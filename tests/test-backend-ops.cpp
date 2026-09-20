@@ -4751,6 +4751,44 @@ struct test_fwht_signed : public test_case {
     }
 };
 
+// rank-1 LoRA at decode as build_lora_mm emits it: MUL_MAT(a, x) -> MUL_MAT(b, .) -> SCALE -> ADD(res, .)
+// (the CUDA backend fuses the four nodes into one launch; the whole graph is compared against CPU)
+struct test_lora_rank1 : public test_case {
+    const int64_t k;
+    const int64_t n;
+    const float scale;
+
+    test_lora_rank1(int64_t k = 5120, int64_t n = 6144, float scale = 1.0f) : k(k), n(n), scale(scale) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(k, n, scale);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LORA_RANK1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(a, "a");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
+        ggml_set_name(res, "res");
+
+        ggml_tensor * ab = ggml_mul_mat(ctx, b, ggml_mul_mat(ctx, a, x));
+        ab = ggml_scale(ctx, ab, scale);
+        ggml_tensor * out = ggml_add(ctx, res, ab);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -9258,6 +9296,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));
+    test_cases.emplace_back(new test_lora_rank1(5120, 6144, 1.0f));
+    test_cases.emplace_back(new test_lora_rank1(17408, 5120, 0.5f));
+    test_cases.emplace_back(new test_lora_rank1(6144, 5120, 1.0f));
     // Block widths above the register path's reach, plus a couple below it as controls. 4096 and
     // 8192 exercise the shared-memory kernel; before it existed the CUDA backend declined them and
     // the op fell back, which cost both speed and (measurably) a little accuracy.

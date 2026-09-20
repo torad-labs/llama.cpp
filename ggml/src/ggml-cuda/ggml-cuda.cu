@@ -28,6 +28,7 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/lora-rank1.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -3472,6 +3473,53 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return ops.size() - 1;
                 }
             }
+        }
+    }
+
+    // Rank-1 LoRA at decode, as build_lora_mm emits it: MUL_MAT(a, x) -> MUL_MAT(b, .) -> SCALE ->
+    // ADD(res, .). One launch computes res + scale * dot(a, x) * b (lora-rank1.cu).
+    // GGML_CUDA_LORA_RANK1_FUSE=0 restores the four separate launches for A/B.
+    static const bool lora_rank1_fuse_enabled = [] {
+        const char * env = getenv("GGML_CUDA_LORA_RANK1_FUSE");
+        return !env || std::atoi(env) != 0;
+    }();
+    if (lora_rank1_fuse_enabled && node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_ADD }, { i + 3 })) {
+        const ggml_tensor * mm_a  = cgraph->nodes[i];
+        const ggml_tensor * mm_b  = cgraph->nodes[i + 1];
+        const ggml_tensor * scale = cgraph->nodes[i + 2];
+        ggml_tensor *       add   = cgraph->nodes[i + 3];
+
+        const ggml_tensor * a   = mm_a->src[0];
+        const ggml_tensor * x   = mm_a->src[1];
+        const ggml_tensor * b   = mm_b->src[0];
+        const ggml_tensor * res = add->src[0];
+
+        float scale_v = 0.0f;
+        float bias_v  = 0.0f;
+        memcpy(&scale_v, (const float *) scale->op_params + 0, sizeof(float));
+        memcpy(&bias_v,  (const float *) scale->op_params + 1, sizeof(float));
+
+        const bool pattern_ok = mm_b->src[1] == mm_a && scale->src[0] == mm_b && add->src[1] == scale &&
+            a && x && b && res && bias_v == 0.0f &&
+            a->ne[1] == 1 && ggml_nrows(a) == 1 &&                     // rank 1
+            ggml_nrows(x) == 1 && ggml_nelements(mm_a) == 1 &&         // one token
+            b->ne[0] == 1 && ggml_nrows(res) == 1 &&
+            ggml_are_same_shape(res, add);
+
+        // The allocator routinely places the ADD in place over `res` (both die here); the kernel is
+        // elementwise in n, so that alias is fine. The inputs it reads across the whole row (a, x, b)
+        // must not alias the destination.
+        const auto overlaps_dst = [&](const ggml_tensor * t) {
+            const int64_t t_start = (int64_t) t->data;
+            const int64_t t_end   = t_start + ggml_nbytes(t);
+            const int64_t d_start = (int64_t) add->data;
+            const int64_t d_end   = d_start + ggml_nbytes(add);
+            return t_start < d_end && d_start < t_end;
+        };
+        if (pattern_ok && !overlaps_dst(a) && !overlaps_dst(x) && !overlaps_dst(b) &&
+                ggml_cuda_op_lora_rank1_fused(*cuda_ctx, a, x, b, scale_v, res, add)) {
+            return 3;
         }
     }
 
