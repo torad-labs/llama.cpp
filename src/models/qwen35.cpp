@@ -226,6 +226,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+        lens_record(cur, il);
 
         // Input for next layer
         inpL = cur;
@@ -249,6 +250,8 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    lens_build(inp_out_ids, model.output_norm, model.output, model.output_s);
 
     ggml_build_forward_expand(gf, cur);
 }

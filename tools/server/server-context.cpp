@@ -25,6 +25,8 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <numeric>
+#include <cmath>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1069,6 +1071,18 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
+        // logit lens (torad-labs fork): read the named layers through the head inside the served
+        // graph; every generated token of every slot is written under lens_out, thinking included
+        if (!params_base.lens_layers.empty()) {
+            llama_set_lens_layers(ctx_tgt, params_base.lens_layers.data(), (int32_t) params_base.lens_layers.size());
+            if (params_base.lens_out.empty()) {
+                SRV_WRN("%s", "--lens-layers without --lens-out: the lens is computed and never written\n");
+            } else if (!fs_create_directory_with_parents(params_base.lens_out)) {
+                SRV_ERR("failed to create the lens directory '%s'\n", params_base.lens_out.c_str());
+                return false;
+            }
+        }
+
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
@@ -1863,6 +1877,78 @@ private:
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
 
         return slot.has_next_token; // continue
+    }
+
+    // logit lens: the top entries of one n_vocab logit row as {id, piece, p}
+    json lens_top(const float * logits, int n_vocab, int top) const {
+        float max_logit = logits[0];
+        for (int i = 1; i < n_vocab; ++i) {
+            max_logit = std::max(max_logit, logits[i]);
+        }
+        double sum = 0.0;
+        for (int i = 0; i < n_vocab; ++i) {
+            sum += std::exp((double) logits[i] - max_logit);
+        }
+        std::vector<int> ids(n_vocab);
+        std::iota(ids.begin(), ids.end(), 0);
+        std::partial_sort(ids.begin(), ids.begin() + top, ids.end(), [logits](int a, int b) { return logits[a] > logits[b]; });
+        json out = json::array();
+        for (int r = 0; r < top; ++r) {
+            const int id = ids[r];
+            json entry = lens_piece(common_token_to_piece(ctx_tgt, id, true));
+            entry["id"] = id;
+            entry["p"]  = std::exp((double) logits[id] - max_logit) / sum;
+            out.push_back(std::move(entry));
+        }
+        return out;
+    }
+
+    // a token piece is bytes, not always a whole UTF-8 string (byte-level BPE): a piece that is
+    // not valid UTF-8 (a fragment of a multi-byte character) is written as "bytes" instead
+    static json lens_piece(const std::string & raw) {
+        if (is_valid_utf8(raw)) {
+            return {{"piece", raw}};
+        }
+        return {{"piece", ""}, {"bytes", completion_token_output::str_to_bytes(raw)}};
+    }
+
+    // logit lens: one JSONL line per generated token, in the slot's own file, from the same
+    // batch row the served token was sampled from (idx). "served" is the head's actual logit
+    // row, so the last layer's lens can be checked against it in the file itself.
+    void lens_write(const server_slot & slot, llama_token tok, int idx) const {
+        if (params_base.lens_out.empty() || llama_n_lens_layers(ctx_tgt) == 0) {
+            return;
+        }
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        const int top     = std::min(std::max(params_base.lens_top, 1), n_vocab);
+
+        json line = lens_piece(common_token_to_piece(ctx_tgt, tok, true));
+        line["slot"]  = slot.id;
+        line["task"]  = slot.task->id;
+        line["pos"]   = slot.prompt.n_tokens();
+        line["n_gen"] = slot.stats.n_gen;
+        line["tok"]   = tok;
+        if (const float * served = llama_get_logits_ith(ctx_tgt, idx)) {
+            line["served"] = lens_top(served, n_vocab, top);
+        }
+        json layers = json::object();
+        for (int32_t k = 0; k < llama_n_lens_layers(ctx_tgt); ++k) {
+            const float * row = llama_get_lens_ith(ctx_tgt, k, idx);
+            if (row == nullptr) {
+                layers = nullptr; // this batch carried no lens (more output rows than the capacity)
+                break;
+            }
+            layers[std::to_string(llama_lens_layer(ctx_tgt, k))] = lens_top(row, n_vocab, top);
+        }
+        line["layers"] = layers;
+
+        const std::string path = params_base.lens_out + "/slot" + std::to_string(slot.id) + "-task" + std::to_string(slot.task->id) + ".jsonl";
+        std::ofstream out(path, std::ios::app);
+        if (!out) {
+            SLT_WRN(slot, "lens: cannot append to %s\n", path.c_str());
+            return;
+        }
+        out << line.dump() << '\n';
     }
 
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
@@ -3802,6 +3888,7 @@ private:
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
+            lens_write(slot, id, tok_idx);
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
