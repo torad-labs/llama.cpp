@@ -3278,6 +3278,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_BENCH}));
     add_opt(common_arg(
+        {"--lens-layers"}, "l0,l1,...",
+        "logit lens: layers whose output is read through the model's own head, inside the served graph (default: off)",
+        [](common_params & params, const std::string & value) {
+            auto p = string_split<int>(value, ',');
+            params.lens_layers.insert(params.lens_layers.end(), p.begin(), p.end());
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lens-out"}, "DIR",
+        "logit lens: directory for per-slot JSONL readouts, one line per generated token (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.lens_out = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lens-top"}, "N",
+        string_format("logit lens: top-k vocabulary entries kept per layer per token (default: %d)", params.lens_top),
+        [](common_params & params, int value) {
+            params.lens_top = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--embd-normalize"}, "N",
         string_format("normalisation for embeddings (default: %d) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)", params.embd_normalize),
         [](common_params & params, int value) {

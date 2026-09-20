@@ -1042,6 +1042,22 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    //
+    // logit lens (torad-labs fork)
+    //
+    // Reads the residual stream at the output of the named layers through the model's own output
+    // norm and head, inside the same graph that produces the served logits (same rotation, same
+    // ternary weights, same control vectors). Rows exist for the batch tokens flagged with
+    // batch.logits, and only for a decode whose every ubatch has at most n_seq_max output rows;
+    // a larger ubatch is served without a lens and llama_get_lens_ith returns NULL for that batch.
+    // Set before the first decode; n_layers == 0 turns the lens off. Layers must be < n_layer.
+    LLAMA_API void    llama_set_lens_layers(struct llama_context * ctx, const int32_t * layers, int32_t n_layers);
+    LLAMA_API int32_t llama_n_lens_layers(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_lens_layer(const struct llama_context * ctx, int32_t k);
+    // n_vocab lens logits of lens entry k (0 <= k < llama_n_lens_layers) for batch token i,
+    // NULL when the last decode carried no lens for its rows
+    LLAMA_API float * llama_get_lens_ith(struct llama_context * ctx, int32_t k, int32_t i);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

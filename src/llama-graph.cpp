@@ -1320,6 +1320,8 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_lens.clear();
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1501,6 +1503,44 @@ ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
     return cvec->apply_to(ctx0, cur, il);
+}
+
+void llm_graph_context::lens_record(ggml_tensor * l_out, int il) const {
+    const auto & layers = cparams.lens_layers;
+    if (layers.empty()) {
+        return;
+    }
+    if (res->t_lens.empty()) {
+        res->t_lens.assign(layers.size(), nullptr);
+    }
+    for (size_t k = 0; k < layers.size(); ++k) {
+        if (layers[k] == il) {
+            res->t_lens[k] = l_out;
+        }
+    }
+}
+
+void llm_graph_context::lens_build(ggml_tensor * inp_out_ids, ggml_tensor * output_norm, ggml_tensor * output, ggml_tensor * output_s) const {
+    if (res->t_lens.empty()) {
+        return;
+    }
+    // capacity: the host buffer holds n_seq_max rows per lens entry (llama_context::output_reserve)
+    if (n_outputs > (int64_t) cparams.n_seq_max) {
+        res->t_lens.clear();
+        return;
+    }
+    for (size_t k = 0; k < res->t_lens.size(); ++k) {
+        ggml_tensor * cur = res->t_lens[k];
+        GGML_ASSERT(cur != nullptr && "lens layer was never recorded by the model graph");
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+        cur = build_norm(cur, output_norm, nullptr, LLM_NORM_RMS, -1);
+        cur = build_lora_mm(output, cur, output_s);
+        cb(cur, "lens_output", cparams.lens_layers[k]);
+        ggml_build_forward_expand(gf, cur);
+        res->t_lens[k] = cur;
+    }
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm(

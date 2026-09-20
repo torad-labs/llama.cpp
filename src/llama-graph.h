@@ -953,6 +953,10 @@ public:
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
+    // lens entry k, [n_vocab, n_outputs]; empty when the graph carries no lens for this ubatch
+    ggml_tensor * get_lens(int k) const { return t_lens[k]; }
+    int32_t       n_lens()      const { return (int32_t) t_lens.size(); }
+
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
@@ -987,6 +991,9 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    // logit lens: one head projection per cparams.lens_layers entry (see llm_graph_context::lens_build)
+    std::vector<ggml_tensor *> t_lens;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1123,6 +1130,12 @@ struct llm_graph_context {
              ggml_tensor * mb,
            llm_norm_type   type,
                      int   il) const;
+
+    // logit lens: a model calls lens_record with each layer's output inside its layer loop and
+    // lens_build once after it, with the same norm and head it uses for the served logits.
+    // The lens is built only when this ubatch's output rows fit the context's lens capacity.
+    void lens_record(ggml_tensor * l_out, int il) const;
+    void lens_build(ggml_tensor * inp_out_ids, ggml_tensor * output_norm, ggml_tensor * output, ggml_tensor * output_s) const;
 
 
     // compute Q, K, V projections with optional bias and reshape
