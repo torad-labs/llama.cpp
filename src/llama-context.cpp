@@ -2026,6 +2026,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             } else {
                 lens_valid = false;
+                if (res->n_lens() == 0 && !lens_warned) {
+                    LLAMA_LOG_WARN("%s: lens layers are set but this model's graph records no lens; every lens row will be NULL\n", __func__);
+                    lens_warned = true;
+                }
             }
         }
 
@@ -2409,7 +2413,7 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (lens.size > 0) {
+        if (lens.size > 0 && lens_valid) { // valid: every row of this batch is within the capacity
             const uint64_t cap = n_seq_max();
             for (size_t l = 0; l < cparams.lens_layers.size(); ++l) {
                 float * rows = lens.data + l*cap*n_vocab;

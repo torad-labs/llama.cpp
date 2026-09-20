@@ -994,6 +994,7 @@ public:
 
     // logit lens: one head projection per cparams.lens_layers entry (see llm_graph_context::lens_build)
     std::vector<ggml_tensor *> t_lens;
+    std::vector<uint8_t>       t_lens_rows_selected; // the recorded tensor already holds only the output rows
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1133,8 +1134,10 @@ struct llm_graph_context {
 
     // logit lens: a model calls lens_record with each layer's output inside its layer loop and
     // lens_build once after it, with the same norm and head it uses for the served logits.
-    // The lens is built only when this ubatch's output rows fit the context's lens capacity.
-    void lens_record(ggml_tensor * l_out, int il) const;
+    // The lens always has the same topology: at most n_seq_max rows (the context's lens capacity)
+    // go through the head, so a ubatch with more output rows is served without a usable lens.
+    // rows_selected: the recorded tensor already went through get_rows(inp_out_ids).
+    void lens_record(ggml_tensor * l_out, int il, bool rows_selected = false) const;
     void lens_build(ggml_tensor * inp_out_ids, ggml_tensor * output_norm, ggml_tensor * output, ggml_tensor * output_s) const;
 
 
