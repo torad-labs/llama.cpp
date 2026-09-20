@@ -1321,6 +1321,7 @@ void llm_graph_result::reset() {
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
     t_lens.clear();
+    t_lens_rows_selected.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -1372,6 +1373,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
                 ggml_set_output(t_layer_inp[il]);
             }
         }
+    }
+    for (auto * tensor : t_lens) {
+        ggml_set_output(tensor);
     }
     for (auto * tensor : t_sampled) {
         if (tensor != nullptr) {
@@ -1505,17 +1509,19 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
-void llm_graph_context::lens_record(ggml_tensor * l_out, int il) const {
+void llm_graph_context::lens_record(ggml_tensor * l_out, int il, bool rows_selected) const {
     const auto & layers = cparams.lens_layers;
     if (layers.empty()) {
         return;
     }
     if (res->t_lens.empty()) {
         res->t_lens.assign(layers.size(), nullptr);
+        res->t_lens_rows_selected.assign(layers.size(), 0);
     }
     for (size_t k = 0; k < layers.size(); ++k) {
         if (layers[k] == il) {
             res->t_lens[k] = l_out;
+            res->t_lens_rows_selected[k] = rows_selected ? 1 : 0;
         }
     }
 }
@@ -1524,16 +1530,18 @@ void llm_graph_context::lens_build(ggml_tensor * inp_out_ids, ggml_tensor * outp
     if (res->t_lens.empty()) {
         return;
     }
-    // capacity: the host buffer holds n_seq_max rows per lens entry (llama_context::output_reserve)
-    if (n_outputs > (int64_t) cparams.n_seq_max) {
-        res->t_lens.clear();
-        return;
-    }
+    // capacity: the host buffer holds n_seq_max rows per lens entry (llama_context::output_reserve);
+    // a larger ubatch still builds the lens on its first rows, so the graph topology never depends
+    // on the output count and the worst-case reservation contains the lens
+    const int64_t cap = cparams.n_seq_max;
     for (size_t k = 0; k < res->t_lens.size(); ++k) {
         ggml_tensor * cur = res->t_lens[k];
         GGML_ASSERT(cur != nullptr && "lens layer was never recorded by the model graph");
-        if (inp_out_ids) {
+        if (inp_out_ids && !res->t_lens_rows_selected[k]) {
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+        if (cur->ne[1] > cap) {
+            cur = ggml_view_2d(ctx0, cur, cur->ne[0], cap, cur->nb[1], 0);
         }
         cur = build_norm(cur, output_norm, nullptr, LLM_NORM_RMS, -1);
         cur = build_lora_mm(output, cur, output_s);

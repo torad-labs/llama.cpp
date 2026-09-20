@@ -312,7 +312,8 @@ private:
     // logit lens output (3-dimensional array: [n_lens][n_seq_max rows][n_vocab]); rows follow
     // output_ids like logits. lens_valid is false when any ubatch of the last decode skipped it.
     buffer_view<float> lens = {nullptr, 0};
-    bool lens_valid = false;
+    bool lens_valid  = false;
+    bool lens_warned = false; // the model graph records no lens (architecture without lens_record)
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

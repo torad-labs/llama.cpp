@@ -1074,6 +1074,13 @@ private:
         // logit lens (torad-labs fork): read the named layers through the head inside the served
         // graph; every generated token of every slot is written under lens_out, thinking included
         if (!params_base.lens_layers.empty()) {
+            const int32_t n_layer = llama_model_n_layer(model_tgt);
+            for (const int32_t il : params_base.lens_layers) {
+                if (il < 0 || il >= n_layer) {
+                    SRV_ERR("--lens-layers: layer %d is outside this model's 0..%d\n", il, n_layer - 1);
+                    return false;
+                }
+            }
             llama_set_lens_layers(ctx_tgt, params_base.lens_layers.data(), (int32_t) params_base.lens_layers.size());
             if (params_base.lens_out.empty()) {
                 SRV_WRN("%s", "--lens-layers without --lens-out: the lens is computed and never written\n");
@@ -1115,6 +1122,13 @@ private:
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+
+                // the lens is written on the sampling path only; a verify batch carries
+                // n_draft+1 rows per slot, which the lens capacity does not hold either
+                if (!params_base.lens_layers.empty()) {
+                    SRV_ERR("%s", "--lens-layers cannot be combined with speculative decoding: the lens covers only the sampled token of each decode\n");
+                    return false;
+                }
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
