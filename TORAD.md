@@ -1,0 +1,21 @@
+# torad-labs/llama.cpp
+
+`main` is PrismML's llama.cpp at tag `prism-b10685-7dffb15` (itself ggml-org/llama.cpp b10685
+plus the ternary PQ/PTQ kernels) with the commits below on top. Each is one self-contained change
+with its own measurement and its own off switch, so any of them can be rebased, dropped or sent
+upstream on its own. Nothing here is model-specific: the examples are Ternary Bonsai 2 27B because
+that is the model these were measured on.
+
+This repo carries kernels and server features only. How a build is produced per GPU, how a model
+is fetched, derived, gated and served, lives in [torad-labs/rig](https://github.com/torad-labs/rig),
+which pins a commit of this branch as a submodule.
+
+| commit | change | off switch |
+|---|---|---|
+| `4651ce7` | `--checkpoint-every N`: a pinned context checkpoint every N prompt tokens and one at the exact token a prompt forked, so a compaction or a new session on a recurrent/hybrid model resumes from a checkpoint instead of re-prefilling from zero | omit the flag |
+| `da69dc5` | tensor-core flash attention reads a q4_0 K/V cache natively (head size 256, GQA > 4) with int8 Q·K; decode uses it from 4,096 tokens on. RTX 5080: prefill at 131K 930 → 1,382 tok/s, decode at 131K 44.5 → 73.3 tok/s | `GGML_CUDA_FATTN_Q4_0_LEGACY=1` |
+| `f0d83e0` | a rank-1 LoRA fused into one decode launch per adapted weight (dot + scaled outer add) instead of four; `test-backend-ops LORA_RANK1` checks the graph against CPU | `GGML_CUDA_LORA_RANK1_FUSE=0` |
+
+Remotes for maintenance: `prism` → PrismML-Eng/llama.cpp (the base), merged in when wanted. The
+83 PrismML branches this repo was first pushed with were removed on 2026-09-20 — every one was at
+the same commit as PrismML's copy; they are one `git fetch prism` away.
