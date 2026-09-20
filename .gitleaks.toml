@@ -1,0 +1,29 @@
+# Repo-local gitleaks config, auto-loaded from the scan root by the org's required
+# secret-scan workflow.
+#
+# Written 2026-09-20 from the full-history scan of torad-labs/llama.cpp (10,688 commits,
+# gitleaks v8.21.2 as the org workflow pins it): 12 findings, every one opened at its commit,
+# none live — all in upstream ggml-org commits, none in the torad patch-set. It NARROWS three
+# false-positive classes only; it never disables a rule and never turns off the default ruleset.
+#
+# `regexTarget = "match"` with FULL identifiers, never "line": the line form suppresses the whole
+# line a finding sits on, which would hide a real credential sharing it. Proven with canaries on
+# 2026-09-20 (see TORAD.md): control = 12 + canaries with no config; red = a canary on the same
+# line as an allowlisted value still fires with this config; green = 0 on main.
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+1. GitHub Actions cache keys in upstream's build workflows (`key: ggml-ci-arm64-cpu-kleidiai`,
+   `key: arm64-cpu-kleidiai-graviton4`, commented or not): a cache name, not a credential.
+2. xxhash's AVX-512 lane variables `data_key_lo` / `data_key_hi` in the vendored
+   examples/gguf-hash/deps/xxhash/xxhash.h.
+3. The placeholder `x-api-key: your-api-key` in tools/server/README.md's Anthropic-API example.
+"""
+regexTarget = "match"
+regexes = [
+  '''key: (ggml-ci-|arm64-cpu-)[a-z0-9-]+''',
+  '''data_key_(lo|hi) = _mm512_srli_epi64''',
+  '''x-api-key: your-api-key''',
+]
