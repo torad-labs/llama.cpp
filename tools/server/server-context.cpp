@@ -296,6 +296,10 @@ struct server_slot {
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
 
+    // where the current prompt forks from the one previously cached in the slot, when the prefix up to it
+    // has to be re-processed; a checkpoint is placed there [--checkpoint-every] (-1 = none)
+    int32_t n_fork = -1;
+
     // sampling
     json json_schema;
 
@@ -2206,14 +2210,15 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // pinned: placed on request [--checkpoint-every], exempt from the min-step thinning below
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool pinned = false) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
+        // created by the current task or pinned
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->id_task != id_task && !it->pinned && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2238,6 +2243,7 @@ private:
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+        cur.pinned  = pinned;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -3047,6 +3053,9 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        // length of the common prefix with the cached prompt, before any checkpoint fallback
+                        int n_lcp = 0;
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -3107,6 +3116,8 @@ private:
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
+
+                                n_lcp = n_past;
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
@@ -3290,6 +3301,10 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        // the prefix up to the fork point is re-processed from an earlier checkpoint (or from 0):
+                        // place a checkpoint at the fork, the likeliest point for the next prompt to fork again
+                        slot.n_fork = n_lcp >= n_past + n_ubatch ? n_lcp : -1;
+
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
@@ -3404,6 +3419,25 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // checkpoints requested by --checkpoint-every: on the N-token grid and at the fork point.
+                    // hybrid/recurrent memory resumes only from a checkpoint at or before the first differing
+                    // token, so these bound the re-processing after a mid-prompt change (e.g. a tool list
+                    // that grew) to the distance back to the nearest one
+                    const auto is_requested_checkpoint = [&](int32_t pos) {
+                        if (params_base.checkpoint_every <= 0 || pos <= 0) {
+                            return false;
+                        }
+                        if (pos % params_base.checkpoint_every != 0 && pos != slot.n_fork) {
+                            return false;
+                        }
+                        for (const auto & cur : slot.prompt.checkpoints) {
+                            if (cur.n_tokens == pos) {
+                                return false; // already there, e.g. the checkpoint this task resumed from
+                            }
+                        }
+                        return true;
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -3440,6 +3474,11 @@ private:
                             }
                         }
 
+                        // break where a checkpoint was requested, so that the next batch starts there
+                        if (do_checkpoint && is_requested_checkpoint(slot.prompt.n_tokens())) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -3471,6 +3510,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_requested = is_requested_checkpoint(n_tokens_start);
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -3488,7 +3528,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_requested) {
                             do_checkpoint = false;
                         }
                     }
@@ -3508,14 +3548,14 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_requested ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_requested);
                     }
                 }
 

@@ -618,6 +618,7 @@ struct common_params {
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t checkpoint_every    = 0;     // also checkpoint every N prompt tokens and where a prompt forks from the cached one (0 = off)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
@@ -1144,6 +1145,9 @@ struct common_prompt_checkpoint {
 
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
+
+    // placed on request (--checkpoint-every grid or fork point): exempt from the min-step thinning
+    bool pinned = false;
 
     llama_pos pos_min;
     llama_pos pos_max;
