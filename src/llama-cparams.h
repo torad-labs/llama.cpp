@@ -56,6 +56,7 @@ struct llama_cparams {
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+    bool attn_mask_bits;     // the KV attention mask is bit-packed (GGML_TYPE_I16) instead of f16; only with flash_attn
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

@@ -1154,7 +1154,12 @@ struct llm_graph_context {
     // rows_selected: the recorded tensor already went through get_rows(inp_out_ids).
     // with cparams.lens_channels the model also passes the block's input and its two contributions
     // (l_out == prev + attn + ffn, plus the layer's control vector if any); all four share rows_selected.
-    void lens_record(ggml_tensor * l_out, int il, bool rows_selected = false,
+    // The output rows are taken HERE, at the layer (get_rows(inp_out_ids), capped at the lens
+    // capacity), so the graph allocator frees the full-ubatch block tensors as the graph moves on
+    // instead of holding every recorded layer's n_embd x n_ubatch rows until lens_build at the end:
+    // with six lens layers and channels that retention was 190 MiB of the 5080 head's 618 MiB
+    // compute buffer at n_ubatch 512 (2026-09-21, allocator trace).
+    void lens_record(ggml_tensor * l_out, int il, ggml_tensor * inp_out_ids, bool rows_selected = false,
                      ggml_tensor * prev = nullptr, ggml_tensor * attn = nullptr, ggml_tensor * ffn = nullptr) const;
     void lens_build(ggml_tensor * inp_out_ids, ggml_tensor * output_norm, ggml_tensor * output, ggml_tensor * output_s) const;
 

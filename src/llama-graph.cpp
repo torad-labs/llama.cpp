@@ -35,10 +35,13 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    // flash attention requires an f16 mask
-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // flash attention requires an f16 mask; attn_mask_bits packs it to one bit per cell (GGML_TYPE_I16, 16 cells per element)
+    const bool bits = cparams.flash_attn && cparams.attn_mask_bits;
+    const auto type = bits ? GGML_TYPE_I16 : cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    GGML_ASSERT(!bits || n_kv % 16 == 0);
+
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, bits ? n_kv/16 : n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -56,7 +59,7 @@ static bool can_reuse_kq_mask(
 
     bool res = true;
 
-    res &= (kq_mask->ne[0] == n_kv);
+    res &= ((kq_mask->type == GGML_TYPE_I16 ? 16*kq_mask->ne[0] : kq_mask->ne[0]) == n_kv);
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
@@ -1517,7 +1520,7 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
-void llm_graph_context::lens_record(ggml_tensor * l_out, int il, bool rows_selected,
+void llm_graph_context::lens_record(ggml_tensor * l_out, int il, ggml_tensor * inp_out_ids, bool rows_selected,
                                     ggml_tensor * prev, ggml_tensor * attn, ggml_tensor * ffn) const {
     const auto & layers = cparams.lens_layers;
     if (layers.empty()) {
@@ -1532,14 +1535,30 @@ void llm_graph_context::lens_record(ggml_tensor * l_out, int il, bool rows_selec
             res->t_lens_ffn.assign(layers.size(), nullptr);
         }
     }
+    // the output rows, taken now so the full-ubatch tensor has no consumer past this layer. The
+    // get_rows node is expanded into the graph HERE: lens_build's expansion at the end of the graph
+    // would place it after every later layer and the full tensor would stay live until then.
+    const int64_t cap = cparams.n_lens_rows();
+    auto select_rows = [&](ggml_tensor * cur) {
+        if (inp_out_ids && !rows_selected) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+            ggml_build_forward_expand(gf, cur);
+        }
+        if (cur->ne[1] > cap) {
+            cur = ggml_view_2d(ctx0, cur, cur->ne[0], cap, cur->nb[1], 0);
+        }
+        return cur;
+    };
     for (size_t k = 0; k < layers.size(); ++k) {
         if (layers[k] == il) {
-            res->t_lens[k] = l_out;
-            res->t_lens_rows_selected[k] = rows_selected ? 1 : 0;
+            // the model's last layer is re-aliased to the served logits by lens_build; its selected
+            // rows only feed the channels' shared rms there
+            res->t_lens[k] = select_rows(l_out);
+            res->t_lens_rows_selected[k] = (rows_selected || inp_out_ids) ? 1 : 0;
             if (cparams.lens_channels) {
-                res->t_lens_prev[k] = prev;
-                res->t_lens_attn[k] = attn;
-                res->t_lens_ffn[k]  = ffn;
+                res->t_lens_prev[k] = select_rows(prev);
+                res->t_lens_attn[k] = select_rows(attn);
+                res->t_lens_ffn[k]  = select_rows(ffn);
             }
         }
     }
