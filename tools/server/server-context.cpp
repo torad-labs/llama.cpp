@@ -4300,7 +4300,14 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // the saved sampler is read only when a partial acceptance restores the checkpoint (below):
+                // never on a recurrent context whose rollback copies cover the whole draft. The clone copies
+                // the grammar's rules and stacks: 15 ms a step with a tool grammar (perf on the live 27B head,
+                // 2026-09-21), so it is taken only when that restore can happen.
+                const bool may_restore =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                common_sampler_ptr smpl_save(may_restore ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 for (const auto idx : slot.spec_i_batch) {
@@ -4344,6 +4351,7 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        GGML_ASSERT(smpl_save && "a restore needs the sampler saved before verification");
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;
