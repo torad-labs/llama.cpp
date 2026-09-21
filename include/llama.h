@@ -383,6 +383,9 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        enum ggml_type type_s; // data type for the recurrent state cache (Gated DeltaNet / SSM S tensor):
+                               // GGML_TYPE_F32 (default), F16, BF16 or Q8_0; the math stays f32, only the
+                               // stored state is narrowed [EXPERIMENTAL]
 
         // optional path to a per-layer K-cache mean-centering bias file (GGUF), or NULL to disable.
         // the bias is subtracted from the K vector for each (kv-head, channel) right before it is
