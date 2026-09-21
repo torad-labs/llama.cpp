@@ -32,6 +32,10 @@ struct llama_cparams {
     float yarn_beta_fast;
     float yarn_beta_slow;
 
+    // lens rows the host buffer holds: one sampled row per sequence plus every drafted row a
+    // speculative verify batch can carry (n_rs_seq is the draft length the context can roll back)
+    uint32_t n_lens_rows() const { return n_seq_max * (1 + n_rs_seq); }
+
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
