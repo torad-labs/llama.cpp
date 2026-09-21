@@ -1535,10 +1535,21 @@ void llm_graph_context::lens_build(ggml_tensor * inp_out_ids, ggml_tensor * outp
     // builds the lens on its first rows, so the graph topology never depends on the output count
     // and the worst-case reservation contains the lens
     const int64_t cap = cparams.n_lens_rows();
-    // every layer's rows, normed, stacked along dim 1: ONE lm_head matmul reads the output weight
-    // once for all lens layers (six separate matmuls read it six times per decode step)
+    // the model's last layer IS the served logits: that entry aliases res->t_logits, so its rows are
+    // the served rows byte for byte. Computing it again through the stacked matmul below would go
+    // through a different kernel path (other column count) and drift from the served row at near-ties,
+    // which the capture contract forbids (the final layer's top-k equals "served").
+    const int32_t last_layer = (int32_t) hparams.n_layer() - 1;
+    // every other layer's rows, normed, stacked along dim 1: ONE lm_head matmul reads the output
+    // weight once for all lens layers (separate matmuls read it once per layer per decode step)
     std::vector<ggml_tensor *> normed;
+    std::vector<size_t>        stacked_k; // lens entry of each stacked block
     for (size_t k = 0; k < res->t_lens.size(); ++k) {
+        if (cparams.lens_layers[k] == last_layer) {
+            GGML_ASSERT(res->t_logits != nullptr && "lens_build runs after the model set its logits");
+            res->t_lens[k] = res->t_logits;
+            continue;
+        }
         ggml_tensor * cur = res->t_lens[k];
         GGML_ASSERT(cur != nullptr && "lens layer was never recorded by the model graph");
         if (inp_out_ids && !res->t_lens_rows_selected[k]) {
@@ -1548,6 +1559,10 @@ void llm_graph_context::lens_build(ggml_tensor * inp_out_ids, ggml_tensor * outp
             cur = ggml_view_2d(ctx0, cur, cur->ne[0], cap, cur->nb[1], 0);
         }
         normed.push_back(build_norm(cur, output_norm, nullptr, LLM_NORM_RMS, -1));
+        stacked_k.push_back(k);
+    }
+    if (normed.empty()) {
+        return;
     }
     ggml_tensor * stacked = normed[0];
     for (size_t k = 1; k < normed.size(); ++k) {
@@ -1558,8 +1573,9 @@ void llm_graph_context::lens_build(ggml_tensor * inp_out_ids, ggml_tensor * outp
     ggml_build_forward_expand(gf, logits);
 
     const int64_t rows = normed[0]->ne[1];
-    for (size_t k = 0; k < res->t_lens.size(); ++k) {
-        ggml_tensor * cur = ggml_view_2d(ctx0, logits, logits->ne[0], rows, logits->nb[1], k * rows * logits->nb[1]);
+    for (size_t b = 0; b < stacked_k.size(); ++b) {
+        const size_t k = stacked_k[b];
+        ggml_tensor * cur = ggml_view_2d(ctx0, logits, logits->ne[0], rows, logits->nb[1], b * rows * logits->nb[1]);
         cb(cur, "lens_output", cparams.lens_layers[k]);
         ggml_build_forward_expand(gf, cur);
         res->t_lens[k] = cur;

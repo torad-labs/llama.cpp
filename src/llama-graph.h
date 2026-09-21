@@ -1133,7 +1133,8 @@ struct llm_graph_context {
                      int   il) const;
 
     // logit lens: a model calls lens_record with each layer's output inside its layer loop and
-    // lens_build once after it, with the same norm and head it uses for the served logits.
+    // lens_build once after it (after res->t_logits is set), with the same norm and head it uses for
+    // the served logits. The entry for the model's last layer aliases the served logits themselves.
     // The lens always has the same topology: at most n_seq_max rows (the context's lens capacity)
     // go through the head, so a ubatch with more output rows is served without a usable lens.
     // rows_selected: the recorded tensor already went through get_rows(inp_out_ids).
