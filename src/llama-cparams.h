@@ -32,6 +32,10 @@ struct llama_cparams {
     float yarn_beta_fast;
     float yarn_beta_slow;
 
+    // lens rows the host buffer holds: one sampled row per sequence plus every drafted row a
+    // speculative verify batch can carry (n_rs_seq is the draft length the context can roll back)
+    uint32_t n_lens_rows() const { return n_seq_max * (1 + n_rs_seq); }
+
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
@@ -55,6 +59,9 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+
+    std::vector<int32_t> lens_layers; // layers whose output the logit lens reads through the head (empty = off)
+    bool lens_channels = false;       // also read each lens layer's block input and its attention and FFN contributions, through the same head, in the block output's scale
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

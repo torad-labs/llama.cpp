@@ -204,6 +204,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
+        ggml_tensor * attn_out = cur; // what this block's attention (or linear attention) adds: a lens channel
 
         // Residual connection
         cur = ggml_add(ctx0, cur, inpSA);
@@ -219,6 +220,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // Dense FFN layer - without residual connection
         cur = build_layer_ffn(attn_post_norm, il);
         cb(cur, "ffn_out", il);
+        ggml_tensor * ffn_out = cur; // what this block's feed-forward adds: a lens channel
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
@@ -226,6 +228,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+        lens_record(cur, il, il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked, inpSA, attn_out, ffn_out);
 
         // Input for next layer
         inpL = cur;
@@ -249,6 +252,8 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    lens_build(inp_out_ids, model.output_norm, model.output, model.output_s);
 
     ggml_build_forward_expand(gf, cur);
 }
@@ -595,6 +600,19 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+
+        // a Hadamard-latent table (the target's, shared when the head brings none) stores rotated
+        // rows; the head was trained on embeddings in the trunk's primal basis, so restore it the
+        // way build_inp_embd() does: h = s * (H z)
+        if (hadamard_inverses) {
+            const auto it = hadamard_inverses->find(tok_embd_w);
+            if (it != hadamard_inverses->end()) {
+                tok_embd = llama_mul_mat_hadamard(ctx0, tok_embd, it->second.rot);
+                if (it->second.signs) {
+                    tok_embd = ggml_mul(ctx0, tok_embd, it->second.signs);
+                }
+            }
+        }
     } else {
         tok_embd = inp->embd;
     }
