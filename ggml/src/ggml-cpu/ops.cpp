@@ -8486,6 +8486,11 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// a bit-packed attention mask row (GGML_TYPE_I16): 16 KV cells per element, LSB first, bit set = attend
+static inline float ggml_kq_mask_bit(const uint16_t * row, int64_t i) {
+    return (row[i >> 4] >> (i & 15)) & 1 ? 0.0f : -INFINITY;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8594,6 +8599,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         }
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const bool mask_bits = mask && mask->type == GGML_TYPE_I16; // bit-packed: 16 cells per element, bit set = attend
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8611,7 +8617,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const float mv = mp ? (mask_bits ? ggml_kq_mask_bit((const uint16_t *) mp, ic) : slope*GGML_CPU_FP16_TO_FP32(mp[ic])) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -8872,11 +8878,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
+                const bool mask_bits = mask->type == GGML_TYPE_I16; // bit-packed: 16 cells per element, bit set = attend
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        mask32[tq * KV_TILE_SZ + tk] = mask_bits ? ggml_kq_mask_bit((const uint16_t *) mp_row, ic + tk) : slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }

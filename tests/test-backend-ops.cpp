@@ -144,10 +144,17 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 }
 
 // generate an F16 mask where certain blocks are randomly masked with -INF value
+// f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
+// block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
+// draws no block) has masked cells and a wrong bit order fails.
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
-    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_I16);
+    const bool bits = tensor->type == GGML_TYPE_I16;
 
-    GGML_TENSOR_LOCALS( int32_t, ne, tensor, ne);
+    const int32_t ne0 = (int32_t) tensor->ne[0] * (bits ? 16 : 1); // cells, not elements
+    const int32_t ne1 = (int32_t) tensor->ne[1];
+    const int32_t ne2 = (int32_t) tensor->ne[2];
+    const int32_t ne3 = (int32_t) tensor->ne[3];
 
     std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
@@ -157,7 +164,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::uniform_real_distribution<float> dis(min, max);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
-        data_f32[i] = dis(gen);
+        data_f32[i] = bits ? (gen() % 8 == 0 ? -INFINITY : 0.0f) : dis(gen);
     }
 
     // block size
@@ -182,6 +189,17 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
                 data_f32[idx + i0] = inf ? -INFINITY : 0.0f;
             }
         }
+    }
+
+    if (bits) {
+        std::vector<uint16_t> words(data_f32.size()/16, 0);
+        for (size_t i = 0; i < data_f32.size(); i++) {
+            if (data_f32[i] == 0.0f) {
+                words[i/16] |= (uint16_t) (1u << (i%16));
+            }
+        }
+        ggml_backend_tensor_set(tensor, words.data(), 0, words.size()*sizeof(uint16_t));
+        return;
     }
 
     ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), ne0*ne1*ne2*ne3);
@@ -7226,9 +7244,11 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
+    const bool mask_bits; // bit-packed mask (GGML_TYPE_I16, 16 cells per element) instead of f16
 
     std::string vars() override {
-        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k);
+        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k)
+            + "," + VAR_TO_STR(mask_bits);
     }
 
     double max_nmse_err() override {
@@ -7245,9 +7265,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, bool mask_bits = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_bits(mask_bits) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7295,7 +7315,8 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = mask_bits ? ggml_new_tensor_4d(ctx, GGML_TYPE_I16, (kv + 15)/16, nb, 1, nr23[1])
+                          : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -10119,6 +10140,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int nb : { 1, 3, 32, 75, 512, }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     }
+
+    // bit-packed mask: the served head's shape through every kernel choice (vec at nb 1 with an f16 cache, q4_0 mma, mma prefill),
+    // two sequences (the KV-max scan), and an unpadded KV (the out-of-bounds tile loader, no GQA path)
+    for (int nb : { 1, 3, 32, 512, }) {
+        for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, true));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 2048, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  113,  7, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {2, 1},  200,  5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, true));
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
