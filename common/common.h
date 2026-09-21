@@ -328,6 +328,10 @@ struct common_params_speculative_draft {
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+    // a drafted token lands only if every token before it lands, so its expected value is the product of
+    // the chain's top-1 probabilities: stop drafting once that product is under this (0 = off; draft
+    // models and MTP heads; block drafts keep p_min alone)
+    float chain_p_min = 0.0f;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 

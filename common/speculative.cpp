@@ -197,7 +197,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         }
 
         SPC_TRC("%s", "adding speculative implementation 'draft-simple'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, chain_p_min=%.2f\n", this->params.n_max, this->params.n_min, this->params.p_min, this->params.chain_p_min);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -286,6 +286,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<float> chain_p(n_seq, 1.0f); // product of the chain's top-1 probabilities so far
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -337,6 +338,22 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                // the chain lands only if every token before it lands: stop once the product of the
+                // draft's top-1 probabilities along it is under chain_p_min (the token that drops it
+                // under is not worth its draft and verify cost)
+                if (params.chain_p_min > 0.0f) {
+                    // the draft sampler chain ends in a softmax, so the top-1 probability is never 0; a chain that
+                    // stopped computing probabilities would otherwise silence drafting at the first position
+                    GGML_ASSERT(cur_p->data[0].p > 0.0f && "chain_p_min needs draft probabilities");
+                }
+                chain_p[seq_id] *= cur_p->data[0].p;
+                if (params.chain_p_min > 0.0f && chain_p[seq_id] < params.chain_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -460,7 +477,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         , params(params.draft)
     {
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, chain_p_min=%.2f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, params.draft.chain_p_min, (int) params.draft.backend_sampling);
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -728,6 +745,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<float> chain_p(n_seq, 1.0f); // product of the chain's top-1 probabilities so far
 
         const size_t row_bytes = (size_t) n_embd_dec * sizeof(float);
 
@@ -799,6 +817,22 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
                 if (cur_p->data[0].p < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                // the chain lands only if every token before it lands: stop once the product of the
+                // draft's top-1 probabilities along it is under chain_p_min (the token that drops it
+                // under is not worth its draft and verify cost)
+                if (params.chain_p_min > 0.0f) {
+                    // the draft sampler chain ends in a softmax, so the top-1 probability is never 0; a chain that
+                    // stopped computing probabilities would otherwise silence drafting at the first position
+                    GGML_ASSERT(cur_p->data[0].p > 0.0f && "chain_p_min needs draft probabilities");
+                }
+                chain_p[seq_id] *= cur_p->data[0].p;
+                if (params.chain_p_min > 0.0f && chain_p[seq_id] < params.chain_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1427,7 +1461,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, chain_p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, this->params.chain_p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -1681,6 +1715,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<float> chain_p(n_seq, 1.0f); // product of the chain's top-1 probabilities so far
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1758,6 +1793,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                // the chain lands only if every token before it lands: stop once the product of the
+                // draft's top-1 probabilities along it is under chain_p_min (the token that drops it
+                // under is not worth its draft and verify cost)
+                if (params.chain_p_min > 0.0f) {
+                    // the draft sampler chain ends in a softmax, so the top-1 probability is never 0; a chain that
+                    // stopped computing probabilities would otherwise silence drafting at the first position
+                    GGML_ASSERT(cur_p->data[0].p > 0.0f && "chain_p_min needs draft probabilities");
+                }
+                chain_p[seq_id] *= cur_p->data[0].p;
+                if (params.chain_p_min > 0.0f && chain_p[seq_id] < params.chain_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2717,6 +2768,17 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             default:
                 break;
+        }
+    }
+
+    if (params.draft.chain_p_min > 0.0f) {
+        for (const auto & impl : impls) {
+            if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE &&
+                impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 &&
+                impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                SPC_WRN("--spec-draft-chain-p-min %.2f has no effect on '%s': the chain cutoff applies to draft-simple, draft-eagle3 and draft-mtp only\n",
+                        params.draft.chain_p_min, common_speculative_type_to_str(impl->type).c_str());
+            }
         }
     }
 
