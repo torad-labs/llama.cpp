@@ -209,10 +209,6 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0.0f, 1.0f)
         ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
 
-    add((new field_num("speculative.chain_p_min", params.speculative.draft.chain_p_min))
-        ->set_hard_limits(0.0f, 1.0f)
-        ->set_desc("Stop drafting once the product of the chain's top-1 probabilities is under this (0 = off)"));
-
 
     add((new field_str("speculative.type"))
         ->set_desc("Speculative decoding method (for debugging and research purposes)")

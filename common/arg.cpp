@@ -4249,9 +4249,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
         {"--spec-draft-chain-p-min"}, "P",
-        string_format("stop drafting once the product of the chain's top-1 probabilities is under P; draft models and MTP heads (default: %.2f = off)", (double)params.speculative.draft.chain_p_min),
+        string_format("stop drafting once the product of the chain's top-1 probabilities is under P, in [0, 1]; draft-simple, draft-eagle3 and draft-mtp only (default: %.2f = off)", (double)params.speculative.draft.chain_p_min),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.chain_p_min = std::stof(value);
+            const float v = std::stof(value);
+            if (!(v >= 0.0f && v <= 1.0f)) {
+                throw std::invalid_argument("must be in [0, 1]");
+            }
+            params.speculative.draft.chain_p_min = v;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CHAIN_P_MIN"));
     add_opt(common_arg(
