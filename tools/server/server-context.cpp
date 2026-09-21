@@ -350,6 +350,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            common_speculative_end(spec, id);
         }
         generated_tokens.clear();
         generated_token_probs.clear();

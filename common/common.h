@@ -331,6 +331,12 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // decode-only MTP: the head never sees the prompt. Its cache holds only the tokens generated in the
+    // current turn (the target's hidden state carries the context), capped at mtp_window cells per
+    // sequence, so the draft costs no prefill pass and a fixed sliver of memory instead of a full window.
+    bool    mtp_decode_only = false;
+    int32_t mtp_window      = 16384;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

@@ -4201,6 +4201,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--spec-draft-mtp-decode-only"},
+        "run the MTP draft head on generated tokens only: the prompt never enters its KV cache, which holds\n"
+        "at most --spec-draft-mtp-window cells per sequence (default: off)",
+        [](common_params & params) {
+            params.speculative.draft.mtp_decode_only = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_DECODE_ONLY"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-window"}, "N",
+        string_format("cells per sequence the MTP draft head keeps in decode-only mode; the oldest half is dropped when full (default: %d)", params.speculative.draft.mtp_window),
+        [](common_params & params, int value) {
+            if (value < 64) {
+                throw std::invalid_argument("--spec-draft-mtp-window must be at least 64");
+            }
+            params.speculative.draft.mtp_window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_WINDOW"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
