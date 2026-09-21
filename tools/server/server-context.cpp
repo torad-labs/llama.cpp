@@ -28,8 +28,11 @@
 #include <thread>
 #include <mutex>
 #include <deque>
+#include <unordered_map>
+#include <unordered_set>
 #include <condition_variable>
 #include <numeric>
+#include <cctype>
 #include <cmath>
 
 // fix problem with std::min and std::max
@@ -822,6 +825,30 @@ public:
     // the top-k over the vocabulary, the JSON and the file append run on this worker, so the
     // lens never costs the head more than that copy. A full queue drops the line and says so:
     // the head's instrumentation must never stall the head.
+    // training-pull detector: what the decode thread saw for one sampled token, before the sampler:
+    // the served argmax's write profile over the pull layers, whether the prompt states its text,
+    // and the decision. Shape scalars are annotation for calibration; the fire rule is the text test.
+    struct pull_rec {
+        bool  fired      = false;
+        int   argmax     = -1;
+        float p          = -1.0f; // served probability of the argmax; computed only for a candidate
+        bool  in_source  = false; // the argmax's text occurs in the prompt
+        bool  content    = false; // a digit, or three or more letters, and not a control token
+        int   first_attn = -1;    // first pull layer whose token mixing wrote >= 1 logit for the argmax
+        int   first_ffn  = -1;    // first pull layer whose FFN did
+        float max_share  = 0.0f;  // largest single write over the sum of positive writes
+        float ffn_share  = 0.0f;  // FFN's part of the sum of positive writes
+        std::vector<std::pair<int, float>> attn; // (layer, write for the argmax) per pull layer
+        std::vector<std::pair<int, float>> ffn;
+        int   tok_after  = -1;    // served argmax after surgery (== argmax unless surgery fired)
+        float p_after    = -1.0f;
+    };
+    struct pull_src {
+        int task = -1;
+        std::string text;                   // the prompt, detokenized
+        std::unordered_set<llama_token> ids; // the prompt's token ids, for the surgery bias
+    };
+
     struct lens_job {
         int slot;
         int task;
@@ -831,6 +858,8 @@ public:
         std::vector<float> served;            // the served logit row, or empty
         std::vector<std::vector<float>> rows; // one row per lens layer, or empty when the batch carried no lens
         std::vector<std::vector<float>> chan; // with --lens-channels: per lens layer its prev, attn, ffn rows (k*3 + c), else empty
+        bool has_pull = false;                // the detector ran on this token
+        pull_rec pull;
     };
     static constexpr size_t LENS_QUEUE_MAX = 64;
     std::thread lens_thread;
@@ -839,6 +868,9 @@ public:
     std::deque<lens_job> lens_queue;
     bool lens_stop = false;
     size_t lens_dropped = 0;
+    std::vector<int32_t>              pull_k;    // lens entry of each pull layer
+    std::unordered_map<int, pull_rec> pull_recs; // batch index -> record, for the current decode only
+    std::unordered_map<int, pull_src> pull_srcs; // slot id -> its current task's prompt
 
     ~server_context_impl() {
         if (lens_thread.joinable()) {
@@ -1118,6 +1150,28 @@ private:
             llama_set_lens_layers(ctx_tgt, params_base.lens_layers.data(), (int32_t) params_base.lens_layers.size());
             if (params_base.lens_channels) {
                 llama_set_lens_channels(ctx_tgt, true);
+            }
+            if (!params_base.pull_layers.empty()) {
+                if (!params_base.lens_channels) {
+                    SRV_ERR("%s", "--pull-layers needs --lens-channels: the detector reads the block's channels\n");
+                    return false;
+                }
+                for (const int32_t il : params_base.pull_layers) {
+                    int32_t k_found = -1;
+                    for (int32_t k = 0; k < llama_n_lens_layers(ctx_tgt); ++k) {
+                        if (llama_lens_layer(ctx_tgt, k) == il) {
+                            k_found = k;
+                            break;
+                        }
+                    }
+                    if (k_found < 0) {
+                        SRV_ERR("--pull-layers: layer %d is not a lens layer; add it to --lens-layers\n", il);
+                        return false;
+                    }
+                    pull_k.push_back(k_found);
+                }
+                SRV_INF("training-pull detector on %zu layers, fires at p >= %.2f on a content token the prompt never states, action %s\n",
+                        pull_k.size(), (double) params_base.pull_p, params_base.pull_action.c_str());
             }
             if (params_base.lens_out.empty()) {
                 SRV_WRN("%s", "--lens-layers without --lens-out: the lens is computed and never written\n");
@@ -2010,6 +2064,40 @@ private:
             line["pos"]   = job.pos;
             line["n_gen"] = job.n_gen;
             line["tok"]   = job.tok;
+            if (job.has_pull) {
+                const auto & r = job.pull;
+                json pull = json::object();
+                pull["fired"]      = r.fired;
+                pull["argmax"]     = r.argmax;
+                pull["in_source"]  = r.in_source;
+                pull["content"]    = r.content;
+                if (r.p >= 0.0f) {
+                    pull["p"] = r.p;
+                }
+                pull["first_attn"] = r.first_attn;
+                pull["first_ffn"]  = r.first_ffn;
+                pull["max_share"]  = r.max_share;
+                pull["ffn_share"]  = r.ffn_share;
+                json attn = json::array(), ffn = json::array();
+                for (const auto & e : r.attn) {
+                    json pair = json::array();
+                    pair.push_back(json(e.first));
+                    pair.push_back(json(e.second));
+                    attn.push_back(pair);
+                }
+                for (const auto & e : r.ffn) {
+                    json pair = json::array();
+                    pair.push_back(json(e.first));
+                    pair.push_back(json(e.second));
+                    ffn.push_back(pair);
+                }
+                pull["attn"] = std::move(attn);
+                pull["ffn"]  = std::move(ffn);
+                if (r.fired && params_base.pull_action == "surgery") {
+                    pull["after"] = json{{"argmax", r.tok_after}, {"p", r.p_after}};
+                }
+                line["pull"] = std::move(pull);
+            }
             if (!job.served.empty()) {
                 line["served"] = lens_top(job.served.data(), n_vocab, top);
             }
@@ -2078,6 +2166,101 @@ private:
     // row, so the last layer's lens can be checked against it in the file itself.
     /** one lens line for the token `tok` sampled from output row `idx`, at sequence position `pos`:
      *  the decode thread copies the rows and hands them to the lens worker */
+    static float pull_softmax_p(const float * logits, int n, int tok) {
+        const float m = *std::max_element(logits, logits + n);
+        double s = 0.0;
+        for (int v = 0; v < n; ++v) {
+            s += std::exp((double) (logits[v] - m));
+        }
+        return (float) (std::exp((double) (logits[tok] - m)) / s);
+    }
+
+    static bool pull_is_content(const std::string & piece) {
+        int  alnum = 0;
+        bool digit = false;
+        for (const unsigned char c : piece) {
+            if (std::isdigit(c)) {
+                digit = true;
+                ++alnum;
+            } else if (std::isalpha(c) || c >= 0x80) {
+                ++alnum;
+            }
+        }
+        return digit || alnum >= 3;
+    }
+
+    // training-pull detector: on the decode thread, after the decode and before the sampler, on the
+    // served logits of batch index idx. surgery edits those logits in place, so the sampler,
+    // populate_token_probs and the token's lens line all see the distribution that was served.
+    void pull_eval(const server_slot & slot, int idx) {
+        if (pull_k.empty()) {
+            return;
+        }
+        float * logits = llama_get_logits_ith(ctx_tgt, idx);
+        if (logits == nullptr) {
+            return;
+        }
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        pull_rec rec;
+        rec.argmax    = (int) (std::max_element(logits, logits + n_vocab) - logits);
+        rec.tok_after = rec.argmax;
+
+        // the write profile of the argmax over the pull layers
+        float total = 0.0f, largest = 0.0f, ffn_sum = 0.0f;
+        for (const int32_t k : pull_k) {
+            const float * attn = llama_get_lens_channel_ith(ctx_tgt, k, LLAMA_LENS_CHANNEL_ATTN, idx);
+            const float * ffn  = llama_get_lens_channel_ith(ctx_tgt, k, LLAMA_LENS_CHANNEL_FFN,  idx);
+            if (attn == nullptr || ffn == nullptr) {
+                return; // this batch carried no lens: no record, no surgery
+            }
+            const int   il = llama_lens_layer(ctx_tgt, k);
+            const float a  = attn[rec.argmax];
+            const float f  = ffn[rec.argmax];
+            rec.attn.emplace_back(il, a);
+            rec.ffn.emplace_back(il, f);
+            if (a >= 1.0f && rec.first_attn < 0) { rec.first_attn = il; }
+            if (f >= 1.0f && rec.first_ffn  < 0) { rec.first_ffn  = il; }
+            total   += std::max(a, 0.0f) + std::max(f, 0.0f);
+            ffn_sum += std::max(f, 0.0f);
+            largest  = std::max(largest, std::max(a, f));
+        }
+        if (total > 0.0f) {
+            rec.max_share = largest / total;
+            rec.ffn_share = ffn_sum / total;
+        }
+
+        // the source test: does the prompt state this token's text
+        auto & src = pull_srcs[slot.id];
+        if (src.task != slot.task->id) {
+            const llama_tokens toks = slot.task->tokens.get_text_tokens();
+            src.task = slot.task->id;
+            src.text = common_detokenize(ctx_tgt, toks, true);
+            src.ids.clear();
+            src.ids.insert(toks.begin(), toks.end());
+        }
+        std::string piece = common_token_to_piece(ctx_tgt, rec.argmax, false);
+        piece.erase(0, piece.find_first_not_of(" \t\n\r"));
+        const bool control = (llama_vocab_get_attr(vocab, rec.argmax) & LLAMA_TOKEN_ATTR_CONTROL) != 0;
+        rec.content   = !control && !piece.empty() && pull_is_content(piece);
+        rec.in_source = !piece.empty() && src.text.find(piece) != std::string::npos;
+
+        if (rec.content && !rec.in_source) {
+            rec.p       = pull_softmax_p(logits, n_vocab, rec.argmax);
+            rec.p_after = rec.p;
+            rec.fired   = rec.p >= params_base.pull_p;
+        }
+        if (rec.fired && params_base.pull_action == "surgery") {
+            for (const llama_token v : src.ids) {
+                if (v >= 0 && v < n_vocab) {
+                    logits[v] += params_base.pull_lambda;
+                }
+            }
+            rec.tok_after = (int) (std::max_element(logits, logits + n_vocab) - logits);
+            rec.p_after   = pull_softmax_p(logits, n_vocab, rec.tok_after);
+        }
+        pull_recs[idx] = rec;
+    }
+
     void lens_write(const server_slot & slot, llama_token tok, int idx, int pos) {
         if (params_base.lens_out.empty() || llama_n_lens_layers(ctx_tgt) == 0) {
             return;
@@ -2117,6 +2300,12 @@ private:
             if (!complete) {
                 job.chan.clear();
             }
+        }
+
+        if (const auto it = pull_recs.find(idx); it != pull_recs.end()) {
+            job.has_pull = true;
+            job.pull     = it->second;
+            pull_recs.erase(it);
         }
 
         {
@@ -3977,6 +4166,7 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+        pull_recs.clear(); // the records are per decode: batch indices repeat across decodes
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4045,6 +4235,8 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
+            pull_eval(slot, tok_idx);
+
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
@@ -4110,6 +4302,9 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                for (const auto idx : slot.spec_i_batch) {
+                    pull_eval(slot, (int) idx);
+                }
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 if (!params_base.lens_layers.empty()) {
                     lens_rows.assign(slot.spec_i_batch.begin(), slot.spec_i_batch.begin() + accepted.size());

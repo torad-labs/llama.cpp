@@ -3307,6 +3307,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--pull-layers"}, "l0,l1,...",
+        "training-pull detector: lens layers (a subset of --lens-layers, needs --lens-channels) whose channels are read before sampling (default: off)",
+        [](common_params & params, const std::string & value) {
+            auto p = string_split<int>(value, ',');
+            params.pull_layers.insert(params.pull_layers.end(), p.begin(), p.end());
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pull-p"}, "P",
+        string_format("training-pull detector: commitment threshold, fire only when the served probability of the argmax is >= P (default: %.2f)", (double) params.pull_p),
+        [](common_params & params, const std::string & value) {
+            params.pull_p = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pull-action"}, "{log,surgery}",
+        "training-pull detector: log = record the fire in the token's lens line; surgery = also add lambda to the served logit of every token id the prompt contains, before sampling (default: log)",
+        [](common_params & params, const std::string & value) {
+            if (value != "log" && value != "surgery") {
+                throw std::invalid_argument("--pull-action: log or surgery");
+            }
+            params.pull_action = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pull-lambda"}, "X",
+        string_format("training-pull detector: surgery strength, logits added to the prompt's token ids on a fired token (default: %.2f)", (double) params.pull_lambda),
+        [](common_params & params, const std::string & value) {
+            params.pull_lambda = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--embd-normalize"}, "N",
         string_format("normalisation for embeddings (default: %d) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)", params.embd_normalize),
         [](common_params & params, int value) {
