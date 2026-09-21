@@ -456,6 +456,14 @@ struct common_params {
     std::string          lens_out;
     int32_t              lens_top = 12;    // top-k vocabulary entries kept per layer per token
     bool                 lens_channels = false; // also each lens layer's block input, attention and FFN contributions
+    // training-pull detector (server): before sampling, reads the lens channels of the served argmax over
+    // the pull layers and records its write profile (per layer: attention/DeltaNet and FFN); fires when
+    // the head is committed (p >= pull_p) to a content token whose text the prompt never states.
+    // Needs --lens-channels; the pull layers are a subset of the lens layers. empty = off
+    std::vector<int32_t> pull_layers;
+    float                pull_p       = 0.5f;
+    std::string          pull_action  = "log"; // log: record in the lens line; surgery: also bias the served logits toward the prompt's tokens
+    float                pull_lambda  = 1.0f;  // surgery: the logit of every token id the prompt contains += lambda
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
