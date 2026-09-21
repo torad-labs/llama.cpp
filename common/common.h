@@ -331,6 +331,12 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // decode-only MTP: the head never sees the prompt. Its cache holds only the tokens generated in the
+    // current turn (the target's hidden state carries the context), capped at mtp_window cells per
+    // sequence, so the draft costs no prefill pass and a fixed sliver of memory instead of a full window.
+    bool    mtp_decode_only = false;
+    int32_t mtp_window      = 16384;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -592,6 +598,7 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_s = GGML_TYPE_F32; // recurrent state cache data type (Gated DeltaNet / SSM S): f32, f16, bf16, q8_0
 
     // path to a K-cache mean-centering bias file (GGUF), or empty to disable.
     // only takes effect when cache_type_k == GGML_TYPE_Q4_0; see docs/kv-mean-center.md

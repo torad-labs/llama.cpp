@@ -67,6 +67,9 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// the sequence stopped generating (slot released): a decode-only MTP head stops feeding it until the next begin
+void common_speculative_end(common_speculative * spec, llama_seq_id seq_id);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 

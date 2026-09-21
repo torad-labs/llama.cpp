@@ -1307,6 +1307,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            if (params.speculative.draft.mtp_decode_only) {
+                cparams_dft.n_ctx = (uint32_t) params.speculative.draft.mtp_window * (uint32_t) std::max(1, params.n_parallel);
+            }
         }
         cparams_dft.n_rs_seq = 0;
 
@@ -1750,6 +1753,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.type_s = params.cache_type_s;
 
     // note: params (and therefore params.kv_mean_center_path) is kept alive by the caller for
     // at least as long as it takes to call llama_init_from_model() with the returned cparams

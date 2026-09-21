@@ -565,7 +565,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+                        (size_t) kv_head * ssm_states_all->nb[1])));
 
         return output;
     }
@@ -606,7 +606,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         0);
     cb(output, "attn_output", il);
 
-    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+    const size_t row_size = ggml_row_size(ssm_states_all->type, hparams.n_embd_s()); // a block type's row is not n_embd_s * element_size
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
