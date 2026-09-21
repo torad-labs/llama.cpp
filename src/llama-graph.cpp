@@ -1322,6 +1322,9 @@ void llm_graph_result::reset() {
 
     t_lens.clear();
     t_lens_rows_selected.clear();
+    t_lens_prev.clear();
+    t_lens_attn.clear();
+    t_lens_ffn.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -1376,6 +1379,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     for (auto * tensor : t_lens) {
         ggml_set_output(tensor);
+    }
+    for (const auto * channel : { &t_lens_prev, &t_lens_attn, &t_lens_ffn }) {
+        for (auto * tensor : *channel) {
+            ggml_set_output(tensor);
+        }
     }
     for (auto * tensor : t_sampled) {
         if (tensor != nullptr) {
@@ -1509,7 +1517,8 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
-void llm_graph_context::lens_record(ggml_tensor * l_out, int il, bool rows_selected) const {
+void llm_graph_context::lens_record(ggml_tensor * l_out, int il, bool rows_selected,
+                                    ggml_tensor * prev, ggml_tensor * attn, ggml_tensor * ffn) const {
     const auto & layers = cparams.lens_layers;
     if (layers.empty()) {
         return;
@@ -1517,11 +1526,21 @@ void llm_graph_context::lens_record(ggml_tensor * l_out, int il, bool rows_selec
     if (res->t_lens.empty()) {
         res->t_lens.assign(layers.size(), nullptr);
         res->t_lens_rows_selected.assign(layers.size(), 0);
+        if (cparams.lens_channels) {
+            res->t_lens_prev.assign(layers.size(), nullptr);
+            res->t_lens_attn.assign(layers.size(), nullptr);
+            res->t_lens_ffn.assign(layers.size(), nullptr);
+        }
     }
     for (size_t k = 0; k < layers.size(); ++k) {
         if (layers[k] == il) {
             res->t_lens[k] = l_out;
             res->t_lens_rows_selected[k] = rows_selected ? 1 : 0;
+            if (cparams.lens_channels) {
+                res->t_lens_prev[k] = prev;
+                res->t_lens_attn[k] = attn;
+                res->t_lens_ffn[k]  = ffn;
+            }
         }
     }
 }
@@ -1540,45 +1559,78 @@ void llm_graph_context::lens_build(ggml_tensor * inp_out_ids, ggml_tensor * outp
     // through a different kernel path (other column count) and drift from the served row at near-ties,
     // which the capture contract forbids (the final layer's top-k equals "served").
     const int32_t last_layer = (int32_t) hparams.n_layer() - 1;
-    // every other layer's rows, normed, stacked along dim 1: ONE lm_head matmul reads the output
-    // weight once for all lens layers (separate matmuls read it once per layer per decode step)
-    std::vector<ggml_tensor *> normed;
-    std::vector<size_t>        stacked_k; // lens entry of each stacked block
-    for (size_t k = 0; k < res->t_lens.size(); ++k) {
-        if (cparams.lens_layers[k] == last_layer) {
-            GGML_ASSERT(res->t_logits != nullptr && "lens_build runs after the model set its logits");
-            res->t_lens[k] = res->t_logits;
-            continue;
-        }
-        ggml_tensor * cur = res->t_lens[k];
-        GGML_ASSERT(cur != nullptr && "lens layer was never recorded by the model graph");
-        if (inp_out_ids && !res->t_lens_rows_selected[k]) {
+    const bool channels = cparams.lens_channels;
+    // the output rows of a recorded tensor, capped at the lens capacity
+    auto select_rows = [&](ggml_tensor * cur, bool rows_selected) {
+        if (inp_out_ids && !rows_selected) {
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);
         }
         if (cur->ne[1] > cap) {
             cur = ggml_view_2d(ctx0, cur, cur->ne[0], cap, cur->nb[1], 0);
         }
-        normed.push_back(build_norm(cur, output_norm, nullptr, LLM_NORM_RMS, -1));
-        stacked_k.push_back(k);
+        return cur;
+    };
+    // every row block that goes through the head, normed, stacked along dim 1: ONE lm_head matmul
+    // reads the output weight once for all lens layers and channels
+    std::vector<ggml_tensor *> normed;
+    struct block { size_t k; int channel; };
+    std::vector<block> stacked;
+    for (size_t k = 0; k < res->t_lens.size(); ++k) {
+        ggml_tensor * rec = res->t_lens[k];
+        GGML_ASSERT(rec != nullptr && "lens layer was never recorded by the model graph");
+        const bool rows_selected = res->t_lens_rows_selected[k] != 0;
+        ggml_tensor * out = nullptr; // the selected output rows, once something needs them
+        if (cparams.lens_layers[k] == last_layer) {
+            GGML_ASSERT(res->t_logits != nullptr && "lens_build runs after the model set its logits");
+            res->t_lens[k] = res->t_logits;
+        } else {
+            out = select_rows(rec, rows_selected);
+            normed.push_back(build_norm(out, output_norm, nullptr, LLM_NORM_RMS, -1));
+            stacked.push_back({k, 0});
+        }
+        if (!channels) {
+            continue;
+        }
+        if (out == nullptr) {
+            out = select_rows(rec, rows_selected);
+        }
+        ggml_tensor * parts[3] = { res->t_lens_prev[k], res->t_lens_attn[k], res->t_lens_ffn[k] };
+        GGML_ASSERT(parts[0] && parts[1] && parts[2] && "lens channels need a model graph that records the block's input and contributions");
+        // the shared scale is the block OUTPUT's rms (the same 1/sqrt(mean(x^2) + eps) the norm applies
+        // to it), so the three channels are that normed row split by linearity: out/r == prev/r + attn/r
+        // + ffn/r, each then scaled by the same norm weight, each then through the same head
+        ggml_tensor * rms = ggml_sqrt(ctx0, ggml_scale_bias(ctx0, ggml_mean(ctx0, ggml_sqr(ctx0, out)), 1.0f, hparams.f_norm_rms_eps));
+        cb(rms, "lens_rms", cparams.lens_layers[k]);
+        for (int c = 0; c < 3; ++c) {
+            ggml_tensor * cur = select_rows(parts[c], rows_selected);
+            cur = ggml_mul(ctx0, ggml_div(ctx0, cur, rms), output_norm);
+            normed.push_back(cur);
+            stacked.push_back({k, c + 1});
+        }
     }
     if (normed.empty()) {
         return;
     }
-    ggml_tensor * stacked = normed[0];
-    for (size_t k = 1; k < normed.size(); ++k) {
-        stacked = ggml_concat(ctx0, stacked, normed[k], 1);
+    ggml_tensor * stack = normed[0];
+    for (size_t b = 1; b < normed.size(); ++b) {
+        stack = ggml_concat(ctx0, stack, normed[b], 1);
     }
-    ggml_tensor * logits = build_lora_mm(output, stacked, output_s);
+    ggml_tensor * logits = build_lora_mm(output, stack, output_s);
     cb(logits, "lens_output", -1);
     ggml_build_forward_expand(gf, logits);
 
     const int64_t rows = normed[0]->ne[1];
-    for (size_t b = 0; b < stacked_k.size(); ++b) {
-        const size_t k = stacked_k[b];
+    for (size_t b = 0; b < stacked.size(); ++b) {
+        const size_t k = stacked[b].k;
         ggml_tensor * cur = ggml_view_2d(ctx0, logits, logits->ne[0], rows, logits->nb[1], b * rows * logits->nb[1]);
         cb(cur, "lens_output", cparams.lens_layers[k]);
         ggml_build_forward_expand(gf, cur);
-        res->t_lens[k] = cur;
+        switch (stacked[b].channel) {
+            case 1:  res->t_lens_prev[k] = cur; break;
+            case 2:  res->t_lens_attn[k] = cur; break;
+            case 3:  res->t_lens_ffn[k]  = cur; break;
+            default: res->t_lens[k]      = cur; break;
+        }
     }
 }
 

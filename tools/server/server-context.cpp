@@ -830,6 +830,7 @@ public:
         llama_token tok;
         std::vector<float> served;            // the served logit row, or empty
         std::vector<std::vector<float>> rows; // one row per lens layer, or empty when the batch carried no lens
+        std::vector<std::vector<float>> chan; // with --lens-channels: per lens layer its prev, attn, ffn rows (k*3 + c), else empty
     };
     static constexpr size_t LENS_QUEUE_MAX = 64;
     std::thread lens_thread;
@@ -1115,6 +1116,9 @@ private:
                 }
             }
             llama_set_lens_layers(ctx_tgt, params_base.lens_layers.data(), (int32_t) params_base.lens_layers.size());
+            if (params_base.lens_channels) {
+                llama_set_lens_channels(ctx_tgt, true);
+            }
             if (params_base.lens_out.empty()) {
                 SRV_WRN("%s", "--lens-layers without --lens-out: the lens is computed and never written\n");
             } else if (!fs_create_directory_with_parents(params_base.lens_out)) {
@@ -1934,14 +1938,16 @@ private:
     // logit lens: the top entries of one n_vocab logit row as {id, piece, p}. Three linear passes
     // (max, softmax denominator, a bounded top-k insertion) — no vocabulary-sized index array,
     // no sort; runs on the lens worker, never on the decode thread.
-    json lens_top(const float * logits, int n_vocab, int top) const {
+    json lens_top(const float * logits, int n_vocab, int top, bool prob = true) const {
         float max_logit = logits[0];
         for (int i = 1; i < n_vocab; ++i) {
             max_logit = std::max(max_logit, logits[i]);
         }
         float sum = 0.0f;
-        for (int i = 0; i < n_vocab; ++i) {
-            sum += expf(logits[i] - max_logit);
+        if (prob) {
+            for (int i = 0; i < n_vocab; ++i) {
+                sum += expf(logits[i] - max_logit);
+            }
         }
         // ids[0..n) sorted by logit, descending; a new entry is inserted only when it beats the last
         std::vector<int> ids;
@@ -1961,7 +1967,11 @@ private:
         for (const int id : ids) {
             json entry = lens_piece(llama_token_to_piece_str(id));
             entry["id"] = id;
-            entry["p"]  = expf(logits[id] - max_logit) / sum;
+            if (prob) {
+                entry["p"] = expf(logits[id] - max_logit) / sum;
+            } else {
+                entry["v"] = logits[id]; // a channel row is a logit contribution, not a distribution
+            }
             out.push_back(std::move(entry));
         }
         return out;
@@ -2011,6 +2021,38 @@ private:
                     layers[std::to_string(llama_lens_layer(ctx_tgt, (int32_t) k))] = lens_top(job.rows[k].data(), n_vocab, top);
                 }
                 line["layers"] = std::move(layers);
+                if (!job.chan.empty()) {
+                    // lens channels, per layer: the out logit of the sampled token and of the served
+                    // argmax, and each channel's top pushes plus its contribution to those two tokens.
+                    // The instrument check, for every layer and token: out == prev + attn + ffn.
+                    int argmax = -1;
+                    if (!job.served.empty()) {
+                        argmax = (int) (std::max_element(job.served.begin(), job.served.end()) - job.served.begin());
+                    }
+                    line["argmax"] = argmax;
+                    static const char * names[3] = { "prev", "attn", "ffn" };
+                    auto at = [&](const std::vector<float> & row) {
+                        json v = json::object();
+                        v["tok"] = row[job.tok];
+                        if (argmax >= 0) {
+                            v["argmax"] = row[argmax];
+                        }
+                        return v;
+                    };
+                    json channels = json::object();
+                    for (size_t k = 0; k < job.rows.size(); ++k) {
+                        json layer = json::object();
+                        layer["out"] = at(job.rows[k]);
+                        for (int c = 0; c < 3; ++c) {
+                            const auto & row = job.chan[k*3 + c];
+                            json entry = at(row);
+                            entry["top"] = lens_top(row.data(), n_vocab, top, false);
+                            layer[names[c]] = std::move(entry);
+                        }
+                        channels[std::to_string(llama_lens_layer(ctx_tgt, (int32_t) k))] = std::move(layer);
+                    }
+                    line["channels"] = std::move(channels);
+                }
             }
             const std::string path = params_base.lens_out + "/slot" + std::to_string(job.slot) + "-task" + std::to_string(job.task) + ".jsonl";
             std::ofstream out(path, std::ios::app);
@@ -2059,13 +2101,31 @@ private:
             }
             job.rows.emplace_back(row, row + n_vocab);
         }
+        const int32_t n_chan = llama_n_lens_channels(ctx_tgt);
+        if (!job.rows.empty() && n_chan > 1) {
+            bool complete = true;
+            for (int32_t k = 0; complete && k < llama_n_lens_layers(ctx_tgt); ++k) {
+                for (int32_t c = 1; c < n_chan; ++c) {
+                    const float * row = llama_get_lens_channel_ith(ctx_tgt, k, (enum llama_lens_channel) c, idx);
+                    if (row == nullptr) {
+                        complete = false;
+                        break;
+                    }
+                    job.chan.emplace_back(row, row + n_vocab);
+                }
+            }
+            if (!complete) {
+                job.chan.clear();
+            }
+        }
 
         {
             std::lock_guard<std::mutex> lock(lens_mutex);
             if (!lens_thread.joinable()) {
                 lens_thread = std::thread([this] { lens_worker(); });
             }
-            if (lens_queue.size() >= LENS_QUEUE_MAX) {
+            // the queue is bounded in bytes, not lines: a channels job carries four rows per layer
+            if (lens_queue.size() >= LENS_QUEUE_MAX / (size_t) n_chan) {
                 if (lens_dropped++ == 0) {
                     SLT_WRN(slot, "lens: the writer is %zu lines behind, dropping lines until it catches up\n", lens_queue.size());
                 }

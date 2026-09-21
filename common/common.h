@@ -455,6 +455,7 @@ struct common_params {
     std::vector<int32_t> lens_layers;
     std::string          lens_out;
     int32_t              lens_top = 12;    // top-k vocabulary entries kept per layer per token
+    bool                 lens_channels = false; // also each lens layer's block input, attention and FFN contributions
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)

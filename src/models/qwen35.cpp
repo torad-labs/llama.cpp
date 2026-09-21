@@ -204,6 +204,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
+        ggml_tensor * attn_out = cur; // what this block's attention (or linear attention) adds: a lens channel
 
         // Residual connection
         cur = ggml_add(ctx0, cur, inpSA);
@@ -219,6 +220,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // Dense FFN layer - without residual connection
         cur = build_layer_ffn(attn_post_norm, il);
         cb(cur, "ffn_out", il);
+        ggml_tensor * ffn_out = cur; // what this block's feed-forward adds: a lens channel
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
@@ -226,7 +228,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
-        lens_record(cur, il, il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked);
+        lens_record(cur, il, il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked, inpSA, attn_out, ffn_out);
 
         // Input for next layer
         inpL = cur;
