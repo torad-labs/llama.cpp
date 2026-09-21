@@ -228,7 +228,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
-        lens_record(cur, il, il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked, inpSA, attn_out, ffn_out);
+        lens_record(cur, il, inp_out_ids, il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked, inpSA, attn_out, ffn_out);
 
         // Input for next layer
         inpL = cur;
