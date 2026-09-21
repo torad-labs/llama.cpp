@@ -5465,7 +5465,9 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        // f16 additive values, or GGML_TYPE_I16 bit-packed: 16 KV cells per element, LSB first, bit set = attend
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I16);
+        GGML_ASSERT(mask->type != GGML_TYPE_I16 || mask->ne[0]*16 >= k->ne[1]);
         GGML_ASSERT(ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
@@ -5475,6 +5477,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     if (max_bias > 0.0f) {
         GGML_ASSERT(mask);
+        GGML_ASSERT(mask->type == GGML_TYPE_F16); // ALiBi slopes need additive values
     }
 
     // permute(0, 2, 1, 3)

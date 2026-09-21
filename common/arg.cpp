@@ -3316,6 +3316,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--attn-mask-bits"},
+        "store the attention mask as one bit per KV cell instead of f16: 16x less compute buffer and host->device traffic for the mask (needs flash attention; CUDA and CPU backends) (default: off)",
+        [](common_params & params) {
+            params.attn_mask_bits = true;
+        }
+    ).set_env("LLAMA_ARG_ATTN_MASK_BITS"));
+    add_opt(common_arg(
         {"--lens-channels"},
         "logit lens: beside each lens layer's output, read the block's input and its attention and FFN contributions through the same head, in the output's scale (default: off)",
         [](common_params & params) {

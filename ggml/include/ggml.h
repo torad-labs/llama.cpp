@@ -2427,7 +2427,8 @@ extern "C" {
     // q:    [n_embd_k, n_batch, n_head,    ne3 ]
     // k:    [n_embd_k, n_kv,    n_head_kv, ne3 ]
     // v:    [n_embd_v, n_kv,    n_head_kv, ne3 ] !! not transposed !!
-    // mask: [n_kv,     n_batch, ne32,      ne33]
+    // mask: [n_kv,     n_batch, ne32,      ne33] f16 additive values, or
+    //       [n_kv/16,  n_batch, ne32,      ne33] GGML_TYPE_I16 bit-packed: 16 KV cells per element, LSB first, bit set = attend (no ALiBi)
     // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! permuted !!
     //
     // broadcast:

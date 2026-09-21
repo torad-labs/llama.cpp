@@ -35,10 +35,13 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    // flash attention requires an f16 mask
-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // flash attention requires an f16 mask; attn_mask_bits packs it to one bit per cell (GGML_TYPE_I16, 16 cells per element)
+    const bool bits = cparams.flash_attn && cparams.attn_mask_bits;
+    const auto type = bits ? GGML_TYPE_I16 : cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    GGML_ASSERT(!bits || n_kv % 16 == 0);
+
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, bits ? n_kv/16 : n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -56,7 +59,7 @@ static bool can_reuse_kq_mask(
 
     bool res = true;
 
-    res &= (kq_mask->ne[0] == n_kv);
+    res &= ((kq_mask->type == GGML_TYPE_I16 ? 16*kq_mask->ne[0] : kq_mask->ne[0]) == n_kv);
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
