@@ -127,6 +127,21 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
+// the graph zeroes the rs_z row of a float state in place (llm_graph_context::build_rs); a quantized
+// state has no in-graph scale op, so its row is zeroed here, before the graph runs. All-zero bytes
+// are an exact zero for every block type (scale 0, quants 0).
+void llama_memory_recurrent::zero_rs_z() {
+    if (rs_z < 0) {
+        return;
+    }
+    for (ggml_tensor * s : s_l) {
+        if (s == nullptr || !ggml_is_quantized(s->type)) {
+            continue;
+        }
+        ggml_backend_tensor_memset(s, 0, (size_t) rs_z * s->nb[1], s->nb[1]);
+    }
+}
+
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
@@ -1213,6 +1228,7 @@ bool llama_memory_recurrent_context::apply() {
     }
 
     mem->find_slot(ubatches[i_next]);
+    mem->zero_rs_z();
 
     return true;
 }

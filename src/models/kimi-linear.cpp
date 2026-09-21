@@ -348,7 +348,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             ggml_build_forward_expand(gf,
                                      ggml_cpy(ctx0, new_state,
                                               ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
-                                                           kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+                                                           (size_t) kv_head * ssm_states_all->nb[1])));
 
             // Output gating g2 = g_b(g_a(x))
             ggml_tensor * cur_2d = ggml_reshape_2d(ctx0, cur, cur->ne[0], n_seq_tokens * n_seqs);

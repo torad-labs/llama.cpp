@@ -2461,6 +2461,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"-cts", "--cache-type-s"}, "TYPE",
+        string_format(
+            "recurrent state cache data type (Gated DeltaNet / SSM state; the update math stays f32)\n"
+            "allowed values: f32, f16, bf16, q8_0\n"
+            "(default: %s)",
+            ggml_type_name(params.cache_type_s)
+        ),
+        [](common_params & params, const std::string & value) {
+            const ggml_type t = kv_cache_type_from_str(value);
+            if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16 && t != GGML_TYPE_Q8_0) {
+                throw std::runtime_error("Unsupported recurrent state cache type: " + value + " (f32, f16, bf16, q8_0)");
+            }
+            params.cache_type_s = t;
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_S"));
+    add_opt(common_arg(
         {"--kv-mean-center"}, "FNAME",
         "path to a K-cache mean-centering bias file (GGUF), generated with tools/kv-mean-center\n"
         "subtracts a fixed per-(head,channel) bias from K before it is quantized into the cache;\n"
