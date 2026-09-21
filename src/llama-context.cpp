@@ -1283,7 +1283,23 @@ void llama_context::set_lens_layers(const int32_t * layers, int32_t n_layers) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_lens_channels(bool enabled) {
+    cparams.lens_channels = enabled;
+    LLAMA_LOG_INFO("%s: lens channels %s\n", __func__, enabled ? "on (out, prev, attn, ffn per lens layer)" : "off");
+
+    // the graph gains nodes, so the worst-case reservation has to be redone
+    sched_need_reserve = true;
+}
+
+int32_t llama_context::n_lens_channels() const {
+    return cparams.lens_channels ? 4 : 1;
+}
+
 float * llama_context::get_lens_ith(int32_t k, int32_t i) {
+    return get_lens_channel_ith(k, 0, i);
+}
+
+float * llama_context::get_lens_channel_ith(int32_t k, int32_t channel, int32_t i) {
     output_reorder();
 
     if (lens.data == nullptr || !lens_valid) {
@@ -1293,10 +1309,13 @@ float * llama_context::get_lens_ith(int32_t k, int32_t i) {
         if (k < 0 || (size_t) k >= cparams.lens_layers.size()) {
             throw std::runtime_error(format("lens entry out of range [0, %zu)", cparams.lens_layers.size()));
         }
+        if (channel < 0 || channel >= n_lens_channels()) {
+            throw std::runtime_error(format("lens channel out of range [0, %d)", n_lens_channels()));
+        }
         const int64_t j = output_resolve_row(i);
-        return lens.data + ((int64_t) k * cparams.n_lens_rows() + j) * model.vocab.n_tokens();
+        return lens.data + (((int64_t) k * n_lens_channels() + channel) * cparams.n_lens_rows() + j) * model.vocab.n_tokens();
     } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: invalid lens id %d/%d, reason: %s\n", __func__, k, i, err.what());
+        LLAMA_LOG_ERROR("%s: invalid lens id %d/%d/%d, reason: %s\n", __func__, k, channel, i, err.what());
         return nullptr;
     }
 }
@@ -2014,15 +2033,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // extract the logit lens, row-aligned with logits; a ubatch the graph built without one
         // (more output rows than the capacity) invalidates the whole batch
         if (lens.data && n_outputs > 0) {
-            const int64_t cap = cparams.n_lens_rows();
-            if (res->n_lens() == (int32_t) cparams.lens_layers.size() && n_outputs_prev + n_outputs <= cap) {
+            const int64_t cap  = cparams.n_lens_rows();
+            const int32_t n_ch = n_lens_channels();
+            if (res->n_lens() == (int32_t) cparams.lens_layers.size() && res->n_lens_channels() == n_ch && n_outputs_prev + n_outputs <= cap) {
                 for (int32_t k = 0; k < res->n_lens(); ++k) {
-                    ggml_tensor * t_lens = res->get_lens(k);
-                    ggml_backend_t backend_lens = ggml_backend_sched_get_tensor_backend(sched.get(), t_lens);
-                    GGML_ASSERT(backend_lens != nullptr);
-                    float * lens_out = lens.data + (k*cap + n_outputs_prev)*n_vocab;
-                    GGML_ASSERT((k*cap + n_outputs_prev + n_outputs)*n_vocab <= (int64_t) lens.size);
-                    ggml_backend_tensor_get_async(backend_lens, t_lens, lens_out, 0, n_outputs*n_vocab*sizeof(float));
+                    for (int32_t c = 0; c < n_ch; ++c) {
+                        ggml_tensor * t_lens = res->get_lens_channel(k, c);
+                        ggml_backend_t backend_lens = ggml_backend_sched_get_tensor_backend(sched.get(), t_lens);
+                        GGML_ASSERT(backend_lens != nullptr);
+                        const int64_t block = (int64_t) k*n_ch + c;
+                        float * lens_out = lens.data + (block*cap + n_outputs_prev)*n_vocab;
+                        GGML_ASSERT((block*cap + n_outputs_prev + n_outputs)*n_vocab <= (int64_t) lens.size);
+                        ggml_backend_tensor_get_async(backend_lens, t_lens, lens_out, 0, n_outputs*n_vocab*sizeof(float));
+                    }
                 }
             } else {
                 lens_valid = false;
@@ -2230,7 +2253,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     // lens rows are capped at n_lens_rows() per entry (llm_graph_context::lens_build views a larger ubatch down to it)
-    lens.size = cparams.lens_layers.size() * (size_t) n_vocab * cparams.n_lens_rows();
+    lens.size = cparams.lens_layers.size() * (size_t) n_lens_channels() * (size_t) n_vocab * cparams.n_lens_rows();
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -2415,7 +2438,7 @@ void llama_context::output_reorder() {
 
         if (lens.size > 0 && lens_valid) { // valid: every row of this batch is within the capacity
             const uint64_t cap = cparams.n_lens_rows();
-            for (size_t l = 0; l < cparams.lens_layers.size(); ++l) {
+            for (size_t l = 0; l < cparams.lens_layers.size() * (size_t) n_lens_channels(); ++l) { // [k][channel] blocks
                 float * rows = lens.data + l*cap*n_vocab;
                 for (uint64_t k = 0; k < n_vocab; k++) {
                     std::swap(rows[i0*n_vocab + k], rows[i1*n_vocab + k]);
@@ -3989,6 +4012,19 @@ int32_t llama_lens_layer(const llama_context * ctx, int32_t k) {
 float * llama_get_lens_ith(llama_context * ctx, int32_t k, int32_t i) {
     ctx->synchronize();
     return ctx->get_lens_ith(k, i);
+}
+
+void llama_set_lens_channels(llama_context * ctx, bool enabled) {
+    ctx->set_lens_channels(enabled);
+}
+
+int32_t llama_n_lens_channels(const llama_context * ctx) {
+    return ctx->n_lens_channels();
+}
+
+float * llama_get_lens_channel_ith(llama_context * ctx, int32_t k, enum llama_lens_channel channel, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_lens_channel_ith(k, (int32_t) channel, i);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

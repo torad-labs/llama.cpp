@@ -1058,6 +1058,23 @@ extern "C" {
     // NULL when the last decode carried no lens for its rows
     LLAMA_API float * llama_get_lens_ith(struct llama_context * ctx, int32_t k, int32_t i);
 
+    // lens channels: beside the block's output (the lens above), the residual entering the block and
+    // the two contributions the block added, attention (or linear attention) and feed-forward, each
+    // read through the same output norm weight and head with the block OUTPUT's rms as the shared
+    // scale, so that for every lens layer and token, in logit space, out == prev + attn + ffn (up to
+    // arithmetic order) when no control vector is applied to that layer. That identity is the
+    // instrument check. Off by default: llama_n_lens_channels is 1 and only channel OUT exists.
+    enum llama_lens_channel {
+        LLAMA_LENS_CHANNEL_OUT  = 0, // the residual after the block, through the norm and head (== llama_get_lens_ith)
+        LLAMA_LENS_CHANNEL_PREV = 1, // the residual entering the block, in the block output's scale
+        LLAMA_LENS_CHANNEL_ATTN = 2, // what the block's attention sublayer added
+        LLAMA_LENS_CHANNEL_FFN  = 3, // what the block's feed-forward sublayer added
+    };
+    LLAMA_API void    llama_set_lens_channels(struct llama_context * ctx, bool enabled);
+    LLAMA_API int32_t llama_n_lens_channels(const struct llama_context * ctx);
+    // n_vocab lens logits of `channel` of lens entry k for batch token i; NULL as llama_get_lens_ith
+    LLAMA_API float * llama_get_lens_channel_ith(struct llama_context * ctx, int32_t k, enum llama_lens_channel channel, int32_t i);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

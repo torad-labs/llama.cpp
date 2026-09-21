@@ -3300,6 +3300,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lens-channels"},
+        "logit lens: beside each lens layer's output, read the block's input and its attention and FFN contributions through the same head, in the output's scale (default: off)",
+        [](common_params & params) {
+            params.lens_channels = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--embd-normalize"}, "N",
         string_format("normalisation for embeddings (default: %d) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)", params.embd_normalize),
         [](common_params & params, int value) {
