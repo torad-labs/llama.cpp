@@ -1530,10 +1530,11 @@ void llm_graph_context::lens_build(ggml_tensor * inp_out_ids, ggml_tensor * outp
     if (res->t_lens.empty()) {
         return;
     }
-    // capacity: the host buffer holds n_seq_max rows per lens entry (llama_context::output_reserve);
-    // a larger ubatch still builds the lens on its first rows, so the graph topology never depends
-    // on the output count and the worst-case reservation contains the lens
-    const int64_t cap = cparams.n_seq_max;
+    // capacity: the host buffer holds n_lens_rows() rows per lens entry (llama_context::output_reserve:
+    // the sampled row plus the drafted rows of a verify batch, per sequence); a larger ubatch still
+    // builds the lens on its first rows, so the graph topology never depends on the output count
+    // and the worst-case reservation contains the lens
+    const int64_t cap = cparams.n_lens_rows();
     for (size_t k = 0; k < res->t_lens.size(); ++k) {
         ggml_tensor * cur = res->t_lens[k];
         GGML_ASSERT(cur != nullptr && "lens layer was never recorded by the model graph");

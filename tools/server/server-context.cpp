@@ -1123,11 +1123,16 @@ private:
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
 
-                // the lens is written on the sampling path only; a verify batch carries
-                // n_draft+1 rows per slot, which the lens capacity does not hold either
+                // a verify batch carries 1 + n_draft rows per slot; the lens holds 1 + n_rs_seq rows per
+                // sequence (the draft length the context rolls back), so a longer draft would leave
+                // every row of every verify batch NULL
                 if (!params_base.lens_layers.empty()) {
-                    SRV_ERR("%s", "--lens-layers cannot be combined with speculative decoding: the lens covers only the sampled token of each decode\n");
-                    return false;
+                    const int n_draft_max = common_speculative_n_max(&params_base.speculative);
+                    if (n_draft_max > (int) llama_n_rs_seq(ctx_tgt)) {
+                        SRV_ERR("--lens-layers cannot be combined with this speculative config: it drafts up to %d tokens but the lens holds 1 + %u rows per slot\n",
+                                n_draft_max, llama_n_rs_seq(ctx_tgt));
+                        return false;
+                    }
                 }
             }
 
@@ -1929,7 +1934,8 @@ private:
     // logit lens: one JSONL line per generated token, in the slot's own file, from the same
     // batch row the served token was sampled from (idx). "served" is the head's actual logit
     // row, so the last layer's lens can be checked against it in the file itself.
-    void lens_write(const server_slot & slot, llama_token tok, int idx) const {
+    /** one lens line for the token `tok` sampled from output row `idx`, at sequence position `pos` */
+    void lens_write(const server_slot & slot, llama_token tok, int idx, int pos) const {
         if (params_base.lens_out.empty() || llama_n_lens_layers(ctx_tgt) == 0) {
             return;
         }
@@ -1939,7 +1945,7 @@ private:
         json line = lens_piece(common_token_to_piece(ctx_tgt, tok, true));
         line["slot"]  = slot.id;
         line["task"]  = slot.task->id;
-        line["pos"]   = slot.prompt.n_tokens();
+        line["pos"]   = pos;
         line["n_gen"] = slot.stats.n_gen;
         line["tok"]   = tok;
         if (const float * served = llama_get_logits_ith(ctx_tgt, idx)) {
@@ -3902,7 +3908,7 @@ private:
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
-            lens_write(slot, id, tok_idx);
+            lens_write(slot, id, tok_idx, slot.prompt.n_tokens());
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
@@ -3931,12 +3937,18 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            // ids[i] was sampled from output row lens_rows[i]: the lens reads those rows after acceptance
+            std::vector<int> lens_rows;
+
             // verify and try to accept the draft
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                if (!params_base.lens_layers.empty()) {
+                    lens_rows.assign(slot.spec_i_batch.begin(), slot.spec_i_batch.begin() + accepted.size());
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4017,6 +4029,9 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            // the prompt already holds ids[0..n-1): ids[i] sits at pos_first + i
+            const int pos_first = slot.prompt.n_tokens() - ((int) ids.size() - 1);
+
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -4027,6 +4042,10 @@ private:
                 // TODO: set result.probs
 
                 slot.stats.n_gen += 1;
+
+                if (i < lens_rows.size()) {
+                    lens_write(slot, ids[i], lens_rows[i], pos_first + (int) i);
+                }
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();

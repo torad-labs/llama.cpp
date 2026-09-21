@@ -1277,7 +1277,7 @@ void llama_context::set_lens_layers(const int32_t * layers, int32_t n_layers) {
         GGML_ASSERT(layers[k] >= 0 && layers[k] < n_layer && "lens layer out of range");
         cparams.lens_layers.push_back(layers[k]);
     }
-    LLAMA_LOG_INFO("%s: %d lens layers, %u rows each\n", __func__, n_layers, n_seq_max());
+    LLAMA_LOG_INFO("%s: %d lens layers, %u rows each (%u seqs x 1 + %u drafted)\n", __func__, n_layers, cparams.n_lens_rows(), n_seq_max(), cparams.n_rs_seq);
 
     // the graph gains nodes, so the worst-case reservation has to be redone
     sched_need_reserve = true;
@@ -1294,7 +1294,7 @@ float * llama_context::get_lens_ith(int32_t k, int32_t i) {
             throw std::runtime_error(format("lens entry out of range [0, %zu)", cparams.lens_layers.size()));
         }
         const int64_t j = output_resolve_row(i);
-        return lens.data + ((int64_t) k * n_seq_max() + j) * model.vocab.n_tokens();
+        return lens.data + ((int64_t) k * cparams.n_lens_rows() + j) * model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid lens id %d/%d, reason: %s\n", __func__, k, i, err.what());
         return nullptr;
@@ -2014,7 +2014,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // extract the logit lens, row-aligned with logits; a ubatch the graph built without one
         // (more output rows than the capacity) invalidates the whole batch
         if (lens.data && n_outputs > 0) {
-            const int64_t cap = cparams.n_seq_max;
+            const int64_t cap = cparams.n_lens_rows();
             if (res->n_lens() == (int32_t) cparams.lens_layers.size() && n_outputs_prev + n_outputs <= cap) {
                 for (int32_t k = 0; k < res->n_lens(); ++k) {
                     ggml_tensor * t_lens = res->get_lens(k);
@@ -2229,8 +2229,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         }
     }
 
-    // lens rows are capped at n_seq_max per entry (llm_graph_context::lens_build skips a larger ubatch)
-    lens.size = cparams.lens_layers.size() * (size_t) n_vocab * n_seq_max();
+    // lens rows are capped at n_lens_rows() per entry (llm_graph_context::lens_build views a larger ubatch down to it)
+    lens.size = cparams.lens_layers.size() * (size_t) n_vocab * cparams.n_lens_rows();
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -2414,7 +2414,7 @@ void llama_context::output_reorder() {
         }
 
         if (lens.size > 0 && lens_valid) { // valid: every row of this batch is within the capacity
-            const uint64_t cap = n_seq_max();
+            const uint64_t cap = cparams.n_lens_rows();
             for (size_t l = 0; l < cparams.lens_layers.size(); ++l) {
                 float * rows = lens.data + l*cap*n_vocab;
                 for (uint64_t k = 0; k < n_vocab; k++) {
