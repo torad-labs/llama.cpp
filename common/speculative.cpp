@@ -286,6 +286,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<float> chain_p(n_seq, 1.0f); // product of the chain's top-1 probabilities so far
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -337,6 +338,17 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                // the chain lands only if every token before it lands: stop once the product of the
+                // draft's top-1 probabilities along it is under chain_p_min (the token that drops it
+                // under is not worth its draft and verify cost)
+                chain_p[seq_id] *= cur_p->data[0].p;
+                if (params.chain_p_min > 0.0f && chain_p[seq_id] < params.chain_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -728,6 +740,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<float> chain_p(n_seq, 1.0f); // product of the chain's top-1 probabilities so far
 
         const size_t row_bytes = (size_t) n_embd_dec * sizeof(float);
 
@@ -799,6 +812,17 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
                 if (cur_p->data[0].p < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                // the chain lands only if every token before it lands: stop once the product of the
+                // draft's top-1 probabilities along it is under chain_p_min (the token that drops it
+                // under is not worth its draft and verify cost)
+                chain_p[seq_id] *= cur_p->data[0].p;
+                if (params.chain_p_min > 0.0f && chain_p[seq_id] < params.chain_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1681,6 +1705,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<float> chain_p(n_seq, 1.0f); // product of the chain's top-1 probabilities so far
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1758,6 +1783,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                // the chain lands only if every token before it lands: stop once the product of the
+                // draft's top-1 probabilities along it is under chain_p_min (the token that drops it
+                // under is not worth its draft and verify cost)
+                chain_p[seq_id] *= cur_p->data[0].p;
+                if (params.chain_p_min > 0.0f && chain_p[seq_id] < params.chain_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
