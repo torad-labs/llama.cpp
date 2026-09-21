@@ -953,6 +953,21 @@ public:
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
+    // lens entry k, [n_vocab, n_outputs]; empty when the graph carries no lens for this ubatch
+    ggml_tensor * get_lens(int k) const { return t_lens[k]; }
+    int32_t       n_lens()      const { return (int32_t) t_lens.size(); }
+    // channel c of lens entry k, in llama_lens_channel order (out, prev, attn, ffn); the channel
+    // vectors are empty when the lens runs without channels
+    ggml_tensor * get_lens_channel(int k, int c) const {
+        switch (c) {
+            case 1:  return t_lens_prev[k];
+            case 2:  return t_lens_attn[k];
+            case 3:  return t_lens_ffn[k];
+            default: return t_lens[k];
+        }
+    }
+    int32_t n_lens_channels() const { return t_lens_prev.empty() ? 1 : 4; }
+
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
@@ -987,6 +1002,13 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    // logit lens: one head projection per cparams.lens_layers entry (see llm_graph_context::lens_build)
+    std::vector<ggml_tensor *> t_lens;
+    std::vector<uint8_t>       t_lens_rows_selected; // the recorded tensor already holds only the output rows
+    std::vector<ggml_tensor *> t_lens_prev; // lens channels (cparams.lens_channels): the block's input,
+    std::vector<ggml_tensor *> t_lens_attn; //   its attention contribution and
+    std::vector<ggml_tensor *> t_lens_ffn;  //   its feed-forward contribution; same rows as t_lens
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1123,6 +1145,18 @@ struct llm_graph_context {
              ggml_tensor * mb,
            llm_norm_type   type,
                      int   il) const;
+
+    // logit lens: a model calls lens_record with each layer's output inside its layer loop and
+    // lens_build once after it (after res->t_logits is set), with the same norm and head it uses for
+    // the served logits. The entry for the model's last layer aliases the served logits themselves.
+    // The lens always has the same topology: at most n_seq_max rows (the context's lens capacity)
+    // go through the head, so a ubatch with more output rows is served without a usable lens.
+    // rows_selected: the recorded tensor already went through get_rows(inp_out_ids).
+    // with cparams.lens_channels the model also passes the block's input and its two contributions
+    // (l_out == prev + attn + ffn, plus the layer's control vector if any); all four share rows_selected.
+    void lens_record(ggml_tensor * l_out, int il, bool rows_selected = false,
+                     ggml_tensor * prev = nullptr, ggml_tensor * attn = nullptr, ggml_tensor * ffn = nullptr) const;
+    void lens_build(ggml_tensor * inp_out_ids, ggml_tensor * output_norm, ggml_tensor * output, ggml_tensor * output_s) const;
 
 
     // compute Q, K, V projections with optional bias and reshape

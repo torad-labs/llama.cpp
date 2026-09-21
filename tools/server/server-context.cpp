@@ -25,6 +25,12 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
+#include <numeric>
+#include <cmath>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -812,7 +818,37 @@ public:
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
 
+    // logit lens: the decode thread only copies the rows it wants written (one memcpy per row);
+    // the top-k over the vocabulary, the JSON and the file append run on this worker, so the
+    // lens never costs the head more than that copy. A full queue drops the line and says so:
+    // the head's instrumentation must never stall the head.
+    struct lens_job {
+        int slot;
+        int task;
+        int pos;
+        int n_gen;
+        llama_token tok;
+        std::vector<float> served;            // the served logit row, or empty
+        std::vector<std::vector<float>> rows; // one row per lens layer, or empty when the batch carried no lens
+        std::vector<std::vector<float>> chan; // with --lens-channels: per lens layer its prev, attn, ffn rows (k*3 + c), else empty
+    };
+    static constexpr size_t LENS_QUEUE_MAX = 64;
+    std::thread lens_thread;
+    std::mutex lens_mutex;
+    std::condition_variable lens_cv;
+    std::deque<lens_job> lens_queue;
+    bool lens_stop = false;
+    size_t lens_dropped = 0;
+
     ~server_context_impl() {
+        if (lens_thread.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(lens_mutex);
+                lens_stop = true;
+            }
+            lens_cv.notify_all();
+            lens_thread.join();
+        }
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1069,6 +1105,28 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
+        // logit lens (torad-labs fork): read the named layers through the head inside the served
+        // graph; every generated token of every slot is written under lens_out, thinking included
+        if (!params_base.lens_layers.empty()) {
+            const int32_t n_layer = llama_model_n_layer(model_tgt);
+            for (const int32_t il : params_base.lens_layers) {
+                if (il < 0 || il >= n_layer) {
+                    SRV_ERR("--lens-layers: layer %d is outside this model's 0..%d\n", il, n_layer - 1);
+                    return false;
+                }
+            }
+            llama_set_lens_layers(ctx_tgt, params_base.lens_layers.data(), (int32_t) params_base.lens_layers.size());
+            if (params_base.lens_channels) {
+                llama_set_lens_channels(ctx_tgt, true);
+            }
+            if (params_base.lens_out.empty()) {
+                SRV_WRN("%s", "--lens-layers without --lens-out: the lens is computed and never written\n");
+            } else if (!fs_create_directory_with_parents(params_base.lens_out)) {
+                SRV_ERR("failed to create the lens directory '%s'\n", params_base.lens_out.c_str());
+                return false;
+            }
+        }
+
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
@@ -1101,6 +1159,18 @@ private:
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+
+                // a verify batch carries 1 + n_draft rows per slot; the lens holds 1 + n_rs_seq rows per
+                // sequence (the draft length the context rolls back), so a longer draft would leave
+                // every row of every verify batch NULL
+                if (!params_base.lens_layers.empty()) {
+                    const int n_draft_max = common_speculative_n_max(&params_base.speculative);
+                    if (n_draft_max > (int) llama_n_rs_seq(ctx_tgt)) {
+                        SRV_ERR("--lens-layers cannot be combined with this speculative config: it drafts up to %d tokens but the lens holds 1 + %u rows per slot\n",
+                                n_draft_max, llama_n_rs_seq(ctx_tgt));
+                        return false;
+                    }
+                }
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -1863,6 +1933,207 @@ private:
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
 
         return slot.has_next_token; // continue
+    }
+
+    // logit lens: the top entries of one n_vocab logit row as {id, piece, p}. Three linear passes
+    // (max, softmax denominator, a bounded top-k insertion) — no vocabulary-sized index array,
+    // no sort; runs on the lens worker, never on the decode thread.
+    json lens_top(const float * logits, int n_vocab, int top, bool prob = true) const {
+        float max_logit = logits[0];
+        for (int i = 1; i < n_vocab; ++i) {
+            max_logit = std::max(max_logit, logits[i]);
+        }
+        float sum = 0.0f;
+        if (prob) {
+            for (int i = 0; i < n_vocab; ++i) {
+                sum += expf(logits[i] - max_logit);
+            }
+        }
+        // ids[0..n) sorted by logit, descending; a new entry is inserted only when it beats the last
+        std::vector<int> ids;
+        ids.reserve(top);
+        for (int i = 0; i < n_vocab; ++i) {
+            const float l = logits[i];
+            if ((int) ids.size() == top && l <= logits[ids.back()]) {
+                continue;
+            }
+            auto pos = std::upper_bound(ids.begin(), ids.end(), l, [logits](float v, int id) { return v > logits[id]; });
+            ids.insert(pos, i);
+            if ((int) ids.size() > top) {
+                ids.pop_back();
+            }
+        }
+        json out = json::array();
+        for (const int id : ids) {
+            json entry = lens_piece(llama_token_to_piece_str(id));
+            entry["id"] = id;
+            if (prob) {
+                entry["p"] = expf(logits[id] - max_logit) / sum;
+            } else {
+                entry["v"] = logits[id]; // a channel row is a logit contribution, not a distribution
+            }
+            out.push_back(std::move(entry));
+        }
+        return out;
+    }
+
+    /** a token's piece from the immutable vocabulary (safe off the decode thread) */
+    std::string llama_token_to_piece_str(llama_token id) const {
+        std::string piece(64, '\0');
+        int n = llama_token_to_piece(vocab, id, piece.data(), (int) piece.size(), 0, true);
+        if (n < 0) {
+            piece.resize(-n);
+            n = llama_token_to_piece(vocab, id, piece.data(), (int) piece.size(), 0, true);
+        }
+        piece.resize(std::max(n, 0));
+        return piece;
+    }
+
+    /** the lens worker: pops jobs, ranks the rows, appends the lines */
+    void lens_worker() {
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        const int top     = std::min(std::max(params_base.lens_top, 1), n_vocab);
+        for (;;) {
+            lens_job job;
+            {
+                std::unique_lock<std::mutex> lock(lens_mutex);
+                lens_cv.wait(lock, [&] { return lens_stop || !lens_queue.empty(); });
+                if (lens_queue.empty()) {
+                    return; // stop, and nothing left to write
+                }
+                job = std::move(lens_queue.front());
+                lens_queue.pop_front();
+            }
+            json line = lens_piece(llama_token_to_piece_str(job.tok));
+            line["slot"]  = job.slot;
+            line["task"]  = job.task;
+            line["pos"]   = job.pos;
+            line["n_gen"] = job.n_gen;
+            line["tok"]   = job.tok;
+            if (!job.served.empty()) {
+                line["served"] = lens_top(job.served.data(), n_vocab, top);
+            }
+            if (job.rows.empty()) {
+                line["layers"] = nullptr; // this batch carried no lens (more output rows than the capacity)
+            } else {
+                json layers = json::object();
+                for (size_t k = 0; k < job.rows.size(); ++k) {
+                    layers[std::to_string(llama_lens_layer(ctx_tgt, (int32_t) k))] = lens_top(job.rows[k].data(), n_vocab, top);
+                }
+                line["layers"] = std::move(layers);
+                if (!job.chan.empty()) {
+                    // lens channels, per layer: the out logit of the sampled token and of the served
+                    // argmax, and each channel's top pushes plus its contribution to those two tokens.
+                    // The instrument check, for every layer and token: out == prev + attn + ffn.
+                    int argmax = -1;
+                    if (!job.served.empty()) {
+                        argmax = (int) (std::max_element(job.served.begin(), job.served.end()) - job.served.begin());
+                    }
+                    line["argmax"] = argmax;
+                    static const char * names[3] = { "prev", "attn", "ffn" };
+                    auto at = [&](const std::vector<float> & row) {
+                        json v = json::object();
+                        v["tok"] = row[job.tok];
+                        if (argmax >= 0) {
+                            v["argmax"] = row[argmax];
+                        }
+                        return v;
+                    };
+                    json channels = json::object();
+                    for (size_t k = 0; k < job.rows.size(); ++k) {
+                        json layer = json::object();
+                        layer["out"] = at(job.rows[k]);
+                        for (int c = 0; c < 3; ++c) {
+                            const auto & row = job.chan[k*3 + c];
+                            json entry = at(row);
+                            entry["top"] = lens_top(row.data(), n_vocab, top, false);
+                            layer[names[c]] = std::move(entry);
+                        }
+                        channels[std::to_string(llama_lens_layer(ctx_tgt, (int32_t) k))] = std::move(layer);
+                    }
+                    line["channels"] = std::move(channels);
+                }
+            }
+            const std::string path = params_base.lens_out + "/slot" + std::to_string(job.slot) + "-task" + std::to_string(job.task) + ".jsonl";
+            std::ofstream out(path, std::ios::app);
+            if (!out) {
+                SRV_WRN("lens: cannot append to %s\n", path.c_str());
+                continue;
+            }
+            out << line.dump() << '\n';
+        }
+    }
+
+    // a token piece is bytes, not always a whole UTF-8 string (byte-level BPE): a piece that is
+    // not valid UTF-8 (a fragment of a multi-byte character) is written as "bytes" instead
+    static json lens_piece(const std::string & raw) {
+        if (is_valid_utf8(raw)) {
+            return {{"piece", raw}};
+        }
+        return {{"piece", ""}, {"bytes", completion_token_output::str_to_bytes(raw)}};
+    }
+
+    // logit lens: one JSONL line per generated token, in the slot's own file, from the same
+    // batch row the served token was sampled from (idx). "served" is the head's actual logit
+    // row, so the last layer's lens can be checked against it in the file itself.
+    /** one lens line for the token `tok` sampled from output row `idx`, at sequence position `pos`:
+     *  the decode thread copies the rows and hands them to the lens worker */
+    void lens_write(const server_slot & slot, llama_token tok, int idx, int pos) {
+        if (params_base.lens_out.empty() || llama_n_lens_layers(ctx_tgt) == 0) {
+            return;
+        }
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+
+        lens_job job;
+        job.slot  = slot.id;
+        job.task  = slot.task->id;
+        job.pos   = pos;
+        job.n_gen = (int) slot.stats.n_gen;
+        job.tok   = tok;
+        if (const float * served = llama_get_logits_ith(ctx_tgt, idx)) {
+            job.served.assign(served, served + n_vocab);
+        }
+        for (int32_t k = 0; k < llama_n_lens_layers(ctx_tgt); ++k) {
+            const float * row = llama_get_lens_ith(ctx_tgt, k, idx);
+            if (row == nullptr) {
+                job.rows.clear(); // this batch carried no lens (more output rows than the capacity)
+                break;
+            }
+            job.rows.emplace_back(row, row + n_vocab);
+        }
+        const int32_t n_chan = llama_n_lens_channels(ctx_tgt);
+        if (!job.rows.empty() && n_chan > 1) {
+            bool complete = true;
+            for (int32_t k = 0; complete && k < llama_n_lens_layers(ctx_tgt); ++k) {
+                for (int32_t c = 1; c < n_chan; ++c) {
+                    const float * row = llama_get_lens_channel_ith(ctx_tgt, k, (enum llama_lens_channel) c, idx);
+                    if (row == nullptr) {
+                        complete = false;
+                        break;
+                    }
+                    job.chan.emplace_back(row, row + n_vocab);
+                }
+            }
+            if (!complete) {
+                job.chan.clear();
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(lens_mutex);
+            if (!lens_thread.joinable()) {
+                lens_thread = std::thread([this] { lens_worker(); });
+            }
+            // the queue is bounded in bytes, not lines: a channels job carries four rows per layer
+            if (lens_queue.size() >= LENS_QUEUE_MAX / (size_t) n_chan) {
+                if (lens_dropped++ == 0) {
+                    SLT_WRN(slot, "lens: the writer is %zu lines behind, dropping lines until it catches up\n", lens_queue.size());
+                }
+                return;
+            }
+            lens_queue.push_back(std::move(job));
+        }
+        lens_cv.notify_one();
     }
 
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
@@ -3802,6 +4073,7 @@ private:
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
+            lens_write(slot, id, tok_idx, slot.prompt.n_tokens());
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
@@ -3830,12 +4102,18 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            // ids[i] was sampled from output row lens_rows[i]: the lens reads those rows after acceptance
+            std::vector<int> lens_rows;
+
             // verify and try to accept the draft
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                if (!params_base.lens_layers.empty()) {
+                    lens_rows.assign(slot.spec_i_batch.begin(), slot.spec_i_batch.begin() + accepted.size());
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3916,6 +4194,9 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            // the prompt already holds ids[0..n-1): ids[i] sits at pos_first + i
+            const int pos_first = slot.prompt.n_tokens() - ((int) ids.size() - 1);
+
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -3926,6 +4207,10 @@ private:
                 // TODO: set result.probs
 
                 slot.stats.n_gen += 1;
+
+                if (i < lens_rows.size()) {
+                    lens_write(slot, ids[i], lens_rows[i], pos_first + (int) i);
+                }
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();

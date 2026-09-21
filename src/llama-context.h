@@ -90,6 +90,12 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    // logit lens: n_vocab floats of lens entry k for batch token i, nullptr when the last decode
+    // carried no lens (lens off, or a ubatch with more output rows than the lens capacity)
+    float * get_lens_ith(int32_t k, int32_t i);
+    float * get_lens_channel_ith(int32_t k, int32_t channel, int32_t i);
+    int32_t n_lens_channels() const;
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -115,6 +121,8 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_lens_layers(const int32_t * layers, int32_t n_layers);
+    void set_lens_channels(bool enabled);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -303,6 +311,13 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // logit lens output ([n_lens][n_lens_channels][n_lens_rows][n_vocab], one channel without
+    // --lens-channels); rows follow output_ids like logits. lens_valid is false when any ubatch of
+    // the last decode skipped it.
+    buffer_view<float> lens = {nullptr, 0};
+    bool lens_valid  = false;
+    bool lens_warned = false; // the model graph records no lens (architecture without lens_record)
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
