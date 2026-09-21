@@ -463,6 +463,7 @@ llama_context::llama_context(
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
+            /*.type_s    =*/ params.type_s,
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
@@ -3747,6 +3748,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.type_s                      =*/ GGML_TYPE_F32,
         /*.path_kv_mean_center         =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
@@ -3800,6 +3802,11 @@ llama_context * llama_init_from_model(
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (params.type_s != GGML_TYPE_F32 && params.type_s != GGML_TYPE_F16 && params.type_s != GGML_TYPE_BF16 && params.type_s != GGML_TYPE_Q8_0) {
+        LLAMA_LOG_ERROR("%s: unsupported recurrent state cache type %s (f32, f16, bf16 or q8_0)\n", __func__, ggml_type_name(params.type_s));
         return nullptr;
     }
 

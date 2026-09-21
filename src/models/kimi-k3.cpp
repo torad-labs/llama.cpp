@@ -454,7 +454,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
     ggml_build_forward_expand(gf,
         ggml_cpy(ctx0, new_state,
             ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
-                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+                         (size_t) kv_head * ssm_states_all->nb[1])));
 
     // K3: single full-rank gate (kimi-linear factors this as g_b(g_a(x)))
     ggml_tensor * cur_2d = ggml_reshape_2d(ctx0, cur_3d, cur_3d->ne[0], n_seq_tokens * n_seqs);

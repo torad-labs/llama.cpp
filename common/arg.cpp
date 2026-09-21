@@ -2461,6 +2461,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"-cts", "--cache-type-s"}, "TYPE",
+        string_format(
+            "recurrent state cache data type (Gated DeltaNet / SSM state; the update math stays f32)\n"
+            "allowed values: f32, f16, bf16, q8_0\n"
+            "(default: %s)",
+            ggml_type_name(params.cache_type_s)
+        ),
+        [](common_params & params, const std::string & value) {
+            const ggml_type t = kv_cache_type_from_str(value);
+            if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16 && t != GGML_TYPE_Q8_0) {
+                throw std::runtime_error("Unsupported recurrent state cache type: " + value + " (f32, f16, bf16, q8_0)");
+            }
+            params.cache_type_s = t;
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_S"));
+    add_opt(common_arg(
         {"--kv-mean-center"}, "FNAME",
         "path to a K-cache mean-centering bias file (GGUF), generated with tools/kv-mean-center\n"
         "subtracts a fixed per-(head,channel) bias from K before it is quantized into the cache;\n"
@@ -4184,6 +4200,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-decode-only"},
+        "run the MTP draft head on generated tokens only: the prompt never enters its KV cache, which holds\n"
+        "at most --spec-draft-mtp-window cells per sequence (default: off)",
+        [](common_params & params) {
+            params.speculative.draft.mtp_decode_only = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_DECODE_ONLY"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-window"}, "N",
+        string_format("cells per sequence the MTP draft head keeps in decode-only mode; the oldest half is dropped when full (default: %d)", params.speculative.draft.mtp_window),
+        [](common_params & params, int value) {
+            if (value < 64) {
+                throw std::invalid_argument("--spec-draft-mtp-window must be at least 64");
+            }
+            params.speculative.draft.mtp_window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_WINDOW"));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
