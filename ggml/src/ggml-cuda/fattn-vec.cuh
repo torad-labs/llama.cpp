@@ -39,7 +39,8 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int32_t mask_packed) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -61,7 +62,7 @@ static __global__ void flash_attn_ext_vec(
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33);
+                  nb31, nb32, nb33, mask_packed);
         NO_DEVICE_CODE;
         return;
     }
@@ -110,7 +111,9 @@ static __global__ void flash_attn_ext_vec(
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
-    const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
+    const half * const mask0 = (const half *) (mask + nb33*(sequence % ne33) + nb31*ic0); // this block's mask rows; a packed row is read by cell index
+    const int stride_mask = nb31 / sizeof(half);
+    const half * maskh  = mask0;
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -278,7 +281,7 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    sum += mask_packed ? fattn_mask_value(mask0, true, j*stride_mask, k_VKQ_0 + i_KQ) : slope*__half2float(maskh[j*ne11 + i_KQ]);
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -522,7 +525,7 @@ static __global__ void flash_attn_ext_vec(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33, mask_packed);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

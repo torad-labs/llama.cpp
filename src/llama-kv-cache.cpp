@@ -1733,8 +1733,31 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
 };
 
-template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
+// How a mask cell is stored: an additive f16/f32 value, or one bit of a 16-bit word (set = attend; GGML_TYPE_I16, 16 cells per element).
+// Cell indices are row*n_kv + cell in both layouts; a packed row is n_kv/16 words, so rows start on a word boundary.
+template<typename T>
+struct llama_kq_mask_cells {
+    T * data;
+    const T v_keep = llama_cast<T>(0.0f);
+    const T v_drop = llama_cast<T>(-INFINITY);
+
+    void keep(uint64_t idx) const { data[idx] = v_keep; }
+    void drop(uint64_t idx) const { data[idx] = v_drop; }
+    void set (uint64_t idx, float v) const { data[idx] = llama_cast<T>(v); }
+    void copy_row(uint64_t dst, uint64_t src, uint64_t n_kv) const { std::copy(data + src, data + src + n_kv, data + dst); }
+};
+
+struct llama_kq_mask_bits {
+    uint16_t * data;
+
+    void keep(uint64_t idx) const { data[idx >> 4] |=  (uint16_t) (1u << (idx & 15)); }
+    void drop(uint64_t idx) const { data[idx >> 4] &= ~(uint16_t) (1u << (idx & 15)); }
+    void set (uint64_t, float)  const { GGML_ABORT("a bit-packed KQ mask holds no ALiBi values"); }
+    void copy_row(uint64_t dst, uint64_t src, uint64_t n_kv) const { std::copy(data + src/16, data + (src + n_kv)/16, data + dst/16); }
+};
+
+template<typename S, bool causal, bool swa, bool is_2d, bool alibi>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S & st) {
   //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
 
@@ -1747,9 +1770,6 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const int64_t n_kv     = args.n_kv;
     const int64_t n_stream = args.n_stream;
     const int64_t n_tps    = args.n_tps;
-
-    const T mask_keep = llama_cast<T>(0.0f);
-    const T mask_drop = llama_cast<T>(-INFINITY);
 
     // the min position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
@@ -1798,7 +1818,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                     const uint64_t idst_prev = n_kv*srct;
 
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
+                    st.copy_row(idst, idst_prev, n_kv);
 
                     prev = true;
                 } else {
@@ -1869,55 +1889,55 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 if (alibi) {
-                    data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+                    st.set(idst + j, static_cast<float>(-std::abs(p0 - p1)));
                 } else {
-                    data[idst + j] = mask_keep;
+                    st.keep(idst + j);
                 }
 
                 continue;
 skip:
-                data[idst + j] = mask_drop;
+                st.drop(idst + j);
             }
         }
     }
 }
 
-template<typename T, bool causal, bool swa, bool is_2d>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
+template<typename S, bool causal, bool swa, bool is_2d>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S & st) {
     const bool alibi = args.hparams.use_alibi;
     if (alibi) {
-        set_input_kq_mask_impl<T, causal, swa, is_2d, true> (args, data);
+        set_input_kq_mask_impl<S, causal, swa, is_2d, true> (args, st);
     } else {
-        set_input_kq_mask_impl<T, causal, swa, is_2d, false>(args, data);
+        set_input_kq_mask_impl<S, causal, swa, is_2d, false>(args, st);
     }
 }
 
-template<typename T, bool causal, bool swa>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
+template<typename S, bool causal, bool swa>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S & st) {
     const bool is_2d = args.ubatch->is_pos_2d();
     if (is_2d) {
-        set_input_kq_mask_impl<T, causal, swa, true> (args, data);
+        set_input_kq_mask_impl<S, causal, swa, true> (args, st);
     } else {
-        set_input_kq_mask_impl<T, causal, swa, false>(args, data);
+        set_input_kq_mask_impl<S, causal, swa, false>(args, st);
     }
 }
 
-template<typename T, bool causal>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
+template<typename S, bool causal>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S & st) {
     const bool swa = args.swa_type != LLAMA_SWA_TYPE_NONE;
     if (swa) {
-        set_input_kq_mask_impl<T, causal, true> (args, data);
+        set_input_kq_mask_impl<S, causal, true> (args, st);
     } else {
-        set_input_kq_mask_impl<T, causal, false>(args, data);
+        set_input_kq_mask_impl<S, causal, false>(args, st);
     }
 }
 
-template<typename T>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data, bool causal_attn) {
+template<typename S>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S & st, bool causal_attn) {
     if (causal_attn) {
-        set_input_kq_mask_impl<T, true> (args, data);
+        set_input_kq_mask_impl<S, true> (args, st);
     } else {
-        set_input_kq_mask_impl<T, false>(args, data);
+        set_input_kq_mask_impl<S, false>(args, st);
     }
 }
 
@@ -1926,7 +1946,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_kv     = dst->type == GGML_TYPE_I16 ? 16*dst->ne[0] : dst->ne[0]; // a bit-packed mask holds 16 cells per element
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
 
     GGML_ASSERT(n_tokens%n_stream == 0);
@@ -1948,10 +1968,11 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_tps            =*/ n_tps,
     };
 
-    if (dst->type == GGML_TYPE_F16) {
-        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
-    } else {
-        set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    switch (dst->type) {
+        case GGML_TYPE_F16: set_input_kq_mask_impl(args, llama_kq_mask_cells<ggml_fp16_t>{(ggml_fp16_t *) dst->data}, causal_attn); break;
+        case GGML_TYPE_F32: set_input_kq_mask_impl(args, llama_kq_mask_cells<float>      {(float       *) dst->data}, causal_attn); break;
+        case GGML_TYPE_I16: set_input_kq_mask_impl(args, llama_kq_mask_bits              {(uint16_t    *) dst->data}, causal_attn); break;
+        default: GGML_ABORT("unsupported KQ mask type %s", ggml_type_name(dst->type));
     }
 
     //const int64_t t_end = ggml_time_us();

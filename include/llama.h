@@ -412,6 +412,9 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool attn_mask_bits; // store the attention mask as one bit per KV cell (GGML_TYPE_I16, 16 cells per element) instead of f16:
+                             // 16x less compute buffer and host->device traffic for the mask. Requires flash attention and a model
+                             // without ALiBi; read by the CUDA and CPU backends.
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
