@@ -10056,7 +10056,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the conv-state concat of a GDN layer at decode, speculative verify and prefill, over channel counts that
     // are and are not multiples of the 32-wide transpose tile, and a state wider than that path takes (9 > 8)
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_F16 }) {
-        for (int64_t n_tokens : { 1, 2, 3, 9, 33 }) {
+        for (int64_t n_tokens : { 1, 2, 3, 9, 33, 512 }) {
             test_cases.emplace_back(new test_concat_conv_state(type, 3, 10240, n_tokens));
             test_cases.emplace_back(new test_concat_conv_state(type, 3, 1000, n_tokens));
         }
