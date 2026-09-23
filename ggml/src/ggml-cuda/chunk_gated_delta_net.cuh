@@ -43,7 +43,10 @@ struct ggml_cuda_gdn_chunked_scratch {
     uintptr_t end;
 };
 
-// Pure function of the tensor graph, so allocation time and execution time cannot disagree.
+// Pure function of the tensor graph, so allocation and execution agree wherever dst was sized by
+// ggml_cuda_gdn_get_alloc_size: the CUDA buffer type does, and an RPC client asks the server for the size of every
+// GATED_DELTA_NET (ggml_backend_rpc_buffer_type_get_alloc_size). A buffer type that sizes dst as ggml_nbytes leaves
+// the chunked pass writing the scratch past dst's end.
 ggml_cuda_gdn_chunked_scratch ggml_cuda_gdn_get_chunked_scratch(const ggml_tensor * dst);
 
 // ggml_nbytes(dst) plus the scratch above, or just ggml_nbytes(dst) when the shape is ineligible.
