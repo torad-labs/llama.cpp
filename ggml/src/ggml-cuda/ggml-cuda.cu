@@ -1828,7 +1828,10 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_ten
 // (80x6: 6.3 vs 6.1 us, 80x8: 8.0 vs 6.2). So the vector kernel takes rows x cols <= 512, cuBLAS the rest.
 // GGML_CUDA_MMVF_UNTILED_LEGACY=1 restores cuBLAS here too.
 static bool ggml_cuda_should_use_mmvf_untiled(const ggml_tensor * src0, int64_t ne11) {
-    static const bool legacy = getenv("GGML_CUDA_MMVF_UNTILED_LEGACY") != nullptr;
+    static const bool legacy = [] {
+        const char * e = getenv("GGML_CUDA_MMVF_UNTILED_LEGACY");
+        return e != nullptr && atoi(e) != 0;
+    }();
     return !legacy && ne11 <= MMVF_MAX_BATCH_SIZE && src0->ne[1]*ne11 <= 512
         && ggml_cuda_mmvf_supports(src0->type, src0->ne, src0->nb);
 }
@@ -2832,7 +2835,10 @@ static int ggml_cuda_try_gdn_cache_fusion(
     // 32-lane warp, a head width that is a multiple of 32, the scalar gate, and the recurrent kernel (the
     // chunked prefill pipeline writes f32; its cpy stays)
     // GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate cpy.
-    static const bool q8_legacy = getenv("GGML_CUDA_GDN_Q8_CACHE_LEGACY") != nullptr;
+    static const bool q8_legacy = [] {
+        const char * e = getenv("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
+        return e != nullptr && atoi(e) != 0;
+    }();
     if (q8 && (q8_legacy || S_v % QK8_0 != 0 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != QK8_0 ||
                gdn->src[3]->ne[0] == S_v || ggml_cuda_should_use_chunked_gdn(gdn))) {
         return 0;
