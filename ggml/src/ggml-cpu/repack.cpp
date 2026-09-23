@@ -5363,6 +5363,15 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     tensor->extra = (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_repack_get_optimal_repack_type(tensor));
 
+    // the buffer holds only the layouts it repacks: a tensor with none would reach set_tensor without one, so the
+    // allocation declines it (a view of a repacked tensor is never written through set_tensor, and keeps its null)
+    if (tensor->extra == nullptr && tensor->view_src == nullptr) {
+        GGML_LOG_ERROR("%s: no repacked layout for %s (%s, [%lld, %lld, %lld, %lld])\n", __func__, tensor->name,
+                ggml_type_name(tensor->type), (long long) tensor->ne[0], (long long) tensor->ne[1],
+                (long long) tensor->ne[2], (long long) tensor->ne[3]);
+        return GGML_STATUS_FAILED;
+    }
+
     GGML_UNUSED(buffer);
     return GGML_STATUS_SUCCESS;
 }
