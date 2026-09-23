@@ -3009,13 +3009,33 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     return true;
 }
 
+// A fused mul_mat_vec_q never reads src1 in the kernel that writes dst: ggml_cuda_mul_mat_vec_q first quantizes all of src1
+// to a q8_1 pool buffer, in its own kernel on the same stream, so the output may overlap src1. ggml-alloc can put it there,
+// the fused matmuls being src1's last readers: at decode, Ternary Bonsai 2 27B's GLU output starts at the address of its
+// FFN input on 24 of 64 layers, which then ran gate, up and the GLU unfused. mul_mat_vec_f reads src1 in the kernel that
+// writes dst, so its src1 stays checked (the dispatch tries it first; it takes only float src0, mul_mat_vec_q only
+// quantized). GGML_CUDA_MMVQ_FUSION_SRC1_LEGACY=1 checks src1 for mul_mat_vec_q too.
+static const ggml_tensor * ggml_cuda_mmvq_staged_src1(const ggml_tensor * mm) {
+    static const bool legacy = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_FUSION_SRC1_LEGACY");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (legacy || ggml_cuda_should_fuse_mul_mat_vec_f(mm) || !ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+        return nullptr;
+    }
+    return mm->src[1];
+}
+
 // returns whether the write (out) nodes overwrite the read nodes in operation
+// staged_src: a src the fused op reads in full, in an earlier kernel on the same stream, before it writes any output, so
+// the outputs may overlap it (see ggml_cuda_mmvq_staged_src1)
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_idx,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const ggml_tensor * staged_src  = nullptr) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3047,7 +3067,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE) {
+                if (!src || src->op == GGML_OP_NONE || src == staged_src) {
                     continue;
                 }
 
@@ -3104,7 +3124,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu, ffn_up_bias, ffn_gate_bias)) {
             int out_nodes[] = { node_idx + 4 };
-            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1, false,
+                                                        ggml_cuda_mmvq_staged_src1(ffn_up));
         }
     }
 
@@ -3116,7 +3137,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
             int out_nodes[] = { node_idx + 2 };
-            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1, false,
+                                                        ggml_cuda_mmvq_staged_src1(ffn_up));
         }
     }
 
@@ -3772,7 +3794,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const int n_ops = with_bias ? 7 : 5;
 
                 if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1) ||
-                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
+                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1, false,
+                                                              ggml_cuda_mmvq_staged_src1(cgraph->nodes[gate_idx]))) {
                     continue;
                 }
 
@@ -3867,7 +3890,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const int n_ops = with_bias ? 13 : 11;
 
                 if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1) ||
-                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
+                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1, false,
+                                                              ggml_cuda_mmvq_staged_src1(cgraph->nodes[gate_idx]))) {
                     continue;
                 }
 
