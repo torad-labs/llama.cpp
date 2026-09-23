@@ -6838,19 +6838,24 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_gate;
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
+    const bool alias_out; // the fused output over src1's bytes (see new_src1)
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool alias_out = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), alias_out(alias_out) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        std::string v = VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        if (alias_out) {
+            v += "," + VAR_TO_STR(alias_out);
+        }
+        return v;
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6873,6 +6878,29 @@ struct test_mul_mat_vec_fusion : public test_case {
             }
         }
         return out;
+    }
+
+    // alias_out: src1 is computed, not a leaf, and the fused output reuses its bytes, as ggml-alloc places them when the
+    // fused matmuls are src1's last readers (qwen35's FFN input at decode). Both live in one arena: src1 is scaled in
+    // place in it, and the output is made a view of it at the same offset.
+    ggml_tensor * arena = nullptr;
+
+    ggml_tensor * new_src1(ggml_context * ctx, const std::array<int64_t, 4> & ne, int64_t n_out) {
+        if (!alias_out) {
+            return ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
+        arena = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, std::max(ne[0]*ne[1]*ne[2]*ne[3], n_out));
+        ggml_set_name(arena, "arena");
+        const size_t ts = sizeof(float);
+        ggml_tensor * src1 = ggml_view_4d(ctx, arena, ne[0], ne[1], ne[2], ne[3], ne[0]*ts, ne[0]*ne[1]*ts, ne[0]*ne[1]*ne[2]*ts, 0);
+        return ggml_scale_inplace(ctx, src1, 0.5f);
+    }
+
+    void place_output(ggml_tensor * out) {
+        if (alias_out) {
+            out->view_src  = arena;
+            out->view_offs = 0;
+        }
     }
 
     ggml_tensor * build_lane_scale_dense(ggml_context * ctx, ggml_tensor * out) {
@@ -6901,7 +6929,7 @@ struct test_mul_mat_vec_fusion : public test_case {
             std::array<int64_t, 4> ne       = { k, m, channels, samples };
             std::array<int64_t, 4> ne0      = { k, n, channels, samples };
 
-            ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_tensor * cur  = new_src1(ctx, ne, n*m*channels*samples);
             ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx, type, 4, ne0.data()) : nullptr;
             ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne0.data());
 
@@ -6935,6 +6963,7 @@ struct test_mul_mat_vec_fusion : public test_case {
             ggml_tensor * ffn_gate = with_gate ? build_lane_gate() : nullptr;
 
             ggml_tensor * out = with_gate ? build_gate(ctx, ffn_gate, ffn_up) : ffn_up;
+            place_output(out);
 
             std::array<int64_t, 4> bias2_ne   = { out->ne[0], 1, channels, samples };
             ggml_tensor * bias2 = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias2_ne.data());
@@ -6951,7 +6980,7 @@ struct test_mul_mat_vec_fusion : public test_case {
                 ids = ggml_view_2d(ctx, ids, n_used, m, ids->nb[1], 0);
             }
 
-            ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, m);
+            ggml_tensor * cur = new_src1(ctx, { k, this->b ? 1 : n_used, m, 1 }, n*n_used*m);
             ggml_set_name(cur, "cur");
 
             auto build_lane_up = [&]() {
@@ -6982,6 +7011,7 @@ struct test_mul_mat_vec_fusion : public test_case {
             ggml_tensor * ffn_gate = with_gate ? build_lane_gate() : nullptr;
 
             ggml_tensor * out = with_gate ? build_gate(ctx, ffn_gate, ffn_up) : ffn_up;
+            place_output(out);
 
             std::array<int64_t, 4> scale_ne { 1, out->ne[1], out->ne[2], out->ne[3] };
             ggml_tensor * scale = ggml_new_tensor(ctx, out->type, 4, scale_ne.data());
@@ -10758,6 +10788,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale));
                                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 32, 256,
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
+                                if (with_gate) {
+                                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 32, 256,
+                                        use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {4, 2}, /*alias_out=*/true));
+                                }
                                 if (!use_id && with_gate && !with_bias) {
                                     // small multi-token batches (speculative decoding / MTP verify)
                                     for (int64_t m_batch : { 2, 4, 8 }) {
@@ -10770,6 +10804,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+        }
+    }
+
+    // Ternary Bonsai 2 27B's FFN at decode (qwen35: n_embd 5120, n_ff 17408, PQ2_0; its MTP layer Q8_0), also with the
+    // GLU output over src1's bytes as the served graph places it; f16 takes mul_mat_vec_f, which reads src1 in the
+    // kernel that writes the output, so it must not fuse over it
+    for (ggml_type type : { GGML_TYPE_PQ2_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (bool alias_out : { false, true }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 17408, 5120,
+                false, 1, 1, false, false, true, false, {1, 1}, alias_out));
         }
     }
 
