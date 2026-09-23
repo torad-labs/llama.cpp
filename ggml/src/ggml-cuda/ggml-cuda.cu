@@ -3028,7 +3028,8 @@ static const ggml_tensor * ggml_cuda_mmvq_staged_src1(const ggml_tensor * mm) {
         const char * e = getenv("GGML_CUDA_MMVQ_FUSION_SRC1_LEGACY");
         return e != nullptr && atoi(e) != 0;
     }();
-    if (legacy || ggml_cuda_should_fuse_mul_mat_vec_f(mm) || !ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+    // no gate: a gate only adds constraints to mul_mat_vec_f, so without one this errs toward keeping src1 checked
+    if (legacy || ggml_cuda_should_fuse_mul_mat_vec_f(mm, /*gate =*/ nullptr) || !ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
         return nullptr;
     }
     return mm->src[1];
