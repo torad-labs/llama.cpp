@@ -130,8 +130,13 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     }
 }
 
-bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
-        const size_t * src0_nb, const size_t * src1_nb, const int src1_ncols, bool mul_mat_id) {
+bool ggml_cuda_should_use_mmf(const ggml_tensor * src0, const ggml_tensor * src1, int cc, int warp_size,
+        const int src1_ncols, bool mul_mat_id) {
+    const enum ggml_type type    = src0->type;
+    const int64_t *      src0_ne = src0->ne;
+    const size_t *       src0_nb = src0->nb;
+    const size_t *       src1_nb = src1->nb;
+
     if (ggml_is_quantized(type)) {
         return false;
     }
@@ -154,6 +159,14 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
         if (src0_nb[i] % 8 != 0 || src1_nb[i] % (2*(4/ts)*sizeof(float)) != 0) {
             return false;
         }
+    }
+
+    // The data addresses must be aligned to those reads too: a view offset by an odd number of f16/bf16 src0 elements
+    // or f32 src1 elements (for an f16/bf16 src0) faults with a misaligned address. This runs at dispatch, when the
+    // data is allocated.
+    if (reinterpret_cast<uintptr_t>(src0->data) % 4 != 0 ||
+        reinterpret_cast<uintptr_t>(src1->data) % ((4/ts)*sizeof(float)) != 0) {
+        return false;
     }
     if (src0_ne[1] % mmf_get_rows_per_block(cc) != 0) {
         return false;

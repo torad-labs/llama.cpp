@@ -63,7 +63,8 @@ static __global__ void rope_norm(const T *            x,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
                                  const int            set_rows_stride,
-                                 const bool           inplace) {
+                                 const bool           inplace,
+                                 const bool           store_pairs) {
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne00) {
@@ -86,6 +87,11 @@ static __global__ void rope_norm(const T *            x,
     }
 
     const auto & store_coaelsced = [&](float x0, float x1) {
+        if (!store_pairs) {
+            dst[idst + 0] = ggml_cuda_cast<D>(x0);
+            dst[idst + 1] = ggml_cuda_cast<D>(x1);
+            return;
+        }
         if constexpr (std::is_same_v<float, D>) {
             float2 v = make_float2(x0, x1);
             ggml_cuda_memcpy_1<8>(dst + idst, &v);
@@ -387,14 +393,21 @@ static void rope_norm_cuda(const T *            x,
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
+    // The kernel stores each pair of outputs as one float2/half2 when every pair it writes is aligned to that size: dst
+    // and all its strides (and a fused SET_ROWS row stride) even in elements. Otherwise, as for an in-place rope on a
+    // view that starts at an odd element, it stores the two values one by one instead of faulting on a misaligned
+    // address.
+    const bool store_pairs = reinterpret_cast<uintptr_t>(dst) % (2*sizeof(D)) == 0
+        && s1 % 2 == 0 && s2 % 2 == 0 && s3 % 2 == 0 && set_rows_stride % 2 == 0;
+
     if (freq_factors == nullptr) {
         rope_norm<forward, false><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, n_offs, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, inplace);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, inplace, store_pairs);
     } else {
         rope_norm<forward, true><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, n_offs, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, inplace);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, inplace, store_pairs);
     }
 }
 

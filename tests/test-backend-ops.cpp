@@ -5097,15 +5097,33 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
-// GGML_OP_MUL_MAT or GGML_OP_MUL_MAT_ID over views with padded rows: src0 is a [k, m] view of rows of k + pad_a
-// elements, and the f32 src1 is a [k, n] view of rows of k + pad_b floats ([k, 1, n] for MUL_MAT_ID, the broadcast
-// layout of an MoE gate/up input). The CUDA float kernels read their operands in pairs and assert on these strides.
-// mmvf needs an even src1 stride in floats. mmf takes its strides in units of the src0 element pair (float, half2 or
-// nv_bfloat162), halves the src1 stride for an f16/bf16 src0, and needs an even src0 row stride and src1 column stride
-// in those units. A dispatch that sends a kernel operands it cannot read aborts, or reads the wrong columns, instead of
-// falling back. With fused set, a gate product shares src1 and a SWIGLU joins the two: the pattern the fused vector
-// kernel takes at one token.
-struct test_mul_mat_padded : public test_case {
+// A new [ne0, ne1, ne2, ne3] view of rows of ne0 + pad elements that starts off elements into its own buffer: with an
+// odd off its data address is an element off the alignment of any wider type, which kernels that read or write their
+// operands in pairs or 16-byte chunks must not be sent.
+static ggml_tensor * new_tensor_view_at(ggml_context * ctx, ggml_type type, std::array<int64_t, 4> ne, int64_t pad,
+        int64_t off, const char * name) {
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, type, off + (ne[0] + pad)*ne[1]*ne[2]*ne[3]);
+    ggml_set_name(t, name);
+    const size_t nb1 = ggml_row_size(type, ne[0] + pad);
+    t = ggml_view_4d(ctx, t, ne[0], ne[1], ne[2], ne[3], nb1, nb1*ne[1], nb1*ne[1]*ne[2], ggml_row_size(type, off));
+    ggml_format_name(t, "%s_view", name);
+    return t;
+}
+
+// GGML_OP_MUL_MAT or GGML_OP_MUL_MAT_ID over views: src0 is a [k, m] view of rows of k + pad_a elements that starts off_a
+// elements into its buffer, and the f32 src1 is a [k, n] view of rows of k + pad_b floats that starts off_b floats in
+// ([k, 1, n] for MUL_MAT_ID, the broadcast layout of an MoE gate/up input). The CUDA float kernels read their operands
+// in pairs: mmvf reads src0 as half2, nv_bfloat162 or float2 and src1 as float2, and mmf reads an f16/bf16 src0 as
+// half2 or nv_bfloat162 and src1 as float2. mmvf needs an even src1 stride in floats. mmf takes its strides in units of
+// the src0 element pair (float, half2 or nv_bfloat162), halves the src1 stride for an f16/bf16 src0, and needs an even
+// src0 row stride and src1 column stride in those units. Both need data addresses aligned to what they read, which an
+// odd element offset breaks. A dispatch that sends a kernel operands it cannot read aborts, reads the wrong columns or
+// faults on a misaligned address instead of falling back. For a quantized src0 (pad_a = off_a = 0), mmq quantizes src1
+// reading 4 floats at a time, which needs 16-byte aligned rows or it faults or quantizes the wrong values; mmvq reads
+// src1 one float at a time. With fused set, a gate product shares src1 and a SWIGLU joins
+// the two: the pattern the fused vector kernel takes at one token. pad_a and off_a then apply to the gate's src0 only,
+// since a view node between the two products would keep them from fusing.
+struct test_mul_mat_view : public test_case {
     static constexpr int n_mats = 4; // MUL_MAT_ID only
     static constexpr int n_used = 2;
 
@@ -5115,11 +5133,13 @@ struct test_mul_mat_padded : public test_case {
     const int64_t k;
     const int64_t pad_a;
     const int64_t pad_b;
+    const int64_t off_a;
+    const int64_t off_b;
     const bool use_id;
     const bool fused;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, m, n, k, pad_a, pad_b, use_id, fused);
+        return VARS_TO_STR10(type_a, m, n, k, pad_a, pad_b, off_a, off_b, use_id, fused);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5133,9 +5153,11 @@ struct test_mul_mat_padded : public test_case {
         return 5e-4;
     }
 
-    test_mul_mat_padded(ggml_type type_a = GGML_TYPE_BF16, int64_t m = 48, int64_t n = 4, int64_t k = 256,
-            int64_t pad_a = 0, int64_t pad_b = 1, bool use_id = false, bool fused = false)
-        : type_a(type_a), m(m), n(n), k(k), pad_a(pad_a), pad_b(pad_b), use_id(use_id), fused(fused) {}
+    test_mul_mat_view(ggml_type type_a = GGML_TYPE_BF16, int64_t m = 48, int64_t n = 4, int64_t k = 256,
+            int64_t pad_a = 0, int64_t pad_b = 1, int64_t off_a = 0, int64_t off_b = 0, bool use_id = false,
+            bool fused = false)
+        : type_a(type_a), m(m), n(n), k(k), pad_a(pad_a), pad_b(pad_b), off_a(off_a), off_b(off_b), use_id(use_id),
+          fused(fused) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * ids = nullptr;
@@ -5146,23 +5168,23 @@ struct test_mul_mat_padded : public test_case {
             ggml_set_name(ids, "view_of_ids");
         }
 
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k + pad_b, use_id ? 1 : n, use_id ? n : 1);
-        ggml_set_name(b, "b");
-        b = ggml_view_3d(ctx, b, k, b->ne[1], b->ne[2], b->nb[1], b->nb[2], 0);
-        ggml_set_name(b, "b_view");
+        ggml_tensor * b = new_tensor_view_at(ctx, GGML_TYPE_F32, {k, use_id ? 1 : n, use_id ? n : 1, 1}, pad_b, off_b, "b");
 
-        auto product = [&](const char * name) {
-            ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k + pad_a, m, use_id ? n_mats : 1);
-            ggml_set_name(a, name);
-            if (pad_a > 0) { // a view node between the gate and up products would keep them from fusing
-                a = ggml_view_3d(ctx, a, k, m, a->ne[2], a->nb[1], a->nb[2], 0);
+        auto product = [&](const char * name, bool viewed) {
+            ggml_tensor * a;
+            if (viewed) {
+                a = new_tensor_view_at(ctx, type_a, {k, m, use_id ? n_mats : 1, 1}, pad_a, off_a, name);
+            } else {
+                a = ggml_new_tensor_3d(ctx, type_a, k, m, use_id ? n_mats : 1);
+                ggml_set_name(a, name);
             }
             return use_id ? ggml_mul_mat_id(ctx, a, b, ids) : ggml_mul_mat(ctx, a, b);
         };
 
-        ggml_tensor * out = product("a");
+        const bool view_a = pad_a > 0 || off_a > 0;
+        ggml_tensor * out = product("a", view_a && !fused);
         if (fused) {
-            out = ggml_swiglu_split(ctx, product("gate"), out);
+            out = ggml_swiglu_split(ctx, product("gate", view_a), out);
         }
         ggml_set_name(out, "out");
         return out;
@@ -5786,7 +5808,7 @@ struct test_rope : public test_case {
     float ef; // ext_factor
     float af; // attn_factor
     bool ff;
-    int v; // view (1 : non-contiguous a)
+    int v; // view (1 : non-contiguous a, 2 : second half of each row of a, 4 : a starts one element into its buffer)
     bool forward;
     bool inplace;
     int n_offs; // offset of the rotated dims window, set via ggml_rope_set_offset()
@@ -5832,6 +5854,10 @@ struct test_rope : public test_case {
                              a->nb[1], a->nb[2], a->nb[3],
                              ne_a[0] * ggml_element_size(a));
             ggml_set_name(a, "view_of_a");
+        } else if (v == 4) {
+            // a view that starts one element into its buffer: an in-place rope writes its output pairs an element off
+            // the alignment of a float2/half2
+            a = new_tensor_view_at(ctx, type, ne_a, 0, 1, "a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
             if (forward && n_offs == 0) {
@@ -7663,6 +7689,54 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with Q, K, V or the mask a view that starts off elements into its buffer. The CUDA kernels read
+// these in chunks of up to 16 bytes (float4/int4 loads, cp.async), so an odd offset must send the op to a backend that
+// can read it rather than fault on a misaligned address.
+struct test_flash_attn_ext_view : public test_case {
+    const int64_t nb; // batch size
+    const ggml_type type_KV;
+    const int64_t off_q;
+    const int64_t off_k;
+    const int64_t off_v;
+    const int64_t off_m;
+
+    std::string vars() override {
+        return VARS_TO_STR6(nb, type_KV, off_q, off_k, off_v, off_m);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_view(int64_t nb = 1, ggml_type type_KV = GGML_TYPE_F16, int64_t off_q = 0, int64_t off_k = 0,
+            int64_t off_v = 0, int64_t off_m = 0)
+        : nb(nb), type_KV(type_KV), off_q(off_q), off_k(off_k), off_v(off_v), off_m(off_m) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hs = 128, nh = 8, nr = 4, kv = 512;
+
+        ggml_tensor * q = new_tensor_view_at(ctx, GGML_TYPE_F32, {hs, nb, nh*nr, 1}, 0, off_q, "q");
+        ggml_tensor * k = new_tensor_view_at(ctx, type_KV,       {hs, kv, nh,    1}, 0, off_k, "k");
+        ggml_tensor * v = new_tensor_view_at(ctx, type_KV,       {hs, kv, nh,    1}, 0, off_v, "v");
+        ggml_tensor * m = new_tensor_view_at(ctx, GGML_TYPE_F16, {kv, nb, 1,     1}, 0, off_m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m_view") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "m") != 0) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -8076,6 +8150,53 @@ struct test_lightning_indexer : public test_case {
         ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
         ggml_set_name(out, "out");
 
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_LIGHTNING_INDEXER with q or k a view that starts off elements into its buffer. The CUDA kernel reads q as
+// float4 and a float k as int2 or float4, so an odd offset must send the op to a backend that can read it rather than
+// fault on a misaligned address.
+struct test_lightning_indexer_view : public test_case {
+    const ggml_type type_K;
+    const int64_t off_q;
+    const int64_t off_k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_K, off_q, off_k);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_lightning_indexer_view(ggml_type type_K = GGML_TYPE_F16, int64_t off_q = 0, int64_t off_k = 0)
+        : type_K(type_K), off_q(off_q), off_k(off_k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hsk = 128, nh = 64, kv = 256, nb = 32;
+
+        ggml_tensor * q = new_tensor_view_at(ctx, GGML_TYPE_F32, {hsk, nh, nb, 1}, 0, off_q, "q");
+        ggml_tensor * k = new_tensor_view_at(ctx, type_K,        {hsk, 1,  kv, 1}, 0, off_k, "k");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, 1);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_set_name(out, "out");
         return out;
     }
 
@@ -9769,23 +9890,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, 12, 5120, {2, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 40,  3, 5122, {1, 1}, {1, 1}));
     }
-    // operand strides the float kernels cannot read, which must fall back (test_mul_mat_padded). At 48 rows: an src1
+    // operands the float kernels cannot read, which must fall back (test_mul_mat_view). Strides: at 48 rows, an src1
     // stride odd in floats at every batch the vector kernel takes, and under the fused gate/up vector kernel at one
-    // token. At 64 rows, which mmf tiles: src1 strides of 1 and 2 mod 4 floats and an src0 row stride of 2 mod 4
-    // elements, for MUL_MAT and MUL_MAT_ID (32 tokens reach mmf's compacted-ids path).
+    // token; at 64 rows, which mmf tiles, src1 strides of 1 and 2 mod 4 floats and an src0 row stride of 2 mod 4
+    // elements, for MUL_MAT and MUL_MAT_ID (32 tokens reach mmf's compacted-ids path). Addresses: src0 or src1 offset by
+    // one element on the same paths (at 48 rows one token takes the vector kernel, four its untiled use, and MUL_MAT_ID
+    // its per-expert fallback), plus a one-row f32 src0 at 16 tokens, which takes the transposed-vector path.
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int64_t n : {1, 2, 3, 4, 8}) {
-            test_cases.emplace_back(new test_mul_mat_padded(type_a, 48, n, 5120, 0, 1));
+            test_cases.emplace_back(new test_mul_mat_view(type_a, 48, n, 5120, 0, 1));
         }
         for (bool use_id : {false, true}) {
-            test_cases.emplace_back(new test_mul_mat_padded(type_a, 48, 1, 5120, 0, 1, use_id, /*fused =*/ true));
+            test_cases.emplace_back(new test_mul_mat_view(type_a, 48, 1, 5120, 0, 1, 0, 0, use_id, /*fused =*/ true));
             const int64_t n_max = use_id ? 32 : 16;
             for (int64_t n : {int64_t(4), n_max}) {
                 for (int64_t pad_b : {1, 2}) {
-                    test_cases.emplace_back(new test_mul_mat_padded(type_a, 64, n, 5120, 0, pad_b, use_id));
+                    test_cases.emplace_back(new test_mul_mat_view(type_a, 64, n, 5120, 0, pad_b, 0, 0, use_id));
                 }
             }
-            test_cases.emplace_back(new test_mul_mat_padded(type_a, 64, 4, 5120, 2, 0, use_id));
+            test_cases.emplace_back(new test_mul_mat_view(type_a, 64, 4, 5120, 2, 0, 0, 0, use_id));
+
+            for (auto [off_a, off_b] : {std::pair<int64_t, int64_t>{1, 0}, {0, 1}}) {
+                for (int64_t n : {1, 4}) {
+                    test_cases.emplace_back(new test_mul_mat_view(type_a, 48, n, 5120, 0, 0, off_a, off_b, use_id));
+                }
+                test_cases.emplace_back(new test_mul_mat_view(type_a, 48, 1, 5120, 0, 0, off_a, off_b, use_id, /*fused =*/ true));
+                for (int64_t n : {int64_t(4), n_max}) {
+                    test_cases.emplace_back(new test_mul_mat_view(type_a, 64, n, 5120, 0, 0, off_a, off_b, use_id));
+                }
+            }
+        }
+    }
+    for (auto [off_a, off_b] : {std::pair<int64_t, int64_t>{1, 0}, {0, 1}}) {
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_F32, 1, 16, 5120, 0, 0, off_a, off_b));
+    }
+    // src1 views mmq quantizes (a quantized src0 at 32 tokens): rows of 1 and 2 mod 4 floats, and rows that start 1 and 2
+    // floats into the buffer. MUL_MAT_ID's one src1 row per token takes the quantizer that scatters to each expert.
+    for (bool use_id : {false, true}) {
+        for (auto [pad_b, off_b] : {std::pair<int64_t, int64_t>{1, 0}, {2, 0}, {0, 1}, {0, 2}}) {
+            test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q4_0, 64, 32, 5120, 0, pad_b, 0, off_b, use_id));
         }
     }
 
@@ -10173,6 +10316,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rope(type, {128,  32, 2, 1}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, ff, 0, true, true));
                 test_cases.emplace_back(new test_rope(type, {128,  32, 2, 1}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, ff, 1, true, true));
                 test_cases.emplace_back(new test_rope(type, {128,  32, 2, 3}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, ff, 1, true, true));
+                test_cases.emplace_back(new test_rope(type, {128,  32, 2, 1}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, ff, 4, true, true));
             }
         }
     }
@@ -10430,6 +10574,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
                 }
+            }
+        }
+    }
+
+    // Q, K, V and the mask one element into their buffers, at one token (vector kernel) and 32 (tensor core kernel)
+    for (int64_t nb : {1, 32}) {
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+            for (int i = 0; i < 4; ++i) {
+                test_cases.emplace_back(new test_flash_attn_ext_view(nb, type_KV, i == 0, i == 1, i == 2, i == 3));
             }
         }
     }
@@ -10766,6 +10919,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+
+    // q or a float k one element into its buffer
+    for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_lightning_indexer_view(type_K, 1, 0));
+        test_cases.emplace_back(new test_lightning_indexer_view(type_K, 0, 1));
     }
 
     return test_cases;
