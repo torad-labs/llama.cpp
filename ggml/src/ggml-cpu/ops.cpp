@@ -1,6 +1,7 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
+#include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <type_traits>
 
 // ggml_compute_forward_dup
 
@@ -266,6 +268,12 @@ static void ggml_compute_forward_dup_flt(
 }
 
 
+// Converts f32/f16/bf16 into dst's type through its from_float (a quantized type, or i32), for a dst whose every row is
+// whole contiguous blocks (ggml_compute_forward_dup_kernel checks that). dst row r takes the flat elements
+// [r*ne0, (r+1)*ne0) of src, which may be strided or shaped differently; the dst may be contiguous or a view with a row
+// or slot stride wider than its rows (the -cts q8_0 recurrent-state snapshots of delta-net-base.cpp). The threads split
+// the dst's blocks, not its rows, so that a few long rows (a snapshot is one row of 786,432 values) still spread over
+// every thread. Every from_float is block-local, so the split does not change the bytes.
 template<typename src_t>
 static void ggml_compute_forward_dup_to_q(
         const ggml_compute_params * params,
@@ -278,47 +286,71 @@ static void ggml_compute_forward_dup_to_q(
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
-    const int ith = params->ith; // thread index
-    const int nth = params->nth; // number of threads
+    const ggml_from_float_t quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
+    const int64_t qk = ggml_blck_size(dst->type);
+    const size_t  qs = ggml_type_size(dst->type);
 
-    // parallelize by rows
-    const int nr = ne01;
-    // number of rows per thread
-    const int dr = (nr + nth - 1) / nth;
-    // row range for this thread
-    const int ir0 = dr * ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    const int ith = params->ith;
+    const int nth = params->nth;
 
-    if (ggml_is_contiguous(dst) &&
-            nb00 == sizeof(src_t) &&
-            ggml_get_type_traits_cpu(dst->type)->from_float) {
-        // casting non-quantized types --> intermediate f32 --> quantized
-        ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
-        float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
+    // blocks per dst row, blocks in the dst, and this thread's block range
+    const int64_t nbr = ne0 / qk;
+    const int64_t nbt = nbr * ne1 * ne2 * ne3;
+    const int64_t dbt = (nbt + nth - 1) / nth;
+    const int64_t b0  = std::min(dbt * ith, nbt);
+    const int64_t b1  = std::min(b0 + dbt, nbt);
 
-        size_t id = 0;
-        size_t rs = nb0 * (ne00 / ggml_blck_size(dst->type));
-        char * dst_ptr = (char *) dst->data;
+    // at most one dst row per pass; the work buffer holds ne0 floats per thread (ggml_graph_plan, GGML_OP_CPY)
+    float * src0_f32 = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
 
-        for (int i03 = 0; i03 < ne03; i03++) {
-            for (int i02 = 0; i02 < ne02; i02++) {
-                id += rs * ir0;
-                for (int i01 = ir0; i01 < ir1; i01++) {
-                    const src_t * src0_ptr = (src_t *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+    for (int64_t b = b0; b < b1; ) {
+        const int64_t ir = b / nbr; // dst row, flattened over ne1, ne2, ne3
+        const int64_t ib = b % nbr; // first block of the pass within that row
+        const int64_t n  = std::min(nbr - ib, b1 - b) * qk;
 
-                    for (int i00 = 0; i00 < ne00; i00++) {
-                        src0_f32[i00] = type_conversion_table<src_t>::to_f32(src0_ptr[i00]);
+        // the pass's n elements of src, from flat index ir*ne0 + ib*qk on
+        int64_t f   = ir * ne0 + ib * qk;
+        int64_t i00 = f % ne00; f /= ne00;
+        int64_t i01 = f % ne01; f /= ne01;
+        int64_t i02 = f % ne02;
+        int64_t i03 = f / ne02;
+
+        const float * x = src0_f32;
+        if (std::is_same<src_t, float>::value && nb00 == sizeof(float) && ne00 - i00 >= n) {
+            // inside one contiguous f32 src row: quantized in place
+            x = (const float *) ((const char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
+        } else {
+            for (int64_t j = 0; j < n; ) {
+                const char *  src0_row = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
+                const int64_t m        = std::min(ne00 - i00, n - j);
+                if (nb00 == sizeof(src_t)) {
+                    const src_t * src0_ptr = (const src_t *) src0_row + i00;
+                    for (int64_t k = 0; k < m; k++) {
+                        src0_f32[j + k] = type_conversion_table<src_t>::to_f32(src0_ptr[k]);
                     }
-
-                    quantize_row_q(src0_f32, dst_ptr + id, ne00);
-                    id += rs;
+                } else {
+                    for (int64_t k = 0; k < m; k++) {
+                        src0_f32[j + k] = type_conversion_table<src_t>::to_f32(*(const src_t *) (src0_row + (i00 + k)*nb00));
+                    }
                 }
-                id += rs * (ne01 - ir1);
+                j  += m;
+                i00 = 0;
+                if (++i01 == ne01) {
+                    i01 = 0;
+                    if (++i02 == ne02) {
+                        i02 = 0;
+                        ++i03;
+                    }
+                }
             }
         }
-    } else {
-        // printf("%s %s\n", ggml_type_name(src0->type), ggml_type_name(dst->type));
-        GGML_ABORT("not implemented");
+
+        const int64_t i1 = ir % ne1;
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i3 = ir / (ne1 * ne2);
+        quantize_row_q(x, (char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3 + ib*qs, n);
+
+        b += n / qk;
     }
 }
 
@@ -372,7 +404,7 @@ static void ggml_compute_forward_dup_bytes(
     if (ggml_is_contiguous(dst)) {
         size_t id = 0;
         char * dst_ptr = (char *) dst->data;
-        const size_t rs = ne00 * type_size;
+        const size_t rs = ggml_row_size(src0->type, ne00);
 
         if (nb00 == type_size) {
             // src0 is contiguous on first dimension, copy by rows
@@ -523,54 +555,81 @@ static void ggml_compute_forward_dup_from_q(
     }
 }
 
-void ggml_compute_forward_dup(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
+using ggml_compute_forward_dup_t = void (*)(const ggml_compute_params * params, ggml_tensor * dst);
 
+// The kernel that DUP, CPY and CONT run for dst, or nullptr where the CPU has none for dst's types and layout. The CPU
+// backend's supports_op asks this same function, so what it claims and what ggml_compute_forward_dup runs cannot
+// drift apart.
+static ggml_compute_forward_dup_t ggml_compute_forward_dup_kernel(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
+    // the blocks of a quantized type run along dim 0, so the kernels that walk blocks need rows of whole blocks, stored
+    // one after another
+    const auto block_rows = [](const ggml_tensor * t) {
+        return t->nb[0] == ggml_type_size(t->type) && t->ne[0] % ggml_blck_size(t->type) == 0;
+    };
+
     if (src0->type == dst->type) {
-        ggml_compute_forward_dup_bytes(params, dst);
-        return;
+        const bool bytes = ggml_blck_size(dst->type) == 1 || (ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) ||
+                           (block_rows(src0) && block_rows(dst));
+        return bytes ? ggml_compute_forward_dup_bytes : nullptr;
     }
+
+    // from f32/f16/bf16 through dst's from_float (a quantized type, or i32)
+    const bool via_from_float = ggml_get_type_traits_cpu(dst->type)->from_float != nullptr && block_rows(dst);
 
     switch (src0->type) {
         case GGML_TYPE_F16:
             {
-                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_fp16_t>(params, dst);
-                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_bf16_t>(params, dst);
-                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_fp16_t, float      >(params, dst);
-                else ggml_compute_forward_dup_to_q<ggml_fp16_t>(params, dst);
-            } break;
+                /**/ if (dst->type == GGML_TYPE_BF16) return ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_bf16_t>;
+                else if (dst->type == GGML_TYPE_F32)  return ggml_compute_forward_dup_flt<ggml_fp16_t, float      >;
+                return via_from_float ? ggml_compute_forward_dup_to_q<ggml_fp16_t> : nullptr;
+            }
         case GGML_TYPE_BF16:
             {
-                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<ggml_bf16_t, ggml_fp16_t>(params, dst);
-                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_bf16_t, ggml_bf16_t>(params, dst);
-                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_bf16_t, float      >(params, dst);
-                else ggml_compute_forward_dup_to_q<ggml_bf16_t>(params, dst);
-            } break;
+                /**/ if (dst->type == GGML_TYPE_F16)  return ggml_compute_forward_dup_flt<ggml_bf16_t, ggml_fp16_t>;
+                else if (dst->type == GGML_TYPE_F32)  return ggml_compute_forward_dup_flt<ggml_bf16_t, float      >;
+                return via_from_float ? ggml_compute_forward_dup_to_q<ggml_bf16_t> : nullptr;
+            }
         case GGML_TYPE_F32:
             {
-                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<float, ggml_fp16_t>(params, dst);
-                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<float, ggml_bf16_t>(params, dst);
-                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<float, float      >(params, dst);
-                else if (dst->type == GGML_TYPE_I32)  ggml_compute_forward_dup_flt<float, int32_t    >(params, dst);
-                else ggml_compute_forward_dup_to_q<float>(params, dst);
-            } break;
+                /**/ if (dst->type == GGML_TYPE_F16)  return ggml_compute_forward_dup_flt<float, ggml_fp16_t>;
+                else if (dst->type == GGML_TYPE_BF16) return ggml_compute_forward_dup_flt<float, ggml_bf16_t>;
+                else if (dst->type == GGML_TYPE_I32)  return ggml_compute_forward_dup_flt<float, int32_t    >;
+                return via_from_float ? ggml_compute_forward_dup_to_q<float> : nullptr;
+            }
         case GGML_TYPE_I32:
             {
-                if (dst->type == GGML_TYPE_F32) ggml_compute_forward_dup_flt<int32_t, float>(params, dst);
-                else GGML_ABORT("not implemented");
-            } break;
+                return dst->type == GGML_TYPE_F32 ? ggml_compute_forward_dup_flt<int32_t, float> : nullptr;
+            }
         default:
             {
-                if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F32) {
-                    ggml_compute_forward_dup_from_q(params, dst);
-                    break;
-                }
-                GGML_ABORT("fatal error");
+                // dequantizing into f32: src0 in block rows, of a type with a to_float, and dst contiguous in dim 0,
+                // its rows whole blocks unless dst is contiguous
+                const bool from_q = ggml_is_quantized(src0->type) && ggml_get_type_traits(src0->type)->to_float &&
+                                    block_rows(src0) && dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float) &&
+                                    (dst->ne[0] % ggml_blck_size(src0->type) == 0 || ggml_is_contiguous(dst));
+                return from_q ? ggml_compute_forward_dup_from_q : nullptr;
             }
     }
+}
+
+bool ggml_cpu_dup_supported(const struct ggml_tensor * dst) {
+    return ggml_compute_forward_dup_kernel(dst) != nullptr;
+}
+
+void ggml_compute_forward_dup(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_compute_forward_dup_t kernel = ggml_compute_forward_dup_kernel(dst);
+    if (kernel == nullptr) {
+        GGML_ABORT("the CPU cannot copy %s into %s with this layout (dst ne0 = %lld, nb0 = %zu, block size = %lld, "
+                "type size = %zu, from_float %s)", ggml_type_name(dst->src[0]->type), ggml_type_name(dst->type),
+                (long long) dst->ne[0], dst->nb[0], (long long) ggml_blck_size(dst->type), ggml_type_size(dst->type),
+                ggml_get_type_traits_cpu(dst->type)->from_float ? "set" : "missing");
+    }
+    kernel(params, dst);
 }
 
 // ggml_compute_forward_add
