@@ -2668,10 +2668,17 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (cgraph->nodes[i]->src[j]) {
-                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
-                memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
-                memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
+            const ggml_tensor * src = cgraph->nodes[i]->src[j];
+            if (src) {
+                ggml_cuda_graph::src_properties & src_prop = prop.srcs[j];
+                src_prop.data      = src->data;
+                src_prop.buffer    = src->buffer;
+                src_prop.view_src  = src->view_src;
+                src_prop.view_offs = src->view_offs;
+                memcpy(src_prop.ne, src->ne, sizeof(src_prop.ne));
+                memcpy(src_prop.nb, src->nb, sizeof(src_prop.nb));
+                src_prop.type      = src->type;
+                src_prop.op        = src->op;
             }
         }
 
