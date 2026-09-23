@@ -28,6 +28,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1301,12 +1302,30 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
-    struct node_properties {
-        ggml_tensor node;
-        void *   node_src_data_ptrs[GGML_MAX_SRC];
-        int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
-        size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+    // What evaluating a node reads from one of its srcs, beyond the node itself: a captured graph is replayed only while
+    // all of it is unchanged. A src that is a node of the same graph is also compared whole as that node; a leaf, or a
+    // node of an earlier split, is compared only here.
+    struct src_properties {
+        void *                data;
+        ggml_backend_buffer_t buffer;    // usage and buffer type: whether and how far MMQ/MMVQ clear src0's padding,
+                                         // and the extent the fusion overlap test compares
+        ggml_tensor *         view_src;  // a view's padding is never cleared (cuBLAS instead); gated delta net fusion
+        size_t                view_offs; // gated delta net fusion
+        int64_t               ne[GGML_MAX_DIMS];
+        size_t                nb[GGML_MAX_DIMS];
+        ggml_type             type;      // selects the kernel; f16 and bf16 have the same ne and nb
+        ggml_op               op;        // fusion: a leaf (GGML_OP_NONE) is exempt from the overlap test, and the gated
+                                         // delta net fusion takes only a VIEW
     };
+    // compared with memcmp: no byte of it may be padding
+    static_assert(std::has_unique_object_representations_v<src_properties>, "src_properties has padding");
+
+    struct node_properties {
+        ggml_tensor    node;
+        src_properties srcs[GGML_MAX_SRC];
+    };
+    static_assert(sizeof(node_properties) == sizeof(ggml_tensor) + GGML_MAX_SRC * sizeof(src_properties),
+                  "node_properties has padding");
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
