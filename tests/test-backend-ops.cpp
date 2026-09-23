@@ -9447,6 +9447,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 3, 2, 1}));
 
+    // a small float src0 whose row count mmf cannot tile (qwen35 ssm_alpha/ssm_beta: 48 x 5120) on both sides of the
+    // vector kernel's batch limit, a batched src1, and an odd K
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t n : {1, 2, 3, 4, 6, 8, 9, 12, 16, 17}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, 12, 5120, {2, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 40,  3, 5122, {1, 1}, {1, 1}));
+    }
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {
@@ -10506,6 +10516,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // float src0 rows mmf cannot tile: qwen35 ssm_alpha/ssm_beta (48 x 5120) at MTP verify / multi-slot batches, the
+    // rows x cols <= 512 edge of the vector-kernel fallback from both sides, and a large src0 that stays with cuBLAS
+    for (int64_t m : {48, 80, 176, 368, 500}) {
+        for (int64_t n : {2, 3, 4, 6, 8, 12}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t n : {4, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 4100, n, 4096, {1, 1}, {1, 1}));
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
