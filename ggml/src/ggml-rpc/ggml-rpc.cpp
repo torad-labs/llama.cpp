@@ -622,6 +622,8 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     // ref: https://github.com/ggml-org/llama.cpp/pull/15966
     rpc_get |= tensor->op == GGML_OP_FLASH_ATTN_EXT;
     rpc_get |= tensor->op == GGML_OP_MUL_MAT_ID;
+    // CUDA carves the chunked prefill scratch out of the tail of dst (ggml_cuda_gdn_get_alloc_size)
+    rpc_get |= tensor->op == GGML_OP_GATED_DELTA_NET;
 
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;

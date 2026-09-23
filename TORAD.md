@@ -22,6 +22,10 @@ which pins a commit of this branch as a submodule.
 | `b4c2d66` | GeForce Blackwell (sm_120) takes two paths that were gated to the DGX Spark: the transposed dim-0 concat for a Gated DeltaNet layer's conv state (3 columns) with the new rows, 11.50 → 1.77 µs per layer at an MTP verify, and the float4 scale, 6.10 → 5.14 µs. RTX 5070 Ti, 3-row verify step: GPU time 20.0 → 19.4 ms (−2.8%), logits identical (KL at the protocol's noise floor, same top p 100 %) | `GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY=1`, `GGML_CUDA_SCALE_VEC4_SM120_LEGACY=1` |
 | `8f64f83` | a q8_0 recurrent-state cache (`-cts q8_0`) takes the fused snapshot write: the Gated DeltaNet kernel quantizes each warp-wide slice of a state column to one q8_0 block as it stores it (cpy's formula, so the cache holds the same bytes) and the per-layer f32 → q8_0 cpy (~14 µs) is skipped at decode and MTP verify; the chunked prefill keeps its cpy. RTX 5070 Ti, GPU time per step with one state written: decode 14.15 → 13.40 ms (−5.3 %), a 3-token ubatch 16.94 → 16.57 ms; served with the MTP draft head, where a verify writes K = 3 snapshots per layer (three cpys before this), legacy / fused A-B-A-B 104.8 / 118.1 / 110.1 / 120.2 tok/s (+9-10 %) with the same draft acceptance and the same text byte for byte; logits identical (KL at the protocol's noise floor, same top p 100 %) | `GGML_CUDA_GDN_Q8_CACHE_LEGACY=1` |
 
+Every switch in the last column is read once per process and parses as an integer: a `*_LEGACY` switch set to `0`
+is the same as unset (the change stays on), and `=0` turns off `GGML_CUDA_LORA_RANK1_FUSE` and
+`GGML_CUDA_GDN_CHUNKED`.
+
 Remotes for maintenance: `prism` → PrismML-Eng/llama.cpp (the base), merged in when wanted. The
 83 PrismML branches this repo was first pushed with were removed on 2026-09-20 — every one was at
 the same commit as PrismML's copy; they are one `git fetch prism` away.
