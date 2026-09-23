@@ -9370,6 +9370,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {256, 2, 3, 1}, {256, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_0, {256, 3, 2, 1}, {256, 2, 3, 1}, {0, 2, 1, 3}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_0, {512, 3, 1, 1}, {256, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
+    // a same-type quantized copy from rows of a permuted src into a contiguous dst of another shape: whole rows of blocks
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {256, 2, 3, 1}, {512, 3, 1, 1}, {0, 2, 1, 3}, {0, 0, 0, 0}));
 
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
