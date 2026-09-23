@@ -261,8 +261,10 @@ static void launch_gated_delta_net(
     }
 }
 
-// Chunked prefill (chunk_gated_delta_net.cu) where GGML_CUDA_GDN_CHUNKED is unset.
-static constexpr bool gdn_chunked_default = false;
+// Chunked prefill (chunk_gated_delta_net.cu) where GGML_CUDA_GDN_CHUNKED is unset: on, since on
+// Ternary Bonsai 2 27B its KL against the recurrent kernel (mean 0.00148, same top p 98.41 %) is at
+// the bar of the int8 Q.K flash attention already served (0.00150 / 98.3 %).
+static constexpr bool gdn_chunked_default = true;
 
 // GGML_CUDA_GDN_CHUNKED=0 keeps every GATED_DELTA_NET on the recurrent kernel; =1 takes the chunked
 // prefill path wherever the op is eligible.

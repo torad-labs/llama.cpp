@@ -15,6 +15,7 @@ which pins a commit of this branch as a submodule.
 | `4651ce7` | `--checkpoint-every N`: a pinned context checkpoint every N prompt tokens and one at the exact token a prompt forked, so a compaction or a new session on a recurrent/hybrid model resumes from a checkpoint instead of re-prefilling from zero | omit the flag |
 | `da69dc5` | tensor-core flash attention reads a q4_0 K/V cache natively (head size 256, GQA > 4) with int8 Q·K; decode uses it from 4,096 tokens on. RTX 5080: prefill at 131K 930 → 1,382 tok/s, decode at 131K 44.5 → 73.3 tok/s | `GGML_CUDA_FATTN_Q4_0_LEGACY=1` |
 | `f0d83e0` | a rank-1 LoRA fused into one decode launch per adapted weight (dot + scaled outer add) instead of four; `test-backend-ops LORA_RANK1` checks the graph against CPU | `GGML_CUDA_LORA_RANK1_FUSE=0` |
+| `8ea0ee2` | chunked tensor-core Gated DeltaNet prefill, a port of ggml-org/llama.cpp#26001 (16-token chunks: f32 forward substitution, fp16 WMMA Q·Kᵀ and state/output with f32 accumulation, f32 state); reads qwen35's q/k/v views and raw gates in place and leaves the last K-1 tokens of a ubatch on the recurrent kernel, so MTP rollback snapshots are unchanged. RTX 5070 Ti: GDN per 512-token ubatch 53.3 → 15.6 ms, prefill pp512 at 32,768 1,330 → 1,446 tok/s; KL against the recurrent kernel 0.00148 (the int8 Q·K bar: 0.00150) | `GGML_CUDA_GDN_CHUNKED=0` |
 
 Remotes for maintenance: `prism` → PrismML-Eng/llama.cpp (the base), merged in when wanted. The
 83 PrismML branches this repo was first pushed with were removed on 2026-09-20 — every one was at
