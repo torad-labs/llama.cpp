@@ -33,7 +33,10 @@ static __global__ void scale_f32_vec4(
 static void scale_f32_cuda(const float * x, float * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
-    if (cc == GGML_CUDA_CC_DGX_SPARK && nelements >= 1024 && nelements % 4 == 0 &&
+    // GeForce Blackwell takes the float4 path too; GGML_CUDA_SCALE_VEC4_SM120_LEGACY=1 keeps it on GB10 only.
+    static const bool sm120_legacy = getenv("GGML_CUDA_SCALE_VEC4_SM120_LEGACY") != nullptr;
+    if ((cc == GGML_CUDA_CC_DGX_SPARK || (cc == GGML_CUDA_CC_BLACKWELL && !sm120_legacy)) &&
+            nelements >= 1024 && nelements % 4 == 0 &&
             (uintptr_t(x) & 0x0F) == 0 && (uintptr_t(dst) & 0x0F) == 0) {
         const int64_t nelements4 = nelements / 4;
         const int64_t num_blocks = (nelements4 + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;

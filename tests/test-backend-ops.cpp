@@ -6346,6 +6346,38 @@ struct test_concat : public test_case {
     }
 };
 
+// GGML_OP_CONCAT along dim 0 of a short contiguous state and a transposed block of rows: a GDN layer's
+// conv state [d_conv - 1, channels] joined with the new tokens' projection [channels, n_tokens]^T
+struct test_concat_conv_state : public test_case {
+    const ggml_type type;
+    const int64_t n_state; // d_conv - 1
+    const int64_t n_channels;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_state, n_channels, n_tokens);
+    }
+
+    test_concat_conv_state(ggml_type type = GGML_TYPE_F32, int64_t n_state = 3, int64_t n_channels = 10240, int64_t n_tokens = 3)
+        : type(type), n_state(n_state), n_channels(n_channels), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, n_state, n_channels);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, type, n_channels, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * b = ggml_transpose(ctx, x);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -9319,6 +9351,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {128, 16, 3, 1}, 0.0883883f, 0.0f)); // float4 path: a GDN verify's scaled q
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {1027, 3, 1, 1}, 2.0f, 1.0f));        // >= 1024 elements, not a multiple of 4
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
@@ -10017,6 +10051,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_concat(type_a, {128, 12, 13, 14}, dim == 0 ? 256 : 7, dim, v));
             }
         }
+    }
+
+    // the conv-state concat of a GDN layer at decode, speculative verify and prefill, over channel counts that
+    // are and are not multiples of the 32-wide transpose tile, and a state wider than that path takes (9 > 8)
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_F16 }) {
+        for (int64_t n_tokens : { 1, 2, 3, 9, 33, 512 }) {
+            test_cases.emplace_back(new test_concat_conv_state(type, 3, 10240, n_tokens));
+            test_cases.emplace_back(new test_concat_conv_state(type, 3, 1000, n_tokens));
+        }
+        test_cases.emplace_back(new test_concat_conv_state(type, 9, 1000, 3));
     }
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
