@@ -131,7 +131,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 }
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
-        const size_t * src0_nb, const int src1_ncols, bool mul_mat_id) {
+        const size_t * src0_nb, const size_t * src1_nb, const int src1_ncols, bool mul_mat_id) {
     if (ggml_is_quantized(type)) {
         return false;
     }
@@ -141,13 +141,17 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
         return false;
     }
 
-    if (src0_nb[0] != ts) {
+    if (src0_nb[0] != ts || src1_nb[0] != sizeof(float)) {
         return false;
     }
 
-    // Pointers not aligned to the size of half2/nv_bfloat162/float2 would result in a crash:
+    // The kernel takes src0 as float, half2 or nv_bfloat162 (4 bytes, 4/ts elements) with its strides in those units.
+    // For an f16/bf16 src0 it reads src1 as float2 and takes the src1 column stride halved. The launcher asserts an
+    // even src0 row stride and src1 column stride in those units, so every src0 stride must be a multiple of 8 bytes
+    // and every src1 stride a multiple of 2*(4/ts) floats. Otherwise the launcher aborts, a halved odd src1 stride
+    // truncates and the kernel reads the wrong columns, or a float2 read is misaligned.
     for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
-        if (src0_nb[i] % (2*ts) != 0) {
+        if (src0_nb[i] % 8 != 0 || src1_nb[i] % (2*(4/ts)*sizeof(float)) != 0) {
             return false;
         }
     }
