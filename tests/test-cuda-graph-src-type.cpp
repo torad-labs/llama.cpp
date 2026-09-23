@@ -108,6 +108,18 @@ static bool test_retype(ggml_backend_t backend, ggml_backend_t cpu, graph_log & 
     ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, n);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
     ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+
+    // both forms of y = w x must run on this backend
+    bool supported = ggml_backend_supports_op(backend, y);
+    w->type = GGML_TYPE_BF16;
+    supported = supported && ggml_backend_supports_op(backend, y);
+    w->type = GGML_TYPE_F16;
+    if (!supported) {
+        printf("  m=%-2lld: MUL_MAT with an f16 or a bf16 weight is not supported here, skipped\n", (long long) m);
+        ggml_free(ctx);
+        return true;
+    }
+
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y);
