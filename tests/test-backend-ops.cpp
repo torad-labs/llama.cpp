@@ -4494,7 +4494,8 @@ struct test_gated_delta_net : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion: the kernel writes the snapshots
-// straight into the cache view and the cpy is skipped). From upstream test-backend-ops.
+// straight into the cache view and the cpy is skipped). From upstream test-backend-ops. cache_type q8_0
+// is -cts q8_0: the kernel quantizes as it writes, and the cache must hold what the cpy would have.
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -4503,21 +4504,25 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const int64_t K; // snapshot slot count
+    const int     v_repeat;
+    const bool    raw_gates;
+    const ggml_type cache_type;
 
     ggml_tensor * cpy_node = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
+        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, K, v_repeat, raw_gates, cache_type);
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2)
-        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+            int64_t K = 2, int v_repeat = 1, bool raw_gates = false, ggml_type cache_type = GGML_TYPE_F32)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
+          v_repeat(v_repeat), raw_gates(raw_gates), cache_type(cache_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
-        const int64_t H_v = head_count;
+        const int64_t H_v = head_count * v_repeat;
         const int64_t H_k = head_count;
         const int64_t D   = S_v * S_v * H_v;
         const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
@@ -4540,6 +4545,13 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 
         ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         ggml_set_name(gdn_out, "gdn_out");
+        if (raw_gates) {
+            ggml_tensor * dt_bias = ggml_new_tensor_1d(ctx, type, H_v);
+            ggml_tensor * a       = ggml_new_tensor_1d(ctx, type, H_v);
+            ggml_set_name(dt_bias, "dt_bias");
+            ggml_set_name(a,       "a");
+            ggml_gated_delta_net_set_raw_gates(gdn_out, dt_bias, a);
+        }
 
         // snapshot tail view [D, n_seqs, n_written]
         const int64_t attn_score_elems = S_v * H_v * n_seq_tokens * n_seqs;
@@ -4550,7 +4562,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 ggml_row_size(gdn_out->type, attn_score_elems));
 
         // recurrent cache view [D, n_seqs, n_written]
-        ggml_tensor * cache = ggml_new_tensor_3d(ctx, type, D, n_seqs, n_written);
+        ggml_tensor * cache = ggml_new_tensor_3d(ctx, cache_type, D, n_seqs, n_written);
         ggml_set_name(cache, "cache");
         ggml_tensor * dst = ggml_view_3d(ctx, cache,
                 D, n_seqs, n_written,
@@ -4562,8 +4574,12 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         cpy_node = cpy;
 
         // read the cpy output (not the plain dst view, which would not pull the cpy into the graph)
-        // so that neither the gdn nor the cpy is the graph output
-        ggml_tensor * out = ggml_sum(ctx, cpy);
+        // so that neither the gdn nor the cpy is the graph output; a q8_0 cache is read back as f32 first
+        ggml_tensor * cached = cpy;
+        if (cache_type != GGML_TYPE_F32) {
+            cached = ggml_cpy(ctx, cpy, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_seqs, n_written));
+        }
+        ggml_tensor * out = ggml_sum(ctx, cached);
         return out;
     }
 
@@ -4576,17 +4592,28 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
 
     double max_nmse_err() override {
-        // see test_gated_delta_net::max_nmse_err
-        return head_size == 128 && n_seq_tokens >= 128 ? 2e-7 : 1e-7;
+        // see test_gated_delta_net::max_nmse_err. A q8_0 cache behind the chunked path (its cpy is kept) quantizes
+        // that path's fp16 error: a value that moves across a rounding boundary moves by a whole q8_0 step
+        // (1/127 of the block max), 1.3e-6 measured here, still ten times under q8_0's own rounding noise
+        const bool chunk_shape = head_size == 128 && n_seq_tokens >= 128;
+        if (chunk_shape && cache_type == GGML_TYPE_Q8_0) {
+            return 5e-6;
+        }
+        return chunk_shape ? 2e-7 : 1e-7;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
+                // raw: see test_gated_delta_net::initialize_tensors
+                init_tensor_uniform(t, raw_gates ? -3.0f : -20.0f, raw_gates ? 3.0f : -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
-                init_tensor_uniform(t, 0.0f, 1.0f);
+                init_tensor_uniform(t, raw_gates ? -4.0f : 0.0f, raw_gates ? 4.0f : 1.0f);
+            } else if (strcmp(t->name, "dt_bias") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (strcmp(t->name, "a") == 0) {
+                init_tensor_uniform(t, -8.0f, -0.05f);
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else if (strcmp(t->name, "cache") == 0) {
@@ -10537,6 +10564,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 256, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 256, 2, 1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 200, 2, 3));
+    // a q8_0 cache (-cts q8_0), fused: the served Bonsai 2 27B layer (16 k-heads, 48 v-heads, raw gates, K = 3) at
+    // decode and MTP verify over 1-4 seqs, activated gates, and the 32/64 head widths
+    for (int64_t n_seqs : { 1, 2, 4 }) {
+        for (int64_t n_tokens : { 1, 2, 3 }) {
+            test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, n_seqs, 3, 3, true, GGML_TYPE_Q8_0));
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, 1, 1, 3, true,  GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4, 128, 3, 2, 3, 1, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  64, 4, 2, 4, 1, true,  GGML_TYPE_Q8_0));
+    // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
