@@ -459,7 +459,7 @@ template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool swiglu = false, bool 
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used,
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, const bool vec4,
         const float * __restrict__ gate = nullptr,
         const float * __restrict__ norm_weight = nullptr,
         const float * __restrict__ norm_scale = nullptr) {
@@ -486,17 +486,21 @@ static __global__ void quantize_mmq_q8_1(
         base_idx = i3*s03 + i2*s02 + i01*s01;
     }
 
-    const float4 * x4 = (const float4 *) x;
     block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
 
     const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
+    // The 4 floats at p[i..i+3]: one float4 load if the launcher found every row start and pointer 16-byte aligned
+    // (vec4), else four float loads.
+    const auto load4 = [vec4](const float * __restrict__ p, const int64_t i) {
+        return vec4 ? ((const float4 *) p)[i/4] : make_float4(p[i + 0], p[i + 1], p[i + 2], p[i + 3]);
+    };
+
     // Load 4 floats per thread and calculate max. abs. value between them:
-    float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi = i0 < ne00 ? load4(x, base_idx + i00) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if constexpr (swiglu) {
-        const float4 gi = i0 < ne00 ? ((const float4 *) gate)[(base_idx + i00)/4] :
-                                      make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float4 gi = i0 < ne00 ? load4(gate, base_idx + i00) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         xi.x *= ggml_cuda_op_silu_single(gi.x);
         xi.y *= ggml_cuda_op_silu_single(gi.y);
         xi.z *= ggml_cuda_op_silu_single(gi.z);
@@ -505,7 +509,7 @@ static __global__ void quantize_mmq_q8_1(
     if constexpr (rms_scale) {
         const int64_t row = ((int64_t) blockIdx.z)*ne1 + blockIdx.x;
         const float scale = norm_scale[row];
-        const float4 wi = i0 < ne00 ? ((const float4 *) norm_weight)[i00/4] : make_float4(0, 0, 0, 0);
+        const float4 wi = i0 < ne00 ? load4(norm_weight, i00) : make_float4(0, 0, 0, 0);
         // Preserve the operation order of the unfused RMS_NORM -> MUL graph:
         // (scale * x) * weight.  Reassociating this as x * (scale * weight)
         // can change the last bit and, in turn, a greedy decoding trajectory.
@@ -579,12 +583,25 @@ static __global__ void quantize_mmq_q8_1(
     GGML_UNUSED(n_expert_used);
 }
 
+// Whether quantize_mmq_q8_1 can load its input 4 floats at a time as one float4: every pointer it reads (x, and a fused
+// gate or norm weight) and every row start of x (strides s01, s02, s03 in floats) at a multiple of 16 bytes. Otherwise,
+// as for a view of src1 whose rows start at an arbitrary float, it loads one float at a time: as float4 such a view
+// would fault with a misaligned address or, with a stride not a multiple of 4 floats, have its row starts truncated to
+// the float4 below and quantize the wrong values.
+static bool quantize_mmq_q8_1_vec4(const float * x, const int64_t s01, const int64_t s02, const int64_t s03,
+        const float * gate = nullptr, const float * norm_weight = nullptr) {
+    const auto aligned = [](const float * p) { return reinterpret_cast<uintptr_t>(p) % sizeof(float4) == 0; };
+    return aligned(x) && (!gate || aligned(gate)) && (!norm_weight || aligned(norm_weight)) &&
+        s01 % 4 == 0 && s02 % 4 == 0 && s03 % 4 == 0;
+}
+
 void quantize_mmq_q8_1_swiglu_cuda(
         const float * x, const float * gate, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+    const bool vec4 = quantize_mmq_q8_1_vec4(x, s01, s02, s03, gate);
 
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
@@ -592,15 +609,15 @@ void quantize_mmq_q8_1_swiglu_cuda(
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true><<<num_blocks, block_size, 0, stream>>>(
-                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, gate);
+                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, vec4, gate);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true><<<num_blocks, block_size, 0, stream>>>(
-                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, gate);
+                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, vec4, gate);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false, true><<<num_blocks, block_size, 0, stream>>>(
-                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, gate);
+                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, vec4, gate);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -613,6 +630,7 @@ void quantize_mmq_q8_1_rms_cuda(
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+    const bool vec4 = quantize_mmq_q8_1_vec4(x, s01, s02, s03, /*gate =*/ nullptr, weight);
 
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
@@ -620,15 +638,15 @@ void quantize_mmq_q8_1_rms_cuda(
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, false, true><<<num_blocks, block_size, 0, stream>>>(
-                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, nullptr, weight, scale);
+                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, vec4, nullptr, weight, scale);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, false, true><<<num_blocks, block_size, 0, stream>>>(
-                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, nullptr, weight, scale);
+                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, vec4, nullptr, weight, scale);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false, false, true><<<num_blocks, block_size, 0, stream>>>(
-                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, nullptr, weight, scale);
+                x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, vec4, nullptr, weight, scale);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -658,6 +676,7 @@ void quantize_mmq_q8_1_cuda(
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+    const bool vec4 = quantize_mmq_q8_1_vec4(x, s01, s02, s03);
 
     // ne1 tends to assume the highest values, therefore use it as the "x" dimension of the CUDA grid:
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
@@ -666,15 +685,15 @@ void quantize_mmq_q8_1_cuda(
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, vec4);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, vec4);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, vec4);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -689,6 +708,7 @@ void quantize_scatter_mmq_q8_1_cuda(
         const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+    const bool vec4 = quantize_mmq_q8_1_vec4(x, /*s01 =*/ 0, /*s02 =*/ stride_token, /*s03 =*/ 0);
 
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(n_tokens, block_num_y, 1);
@@ -696,15 +716,15 @@ void quantize_scatter_mmq_q8_1_cuda(
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true><<<num_blocks, block_size, 0, stream>>>(
-                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used, vec4);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true><<<num_blocks, block_size, 0, stream>>>(
-                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used, vec4);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, true><<<num_blocks, block_size, 0, stream>>>(
-                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used, vec4);
             break;
         default:
             GGML_ABORT("fatal error");

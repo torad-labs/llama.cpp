@@ -783,36 +783,29 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
-bool ggml_cuda_mmvf_supports(enum ggml_type type, const int64_t * src0_ne, const size_t * src0_nb) {
-    if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16) {
+// The kernel reads every row of an operand in pairs (half2, nv_bfloat162 or float2), so the row length must be even,
+// the rows contiguous, and the data address and every stride a multiple of the pair size. An odd stride trips the
+// launcher's asserts; a data address offset by an odd number of elements faults with a misaligned address.
+static bool ggml_cuda_mmvf_can_read(const ggml_tensor * t) {
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
         return false;
     }
 
-    if (src0_ne[0] % 2 != 0) {
-        return false;
-    }
-
-    const size_t ts = ggml_type_size(type);
-    if (src0_nb[0] != ts) {
-        return false;
-    }
-
-    // Pointers not aligned to the size of half2/nv_bfloat162/float2 would result in a crash:
-    for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
-        if (src0_nb[i] % (2*ts) != 0) {
-            return false;
-        }
-    }
-
-    return true;
+    const size_t ts = ggml_type_size(t->type);
+    return t->ne[0] % 2 == 0 && t->nb[0] == ts && ggml_cuda_is_aligned(t, 2*ts);
 }
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb,
-        const int64_t * src1_ne, const size_t * src1_nb, int64_t ne11) {
-    // The kernel reads src1 as float2, so src1 must pass the same check as an f32 src0.
-    if (!ggml_cuda_mmvf_supports(type, src0_ne, src0_nb) || !ggml_cuda_mmvf_supports(GGML_TYPE_F32, src1_ne, src1_nb)) {
+bool ggml_cuda_mmvf_supports(const ggml_tensor * src0, const ggml_tensor * src1) {
+    return src1->type == GGML_TYPE_F32 && ggml_cuda_mmvf_can_read(src0) && ggml_cuda_mmvf_can_read(src1);
+}
+
+bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, const ggml_tensor * src1, int cc, int64_t ne11) {
+    if (!ggml_cuda_mmvf_supports(src0, src1)) {
         return false;
     }
+
+    const enum ggml_type type    = src0->type;
+    const int64_t *      src0_ne = src0->ne;
 
     switch (type) {
         case GGML_TYPE_F32:
