@@ -1459,8 +1459,8 @@ struct test_case {
                 if (memcmp(t1_data.data(), t2_data.data(), ggml_nbytes(t1)) != 0) {
                     printf("sentinel mismatch: %s ", t1->name);
                     ud->ok = false;
-                    return true;
                 }
+                return true; // a sentinel is compared byte for byte, not as values
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
@@ -1507,6 +1507,11 @@ struct test_case {
         std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
+        }
+        if (run_whole_graph()) {
+            // the callback runs only for the nodes listed here, so list the sentinels too: a fused kernel that
+            // writes outside its view shows up only in them
+            fused_nodes_to_verify.insert(fused_nodes_to_verify.end(), sentinels.begin(), sentinels.end());
         }
         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
@@ -4507,18 +4512,28 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int     v_repeat;
     const bool    raw_gates;
     const ggml_type cache_type;
+    // 0: the cache is exactly the [D, n_seqs, n_written] view. > 0: the cache is laid out as delta-net-base.cpp lays
+    // out ssm_states_all, K slots of mem_size rows, and the view takes n_seqs rows from row kv_head of each slot
+    const int64_t mem_size;
+    const int64_t kv_head;
 
-    ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * cpy_node      = nullptr;
+    ggml_tensor * readback_node = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, K, v_repeat, raw_gates, cache_type);
+        std::string s = VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, K, v_repeat, raw_gates, cache_type);
+        if (mem_size > 0) {
+            s += "," + VARS_TO_STR2(mem_size, kv_head);
+        }
+        return s;
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2, int v_repeat = 1, bool raw_gates = false, ggml_type cache_type = GGML_TYPE_F32)
+            int64_t K = 2, int v_repeat = 1, bool raw_gates = false, ggml_type cache_type = GGML_TYPE_F32,
+            int64_t mem_size = 0, int64_t kv_head = 0)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
-          v_repeat(v_repeat), raw_gates(raw_gates), cache_type(cache_type) {}
+          v_repeat(v_repeat), raw_gates(raw_gates), cache_type(cache_type), mem_size(mem_size), kv_head(kv_head) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -4562,12 +4577,21 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 ggml_row_size(gdn_out->type, attn_score_elems));
 
         // recurrent cache view [D, n_seqs, n_written]
-        ggml_tensor * cache = ggml_new_tensor_3d(ctx, cache_type, D, n_seqs, n_written);
+        const size_t  row_size = ggml_row_size(cache_type, D);
+        ggml_tensor * cache;
+        ggml_tensor * dst;
+        if (mem_size > 0) {
+            // slot stride nb[2] = mem_size rows, not n_seqs, at an offset of kv_head rows
+            cache = ggml_new_tensor_2d(ctx, cache_type, D, mem_size * K);
+            dst   = ggml_view_3d(ctx, cache, D, n_seqs, n_written, row_size, mem_size * row_size, kv_head * row_size);
+        } else {
+            cache = ggml_new_tensor_3d(ctx, cache_type, D, n_seqs, n_written);
+            dst = ggml_view_3d(ctx, cache,
+                    D, n_seqs, n_written,
+                    ggml_row_size(cache->type, D),
+                    ggml_row_size(cache->type, D * n_seqs), 0);
+        }
         ggml_set_name(cache, "cache");
-        ggml_tensor * dst = ggml_view_3d(ctx, cache,
-                D, n_seqs, n_written,
-                ggml_row_size(cache->type, D),
-                ggml_row_size(cache->type, D * n_seqs), 0);
 
         ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
         ggml_set_name(cpy, "gdn_cache_cpy");
@@ -4576,7 +4600,14 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         // read the cpy output (not the plain dst view, which would not pull the cpy into the graph)
         // so that neither the gdn nor the cpy is the graph output; a q8_0 cache is read back as f32 first
         ggml_tensor * cached = cpy;
-        if (cache_type != GGML_TYPE_F32) {
+        if (mem_size > 0) {
+            // every row from the view's first to the cache's end, read through the cpy (so after it): a snapshot
+            // written to another slot or row is compared too, not only the view
+            const int64_t n_rows = mem_size * K - kv_head;
+            cached = ggml_cpy(ctx, ggml_view_2d(ctx, cpy, D, n_rows, row_size, 0),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rows));
+            readback_node = cached;
+        } else if (cache_type != GGML_TYPE_F32) {
             cached = ggml_cpy(ctx, cpy, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_seqs, n_written));
         }
         ggml_tensor * out = ggml_sum(ctx, cached);
@@ -4589,7 +4620,12 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (readback_node != nullptr) {
+            return { cpy_node, readback_node };
+        }
+        return { cpy_node };
+    }
 
     double max_nmse_err() override {
         // see test_gated_delta_net::max_nmse_err. A q8_0 cache behind the chunked path (its cpy is kept) quantizes
@@ -4815,6 +4851,41 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// GGML_OP_MUL_MAT with an f32 src1 whose column stride is an odd number of floats: a [k, n] view of a [k + 1, n]
+// tensor. The CUDA vector kernel reads src1 as float2 and asserts an even column stride, so a dispatch that sends it
+// this src1 aborts instead of falling back.
+struct test_mul_mat_src1_odd_stride : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_src1_odd_stride(ggml_type type_a = GGML_TYPE_BF16, int64_t m = 48, int64_t n = 4, int64_t k = 256)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + 1, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        b = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
+        ggml_set_name(b, "b_view");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -9657,6 +9728,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, 12, 5120, {2, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 40,  3, 5122, {1, 1}, {1, 1}));
     }
+    // the same shapes with an src1 column stride the vector kernel cannot read (odd in floats), at the batches only the
+    // untiled dispatch sends it on Ampere and newer (f32 from 4, f16/bf16 from 2; below those, ggml_cuda_should_use_mmvf
+    // takes them and checks only src0 as well)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t n : {2, 3, 4, 8}) {
+            if (type_a == GGML_TYPE_F32 && n < 4) {
+                continue;
+            }
+            test_cases.emplace_back(new test_mul_mat_src1_odd_stride(type_a, 48, n, 5120));
+        }
+    }
 
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
@@ -10575,6 +10657,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4, 128, 3, 2, 3, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  64, 4, 2, 4, 1, true,  GGML_TYPE_Q8_0));
+    // the served cache view (delta-net-base.cpp): K = 3 slots of mem_size = n_seqs + 2 rows, viewed at kv_head = 1, so
+    // nb[2] is mem_size rows and not n_seqs; the readback covers every row from the view to the cache's end. q8_0 at
+    // decode; the 3-token verify in f32 (same slot stride, nb[2] / type size), since the CPU reference cannot cpy into a
+    // non-contiguous q8_0 view (ggml_compute_forward_dup_to_q aborts)
+    for (int64_t n_seqs : { 1, 2 }) {
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, n_seqs, 3, 3, true, GGML_TYPE_Q8_0, n_seqs + 2, 1));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_F32,  n_seqs + 2, 1));    }
     // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0));
