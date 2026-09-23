@@ -4854,41 +4854,6 @@ struct test_mul_mat : public test_case {
     }
 };
 
-// GGML_OP_MUL_MAT with an f32 src1 whose column stride is an odd number of floats: a [k, n] view of a [k + 1, n]
-// tensor. The CUDA vector kernel reads src1 as float2 and asserts an even column stride, so a dispatch that sends it
-// this src1 aborts instead of falling back.
-struct test_mul_mat_src1_odd_stride : public test_case {
-    const ggml_type type_a;
-    const int64_t m;
-    const int64_t n;
-    const int64_t k;
-
-    std::string vars() override {
-        return VARS_TO_STR4(type_a, m, n, k);
-    }
-
-    double max_nmse_err() override {
-        return 5e-4;
-    }
-
-    test_mul_mat_src1_odd_stride(ggml_type type_a = GGML_TYPE_BF16, int64_t m = 48, int64_t n = 4, int64_t k = 256)
-        : type_a(type_a), m(m), n(n), k(k) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
-        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + 1, n);
-        ggml_set_name(a, "a");
-        ggml_set_name(b, "b");
-
-        b = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
-        ggml_set_name(b, "b_view");
-
-        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
-        ggml_set_name(out, "out");
-        return out;
-    }
-};
-
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -5124,6 +5089,82 @@ struct test_mul_mat_id : public test_case {
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
 
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// GGML_OP_MUL_MAT or GGML_OP_MUL_MAT_ID over views with padded rows: src0 is a [k, m] view of rows of k + pad_a
+// elements, and the f32 src1 is a [k, n] view of rows of k + pad_b floats ([k, 1, n] for MUL_MAT_ID, the broadcast
+// layout of an MoE gate/up input). The CUDA float kernels read their operands in pairs and assert on these strides.
+// mmvf needs an even src1 stride in floats. mmf takes its strides in units of the src0 element pair (float, half2 or
+// nv_bfloat162), halves the src1 stride for an f16/bf16 src0, and needs an even src0 row stride and src1 column stride
+// in those units. A dispatch that sends a kernel operands it cannot read aborts, or reads the wrong columns, instead of
+// falling back. With fused set, a gate product shares src1 and a SWIGLU joins the two: the pattern the fused vector
+// kernel takes at one token.
+struct test_mul_mat_padded : public test_case {
+    static constexpr int n_mats = 4; // MUL_MAT_ID only
+    static constexpr int n_used = 2;
+
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t pad_a;
+    const int64_t pad_b;
+    const bool use_id;
+    const bool fused;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, m, n, k, pad_a, pad_b, use_id, fused);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return fused ? "MUL_MAT_VEC_FUSION" : ggml_op_name(use_id ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT);
+    }
+
+    bool run_whole_graph() override { return fused; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_padded(ggml_type type_a = GGML_TYPE_BF16, int64_t m = 48, int64_t n = 4, int64_t k = 256,
+            int64_t pad_a = 0, int64_t pad_b = 1, bool use_id = false, bool fused = false)
+        : type_a(type_a), m(m), n(n), k(k), pad_a(pad_a), pad_b(pad_b), use_id(use_id), fused(fused) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ids = nullptr;
+        if (use_id) {
+            ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            ggml_set_name(ids, "ids");
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k + pad_b, use_id ? 1 : n, use_id ? n : 1);
+        ggml_set_name(b, "b");
+        b = ggml_view_3d(ctx, b, k, b->ne[1], b->ne[2], b->nb[1], b->nb[2], 0);
+        ggml_set_name(b, "b_view");
+
+        auto product = [&](const char * name) {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k + pad_a, m, use_id ? n_mats : 1);
+            ggml_set_name(a, name);
+            if (pad_a > 0) { // a view node between the gate and up products would keep them from fusing
+                a = ggml_view_3d(ctx, a, k, m, a->ne[2], a->nb[1], a->nb[2], 0);
+            }
+            return use_id ? ggml_mul_mat_id(ctx, a, b, ids) : ggml_mul_mat(ctx, a, b);
+        };
+
+        ggml_tensor * out = product("a");
+        if (fused) {
+            out = ggml_swiglu_split(ctx, product("gate"), out);
+        }
+        ggml_set_name(out, "out");
         return out;
     }
 
@@ -9352,6 +9393,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {2, 2, 524281, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
+    // a strided quantized dst: each row whole contiguous blocks, the rows 4 apart where 2 are copied (the -cts q8_0
+    // recurrent-state snapshot view of delta-net-base.cpp); from a contiguous, a permuted and a reshaped src
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_0, {256, 2, 3, 1}, {256, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_Q8_0, {256, 2, 3, 1}, {256, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {256, 2, 3, 1}, {256, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_0, {256, 3, 2, 1}, {256, 2, 3, 1}, {0, 2, 1, 3}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_0, {512, 3, 1, 1}, {256, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
+    // copies the CPU has no kernel for, which it must decline in supports_op rather than crash, hang or abort on: a
+    // quantized dst transposed so that its rows are one block or several, a dequantizing copy into a transposed f32 dst,
+    // a copy between two quantized types, i32 into anything but f32, and a same-type quantized copy into a transposed dst
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_0, {64, 32, 1, 1}, {-1, -1, -1, -1}, {0, 0, 0, 0}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_Q4_0, {64, 64, 2, 1}, {-1, -1, -1, -1}, {0, 0, 0, 0}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_0, GGML_TYPE_F32, {64, 32, 1, 1}, {-1, -1, -1, -1}, {0, 0, 0, 0}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, {256, 4, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F16, {256, 2, 3, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {256, 4, 1, 1}, {-1, -1, -1, -1}, {0, 0, 0, 0}, {1, 0, 2, 3}));
+    // a same-type quantized copy from rows of a permuted src into a contiguous dst of another shape: whole rows of blocks
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {256, 2, 3, 1}, {512, 3, 1, 1}, {0, 2, 1, 3}, {0, 0, 0, 0}));
 
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
@@ -9758,15 +9817,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, 12, 5120, {2, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 40,  3, 5122, {1, 1}, {1, 1}));
     }
-    // the same shapes with an src1 column stride the vector kernel cannot read (odd in floats), at the batches only the
-    // untiled dispatch sends it on Ampere and newer (f32 from 4, f16/bf16 from 2; below those, ggml_cuda_should_use_mmvf
-    // takes them and checks only src0 as well)
+    // operand strides the float kernels cannot read, which must fall back (test_mul_mat_padded). At 48 rows: an src1
+    // stride odd in floats at every batch the vector kernel takes, and under the fused gate/up vector kernel at one
+    // token. At 64 rows, which mmf tiles: src1 strides of 1 and 2 mod 4 floats and an src0 row stride of 2 mod 4
+    // elements, for MUL_MAT and MUL_MAT_ID (32 tokens reach mmf's compacted-ids path).
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
-        for (int64_t n : {2, 3, 4, 8}) {
-            if (type_a == GGML_TYPE_F32 && n < 4) {
-                continue;
+        for (int64_t n : {1, 2, 3, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_padded(type_a, 48, n, 5120, 0, 1));
+        }
+        for (bool use_id : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_padded(type_a, 48, 1, 5120, 0, 1, use_id, /*fused =*/ true));
+            const int64_t n_max = use_id ? 32 : 16;
+            for (int64_t n : {int64_t(4), n_max}) {
+                for (int64_t pad_b : {1, 2}) {
+                    test_cases.emplace_back(new test_mul_mat_padded(type_a, 64, n, 5120, 0, pad_b, use_id));
+                }
             }
-            test_cases.emplace_back(new test_mul_mat_src1_odd_stride(type_a, 48, n, 5120));
+            test_cases.emplace_back(new test_mul_mat_padded(type_a, 64, 4, 5120, 2, 0, use_id));
         }
     }
 
@@ -10703,11 +10770,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  64, 4, 2, 4, 1, true,  GGML_TYPE_Q8_0));
     // the served cache view (delta-net-base.cpp): K = 3 slots of mem_size = n_seqs + 2 rows, viewed at kv_head = 1, so
     // nb[2] is mem_size rows and not n_seqs; the readback covers every row from the view to the cache's end. q8_0 at
-    // decode; the 3-token verify in f32 (same slot stride, nb[2] / type size), since the CPU reference cannot cpy into a
-    // non-contiguous q8_0 view (ggml_compute_forward_dup_to_q aborts)
+    // decode and at the 3-token MTP verify (the CPU reference quantizes row by row into the non-contiguous view), and
+    // the verify with an f32 cache
     for (int64_t n_seqs : { 1, 2 }) {
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, n_seqs, 3, 3, true, GGML_TYPE_Q8_0, n_seqs + 2, 1));
-        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_F32,  n_seqs + 2, 1));    }
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_Q8_0, n_seqs + 2, 1));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_F32,  n_seqs + 2, 1));
+    }
     // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0));

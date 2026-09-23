@@ -807,8 +807,10 @@ bool ggml_cuda_mmvf_supports(enum ggml_type type, const int64_t * src0_ne, const
     return true;
 }
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
-    if (!ggml_cuda_mmvf_supports(type, src0_ne, src0_nb)) {
+bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb,
+        const int64_t * src1_ne, const size_t * src1_nb, int64_t ne11) {
+    // The kernel reads src1 as float2, so src1 must pass the same check as an f32 src0.
+    if (!ggml_cuda_mmvf_supports(type, src0_ne, src0_nb) || !ggml_cuda_mmvf_supports(GGML_TYPE_F32, src1_ne, src1_nb)) {
         return false;
     }
 
