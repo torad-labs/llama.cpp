@@ -4,8 +4,9 @@
 
 // fused-kernel recurrent-state output; strides in elements (per-seq stride is always D, set in-kernel)
 struct ggml_cuda_gated_delta_net_fused_cache {
-    float * data;        // rollback slot 0
-    int64_t slot_stride; // between rollback slots (0 when K==1)
+    void *  data;        // rollback slot 0: f32 rows, or q8_0 rows when q8_0
+    int64_t slot_stride; // between rollback slots, in elements (0 when K==1)
+    bool    q8_0;        // the cache is q8_0 (-cts q8_0): the kernel quantizes as it writes
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

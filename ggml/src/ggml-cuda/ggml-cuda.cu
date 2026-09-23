@@ -2819,17 +2819,28 @@ static int ggml_cuda_try_gdn_cache_fusion(
         return 0;
     }
 
-    // dst is the [D, n_seqs, n_written] cache view; require nb[1] == D (the per-seq stride the kernel
-    // assumes). ggml_cpy pins src to the same element count.
+    // dst is the [D, n_seqs, n_written] cache view, f32 or q8_0 (-cts q8_0); require nb[1] == one row of D (the
+    // per-seq stride the kernel assumes). ggml_cpy pins src to the same element count.
+    const bool q8 = dst->type == GGML_TYPE_Q8_0;
     const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
-    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+    if (dst->op != GGML_OP_VIEW || (dst->type != GGML_TYPE_F32 && !q8) || dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
-        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        dst->nb[0] != ggml_type_size(dst->type) || dst->nb[1] != (size_t) ggml_row_size(dst->type, D)) {
+        return 0;
+    }
+    // q8_0: the kernel quantizes one block per warp-wide slice of a state column (gdn_store_state), so a
+    // 32-lane warp, a head width that is a multiple of 32, the scalar gate, and the recurrent kernel (the
+    // chunked prefill pipeline writes f32; its cpy stays)
+    // GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate cpy.
+    static const bool q8_legacy = getenv("GGML_CUDA_GDN_Q8_CACHE_LEGACY") != nullptr;
+    if (q8 && (q8_legacy || S_v % QK8_0 != 0 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != QK8_0 ||
+               gdn->src[3]->ne[0] == S_v || ggml_cuda_should_use_chunked_gdn(gdn))) {
         return 0;
     }
 
-    fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
-    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    fused_state_cpy.data        = dst->data; // rollback group 0 (newest)
+    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / ggml_type_size(dst->type) * ggml_blck_size(dst->type)) : 0;
+    fused_state_cpy.q8_0        = q8;
     return skip;
 }
 
