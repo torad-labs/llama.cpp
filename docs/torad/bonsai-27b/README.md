@@ -86,6 +86,14 @@ Measured on the RTX 5070 Ti and kept out of `main`, each for the reason given:
   (bar 98.3 %).
 - **Decoding each weight block once for several columns in the vector kernel.** No measurable
   change at 2-6 columns; the kernel was already at 82-94 % of DRAM bandwidth.
+- **P·V in FP8 (e4m3) in the q4_0 flash attention.** On GeForce Blackwell an FP8 MMA with f32
+  accumulation runs at twice the f16 rate, so P and the V tiles went to e4m3.
+  - Prefill at 131,072: 1,032 / 1,006 → 1,080 tok/s, about +6 %.
+  - Decode at 131,072: 60.1 / 57.3 → 61.3 tok/s, within the drift between the two off runs.
+  - Nothing at 32,768 or below, in either direction.
+  - It fails the quality bar: KL against the f16 P·V is 0.00162 (bar 0.00150). Same top-p is
+    98.56 % (bar 98.3 %).
+  - The numbers are one binary with its switch off / on / off.
 
 ## Run it yourself
 
