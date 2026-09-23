@@ -1826,14 +1826,16 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_ten
 // K = 5120, rows not a multiple of 32): that kernel is chosen at rows x cols 48x2..8, 80x2..4 and 176x2, where the vector
 // kernel takes 2.6-6.5 us; elsewhere cuBLAS runs 6-9 us and the vector kernel only keeps up while rows x cols is small
 // (80x6: 6.3 vs 6.1 us, 80x8: 8.0 vs 6.2). So the vector kernel takes rows x cols <= 512, cuBLAS the rest.
-// GGML_CUDA_MMVF_UNTILED_LEGACY=1 restores cuBLAS here too.
-static bool ggml_cuda_should_use_mmvf_untiled(const ggml_tensor * src0, int64_t ne11) {
+// GGML_CUDA_MMVF_UNTILED_LEGACY=1 restores cuBLAS here too. The kernel reads src1 as float2 and src0 in pairs, so src1
+// must pass the same stride check as src0 (an odd column stride in floats trips its assert).
+static bool ggml_cuda_should_use_mmvf_untiled(const ggml_tensor * src0, const ggml_tensor * src1, int64_t ne11) {
     static const bool legacy = [] {
         const char * e = getenv("GGML_CUDA_MMVF_UNTILED_LEGACY");
         return e != nullptr && atoi(e) != 0;
     }();
     return !legacy && ne11 <= MMVF_MAX_BATCH_SIZE && src0->ne[1]*ne11 <= 512
-        && ggml_cuda_mmvf_supports(src0->type, src0->ne, src0->nb);
+        && ggml_cuda_mmvf_supports(src0->type, src0->ne, src0->nb)
+        && ggml_cuda_mmvf_supports(src1->type, src1->ne, src1->nb);
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -1881,7 +1883,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvf_untiled(src0, ne11)) {
+    if (ggml_cuda_should_use_mmvf_untiled(src0, src1, ne11)) {
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }

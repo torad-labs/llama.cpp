@@ -4854,6 +4854,41 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT with an f32 src1 whose column stride is an odd number of floats: a [k, n] view of a [k + 1, n]
+// tensor. The CUDA vector kernel reads src1 as float2 and asserts an even column stride, so a dispatch that sends it
+// this src1 aborts instead of falling back.
+struct test_mul_mat_src1_odd_stride : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_src1_odd_stride(ggml_type type_a = GGML_TYPE_BF16, int64_t m = 48, int64_t n = 4, int64_t k = 256)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + 1, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        b = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
+        ggml_set_name(b, "b_view");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9692,6 +9727,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, 12, 5120, {2, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 40,  3, 5122, {1, 1}, {1, 1}));
+    }
+    // the same shapes with an src1 column stride the vector kernel cannot read (odd in floats), at the batches only the
+    // untiled dispatch sends it on Ampere and newer (f32 from 4, f16/bf16 from 2; below those, ggml_cuda_should_use_mmvf
+    // takes them and checks only src0 as well)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t n : {2, 3, 4, 8}) {
+            if (type_a == GGML_TYPE_F32 && n < 4) {
+                continue;
+            }
+            test_cases.emplace_back(new test_mul_mat_src1_odd_stride(type_a, 48, n, 5120));
+        }
     }
 
     for (ggml_type type_a : other_types) {
