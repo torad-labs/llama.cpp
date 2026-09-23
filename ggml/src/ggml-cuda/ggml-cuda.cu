@@ -2823,12 +2823,15 @@ static int ggml_cuda_try_gdn_cache_fusion(
     }
 
     // dst is the [D, n_seqs, n_written] cache view, f32 or q8_0 (-cts q8_0); require nb[1] == one row of D (the
-    // per-seq stride the kernel assumes). ggml_cpy pins src to the same element count.
+    // per-seq stride the kernel assumes) and nb[2] a whole number of blocks (the slot stride below is nb[2] in
+    // elements; a remainder would be truncated and every slot after the first written shifted). ggml_cpy pins src to
+    // the same element count.
     const bool q8 = dst->type == GGML_TYPE_Q8_0;
     const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
     if (dst->op != GGML_OP_VIEW || (dst->type != GGML_TYPE_F32 && !q8) || dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
-        dst->nb[0] != ggml_type_size(dst->type) || dst->nb[1] != (size_t) ggml_row_size(dst->type, D)) {
+        dst->nb[0] != ggml_type_size(dst->type) || dst->nb[1] != (size_t) ggml_row_size(dst->type, D) ||
+        dst->nb[2] % ggml_type_size(dst->type) != 0) {
         return 0;
     }
     // q8_0: the kernel quantizes one block per warp-wide slice of a state column (gdn_store_state), so a
