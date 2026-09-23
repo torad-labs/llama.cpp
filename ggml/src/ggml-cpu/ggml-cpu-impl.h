@@ -534,6 +534,9 @@ void ggml_barrier(struct ggml_threadpool * tp);
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 
+// whether ggml_compute_forward_dup (ops.cpp) has a kernel for dst, a DUP, CPY or CONT, given its types and layout
+bool ggml_cpu_dup_supported(const struct ggml_tensor * dst);
+
 #ifdef __cplusplus
 }
 #endif

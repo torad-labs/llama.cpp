@@ -4,6 +4,7 @@
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
+#include "ggml-cpu-impl.h"
 #include "amx/amx.h"
 
 #include <cctype>
@@ -440,7 +441,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_DUP:
         case GGML_OP_CPY:
+        case GGML_OP_CONT:
+            // all three run ggml_compute_forward_dup: supported is exactly what it has a kernel for
+            return ggml_cpu_dup_supported(op);
         case GGML_OP_SET_ROWS:
             return
                 op->type != GGML_TYPE_IQ3_XXS &&
