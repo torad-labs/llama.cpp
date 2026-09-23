@@ -1,8 +1,8 @@
 # Ternary Bonsai 2 27B on a Blackwell GPU, driven from Claude Code
 
 Ternary Bonsai 2 27B is PrismML's ternary Qwen3.8-27B: 64 layers (48 Gated DeltaNet + 16 full
-attention), 1.72 bits per weight, 6.8 GB on disk. It fits a 16 GB GeForce card with a 262,144-token
-window. This fork (torad-labs/llama.cpp) is PrismML's llama.cpp plus kernels and server features
+attention), packed as PQ2_0 at 2.13 bits per weight, 7.66 GB with its MTP draft head. It fits a
+16 GB GeForce card with a 262,144-token window. This fork (torad-labs/llama.cpp) is PrismML's llama.cpp plus kernels and server features
 measured on that model on RTX 50-series cards. This page has the numbers and every command needed
 to reproduce them, then shows how to put the server behind Claude Code with
 [splice](https://github.com/torad-labs/splice).
@@ -13,8 +13,9 @@ One RTX 5070 Ti (16 GB), the public pack, and PrismML's latest release (`prism-b
 against this fork at `3520147`. Both were built with the flags in step 1.
 
 **Long context is where the fork pays.** At 131,072 tokens of context it decodes 1.83× and
-prefills 2.0× faster, because the attention reads the q4_0 cache directly instead of converting it
-to fp16 first. From [`bench-matrix.sh`](bench-matrix.sh) (llama-bench, q4_0 K/V, flash attention
+prefills 2.0× faster, mostly because the attention reads the q4_0 cache directly instead of
+converting it to fp16 first. Prefill also carries the chunked Gated DeltaNet kernel, which is
+worth +9 % at 32K on its own (row `8ea0ee2` below). From [`bench-matrix.sh`](bench-matrix.sh) (llama-bench, q4_0 K/V, flash attention
 on, no draft head on either side, 3 repetitions):
 
 | context depth | prefill (pp512), Prism → fork | decode (tg128), Prism → fork |
