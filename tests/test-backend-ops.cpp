@@ -9370,6 +9370,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {256, 2, 3, 1}, {256, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_0, {256, 3, 2, 1}, {256, 2, 3, 1}, {0, 2, 1, 3}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_0, {512, 3, 1, 1}, {256, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {256, 4, 3, 1}));
+    // copies the CPU has no kernel for, which it must decline in supports_op rather than crash, hang or abort on: a
+    // quantized dst transposed so that its rows are one block or several, a dequantizing copy into a transposed f32 dst,
+    // a copy between two quantized types, i32 into anything but f32, and a same-type quantized copy into a transposed dst
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_0, {64, 32, 1, 1}, {-1, -1, -1, -1}, {0, 0, 0, 0}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_Q4_0, {64, 64, 2, 1}, {-1, -1, -1, -1}, {0, 0, 0, 0}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_0, GGML_TYPE_F32, {64, 32, 1, 1}, {-1, -1, -1, -1}, {0, 0, 0, 0}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, {256, 4, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F16, {256, 2, 3, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {256, 4, 1, 1}, {-1, -1, -1, -1}, {0, 0, 0, 0}, {1, 0, 2, 3}));
+    // a same-type quantized copy from rows of a permuted src into a contiguous dst of another shape: whole rows of blocks
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {256, 2, 3, 1}, {512, 3, 1, 1}, {0, 2, 1, 3}, {0, 0, 0, 0}));
 
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
