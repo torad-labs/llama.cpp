@@ -266,6 +266,74 @@ static void ggml_compute_forward_dup_flt(
 }
 
 
+// Quantizes src into a dst whose rows are each whole contiguous blocks but which is otherwise laid out freely: a view
+// with a row or slot stride wider than its rows (the -cts q8_0 recurrent-state snapshots of delta-net-base.cpp), or a
+// contiguous dst behind a src strided in its first dimension. dst row r takes the flat elements [r*ne0, (r+1)*ne0) of
+// src, which may be strided or shaped differently. The threads split the dst's blocks, not its rows, so that a few long
+// rows still spread over every thread.
+template<typename src_t>
+static void ggml_compute_forward_dup_to_q_rows(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const ggml_from_float_t quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
+    const int64_t qk = ggml_blck_size(dst->type);
+    const size_t  qs = ggml_type_size(dst->type);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // blocks per dst row, blocks in the dst, and this thread's block range
+    const int64_t nbr = ne0 / qk;
+    const int64_t nbt = nbr * ne1 * ne2 * ne3;
+    const int64_t dbt = (nbt + nth - 1) / nth;
+    const int64_t b0  = std::min(dbt * ith, nbt);
+    const int64_t b1  = std::min(b0 + dbt, nbt);
+
+    // at most one dst row per pass; the work buffer holds ne0 floats per thread (ggml_graph_plan, GGML_OP_CPY)
+    float * src0_f32 = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
+
+    for (int64_t b = b0; b < b1; ) {
+        const int64_t ir = b / nbr; // dst row, flattened over ne1, ne2, ne3
+        const int64_t ib = b % nbr; // first block of the pass within that row
+        const int64_t n  = std::min(nbr - ib, b1 - b) * qk;
+
+        // gather the pass's n elements of src, from flat index ir*ne0 + ib*qk on
+        int64_t f   = ir * ne0 + ib * qk;
+        int64_t i00 = f % ne00; f /= ne00;
+        int64_t i01 = f % ne01; f /= ne01;
+        int64_t i02 = f % ne02;
+        int64_t i03 = f / ne02;
+        for (int64_t j = 0; j < n; ) {
+            const char *  src0_row = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
+            const int64_t m        = std::min(ne00 - i00, n - j);
+            for (int64_t k = 0; k < m; k++) {
+                src0_f32[j + k] = type_conversion_table<src_t>::to_f32(*(const src_t *) (src0_row + (i00 + k)*nb00));
+            }
+            j  += m;
+            i00 = 0;
+            if (++i01 == ne01) {
+                i01 = 0;
+                if (++i02 == ne02) {
+                    i02 = 0;
+                    ++i03;
+                }
+            }
+        }
+
+        const int64_t i1 = ir % ne1;
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i3 = ir / (ne1 * ne2);
+        quantize_row_q(src0_f32, (char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3 + ib*qs, n);
+
+        b += n / qk;
+    }
+}
+
 template<typename src_t>
 static void ggml_compute_forward_dup_to_q(
         const ggml_compute_params * params,
@@ -316,9 +384,16 @@ static void ggml_compute_forward_dup_to_q(
                 id += rs * (ne01 - ir1);
             }
         }
+    } else if (nb0 == ggml_type_size(dst->type) &&
+            ne0 % ggml_blck_size(dst->type) == 0 &&
+            ggml_get_type_traits_cpu(dst->type)->from_float) {
+        ggml_compute_forward_dup_to_q_rows<src_t>(params, dst);
     } else {
-        // printf("%s %s\n", ggml_type_name(src0->type), ggml_type_name(dst->type));
-        GGML_ABORT("not implemented");
+        GGML_ABORT("cannot quantize %s into %s: a dst row must be whole contiguous blocks (ne0 = %lld, nb0 = %zu, "
+                "block size = %lld, type size = %zu, from_float %s)",
+                ggml_type_name(src0->type), ggml_type_name(dst->type), (long long) ne0, nb0,
+                (long long) ggml_blck_size(dst->type), ggml_type_size(dst->type),
+                ggml_get_type_traits_cpu(dst->type)->from_float ? "set" : "missing");
     }
 }
 
