@@ -1820,6 +1820,19 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// A float src0 that mmf cannot tile (it needs whole blocks of MMF_ROWS_PER_BLOCK rows) falls through to cuBLAS at every
+// batch > 1, and for a small dst cuBLAS picks an f32->bf16 copy plus a 4-block sm80 WMMA GEMM that costs ~26 us however
+// little it computes: qwen35's 48 x 5120 bf16 ssm_alpha/ssm_beta at a 3-row MTP verify. Measured on a 5070 Ti (bf16,
+// K = 5120, rows not a multiple of 32): that kernel is chosen at rows x cols 48x2..8, 80x2..4 and 176x2, where the vector
+// kernel takes 2.6-6.5 us; elsewhere cuBLAS runs 6-9 us and the vector kernel only keeps up while rows x cols is small
+// (80x6: 6.3 vs 6.1 us, 80x8: 8.0 vs 6.2). So the vector kernel takes rows x cols <= 512, cuBLAS the rest.
+// GGML_CUDA_MMVF_UNTILED_LEGACY=1 restores cuBLAS here too.
+static bool ggml_cuda_should_use_mmvf_untiled(const ggml_tensor * src0, int64_t ne11) {
+    static const bool legacy = getenv("GGML_CUDA_MMVF_UNTILED_LEGACY") != nullptr;
+    return !legacy && ne11 <= MMVF_MAX_BATCH_SIZE && src0->ne[1]*ne11 <= 512
+        && ggml_cuda_mmvf_supports(src0->type, src0->ne, src0->nb);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1863,6 +1876,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_should_use_mmvf_untiled(src0, ne11)) {
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
