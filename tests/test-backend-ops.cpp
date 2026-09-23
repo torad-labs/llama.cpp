@@ -9769,14 +9769,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, 12, 5120, {2, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 40,  3, 5122, {1, 1}, {1, 1}));
     }
-    // operand strides the float kernels cannot read, which must fall back (test_mul_mat_padded): at 48 rows, an src1
-    // stride odd in floats at every batch the vector kernel takes, and under the fused gate/up vector kernel at one token
+    // operand strides the float kernels cannot read, which must fall back (test_mul_mat_padded). At 48 rows: an src1
+    // stride odd in floats at every batch the vector kernel takes, and under the fused gate/up vector kernel at one
+    // token. At 64 rows, which mmf tiles: src1 strides of 1 and 2 mod 4 floats and an src0 row stride of 2 mod 4
+    // elements, for MUL_MAT and MUL_MAT_ID (32 tokens reach mmf's compacted-ids path).
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int64_t n : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat_padded(type_a, 48, n, 5120, 0, 1));
         }
         for (bool use_id : {false, true}) {
             test_cases.emplace_back(new test_mul_mat_padded(type_a, 48, 1, 5120, 0, 1, use_id, /*fused =*/ true));
+            const int64_t n_max = use_id ? 32 : 16;
+            for (int64_t n : {int64_t(4), n_max}) {
+                for (int64_t pad_b : {1, 2}) {
+                    test_cases.emplace_back(new test_mul_mat_padded(type_a, 64, n, 5120, 0, pad_b, use_id));
+                }
+            }
+            test_cases.emplace_back(new test_mul_mat_padded(type_a, 64, 4, 5120, 2, 0, use_id));
         }
     }
 
