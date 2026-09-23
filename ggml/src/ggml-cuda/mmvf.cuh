@@ -14,4 +14,7 @@ void ggml_cuda_op_mul_mat_vec_f(
 // Whether the kernel can run src0 at all (type, alignment); ggml_cuda_should_use_mmvf adds when it is the fastest choice.
 bool ggml_cuda_mmvf_supports(enum ggml_type type, const int64_t * src0_ne, const size_t * src0_nb);
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+// Whether to run src0 x src1 on the kernel: both operands pass ggml_cuda_mmvf_supports (src1 as f32) and the kernel is
+// the fastest choice for src0 at ne11 columns.
+bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb,
+        const int64_t * src1_ne, const size_t * src1_nb, int64_t ne11);
