@@ -9,7 +9,10 @@
 
 #include "json.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cstdlib>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -1476,8 +1479,52 @@ static void test_json_schema() {
     );
 }
 
+// A WORD trigger reaches the grammar regex-escaped; the literal it stands for is searched only where the
+// bytes just appended could complete it. Growing a buffer piece by piece, that windowed search and the regex
+// search over the whole buffer agree at every step up to the first match, however the pieces cut the trigger.
+static void test_trigger_literal_window() {
+    fprintf(stderr, "⚫ Testing lazy-grammar trigger literals\n");
+    const auto word  = llama_grammar_trigger_pattern_init("<function=write_file>");
+    const auto dots  = llama_grammar_trigger_pattern_init("a\\.b\\(c\\)");
+    const auto regex = llama_grammar_trigger_pattern_init("<tool_call>\\s*\\{");
+    const auto cls   = llama_grammar_trigger_pattern_init("\\d+");
+    const auto empty = llama_grammar_trigger_pattern_init("");
+    // LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY=1 keeps every trigger a regex; the equivalence below holds either way
+    const char * legacy_env = getenv("LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY");
+    const bool legacy = legacy_env != nullptr && atoi(legacy_env) != 0;
+    assert(word.is_literal == !legacy && (legacy || word.literal == "<function=write_file>"));
+    assert(dots.is_literal == !legacy && (legacy || dots.literal == "a.b(c)"));
+    assert(!regex.is_literal && !cls.is_literal && !empty.is_literal);
+
+    const std::string text = "we <function=write>, then <function=write_file> and <function=write_file> again";
+    const size_t expected = text.find("<function=write_file>");
+    for (size_t cut = 1; cut <= 7; cut++) {
+        for (size_t offset = 0; offset < cut; offset++) {
+            std::string buffer;
+            size_t pos = 0;
+            size_t first = std::string::npos;
+            while (pos < text.size()) {
+                const size_t n = std::min(pos == 0 && offset ? offset : cut, text.size() - pos);
+                buffer += text.substr(pos, n);
+                pos += n;
+                const size_t fast = word.find(buffer, n);
+                std::smatch m;
+                const size_t full = std::regex_search(buffer, m, word.regex) ? (size_t) m.position(0) : std::string::npos;
+                assert(fast == full);
+                if (fast != std::string::npos) {
+                    first = fast;
+                    break;
+                }
+            }
+            assert(first == expected);
+        }
+    }
+    fprintf(stdout, "  ✅︎\n");
+}
+
 int main() {
     fprintf(stdout, "Running grammar integration tests...\n");
+    test_trigger_literal_window();
     test_simple_grammar();
     test_complex_grammar();
     test_special_chars();
