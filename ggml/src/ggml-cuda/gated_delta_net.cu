@@ -16,14 +16,20 @@ static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_
 template <int warp_size, bool STATE_Q8>
 static __device__ __forceinline__ void gdn_store_state(void * dst, const int64_t e, const float v) {
     if constexpr (STATE_Q8) {
-        static_assert(warp_size == QK8_0, "a q8_0 state store is one warp-wide block");
-        const float amax = warp_reduce_max<warp_size>(fabsf(v));
-        const float d    = amax / ((1 << 7) - 1);
-        const float id   = d ? 1.0f/d : 0.0f;
-        block_q8_0 * b   = (block_q8_0 *) dst + e / QK8_0;
-        b->qs[e % QK8_0] = roundf(v*id);
-        if (e % QK8_0 == 0) {
-            b->d = d;
+        // a q8_0 state store is one warp-wide block. The dispatch still instantiates it for 64-lane warps (HIP gfx8/9),
+        // where the host declines the fusion (ggml_cuda_try_gdn_cache_fusion), so it compiles there to no device code.
+        if constexpr (warp_size != QK8_0) {
+            GGML_UNUSED_VARS(dst, e, v);
+            NO_DEVICE_CODE;
+        } else {
+            const float amax = warp_reduce_max<warp_size>(fabsf(v));
+            const float d    = amax / ((1 << 7) - 1);
+            const float id   = d ? 1.0f/d : 0.0f;
+            block_q8_0 * b   = (block_q8_0 *) dst + e / QK8_0;
+            b->qs[e % QK8_0] = roundf(v*id);
+            if (e % QK8_0 == 0) {
+                b->d = d;
+            }
         }
     } else {
         ((float *) dst)[e] = v;
