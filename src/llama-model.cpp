@@ -1958,6 +1958,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // forward rotations live on (the GPU when layers are offloaded).
         ggml_backend_buffer_type_t preferred_buft = nullptr;
 
+        // the tables are f32 operands of the activation transform, not weights: a weight in a CPU extra buffer type
+        // (CPU_REPACK) gets its tables in the CPU buffer type, since an extra buffer type holds only the layouts it
+        // repacks (llama_adapter_lora_init_impl places LoRA tensors the same way)
+        std::vector<ggml_backend_buffer_type_t> cpu_extra_bufts;
+        {
+            auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+            auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+                ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+            if (ggml_backend_dev_get_extra_bufts_fn) {
+                for (auto * extra = ggml_backend_dev_get_extra_bufts_fn(cpu_dev); extra && *extra; ++extra) {
+                    cpu_extra_bufts.push_back(*extra);
+                }
+            }
+        }
+
         for (const auto & [blocks, target] : groups)
         for (const auto & entry : *blocks) {
             const std::string & weight_name = entry.first;
@@ -1976,6 +1991,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
 
             ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+            if (std::find(cpu_extra_bufts.begin(), cpu_extra_bufts.end(), buft) != cpu_extra_bufts.end()) {
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+            }
             if (target == &hadamard_rotations) {
                 preferred_buft = buft;
             } else if (preferred_buft) {
