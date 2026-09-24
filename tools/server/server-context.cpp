@@ -1844,6 +1844,9 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            // the pull detector reads, and may edit, the served logits before the sampler (pull_eval)
+            use_backend_sampling &= pull_k.empty();
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
                 slot.backend_sampler = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
