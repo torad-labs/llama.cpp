@@ -79,6 +79,38 @@ def test_draft_acceptance_floor():
         )
 
 
+def test_backend_sampling_lazy_grammar_mid_draft():
+    # The model drafts for itself, so every draft is accepted and the token that triggers the lazy grammar sits
+    # mid-verification: the rows after it were sampled on the backend without the grammar, so the verification must
+    # end on that token and the slot continue on the CPU. The tokens match a CPU-sampled run.
+    global server
+    server.model_hf_repo = None
+    server.model_hf_file = None
+    server.model_file = server.model_draft
+    server.backend_sampling = True
+    server.start()
+
+    def run(backend_sampling):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "Once upon a time",
+            "temperature": 0.0,
+            "n_predict": 48,
+            "return_tokens": True,
+            "backend_sampling": backend_sampling,
+            "grammar": 'root ::= "girl named Zo" [a-z]* "."',
+            "grammar_lazy": True,
+            "grammar_triggers": [{"type": 1, "value": "girl named"}],
+        })
+        assert res.status_code == 200
+        return res.body
+
+    on, off = run(True), run(False)
+    assert on["timings"]["draft_n"] > 0
+    assert on["generation_settings"]["backend_sampling"] is True
+    assert "girl named Zo" in on["content"]
+    assert on["tokens"] == off["tokens"]
+
+
 def test_different_draft_min_draft_max():
     global server
     test_values = [

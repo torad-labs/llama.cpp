@@ -16,6 +16,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// True while a lazy grammar sampler waits for its trigger: its apply leaves every logit as it is until then.
+// False for any other sampler, and for a grammar that constrains (triggered, or not lazy).
+LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

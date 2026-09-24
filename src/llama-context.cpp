@@ -706,6 +706,7 @@ void llama_context::sched_reserve() {
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    sched_max_nodes = max_nodes;
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1367,9 +1368,36 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+// LLAMA_SAMPLER_DETACH_RESERVE_LEGACY=1: a sampler leaving the graph re-reserves the scheduler, as attaching one does
+static bool sampler_detach_reserve_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_SAMPLER_DETACH_RESERVE_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return legacy;
+}
+
+static bool sampler_attach_reserve_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_SAMPLER_ATTACH_RESERVE_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return legacy;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
+    }
+
+    // the scheduler and its buffers were reserved with this sequence's sampler in the graph (graph_max_nodes counts
+    // its nodes): the graph without it fits them, and a changed sampler map already fails graph reuse, so a sampler
+    // that only leaves costs no reserve (~18 ms on a 27B hybrid, a stall of every slot mid-generation)
+    const bool reserve_on_detach = sampler_detach_reserve_legacy();
+
+    // the sampler this sequence drew from on the backend goes back to the CPU (a caller may keep sampling with it)
+    if (const auto it = sampling.samplers.find(seq_id); it != sampling.samplers.end() && it->second != sampler) {
+        llama_sampler_backend_release(it->second);
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
@@ -1380,7 +1408,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
             warned = true;
         }
-        if (sampling.samplers.count(seq_id) > 0) {
+        if (sampling.samplers.count(seq_id) > 0 && reserve_on_detach) {
             sched_need_reserve = true;
         }
         sampling.samplers.erase(seq_id);
@@ -1400,7 +1428,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        // a graph with this sampler whose nodes fit the budget the scheduler was reserved for needs no reserve (a
+        // sequence taking a new request's chain after its last one left): a compute buffer the graph outgrows is
+        // reallocated by the scheduler when it allocates the graph
+        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        if (sampler_attach_reserve_legacy() || graph_max_nodes(n_tokens) > sched_max_nodes) {
+            sched_need_reserve = true;
+        }
 
         return true;
     }
@@ -1408,7 +1442,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && !can_offload) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
-        if (sampling.samplers.count(seq_id) > 0) {
+        if (sampling.samplers.count(seq_id) > 0 && reserve_on_detach) {
             sched_need_reserve = true;
         }
 
@@ -1419,7 +1453,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    if (reserve_on_detach) {
+        sched_need_reserve = true;
+    }
 
     return true;
 }

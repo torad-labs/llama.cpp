@@ -93,6 +93,10 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
+// true while neither the grammar nor the reasoning budget would change the logits of the next token (no grammar, a lazy
+// one awaiting its trigger or held off while reasoning; a budget not forcing), so a backend-sampled token is valid
+bool common_sampler_backend_passive(const struct common_sampler * gsmpl);
+
 // helpers
 
 // access the internal list of current candidate tokens
