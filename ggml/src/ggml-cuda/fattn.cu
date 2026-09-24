@@ -443,6 +443,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
 
+    // The kernels read Q, float K/V and the mask in chunks of up to 16 bytes (float4/int4 loads, cp.async), so one
+    // whose data does not start at a multiple of 16 bytes (a view offset by an odd number of elements, say) would fault
+    // with a misaligned address. There is no kernel for it here; this also runs in supports_op, before allocation, so
+    // such an operand goes to another backend.
+    for (const ggml_tensor * t : {Q, K, V, mask}) {
+        if (t != nullptr && !ggml_is_quantized(t->type) && !ggml_cuda_data_is_aligned(t, 16)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+    }
+
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
