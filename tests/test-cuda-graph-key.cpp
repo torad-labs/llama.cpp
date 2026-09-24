@@ -8,6 +8,7 @@
 // (a replay of the other shape's graph would not). The test counts the backend's own debug lines: "CUDA graph warmup
 // complete" when a graph is captured, "CUDA graph warmup reset" when a captured graph is found stale. A control first
 // computes one shape three times: a device that does not capture it does not use CUDA graphs and is skipped.
+// Under GGML_CUDA_GRAPH_KEY_LEGACY=1 (the first node's address alone) the two shapes are never captured and it fails.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
