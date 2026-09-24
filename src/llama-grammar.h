@@ -120,7 +120,15 @@ struct llama_grammar_trigger_pattern {
     std::string pattern;
     std::regex  regex;
 
-    size_t find(const std::string & input) const;
+    // a pattern that only escapes literal text (how common/sampling.cpp passes a WORD trigger) is kept
+    // unescaped too: a literal can newly match only where it ends in the bytes just appended, so it is
+    // searched there instead of the whole buffer the lazy grammar has held since generation began
+    bool        is_literal = false;
+    std::string literal;
+
+    // where the trigger starts in `input`, or npos. `appended` is how many trailing bytes of `input` are
+    // new since the previous call, which found nothing (npos: search it all)
+    size_t find(const std::string & input, size_t appended = std::string::npos) const;
 };
 
 struct llama_grammar {
@@ -172,6 +180,9 @@ struct llama_grammar * llama_grammar_init_impl(
                             size_t num_trigger_tokens);
 
 void llama_grammar_free_impl(struct llama_grammar * grammar);
+
+// note: needed for tests
+llama_grammar_trigger_pattern llama_grammar_trigger_pattern_init(const std::string & pattern);
 
 struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & grammar);
 
