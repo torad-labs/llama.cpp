@@ -97,6 +97,28 @@ Measured on the RTX 5070 Ti and kept out of `main`, each for the reason given:
 
 ## Run it yourself
 
+### The short way: rig
+
+[rig](https://github.com/torad-labs/rig) does steps 1–3 below on Linux with an RTX 50-series or
+RTX PRO Blackwell card. The machine needs only the NVIDIA driver (CUDA 13 or newer) and glibc 2.38
+or newer (Ubuntu 24.04+, Debian 13+, Fedora 39+):
+
+```bash
+curl -fsSL https://github.com/torad-labs/rig/releases/latest/download/install.sh | sh
+rig up bonsai-2-27b
+```
+
+`rig up`:
+- checks the card and driver;
+- installs this fork's published build ([`engine-1399830`](https://github.com/torad-labs/llama.cpp/releases/tag/engine-1399830)) and NVIDIA's CUDA 13.3 runtime, each checked by sha256, with no toolkit or compiler;
+- fetches the pack from step 2 by sha256;
+- starts it as a systemd user service on `127.0.0.1:8099`, with step 3's flags and `-c`/`-np` sized to the card.
+
+On a fresh Ubuntu 24.04 with only the driver, the engine install takes about 45 seconds, plus the
+7.66 GB download. `rig describe bonsai-2-27b` prints what step 4 needs as JSON. In step 4, use
+`base_url = "http://127.0.0.1:8099/v1"`; the model id can stay `bonsai-2-27b`, since llama-server
+answers for any id.
+
 ### 1. Build (CUDA 12.8 or newer, sm_120: RTX 50-series and RTX PRO Blackwell)
 
 ```bash
