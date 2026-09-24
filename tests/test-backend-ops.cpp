@@ -6839,12 +6839,15 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
     const bool alias_out; // the fused output over src1's bytes (see new_src1)
+    const bool full_bias; // a dense bias has the output's shape, one value per column (a residual), not one broadcast
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool alias_out = false)
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool alias_out = false,
+                        bool full_bias = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), alias_out(alias_out) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), alias_out(alias_out),
+        full_bias(full_bias) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
@@ -6854,6 +6857,9 @@ struct test_mul_mat_vec_fusion : public test_case {
         std::string v = VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
         if (alias_out) {
             v += "," + VAR_TO_STR(alias_out);
+        }
+        if (full_bias) {
+            v += "," + VAR_TO_STR(full_bias);
         }
         return v;
     }
@@ -6939,7 +6945,7 @@ struct test_mul_mat_vec_fusion : public test_case {
                     ffn_up = build_lane_scale_dense(ctx, ffn_up);
                 }
                 if (with_bias) {
-                    std::array<int64_t, 4> bias_ne = { ffn_up->ne[0], 1, channels, samples };
+                    std::array<int64_t, 4> bias_ne = { ffn_up->ne[0], full_bias ? ffn_up->ne[1] : 1, channels, samples };
                     ggml_tensor * up_bias = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias_ne.data());
                     ffn_up = ggml_add(ctx, ffn_up, up_bias);
                 }
@@ -6952,7 +6958,7 @@ struct test_mul_mat_vec_fusion : public test_case {
                     ffn_gate = build_lane_scale_dense(ctx, ffn_gate);
                 }
                 if (with_bias) {
-                    std::array<int64_t, 4> bias_ne   = { ffn_gate->ne[0], 1, channels, samples };
+                    std::array<int64_t, 4> bias_ne   = { ffn_gate->ne[0], full_bias ? ffn_gate->ne[1] : 1, channels, samples };
                     ggml_tensor * gate_bias = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias_ne.data());
                     ffn_gate = ggml_add(ctx, ffn_gate, gate_bias);
                 }
@@ -10799,6 +10805,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                             use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
                                     }
                                 }
+                                if (!use_id && with_bias) {
+                                    // the same batches with a bias per column (a residual), over channels and samples too
+                                    for (int64_t m_batch : { 2, 3, 4 }) {
+                                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 32, 256,
+                                            use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}, false, true));
+                                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 32, 256,
+                                            use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {4, 2}, false, true));
+                                    }
+                                }
                             }
                         }
                     }
@@ -10814,6 +10829,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool alias_out : { false, true }) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 17408, 5120,
                 false, 1, 1, false, false, true, false, {1, 1}, alias_out));
+        }
+    }
+
+    // the same model at an MTP verify's width and around the fused-column limit (MMVQ_MAX_FUSED_NCOLS, 3): the FFN's
+    // gate/up + GLU (fused at 1 column only), and a residual add (a bias with the output's shape) after the FFN down
+    // (17408 -> 5120) and after a Gated DeltaNet layer's output projection (6144 -> 5120); 4-5 columns do not fuse
+    for (ggml_type type : { GGML_TYPE_PQ2_0, GGML_TYPE_Q8_0 }) {
+        for (int64_t m : { 1, 2, 3, 4, 5 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 17408, 5120,
+                false, 1, 1, false, false, true, false, {1, 1}));
+            for (int64_t k : { 17408, 6144 }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 5120, k,
+                    false, 1, 1, false, true, false, false, {1, 1}, false, /*full_bias=*/true));
+            }
         }
     }
 
@@ -11000,6 +11029,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Ternary Bonsai 2 27B at decode and an MTP verify's width (1-5 columns): the FFN's gate/up + GLU and the residual adds
+    // after the FFN down and a Gated DeltaNet layer's output projection, each one fused graph where the backend fuses it
+    for (int64_t m : { 1, 2, 3, 4, 5 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, m, 17408, 5120,
+            false, 1, 1, false, false, true, false, {1, 1}));
+        for (int64_t k : { 17408, 6144 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, m, 5120, k,
+                false, 1, 1, false, true, false, false, {1, 1}, false, /*full_bias=*/true));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

@@ -941,25 +941,28 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+    if constexpr (c_ncols_dst <= MMVQ_MAX_FUSED_NCOLS) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            if (fusion.gate != nullptr) {
-                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, true, small_k, halve_iters>, launch_params,
-                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-            } else {
-                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, false, small_k, halve_iters>, launch_params,
-                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            if constexpr (c_ncols_dst == 1) {
+                if (fusion.gate != nullptr) {
+                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, true, small_k, halve_iters>, launch_params,
+                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                    return;
+                }
             }
+            GGML_ASSERT(fusion.gate == nullptr && "a gate and GLU fuse at one column only");
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, false, small_k, halve_iters>, launch_params,
+                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
             return;
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst <= MMVQ_MAX_FUSED_NCOLS");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, small_k, halve_iters>, launch_params,
@@ -1386,7 +1389,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] <= MMVQ_MAX_FUSED_NCOLS);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1395,6 +1398,7 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
+            GGML_ASSERT(ids || ggml_cuda_mmvq_fusion_operand_ok(fusion->x_bias, dst));
             fusion_local.x_bias = fusion->x_bias->data;
         }
         if (fusion->gate) {
@@ -1405,6 +1409,7 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
+            GGML_ASSERT(ids || ggml_cuda_mmvq_fusion_operand_ok(fusion->gate_bias, dst));
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
         if (fusion->x_scale) {
