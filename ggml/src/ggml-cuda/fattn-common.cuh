@@ -673,10 +673,17 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 }
 
 // f16 mask: s31/s33 in half2, every thread reads 2 cells; packed mask: s31/s33 in 16-bit words, threads < FATTN_KQ_STRIDE/16 read one word (16 cells) each
-template <int ncols1, bool packed>
+// Per (sequence, Q tile), n = gridDim.y*gridDim.x values each: KV_max, the upper edge of the last FATTN_KQ_STRIDE tile
+// with a non-masked value, in KV_max_ptr[0, n); KV_min, the lower edge of the first one, in KV_max_ptr[n, 2n).
+// Mask rows at or past nrows (the last Q tile's padding) count as masked.
+// scan_range == false: KV_max by a cooperative backward scan, one tile per pass; KV_min = 0.
+// scan_range == true: one tile per thread, blockDim.x tiles per pass, forward to KV_min then backward to KV_max. For
+//     few Q rows on a large KV cache, where the masked tiles can be most of it: with --kv-unified, n_kv spans every
+//     sequence's cells, and one sequence's cells can sit before or after another's.
+template <int ncols1, bool packed, bool scan_range>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const void * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const void * mask_ptr, int * KV_max_ptr, const int ne30, const int nrows, const int ne33, const int64_t s31, const int64_t s33) {
     const half2    * GGML_CUDA_RESTRICT mask   = (const half2    *) mask_ptr;
     const uint16_t * GGML_CUDA_RESTRICT maskw  = (const uint16_t *) mask_ptr;
     int            * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
@@ -685,9 +692,97 @@ static __global__ void flash_attn_mask_to_KV_max(
     const int tid      = threadIdx.x;
     const int sequence = blockIdx.y;
     const int jt       = blockIdx.x;
+    const int ncols1_v = min(ncols1, nrows - jt*ncols1); // mask rows of this Q tile
 
-    mask  += sequence*s33 + jt*ncols1*s31;
-    maskw += sequence*s33 + jt*ncols1*s31;
+    mask  += (sequence % ne33)*s33 + jt*ncols1*s31;
+    maskw += (sequence % ne33)*s33 + jt*ncols1*s31;
+
+    int * KV_min = KV_max + ne31*gridDim.y;
+
+    if constexpr (scan_range) {
+        static_assert(FATTN_KQ_STRIDE % 128 == 0, "a tile's mask row is read in 16-byte vectors");
+        // A tile's mask row is read in 16-byte vectors, loaded together and tested once per group (the launch checks the
+        // alignment): packed, 16 cells per 16-bit word, a cell live when its bit is set; f16, a cell live when it is not
+        // +-inf, i.e. a 32-bit word of two cells is fully masked when (word & 0x7FFF7FFF) == 0x7C007C00.
+        const auto tile_live = [&](const int t) {
+            for (int j = 0; j < ncols1_v; ++j) {
+                if constexpr (packed) {
+                    const uint4 * w = (const uint4 *) (maskw + j*s31 + t*(FATTN_KQ_STRIDE/16));
+                    uint32_t live = 0;
+#pragma unroll
+                    for (int i = 0; i < FATTN_KQ_STRIDE/128; ++i) {
+                        const uint4 v = w[i];
+                        live |= v.x | v.y | v.z | v.w;
+                    }
+                    if (live) {
+                        return true;
+                    }
+                } else {
+                    const uint4 * m = (const uint4 *) (mask + j*s31 + t*(FATTN_KQ_STRIDE/2));
+                    constexpr int group = 16;
+                    for (int i0 = 0; i0 < FATTN_KQ_STRIDE/8; i0 += group) {
+                        uint32_t live = 0;
+#pragma unroll
+                        for (int i = 0; i < group; ++i) {
+                            const uint4 v = m[i0 + i];
+                            live |= ((v.x & 0x7FFF7FFF) ^ 0x7C007C00) | ((v.y & 0x7FFF7FFF) ^ 0x7C007C00) |
+                                    ((v.z & 0x7FFF7FFF) ^ 0x7C007C00) | ((v.w & 0x7FFF7FFF) ^ 0x7C007C00);
+                        }
+                        if (live) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        };
+
+        __shared__ int found;
+        ggml_cuda_pdl_sync();
+
+        int t_min = INT_MAX;
+        for (int t0 = 0; t0 < ne30; t0 += blockDim.x) {
+            if (tid == 0) {
+                found = INT_MAX;
+            }
+            __syncthreads();
+            const int t = t0 + tid;
+            if (t < ne30 && tile_live(t)) {
+                atomicMin(&found, t);
+            }
+            __syncthreads();
+            t_min = found;
+            __syncthreads();
+            if (t_min != INT_MAX) {
+                break;
+            }
+        }
+
+        // t_min is live, so when there is one the backward scan ends at or above it.
+        int t_max = -1;
+        for (int t1 = ne30 - 1; t_min != INT_MAX && t1 >= t_min; t1 -= blockDim.x) {
+            if (tid == 0) {
+                found = -1;
+            }
+            __syncthreads();
+            const int t = t1 - tid;
+            if (t >= t_min && tile_live(t)) {
+                atomicMax(&found, t);
+            }
+            __syncthreads();
+            t_max = found;
+            __syncthreads();
+            if (t_max >= 0) {
+                break;
+            }
+        }
+
+        if (tid == 0) {
+            KV_min[sequence*ne31 + jt] = t_min == INT_MAX ? 0 : t_min*FATTN_KQ_STRIDE;
+            KV_max[sequence*ne31 + jt] = (t_max + 1)*FATTN_KQ_STRIDE;
+        }
+        return;
+    }
 
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
@@ -702,6 +797,9 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
+            if (j >= ncols1_v) {
+                break;
+            }
             if constexpr (packed) {
                 if (tid < FATTN_KQ_STRIDE/16) {
                     all_inf = all_inf && int(maskw[j*s31 + KV_max_sj/16 + tid] == 0);
@@ -736,6 +834,7 @@ static __global__ void flash_attn_mask_to_KV_max(
     }
 
     KV_max[sequence*ne31 + jt] = KV_max_sj;
+    KV_min[sequence*ne31 + jt] = 0;
 }
 
 template<int D, int ncols1, int ncols2> // D == head size
@@ -1112,7 +1211,17 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // kv_range: a decode-sized batch on a large KV cache, where with --kv-unified the other sequences' cells are masked
+    //     tiles before or after this batch's; the scan bounds the range from both ends. One thread reads every row of
+    //     its tile, so the batch is bounded (a decode, or an MTP verify of up to 5 sequences at 2 drafts): at a 512-row
+    //     ubatch the scan cost more than the attention it saved. GGML_CUDA_FATTN_KV_RANGE_LEGACY=1: off.
+    static const bool kv_range_legacy = [] {
+        const char * v = getenv("GGML_CUDA_FATTN_KV_RANGE_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    const bool kv_range = !kv_range_legacy && mask && Q->ne[1] <= 16 && K->ne[1] >= 4096 &&
+        (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0; // 16-byte mask reads
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_range)) {
         const size_t  unit = mask_packed ? sizeof(uint16_t) : sizeof(half2);
         const int64_t s31 = mask->nb[1] / unit;
         const int64_t s33 = mask->nb[3] / unit;
@@ -1122,13 +1231,19 @@ void launch_fattn(
 
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
+        const int nrows  = mask->ne[1];
+        const int ne33   = mask->ne[3];
 
-        KV_max.alloc(ne_KV_max);
+        KV_max.alloc(2*ne_KV_max); // KV_max, then KV_min
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
-        if (mask_packed) {
-            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, true>,  launch_params, mask->data, KV_max.ptr, iter_k, s31, s33);
+        if (mask_packed && kv_range) {
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, true,  true>,  launch_params, mask->data, KV_max.ptr, iter_k, nrows, ne33, s31, s33);
+        } else if (mask_packed) {
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, true,  false>, launch_params, mask->data, KV_max.ptr, iter_k, nrows, ne33, s31, s33);
+        } else if (kv_range) {
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, false, true>,  launch_params, mask->data, KV_max.ptr, iter_k, nrows, ne33, s31, s33);
         } else {
-            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, false>, launch_params, mask->data, KV_max.ptr, iter_k, s31, s33);
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, false, false>, launch_params, mask->data, KV_max.ptr, iter_k, nrows, ne33, s31, s33);
         }
         CUDA_CHECK(cudaGetLastError());
     }
