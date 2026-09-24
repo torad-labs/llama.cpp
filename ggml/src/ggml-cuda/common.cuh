@@ -371,6 +371,20 @@ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignm
            tensor->nb[3] % alignment == 0;
 }
 
+// Whether the tensor's data address is a multiple of `alignment`, also while the tensor is not allocated yet, as when
+// the scheduler asks supports_op: every buffer places a tensor that is not a view at a multiple of TENSOR_ALIGNMENT or
+// more, so the address of a view is aligned as its offset into the tensor it views is.
+static bool ggml_cuda_data_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
+    GGML_ASSERT(tensor != nullptr && alignment <= TENSOR_ALIGNMENT);
+    if (tensor->data != nullptr) {
+        return reinterpret_cast<uintptr_t>(tensor->data) % alignment == 0;
+    }
+    if (tensor->view_src != nullptr && tensor->view_src->data != nullptr) {
+        return (reinterpret_cast<uintptr_t>(tensor->view_src->data) + tensor->view_offs) % alignment == 0;
+    }
+    return tensor->view_offs % alignment == 0;
+}
+
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
     return 64;
@@ -1453,6 +1467,39 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Names one ggml graph across computes, to find its CUDA graph. The first node's address alone names the memory a
+// graph is built in, and graphs of different shapes built there in turn (a speculative draft context's catch-up batch
+// and its one-row draft step) would share one CUDA graph, each finding the other's capture stale on every compute and
+// running uncaptured. The node count and the first and last nodes' shapes tell them apart; a graph that only grows in
+// the middle (a longer KV view) keeps its key and is updated in place.
+struct ggml_cuda_graph_key {
+    const void * first_node = nullptr;
+    int          n_nodes    = 0;
+    int64_t      first_ne[GGML_MAX_DIMS] = {};
+    int64_t      last_ne[GGML_MAX_DIMS]  = {};
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return first_node == other.first_node && n_nodes == other.n_nodes &&
+               std::equal(first_ne, first_ne + GGML_MAX_DIMS, other.first_ne) &&
+               std::equal(last_ne, last_ne + GGML_MAX_DIMS, other.last_ne);
+    }
+};
+
+struct ggml_cuda_graph_key_hash {
+    size_t operator()(const ggml_cuda_graph_key & key) const {
+        size_t h = std::hash<const void *>{}(key.first_node);
+        const auto mix = [&h](int64_t v) {
+            h ^= std::hash<int64_t>{}(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+        mix(key.n_nodes);
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            mix(key.first_ne[i]);
+            mix(key.last_ne[i]);
+        }
+        return h;
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1466,13 +1513,13 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Map from graph key to cuda_graph - allows multiple graphs per context: the splits of a computation divided
+    // across CPU/GPU (e.g., with --n-cpu-moe), and graphs of different shapes computed in turn
+    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1487,9 +1534,9 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
