@@ -419,6 +419,9 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)
     GGML_TENSOR_LOCALS(size_t,  nb, dst, nb)
 
+    // the operands the scheduler assigned here at supports_op time must still be readable (data addresses included)
+    GGML_ASSERT(ggml_cuda_lightning_indexer_supported(ctx.device, dst));
+
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
@@ -560,10 +563,15 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
         return false;
     }
 
-    // alignment checks
+    // alignment checks: the kernels read q as float4 and a float k as int2 or float4, so the data addresses must be
+    // multiples of 16 bytes as well as the strides (a view offset by an odd number of elements would fault with a
+    // misaligned address). This runs in supports_op, before allocation, and again at dispatch.
     for (const ggml_tensor * t : {q, k}) {
         if (ggml_is_quantized(t->type)) {
             continue;
+        }
+        if (!ggml_cuda_data_is_aligned(t, 16)) {
+            return false;
         }
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
             if (t->nb[i] % 16 != 0) {

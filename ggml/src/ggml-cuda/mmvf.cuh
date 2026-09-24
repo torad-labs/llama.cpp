@@ -11,10 +11,12 @@ void ggml_cuda_op_mul_mat_vec_f(
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
-// Whether the kernel can run src0 at all (type, alignment); ggml_cuda_should_use_mmvf adds when it is the fastest choice.
-bool ggml_cuda_mmvf_supports(enum ggml_type type, const int64_t * src0_ne, const size_t * src0_nb);
+// Whether the kernel can run src0 x src1 at all: src0 f32/f16/bf16, src1 f32, and both laid out and placed so that its
+// paired reads are aligned (data address and strides, checked at dispatch, when the data is allocated). A fused gate is
+// read like src0 and is checked as ggml_cuda_mmvf_supports(gate, src1). ggml_cuda_should_use_mmvf adds when the kernel
+// is the fastest choice.
+bool ggml_cuda_mmvf_supports(const ggml_tensor * src0, const ggml_tensor * src1);
 
-// Whether to run src0 x src1 on the kernel: both operands pass ggml_cuda_mmvf_supports (src1 as f32) and the kernel is
-// the fastest choice for src0 at ne11 columns.
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb,
-        const int64_t * src1_ne, const size_t * src1_nb, int64_t ne11);
+// Whether to run src0 x src1 on the kernel: ggml_cuda_mmvf_supports holds and the kernel is the fastest choice for src0
+// at ne11 columns.
+bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, const ggml_tensor * src1, int cc, int64_t ne11);
