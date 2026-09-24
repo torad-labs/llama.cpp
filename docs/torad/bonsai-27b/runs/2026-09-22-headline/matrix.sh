@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Depth matrix, PrismML prism-b10709-9a9394a vs torad-labs/llama.cpp 3520147, public pack, RTX 5070 Ti.
+# Depth matrix, PrismML prism-b10709-9a9394a vs torad-labs/llama.cpp c54ace8, public pack, RTX 5070 Ti.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # PRISM_BIN, FORK_BIN: the two builds' bin dirs; MODEL: the public pack (README step 2); GPU: the card's index
