@@ -1548,6 +1548,59 @@ static void test_backend_release_to_cpu(const test_params & params) {
     printf("backend release to cpu test PASSED\n");
 }
 
+static void test_backend_reattach_no_reserve(const test_params & params) {
+    const int seq_id = 0;
+
+    const auto top1_chain = [] {
+        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(1));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(88));
+        return chain;
+    };
+
+    llama_sampler_ptr first = top1_chain();
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, first.get() }};
+    test_context test_ctx(params, backend_sampler_configs);
+
+    // the scheduler's reserves, counted from the context's own log line
+    int n_reserves = 0;
+    llama_log_set([](ggml_log_level, const char * text, void * user_data) {
+        if (strstr(text, "reserving ...")) {
+            (*(int *) user_data)++;
+        }
+    }, &n_reserves);
+
+    if (!test_ctx.decode({{seq_id, "Hello"}})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+    const llama_token first_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+    GGML_ASSERT(first_token >= 0 && first_token < test_ctx.n_vocab);
+    const int n_first = n_reserves;
+
+    // the request ends: its chain leaves the backend and the sequence samples on the CPU
+    llama_set_sampler(test_ctx.ctx.get(), seq_id, nullptr);
+    if (!test_ctx.decode_tokens({{ seq_id, first_token }})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+    const llama_token cpu_token = llama_sampler_sample(first.get(), test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+
+    // the next request's chain, of the same shape, fits the graph the scheduler was reserved for
+    llama_sampler_ptr second = top1_chain();
+    GGML_ASSERT(llama_set_sampler(test_ctx.ctx.get(), seq_id, second.get()));
+    if (!test_ctx.decode_tokens({{ seq_id, cpu_token }})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+    const llama_token second_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+    llama_log_set(nullptr, nullptr);
+
+    printf("reserves: %d through the first request, %d more after its chain left and the next one attached; "
+           "backend tokens %d, %d\n", n_first, n_reserves - n_first, first_token, second_token);
+    GGML_ASSERT(second_token >= 0 && second_token < test_ctx.n_vocab);
+    GGML_ASSERT(n_reserves == n_first);
+
+    printf("backend reattach without reserve test PASSED\n");
+}
+
 static void test_backend_cpu_mixed_batch(const test_params & params) {
     // Sequence 0 uses backend sampling
     struct llama_sampler_chain_params chain_params_0 = llama_sampler_chain_default_params();
@@ -2048,6 +2101,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "dist_and_cpu",    test_backend_dist_sampling_and_cpu,   true  },
     { "set_sampler",     test_backend_set_sampler,             true  },
     { "release_to_cpu",  test_backend_release_to_cpu,          true  },
+    { "reattach_no_reserve", test_backend_reattach_no_reserve, true  },
     { "multi_output_limit",    test_backend_multi_output_limit,      true },
     { "multi_sequence_multi_output_dist", test_backend_multi_sequence_multi_output_dist, true },
     { "multi_output_dist_transaction", test_backend_multi_output_dist_transaction, true },
@@ -2143,6 +2197,7 @@ static std::vector<const backend_test_case *> collect_tests_to_run(const std::st
 #ifdef GGML_USE_HIP
             // TODO: remove this when https://github.com/ggml-org/llama.cpp/pull/26592 is merged
             if (test.name == "penalties" || test.name == "set_sampler" || test.name == "release_to_cpu" ||
+                test.name == "reattach_no_reserve" ||
                 test.name == "mixed"     || test.name == "top_p"       ||
                 test.name == "multi_output_sampling_chain" ||
                 test.name == "multi_output_cpu") {

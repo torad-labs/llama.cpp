@@ -706,6 +706,7 @@ void llama_context::sched_reserve() {
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    sched_max_nodes = max_nodes;
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1376,6 +1377,14 @@ static bool sampler_detach_reserve_legacy() {
     return legacy;
 }
 
+static bool sampler_attach_reserve_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_SAMPLER_ATTACH_RESERVE_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return legacy;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1419,7 +1428,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        // a graph with this sampler whose nodes fit the budget the scheduler was reserved for needs no reserve (a
+        // sequence taking a new request's chain after its last one left): a compute buffer the graph outgrows is
+        // reallocated by the scheduler when it allocates the graph
+        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        if (sampler_attach_reserve_legacy() || graph_max_nodes(n_tokens) > sched_max_nodes) {
+            sched_need_reserve = true;
+        }
 
         return true;
     }
