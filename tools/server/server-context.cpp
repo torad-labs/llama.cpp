@@ -314,6 +314,9 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
+    // the sampler chain is attached to the context and the decode draws this slot's tokens on the backend
+    bool backend_sampler = false;
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -366,12 +369,23 @@ struct server_slot {
         n_predict_max = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        backend_sampler = false;
 
         // clear alora start
         alora_invocation_start = -1;
 
         // clear multimodal state
         mbatch.reset();
+    }
+
+    // a lazy grammar that just triggered or a reasoning budget that turned to forcing constrains the next token: the
+    // backend draws it without that constraint, so the slot samples on the CPU chain from here to the end of the task
+    void release_backend_sampler_if_constrained() {
+        if (backend_sampler && !common_sampler_backend_passive(smpl.get())) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+            backend_sampler = false;
+            SLT_INF(*this, "%s", "grammar or reasoning budget constrains the next token, sampling on the CPU\n");
+        }
     }
 
     void init_sampler() const {
@@ -1832,9 +1846,10 @@ private:
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                slot.backend_sampler = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.backend_sampler = false;
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -3182,6 +3197,14 @@ private:
             }
         }
 
+        // before the decode that samples the next tokens: a token accepted or a reasoning-end control since the last one
+        // may have switched a grammar or a reasoning budget on
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                slot.release_backend_sampler_if_constrained();
+            }
+        }
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -4314,6 +4337,9 @@ private:
                     pull_eval(slot, (int) idx);
                 }
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // here, before a checkpoint restore rewinds the sampler to its passive state: the replay must sample the
+                // row after the switching token on the CPU, or it stops at the same token on every pass
+                slot.release_backend_sampler_if_constrained();
                 if (!params_base.lens_layers.empty()) {
                     lens_rows.assign(slot.spec_i_batch.begin(), slot.spec_i_batch.begin() + accepted.size());
                 }

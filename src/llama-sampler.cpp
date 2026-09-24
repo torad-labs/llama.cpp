@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-grammar.h"
+#include "llama-ext.h"
 
 #include "ggml-cpp.h"
 
@@ -1435,6 +1436,28 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
     }
 }
 
+void llama_sampler_backend_release(llama_sampler * sampler) {
+    GGML_ASSERT(sampler != nullptr);
+
+    if (sampler->iface == &llama_sampler_chain_i) {
+        auto * chain = (llama_sampler_chain *) sampler->ctx;
+        for (auto & entry : chain->samplers) {
+            if (entry.is_backend) {
+                llama_sampler_backend_release(entry.ptr);
+            }
+            entry.is_backend = false;
+        }
+        chain->is_init = false;
+        chain->n_nodes = 0;
+    } else if (sampler->iface == &llama_sampler_dist_i) {
+        auto * ctx = (llama_sampler_dist *) sampler->ctx;
+        ctx->backend_transactional     = false;
+        ctx->n_backend_draws_generated = 0;
+        ctx->n_backend_draws_committed = 0;
+        ctx->inp_uniforms.clear();
+    }
+}
+
 // top-k
 
 struct llama_sampler_top_k : public llama_sampler_backend {
@@ -2762,6 +2785,14 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
+
+bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_grammar_i) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    return ctx->grammar != nullptr && ctx->grammar->awaiting_trigger;
+}
 
 static struct llama_sampler * llama_sampler_init_grammar_impl(
         const struct llama_vocab * vocab,

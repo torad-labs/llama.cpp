@@ -37,6 +37,9 @@ struct llama_sampler_chain {
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
+// the context no longer runs the sampler: the chain applies every sampler on the CPU again and the dist sampler draws
+// from its own RNG outside any backend transaction (a sequence goes back to the backend with a fresh sampler)
+void llama_sampler_backend_release(llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,

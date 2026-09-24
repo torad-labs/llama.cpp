@@ -1511,6 +1511,43 @@ static void test_backend_set_sampler(const test_params & params) {
     printf("backend set sampler test PASSED\n");
 }
 
+static void test_backend_release_to_cpu(const test_params & params) {
+    const int seq_id = 0;
+
+    // top-k 1: the backend and the CPU both draw the argmax
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(1));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(88));
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, chain.get() }};
+
+    test_context test_ctx(params, backend_sampler_configs);
+
+    if (!test_ctx.decode({{seq_id, "Hello"}})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    const llama_token backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+    GGML_ASSERT(backend_token >= 0 && backend_token < test_ctx.n_vocab);
+
+    // detached from the context, the same chain samples on the CPU with all of its samplers
+    llama_set_sampler(test_ctx.ctx.get(), seq_id, nullptr);
+
+    if (!test_ctx.decode_tokens({{ seq_id, backend_token }})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    const int32_t idx = test_ctx.idx_for_seq(seq_id);
+    GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), idx) == LLAMA_TOKEN_NULL);
+
+    llama_sampler_ptr greedy(llama_sampler_init_greedy());
+    const llama_token cpu_token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), idx);
+    const llama_token argmax    = llama_sampler_sample(greedy.get(), test_ctx.ctx.get(), idx);
+    printf("backend token = %d, then CPU token = %d (argmax %d)\n", backend_token, cpu_token, argmax);
+    GGML_ASSERT(cpu_token == argmax);
+
+    printf("backend release to cpu test PASSED\n");
+}
+
 static void test_backend_cpu_mixed_batch(const test_params & params) {
     // Sequence 0 uses backend sampling
     struct llama_sampler_chain_params chain_params_0 = llama_sampler_chain_default_params();
@@ -2010,6 +2047,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "dist",            test_backend_dist_sampling,           true  },
     { "dist_and_cpu",    test_backend_dist_sampling_and_cpu,   true  },
     { "set_sampler",     test_backend_set_sampler,             true  },
+    { "release_to_cpu",  test_backend_release_to_cpu,          true  },
     { "multi_output_limit",    test_backend_multi_output_limit,      true },
     { "multi_sequence_multi_output_dist", test_backend_multi_sequence_multi_output_dist, true },
     { "multi_output_dist_transaction", test_backend_multi_output_dist_transaction, true },
@@ -2104,7 +2142,7 @@ static std::vector<const backend_test_case *> collect_tests_to_run(const std::st
             }
 #ifdef GGML_USE_HIP
             // TODO: remove this when https://github.com/ggml-org/llama.cpp/pull/26592 is merged
-            if (test.name == "penalties" || test.name == "set_sampler" ||
+            if (test.name == "penalties" || test.name == "set_sampler" || test.name == "release_to_cpu" ||
                 test.name == "mixed"     || test.name == "top_p"       ||
                 test.name == "multi_output_sampling_chain" ||
                 test.name == "multi_output_cpu") {
