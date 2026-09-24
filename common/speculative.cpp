@@ -16,6 +16,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -2574,6 +2575,27 @@ struct common_speculative_init_result::impl {
     llama_context_ptr context;
 };
 
+// the MTP draft vocabulary (--spec-draft-mtp-vocab) applied to the model the head runs on; an empty path is the
+// full vocabulary. False (logged) leaves no draft context: a vocabulary asked for is never silently dropped
+static bool common_mtp_set_vocab(llama_model * model, const std::string & path) {
+    if (path.empty()) {
+        return true;
+    }
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    const std::streamoff size = f ? (std::streamoff) f.tellg() : -1;
+    if (size <= 0 || size % (std::streamoff) sizeof(llama_token) != 0) {
+        LOG_ERR("%s: the MTP draft vocabulary '%s' is not a non-empty file of int32 token ids\n", __func__, path.c_str());
+        return false;
+    }
+    std::vector<llama_token> ids((size_t) size / sizeof(llama_token));
+    f.seekg(0).read((char *) ids.data(), size);
+    if (!f || !llama_model_set_draft_vocab(model, ids.data(), ids.size())) {
+        LOG_ERR("%s: the MTP draft vocabulary '%s' could not be applied\n", __func__, path.c_str());
+        return false;
+    }
+    return true;
+}
+
 common_speculative_init_result::common_speculative_init_result(
     common_params & params,
       llama_model * model_tgt,
@@ -2583,6 +2605,11 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    if (!spec_mtp && !params.speculative.draft.mtp_vocab.empty()) {
+        LOG_ERR("%s: --spec-draft-mtp-vocab is set but no draft-mtp speculative type is\n", __func__);
+        return;
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -2617,6 +2644,10 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        if (spec_mtp && !common_mtp_set_vocab(model_dft, params.speculative.draft.mtp_vocab)) {
+            return;
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
@@ -2626,6 +2657,10 @@ common_speculative_init_result::common_speculative_init_result(
         pimpl->context.reset(ctx_dft);
     } else if (spec_mtp) {
         model_path = params.model.path;
+
+        if (!common_mtp_set_vocab(model_tgt, params.speculative.draft.mtp_vocab)) {
+            return;
+        }
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
 

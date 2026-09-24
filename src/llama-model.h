@@ -617,6 +617,11 @@ struct llama_model {
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
+    // the MTP draft head's vocabulary (set_draft_vocab): the LM head's rows for these token ids only, so a draft
+    // step reads n_ids rows of the head instead of n_vocab; the graph scores those and every other logit is -inf
+    struct ggml_tensor * output_draft     = nullptr;
+    struct ggml_tensor * output_draft_ids = nullptr;
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
@@ -748,6 +753,10 @@ struct llama_model {
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
+
+    // builds output_draft / output_draft_ids from the head the MTP graph scores with; call before the MTP context
+    // is created. Throws on ids that are not strictly increasing token ids, or a head it cannot trim
+    void set_draft_vocab(const llama_token * ids, size_t n_ids);
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;

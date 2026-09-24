@@ -731,7 +731,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (model.output_draft) {
+        // a draft vocabulary (llama_model_set_draft_vocab): score its rows of the head only, then lay them over
+        // -inf at their token ids, so the logits keep the full-vocabulary shape every sampler reads
+        const int64_t n_vocab = head_w->ne[1];
+        const int64_t n_hot   = model.output_draft->ne[1];
+        const int64_t n_out   = cur->ne[1];
+        ggml_tensor * hot = build_lora_mm(model.output_draft, cur, nullptr);
+        cb(hot, "mtp_draft_logits", -1);
+        ggml_tensor * full = ggml_fill_inplace(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
+        cur = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, hot, 1, n_hot, n_out), model.output_draft_ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_out);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
