@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <set>
 #include <stdexcept>
 
@@ -374,7 +375,48 @@ static void print_rule(
 // Regex utilities
 //
 
-size_t llama_grammar_trigger_pattern::find(const std::string & input) const {
+// the text an escaped literal stands for, if every regex metacharacter in it is escaped and every escape
+// is of a metacharacter (the character set common's regex_escape escapes); anything else is a real regex
+static bool llama_grammar_unescape_literal(const std::string & pattern, std::string & out) {
+    static const std::string special = ".^$|()*+?[]{}\\";
+    out.clear();
+    for (size_t i = 0; i < pattern.size(); i++) {
+        const char c = pattern[i];
+        if (c == '\\') {
+            if (i + 1 == pattern.size() || special.find(pattern[i + 1]) == std::string::npos) {
+                return false;
+            }
+            out += pattern[++i];
+        } else if (special.find(c) != std::string::npos) {
+            return false;
+        } else {
+            out += c;
+        }
+    }
+    return !out.empty();
+}
+
+llama_grammar_trigger_pattern llama_grammar_trigger_pattern_init(const std::string & pattern) {
+    // LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY=1: every trigger is a regex searched over the whole buffer again
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    llama_grammar_trigger_pattern trigger;
+    trigger.pattern = pattern;
+    trigger.regex = std::regex(pattern);
+    trigger.is_literal = !legacy && llama_grammar_unescape_literal(pattern, trigger.literal);
+    return trigger;
+}
+
+size_t llama_grammar_trigger_pattern::find(const std::string & input, size_t appended) const {
+    if (is_literal) {
+        // no match before the append, so a match now ends inside the appended bytes: it starts at most
+        // literal.size() - 1 bytes before them. The first such match is the regex search's leftmost one.
+        const size_t back = appended == std::string::npos ? input.size() : appended + literal.size() - 1;
+        return input.find(literal, input.size() > back ? input.size() - back : 0);
+    }
+
     auto find_start_pos = [](const std::smatch & match) {
         // get from the first matched capturing group to the end of the string
         size_t start = std::string::npos;
@@ -1290,9 +1332,7 @@ struct llama_grammar * llama_grammar_init_impl(
     }
     for (size_t i = 0; i < num_trigger_patterns; i++) {
         GGML_ASSERT(trigger_patterns != nullptr);
-        auto & trigger = vec_trigger_patterns.emplace_back();
-        trigger.pattern = trigger_patterns[i];
-        trigger.regex = std::regex(trigger.pattern);
+        vec_trigger_patterns.push_back(llama_grammar_trigger_pattern_init(trigger_patterns[i]));
     }
 
     // Important: vec_rules has to be moved here, not copied, because stacks contains
@@ -1411,7 +1451,7 @@ void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token
             grammar.trigger_buffer += piece;
 
             for (const auto & trigger_pattern : grammar.trigger_patterns) {
-                auto start = trigger_pattern.find(grammar.trigger_buffer);
+                auto start = trigger_pattern.find(grammar.trigger_buffer, piece.size());
                 if (start != std::string::npos) {
                     grammar.awaiting_trigger = false;
 
