@@ -537,6 +537,23 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
+    // The output projection takes a 2D input, [n_heads * head_dim, n_tokens * n_seqs], so it emits the layer's
+    // [n_embd, n_tokens] itself: no reshape node sits between it and the residual ADD, which a backend's
+    // mul_mat + add fusion needs adjacent. LLAMA_GDN_OUT_PROJ_3D_LEGACY=1 projects the 3D form and reshapes after.
+    static const bool out_proj_3d_legacy = [] {
+        const char * v = getenv("LLAMA_GDN_OUT_PROJ_3D_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    if (!out_proj_3d_legacy) {
+        ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+        cb(final_output, "final_output", il);
+
+        cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+        cb(cur, "linear_attn_out", il);
+
+        return cur;
+    }
+
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
     ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
     cb(final_output, "final_output", il);
