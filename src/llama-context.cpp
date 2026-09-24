@@ -1372,6 +1372,11 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         return true;
     }
 
+    // the sampler this sequence drew from on the backend goes back to the CPU (a caller may keep sampling with it)
+    if (const auto it = sampling.samplers.find(seq_id); it != sampling.samplers.end() && it->second != sampler) {
+        llama_sampler_backend_release(it->second);
+    }
+
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
