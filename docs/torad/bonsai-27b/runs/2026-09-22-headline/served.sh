@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Served decode, PrismML prism-b10709-9a9394a vs torad-labs/llama.cpp 3520147, public pack, RTX 5070 Ti.
+# Served decode, PrismML prism-b10709-9a9394a vs torad-labs/llama.cpp c54ace8, public pack, RTX 5070 Ti.
 # Each leg: start llama-server with the runtime's flags, run bench-server.sh, stop it. Without MTP A-B-A-B;
 # then the fork with its MTP draft head, twice. Prism b10709 refuses this pack's MTP head at load
 # (server-prism-mtp.log: the head reads the Hadamard-latent token table without the inverse transform; the
-# fork's a0af7ec restores it), so its MTP leg is recorded as refused, not measured.
+# fork's 514c53c restores it), so its MTP leg is recorded as refused, not measured.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd); bench=$here/../../bench-server.sh; tmpl=$here/../../chat-template.jinja
 # PRISM_BIN, FORK_BIN: the two builds' bin dirs; MODEL: the public pack (README step 2); GPU: the card's index
