@@ -2621,9 +2621,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    // GGML_CUDA_GRAPH_KEY_LEGACY=1: the first node's address alone, one CUDA graph for every shape built there
+    static const bool legacy = getenv("GGML_CUDA_GRAPH_KEY_LEGACY") != nullptr;
+
     ggml_cuda_graph_key key;
     key.first_node = cgraph->nodes[0];
-    key.n_nodes    = cgraph->n_nodes;
+    if (legacy) {
+        return key;
+    }
+    key.n_nodes = cgraph->n_nodes;
     if (cgraph->n_nodes == 0) {
         return key;
     }
