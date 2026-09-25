@@ -1264,74 +1264,73 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-// flash_attn_stream_k_fixup_general for the live mode: a block's range is of live steps (KV_live), its tiles found with fattn_kv_live_find.
+// The stream-k fixup of the live mode (KV_live): one block per output tile and column, as flash_attn_stream_k_fixup_uniform, combining
+// the blocks that split the tile's live steps. Block b of nblocks worked on [b*W/nblocks, (b+1)*W/nblocks) of the W units of work.
 template <int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_live(
         float * dst_ptr,
         const float2 * dst_fixup_ptr,
         const int * KV_live,
-        const int ne01, const int ne02, const int ne03,
+        const int ne01, const int ne02, const int ne03, const int ne12, const int nblocks,
         const int gqa_ratio, const int iter_k, const int iter_j, const int iter_z_gqa) {
     float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
     const float2 * GGML_CUDA_RESTRICT dst_fixup = dst_fixup_ptr;
     constexpr int ncols = ncols1*ncols2;
 
-    const int bidx0 = blockIdx.x;
-    const int j     = blockIdx.y;
-    const int c     = blockIdx.z;
-    const int jc    = j*ncols2 + c;
-    const int tid   = threadIdx.x;
+    const int tile = blockIdx.x; // ((sequence*ne12 + z_KV)*iter_z_gqa + zt_gqa)*iter_j + jt
+    const int j    = blockIdx.y;
+    const int c    = blockIdx.z;
+    const int jc   = j*ncols2 + c;
+    const int tid  = threadIdx.x;
 
-    const float * dst_fixup_data = ((const float *) dst_fixup) + gridDim.x*(2*2*ncols);
+    const int jt       = tile % iter_j;
+    const int zt       = (tile / iter_j) % (iter_z_gqa*ne12);
+    const int sequence = tile / (iter_j*iter_z_gqa*ne12);
+    const int z_KV     = zt / iter_z_gqa;
+    const int zt_gqa   = zt - z_KV*iter_z_gqa;
+    const int zt_Q     = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
+
+    if (jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+        return;
+    }
 
     ggml_cuda_pdl_sync();
     const fattn_kv_live live = fattn_kv_live_view(KV_live, iter_j, ne03, iter_k);
     const int total_work = live.seq_start[ne03];
+    const int pair       = sequence*iter_j + jt;
+    const int start      = live.seq_start[sequence] + zt*live.seq_steps[sequence] + live.step0[pair];
+    const int end        = start + live.n_steps[pair];
 
-    const int kbc0      = int64_t(bidx0 + 0)*total_work / gridDim.x;
-    const int kbc0_stop = int64_t(bidx0 + 1)*total_work / gridDim.x;
-    if (kbc0 == kbc0_stop) {
-        return; // did not have any data
-    }
-    const fattn_kv_live_tile tile = fattn_kv_live_find(live, kbc0);
-    if (kbc0 == tile.start || kbc0_stop < tile.start + tile.n) {
-        return; // wrote the beginning of the tile, or did not write its last part
-    }
-
-    const int z_KV   = tile.zt / iter_z_gqa;
-    const int zt_gqa = tile.zt - z_KV*iter_z_gqa;
-    const int zt_Q   = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
-
-    if (tile.jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
-        return;
+    // The block that worked on unit w: the last b with b*W/nblocks <= w.
+    const int b_first = (int64_t(start + 1)*nblocks - 1) / total_work;
+    const int b_last  = (int64_t(end)*nblocks - 1) / total_work;
+    if (b_first == b_last) {
+        return; // one block worked on the whole tile
     }
 
-    dst += tile.sequence*ne02*ne01*D + tile.jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+    const float * dst_fixup_data = ((const float *) dst_fixup) + nblocks*(2*2*ncols);
 
+    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+
+    // The block that finished the tile wrote its result to dst, the ones before it to the fixup buffer.
     float dst_val = *dst;
     float max_val;
     float rowsum;
     {
-        const float2 tmp = dst_fixup[bidx0*ncols + jc];
+        const float2 tmp = dst_fixup[b_last*ncols + jc];
         max_val = tmp.x;
         rowsum  = tmp.y;
     }
 
-    // Combine with the previous blocks back to the one that started the tile.
-    int bidx     = bidx0 - 1;
-    int kbc_stop = kbc0;
-    while (true) {
-        const int kbc = int64_t(bidx)*total_work / gridDim.x;
-        if (kbc == kbc_stop) { // Did not have any data.
-            bidx--;
-            kbc_stop = kbc;
-            continue;
+    for (int bidx = b_last - 1; bidx >= b_first; --bidx) {
+        if (int64_t(bidx)*total_work / nblocks == int64_t(bidx + 1)*total_work / nblocks) {
+            continue; // Did not have any data.
         }
 
         const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
 
-        const float2 tmp = dst_fixup[(gridDim.x + bidx)*ncols + jc];
+        const float2 tmp = dst_fixup[(nblocks + bidx)*ncols + jc];
 
         const float max_val_new = fmaxf(max_val, tmp.x);
 
@@ -1345,12 +1344,6 @@ static __global__ void flash_attn_stream_k_fixup_live(
         rowsum  = scale_val*rowsum  + scale_add*tmp.y;
 
         max_val = max_val_new;
-
-        if (kbc <= tile.start) {
-            break;
-        }
-        bidx--;
-        kbc_stop = kbc;
     }
 
     *dst = dst_val / rowsum;
@@ -1737,12 +1730,13 @@ void launch_fattn(
     if (stream_k) {
         if (kv_live) {
             const dim3 block_dim_combine(DV, 1, 1);
-            const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
+            const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_live<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr, KV_live.ptr,
-                 Q->ne[1], Q->ne[2], Q->ne[3], gqa_ratio, K->ne[1] / nbatch_fa, ntiles_x, ntiles_z_gqa);
+                 Q->ne[1], Q->ne[2], Q->ne[3], K->ne[2], (int)blocks_num.x,
+                 gqa_ratio, K->ne[1] / nbatch_fa, ntiles_x, ntiles_z_gqa);
         } else if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
             // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
             const int nblocks_sk  = (int)blocks_num.x;
