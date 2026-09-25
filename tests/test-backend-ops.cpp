@@ -1286,6 +1286,9 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // nodes the graph expands before its output, as a model's graph builder forward-expands a side effect (a cache
+    // write) ahead of the tensor it returns, which places them earlier in the node order
+    virtual std::vector<ggml_tensor *> forward_first() { return {}; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1467,6 +1470,9 @@ struct test_case {
         }
 
         // build graph
+        for (ggml_tensor * t : forward_first()) {
+            ggml_build_forward_expand(gf, t);
+        }
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
@@ -1639,6 +1645,9 @@ struct test_case {
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        for (ggml_tensor * t : forward_first()) {
+            ggml_build_forward_expand(gf, t);
+        }
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -4190,6 +4199,95 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV + SILU behind build_conv_state's chain (delta-net-base.cpp), one sequence: GET_ROWS(cache,
+// [state_row]) -> RESHAPE -> CONCAT(state, TRANSPOSE(x)) -> a CPY of a window into the cache per rollback snapshot, which
+// CUDA runs as one kernel at the SSM_CONV (ggml_cuda_try_ssm_conv_state_update), with Qwen3.5's joint q/k L2_NORM over
+// the leading l2_heads heads of 128 channels folded in when there is one. The output is the whole cache, read after the
+// SSM_CONV, beside the conv output and the norm: a wrong window, row, column or head shows in one of them.
+struct test_ssm_conv_state_update : public test_case {
+    const int64_t n_channels;
+    const int64_t n_t;         // new tokens
+    const int64_t n_snapshots; // rollback slots, n_rs_seq + 1
+    const int64_t mem_size;    // rows per slot
+    const int64_t kv_head;     // the sequence's row in each slot
+    const int64_t state_row;   // the row the state is gathered from
+    const int64_t x_pad;       // > 0: x is a view of wider rows, as a projection shared with other outputs lays it out
+    const int64_t l2_heads;    // > 0: an L2_NORM over that many leading heads of 128 channels of the conv output
+
+    std::vector<ggml_tensor *> cpys;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STATE_UPDATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> forward_first() override { return cpys; }
+
+    std::string vars() override {
+        return VARS_TO_STR8(n_channels, n_t, n_snapshots, mem_size, kv_head, state_row, x_pad, l2_heads);
+    }
+
+    test_ssm_conv_state_update(int64_t n_channels = 256, int64_t n_t = 1, int64_t n_snapshots = 3,
+            int64_t mem_size = 4, int64_t kv_head = 1, int64_t state_row = 1, int64_t x_pad = 0, int64_t l2_heads = 0)
+        : n_channels(n_channels), n_t(n_t), n_snapshots(n_snapshots), mem_size(mem_size), kv_head(kv_head),
+          state_row(state_row), x_pad(x_pad), l2_heads(l2_heads) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d_conv = 4;
+        const int64_t row    = (d_conv - 1) * n_channels;
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, mem_size * n_snapshots);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels + x_pad, n_t, 1);
+        if (x_pad > 0) {
+            x = ggml_view_3d(ctx, x, n_channels, n_t, 1, x->nb[1], x->nb[2], 0);
+        }
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_channels);
+
+        ggml_tensor * state      = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, ids), d_conv - 1, n_channels, 1);
+        ggml_tensor * conv_input = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+
+        // build_conv_state's snapshots: window t of K at column max(0, n_t - K + t) into slot K - t
+        cpys.clear();
+        for (int64_t t = 1; t <= n_snapshots; ++t) {
+            const int64_t col  = std::max<int64_t>(0, n_t - n_snapshots + t);
+            const int64_t slot = n_snapshots - t;
+            ggml_tensor * src  = ggml_view_3d(ctx, conv_input, d_conv - 1, n_channels, 1, conv_input->nb[1],
+                                              conv_input->nb[2], ggml_row_size(GGML_TYPE_F32, col));
+            ggml_tensor * dst  = ggml_view_2d(ctx, cache, row, 1, cache->nb[1], (slot * mem_size + kv_head) * cache->nb[1]);
+            cpys.push_back(ggml_cpy(ctx, src, dst));
+        }
+
+        ggml_tensor * conv   = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+        ggml_tensor * result = ggml_reshape_1d(ctx, conv, ggml_nelements(conv));
+        if (l2_heads > 0) {
+            // as qwen35.cpp: a view of the leading heads, one row per head and token, normalized right after the SILU
+            ggml_tensor * qk = ggml_view_4d(ctx, conv, 128, l2_heads, n_t, 1, ggml_row_size(GGML_TYPE_F32, 128),
+                                            conv->nb[1], conv->nb[1] * n_t, 0);
+            ggml_tensor * l2 = ggml_l2_norm(ctx, qk, 1e-6f);
+            result = ggml_concat(ctx, ggml_reshape_1d(ctx, l2, ggml_nelements(l2)), result, 0);
+        }
+        ggml_tensor * out = ggml_concat(ctx, ggml_view_1d(ctx, cache, ggml_nelements(cache), 0), result, 0);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                const int32_t r = (int32_t) state_row;
+                ggml_backend_tensor_set(t, &r, 0, sizeof(r));
+            } else {
+                // the cache too: every row different, so reading or writing another row fails
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -4618,6 +4716,9 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     // out ssm_states_all, K slots of mem_size rows, and the view takes n_seqs rows from row kv_head of each slot
     const int64_t mem_size;
     const int64_t kv_head;
+    // >= 0 (mem_size > 0, one sequence): the initial state is build_rs's gather, GET_ROWS(cache, [state_row]) reshaped
+    // for the op, which CUDA folds into the kernel (ggml_cuda_try_gdn_gather_skip); the cache then starts random
+    const int64_t state_row;
 
     ggml_tensor * cpy_node      = nullptr;
     ggml_tensor * readback_node = nullptr;
@@ -4627,15 +4728,19 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         if (mem_size > 0) {
             s += "," + VARS_TO_STR2(mem_size, kv_head);
         }
+        if (state_row >= 0) {
+            s += "," + VAR_TO_STR(state_row);
+        }
         return s;
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
             int64_t K = 2, int v_repeat = 1, bool raw_gates = false, ggml_type cache_type = GGML_TYPE_F32,
-            int64_t mem_size = 0, int64_t kv_head = 0)
+            int64_t mem_size = 0, int64_t kv_head = 0, int64_t state_row = -1)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
-          v_repeat(v_repeat), raw_gates(raw_gates), cache_type(cache_type), mem_size(mem_size), kv_head(kv_head) {}
+          v_repeat(v_repeat), raw_gates(raw_gates), cache_type(cache_type), mem_size(mem_size), kv_head(kv_head),
+          state_row(state_row) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -4652,10 +4757,21 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         ggml_set_name(v, "v");
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
-        ggml_set_name(state, "state");
+
+        ggml_tensor * cache = nullptr;
+        ggml_tensor * state;
+        if (state_row >= 0) {
+            GGML_ASSERT(mem_size > 0 && n_seqs == 1);
+            cache = ggml_new_tensor_2d(ctx, cache_type, D, mem_size * K);
+            ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(ids, "ids");
+            state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, cache, ids), head_size, head_size, H_v, n_seqs);
+        } else {
+            state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
+            ggml_set_name(state, "state");
+        }
 
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -4680,11 +4796,12 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 
         // recurrent cache view [D, n_seqs, n_written]
         const size_t  row_size = ggml_row_size(cache_type, D);
-        ggml_tensor * cache;
         ggml_tensor * dst;
         if (mem_size > 0) {
             // slot stride nb[2] = mem_size rows, not n_seqs, at an offset of kv_head rows
-            cache = ggml_new_tensor_2d(ctx, cache_type, D, mem_size * K);
+            if (cache == nullptr) {
+                cache = ggml_new_tensor_2d(ctx, cache_type, D, mem_size * K);
+            }
             dst   = ggml_view_3d(ctx, cache, D, n_seqs, n_written, row_size, mem_size * row_size, kv_head * row_size);
         } else {
             cache = ggml_new_tensor_3d(ctx, cache_type, D, n_seqs, n_written);
@@ -4755,7 +4872,11 @@ struct test_gated_delta_net_cache_fusion : public test_case {
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else if (strcmp(t->name, "cache") == 0) {
-                init_tensor_uniform(t, 0.0f, 0.0f);
+                // gathered: every row a different state, so reading another row than state_row fails
+                init_tensor_uniform(t, state_row >= 0 ? -1.0f : 0.0f, state_row >= 0 ? 1.0f : 0.0f);
+            } else if (strcmp(t->name, "ids") == 0) {
+                const std::vector<int32_t> rows(n_seqs, (int32_t) state_row);
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size() * sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -9858,6 +9979,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // build_conv_state's chain: decode (1 token) and a draft verify (3), one snapshot or three, the state row the slot-0
+    // snapshot overwrites or another, x strided; 9 tokens is over the fused kernel's 8 and keeps the chain
+    for (int64_t n_t : { 1, 3, 8, 9 }) {
+        for (int64_t n_snapshots : { 1, 3 }) {
+            for (int64_t kv_head : { 0, 1 }) {
+                for (int64_t state_row : { kv_head, (int64_t) 4 * n_snapshots - 1 }) {
+                    test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, n_snapshots, 4, kv_head, state_row, 0));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 4, 1, 1, 64));
+        for (int64_t l2_heads : { 1, 2 }) {
+            test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 4, 1, 1, 0, l2_heads));
+        }
+    }
+
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 9}) {
@@ -11092,6 +11229,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_Q8_0, n_seqs + 2, 1));
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_F32,  n_seqs + 2, 1));
     }
+    // build_rs's gather of the initial state from the cache (GET_ROWS -> RESHAPE -> GATED_DELTA_NET), folded into the
+    // kernel on CUDA: the served layer at decode and at the 3-token verify, the state read from the row the newest
+    // snapshot overwrites (1, kv_head in slot 0) and from a rollback slot's row the verify also writes (4, slot 1), a
+    // q8_0 and an f32 cache; and the chunked prefill ubatch, which keeps the GET_ROWS
+    for (ggml_type cache_type : { GGML_TYPE_Q8_0, GGML_TYPE_F32 }) {
+        for (int64_t n_tokens : { 1, 3 }) {
+            for (int64_t state_row : { 1, 4 }) {
+                test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3, 3, true, cache_type, 3, 1, state_row));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0, 3, 1, 4));
     // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0));

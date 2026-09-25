@@ -36,6 +36,19 @@ static __device__ __forceinline__ void gdn_store_state(void * dst, const int64_t
     }
 }
 
+// Reads element e of a state source: f32, or a q8_0 cache row (the fused gather, ggml_cuda_try_gdn_gather_skip). q8_0
+// is dequantized with get_rows' formula (dequantize_q8_0), so the kernel sees the values the skipped GET_ROWS wrote.
+static __device__ __forceinline__ float gdn_load_state(const void * src, const int64_t e, const bool q8) {
+    if (q8) {
+        const block_q8_0 * b = (const block_q8_0 *) src + e / QK8_0;
+        const float        d = b->d;
+        float              v = b->qs[e % QK8_0];
+        v *= d;
+        return v;
+    }
+    return ((const float *) src)[e];
+}
+
 // RAW: beta and g arrive pre-activation (ggml_gated_delta_net_set_raw_gates); the kernel applies
 // sigmoid(beta) and raw_a[h] * softplus(g + raw_dt_bias[h]) with the unary kernels' formulas.
 // G_PRECOMPUTED: g already holds exp(g) (GB10 long-prompt path); only used with RAW == false.
@@ -48,7 +61,7 @@ gated_delta_net_cuda(const float * q,
                                      const float * beta,
                                      const float * raw_dt_bias,
                                      const float * raw_a,
-                                     const float * curr_state,
+                                     const void *  curr_state,
                                      float *       dst,
                                      void *        state,
                                      int64_t       H,
@@ -68,7 +81,10 @@ gated_delta_net_cuda(const float * q,
                                      float         scale,
                                      int64_t       state_slot_stride,
                                      int           K,
-                                     int64_t       attn_seq_stride) {
+                                     int64_t       attn_seq_stride,
+                                     const int32_t * s_ids,
+                                     int64_t       s_row_stride,
+                                     bool          s_q8) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // Each warp owns one or more columns, using warp-level primitives to reduce across rows.
@@ -85,11 +101,10 @@ gated_delta_net_cuda(const float * q,
 
     float *       attn_data        = dst;
 
-    // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
+    // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v; with the fused gather
+    // (s_ids) it is the cache itself, this sequence's live state at row s_ids[sequence] (read after the PDL wait).
     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
-    const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v; // in elements of the destination
-    curr_state += state_in_offset;
     // attention rows of one sequence are attn_seq_stride apart: n_tokens * H * S_v, unless this launch
     // covers only the tail of each sequence (the chunked prefill path hands the last K-1 tokens here)
     attn_data += sequence * attn_seq_stride + h_idx * S_v;
@@ -101,12 +116,14 @@ gated_delta_net_cuda(const float * q,
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     ggml_cuda_pdl_sync();
+    const int64_t state_in_offset = (s_ids ? (int64_t) s_ids[sequence] * s_row_stride : (int64_t) sequence * H * S_v * S_v)
+                                    + h_idx * S_v * S_v;
 #pragma unroll
     for (int c = 0; c < cols_per_warp; ++c) {
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * warp_size + lane;
-            s_shard[c][r] = curr_state[(col + c) * S_v + i];
+            s_shard[c][r] = gdn_load_state(curr_state, state_in_offset + (col + c) * S_v + i, s_q8);
         }
     }
 
@@ -235,14 +252,15 @@ gated_delta_net_cuda(const float * q,
 template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, bool STATE_Q8>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
-        const float * g_d, const float * b_d, const float * rb_d, const float * ra_d, const float * s_d,
+        const float * g_d, const float * b_d, const float * rb_d, const float * ra_d, const void * s_d,
         float * dst_d, void * state_d,
         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1,   int64_t sq2, int64_t sq3,
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, int64_t attn_seq_stride, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, int64_t attn_seq_stride,
+        const int32_t * s_ids, int64_t s_row_stride, bool s_q8, cudaStream_t stream) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int num_warps = 4;
@@ -260,7 +278,7 @@ static void launch_gated_delta_net(
                 ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW, G_PRECOMPUTED, false>, launch_params,
                     q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                     n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_q8);
                 break;
             }
             GGML_ABORT("a q8_0 recurrent state needs S_v >= 32");
@@ -268,20 +286,20 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_Q8>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_q8);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_Q8>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_q8);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_Q8>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_q8);
             break;
         }
         default:
@@ -383,6 +401,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float * s_d   = (const float *) src_state->data;
     float *       dst_d = (float *) dst->data;
 
+    // the fused state gather, registered for this node by this context's graph evaluator (ggml_cuda_try_gdn_gather_skip):
+    // the state comes from the cache rows, not from src_state (the skipped GET_ROWS's temp, never written)
+    const ggml_cuda_gated_delta_net_gather * gather = ctx.gdn_gathers().find(dst);
+    const void *    s_in         = gather ? gather->base : (const void *) s_d;
+    const int32_t * s_ids        = gather ? gather->ids : nullptr;
+    const int64_t   s_row_stride = gather ? gather->row_stride : 0;
+    const bool      s_q8         = gather != nullptr && gather->q8_0;
+
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
@@ -434,6 +460,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // the fused cache).
     if (ggml_cuda_should_use_chunked_gdn(dst)) {
         GGML_ASSERT(!state_q8); // the chunk pipeline writes f32 (ggml_cuda_try_gdn_cache_fusion keeps q8_0 off it)
+        GGML_ASSERT(!gather);   // and reads a gathered s0 (ggml_cuda_try_gdn_gather_skip keeps the GET_ROWS for it)
         const int64_t n_tail      = K - 1;
         const int64_t n_chunked   = n_tokens - n_tail;
         float *       chunk_state = (float *) state_d + n_tail * state_slot_stride;
@@ -469,7 +496,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             launch_gated_delta_net<false, true, RAW_, false, false>(q_d + t0 * sq2, k_d + t0 * sq2, v_d + t0 * sv2, \
                 g_d + t0 * sb2, b_d + t0 * sb2, rb_d, ra_d, chunk_state, dst_d + t0 * S_v * H, state_d,        \
                 S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                           \
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, S_v * H * n_tokens, stream)
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, S_v * H * n_tokens, nullptr, 0, false, stream)
             if (raw) { GDN_TAIL_LAUNCH(true); } else { GDN_TAIL_LAUNCH(false); }
 #undef GDN_TAIL_LAUNCH
         }
@@ -492,9 +519,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
 
 #define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_, Q8_)                                                  \
-    launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_, Q8_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
+    launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_, Q8_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_in, dst_d, state_d, \
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                    \
-        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, S_v * H * n_tokens, stream)
+        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, S_v * H * n_tokens,                \
+        s_ids, s_row_stride, s_q8, stream)
 
     // a q8_0 cache is fused for the scalar gate only (ggml_cuda_try_gdn_cache_fusion)
     GGML_ASSERT(!(state_q8 && kda));
