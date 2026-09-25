@@ -4640,14 +4640,30 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // scratch pool is stack-like, so all releases happen globally in reverse.
     std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> gb10_pool_allocations;
 
+    // counted at the first read, so an evaluation that never reaches the GB10 shared Q8 path (another GPU, a replayed CUDA graph) does not build the map
+    // GGML_CUDA_GB10_Q8_COUNT_LEGACY=1: counted on every evaluation, as before
+    static const bool gb10_q8_count_legacy = [] {
+        const char * env = getenv("GGML_CUDA_GB10_Q8_COUNT_LEGACY");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
     std::map<const ggml_tensor *, std::array<int, GGML_TYPE_COUNT>> gb10_shared_q8_consumer_counts;
-    for (int j = 0; j < cgraph->n_nodes; ++j) {
-        const ggml_tensor * candidate = cgraph->nodes[j];
-        if (candidate->op == GGML_OP_MUL_MAT && candidate->src[0] && candidate->src[1]) {
-            ++gb10_shared_q8_consumer_counts[candidate->src[1]][candidate->src[0]->type];
+    bool gb10_shared_q8_counted = false;
+    const auto gb10_shared_q8_count = [&]() {
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * candidate = cgraph->nodes[j];
+            if (candidate->op == GGML_OP_MUL_MAT && candidate->src[0] && candidate->src[1]) {
+                ++gb10_shared_q8_consumer_counts[candidate->src[1]][candidate->src[0]->type];
+            }
         }
+        gb10_shared_q8_counted = true;
+    };
+    if (gb10_q8_count_legacy) {
+        gb10_shared_q8_count();
     }
     const auto gb10_shared_q8_consumer_count = [&](const ggml_tensor * src1, ggml_type type) {
+        if (!gb10_shared_q8_counted) {
+            gb10_shared_q8_count();
+        }
         const auto it = gb10_shared_q8_consumer_counts.find(src1);
         return it == gb10_shared_q8_consumer_counts.end() ? 0 : it->second[type];
     };
