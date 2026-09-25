@@ -2968,7 +2968,7 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 if (x->type != GGML_TYPE_F32 || x->data == nullptr || x->nb[0] != sizeof(float) ||
                         x->nb[1] % sizeof(float) != 0 || x->ne[0] != n->ne[1] || x->ne[1] != n_t || x->ne[2] != 1 ||
                         x->ne[3] != 1 || n_t < 1 || n_t > GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T ||
-                        n->ne[1] % 128 != 0) {
+                        n->ne[1] % GGML_CUDA_SSM_CONV_UPDATE_THREADS != 0) {
                     return false;
                 }
                 concat     = n;
@@ -3025,6 +3025,35 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 u.x           = (const float *) x->data;
                 u.x_stride    = x->nb[1] / sizeof(float);
                 u.n_snapshots = (int) cpys.size();
+
+                // Qwen3.5's joint q/k L2_NORM, the first node after the SILU that is not a view: a view of the leading
+                // whole heads of its output, one row per head and token. The kernel writes it at the SSM_CONV, before
+                // its place, which only views separate; it may overlap nothing the kernel reads or writes
+                const ggml_tensor * silu = cgraph->nodes[j + 1];
+                const ggml_tensor * l2   = nullptr;
+                for (int k = j + 2; k < cgraph->n_nodes; ++k) {
+                    if (!ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                        l2 = cgraph->nodes[k]->op == GGML_OP_L2_NORM ? cgraph->nodes[k] : nullptr;
+                        break;
+                    }
+                }
+                if (l2 != nullptr) {
+                    const ggml_tensor * qk    = l2->src[0];
+                    const int64_t       width = GGML_CUDA_SSM_CONV_UPDATE_THREADS;
+                    const bool ok = qk->op == GGML_OP_VIEW && qk->view_src == silu && qk->view_offs == 0 &&
+                            qk->ne[0] == width && qk->nb[1] == width * sizeof(float) && qk->nb[2] == silu->nb[1] &&
+                            qk->ne[1] * width <= concat->ne[1] && qk->ne[2] == concat->ne[0] - (d_conv - 1) &&
+                            qk->ne[3] == 1 && l2->type == GGML_TYPE_F32 && ggml_is_contiguous(l2) &&
+                            !(l2->flags & GGML_TENSOR_FLAG_OUTPUT) && !ggml_cuda_ranges_overlap(l2, x) &&
+                            !ggml_cuda_ranges_overlap(l2, ids) && !ggml_cuda_ranges_overlap(l2, n) &&
+                            !ggml_cuda_ranges_overlap(l2, silu);
+                    if (ok) {
+                        u.l2_dst   = (float *) l2->data;
+                        u.l2_heads = (int) qk->ne[1];
+                        memcpy(&u.l2_eps, l2->op_params, sizeof(float));
+                        ctx.ssm_conv_updates().l2_norms[n] = l2;
+                    }
+                }
 
                 auto & reg = ctx.ssm_conv_updates();
                 reg.updates[n] = u;

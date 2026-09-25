@@ -4099,8 +4099,9 @@ struct test_ssm_conv : public test_case {
 
 // GGML_OP_SSM_CONV + SILU behind build_conv_state's chain (delta-net-base.cpp), one sequence: GET_ROWS(cache,
 // [state_row]) -> RESHAPE -> CONCAT(state, TRANSPOSE(x)) -> a CPY of a window into the cache per rollback snapshot, which
-// CUDA runs as one kernel at the SSM_CONV (ggml_cuda_try_ssm_conv_state_update). The output is the whole cache, read
-// after the SSM_CONV, beside the conv output: a wrong window, row or column shows in one or the other.
+// CUDA runs as one kernel at the SSM_CONV (ggml_cuda_try_ssm_conv_state_update), with Qwen3.5's joint q/k L2_NORM over
+// the leading l2_heads heads of 128 channels folded in when there is one. The output is the whole cache, read after the
+// SSM_CONV, beside the conv output and the norm: a wrong window, row, column or head shows in one of them.
 struct test_ssm_conv_state_update : public test_case {
     const int64_t n_channels;
     const int64_t n_t;         // new tokens
@@ -4109,6 +4110,7 @@ struct test_ssm_conv_state_update : public test_case {
     const int64_t kv_head;     // the sequence's row in each slot
     const int64_t state_row;   // the row the state is gathered from
     const int64_t x_pad;       // > 0: x is a view of wider rows, as a projection shared with other outputs lays it out
+    const int64_t l2_heads;    // > 0: an L2_NORM over that many leading heads of 128 channels of the conv output
 
     std::vector<ggml_tensor *> cpys;
 
@@ -4121,13 +4123,13 @@ struct test_ssm_conv_state_update : public test_case {
     std::vector<ggml_tensor *> forward_first() override { return cpys; }
 
     std::string vars() override {
-        return VARS_TO_STR7(n_channels, n_t, n_snapshots, mem_size, kv_head, state_row, x_pad);
+        return VARS_TO_STR8(n_channels, n_t, n_snapshots, mem_size, kv_head, state_row, x_pad, l2_heads);
     }
 
     test_ssm_conv_state_update(int64_t n_channels = 256, int64_t n_t = 1, int64_t n_snapshots = 3,
-            int64_t mem_size = 4, int64_t kv_head = 1, int64_t state_row = 1, int64_t x_pad = 0)
+            int64_t mem_size = 4, int64_t kv_head = 1, int64_t state_row = 1, int64_t x_pad = 0, int64_t l2_heads = 0)
         : n_channels(n_channels), n_t(n_t), n_snapshots(n_snapshots), mem_size(mem_size), kv_head(kv_head),
-          state_row(state_row), x_pad(x_pad) {}
+          state_row(state_row), x_pad(x_pad), l2_heads(l2_heads) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t d_conv = 4;
@@ -4157,9 +4159,16 @@ struct test_ssm_conv_state_update : public test_case {
             cpys.push_back(ggml_cpy(ctx, src, dst));
         }
 
-        ggml_tensor * conv = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
-        ggml_tensor * out  = ggml_concat(ctx, ggml_view_1d(ctx, cache, ggml_nelements(cache), 0),
-                                         ggml_reshape_1d(ctx, conv, ggml_nelements(conv)), 0);
+        ggml_tensor * conv   = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+        ggml_tensor * result = ggml_reshape_1d(ctx, conv, ggml_nelements(conv));
+        if (l2_heads > 0) {
+            // as qwen35.cpp: a view of the leading heads, one row per head and token, normalized right after the SILU
+            ggml_tensor * qk = ggml_view_4d(ctx, conv, 128, l2_heads, n_t, 1, ggml_row_size(GGML_TYPE_F32, 128),
+                                            conv->nb[1], conv->nb[1] * n_t, 0);
+            ggml_tensor * l2 = ggml_l2_norm(ctx, qk, 1e-6f);
+            result = ggml_concat(ctx, ggml_reshape_1d(ctx, l2, ggml_nelements(l2)), result, 0);
+        }
+        ggml_tensor * out = ggml_concat(ctx, ggml_view_1d(ctx, cache, ggml_nelements(cache), 0), result, 0);
         return out;
     }
 
@@ -9862,6 +9871,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 4, 1, 1, 64));
+        for (int64_t l2_heads : { 1, 2 }) {
+            test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 4, 1, 1, 0, l2_heads));
+        }
     }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally

@@ -1525,6 +1525,7 @@ struct ggml_cuda_gdn_gather_context {
 #define GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS  8
 #define GGML_CUDA_SSM_CONV_UPDATE_D_CONV  4 // the kernel width it is built for (Qwen3-Next, Qwen3.5)
 #define GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T 8 // new tokens per step it holds in registers
+#define GGML_CUDA_SSM_CONV_UPDATE_THREADS 128 // channels per block, and so the head width the L2 fold takes
 
 struct ggml_cuda_ssm_conv_state_update {
     const float *   cache      = nullptr; // conv cache rows, f32
@@ -1535,22 +1536,33 @@ struct ggml_cuda_ssm_conv_state_update {
     int             n_snapshots = 0;
     float *         snapshot_dst[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // a snapshot CPY's cache row
     int             snapshot_col[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // the CONCAT column its window starts at
+    // the L2_NORM over the leading heads of the SILU output (Qwen3.5's joint q/k norm), folded in: 0 heads, not
+    float *         l2_dst   = nullptr; // [GGML_CUDA_SSM_CONV_UPDATE_THREADS, l2_heads, n_t], contiguous
+    int             l2_heads = 0;
+    float           l2_eps   = 0.0f;
 };
 
 // Registrations are keyed by node pointer, like ggml_cuda_gdn_gather_context, and cleared at the start of every graph
 // evaluation/capture.
 struct ggml_cuda_ssm_conv_update_context {
-    std::unordered_map<const ggml_tensor *, ggml_cuda_ssm_conv_state_update> updates; // by SSM_CONV
-    std::unordered_set<const ggml_tensor *>                                  skipped; // the CONCATs and CPYs
+    std::unordered_map<const ggml_tensor *, ggml_cuda_ssm_conv_state_update> updates;  // by SSM_CONV
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *>             l2_norms; // SSM_CONV -> its L2_NORM
+    std::unordered_set<const ggml_tensor *>                                  skipped;  // the CONCATs, CPYs, L2_NORMs
 
     void reset() {
         updates.clear();
+        l2_norms.clear();
         skipped.clear();
     }
 
     const ggml_cuda_ssm_conv_state_update * find(const ggml_tensor * conv) const {
         const auto it = updates.find(conv);
         return it == updates.end() ? nullptr : &it->second;
+    }
+
+    const ggml_tensor * l2_norm_of(const ggml_tensor * conv) const {
+        const auto it = l2_norms.find(conv);
+        return it == l2_norms.end() ? nullptr : it->second;
     }
 
     bool skips(const ggml_tensor * node) const {

@@ -127,7 +127,10 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 // d_conv - 1 state columns out of the cache row ids[0] and its n_t new inputs out of the projection, writes its n_t
 // outputs, then its window of every snapshot. All its reads come before any of its writes, and a thread touches only
 // its own channel in every row and every column, so a snapshot that overwrites the row being read, and an output the
-// allocator placed exactly on the inputs (the matcher declines any other overlap), read the old values.
+// allocator placed exactly on the inputs (the matcher declines any other overlap), read the old values. A block is one
+// head of GGML_CUDA_SSM_CONV_UPDATE_THREADS channels, so the blocks of the leading u.l2_heads heads also write the L2_NORM
+// of their outputs (u.l2_dst) with l2_norm_f32's arithmetic: one warp sums the squares lane by lane in its column order,
+// then the same warp reduction, rsqrtf and product, so the values match the L2_NORM's bit for bit.
 template <bool apply_silu, int d_conv, int max_n_t>
 static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_update u, const float * w,
                                                  const int w_stride, float * dst, const int dst_stride, const int n_t) {
@@ -156,6 +159,7 @@ static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_
 
     // the same sum as ssm_conv_f32, including its zero bias (it turns a -0.0f sum into +0.0f)
     const float b = 0.0f;
+    float       y[max_n_t];
 #pragma unroll
     for (int t = 0; t < max_n_t; ++t) {
         if (t < n_t) {
@@ -165,7 +169,35 @@ static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_
                 sumf += x[t + j] * wc[j];
             }
             sumf += b;
-            dst[t * dst_stride + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+            y[t] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+            dst[t * dst_stride + c] = y[t];
+        }
+    }
+
+    if ((int) blockIdx.x < u.l2_heads) { // uniform across the block
+        constexpr int width = GGML_CUDA_SSM_CONV_UPDATE_THREADS;
+        __shared__ float row[width];
+        __shared__ float row_scale;
+#pragma unroll
+        for (int t = 0; t < max_n_t; ++t) {
+            if (t < n_t) {
+                row[threadIdx.x] = y[t];
+                __syncthreads();
+                if (threadIdx.x < WARP_SIZE) {
+                    float tmp = 0.0f;
+                    for (int col = threadIdx.x; col < width; col += WARP_SIZE) {
+                        const float xi = row[col];
+                        tmp += xi * xi;
+                    }
+                    tmp = warp_reduce_sum(tmp);
+                    if (threadIdx.x == 0) {
+                        row_scale = rsqrtf(fmaxf(tmp, u.l2_eps * u.l2_eps));
+                    }
+                }
+                __syncthreads();
+                u.l2_dst[((int64_t) t * u.l2_heads + blockIdx.x) * width + threadIdx.x] = row_scale * y[t];
+                __syncthreads();
+            }
         }
     }
 
@@ -260,18 +292,24 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 
     // the chain ggml_cuda_try_ssm_conv_state_update matched: src0 (the CONCAT) was never written, the kernel builds it
     if (const ggml_cuda_ssm_conv_state_update * u = ctx.ssm_conv_updates().find(dst)) {
-        constexpr int threads = 128;
+        constexpr int threads = GGML_CUDA_SSM_CONV_UPDATE_THREADS;
         GGML_ASSERT(!fuse_bias && nc == GGML_CUDA_SSM_CONV_UPDATE_D_CONV && n_s == 1 && nr % threads == 0 &&
                     n_t <= GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T);
         const ggml_cuda_kernel_launch_params launch_params(dim3(nr / threads), dim3(threads), 0, stream);
         const int w_stride   = src1->nb[1] / sizeof(float);
         const int dst_stride = out->nb[1] / sizeof(float);
         if (fuse_silu) {
+            // the L2_NORM normalizes the SILU's output: run it here only with the SILU fused, and only then skip it
+            if (const ggml_tensor * l2 = ctx.ssm_conv_updates().l2_norm_of(dst)) {
+                ctx.ssm_conv_updates().skipped.insert(l2);
+            }
             ggml_cuda_kernel_launch(ssm_conv_state_update_f32<true, GGML_CUDA_SSM_CONV_UPDATE_D_CONV, GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T>,
                                     launch_params, *u, src1_d, w_stride, dst_d, dst_stride, (int) n_t);
         } else {
+            ggml_cuda_ssm_conv_state_update raw = *u;
+            raw.l2_heads = 0;
             ggml_cuda_kernel_launch(ssm_conv_state_update_f32<false, GGML_CUDA_SSM_CONV_UPDATE_D_CONV, GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T>,
-                                    launch_params, *u, src1_d, w_stride, dst_d, dst_stride, (int) n_t);
+                                    launch_params, raw, src1_d, w_stride, dst_d, dst_stride, (int) n_t);
         }
         return;
     }
