@@ -166,6 +166,29 @@ static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & 
 // f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
 // block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
 // draws no block) has masked cells and a wrong bit order fails.
+// PQ2_0 blocks written directly: every 2-bit code (3, the +2 that the reference quantizer never emits from absmax-scaled
+// data, included) and a scale per block log-uniform over [d_min, d_max], two decades by default. Uniform data quantized
+// gives every block d ~ 0.99 and no code 3, so a kernel that drops or misplaces a block's scale, or decodes +2 wrong,
+// still passes on it.
+static void init_tensor_pq2_raw(ggml_tensor * tensor, float d_min = 0.01f, float d_max = 1.0f) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_PQ2_0 && ggml_is_contiguous(tensor));
+    GGML_ASSERT(ggml_type_size(GGML_TYPE_PQ2_0) == 34 && ggml_blck_size(GGML_TYPE_PQ2_0) == 128); // fp16 d, then 32 B of codes
+
+    std::mt19937 gen(std::random_device{}());
+    std::uniform_real_distribution<float> log_d(std::log(d_min), std::log(d_max));
+    std::uniform_int_distribution<int> byte(0, 255);
+
+    std::vector<uint8_t> data(ggml_nbytes(tensor));
+    for (size_t i = 0; i < data.size(); i += 34) {
+        const ggml_fp16_t d = ggml_fp32_to_fp16(std::exp(log_d(gen)));
+        memcpy(data.data() + i, &d, sizeof(d));
+        for (size_t j = 2; j < 34; ++j) {
+            data[i + j] = (uint8_t) byte(gen);
+        }
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
+}
+
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_I16);
     const bool bits = tensor->type == GGML_TYPE_I16;
@@ -5077,6 +5100,26 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// MUL_MAT on PQ2_0 blocks written directly (init_tensor_pq2_raw): every code, block scales over two decades
+struct test_mul_mat_pq2_raw : public test_mul_mat {
+    test_mul_mat_pq2_raw(int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",raw_blocks=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_PQ2_0) {
+                init_tensor_pq2_raw(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -7063,14 +7106,17 @@ struct test_mul_mat_vec_fusion : public test_case {
     std::array<int64_t, 2> batch_dims;
     const bool alias_out; // the fused output over src1's bytes (see new_src1)
     const bool full_bias; // a dense bias has the output's shape, one value per column (a residual), not one broadcast
+    // PQ2_0 block scales 1e-4..1e-3: the products stay far under the bias, which a kernel that drops it then fails by
+    // ~100 % (at K 5120 and block scales 0.01..1 a dropped bias moves the output by ~0.1 %, under the tolerance)
+    const bool small_scales;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
                         bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool alias_out = false,
-                        bool full_bias = false)
+                        bool full_bias = false, bool small_scales = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
         with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), alias_out(alias_out),
-        full_bias(full_bias) {
+        full_bias(full_bias), small_scales(small_scales) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
@@ -7083,6 +7129,9 @@ struct test_mul_mat_vec_fusion : public test_case {
         }
         if (full_bias) {
             v += "," + VAR_TO_STR(full_bias);
+        }
+        if (small_scales) {
+            v += "," + VAR_TO_STR(small_scales);
         }
         return v;
     }
@@ -7254,7 +7303,12 @@ struct test_mul_mat_vec_fusion : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         if (!use_id) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-                init_tensor_uniform(t);
+                if (t->type == GGML_TYPE_PQ2_0) {
+                    // every code and varied block scales, not d ~ 0.99 everywhere
+                    init_tensor_pq2_raw(t, small_scales ? 1e-4f : 0.01f, small_scales ? 1e-3f : 1.0f);
+                } else {
+                    init_tensor_uniform(t);
+                }
             }
         } else {
             init_mul_mat_id_tensors(ctx, n_mats);
@@ -11102,9 +11156,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PQ2_0 at 1-8 columns (decode and an MTP verify) on the tensor-core kernel (mmvq-pq2-mma.cu): Ternary Bonsai 2 27B's
+    // shapes (K 5120 / 6144 / 17408), rows that are not a multiple of 16, a matrix with fewer tiles than warps, and
+    // K 1024 / 2048 (one and two TMA boxes a row)
+    for (int64_t n : { 1, 2, 3, 4, 5, 8 }) {
+        for (const auto & mk : std::vector<std::array<int64_t, 2>>{
+                 {5120, 17408}, {17408, 5120}, {5120, 6144}, {1000, 5120}, {48, 5120}, {33, 1024}, {4096, 2048} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+    // and on blocks written directly (init_tensor_pq2_raw), where a block's scale and the code for +2 matter
+    for (int64_t n : { 1, 2, 3, 8 }) {
+        for (const auto & mk : std::vector<std::array<int64_t, 2>>{ {1000, 5120}, {33, 1024}, {4096, 2048} }) {
+            test_cases.emplace_back(new test_mul_mat_pq2_raw(mk[0], n, mk[1]));
+        }
+    }
+
     // the same model at an MTP verify's width and around the fused-column limit (MMVQ_MAX_FUSED_NCOLS, 3): the FFN's
     // gate/up + GLU (fused at 1 column only), and a residual add (a bias with the output's shape) after the FFN down
-    // (17408 -> 5120) and after a Gated DeltaNet layer's output projection (6144 -> 5120); 4-5 columns do not fuse
+    // (17408 -> 5120) and after a Gated DeltaNet layer's output projection (6144 -> 5120); 4-5 columns do not fuse. Those
+    // are mul_mat_vec_q's limits: on sm_120 the PQ2_0 tensor-core kernel (mmvq-pq2-mma.cu) fuses both at every width here
     for (ggml_type type : { GGML_TYPE_PQ2_0, GGML_TYPE_Q8_0 }) {
         for (int64_t m : { 1, 2, 3, 4, 5 }) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 17408, 5120,
@@ -11113,6 +11184,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 5120, k,
                     false, 1, 1, false, true, false, false, {1, 1}, false, /*full_bias=*/true));
             }
+        }
+    }
+    // the residual add where the bias outweighs the products, so a fused path that drops or misplaces it fails
+    for (int64_t m : { 1, 3, 5, 8 }) {
+        for (int64_t k : { 17408, 6144 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, m, 5120, k,
+                false, 1, 1, false, true, false, false, {1, 1}, false, /*full_bias=*/true, /*small_scales=*/true));
         }
     }
 
