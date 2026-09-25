@@ -3684,6 +3684,57 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_GLU (Qwen3.5's gated norm, silu(gate) * (rms_norm(x) * w), fused operation)
+struct test_rms_norm_mul_glu : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool x_strided;    // x rows 2 * ne[0] apart
+    const bool gate_strided; // the gate a view at an offset in rows 3 * ne[0] apart
+    const bool gate_first;   // swiglu_split(gate, normed); false: swiglu_split(normed, gate), which stays unfused
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_GLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, eps, x_strided, gate_strided, gate_first);
+    }
+
+    test_rms_norm_mul_glu(std::array<int64_t, 4> ne = {128, 48, 3, 1}, float eps = 1e-6f,
+            bool x_strided = false, bool gate_strided = false, bool gate_first = true)
+        : ne(ne), eps(eps), x_strided(x_strided), gate_strided(gate_strided), gate_first(gate_first) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * (x_strided ? 2 : 1), ne[1], ne[2], ne[3]);
+        ggml_set_name(x, "x");
+        if (x_strided) {
+            x = ggml_view_4d(ctx, x, ne[0], ne[1], ne[2], ne[3], x->nb[1], x->nb[2], x->nb[3], 0);
+        }
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+        ggml_tensor * gate = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * (gate_strided ? 3 : 1), ne[1], ne[2], ne[3]);
+        ggml_set_name(gate, "gate");
+        if (gate_strided) {
+            gate = ggml_view_4d(ctx, gate, ne[0], ne[1], ne[2], ne[3], gate->nb[1], gate->nb[2], gate->nb[3],
+                                ne[0] * sizeof(float));
+        }
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        ggml_tensor * out = gate_first ? ggml_swiglu_split(ctx, gate, normed) : ggml_swiglu_split(ctx, normed, gate);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
 struct test_add_rms_norm : public test_case {
     const ggml_type type;
@@ -9760,6 +9811,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
     }
+    // the gated norm at the GDN shape (128 wide, 48 heads, decode and a 3-row verify), a 1024 and a 4096 row width
+    // (the other block sizes), strided x and gate, and the swapped GLU operands that stay unfused
+    for (std::array<int64_t, 4> ne : std::vector<std::array<int64_t, 4>>{ {128, 48, 1, 1}, {128, 48, 3, 1}, {64, 5, 4, 3},
+                                                                         {1024, 3, 2, 1}, {4096, 2, 1, 1} }) {
+        for (bool x_strided : {false, true}) {
+            for (bool gate_strided : {false, true}) {
+                test_cases.emplace_back(new test_rms_norm_mul_glu(ne, 1e-6f, x_strided, gate_strided, true));
+            }
+        }
+        test_cases.emplace_back(new test_rms_norm_mul_glu(ne, 1e-6f, false, false, false));
+    }
+
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
