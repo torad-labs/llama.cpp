@@ -143,10 +143,6 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
-// generate an F16 mask where certain blocks are randomly masked with -INF value
-// f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
-// block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
-// draws no block) has masked cells and a wrong bit order fails.
 // data_f32: one value per cell, 0 or -INFINITY for a bit-packed mask (GGML_TYPE_I16, 16 cells per element, bit set = visible)
 static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & data_f32) {
     if (tensor->type == GGML_TYPE_I16) {
@@ -166,6 +162,10 @@ static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & 
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
+// generate an F16 mask where certain blocks are randomly masked with -INF value
+// f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
+// block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
+// draws no block) has masked cells and a wrong bit order fails.
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_I16);
     const bool bits = tensor->type == GGML_TYPE_I16;
