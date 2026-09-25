@@ -52,7 +52,9 @@ static __device__ __forceinline__ float gdn_load_state(const void * src, const i
 // RAW: beta and g arrive pre-activation (ggml_gated_delta_net_set_raw_gates); the kernel applies
 // sigmoid(beta) and raw_a[h] * softplus(g + raw_dt_bias[h]) with the unary kernels' formulas.
 // G_PRECOMPUTED: g already holds exp(g) (GB10 long-prompt path); only used with RAW == false.
-template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, bool STATE_Q8>
+// max_t > 0: n_tokens <= max_t, and every token's k, q, v, beta and g are loaded right after the state, in one memory
+// round trip; the runtime loop (max_t == 0) cannot hoist a token's loads above the previous token's stores.
+template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, bool STATE_Q8, int max_t = 0>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -127,7 +129,39 @@ gated_delta_net_cuda(const float * q,
         }
     }
 
-    for (int t = 0; t < n_tokens; t++) {
+    static_assert(max_t == 0 || !KDA, "the token prefetch is for the scalar gate");
+    constexpr int n_pre = max_t > 0 ? max_t : 1;
+    float k_pre[n_pre][rows_per_lane];
+    float q_pre[n_pre][rows_per_lane];
+    float v_pre[n_pre][cols_per_warp];
+    float beta_pre[n_pre];
+    float g_pre[n_pre];
+    if constexpr (max_t > 0) {
+#pragma unroll
+        for (int t = 0; t < max_t; t++) {
+            if (t < n_tokens) {
+                const int64_t qk_offset = iq3 * sq3 + t * sq2 + iq1 * sq1;
+                const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    k_pre[t][r] = k[qk_offset + r * warp_size + lane];
+                    q_pre[t][r] = q[qk_offset + r * warp_size + lane];
+                }
+#pragma unroll
+                for (int c = 0; c < cols_per_warp; ++c) {
+                    v_pre[t][c] = v[sequence * sv3 + t * sv2 + h_idx * sv1 + col + c];
+                }
+                beta_pre[t] = beta[gb_offset];
+                g_pre[t]    = g[gb_offset];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < (max_t > 0 ? max_t : n_tokens); t++) {
+        if (max_t > 0 && t >= n_tokens) {
+            break;
+        }
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
@@ -136,7 +170,7 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        float beta_val = *beta_t;
+        float beta_val = max_t > 0 ? beta_pre[t] : *beta_t;
         if constexpr (RAW) {
             beta_val = 1.0f / (1.0f + expf(-beta_val));
         }
@@ -147,13 +181,13 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * warp_size + lane;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
+            k_reg[r] = max_t > 0 ? k_pre[t][r] : k_t[i];
+            q_reg[r] = max_t > 0 ? q_pre[t][r] : q_t[i];
         }
 
         if constexpr (!KDA) {
             static_assert(!(RAW && G_PRECOMPUTED), "exp(g) precompute is only defined for activated gates");
-            float g0 = *g_t;
+            float g0 = max_t > 0 ? g_pre[t] : *g_t;
             if constexpr (RAW) {
                 const float x = g0 + raw_dt_bias[h_idx];
                 g0 = raw_a[h_idx] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
@@ -170,7 +204,7 @@ gated_delta_net_cuda(const float * q,
                 }
                 float kv_col = warp_reduce_sum<warp_size>(kv_shard);
 
-                float delta_col = (v_t[col + c] - g_val * kv_col) * beta_val;
+                float delta_col = ((max_t > 0 ? v_pre[t][c] : v_t[col + c]) - g_val * kv_col) * beta_val;
 
                 float attn_partial = 0.0f;
 #pragma unroll
@@ -249,6 +283,16 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+// a decode or an MTP verify (up to 4 tokens) takes the token prefetch; GGML_CUDA_GDN_PREFETCH_LEGACY=1 keeps the loop
+#define GGML_CUDA_GDN_PREFETCH_MAX_T 4
+static bool ggml_cuda_gdn_prefetch_legacy() {
+    static const bool legacy = [] {
+        const char * s = getenv("GGML_CUDA_GDN_PREFETCH_LEGACY");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return legacy;
+}
+
 template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, bool STATE_Q8>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -296,6 +340,16 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
+            if constexpr (!KDA) {
+                if (n_tokens <= GGML_CUDA_GDN_PREFETCH_MAX_T && !ggml_cuda_gdn_prefetch_legacy()) {
+                    ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_Q8,
+                        GGML_CUDA_GDN_PREFETCH_MAX_T>, launch_params,
+                        q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_q8);
+                    break;
+                }
+            }
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_Q8>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
