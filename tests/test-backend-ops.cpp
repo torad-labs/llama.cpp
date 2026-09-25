@@ -7320,6 +7320,64 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// PQ2_0 matmuls on one activation, next to each other in the graph, as qwen35's qkv and z (or q, k and v) sit once
+// ggml_backend_cuda_graph_optimize has moved them: the CUDA backend runs them as one launch over all their tiles
+// (GGML_CUDA_PQ2_MMA_GROUP_LEGACY=1: one launch each). Every matrix's output is checked, and the row counts put partial
+// tiles inside the launch's tile sequence, where a tile read or written against the wrong matrix shows.
+struct test_mul_mat_group : public test_case {
+    const std::vector<int64_t> rows; // each matrix's
+    const int64_t n;                 // columns
+    const int64_t k;
+
+    std::vector<ggml_tensor *> mms;
+
+    test_mul_mat_group(std::vector<int64_t> rows, int64_t n, int64_t k) : rows(std::move(rows)), n(n), k(k) {}
+
+    std::string vars() override {
+        std::string r;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            r += (i > 0 ? "," : "") + std::to_string(rows[i]);
+        }
+        return "rows=[" + r + "]," + VARS_TO_STR2(n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_GROUP";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> forward_first() override { return mms; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return mms; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        mms.clear();
+        for (size_t i = 0; i < rows.size(); ++i) {
+            ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_PQ2_0, k, rows[i]);
+            ggml_tensor * mm = ggml_mul_mat(ctx, w, x);
+            ggml_format_name(mm, "mm%zu", i);
+            mms.push_back(mm);
+        }
+        return mms.back();
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_PQ2_0) {
+                init_tensor_pq2_raw(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -11204,6 +11262,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, m, n, k,
                     false, 1, 1, false, false, true, false, {1, 1}));
             }
+        }
+    }
+
+    // PQ2_0 group launches: qwen35 27B's qkv and z (a Gated DeltaNet layer) and q, k and v (an attention layer) on one
+    // activation; partial tiles inside the launch's tile sequence (24 and 40 rows: a tile and a half, two and a half; 8:
+    // half a tile); and five matrices, past PQ2_MMA_MAX_GROUP (a group of four, then one on its own)
+    for (int64_t n : { 1, 3, 8 }) {
+        test_cases.emplace_back(new test_mul_mat_group({ 10240, 6144 }, n, 5120));
+        test_cases.emplace_back(new test_mul_mat_group({ 12288, 1024, 1024 }, n, 5120));
+        for (int64_t k : { 1024, 5120 }) {
+            test_cases.emplace_back(new test_mul_mat_group({ 24, 40 }, n, k));
+            test_cases.emplace_back(new test_mul_mat_group({ 8, 1000, 24 }, n, k));
+            test_cases.emplace_back(new test_mul_mat_group({ 40, 8, 24, 16, 8 }, n, k));
         }
     }
 
