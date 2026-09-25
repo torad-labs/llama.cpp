@@ -1386,13 +1386,13 @@ void ggml_cuda_mul_mat_vec_q(
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
-    // PQ2_0 at 1-8 columns (decode and an MTP verify) on int8 tensor cores fed by TMA rings (mmvq-pq2-mma.cu), which also
-    // takes a gated FFN (SWIGLU, no biases) and a residual add at columns past MMVQ_MAX_FUSED_NCOLS
+    // PQ2_0 at 1-8 columns (decode and an MTP verify) on int8 tensor cores fed by a TMA ring per SM (mmvq-pq2-mma.cu),
+    // which also takes a gated FFN (SWIGLU, no biases) and a residual add at columns past MMVQ_MAX_FUSED_NCOLS
     const bool pq2_mma = src0->type == GGML_TYPE_PQ2_0 && !ids && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
         (fusion == nullptr || (fusion->gate_bias == nullptr && fusion->x_scale == nullptr && fusion->gate_scale == nullptr &&
             (fusion->gate == nullptr || (fusion->x_bias == nullptr && fusion->glu_op == GGML_GLU_OP_SWIGLU)))) &&
         ggml_cuda_mmvq_pq2_mma_usable(ggml_cuda_info().devices[ctx.device].cc, src0->data,
-            fusion && fusion->gate ? fusion->gate->data : nullptr, ne00, ne01, nb01 / ts_src0, ne1, stream);
+            fusion && fusion->gate ? fusion->gate->data : nullptr, ne00, ne01, nb01 / ts_src0, ne1);
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
@@ -1479,7 +1479,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     if (pq2_mma) {
-        ggml_cuda_mmvq_pq2_mma(ctx, src0->data, fusion_local.gate, src1_q8_1.get(), (const float *) fusion_local.x_bias,
+        ggml_cuda_mmvq_pq2_mma(src0->data, fusion_local.gate, src1_q8_1.get(), (const float *) fusion_local.x_bias,
             dst_d, ne00, ne01, ne1, s01, s11, s1, stream);
         return;
     }

@@ -1847,7 +1847,7 @@ static bool ggml_cuda_pq2_mma_fuses(ggml_backend_cuda_context & ctx, const ggml_
     }
     return ggml_cuda_mmvq_pq2_mma_usable(ggml_cuda_info().devices[ctx.device].cc, src0->data,
         gate_src0 != nullptr ? gate_src0->data : nullptr, src0->ne[0], src0->ne[1], src0->nb[1] / ggml_type_size(src0->type),
-        mm->ne[1], ctx.stream());
+        mm->ne[1]);
 }
 
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
