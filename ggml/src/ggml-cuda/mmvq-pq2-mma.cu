@@ -387,9 +387,9 @@ static bool pq2_mma_legacy() {
 
 bool ggml_cuda_mmvq_pq2_mma_usable(int cc, const void * vx, int64_t ncols_x, int64_t nrows_x, int64_t stride_row_x,
                                    int64_t ncols_dst) {
-    return !pq2_mma_legacy() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN &&
+    return !pq2_mma_legacy() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_DGX_SPARK &&
         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
-        ncols_dst >= 2 && ncols_dst <= PQ2_MMA_MAX_COLS &&
+        ncols_dst >= 1 && ncols_dst <= PQ2_MMA_MAX_COLS &&
         ncols_x % 1024 == 0 && stride_row_x*(int64_t) sizeof(block_pq2_0) % 16 == 0 && (uintptr_t) vx % 16 == 0 &&
         nrows_x < (int64_t) 1 << 31 && ncols_x*(int64_t) sizeof(block_pq2_0)/QK_PQ2_0 < ((int64_t) 1 << 32);
 }
@@ -406,7 +406,8 @@ static PFN_cuTensorMapEncodeTiled_v12000 pq2_mma_encode_fn() {
 }
 
 // the stream-K fixup's per-tile arrival counters: zeroed once, left zeroed by every launch's last contributors, one
-// buffer per stream (two streams' launches never share it), grown only outside a graph capture
+// buffer per stream (two streams' launches never share it), grown only outside a graph capture (nullptr inside one when
+// it is too small: the caller then leaves the matmul to mul_mat_vec_q)
 static int * pq2_mma_counters(cudaStream_t stream, int64_t n_tiles) {
     static std::mutex mtx;
     static std::map<std::pair<int, cudaStream_t>, std::pair<int *, int64_t>> buffers;
@@ -420,7 +421,7 @@ static int * pq2_mma_counters(cudaStream_t stream, int64_t n_tiles) {
     if (capture != cudaStreamCaptureStatusNone) {
         return nullptr;
     }
-    const int64_t n = std::max<int64_t>(n_tiles, 4096);
+    const int64_t n = std::max<int64_t>(n_tiles, 1 << 16); // 256 KB: every tile of a 1M-row matrix
     if (b.first != nullptr) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaFree(b.first));
@@ -462,7 +463,7 @@ static void pq2_mma_launch_flags(const pq2_mma_config & c, const CUtensorMap & t
 #undef PQ2_MMA_LAUNCH
 }
 
-void ggml_cuda_mmvq_pq2_mma(ggml_backend_cuda_context & ctx, const void * vx, const void * vy, const float * x_bias,
+bool ggml_cuda_mmvq_pq2_mma(ggml_backend_cuda_context & ctx, const void * vx, const void * vy, const float * x_bias,
                             float * dst, int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x,
                             int64_t stride_col_y, int64_t stride_col_dst, cudaStream_t stream) {
     const pq2_mma_config c = pq2_mma_get_config();
@@ -472,6 +473,11 @@ void ggml_cuda_mmvq_pq2_mma(ggml_backend_cuda_context & ctx, const void * vx, co
     const int     nk          = (int) (ncols_x / (QK_PQ2_0 * PQ2_MMA_BOX_BLOCKS));
     const int64_t n_tiles     = (nrows_x + tile_rows - 1) / tile_rows;
     const int64_t total_iters = n_tiles * nk;
+
+    int * counters = pq2_mma_counters(stream, n_tiles);
+    if (counters == nullptr) {
+        return false;
+    }
 
     // weights as 2-byte elements, [row_bytes/2, nrows] with the row stride; one box = tile_rows rows x 272 bytes
     CUtensorMap tmap;
@@ -487,15 +493,13 @@ void ggml_cuda_mmvq_pq2_mma(ggml_backend_cuda_context & ctx, const void * vx, co
     const int nsm     = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     const int nblocks = (int) std::min<int64_t>(nsm, (total_iters + c.nwarps - 1) / c.nwarps);
 
-    int * counters = pq2_mma_counters(stream, n_tiles);
-    GGML_ASSERT(counters != nullptr && "the PQ2_0 MMA counters are allocated by an uncaptured run before a capture");
     ggml_cuda_pool_alloc<float> ws(ctx.pool(), (size_t) nblocks * c.nwarps * 2 * 32 * 4 * c.rg);
 
 #define PQ2_MMA_CASE(NW, NS, RG)                                                                                        \
     if (c.nwarps == (NW) && c.nslots == (NS) && c.rg == (RG)) {                                                        \
         pq2_mma_launch_flags<NW, NS, RG>(c, tmap, (const block_q8_1 *) vy, x_bias, dst, ws.get(), counters,            \
             (int) nrows_x, (int) ncols_dst, nk, total_iters, (int) stride_col_y, (int) stride_col_dst, nblocks, stream); \
-        return;                                                                                                        \
+        return true;                                                                                                   \
     }
     // (nwarps, nslots, rg) within the 99 KB a block may take: 8x2x1 72 KB, 10x2x1 90, 6x3x1 81, 4x2x2 70, 2x2x2 35
     PQ2_MMA_CASE(8,  2, 1)
