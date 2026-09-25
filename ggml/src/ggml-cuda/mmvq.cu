@@ -1491,6 +1491,46 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
 
+void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, const int n) {
+    GGML_ASSERT(n >= 2 && n <= PQ2_MMA_MAX_GROUP);
+    const ggml_tensor * src1 = dsts[0]->src[1];
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float) && src1->ne[2] == 1 && src1->ne[3] == 1);
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+
+    const void * vx[PQ2_MMA_MAX_GROUP];
+    float *      dst[PQ2_MMA_MAX_GROUP];
+    int64_t      nrows[PQ2_MMA_MAX_GROUP];
+    int64_t      stride_row[PQ2_MMA_MAX_GROUP];
+    int64_t      stride_col_dst[PQ2_MMA_MAX_GROUP];
+    for (int g = 0; g < n; ++g) {
+        const ggml_tensor * src0 = dsts[g]->src[0];
+        GGML_ASSERT(dsts[g]->src[1] == src1 && src0->type == GGML_TYPE_PQ2_0 && src0->ne[0] == ne10);
+        GGML_ASSERT(dsts[g]->type == GGML_TYPE_F32 && dsts[g]->nb[0] == sizeof(float) && dsts[g]->ne[1] == ne11);
+        vx[g]             = src0->data;
+        dst[g]            = (float *) dsts[g]->data;
+        nrows[g]          = src0->ne[1];
+        stride_row[g]     = src0->nb[1] / ggml_type_size(src0->type);
+        stride_col_dst[g] = dsts[g]->nb[1] / sizeof(float);
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    {
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        const int64_t s12 = src1->nb[2] / sizeof(float);
+        const int64_t s13 = src1->nb[3] / sizeof(float);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), GGML_TYPE_PQ2_0, ne10, s11, s12, s13,
+            ne10_padded, ne11, 1, 1, stream);
+    }
+
+    ggml_cuda_mmvq_pq2_mma_group(n, vx, dst, nrows, stride_row, stride_col_dst, src1_q8_1.get(), ne10, ne11,
+        ne10_padded / QK8_1, stream);
+}
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

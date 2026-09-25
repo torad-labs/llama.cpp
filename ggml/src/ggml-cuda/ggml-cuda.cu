@@ -1850,6 +1850,130 @@ static bool ggml_cuda_pq2_mma_fuses(ggml_backend_cuda_context & ctx, const ggml_
         mm->ne[1]);
 }
 
+// PQ2_0 group launches: MUL_MATs that read one src1 (qwen35's qkv and z, or q, k and v) and sit next to each other run as
+// one launch of the tensor-core kernel over all their tiles, with src1 quantized once (ggml_cuda_mul_mat_vec_q_pq2_group).
+// ggml_backend_cuda_graph_optimize moves them next to each other. GGML_CUDA_PQ2_MMA_GROUP_LEGACY=1 turns both off. So
+// does GGML_CUDA_GRAPH_OPT=1, whose concurrent streams give q, k and v a stream each.
+static bool ggml_cuda_pq2_mma_group_enabled() {
+    static const bool enabled = [] {
+        const char * legacy    = getenv("GGML_CUDA_PQ2_MMA_GROUP_LEGACY");
+        const char * no_fusion = getenv("GGML_CUDA_DISABLE_FUSION");
+        const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
+        return !(legacy != nullptr && atoi(legacy) != 0) && !(no_fusion != nullptr && atoi(no_fusion) != 0) &&
+            !(graph_opt != nullptr && atoi(graph_opt) == 1);
+    }();
+    return enabled;
+}
+
+// A MUL_MAT that ggml_cuda_mul_mat sends to ggml_cuda_mul_mat_vec_q and that sends it, unfused, to the tensor-core kernel
+static bool ggml_cuda_pq2_mma_group_member(ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+    return mm->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+        mm->src[1]->nb[0] == sizeof(float) && mm->nb[0] == sizeof(float) &&
+        ggml_cuda_should_use_mmvq(GGML_TYPE_PQ2_0, ggml_cuda_info().devices[ctx.device].cc, mm->src[1]->ne[1]) &&
+        ggml_cuda_pq2_mma_fuses(ctx, mm, nullptr, nullptr);
+}
+
+// Whether a fusion may start at node i: an ADD, MUL or GLU reads it within the next four nodes (a bias or scale after
+// it, a gate/up pair's GLU, the LoRA terms added to it), so it stays out of a group
+static bool ggml_cuda_pq2_mma_group_fusion_follows(const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    for (int k = i + 1; k < std::min(i + 5, cgraph->n_nodes); ++k) {
+        const ggml_tensor * next = cgraph->nodes[k];
+        if (next->op != GGML_OP_ADD && next->op != GGML_OP_ADD_ID && next->op != GGML_OP_MUL && next->op != GGML_OP_GLU) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (next->src[s] == node) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The group starting at node i, next to each other in the graph: how many MUL_MATs (0 if fewer than two)
+static int ggml_cuda_pq2_mma_group_size(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    if (!ggml_cuda_pq2_mma_group_enabled() || !ggml_cuda_pq2_mma_group_member(ctx, first) ||
+            ggml_cuda_pq2_mma_group_fusion_follows(cgraph, i)) {
+        return 0;
+    }
+    int n = 1;
+    while (n < PQ2_MMA_MAX_GROUP && i + n < cgraph->n_nodes) {
+        const ggml_tensor * mm = cgraph->nodes[i + n];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != first->src[1] || mm->src[0]->ne[0] != first->src[0]->ne[0] ||
+                !ggml_cuda_pq2_mma_group_member(ctx, mm) || ggml_cuda_pq2_mma_group_fusion_follows(cgraph, i + n)) {
+            break;
+        }
+        ++n;
+    }
+    return n > 1 ? n : 0;
+}
+
+static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
+    while (t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// Moves the group members that read one src1 next to the first of them, in graph order, so the fusion pass launches them
+// as one. A member moves only past nodes that none of its operands comes from and that write nothing over src1's bytes
+// (an in-place op or a view of src1's storage), so it reads the same src1 at its new place; the nodes it moves past keep
+// their order. It runs before ggml-alloc places the tensors, so their lifetimes follow the new order.
+static void ggml_cuda_pq2_mma_group_reorder(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph) {
+    if (!ggml_cuda_pq2_mma_group_enabled()) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> readers;
+    for (int k = 0; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * node = cgraph->nodes[k];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] != nullptr && std::find(node->src, node->src + s, node->src[s]) == node->src + s) {
+                readers[node->src[s]]++;
+            }
+        }
+    }
+    const auto is_view_op = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+            t->op == GGML_OP_TRANSPOSE;
+    };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * first = cgraph->nodes[i];
+        if (!ggml_cuda_pq2_mma_group_member(ctx, first) || ggml_cuda_pq2_mma_group_fusion_follows(cgraph, i)) {
+            continue;
+        }
+        const ggml_tensor * src1  = first->src[1];
+        const ggml_tensor * root  = ggml_cuda_view_root(src1);
+        int                 left  = readers[src1] - 1; // src1's readers after this one
+        int                 end   = i + 1;             // where the next member moves to
+        for (int j = i + 1; j < cgraph->n_nodes && left > 0 && end - i < PQ2_MMA_MAX_GROUP; ++j) {
+            ggml_tensor * node = cgraph->nodes[j];
+            if (!is_view_op(node) && ggml_cuda_view_root(node) == root) {
+                break; // writes over src1's bytes: a reader past it reads what it wrote
+            }
+            if (std::find(node->src, node->src + GGML_MAX_SRC, src1) == node->src + GGML_MAX_SRC) {
+                continue;
+            }
+            --left;
+            if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 || node->src[0]->ne[0] != first->src[0]->ne[0] ||
+                    !ggml_cuda_pq2_mma_group_member(ctx, node) || ggml_cuda_pq2_mma_group_fusion_follows(cgraph, j)) {
+                continue;
+            }
+            bool operands_before = true;
+            for (int k = end; k < j && operands_before; ++k) {
+                operands_before = std::find(node->src, node->src + GGML_MAX_SRC, cgraph->nodes[k]) == node->src + GGML_MAX_SRC;
+            }
+            if (!operands_before) {
+                continue;
+            }
+            std::rotate(cgraph->nodes + end, cgraph->nodes + j, cgraph->nodes + j + 1);
+            ++end;
+        }
+        i = end - 1;
+    }
+}
+
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 // A float src0 that mmf cannot tile (it needs whole blocks of MMF_ROWS_PER_BLOCK rows) falls through to cuBLAS at every
@@ -4653,6 +4777,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (const int n = ggml_cuda_pq2_mma_group_size(*cuda_ctx, cgraph, i); n > 1) {
+        ggml_cuda_mul_mat_vec_q_pq2_group(*cuda_ctx, cgraph->nodes + i, n);
+        return n - 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -5209,6 +5338,8 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_cuda_pq2_mma_group_reorder(*cuda_ctx, cgraph);
 
 #ifdef USE_CUDA_GRAPH
     const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);

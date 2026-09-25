@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -646,8 +647,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -703,6 +703,29 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
 
+    // a batch with no outputs (the catch-up of the verified rows, a prompt) only leaves its K and V in the cache for the draft steps: store them as build_attn() does and skip the query, the attention, the FFN and the LM head
+    // LLAMA_MTP_KV_ONLY_LEGACY=1: the whole head runs on every row, as before
+    static const bool kv_only_legacy = [] {
+        const char * v = getenv("LLAMA_MTP_KV_ONLY_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    if (n_outputs == 0 && !kv_only_legacy) {
+        if (inp_attn->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        cb(Kcur, "k_cache_in", il);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -748,7 +771,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (model.output_draft) {
+        // a draft vocabulary (llama_model_set_draft_vocab): score its rows of the head only, then lay them over
+        // -inf at their token ids, so the logits keep the full-vocabulary shape every sampler reads
+        const int64_t n_vocab = head_w->ne[1];
+        const int64_t n_hot   = model.output_draft->ne[1];
+        const int64_t n_out   = cur->ne[1];
+        ggml_tensor * hot = build_lora_mm(model.output_draft, cur, nullptr);
+        cb(hot, "mtp_draft_logits", -1);
+        ggml_tensor * full = ggml_fill_inplace(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
+        cur = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, hot, 1, n_hot, n_out), model.output_draft_ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_out);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
