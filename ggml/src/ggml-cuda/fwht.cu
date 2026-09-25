@@ -16,7 +16,10 @@ __device__ __forceinline__ float fwht_load<half>(const half value) {
 template <int N, typename T, bool has_signs>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale,
-                          const float * signs, const int n_blk) {
+                          const float * signs, const int n_blk, const bool pdl_trigger) {
+    if (pdl_trigger) {
+        ggml_cuda_pdl_lc();
+    }
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
@@ -86,7 +89,10 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
 template <int N, typename T, bool has_signs>
 __launch_bounds__(FWHT_SMEM_THREADS, 1)
 __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows, const float scale,
-                               const float * signs, const int n_blk) {
+                               const float * signs, const int n_blk, const bool pdl_trigger) {
+    if (pdl_trigger) {
+        ggml_cuda_pdl_lc();
+    }
     __shared__ float s[N];
 
     const int64_t r = blockIdx.x;
@@ -137,7 +143,10 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
 template <int N, int NT, typename T, bool has_signs>
 __launch_bounds__(NT, 1)
 __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
-                                const float * signs, const int n_blk) {
+                                const float * signs, const int n_blk, const bool pdl_trigger) {
+    if (pdl_trigger) {
+        ggml_cuda_pdl_lc();
+    }
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
@@ -230,13 +239,22 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
     const ggml_cuda_kernel_launch_params launch_params =
         ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 
+    // The kernels let their dependents launch as soon as they start (PDL). The next kernels, typically src1's q8_1
+    // quantization and the matmul after it, wait in ggml_cuda_pdl_sync until this one is done before they read what it
+    // writes. Until now they launched only after it finished, which put a launch between every Hadamard rotation and its
+    // matmul and kept the matmul from requesting its weights early. GGML_CUDA_FWHT_PDL_LEGACY=1 restores that.
+    static const bool pdl_trigger = [] {
+        const char * s = getenv("GGML_CUDA_FWHT_PDL_LEGACY");
+        return s == nullptr || atoi(s) == 0;
+    }();
+
     switch (n) {
 #define FWHT_CASE(NN) \
         case NN: \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda<NN, T, true>,  launch_params, src_d, dst_d, rows, scale, signs, n_blk); \
+                ggml_cuda_kernel_launch(fwht_cuda<NN, T, true>,  launch_params, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda<NN, T, false>, launch_params, src_d, dst_d, rows, scale, nullptr, 1); \
+                ggml_cuda_kernel_launch(fwht_cuda<NN, T, false>, launch_params, src_d, dst_d, rows, scale, nullptr, 1, pdl_trigger); \
             } \
             return true;
         FWHT_CASE(64)
@@ -253,9 +271,9 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_SMEM_THREADS, 1, 1); \
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
+                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
+                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, pdl_trigger); \
             } \
             return true; \
         }
@@ -264,9 +282,9 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1); \
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, pdl_trigger); \
             } \
             return true; \
         }

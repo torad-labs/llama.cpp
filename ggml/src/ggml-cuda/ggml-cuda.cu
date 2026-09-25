@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-pq2-mma.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1829,6 +1830,26 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
     return use_mul_mat_vec_q;
 }
 
+// Whether the PQ2_0 tensor-core kernel (mmvq-pq2-mma.cu) takes this MUL_MAT fused past what mul_mat_vec_q fuses: a gate
+// (glu: the GLU node, SWIGLU, no biases) at 1-8 columns, or a residual add at 1-8 columns (glu nullptr, no scale).
+// ggml_cuda_mul_mat_vec_q sends the fused call to that kernel on the same conditions, so it never sees one it cannot run.
+static bool ggml_cuda_pq2_mma_fuses(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * gate_src0,
+                                    const ggml_tensor * glu) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || src0->type != GGML_TYPE_PQ2_0 || src1->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || (gate_src0 != nullptr && ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) ||
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    return ggml_cuda_mmvq_pq2_mma_usable(ggml_cuda_info().devices[ctx.device].cc, src0->data,
+        gate_src0 != nullptr ? gate_src0->data : nullptr, src0->ne[0], src0->ne[1], src0->nb[1] / ggml_type_size(src0->type),
+        mm->ne[1]);
+}
+
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 // A float src0 that mmf cannot tile (it needs whole blocks of MMF_ROWS_PER_BLOCK rows) falls through to cuBLAS at every
@@ -3330,8 +3351,12 @@ static const ggml_tensor * ggml_cuda_mmvq_staged_src1(const ggml_tensor * mm) {
         const char * e = getenv("GGML_CUDA_MMVQ_FUSION_SRC1_LEGACY");
         return e != nullptr && atoi(e) != 0;
     }();
-    // no gate: a gate only adds constraints to mul_mat_vec_f, so without one this errs toward keeping src1 checked
-    if (legacy || ggml_cuda_should_fuse_mul_mat_vec_f(mm, /*gate =*/ nullptr) || !ggml_cuda_should_fuse_mul_mat_vec_q(mm, /*with_gate =*/ false)) {
+    // no gate: a gate only adds constraints to mul_mat_vec_f, so without one this errs toward keeping src1 checked. A PQ2_0
+    // matmul at 1-8 columns that mul_mat_vec_q does not fuse can only fuse into the tensor-core kernel
+    // (ggml_cuda_pq2_mma_fuses), which reads src1 through the same q8_1 copy.
+    const bool pq2_mma = mm->op == GGML_OP_MUL_MAT && mm->src[0]->type == GGML_TYPE_PQ2_0 && mm->ne[1] <= 8;
+    if (legacy || ggml_cuda_should_fuse_mul_mat_vec_f(mm, /*gate =*/ nullptr) ||
+            !(ggml_cuda_should_fuse_mul_mat_vec_q(mm, /*with_gate =*/ false) || pq2_mma)) {
         return nullptr;
     }
     return mm->src[1];
@@ -4378,7 +4403,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*with_gate =*/ true)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*with_gate =*/ true) ||
+                    ggml_cuda_pq2_mma_fuses(*cuda_ctx, up, gate->src[0], glu)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
@@ -4535,7 +4561,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             break;
         }
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, /*with_gate =*/ false) && mmvq_bias_ok(bias_tensor, ids, bias_node)) {
+        if ((ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, /*with_gate =*/ false) ||
+                ggml_cuda_pq2_mma_fuses(*cuda_ctx, mm_node, nullptr, nullptr)) && mmvq_bias_ok(bias_tensor, ids, bias_node)) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
