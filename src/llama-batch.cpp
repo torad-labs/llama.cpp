@@ -320,7 +320,13 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (memory) {
+    // only a token in several sequences couples them: with none, the n_seq_max^2 walk (256^2 with a unified KV cache,
+    // every decode) has nothing to find (LLAMA_BATCH_CPL_CHECK_LEGACY=1: walk it anyway)
+    static const bool cpl_walk_all = [] {
+        const char * v = getenv("LLAMA_BATCH_CPL_CHECK_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    if (memory && (has_cpl || cpl_walk_all)) {
         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
                 if (seq_cpl[s0][s1]) {
