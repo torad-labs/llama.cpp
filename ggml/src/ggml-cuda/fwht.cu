@@ -140,41 +140,16 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
 // Both leave most of the GPU idle at these shapes.
 #define FWHT_BLOCK_THREADS 256
 
-template <int N, int NT, typename T, bool has_signs>
-__launch_bounds__(NT, 1)
-__global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
-                                const float * signs, const int n_blk, const bool pdl_trigger) {
-    if (pdl_trigger) {
-        ggml_cuda_pdl_lc();
-    }
+// The transform of an N-element row held as reg[i] = element i * NT + tid (NT threads), s: N floats of shared memory.
+// The stages run in order of their distance h, so every NT gives the same result.
+template <int N, int NT>
+static __device__ __forceinline__ void fwht_block_transform(float (&reg)[N / NT], float * s) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
 
-    __shared__ float s[N];
-
-    const int64_t r = blockIdx.x;
-    if (r >= n_rows) {
-        return;
-    }
-
-    src += r * N;
-    dst += r * N;
-
     const int tid  = threadIdx.x;
     const int lane = tid % warp_size;
-
-    ggml_cuda_pdl_sync();
-    const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
-
-    float reg[NE];
-#pragma unroll
-    for (int i = 0; i < NE; ++i) {
-        reg[i] = fwht_load(src[i * NT + tid]) * scale;
-        if (has_signs) {
-            reg[i] *= signs_row[i * NT + tid];
-        }
-    }
 
     // stages within a warp: partner differs in the lane bits
 #pragma unroll
@@ -219,11 +194,119 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
             }
         }
     }
+}
+
+// Stores a row fwht_block_transform left in reg at dst.
+template <int N, int NT>
+static __device__ __forceinline__ void fwht_block_store(const float (&reg)[N / NT], float * dst) {
+    constexpr int NE = N / NT;
+    const int tid = threadIdx.x;
 
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
         dst[i * NT + tid] = reg[i];
     }
+}
+
+template <int N, int NT, typename T, bool has_signs>
+__launch_bounds__(NT, 1)
+__global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
+                                const float * signs, const int n_blk, const bool pdl_trigger) {
+    if (pdl_trigger) {
+        ggml_cuda_pdl_lc();
+    }
+    constexpr int NE = N / NT;
+
+    __shared__ float s[N];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+
+    src += r * N;
+    dst += r * N;
+
+    const int tid = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        reg[i] = fwht_load(src[i * NT + tid]) * scale;
+        if (has_signs) {
+            reg[i] *= signs_row[i * NT + tid];
+        }
+    }
+
+    fwht_block_transform<N, NT>(reg, s);
+    fwht_block_store<N, NT>(reg, dst);
+}
+
+// rms_norm with its weight multiply (as rms_norm_f32<1024, true>), the sign flip and the transform in one launch.
+// Block (c, t) reduces token t's whole row as rms_norm does, then transforms its chunk c. normed: the multiply's result or nullptr.
+template <int N>
+__launch_bounds__(1024, 1)
+__global__ void rms_norm_fwht_cuda(const float * x, const float * w, const float * signs, float * normed, float * dst,
+                                   const int ncols, const float eps, const float scale, const bool pdl_trigger) {
+    if (pdl_trigger) {
+        ggml_cuda_pdl_lc();
+    }
+    constexpr int NT = 1024;
+    constexpr int NE = N / NT;
+
+    __shared__ float s[N];
+    __shared__ float s_sum[32];
+
+    const int     tid = threadIdx.x;
+    const int64_t e0  = (int64_t) blockIdx.y * ncols + (int64_t) blockIdx.x * N;
+    x += (int64_t) blockIdx.y * ncols;
+
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += NT) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, NT>(tmp, s_sum);
+
+    const float mean      = tmp / ncols;
+    const float rms_scale = rsqrtf(mean + eps);
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const int   col = blockIdx.x * N + i * NT + tid;
+        const float v   = rms_scale * x[col] * w[col];
+        if (normed != nullptr) {
+            normed[e0 + i * NT + tid] = v;
+        }
+        reg[i] = v * scale;
+        reg[i] *= signs[col];
+    }
+
+    fwht_block_transform<N, NT>(reg, s);
+    fwht_block_store<N, NT>(reg, dst + e0);
+}
+
+static bool fwht_legacy() {
+    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
+    return legacy;
+}
+
+// The kernels let their dependents launch as soon as they start (PDL). The next kernels, typically src1's q8_1
+// quantization and the matmul after it, wait in ggml_cuda_pdl_sync until this one is done before they read what it
+// writes. Until now they launched only after it finished, which put a launch between every Hadamard rotation and its
+// matmul and kept the matmul from requesting its weights early. GGML_CUDA_FWHT_PDL_LEGACY=1 restores that.
+static bool fwht_pdl_trigger() {
+    static const bool pdl_trigger = [] {
+        const char * s = getenv("GGML_CUDA_FWHT_PDL_LEGACY");
+        return s == nullptr || atoi(s) == 0;
+    }();
+    return pdl_trigger;
 }
 
 template <typename T>
@@ -239,14 +322,7 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
     const ggml_cuda_kernel_launch_params launch_params =
         ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 
-    // The kernels let their dependents launch as soon as they start (PDL). The next kernels, typically src1's q8_1
-    // quantization and the matmul after it, wait in ggml_cuda_pdl_sync until this one is done before they read what it
-    // writes. Until now they launched only after it finished, which put a launch between every Hadamard rotation and its
-    // matmul and kept the matmul from requesting its weights early. GGML_CUDA_FWHT_PDL_LEGACY=1 restores that.
-    static const bool pdl_trigger = [] {
-        const char * s = getenv("GGML_CUDA_FWHT_PDL_LEGACY");
-        return s == nullptr || atoi(s) == 0;
-    }();
+    const bool pdl_trigger = fwht_pdl_trigger();
 
     switch (n) {
 #define FWHT_CASE(NN) \
@@ -288,8 +364,7 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             } \
             return true; \
         }
-    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
-    if (legacy) {
+    if (fwht_legacy()) {
         switch (n) {
             FWHT_CASE(512)
             FWHT_CASE(1024)
@@ -354,4 +429,53 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
                               const ggml_tensor * signs, ggml_tensor * dst) {
     return fwht_dispatch(ctx, src, dst, signs);
+}
+
+bool ggml_cuda_rms_norm_fwht_supported(const ggml_tensor * rms_norm, const ggml_tensor * w, const ggml_tensor * normed,
+                                       const ggml_tensor * signs, const ggml_tensor * dst) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const int64_t ncols = x->ne[0];
+    const int64_t n     = dst->ne[0];
+    // from 1,024 columns rms_norm reduces with 1024 threads, the reduction this kernel repeats
+    return !fwht_legacy() && (n == 1024 || n == 2048 || n == 4096) && ggml_nrows(x) <= 8 &&
+        x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ncols >= 1024 && ncols % n == 0 &&
+        w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == ncols && ggml_nrows(w) == 1 &&
+        signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && signs->ne[0] == ncols && ggml_nrows(signs) == 1 &&
+        dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && ggml_nelements(dst) == ggml_nelements(x) &&
+        (normed == nullptr || (normed->type == GGML_TYPE_F32 && ggml_is_contiguous(normed)));
+}
+
+void ggml_cuda_op_rms_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * w,
+                                ggml_tensor * normed, const ggml_tensor * signs, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_rms_norm_fwht_supported(rms_norm, w, normed, signs, dst));
+    const ggml_tensor * x = rms_norm->src[0];
+    const int     ncols = x->ne[0];
+    const int     n     = dst->ne[0];
+    const int64_t ntok  = ggml_nrows(x);
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const float * x_d      = (const float *) x->data;
+    const float * w_d      = (const float *) w->data;
+    const float * signs_d  = (const float *) signs->data;
+    float       * normed_d = normed ? (float *) normed->data : nullptr;
+    float       * dst_d    = (float *) dst->data;
+    const float   scale    = 1 / sqrtf(n);
+
+    const bool pdl_trigger = fwht_pdl_trigger();
+
+    const dim3 grid(ncols / n, ntok, 1), block(1024, 1, 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, block, 0, ctx.stream());
+    switch (n) {
+        case 1024:
+            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<1024>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger);
+            break;
+        case 2048:
+            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<2048>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger);
+            break;
+        default:
+            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<4096>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger);
+            break;
+    }
 }

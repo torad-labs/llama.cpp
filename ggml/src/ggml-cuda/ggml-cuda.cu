@@ -4714,6 +4714,85 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // rms_norm + weight multiply + Hadamard sign flip + reshape + FWHT-hint matmul in one launch at decode.
+    // The graph may order a few nodes that read none of these between the multiply and the sign flip: they run first.
+    // GGML_CUDA_NORM_FWHT_LEGACY=1 restores the separate launches.
+    static const bool norm_fwht_legacy = [] {
+        const char * env = getenv("GGML_CUDA_NORM_FWHT_LEGACY");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!norm_fwht_legacy && node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes && cuda_ctx->curr_stream_no == 0 &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_tensor * mul_w = cgraph->nodes[i + 1];
+        const ggml_tensor * w = mul_w->op != GGML_OP_MUL ? nullptr :
+            mul_w->src[0] == node ? mul_w->src[1] : mul_w->src[1] == node ? mul_w->src[0] : nullptr;
+
+        const auto based_on = [](const ggml_tensor * t, const ggml_tensor * s) {
+            for (; t != nullptr; t = t->view_src) {
+                if (t == s) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const auto reads = [&](const ggml_tensor * t, const ggml_tensor * s) {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (based_on(t->src[k], s)) {
+                    return true;
+                }
+            }
+            return based_on(t->view_src, s);
+        };
+        int j = i + 2;
+        while (w && j < cgraph->n_nodes && j <= i + 9 && !reads(cgraph->nodes[j], mul_w) && !reads(cgraph->nodes[j], node)) {
+            ++j;
+        }
+
+        if (w && j + 2 < cgraph->n_nodes) {
+            ggml_tensor * mul_s   = cgraph->nodes[j];
+            ggml_tensor * reshape = cgraph->nodes[j + 1];
+            ggml_tensor * mm      = cgraph->nodes[j + 2];
+            const ggml_op ops[]   = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+            const int     idxs[]  = { i, i + 1, j, j + 1, j + 2 };
+            const int     out_mm[]    = { j + 2 };
+            const int     out_both[]  = { i + 1, j + 2 };
+
+            const bool chain_ok = mul_s->op == GGML_OP_MUL && mul_s->src[0] == mul_w && reshape->src[0] == mul_s &&
+                mm->op == GGML_OP_MUL_MAT && mm->src[1] == reshape &&
+                ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD;
+            const bool normed_elided = chain_ok && ggml_can_fuse_subgraph_ext(cgraph, idxs, 5, ops, out_mm, 1);
+            const bool fusable = normed_elided || (chain_ok && ggml_can_fuse_subgraph_ext(cgraph, idxs, 5, ops, out_both, 2));
+
+            // the kernel reads x, w and the signs after the nodes in between run and while it writes normed and dst (each block of a token reads the token's whole row)
+            // ggml-alloc may have placed any of those on what it reads once a skipped node was that tensor's last reader
+            const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data;
+                const char * b0 = (const char *) b->data;
+                return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+            };
+            ggml_tensor * normed = normed_elided ? nullptr : mul_w;
+            bool ok = fusable && ggml_cuda_rms_norm_fwht_supported(node, w, normed, mul_s->src[1], mm);
+            const ggml_tensor * late_reads[] = { node->src[0], w, mul_s->src[1] };
+            for (const ggml_tensor * r : late_reads) {
+                ok = ok && !overlap(mm, r) && (normed == nullptr || !overlap(normed, r));
+                for (int k = i + 2; ok && k < j; ++k) {
+                    ok = ggml_cuda_is_view_or_noop(cgraph->nodes[k]) || !overlap(cgraph->nodes[k], r);
+                }
+            }
+
+            if (ok) {
+                for (int k = i + 2; k < j; ++k) {
+                    ggml_tensor * t = cgraph->nodes[k];
+                    if (!ggml_cuda_is_view_or_noop(t) && (t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                        GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, t));
+                    }
+                }
+                ggml_cuda_op_rms_norm_fwht(*cuda_ctx, node, w, normed, mul_s->src[1], mm);
+                return j + 2 - i;
+            }
+        }
+    }
+
     if (const int n = ggml_cuda_pq2_mma_group_size(*cuda_ctx, cgraph, i); n > 1) {
         ggml_cuda_mul_mat_vec_q_pq2_group(*cuda_ctx, cgraph->nodes + i, n);
         return n - 1;

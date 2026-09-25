@@ -5229,20 +5229,31 @@ struct test_mul_mat_pair : public test_case {
     }
 };
 
-// sign flip + reshape + FWHT-hint matmul, the fusable Hadamard activation path
+// sign flip + reshape + FWHT-hint matmul, the fusable Hadamard activation path; with n_mm > 0, that many PQ2_0 matmuls
+// read the transform. norm: an rms_norm and weight multiply first (1), whose result an f32 matmul also reads (2), or
+// with a node the graph orders between them and the sign flip (3)
 struct test_fwht_signed : public test_case {
     const int64_t blk;
     const int64_t width;
     const int64_t n_tokens;
     const ggml_type type_x;
+    const int n_mm;
+    const int norm;
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x) {}
+                     ggml_type type_x = GGML_TYPE_F32, int n_mm = 0, int norm = 0)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), n_mm(n_mm), norm(norm) {}
 
     std::string vars() override {
-        return VARS_TO_STR4(blk, width, n_tokens, type_x);
+        return VARS_TO_STR6(blk, width, n_tokens, type_x, n_mm, norm);
     }
+
+    double max_nmse_err() override {
+        return n_mm > 0 ? 5e-4 : 1e-7; // the matmuls quantize their activations, as in test_mul_mat
+    }
+
+    // the norm fold spans several nodes: evaluated one node at a time, it would not run
+    bool run_whole_graph() override { return norm > 0; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5257,10 +5268,25 @@ struct test_fwht_signed : public test_case {
         ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
         ggml_set_name(s, "s");
 
-        ggml_tensor * cur = ggml_mul(ctx, x, s);
+        ggml_tensor * xn = x;
+        if (norm > 0) {
+            xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width));
+        }
+        ggml_tensor * cur = ggml_mul(ctx, xn, norm == 3 ? ggml_scale(ctx, s, 1.0f) : s);
         cur = ggml_reshape_2d(ctx, cur, blk, width / blk * n_tokens);
         ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
         ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+        if (n_mm > 0) {
+            ggml_tensor * h = ggml_reshape_2d(ctx, out, width, n_tokens);
+            out = nullptr;
+            for (int i = 0; i < n_mm; ++i) {
+                ggml_tensor * y = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_PQ2_0, width, 256), h);
+                out = out ? ggml_add(ctx, out, y) : y;
+            }
+            if (norm == 2) {
+                out = ggml_add(ctx, out, ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 256), xn));
+            }
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -5287,7 +5313,7 @@ struct test_fwht_signed : public test_case {
                     data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+            } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_PQ2_0) {
                 init_tensor_uniform(t);
             }
         }
@@ -10229,6 +10255,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, 2, 1));
+    test_cases.emplace_back(new test_fwht_signed(1024, 6144, 3, GGML_TYPE_F32, 1, 1));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, 2, 2));
+    test_cases.emplace_back(new test_fwht_signed(2048, 4096, 2, GGML_TYPE_F32, 1, 3));
     test_cases.emplace_back(new test_lora_rank1(5120, 6144, 1.0f));
     test_cases.emplace_back(new test_lora_rank1(17408, 5120, 0.5f));
     test_cases.emplace_back(new test_lora_rank1(6144, 5120, 1.0f));
