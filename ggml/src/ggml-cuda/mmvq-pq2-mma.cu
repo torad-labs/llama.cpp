@@ -115,8 +115,9 @@ static __device__ __forceinline__ int64_t pq2_share_begin(int64_t w, int64_t T, 
 template <int nwarps, int nslots, int rg, bool evict_first, bool pre_sync_issue, bool has_bias>
 __launch_bounds__(nwarps*32, 1)
 static __global__ void mmvq_pq2_mma(
-        const __grid_constant__ CUtensorMap tmap, const block_q8_1 * __restrict__ y, const float * __restrict__ x_bias,
-        float * __restrict__ dst, float * __restrict__ ws, int * __restrict__ counters,
+        const __grid_constant__ CUtensorMap tmap, const block_q8_1 * GGML_CUDA_RESTRICT y,
+        const float * GGML_CUDA_RESTRICT x_bias, float * GGML_CUDA_RESTRICT dst, float * GGML_CUDA_RESTRICT ws,
+        int * GGML_CUDA_RESTRICT counters,
         const int nrows, const int ncols, const int nk, const int64_t total_iters,
         const int stride_col_y, const int stride_col_dst) {
 #ifdef PQ2_MMA_AVAILABLE
