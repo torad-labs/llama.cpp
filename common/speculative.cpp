@@ -2637,6 +2637,10 @@ common_speculative_init_result::common_speculative_init_result(
         LOG_ERR("%s: --spec-draft-mtp-vocab is set but no draft-mtp speculative type is\n", __func__);
         return;
     }
+    if (params.speculative.draft.mtp_swa > 0 && (!spec_mtp || params.speculative.draft.mtp_decode_only)) {
+        LOG_ERR("%s: --spec-draft-mtp-swa needs the draft-mtp speculative type and excludes --spec-draft-mtp-decode-only\n", __func__);
+        return;
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -2651,6 +2655,9 @@ common_speculative_init_result::common_speculative_init_result(
         // decode-only MTP: the head keeps only the current turn, mtp_window cells per sequence
         cparams.n_ctx = (uint32_t) params.speculative.draft.mtp_window * (uint32_t) std::max(1, params.n_parallel);
         LOG_INF("%s: decode-only MTP draft context: %u cells (%d per sequence)\n", __func__, cparams.n_ctx, params.speculative.draft.mtp_window);
+    }
+    if (spec_mtp) {
+        cparams.n_swa_mtp = (uint32_t) params.speculative.draft.mtp_swa;
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types

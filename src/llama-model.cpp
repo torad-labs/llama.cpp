@@ -2505,6 +2505,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+    bool mtp_swa_applied = false;
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2892,6 +2893,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // an MTP context given a window attends to its sequences' last n_swa_mtp positions only: the
+                        // cache holds the window and a ubatch per sequence (the iswa cache's SWA sizing) and reuses
+                        // the cells that fall out of it
+                        const bool     mtp_swa = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.n_swa_mtp > 0;
+                        const uint32_t kv_size = !mtp_swa ? cparams.n_ctx_seq : GGML_PAD(std::min(cparams.n_ctx_seq,
+                                params.n_swa_mtp*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch), 256);
+                        if (mtp_swa) {
+                            LLAMA_LOG_INFO("%s: MTP attention window %u positions per sequence, KV cache %u cells\n",
+                                    __func__, params.n_swa_mtp, kv_size);
+                            mtp_swa_applied = true;
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -2900,11 +2913,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                mtp_swa ? params.n_swa_mtp : hparams.n_swa,
+                                mtp_swa ? LLAMA_SWA_TYPE_STANDARD : hparams.swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
@@ -2912,6 +2925,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
             }
+    }
+
+    // a window asked for is never dropped: only the plain KV cache above takes one
+    if (params.n_swa_mtp > 0 && !mtp_swa_applied) {
+        delete res;
+        throw std::runtime_error("an MTP attention window is not supported by this model's memory");
     }
 
     return res;

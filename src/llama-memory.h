@@ -27,6 +27,9 @@ struct llama_memory_params {
 
     llama_context_type ctx_type;
 
+    // MTP context: the attention window over a sequence's last positions (0 = the whole context)
+    uint32_t n_swa_mtp;
+
     llama_memory_t mem_other;
 };
 

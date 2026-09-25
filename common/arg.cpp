@@ -4226,6 +4226,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_WINDOW"));
     add_opt(common_arg(
+        {"--spec-draft-mtp-swa"}, "N",
+        string_format("the MTP draft head attends to the last N positions of each sequence only, prompt and generated, and its KV\n"
+                      "cache holds N cells per sequence plus a ubatch; the verify is untouched (default: %d, the whole context)", params.speculative.draft.mtp_swa),
+        [](common_params & params, int value) {
+            if (value != 0 && value < 64) {
+                throw std::invalid_argument("--spec-draft-mtp-swa must be 0 or at least 64");
+            }
+            params.speculative.draft.mtp_swa = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_SWA"));
+    add_opt(common_arg(
         {"--spec-draft-mtp-vocab"}, "FNAME",
         "the MTP draft head's vocabulary: a file of strictly increasing int32 token ids. A draft step scores their\n"
         "rows of the LM head only; every other token's draft logit is -inf (default: the full vocabulary)",
