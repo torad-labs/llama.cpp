@@ -1792,7 +1792,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, cons
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+// with_gate: the fusion carries a gate and GLU (gate/up + GLU), which fuses at one column only (MMVQ_MAX_FUSED_NCOLS).
+// No default: every caller states it, as the kernel aborts on a gate at more than one column.
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool with_gate) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1809,8 +1811,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // A MUL_MAT fuses its bias or residual add up to MMVQ_MAX_FUSED_NCOLS columns, the kernel reading one per column at
+    // dst's column stride (ggml_cuda_mmvq_fusion_operand_ok), so an MTP verify of 2-3 rows fuses its residual adds as
+    // decode does. GGML_CUDA_MMVQ_FUSION_MULTICOL_LEGACY=1 fuses one column only.
+    static const bool multicol_legacy = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_FUSION_MULTICOL_LEGACY");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > (multicol_legacy || with_gate ? 1 : MMVQ_MAX_FUSED_NCOLS)) {
         return false;
     }
 
@@ -3053,7 +3061,7 @@ static const ggml_tensor * ggml_cuda_mmvq_staged_src1(const ggml_tensor * mm) {
         return e != nullptr && atoi(e) != 0;
     }();
     // no gate: a gate only adds constraints to mul_mat_vec_f, so without one this errs toward keeping src1 checked
-    if (legacy || ggml_cuda_should_fuse_mul_mat_vec_f(mm, /*gate =*/ nullptr) || !ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+    if (legacy || ggml_cuda_should_fuse_mul_mat_vec_f(mm, /*gate =*/ nullptr) || !ggml_cuda_should_fuse_mul_mat_vec_q(mm, /*with_gate =*/ false)) {
         return nullptr;
     }
     return mm->src[1];
@@ -3793,6 +3801,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return bias_node->src[1];
     };
 
+    // a bias the fused mul_mat_vec_q reads at its output's strides; MUL_MAT_ID indexes its bias by expert instead
+    auto mmvq_bias_ok = [](const ggml_tensor * bias, const ggml_tensor * ids, const ggml_tensor * out) {
+        return bias == nullptr || ids != nullptr || ggml_cuda_mmvq_fusion_operand_ok(bias, out);
+    };
+
     // gate + glu + up, with optional scale/bias on both lanes.
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
@@ -3870,7 +3883,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, /*with_gate =*/ true) && mmvq_bias_ok(up_bias, ids, cgraph->nodes[glu_idx]) &&
+                        mmvq_bias_ok(gate_bias, ids, cgraph->nodes[glu_idx])) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -3964,7 +3978,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, /*with_gate =*/ true) && mmvq_bias_ok(up_bias, ids, cgraph->nodes[glu_idx]) &&
+                        mmvq_bias_ok(gate_bias, ids, cgraph->nodes[glu_idx])) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -4026,7 +4041,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, /*with_gate =*/ true) && mmvq_bias_ok(up_bias_tensor, ids, glu) &&
+                    mmvq_bias_ok(gate_bias_tensor, ids, glu)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -4065,7 +4081,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*with_gate =*/ true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
@@ -4157,7 +4173,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, /*with_gate =*/ false) && mmvq_bias_ok(bias, ids, out_node)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
@@ -4222,7 +4238,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             break;
         }
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, /*with_gate =*/ false) && mmvq_bias_ok(bias_tensor, ids, bias_node)) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
