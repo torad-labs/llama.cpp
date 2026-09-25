@@ -9851,6 +9851,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // build_conv_state's chain: decode (1 token) and a draft verify (3), one snapshot or three, the state row the slot-0
+    // snapshot overwrites or another, x strided; 9 tokens is over the fused kernel's 8 and keeps the chain
+    for (int64_t n_t : { 1, 3, 8, 9 }) {
+        for (int64_t n_snapshots : { 1, 3 }) {
+            for (int64_t kv_head : { 0, 1 }) {
+                for (int64_t state_row : { kv_head, (int64_t) 4 * n_snapshots - 1 }) {
+                    test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, n_snapshots, 4, kv_head, state_row, 0));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 4, 1, 1, 64));
+    }
+
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 9}) {
@@ -11527,19 +11540,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
-
-    // build_conv_state's chain: decode (1 token) and a draft verify (3), one snapshot or three, the state row the slot-0
-    // snapshot overwrites or another, x strided; 9 tokens is over the fused kernel's 8 and keeps the chain
-    for (int64_t n_t : { 1, 3, 8, 9 }) {
-        for (int64_t n_snapshots : { 1, 3 }) {
-            for (int64_t kv_head : { 0, 1 }) {
-                for (int64_t state_row : { kv_head, (int64_t) 4 * n_snapshots - 1 }) {
-                    test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, n_snapshots, 4, kv_head, state_row, 0));
-                }
-            }
-        }
-        test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 4, 1, 1, 64));
-    }
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
