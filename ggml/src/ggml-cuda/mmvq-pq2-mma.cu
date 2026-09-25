@@ -19,7 +19,8 @@
 // Tensor cores: mma.m16n8k32 s8, weights in A (16 rows), tokens in B (8 columns, those past ncols zero). A PQ2_0 int16
 // holds 8 weights as 2-bit codes (0 -> -1, 1 -> 0, 2 -> 1, 3 -> 2); __byte_perm on it gives the even and the odd four as
 // int8, which go to the fragment's two k halves, and the token's 8 int8 are split the same way, so each MMA is exactly
-// one 32-weight chunk's integer dot for 16 rows x 8 columns, rescaled per chunk as vec_dot_pq2_0_q8_1 does (d2 * d8 * sumi).
+// one 32-weight chunk's integer dot for 16 rows x 8 columns. vec_dot_pq2_0_q8_1's d2 * d8 * sumi is regrouped: a block's
+// four chunks sum d8 * sumi, and its d2 scales that sum once.
 //
 // The pointers carry no __restrict__: with PDL a restrict load may compile to ld.global.nc, which the compiler can move
 // above the grid dependency wait (upstream #24030), and the tokens and the bias are written by the kernels before this one.
@@ -97,12 +98,21 @@ static __device__ __forceinline__ void pq2_tma_load_2d(void * dst, const CUtenso
     }
 }
 
+// The accumulator starts at 0x4B400000, the bits of 12582912.0f (1.5 * 2^23), so each s32 result is the bits of
+// 12582912 + dot as an fp32 (exact: |dot| <= 32 * 2 * 127 < 2^22), and one FADD converts it instead of a quarter-rate I2F.
+#define PQ2_MMA_F32_MAGIC_BITS 0x4B400000
+#define PQ2_MMA_F32_MAGIC      12582912.0f
+
 static __device__ __forceinline__ void pq2_mma_s8(int & c0, int & c1, int & c2, int & c3,
                                                   const int a0, const int a1, const int a2, const int a3,
                                                   const int b0, const int b1) {
     asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %10, %10, %10};"
         : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(PQ2_MMA_F32_MAGIC_BITS));
+}
+
+static __device__ __forceinline__ float pq2_mma_dot(const int c) {
+    return __int_as_float(c) - PQ2_MMA_F32_MAGIC;
 }
 
 // The warp whose share [w*T/W, (w+1)*T/W) holds iteration x: the largest w with floor(w*T/W) <= x.
@@ -208,12 +218,7 @@ static __global__ void mmvq_pq2_mma(
 
 #pragma unroll
             for (int b = 0; b < PQ2_MMA_BOX_BLOCKS; ++b) {
-                float d2[rg][2];
-#pragma unroll
-                for (int r = 0; r < rg; ++r) {
-                    d2[r][0] = __half2float(*(const half *) (sw + (r*16 + g    )*PQ2_MMA_ROW_BYTES + b*34));
-                    d2[r][1] = __half2float(*(const half *) (sw + (r*16 + g + 8)*PQ2_MMA_ROW_BYTES + b*34));
-                }
+                float blk[rg][4] = {{0.0f}}; // the block's sum over its 4 chunks of d8 * dot; d2 scales it once
 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
                     const int kq = (kb0 + b)*4 + q; // the q8_1 block of these 32 weights' tokens
@@ -241,11 +246,20 @@ static __global__ void mmvq_pq2_mma(
                             __byte_perm(pool, pool, qlo), __byte_perm(pool, pool, qhi),
                             __byte_perm(pool, pool, qlo >> 2), __byte_perm(pool, pool, qhi >> 2), b0, b1);
 
-                        acc[r][0] += d2[r][0] * d8_0 * (float) c0;
-                        acc[r][1] += d2[r][0] * d8_1 * (float) c1;
-                        acc[r][2] += d2[r][1] * d8_0 * (float) c2;
-                        acc[r][3] += d2[r][1] * d8_1 * (float) c3;
+                        blk[r][0] += d8_0 * pq2_mma_dot(c0);
+                        blk[r][1] += d8_1 * pq2_mma_dot(c1);
+                        blk[r][2] += d8_0 * pq2_mma_dot(c2);
+                        blk[r][3] += d8_1 * pq2_mma_dot(c3);
                     }
+                }
+#pragma unroll
+                for (int r = 0; r < rg; ++r) {
+                    const float d2_lo = __half2float(*(const half *) (sw + (r*16 + g    )*PQ2_MMA_ROW_BYTES + b*34));
+                    const float d2_hi = __half2float(*(const half *) (sw + (r*16 + g + 8)*PQ2_MMA_ROW_BYTES + b*34));
+                    acc[r][0] += d2_lo * blk[r][0];
+                    acc[r][1] += d2_lo * blk[r][1];
+                    acc[r][2] += d2_hi * blk[r][2];
+                    acc[r][3] += d2_hi * blk[r][3];
                 }
             }
 
