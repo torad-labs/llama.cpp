@@ -11193,6 +11193,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 false, 1, 1, false, true, false, false, {1, 1}, false, /*full_bias=*/true, /*small_scales=*/true));
         }
     }
+    // both fused epilogues on a partial last tile (1,026 rows: 64 tiles and 2 rows), a row in one box (K 1024) and in
+    // several (K 17408)
+    for (int64_t m : { 1, 3, 8 }) {
+        for (int64_t k : { 1024, 17408 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, m, 1026, k,
+                false, 1, 1, false, true, false, false, {1, 1}, false, /*full_bias=*/true, /*small_scales=*/true));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, m, 1026, k,
+                false, 1, 1, false, false, true, false, {1, 1}));
+        }
+    }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
