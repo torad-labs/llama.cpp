@@ -235,17 +235,34 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     set_tensor_kq_mask(tensor, data_f32);
 }
 
-// mask_band: every row sees only the cells [lo, hi), the way a sequence sees only its own cells in a unified KV cache
-// (--kv-unified), so the tiles before and after the band are masked. 1: a band in the middle; 2: rows alternate between
-// a band at the end and one near the start (two sequences in one Q tile); 3: a band not aligned to 256-cell tiles;
-// 4: a band at the start. The band moves with the stream (dim 3).
-static std::pair<int64_t, int64_t> kq_mask_band(int band, int64_t n_cells, int64_t row, int64_t stream) {
+// mask_band: every row sees only the cells of a few ranges [lo, hi), the way a sequence sees only its own cells in a unified KV
+// cache (--kv-unified), so the tiles around them are masked. 1: a band in the middle; 2: rows alternate between a band at the end
+// and one near the start (two sequences in one Q tile); 3: a band not aligned to 256-cell tiles; 4: a band at the start; 5: chunks
+// 1, 5 and 9 of 12 (one of four slots taking turns); 6: every fourth run of 100 cells; 7: rows alternate between chunks 0, 4, 8
+// and 2, 6, 10 of 12. The bands move with the stream (dim 3).
+static std::vector<std::pair<int64_t, int64_t>> kq_mask_band(int band, int64_t n_cells, int64_t row, int64_t stream) {
     const int64_t shift = stream*(n_cells/16);
     switch (band) {
-        case 1: return { n_cells*5/8 + shift, n_cells*3/4 + shift };
-        case 2: return row % 2 == 0 ? std::make_pair(n_cells*3/4, n_cells - shift) : std::make_pair(n_cells/8 + shift, n_cells/4 + shift);
-        case 3: return { n_cells/2 + 37 + shift, n_cells/2 + 337 + shift };
-        case 4: return { shift, 200 + shift };
+        case 1: return {{ n_cells*5/8 + shift, n_cells*3/4 + shift }};
+        case 2: return {row % 2 == 0 ? std::make_pair(n_cells*3/4, n_cells - shift) : std::make_pair(n_cells/8 + shift, n_cells/4 + shift)};
+        case 3: return {{ n_cells/2 + 37 + shift, n_cells/2 + 337 + shift }};
+        case 4: return {{ shift, 200 + shift }};
+        case 5:
+        case 7: {
+            const int64_t chunk = n_cells/12;
+            std::vector<std::pair<int64_t, int64_t>> ranges;
+            for (int64_t c = (band == 5 ? 1 : 2*(row % 2)) + stream; c < 12; c += 4) {
+                ranges.emplace_back(c*chunk, (c + 1)*chunk);
+            }
+            return ranges;
+        }
+        case 6: {
+            std::vector<std::pair<int64_t, int64_t>> ranges;
+            for (int64_t lo = 100*stream; lo + 100 <= n_cells; lo += 400) {
+                ranges.emplace_back(lo, lo + 100);
+            }
+            return ranges;
+        }
     }
     GGML_ABORT("bad mask_band %d", band);
 }
@@ -268,11 +285,12 @@ static void init_tensor_kq_mask_band(ggml_tensor * tensor, int band) {
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
             for (int64_t i1 = 0; i1 < ne1; i1++) {
-                const auto [lo, hi] = kq_mask_band(band, ne0, i1, i3);
-                GGML_ASSERT(0 <= lo && lo < hi && hi <= ne0);
                 float * row = data_f32.data() + ((i3*ne2 + i2)*ne1 + i1)*ne0;
-                for (int64_t i0 = lo; i0 < hi; i0++) {
-                    row[i0] = bits ? (gen() % 8 == 0 ? -INFINITY : 0.0f) : dis(gen);
+                for (const auto & [lo, hi] : kq_mask_band(band, ne0, i1, i3)) {
+                    GGML_ASSERT(0 <= lo && lo < hi && hi <= ne0);
+                    for (int64_t i0 = lo; i0 < hi; i0++) {
+                        row[i0] = bits ? (gen() % 8 == 0 ? -INFINITY : 0.0f) : dis(gen);
+                    }
                 }
             }
         }
@@ -11167,8 +11185,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // banded masks, a unified KV cache at decode: the KV range scan, the masked head a stream-k block skips, the rows of
     // one Q tile in different bands (nb 3: a Q tile's padding rows; nb 16: the scan's largest batch, 17 the smallest
-    // without it), two streams
-    for (int mask_band : { 1, 2, 3, 4, }) {
+    // without it), two streams; bands 5-7, the mma kernel's live steps between masked ones
+    for (int mask_band : { 1, 2, 3, 4, 5, 6, 7, }) {
         for (int nb : { 1, 2, 3, 8, 16, 17, 32, }) {
             for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0, }) {
                 for (bool mask_bits : { false, true, }) {
@@ -11178,6 +11196,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 8192, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, mask_band));
     }
+    // the live steps of prefill-sized batches: several Q tiles, the last one padded
+    for (int mask_band : { 5, 6, 7, }) {
+        for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 75, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, true, mask_band));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, 5));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 8192,  75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, 5));
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
