@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -151,6 +152,55 @@ static __global__ void rms_norm_f32(const float * x,
         } else {
             dst[col] = scale * x[col];
         }
+    }
+}
+
+// Qwen3.5's gated norm, silu(gate) * (rms_norm(x) * w) with a one-row weight w, in one kernel: rms_norm_f32's sum of
+// squares and scale at the same block size, then the weight multiply and the GLU's product in the unfused order, so the
+// values match the RMS_NORM -> MUL -> GLU(swiglu split) chain bit for bit.
+template <int block_size>
+static __global__ void rms_norm_mul_gate_f32(const float * x,
+                                             const float * mul,
+                                             const float * gate,
+                                             float *       dst,
+                                             const int     ncols,
+                                             const int64_t stride_row,
+                                             const int64_t stride_channel,
+                                             const int64_t stride_sample,
+                                             const int64_t gate_stride_row,
+                                             const int64_t gate_stride_channel,
+                                             const int64_t gate_stride_sample,
+                                             const float   eps) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x    += sample*stride_sample + channel*stride_channel + row*stride_row;
+    gate += sample*gate_stride_sample + channel*gate_stride_channel + row*gate_stride_row;
+    dst  += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float normed = scale * x[col] * mul[col];
+        dst[col] = ggml_cuda_op_silu_single(gate[col]) * normed;
     }
 }
 
@@ -791,6 +841,59 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                           /*add_s00*/ add_s01, add_s02, add_s03,
                           add_ncols, add_nrows, add_nchannels, add_nsamples,
                           eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_mul_gate_fused(
+        ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_tensor, ggml_tensor * glu) {
+    const ggml_tensor * x    = rms_norm->src[0];
+    const ggml_tensor * w    = mul_tensor->src[0] == rms_norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const ggml_tensor * gate = glu->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && glu->src[1] == mul_tensor);
+    GGML_ASSERT(ggml_are_same_shape(x, glu) && ggml_are_same_shape(gate, glu));
+    GGML_ASSERT(ggml_is_contiguous(w) && ggml_nrows(w) == 1 && w->ne[0] == x->ne[0]);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && gate->nb[0] == sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = x->ne[0];
+    const dim3 blocks_num(x->ne[1], x->ne[2], x->ne[3]);
+    const int64_t s01 = x->nb[1] / sizeof(float);
+    const int64_t s02 = x->nb[2] / sizeof(float);
+    const int64_t s03 = x->nb[3] / sizeof(float);
+    const int64_t g01 = gate->nb[1] / sizeof(float);
+    const int64_t g02 = gate->nb[2] / sizeof(float);
+    const int64_t g03 = gate->nb[3] / sizeof(float);
+
+    const float * x_d = (const float *) x->data;
+    const float * w_d = (const float *) w->data;
+    const float * g_d = (const float *) gate->data;
+    float *       dst = (float *) glu->data;
+
+    // the block size rms_norm_mul_f32_cuda takes for this row width, so the sum of squares is the same sum
+    static const bool rms128_enabled = [] {
+        const char * env = getenv("GGML_CUDA_GB10_RMS128");
+        return !env || std::atoi(env) != 0;
+    }();
+    const bool use_rms128 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+        ncols <= 128 && rms128_enabled;
+    cudaStream_t stream = ctx.stream();
+    if (use_rms128) {
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(128, 1, 1), 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_mul_gate_f32<128>, launch_params,
+            x_d, w_d, g_d, dst, ncols, s01, s02, s03, g01, g02, g03, eps);
+    } else if (ncols < 1024) {
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(256, 1, 1), 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_mul_gate_f32<256>, launch_params,
+            x_d, w_d, g_d, dst, ncols, s01, s02, s03, g01, g02, g03, eps);
+    } else {
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(1024, 1, 1), 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_mul_gate_f32<1024>, launch_params,
+            x_d, w_d, g_d, dst, ncols, s01, s02, s03, g01, g02, g03, eps);
+    }
 }
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

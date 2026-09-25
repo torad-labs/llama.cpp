@@ -5,6 +5,8 @@
 #include "log.h"
 #include "reasoning-budget.h"
 
+#include "../src/llama-ext.h" // staging API: llama_sampler_grammar_awaiting_trigger
+
 #include "ggml.h"
 
 #include <algorithm>
@@ -108,6 +110,50 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// the k largest logits as candidates, sorted by logit (ties by id): the set top-k's partial sort of every token keeps,
+// without the n_vocab-long array; a block of logits is skipped with one compare pass when none beats the k-th so far
+static void top_k_candidates(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
+    // a min-heap on the logit, as in std::partial_sort: a later token replaces the smallest only when strictly larger
+    const auto heap_cmp = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+
+    out.resize(k);
+    for (int32_t i = 0; i < k; ++i) {
+        out[i] = llama_token_data{i, logits[i], 0.0f};
+    }
+    std::make_heap(out.begin(), out.end(), heap_cmp);
+
+    const auto consider = [&](int32_t i) {
+        if (logits[i] > out.front().logit) {
+            std::pop_heap(out.begin(), out.end(), heap_cmp);
+            out.back() = llama_token_data{i, logits[i], 0.0f};
+            std::push_heap(out.begin(), out.end(), heap_cmp);
+        }
+    };
+
+    constexpr int32_t block = 16;
+
+    int32_t i = k;
+    for (; i + block <= n_vocab; i += block) {
+        const float kth = out.front().logit;
+        bool any = false;
+        for (int32_t j = 0; j < block; ++j) {
+            any |= logits[i + j] > kth;
+        }
+        if (any) {
+            for (int32_t j = 0; j < block; ++j) {
+                consider(i + j);
+            }
+        }
+    }
+    for (; i < n_vocab; ++i) {
+        consider(i);
+    }
+
+    std::sort(out.begin(), out.end(), [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+    });
+}
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -121,13 +167,17 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // the chain's top-k when no sampler before it changes a logit for these params, else 0 (sampler_top_k_first)
+    int32_t top_k_first = 0;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    // top_k > 0: the candidates are the top_k largest logits, sorted, instead of every token's
+    void set_logits(struct llama_context * ctx, int idx, int32_t top_k = 0) {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -152,6 +202,12 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
+            // a token the backend sampled is looked up among the candidates, so they stay every token's
+            if (top_k > 0 && top_k < n_vocab && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
+                top_k_candidates(logits, n_vocab, top_k, cur);
+                cur_p = { cur.data(), cur.size(), -1, true };
+                return;
+            }
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
@@ -182,6 +238,59 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// LLAMA_SAMPLING_BACKEND_PASSIVE_LEGACY=1: backend sampling is off for any request with a grammar or a reasoning
+// budget, passive or not (the behaviour before common_sampler_backend_passive)
+static bool backend_passive_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_SAMPLING_BACKEND_PASSIVE_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return legacy;
+}
+
+// LLAMA_SAMPLING_TOP_K_FIRST_LEGACY=1: the chain always starts from every token's logit (the behaviour before
+// sampler_top_k_first)
+static bool top_k_first_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_SAMPLING_TOP_K_FIRST_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return legacy;
+}
+
+// the chain's top-k when it is the first sampler of the chain to change a logit or drop a token (the penalties, DRY and
+// top-n-sigma before it off for these params), else 0; up to 128, the k llama_sampler_top_k partial-sorts for
+static int32_t sampler_top_k_first(const common_params_sampling & params, bool has_logit_bias) {
+    if (top_k_first_legacy() || has_logit_bias || params.mirostat != 0 || params.top_k <= 0 || params.top_k > 128) {
+        return 0;
+    }
+    for (const auto & cnstr : params.samplers) {
+        switch (cnstr) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                return params.top_k;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (params.penalty_last_n != 0 &&
+                        (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_base >= 1.0f && params.dry_penalty_last_n != 0) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (params.top_n_sigma > 0.0f) {
+                    return 0;
+                }
+                break;
+            default:
+                return 0;
+        }
+    }
+    return 0;
 }
 
 struct common_sampler * common_sampler_init(
@@ -323,6 +432,7 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    bool has_logit_bias = false;
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
 
@@ -334,6 +444,7 @@ struct common_sampler * common_sampler_init(
 
         if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+            has_logit_bias = true;
         }
     }
 
@@ -412,18 +523,6 @@ struct common_sampler * common_sampler_init(
         llama_sampler_chain_add(chain, smpl);
     }
 
-    if (grmr && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -433,6 +532,19 @@ struct common_sampler * common_sampler_init(
         /* .cur     = */ {},
         /* .cur_p   = */ {},
     };
+
+    result->top_k_first = sampler_top_k_first(params, has_logit_bias);
+
+    // a lazy grammar waiting for its trigger and a reasoning budget that is not forcing leave every logit as it is,
+    // so while both stay so a backend-sampled token is the one the CPU chain would draw (common_sampler_backend_passive);
+    // the server takes the slot off the backend when either turns active. A sampler that constrains from the first
+    // token (a grammar that is not lazy, llguidance, a budget that starts forcing) keeps the CPU path throughout.
+    if (params.backend_sampling && (backend_passive_legacy() ? (grmr || rbudget) : !common_sampler_backend_passive(result))) {
+        LOG_WRN("%s: backend sampling is not compatible with %s, disabling\n", __func__, grmr ? "this grammar" : "this reasoning budget");
+
+        params.backend_sampling         = false;
+        result->params.backend_sampling = false;
+    }
 
     return result;
 }
@@ -449,7 +561,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
-static bool grammar_should_apply(struct common_sampler * gsmpl) {
+static bool grammar_should_apply(const struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;
     }
@@ -462,6 +574,16 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
     return true;
+}
+
+bool common_sampler_backend_passive(const struct common_sampler * gsmpl) {
+    if (gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING) {
+        return false; // the only state in which the budget rewrites logits
+    }
+    if (!gsmpl->grmr || !grammar_should_apply(gsmpl)) {
+        return true;  // no grammar, or a lazy one held off while reasoning
+    }
+    return llama_sampler_grammar_awaiting_trigger(gsmpl->grmr);
 }
 
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
@@ -604,7 +726,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // the chain's top-k picks first unless something before the chain needs every token: a reasoning budget forcing its
+    // token or a grammar applied first (a grammar's resample below also starts from every token)
+    const bool every_token = (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) ||
+        (grammar_first && grammar_should_apply(gsmpl));
+
+    gsmpl->set_logits(ctx, idx, every_token ? 0 : gsmpl->top_k_first);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -614,8 +741,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            // a grammar or reasoning budget that would change these logits must have taken the slot off the backend
+            GGML_ASSERT(common_sampler_backend_passive(gsmpl) && "backend-sampled token while the grammar or reasoning budget constrains");
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
@@ -691,6 +818,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         if (draft[i] != id) {
             break;
+        }
+
+        // the rows after this one were sampled on the backend without the constraint this token just switched on
+        // (a lazy grammar's trigger, the reasoning budget forcing): end here with a valid sample as the last token
+        if (llama_get_sampled_token_ith(ctx, idxs[i + 1]) != LLAMA_TOKEN_NULL && !common_sampler_backend_passive(gsmpl)) {
+            return result;
         }
     }
 

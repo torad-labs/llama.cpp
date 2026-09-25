@@ -453,7 +453,8 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx,
     if (cc < GGML_CUDA_CC_HOPPER || cc >= 1000 ||
         (!is_q1 && !is_q2) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         src1->ne[2] * src1->ne[3] != 1 || src0->ne[2] * src0->ne[3] != 1 || (M % 128) || (N % 128) || (K % 128) ||
-        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+        reinterpret_cast<uintptr_t>(src1->data) % sizeof(float4) != 0) { // quant_act_per128 reads src1 as float4
         return false;
     }
     cudaStream_t      stream = ctx.stream();

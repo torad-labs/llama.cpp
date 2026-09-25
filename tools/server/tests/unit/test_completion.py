@@ -570,6 +570,38 @@ def test_n_probs_post_backend_sampling():
         for (aa, bb) in zip(a["top_probs"], b["top_probs"]):
             verify_token(aa, bb)
 
+@pytest.mark.parametrize("constraint,expected", [
+    # a lazy grammar that triggers mid-generation ("girl named" is generated at tokens 5-8)
+    ({"grammar": 'root ::= "girl named Zo" [a-z]* "."', "grammar_lazy": True,
+      "grammar_triggers": [{"type": 1, "value": "girl named"}]}, "girl named Zo"),
+    # a reasoning budget that runs out mid-generation and forces its end
+    ({"reasoning_budget_tokens": 3, "reasoning_budget_start_tag": "there", "reasoning_budget_end_tag": "end",
+      "reasoning_budget_message": "Zoo"}, "Zoo end"),
+])
+def test_backend_sampling_until_constrained(constraint, expected):
+    """A lazy grammar awaiting its trigger and a reasoning budget that is not forcing leave the logits alone: the slot
+    samples on the backend until the constraint turns on, and on the CPU from there. The tokens match a CPU-only run."""
+    global server
+    server.backend_sampling = True
+    server.start()
+
+    def run(backend_sampling):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "Once upon a time",
+            "n_predict": 40,
+            "temperature": 0.0,
+            "return_tokens": True,
+            "backend_sampling": backend_sampling,
+            **constraint,
+        })
+        assert res.status_code == 200
+        return res.body
+
+    on, off = run(True), run(False)
+    assert on["generation_settings"]["backend_sampling"] is True
+    assert expected in on["content"]
+    assert on["tokens"] == off["tokens"]
+
 @pytest.mark.parametrize("tokenize,openai_style", [(False, False), (False, True), (True, False), (True, True)])
 def test_logit_bias(tokenize, openai_style):
     global server

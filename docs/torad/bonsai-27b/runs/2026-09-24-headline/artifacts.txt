@@ -1,0 +1,4 @@
+prism libggml-cuda 64c9580d19cdee0d
+fork  libggml-cuda f13be855b00a8605
+pack  3cb3f0056d2e34ee
+NVIDIA GeForce RTX 5070 Ti, 610.43.02

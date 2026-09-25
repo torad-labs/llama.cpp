@@ -10,24 +10,31 @@ to reproduce them, then shows how to put the server behind Claude Code with
 ## Headline
 
 One RTX 5070 Ti (16 GB), the public pack, and PrismML's latest release (`prism-b10709-9a9394a`)
-against this fork at `3520147`. Both were built with the flags in step 1.
+against this fork at `c008fe8`, the engine rig 0.1.2 and later install. Both were built with the
+flags in step 1, and the benchmarks ran only once the shared host had been quiet for two minutes
+(1-minute load under 6; at most 4.4 during the run, [`quiet-rerun.sh`](runs/2026-09-24-headline/quiet-rerun.sh)).
 
-**Long context is where the fork pays.** At 131,072 tokens of context it decodes 1.83× and
+**Long context is where the fork pays.** At 131,072 tokens of context it decodes 1.89× and
 prefills 2.0× faster, mostly because the attention reads the q4_0 cache directly instead of
 converting it to fp16 first. Prefill also carries the chunked Gated DeltaNet kernel, which is
-worth +9 % at 32K on its own (row `8ea0ee2` below). From [`bench-matrix.sh`](bench-matrix.sh) (llama-bench, q4_0 K/V, flash attention
+worth +9 % at 32K on its own (row `b120f63` below). From [`bench-matrix.sh`](bench-matrix.sh) (llama-bench, q4_0 K/V, flash attention
 on, no draft head on either side, 3 repetitions):
 
 | context depth | prefill (pp512), Prism → fork | decode (tg128), Prism → fork |
 |---|---|---|
-| 0 | 1,736 → 1,937 tok/s | 78.8 → 76.3 tok/s |
-| 16,384 | 1,475 → 1,742 | 67.5 → 73.9 |
-| 65,536 | 804 → 1,323 | 46.4 → 66.1 |
-| 131,072 | 492 → 985 | 32.1 → 58.6 |
+| 0 | 1,888 → 2,164 tok/s | 85.8 → 85.8 tok/s |
+| 16,384 | 1,626 → 1,994 | 71.2 → 81.9 |
+| 65,536 | 874 → 1,479 | 50.3 → 75.0 |
+| 131,072 | 547 → 1,104 | 35.5 → 67.3 |
 
-At depth 0 the decode rows are within the card's drift. A-B-A-B with 5 repetitions each gives
-Prism 78.3 / 77.2 and the fork 77.6 / 75.8, and setting every fork off switch leaves 75.7
-([`d0-decode.tsv`](runs/2026-09-22-headline/d0-decode.tsv)).
+At depth 0 the fork decodes 1.3 % slower than Prism. A-B-A-B with 5 repetitions each gives Prism
+88.4 / 88.2 and the fork 87.1 / 87.1 tok/s, and the fork with every off switch set gives 87.4, so
+the gap comes from none of the switchable changes
+([`d0-decode.tsv`](runs/2026-09-24-headline/d0-decode.tsv)).
+
+The served rows below are from the 2026-09-22 run, with the fork at `c54ace8`. The 2026-09-24
+directory also has served rows for `c008fe8`'s tree, but they ran while the host's load was 20-50.
+That load moves decode by 8-12 tok/s, so they are kept as a record and not used here.
 
 **Served, the MTP draft head is the fork's largest single gain.** From
 [`bench-server.sh`](bench-server.sh): one conversation, 65,536-token window, six prompts of 512
@@ -57,16 +64,16 @@ Each change is one commit with its own measurement and an environment switch tha
 
 | change | commit | measured on this model | off switch |
 |---|---|---|---|
-| Tensor-core flash attention reads the q4_0 K/V cache natively, with int8 Q·K, instead of converting the whole context to fp16 before every attention op | `da69dc5` | RTX 5080: prefill at 131K 930 → 1,382 tok/s, decode at 131K 44.5 → 73.3 tok/s | `GGML_CUDA_FATTN_Q4_0_LEGACY=1` |
-| The MTP draft head reads the pack's Hadamard-latent token table through the inverse rotation, the way the trunk does | `a0af7ec` | Stock PrismML refuses the head at load; the MTP rows of the headline are what it enables | omit `--spec-type draft-mtp` |
-| The recurrent (Gated DeltaNet) state cache in a narrower type, `-cts q8_0`; the update math stays f32 in the kernel | `ca9e071` | RTX 5080, 4 conversations with 2 rollback snapshots each: 1,795.5 → 526.5 MiB of VRAM | omit `-cts` (f32) |
-| The attention mask as one bit per KV cell, `--attn-mask-bits` | `3d68483` | At 294,912 cells × 512: mask 288 → 18 MB (target) and 64 → 4 MB (draft); the same greedy tokens with bit-identical top-5 logprobs | omit the flag |
-| A pinned context checkpoint every N prompt tokens and at the token a prompt forked, `--checkpoint-every`, so a compacted or new Claude Code session resumes from a checkpoint instead of re-reading its whole prompt | in `da69dc5` | — | omit the flag |
-| A small float matrix the tiled kernel cannot take goes to the vector kernel, not a ~26 µs cuBLAS GEMM: the 48-row gate projections of every Gated DeltaNet layer at each MTP verify | `8498fa7` | RTX 5070 Ti, served with MTP: 83.3 → 90.1 / 90.8 tok/s (A-B-A) | `GGML_CUDA_MMVF_UNTILED_LEGACY=1` |
-| Chunked tensor-core Gated DeltaNet prefill (a port of ggml-org/llama.cpp#26001) | `8ea0ee2` | RTX 5070 Ti: Gated DeltaNet per 512-token ubatch 53.3 → 15.6 ms, prefill at 32K 1,330 → 1,446 tok/s; KL 0.00148 against the recurrent kernel | `GGML_CUDA_GDN_CHUNKED=0` |
-| GeForce Blackwell takes the transposed conv-state concat and the float4 scale, which were gated to the DGX Spark | `b4c2d66` | RTX 5070 Ti, MTP verify step: GPU time 20.0 → 19.4 ms; identical logits | `GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY=1`, `GGML_CUDA_SCALE_VEC4_SM120_LEGACY=1` |
+| Tensor-core flash attention reads the q4_0 K/V cache natively, with int8 Q·K, instead of converting the whole context to fp16 before every attention op | `60feea0` | RTX 5080: prefill at 131K 930 → 1,382 tok/s, decode at 131K 44.5 → 73.3 tok/s | `GGML_CUDA_FATTN_Q4_0_LEGACY=1` |
+| The MTP draft head reads the pack's Hadamard-latent token table through the inverse rotation, the way the trunk does | `514c53c` | Stock PrismML refuses the head at load; the MTP rows of the headline are what it enables | omit `--spec-type draft-mtp` |
+| The recurrent (Gated DeltaNet) state cache in a narrower type, `-cts q8_0`; the update math stays f32 in the kernel | `a941add` | RTX 5080, 4 conversations with 2 rollback snapshots each: 1,795.5 → 526.5 MiB of VRAM | omit `-cts` (f32) |
+| The attention mask as one bit per KV cell, `--attn-mask-bits` | `9e358e6` | At 294,912 cells × 512: mask 288 → 18 MB (target) and 64 → 4 MB (draft); the same greedy tokens with bit-identical top-5 logprobs | omit the flag |
+| A pinned context checkpoint every N prompt tokens and at the token a prompt forked, `--checkpoint-every`, so a compacted or new Claude Code session resumes from a checkpoint instead of re-reading its whole prompt | in `60feea0` | — | omit the flag |
+| A small float matrix the tiled kernel cannot take goes to the vector kernel, not a ~26 µs cuBLAS GEMM: the 48-row gate projections of every Gated DeltaNet layer at each MTP verify | `55b7db6` | RTX 5070 Ti, served with MTP: 83.3 → 90.1 / 90.8 tok/s (A-B-A) | `GGML_CUDA_MMVF_UNTILED_LEGACY=1` |
+| Chunked tensor-core Gated DeltaNet prefill (a port of ggml-org/llama.cpp#26001) | `b120f63` | RTX 5070 Ti: Gated DeltaNet per 512-token ubatch 53.3 → 15.6 ms, prefill at 32K 1,330 → 1,446 tok/s; KL 0.00148 against the recurrent kernel | `GGML_CUDA_GDN_CHUNKED=0` |
+| GeForce Blackwell takes the transposed conv-state concat and the float4 scale, which were gated to the DGX Spark | `d371dff` | RTX 5070 Ti, MTP verify step: GPU time 20.0 → 19.4 ms; identical logits | `GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY=1`, `GGML_CUDA_SCALE_VEC4_SM120_LEGACY=1` |
 
-`da69dc5` is this branch's first commit: PrismML's tree with the q4_0 flash attention and
+`60feea0` is this branch's first commit: PrismML's tree with the q4_0 flash attention and
 `--checkpoint-every` folded in.
 
 ## Tried, not shipped
@@ -96,6 +103,28 @@ Measured on the RTX 5070 Ti and kept out of `main`, each for the reason given:
   - The numbers are one binary with its switch off / on / off.
 
 ## Run it yourself
+
+### The short way: rig
+
+[rig](https://github.com/torad-labs/rig) does steps 1–3 below on Linux with an RTX 50-series or
+RTX PRO Blackwell card. The machine needs only the NVIDIA driver (CUDA 13 or newer) and glibc 2.35
+or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+):
+
+```bash
+curl -fsSL https://github.com/torad-labs/rig/releases/latest/download/install.sh | sh
+rig up bonsai-2-27b
+```
+
+`rig up`:
+- checks the card and driver;
+- installs this fork's published build ([`engine-c008fe8`](https://github.com/torad-labs/llama.cpp/releases/tag/engine-c008fe8)) and NVIDIA's CUDA 13.3 runtime, each checked by sha256, with no toolkit or compiler;
+- fetches the pack from step 2 by sha256, then writes our retrained MTP draft head over the pack's own ([`bonsai-2-27b-mtp-r2`](https://github.com/torad-labs/rig/releases/tag/bonsai-2-27b-mtp-r2), also checked by sha256; it raises the share of drafted tokens accepted from 0.670 to 0.733 on the pack as published);
+- starts it as a systemd user service on `127.0.0.1:8099`, with step 3's flags and `-c`/`-np` sized to the card.
+
+On a fresh Ubuntu 24.04 with only the driver, the engine install took about 45 seconds, plus the
+7.66 GB pack and the 451 MB head. `rig describe bonsai-2-27b` prints what step 4 needs as JSON. In step 4, use
+`base_url = "http://127.0.0.1:8099/v1"`; the model id can stay `bonsai-2-27b`, since llama-server
+answers for any id.
 
 ### 1. Build (CUDA 12.8 or newer, sm_120: RTX 50-series and RTX PRO Blackwell)
 
@@ -219,7 +248,7 @@ Three settings carry measurements:
   unmodified. It has no `-cts`, `--attn-mask-bits` or `--checkpoint-every`, so its served runs use
   the same command without those flags. It also refuses this pack's MTP draft head at load
   ([`server-prism-mtp.log`](runs/2026-09-22-headline/server-prism-mtp.log)): the head reads the
-  pack's Hadamard-latent token table without the inverse rotation, and the fork's `a0af7ec` adds it.
+  pack's Hadamard-latent token table without the inverse rotation, and the fork's `514c53c` adds it.
   So the engine comparison runs with MTP off on both sides, and the MTP gain is measured on the
   fork alone, on top of that.
 - **Throughput:**

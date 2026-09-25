@@ -1,0 +1,5 @@
+{
+  "n_ctx": 65536,
+  "total_slots": 1,
+  "build_info": "b10709-9a9394a89"
+}

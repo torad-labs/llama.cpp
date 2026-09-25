@@ -28,7 +28,9 @@
 #include <cfloat>
 #include <cstdio>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -369,6 +371,20 @@ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignm
            tensor->nb[1] % alignment == 0 &&
            tensor->nb[2] % alignment == 0 &&
            tensor->nb[3] % alignment == 0;
+}
+
+// Whether the tensor's data address is a multiple of `alignment`, also while the tensor is not allocated yet, as when
+// the scheduler asks supports_op: every buffer places a tensor that is not a view at a multiple of TENSOR_ALIGNMENT or
+// more, so the address of a view is aligned as its offset into the tensor it views is.
+static bool ggml_cuda_data_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
+    GGML_ASSERT(tensor != nullptr && alignment <= TENSOR_ALIGNMENT);
+    if (tensor->data != nullptr) {
+        return reinterpret_cast<uintptr_t>(tensor->data) % alignment == 0;
+    }
+    if (tensor->view_src != nullptr && tensor->view_src->data != nullptr) {
+        return (reinterpret_cast<uintptr_t>(tensor->view_src->data) + tensor->view_offs) % alignment == 0;
+    }
+    return tensor->view_offs % alignment == 0;
 }
 
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
@@ -1287,12 +1303,30 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
-    struct node_properties {
-        ggml_tensor node;
-        void *   node_src_data_ptrs[GGML_MAX_SRC];
-        int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
-        size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+    // What evaluating a node reads from one of its srcs, beyond the node itself: a captured graph is replayed only while
+    // all of it is unchanged. A src that is a node of the same graph is also compared whole as that node; a leaf, or a
+    // node of an earlier split, is compared only here.
+    struct src_properties {
+        void *                data;
+        ggml_backend_buffer_t buffer;    // usage and buffer type: whether and how far MMQ/MMVQ clear src0's padding,
+                                         // and the extent the fusion overlap test compares
+        ggml_tensor *         view_src;  // a view's padding is never cleared (cuBLAS instead); gated delta net fusion
+        size_t                view_offs; // gated delta net fusion
+        int64_t               ne[GGML_MAX_DIMS];
+        size_t                nb[GGML_MAX_DIMS];
+        ggml_type             type;      // selects the kernel; f16 and bf16 have the same ne and nb
+        ggml_op               op;        // fusion: a leaf (GGML_OP_NONE) is exempt from the overlap test, and the gated
+                                         // delta net fusion takes only a VIEW
     };
+    // compared with memcmp: no byte of it may be padding
+    static_assert(std::has_unique_object_representations_v<src_properties>, "src_properties has padding");
+
+    struct node_properties {
+        ggml_tensor    node;
+        src_properties srcs[GGML_MAX_SRC];
+    };
+    static_assert(sizeof(node_properties) == sizeof(ggml_tensor) + GGML_MAX_SRC * sizeof(src_properties),
+                  "node_properties has padding");
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
@@ -1453,6 +1487,122 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Fused recurrent-state gather for GATED_DELTA_NET (PrismML-Eng/llama.cpp#220, plus a q8_0 cache): build_rs
+// materialises GET_ROWS(cache, s_copy) into a temp that only the GDN kernel reads; the graph evaluator skips that
+// GET_ROWS (ggml_cuda_try_gdn_gather_skip) and records the gather here, so the kernel reads each sequence's state
+// row ids[seq] out of the cache itself.
+struct ggml_cuda_gated_delta_net_gather {
+    const void *    base       = nullptr; // cache rows, f32 or q8_0
+    const int32_t * ids        = nullptr; // per-seq row index
+    int64_t         row_stride = 0;       // between rows, in elements
+    bool            q8_0       = false;   // a q8_0 cache (-cts q8_0): the kernel dequantizes as it loads
+};
+
+// Owned by the backend context that evaluates the graph: registrations are keyed by node pointer, so they only mean
+// something for the evaluation that made them. Cleared at the start of every graph evaluation/capture.
+struct ggml_cuda_gdn_gather_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_gated_delta_net_gather> gathers;
+
+    void reset() {
+        gathers.clear();
+    }
+
+    void set(const ggml_tensor * gdn, const ggml_cuda_gated_delta_net_gather & gather) {
+        gathers[gdn] = gather;
+    }
+
+    const ggml_cuda_gated_delta_net_gather * find(const ggml_tensor * gdn) const {
+        const auto it = gathers.find(gdn);
+        return it == gathers.end() ? nullptr : &it->second;
+    }
+};
+
+// Fused conv-state update for the GDN's causal conv (build_conv_state): GET_ROWS(conv cache, s_copy) -> RESHAPE ->
+// CONCAT(state, transposed new inputs) -> the rollback snapshots' CPYs into the cache, and the SSM_CONV reading the
+// CONCAT. The graph evaluator skips the GET_ROWS, the CONCAT and the CPYs (ggml_cuda_try_ssm_conv_state_update) and
+// records the chain here under the SSM_CONV, whose kernel then reads the sequence's state row out of the cache and the
+// new inputs out of their projection, and writes the snapshots itself.
+#define GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS  8
+#define GGML_CUDA_SSM_CONV_UPDATE_D_CONV  4 // the kernel width it is built for (Qwen3-Next, Qwen3.5)
+#define GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T 8 // new tokens per step it holds in registers
+#define GGML_CUDA_SSM_CONV_UPDATE_THREADS 128 // channels per block, and so the head width the L2 fold takes
+
+struct ggml_cuda_ssm_conv_state_update {
+    const float *   cache      = nullptr; // conv cache rows, f32
+    const int32_t * ids        = nullptr; // the sequence's state row, ids[0]
+    int64_t         row_stride = 0;       // between cache rows, in floats
+    const float *   x          = nullptr; // the new tokens' inputs, [channels, n_t]
+    int64_t         x_stride   = 0;       // between tokens, in floats
+    int             n_snapshots = 0;
+    float *         snapshot_dst[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // a snapshot CPY's cache row
+    int             snapshot_col[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // the CONCAT column its window starts at
+    // the L2_NORM over the leading heads of the SILU output (Qwen3.5's joint q/k norm), folded in: 0 heads, not
+    float *         l2_dst   = nullptr; // [GGML_CUDA_SSM_CONV_UPDATE_THREADS, l2_heads, n_t], contiguous
+    int             l2_heads = 0;
+    float           l2_eps   = 0.0f;
+};
+
+// Registrations are keyed by node pointer, like ggml_cuda_gdn_gather_context, and cleared at the start of every graph
+// evaluation/capture.
+struct ggml_cuda_ssm_conv_update_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_ssm_conv_state_update> updates;  // by SSM_CONV
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *>             l2_norms; // SSM_CONV -> its L2_NORM
+    std::unordered_set<const ggml_tensor *>                                  skipped;  // the CONCATs, CPYs, L2_NORMs
+
+    void reset() {
+        updates.clear();
+        l2_norms.clear();
+        skipped.clear();
+    }
+
+    const ggml_cuda_ssm_conv_state_update * find(const ggml_tensor * conv) const {
+        const auto it = updates.find(conv);
+        return it == updates.end() ? nullptr : &it->second;
+    }
+
+    const ggml_tensor * l2_norm_of(const ggml_tensor * conv) const {
+        const auto it = l2_norms.find(conv);
+        return it == l2_norms.end() ? nullptr : it->second;
+    }
+
+    bool skips(const ggml_tensor * node) const {
+        return skipped.count(node) != 0;
+    }
+};
+
+// Names one ggml graph across computes, to find its CUDA graph. The first node's address alone names the memory a
+// graph is built in, and graphs of different shapes built there in turn (a speculative draft context's catch-up batch
+// and its one-row draft step) would share one CUDA graph, each finding the other's capture stale on every compute and
+// running uncaptured. The node count and the first and last nodes' shapes tell them apart; a graph that only grows in
+// the middle (a longer KV view) keeps its key and is updated in place.
+struct ggml_cuda_graph_key {
+    const void * first_node = nullptr;
+    int          n_nodes    = 0;
+    int64_t      first_ne[GGML_MAX_DIMS] = {};
+    int64_t      last_ne[GGML_MAX_DIMS]  = {};
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return first_node == other.first_node && n_nodes == other.n_nodes &&
+               std::equal(first_ne, first_ne + GGML_MAX_DIMS, other.first_ne) &&
+               std::equal(last_ne, last_ne + GGML_MAX_DIMS, other.last_ne);
+    }
+};
+
+struct ggml_cuda_graph_key_hash {
+    size_t operator()(const ggml_cuda_graph_key & key) const {
+        size_t h = std::hash<const void *>{}(key.first_node);
+        const auto mix = [&h](int64_t v) {
+            h ^= std::hash<int64_t>{}(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+        mix(key.n_nodes);
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            mix(key.first_ne[i]);
+            mix(key.last_ne[i]);
+        }
+        return h;
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1466,13 +1616,13 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Map from graph key to cuda_graph - allows multiple graphs per context: the splits of a computation divided
+    // across CPU/GPU (e.g., with --n-cpu-moe), and graphs of different shapes computed in turn
+    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1487,9 +1637,9 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
@@ -1523,6 +1673,8 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+    ggml_cuda_gdn_gather_context gdn_gather_context;
+    ggml_cuda_ssm_conv_update_context ssm_conv_update_context;
 
     ~ggml_backend_cuda_context();
 
@@ -1537,6 +1689,10 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
+
+    ggml_cuda_gdn_gather_context & gdn_gathers() { return gdn_gather_context; }
+
+    ggml_cuda_ssm_conv_update_context & ssm_conv_updates() { return ssm_conv_update_context; }
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
