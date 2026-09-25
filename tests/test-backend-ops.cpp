@@ -143,6 +143,25 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
+// data_f32: one value per cell, 0 or -INFINITY for a bit-packed mask (GGML_TYPE_I16, 16 cells per element, bit set = visible)
+static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & data_f32) {
+    if (tensor->type == GGML_TYPE_I16) {
+        std::vector<uint16_t> words(data_f32.size()/16, 0);
+        for (size_t i = 0; i < data_f32.size(); i++) {
+            if (data_f32[i] == 0.0f) {
+                words[i/16] |= (uint16_t) (1u << (i%16));
+            }
+        }
+        ggml_backend_tensor_set(tensor, words.data(), 0, words.size()*sizeof(uint16_t));
+        return;
+    }
+
+    std::vector<ggml_fp16_t> data_f16(data_f32.size());
+    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f32.size());
+
+    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+}
+
 // generate an F16 mask where certain blocks are randomly masked with -INF value
 // f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
 // block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
@@ -156,8 +175,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int32_t ne2 = (int32_t) tensor->ne[2];
     const int32_t ne3 = (int32_t) tensor->ne[3];
 
-    std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
-    std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
+    std::vector<float> data_f32(ne0*ne1*ne2*ne3);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -191,20 +209,53 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
         }
     }
 
-    if (bits) {
-        std::vector<uint16_t> words(data_f32.size()/16, 0);
-        for (size_t i = 0; i < data_f32.size(); i++) {
-            if (data_f32[i] == 0.0f) {
-                words[i/16] |= (uint16_t) (1u << (i%16));
+    set_tensor_kq_mask(tensor, data_f32);
+}
+
+// mask_band: every row sees only the cells [lo, hi), the way a sequence sees only its own cells in a unified KV cache
+// (--kv-unified), so the tiles before and after the band are masked. 1: a band in the middle; 2: rows alternate between
+// a band at the end and one near the start (two sequences in one Q tile); 3: a band not aligned to 256-cell tiles;
+// 4: a band at the start. The band moves with the stream (dim 3).
+static std::pair<int64_t, int64_t> kq_mask_band(int band, int64_t n_cells, int64_t row, int64_t stream) {
+    const int64_t shift = stream*(n_cells/16);
+    switch (band) {
+        case 1: return { n_cells*5/8 + shift, n_cells*3/4 + shift };
+        case 2: return row % 2 == 0 ? std::make_pair(n_cells*3/4, n_cells - shift) : std::make_pair(n_cells/8 + shift, n_cells/4 + shift);
+        case 3: return { n_cells/2 + 37 + shift, n_cells/2 + 337 + shift };
+        case 4: return { shift, 200 + shift };
+    }
+    GGML_ABORT("bad mask_band %d", band);
+}
+
+static void init_tensor_kq_mask_band(ggml_tensor * tensor, int band) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_I16);
+    const bool bits = tensor->type == GGML_TYPE_I16;
+
+    const int64_t ne0 = tensor->ne[0] * (bits ? 16 : 1); // cells, not elements
+    const int64_t ne1 = tensor->ne[1];
+    const int64_t ne2 = tensor->ne[2];
+    const int64_t ne3 = tensor->ne[3];
+
+    std::vector<float> data_f32(ne0*ne1*ne2*ne3, -INFINITY);
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+    for (int64_t i3 = 0; i3 < ne3; i3++) {
+        for (int64_t i2 = 0; i2 < ne2; i2++) {
+            for (int64_t i1 = 0; i1 < ne1; i1++) {
+                const auto [lo, hi] = kq_mask_band(band, ne0, i1, i3);
+                GGML_ASSERT(0 <= lo && lo < hi && hi <= ne0);
+                float * row = data_f32.data() + ((i3*ne2 + i2)*ne1 + i1)*ne0;
+                for (int64_t i0 = lo; i0 < hi; i0++) {
+                    row[i0] = bits ? (gen() % 8 == 0 ? -INFINITY : 0.0f) : dis(gen);
+                }
             }
         }
-        ggml_backend_tensor_set(tensor, words.data(), 0, words.size()*sizeof(uint16_t));
-        return;
     }
 
-    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), ne0*ne1*ne2*ne3);
-
-    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    set_tensor_kq_mask(tensor, data_f32);
 }
 
 // generate a lower triangular matrix
@@ -7641,10 +7692,11 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const bool mask_bits; // bit-packed mask (GGML_TYPE_I16, 16 cells per element) instead of f16
+    const int mask_band; // 0: random mask; else every row sees only a band of the cells, see kq_mask_band
 
     std::string vars() override {
         return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k)
-            + "," + VAR_TO_STR(mask_bits);
+            + "," + VAR_TO_STR(mask_bits) + (mask_band ? "," + VAR_TO_STR(mask_band) : "");
     }
 
     double max_nmse_err() override {
@@ -7661,9 +7713,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, bool mask_bits = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, bool mask_bits = false, int mask_band = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_bits(mask_bits) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_bits(mask_bits), mask_band(mask_band) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7736,7 +7788,11 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (mask_band) {
+                    init_tensor_kq_mask_band(t, mask_band);
+                } else {
+                    init_tensor_kq_mask(t);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -10733,6 +10789,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 2048, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, true));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  113,  7, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, true));
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {2, 1},  200,  5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, true));
+
+    // banded masks, a unified KV cache at decode: the KV range scan, the masked head a stream-k block skips, the rows of
+    // one Q tile in different bands (nb 3: a Q tile's padding rows; nb 16: the scan's largest batch, 17 the smallest
+    // without it), two streams
+    for (int mask_band : { 1, 2, 3, 4, }) {
+        for (int nb : { 1, 2, 3, 8, 16, 17, 32, }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0, }) {
+                for (bool mask_bits : { false, true, }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, mask_bits, mask_band));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 8192, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, mask_band));
+    }
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));

@@ -359,6 +359,19 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // the number of cells of sequence seq_id with a position in [p0, p1), counted until it exceeds n_max
+    uint32_t seq_pos_count(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t n_max) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        uint32_t n = 0;
+        for (auto it = seq_pos[seq_id].lower_bound(p0); it != seq_pos[seq_id].end() && it->first < p1 && n <= n_max; ++it) {
+            n += it->second;
+        }
+
+        return n;
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());
