@@ -789,6 +789,8 @@ bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREA
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
 void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model = nullptr);
 bool set_process_priority(enum ggml_sched_priority prio);
+// runs every thread on the NUMA node of the GPUs the model uses, if the host has more nodes (Linux)
+void common_bind_to_gpu_node(const common_params & params);
 
 //
 // String utils

@@ -53,6 +53,7 @@
 #if defined(__linux__)
 #include <sys/types.h>
 #include <pwd.h>
+#include <sched.h>
 #endif
 
 #if defined(_AIX)
@@ -279,6 +280,80 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 }
 
 #endif
+
+void common_bind_to_gpu_node(const common_params & params) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    // LLAMA_GPU_NODE_BIND_LEGACY=1 leaves the placement to the scheduler
+    const char * legacy = getenv("LLAMA_GPU_NODE_BIND_LEGACY");
+    if ((legacy && atoi(legacy) != 0) || params.n_gpu_layers == 0 || params.numa != GGML_NUMA_STRATEGY_DISABLED || params.cpuparams.mask_valid) {
+        return;
+    }
+    std::vector<ggml_backend_dev_t> devs;
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr) {
+            devs.push_back(dev);
+        }
+    }
+    if (params.devices.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                devs.push_back(ggml_backend_dev_get(i));
+            }
+        }
+    }
+    // the CPUs of the node all devices share
+    std::string cpus;
+    for (ggml_backend_dev_t dev : devs) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (props.device_id == nullptr) {
+            return;
+        }
+        std::ifstream file(std::string("/sys/bus/pci/devices/") + props.device_id + "/local_cpulist");
+        std::string list;
+        if (!std::getline(file, list) || list.empty() || (!cpus.empty() && list != cpus)) {
+            return;
+        }
+        cpus = list;
+    }
+    if (cpus.empty()) {
+        return;
+    }
+    cpu_set_t node;
+    CPU_ZERO(&node);
+    std::stringstream ss(cpus);
+    for (std::string range; std::getline(ss, range, ',');) {
+        const size_t dash = range.find('-');
+        const int first = std::atoi(range.c_str());
+        const int last  = dash == std::string::npos ? first : std::atoi(range.c_str() + dash + 1);
+        if (first < 0 || last < first || last >= CPU_SETSIZE) {
+            return;
+        }
+        for (int cpu = first; cpu <= last; cpu++) {
+            CPU_SET(cpu, &node);
+        }
+    }
+    cpu_set_t cur;
+    cpu_set_t both;
+    if (sched_getaffinity(0, sizeof(cur), &cur) != 0) {
+        return;
+    }
+    CPU_AND(&both, &cur, &node);
+    // the process may not run on the node, or runs only there already
+    if (CPU_COUNT(&both) == 0 || CPU_EQUAL(&both, &cur)) {
+        return;
+    }
+    // every thread, also the ones the backends started
+    int n_threads = 0;
+    std::error_code ec;
+    for (const auto & task : std::filesystem::directory_iterator("/proc/self/task", ec)) {
+        n_threads += sched_setaffinity(std::atoi(task.path().filename().c_str()), sizeof(both), &both) == 0;
+    }
+    COM_INF("%d threads on CPUs %s, the NUMA node of %s\n", n_threads, cpus.c_str(), ggml_backend_dev_name(devs[0]));
+#else
+    GGML_UNUSED(params);
+#endif
+}
 
 //
 // CLI argument parsing
