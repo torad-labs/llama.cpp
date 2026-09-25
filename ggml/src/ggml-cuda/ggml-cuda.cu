@@ -1914,6 +1914,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// Whether ggml_cuda_mul_mat runs the MUL_MAT dst on ggml_cuda_mul_mat_vec_f with its own operands, as its choices above
+// go at up to MMVF_MAX_BATCH_SIZE columns (where the transposed-vector path cannot apply).
+static bool ggml_cuda_mul_mat_runs_mmvf(const ggml_tensor * dst, const int cc, const int warp_size) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t       ne11 = src1->ne[1];
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    return ggml_get_op_params_i32(dst, 1) != GGML_HINT_SRC0_IS_HADAMARD && !bad_padding_clear
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne11 <= MMVF_MAX_BATCH_SIZE
+        && (ggml_cuda_should_use_mmvf(src0, src1, cc, ne11)
+            || (!ggml_cuda_should_use_mmf(src0, src1, cc, warp_size, ne11, /*mul_mat_id =*/ false)
+                && ggml_cuda_should_use_mmvf_untiled(src0, src1, ne11)));
+}
+
 // AMD runs a float MUL_MAT_ID of up to MMVF_MAX_BATCH_SIZE tokens on the vector kernel, which can read only operands
 // that pass ggml_cuda_mmvf_supports. ggml_cuda_mul_mat_id and ggml_cuda_mul_mat_id_needs_sync ask here.
 static bool ggml_cuda_mul_mat_id_use_mmvf(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
@@ -4248,6 +4264,39 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // Two MUL_MATs of one src1 by float weights of one shape, up to 4 views between them, that ggml_cuda_mul_mat runs on
+    // mul_mat_vec_f one after the other (qwen35's ssm_beta and ssm_alpha at decode and verify): one launch runs both.
+    // GGML_CUDA_MMVF_PAIR_LEGACY=1 launches them one by one.
+    static const bool mmvf_pair_legacy = [] {
+        const char * env = getenv("GGML_CUDA_MMVF_PAIR_LEGACY");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!mmvf_pair_legacy && node->op == GGML_OP_MUL_MAT && cuda_ctx->curr_stream_no == 0 &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && j - i <= 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ++j;
+        }
+        ggml_tensor * mm_b = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+
+        // the second weights must not be the first output (or a view of it), which the launch writes while it reads them
+        bool reads_first = false;
+        for (const ggml_tensor * t = mm_b ? mm_b->src[0] : nullptr; t != nullptr; t = t->view_src) {
+            reads_first = reads_first || t == node;
+        }
+
+        const int cc          = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const int warp_size   = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+        const int out_nodes[] = { i, j };
+        if (mm_b && mm_b->op == GGML_OP_MUL_MAT && (mm_b->flags & GGML_TENSOR_FLAG_COMPUTE) && mm_b->src[1] == node->src[1] &&
+                !reads_first && ggml_cuda_mul_mat_runs_mmvf(node, cc, warp_size) && ggml_cuda_mul_mat_runs_mmvf(mm_b, cc, warp_size) &&
+                ggml_cuda_mmvf_pair_supports(node->src[0], mm_b->src[0], node->src[1], node, mm_b) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, j - i + 1, out_nodes, 2)) {
+            ggml_cuda_mul_mat_vec_f_pair(*cuda_ctx, node->src[0], mm_b->src[0], node->src[1], node, mm_b);
+            return j - i;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
