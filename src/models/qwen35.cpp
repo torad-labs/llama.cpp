@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -646,8 +647,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -702,6 +702,29 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
+
+    // a batch with no outputs (the catch-up of the verified rows, a prompt) only leaves its K and V in the cache for the draft steps: store them as build_attn() does and skip the query, the attention, the FFN and the LM head
+    // LLAMA_MTP_KV_ONLY_LEGACY=1: the whole head runs on every row, as before
+    static const bool kv_only_legacy = [] {
+        const char * v = getenv("LLAMA_MTP_KV_ONLY_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    if (n_outputs == 0 && !kv_only_legacy) {
+        if (inp_attn->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        cb(Kcur, "k_cache_in", il);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
