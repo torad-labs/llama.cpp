@@ -11568,6 +11568,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // GATED_DELTA_NET: realistic model configurations
     // TG: n_seq_tokens=1 (autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
+    // Ternary Bonsai 2 27B served: 16 q/k heads x3 = 48 v heads, d=128, raw gates, q8_0 cache, 3 snapshots, gathered row
+    for (int64_t n_t : { 1, 3 }) {
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_t, 1, 3, 3, true, GGML_TYPE_Q8_0, 3, 1, 1));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
     // PP: n_seq_tokens=64,256 (prompt processing)
