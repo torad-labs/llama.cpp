@@ -344,9 +344,10 @@ static __global__ void mmvq_pq2_mma(
 // host
 
 // GGML_CUDA_PQ2_MMA_CFG="nslots,evict_first" for a sweep: at most nslots slots in the ring (it takes what fits in the
-// shared memory, at least 2), and the weights' L2 policy (1 evict_first, 0 evict_normal).
+// shared memory, at least 2), and the weights' L2 policy (1 evict_first, 0 evict_normal). Two slots: four measured
+// the same at one column and 3.8 % slower at eight on an RTX 5080 (13.94 against 13.43 ms per step).
 struct pq2_mma_config {
-    int  nslots      = 4;
+    int  nslots      = 2;
     bool evict_first = true;
 };
 
