@@ -628,6 +628,20 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     gsmpl->reset();
 }
 
+int32_t common_sampler_n_history(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return 0;
+    }
+
+    const auto & params = gsmpl->params;
+
+    // accepted without is_generated, a token reaches only the chain and prev. Of the chain, penalties keep the last
+    // penalty_last_n tokens and their counts, DRY the last dry_penalty_last_n (both clamped at 0 by their init, and a
+    // sampler disabled by its params keeps nothing); dist and adaptive_p act on an accept only after a draw or an apply,
+    // which a reset clears; prev keeps its capacity. Every window evicts exactly, so an older token leaves no trace.
+    return std::max({ (int32_t) gsmpl->prev.capacity, std::max(params.penalty_last_n, 0), std::max(params.dry_penalty_last_n, 0) });
+}
+
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,

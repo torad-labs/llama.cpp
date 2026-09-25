@@ -200,6 +200,26 @@ struct server_batch {
     }
 };
 
+// LLAMA_SAMPLER_REPLAY_LEGACY=1: a slot's sampler is initialised by accepting every text token of the prompt, not only
+// the last common_sampler_n_history of them
+static bool sampler_replay_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_SAMPLER_REPLAY_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return legacy;
+}
+
+// LLAMA_CHECKPOINT_DEDUP_LEGACY=1: a context checkpoint is also created where one already is (the first batch after a
+// resume starts at the checkpoint it resumed from), copying the same state again
+static bool checkpoint_dedup_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_CHECKPOINT_DEDUP_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return legacy;
+}
+
 // LLAMA_CHECKPOINT_SPARE_LEGACY=1: a dropped context checkpoint's buffers are freed, and each new checkpoint allocates
 // its own (the behaviour before the slot kept a spare)
 static bool checkpoint_spare_legacy() {
@@ -425,9 +445,20 @@ struct server_slot {
 
         const int64_t t_start = ggml_time_us();
 
+        // the sampler's state depends on its last n_history text tokens only (common_sampler_n_history): the ones
+        // before are not replayed, 245,760 accepts at the operator's depth
+        int i0 = 0;
+        if (!sampler_replay_legacy()) {
+            const int32_t n_history = common_sampler_n_history(smpl.get());
+            for (int n = 0, i = (int) prompt.tokens.size(); i > 0 && n < n_history; --i) {
+                n += prompt.tokens[i - 1] != LLAMA_TOKEN_NULL;
+                i0 = i - 1;
+            }
+        }
+
         int n_text = 0;
 
-        for (int i = 0; i < (int) prompt.tokens.size(); i++) {
+        for (int i = i0; i < (int) prompt.tokens.size(); i++) {
             const llama_token id = prompt.tokens[i];
 
             if (id != LLAMA_TOKEN_NULL) {
@@ -436,7 +467,7 @@ struct server_slot {
             }
         }
 
-        SLT_TRC(*this, "init sampler, took %0.2f ms, tokens: text = %d, total = %d\n",
+        SLT_TRC(*this, "init sampler, took %0.2f ms, tokens: text replayed = %d, total = %d\n",
                 (ggml_time_us() - t_start) / 1000.0, n_text, (int) prompt.tokens.size());
     }
 
@@ -3941,6 +3972,17 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // a checkpoint at n tokens holds the state a new one there would copy: every checkpoint past the
+                    // point this task resumed from was erased, and resuming before the cached end restores one
+                    const auto has_checkpoint_at = [&](int64_t n) {
+                        for (const auto & cur : slot.prompt.checkpoints) {
+                            if (cur.n_tokens == n) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+
                     // checkpoints requested by --checkpoint-every: on the N-token grid and at the fork point.
                     // hybrid/recurrent memory resumes only from a checkpoint at or before the first differing
                     // token, so these bound the re-processing after a mid-prompt change (e.g. a tool list
@@ -3952,12 +3994,7 @@ private:
                         if (pos % params_base.checkpoint_every != 0 && pos != slot.n_fork) {
                             return false;
                         }
-                        for (const auto & cur : slot.prompt.checkpoints) {
-                            if (cur.n_tokens == pos) {
-                                return false; // already there, e.g. the checkpoint this task resumed from
-                            }
-                        }
-                        return true;
+                        return !has_checkpoint_at(pos); // already there, e.g. the checkpoint this task resumed from
                     };
 
                     // add prompt tokens for processing in the current batch
@@ -4072,6 +4109,9 @@ private:
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end || is_requested ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
+                    // none where one already is: the first batch after a resume starts at the checkpoint it resumed from
+                    do_checkpoint = do_checkpoint && (checkpoint_dedup_legacy() || !has_checkpoint_at(n_tokens_start));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
