@@ -2814,6 +2814,89 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+static bool ggml_cuda_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// GET_ROWS(cache, ids) -> [RESHAPE] -> GATED_DELTA_NET src[5], build_rs's recurrent-state gather: skip the GET_ROWS and
+// register the gather for the GDN node, whose kernel then reads each sequence's cache row ids[seq] itself (f32, or q8_0
+// dequantized as it loads) instead of the temp, which the allocator still reserved. One sequence only: with several, a
+// sequence's source row can be another's destination (a copied sequence), which the GET_ROWS read before any write and
+// the kernel's blocks would race on; with one, the block that reads a region is the only one that writes it, after.
+// Declined when anything else reads the temp, when a node between the two writes the cache (build_rs's extra-states
+// copy relocates rows there; the GET_ROWS read them before it, the kernel would read after), when a node up to the GDN
+// was allocated over ids (freed after the GET_ROWS if it was their last reader), and when the GDN takes the chunked
+// prefill path (its pipeline reads a gathered s0). From PrismML-Eng/llama.cpp#220 (f32), plus a q8_0
+// cache (-cts q8_0), the one the served head runs. GGML_CUDA_GDN_STATE_GATHER_LEGACY=1 keeps the GET_ROWS.
+static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    static const bool legacy = [] {
+        const char * e = getenv("GGML_CUDA_GDN_STATE_GATHER_LEGACY");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (legacy) {
+        return false;
+    }
+
+    const ggml_tensor * gr = cgraph->nodes[node_idx];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            !ggml_is_contiguous(gr) || gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1) {
+        return false;
+    }
+    const ggml_tensor * cache = gr->src[0];
+    const ggml_tensor * ids   = gr->src[1];
+    const bool          q8    = cache->type == GGML_TYPE_Q8_0;
+    if ((cache->type != GGML_TYPE_F32 && !q8) || ids->type != GGML_TYPE_I32 || cache->data == nullptr ||
+            ids->data == nullptr || cache->ne[0] != gr->ne[0] || cache->nb[0] != ggml_type_size(cache->type) ||
+            cache->nb[1] % ggml_type_size(cache->type) != 0 || !ggml_is_contiguous(ids) || ids->ne[0] != gr->ne[1] ||
+            ggml_nelements(ids) != gr->ne[1] || ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return false;
+    }
+    const ggml_tensor * cache_base = cache->view_src ? cache->view_src : cache;
+
+    const ggml_tensor * cur = gr;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        // the kernel reads ids at the GDN, and the GET_ROWS it skips may have been ids' last reader (the last recurrent
+        // layer's), after which the allocator hands ids' memory on: nothing up to and including the GDN may be on it
+        if (!ggml_cuda_is_view_or_noop(n) && ggml_cuda_ranges_overlap(n, ids)) {
+            return false;
+        }
+        if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == cur) {
+            const ggml_tensor * v = n->src[2];
+            const int64_t       D = v->ne[0] * v->ne[0] * v->ne[1];
+            if (gr->ne[0] != D || gr->ne[1] != v->ne[3] || ggml_nelements(cur) != D * v->ne[3] ||
+                    (q8 && D % QK8_0 != 0) || ggml_cuda_should_use_chunked_gdn(n)) {
+                return false;
+            }
+            ggml_cuda_gated_delta_net_gather gather;
+            gather.base       = cache->data;
+            gather.ids        = (const int32_t *) ids->data;
+            gather.row_stride = (int64_t) (cache->nb[1] / ggml_type_size(cache->type)) * ggml_blck_size(cache->type);
+            gather.q8_0       = q8;
+            ctx.gdn_gathers().set(n, gather);
+            return true;
+        }
+        if (n->op == GGML_OP_RESHAPE && n->src[0] == cur) {
+            if (ggml_node_get_use_count(cgraph, j) != 1) {
+                return false;
+            }
+            cur = n;
+            continue;
+        }
+        if (!ggml_cuda_is_view_or_noop(n) && ggml_nelements(n) > 0 && (n == cache_base || n->view_src == cache_base)) {
+            return false;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] == cur || (n->view_src != nullptr && n->view_src == gr)) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 static int ggml_cuda_try_gdn_cache_fusion(
@@ -4445,6 +4528,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            cuda_ctx->gdn_gathers().reset();
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4484,6 +4569,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                // the recurrent-state gather whose only reader is a GATED_DELTA_NET: its kernel reads the cache rows
+                if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active &&
+                        ggml_cuda_try_gdn_gather_skip(*cuda_ctx, cgraph, i)) {
                     continue;
                 }
 

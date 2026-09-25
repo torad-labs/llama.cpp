@@ -4567,6 +4567,9 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     // out ssm_states_all, K slots of mem_size rows, and the view takes n_seqs rows from row kv_head of each slot
     const int64_t mem_size;
     const int64_t kv_head;
+    // >= 0 (mem_size > 0, one sequence): the initial state is build_rs's gather, GET_ROWS(cache, [state_row]) reshaped
+    // for the op, which CUDA folds into the kernel (ggml_cuda_try_gdn_gather_skip); the cache then starts random
+    const int64_t state_row;
 
     ggml_tensor * cpy_node      = nullptr;
     ggml_tensor * readback_node = nullptr;
@@ -4576,15 +4579,19 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         if (mem_size > 0) {
             s += "," + VARS_TO_STR2(mem_size, kv_head);
         }
+        if (state_row >= 0) {
+            s += "," + VAR_TO_STR(state_row);
+        }
         return s;
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
             int64_t K = 2, int v_repeat = 1, bool raw_gates = false, ggml_type cache_type = GGML_TYPE_F32,
-            int64_t mem_size = 0, int64_t kv_head = 0)
+            int64_t mem_size = 0, int64_t kv_head = 0, int64_t state_row = -1)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
-          v_repeat(v_repeat), raw_gates(raw_gates), cache_type(cache_type), mem_size(mem_size), kv_head(kv_head) {}
+          v_repeat(v_repeat), raw_gates(raw_gates), cache_type(cache_type), mem_size(mem_size), kv_head(kv_head),
+          state_row(state_row) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -4601,10 +4608,21 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         ggml_set_name(v, "v");
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
-        ggml_set_name(state, "state");
+
+        ggml_tensor * cache = nullptr;
+        ggml_tensor * state;
+        if (state_row >= 0) {
+            GGML_ASSERT(mem_size > 0 && n_seqs == 1);
+            cache = ggml_new_tensor_2d(ctx, cache_type, D, mem_size * K);
+            ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(ids, "ids");
+            state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, cache, ids), head_size, head_size, H_v, n_seqs);
+        } else {
+            state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
+            ggml_set_name(state, "state");
+        }
 
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -4629,11 +4647,12 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 
         // recurrent cache view [D, n_seqs, n_written]
         const size_t  row_size = ggml_row_size(cache_type, D);
-        ggml_tensor * cache;
         ggml_tensor * dst;
         if (mem_size > 0) {
             // slot stride nb[2] = mem_size rows, not n_seqs, at an offset of kv_head rows
-            cache = ggml_new_tensor_2d(ctx, cache_type, D, mem_size * K);
+            if (cache == nullptr) {
+                cache = ggml_new_tensor_2d(ctx, cache_type, D, mem_size * K);
+            }
             dst   = ggml_view_3d(ctx, cache, D, n_seqs, n_written, row_size, mem_size * row_size, kv_head * row_size);
         } else {
             cache = ggml_new_tensor_3d(ctx, cache_type, D, n_seqs, n_written);
@@ -4704,7 +4723,11 @@ struct test_gated_delta_net_cache_fusion : public test_case {
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else if (strcmp(t->name, "cache") == 0) {
-                init_tensor_uniform(t, 0.0f, 0.0f);
+                // gathered: every row a different state, so reading another row than state_row fails
+                init_tensor_uniform(t, state_row >= 0 ? -1.0f : 0.0f, state_row >= 0 ? 1.0f : 0.0f);
+            } else if (strcmp(t->name, "ids") == 0) {
+                const std::vector<int32_t> rows(n_seqs, (int32_t) state_row);
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size() * sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -11029,6 +11052,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_Q8_0, n_seqs + 2, 1));
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_F32,  n_seqs + 2, 1));
     }
+    // build_rs's gather of the initial state from the cache (GET_ROWS -> RESHAPE -> GATED_DELTA_NET), folded into the
+    // kernel on CUDA: the served layer at decode and at the 3-token verify, the state read from the row the newest
+    // snapshot overwrites (1, kv_head in slot 0) and from a rollback slot's row the verify also writes (4, slot 1), a
+    // q8_0 and an f32 cache; and the chunked prefill ubatch, which keeps the GET_ROWS
+    for (ggml_type cache_type : { GGML_TYPE_Q8_0, GGML_TYPE_F32 }) {
+        for (int64_t n_tokens : { 1, 3 }) {
+            for (int64_t state_row : { 1, 4 }) {
+                test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3, 3, true, cache_type, 3, 1, state_row));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0, 3, 1, 4));
     // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0));

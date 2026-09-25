@@ -1486,6 +1486,36 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Fused recurrent-state gather for GATED_DELTA_NET (PrismML-Eng/llama.cpp#220, plus a q8_0 cache): build_rs
+// materialises GET_ROWS(cache, s_copy) into a temp that only the GDN kernel reads; the graph evaluator skips that
+// GET_ROWS (ggml_cuda_try_gdn_gather_skip) and records the gather here, so the kernel reads each sequence's state
+// row ids[seq] out of the cache itself.
+struct ggml_cuda_gated_delta_net_gather {
+    const void *    base       = nullptr; // cache rows, f32 or q8_0
+    const int32_t * ids        = nullptr; // per-seq row index
+    int64_t         row_stride = 0;       // between rows, in elements
+    bool            q8_0       = false;   // a q8_0 cache (-cts q8_0): the kernel dequantizes as it loads
+};
+
+// Owned by the backend context that evaluates the graph: registrations are keyed by node pointer, so they only mean
+// something for the evaluation that made them. Cleared at the start of every graph evaluation/capture.
+struct ggml_cuda_gdn_gather_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_gated_delta_net_gather> gathers;
+
+    void reset() {
+        gathers.clear();
+    }
+
+    void set(const ggml_tensor * gdn, const ggml_cuda_gated_delta_net_gather & gather) {
+        gathers[gdn] = gather;
+    }
+
+    const ggml_cuda_gated_delta_net_gather * find(const ggml_tensor * gdn) const {
+        const auto it = gathers.find(gdn);
+        return it == gathers.end() ? nullptr : &it->second;
+    }
+};
+
 // Names one ggml graph across computes, to find its CUDA graph. The first node's address alone names the memory a
 // graph is built in, and graphs of different shapes built there in turn (a speculative draft context's catch-up batch
 // and its one-row draft step) would share one CUDA graph, each finding the other's capture stale on every compute and
@@ -1589,6 +1619,7 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+    ggml_cuda_gdn_gather_context gdn_gather_context;
 
     ~ggml_backend_cuda_context();
 
@@ -1603,6 +1634,8 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
+
+    ggml_cuda_gdn_gather_context & gdn_gathers() { return gdn_gather_context; }
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
