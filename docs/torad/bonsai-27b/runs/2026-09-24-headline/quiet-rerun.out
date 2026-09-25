@@ -1,0 +1,11 @@
+quiet at 16:37:37, load 4.17 12.61 20.26
+== matrix.sh 16:37:37
+   exit 0 16:44:45
+== d0-decode.sh 16:44:45
+   exit 0 16:45:29
+load during the rerun: max 4.40, samples 48
+prism-1	88.428117	±0.195743
+fork-1	87.122239	±0.406734
+prism-2	88.194968	±0.343574
+fork-2	87.147223	±0.201786
+fork-all-switches-off	87.396671	±0.239490
