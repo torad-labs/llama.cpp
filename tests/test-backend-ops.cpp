@@ -167,14 +167,15 @@ static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & 
 // block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
 // draws no block) has masked cells and a wrong bit order fails.
 // PQ2_0 blocks written directly: every 2-bit code (3, the +2 that the reference quantizer never emits from absmax-scaled
-// data, included) and a scale per block log-uniform over two decades. Uniform data quantized gives every block d ~ 0.99
-// and no code 3, so a kernel that drops or misplaces a block's scale, or decodes +2 wrong, still passes on it.
-static void init_tensor_pq2_raw(ggml_tensor * tensor) {
+// data, included) and a scale per block log-uniform over [d_min, d_max], two decades by default. Uniform data quantized
+// gives every block d ~ 0.99 and no code 3, so a kernel that drops or misplaces a block's scale, or decodes +2 wrong,
+// still passes on it.
+static void init_tensor_pq2_raw(ggml_tensor * tensor, float d_min = 0.01f, float d_max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_PQ2_0 && ggml_is_contiguous(tensor));
     GGML_ASSERT(ggml_type_size(GGML_TYPE_PQ2_0) == 34 && ggml_blck_size(GGML_TYPE_PQ2_0) == 128); // fp16 d, then 32 B of codes
 
     std::mt19937 gen(std::random_device{}());
-    std::uniform_real_distribution<float> log_d(std::log(0.01f), std::log(1.0f));
+    std::uniform_real_distribution<float> log_d(std::log(d_min), std::log(d_max));
     std::uniform_int_distribution<int> byte(0, 255);
 
     std::vector<uint8_t> data(ggml_nbytes(tensor));
@@ -6933,14 +6934,17 @@ struct test_mul_mat_vec_fusion : public test_case {
     std::array<int64_t, 2> batch_dims;
     const bool alias_out; // the fused output over src1's bytes (see new_src1)
     const bool full_bias; // a dense bias has the output's shape, one value per column (a residual), not one broadcast
+    // PQ2_0 block scales 1e-4..1e-3: the products stay far under the bias, which a kernel that drops it then fails by
+    // ~100 % (at K 5120 and block scales 0.01..1 a dropped bias moves the output by ~0.1 %, under the tolerance)
+    const bool small_scales;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
                         bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool alias_out = false,
-                        bool full_bias = false)
+                        bool full_bias = false, bool small_scales = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
         with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), alias_out(alias_out),
-        full_bias(full_bias) {
+        full_bias(full_bias), small_scales(small_scales) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
@@ -6953,6 +6957,9 @@ struct test_mul_mat_vec_fusion : public test_case {
         }
         if (full_bias) {
             v += "," + VAR_TO_STR(full_bias);
+        }
+        if (small_scales) {
+            v += "," + VAR_TO_STR(small_scales);
         }
         return v;
     }
@@ -7125,7 +7132,8 @@ struct test_mul_mat_vec_fusion : public test_case {
         if (!use_id) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
                 if (t->type == GGML_TYPE_PQ2_0) {
-                    init_tensor_pq2_raw(t); // every code and varied block scales, not d ~ 0.99 everywhere
+                    // every code and varied block scales, not d ~ 0.99 everywhere
+                    init_tensor_pq2_raw(t, small_scales ? 1e-4f : 0.01f, small_scales ? 1e-3f : 1.0f);
                 } else {
                     init_tensor_uniform(t);
                 }
@@ -10976,6 +10984,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 5120, k,
                     false, 1, 1, false, true, false, false, {1, 1}, false, /*full_bias=*/true));
             }
+        }
+    }
+    // the residual add where the bias outweighs the products, so a fused path that drops or misplaces it fails
+    for (int64_t m : { 1, 3, 5, 8 }) {
+        for (int64_t k : { 17408, 6144 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, m, 5120, k,
+                false, 1, 1, false, true, false, false, {1, 1}, false, /*full_bias=*/true, /*small_scales=*/true));
         }
     }
 
