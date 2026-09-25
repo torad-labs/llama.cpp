@@ -403,14 +403,39 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
+        // a speculative rollback removes the few cells placed last, just below the head: up to 1024 cells are found
+        // walking backward from it, stopping at the last one, instead of scanning every cell of the cache
+        static const bool scan_all = [] {
+            const char * v = getenv("LLAMA_KV_SEQ_RM_SCAN_LEGACY");
+            return v != nullptr && atoi(v) != 0;
+        }();
+        uint32_t n_rm = scan_all ? UINT32_MAX : cells.seq_pos_count(seq_id, p0, p1, 1024);
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+        if (n_rm <= 1024) {
+            const auto visit = [&](uint32_t i) {
+                if (cells.pos_in(i, p0, p1) && cells.seq_has(i, seq_id)) {
+                    --n_rm;
+                    if (cells.seq_rm(i, seq_id)) {
+                        new_head = std::min(new_head, i);
+                    }
+                }
+            };
+            for (uint32_t i = head; n_rm > 0 && i-- > 0;) {
+                visit(i);
+            }
+            for (uint32_t i = cells.size(); n_rm > 0 && i-- > head;) {
+                visit(i);
+            }
+        } else {
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.pos_in(i, p0, p1)) {
+                    continue;
+                }
+
+                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                    if (new_head == cells.size()) {
+                        new_head = i;
+                    }
                 }
             }
         }
@@ -1731,10 +1756,13 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    bool scan_cells; // LLAMA_KQ_MASK_SCAN_LEGACY=1: every row's first scan tests cell by cell, not 16 cells at a time
 };
 
 // How a mask cell is stored: an additive f16/f32 value, or one bit of a 16-bit word (set = attend; GGML_TYPE_I16, 16 cells per element).
 // Cell indices are row*n_kv + cell in both layouts; a packed row is n_kv/16 words, so rows start on a word boundary.
+// keep_n: the n (<= 16) cells from idx, bit k of live set = cell idx + k attended.
 template<typename T>
 struct llama_kq_mask_cells {
     T * data;
@@ -1744,6 +1772,11 @@ struct llama_kq_mask_cells {
     void keep(uint64_t idx) const { data[idx] = v_keep; }
     void drop(uint64_t idx) const { data[idx] = v_drop; }
     void set (uint64_t idx, float v) const { data[idx] = llama_cast<T>(v); }
+    void keep_n(uint64_t idx, uint32_t live, uint32_t n) const {
+        for (uint32_t k = 0; k < n; ++k) {
+            data[idx + k] = (live >> k) & 1 ? v_keep : v_drop;
+        }
+    }
     void copy_row(uint64_t dst, uint64_t src, uint64_t n_kv) const { std::copy(data + src, data + src + n_kv, data + dst); }
 };
 
@@ -1753,6 +1786,10 @@ struct llama_kq_mask_bits {
     void keep(uint64_t idx) const { data[idx >> 4] |=  (uint16_t) (1u << (idx & 15)); }
     void drop(uint64_t idx) const { data[idx >> 4] &= ~(uint16_t) (1u << (idx & 15)); }
     void set (uint64_t, float)  const { GGML_ABORT("a bit-packed KQ mask holds no ALiBi values"); }
+    void keep_n(uint64_t idx, uint32_t live, uint32_t n) const {
+        GGML_ASSERT(idx % 16 == 0 && n == 16); // whole words: n_kv is a multiple of 16
+        data[idx >> 4] = (uint16_t) live;
+    }
     void copy_row(uint64_t dst, uint64_t src, uint64_t n_kv) const { std::copy(data + src/16, data + (src + n_kv)/16, data + dst/16); }
 };
 
@@ -1771,14 +1808,17 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S 
     const int64_t n_stream = args.n_stream;
     const int64_t n_tps    = args.n_tps;
 
-    // the min position in the batch for each sequence
+    // the min and max position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
+    llama_pos seq_pos_max[LLAMA_MAX_SEQ];
     std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
+    std::fill(seq_pos_max, seq_pos_max + LLAMA_MAX_SEQ, -1);
 
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+        seq_pos_max[seq_id] = std::max(seq_pos_max[seq_id], ubatch->pos[i]);
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1829,6 +1869,73 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S 
                 }
             }
 
+            // true if the token does not see cell j, a cell of its sequence at position pj
+            const auto masked = [&cells, p1, p1_x, p1_y, n_swa, swa_type](uint32_t j, llama_pos pj) {
+                if (causal) {
+                    // mask future tokens
+                    if (pj > p1) {
+                        return true;
+                    }
+
+                    // M-RoPE causal mask
+                    if (is_2d && pj == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                        return true;
+                    }
+                }
+
+                // apply SWA if any
+                return swa && llama_hparams::is_masked_swa(n_swa, swa_type, pj, p1);
+            };
+
+            // the first scan of a sequence, 16 cells at a time: a cell past the sequence's last position in the batch is masked
+            // for all its tokens (causal) and needs no bookkeeping, so a group with no cell before that position is masked on
+            // the positions alone, before any sequence bitset is read (with --kv-unified, the cells of other sequences)
+            if (!alibi && !prev && !args.scan_cells) {
+                const llama_pos p_end = causal ? seq_pos_max[seq_id] + 1 : std::numeric_limits<llama_pos>::max();
+                const llama_pos p_idx = seq_pos_min[seq_id] - (llama_pos) (n_swa + 32);
+
+                // bit k set: the token sees cell j0 + k; n is a constant for the full groups. The cells of a sequence come in
+                // runs, so the positions alone are checked first only after a group with no cell seen.
+                bool check = true;
+                const auto scan = [&cells, &idxs, &check, masked, p_end, p_idx, seq_id](uint32_t j0, auto n) {
+                    bool any = !check;
+                    for (uint32_t k = 0; check && k < n; ++k) {
+                        any |= cells.pos_in(j0 + k, 0, p_end);
+                    }
+
+                    uint32_t live = 0;
+                    for (uint32_t k = 0; any && k < n; ++k) {
+                        const uint32_t j = j0 + k;
+
+                        if (!cells.pos_in(j, 0, p_end) || !cells.seq_has(j, seq_id)) {
+                            continue;
+                        }
+
+                        const llama_pos pj = cells.pos_get(j);
+
+                        if (pj >= p_idx) {
+                            idxs.push_back(j);
+                        }
+
+                        live |= (uint32_t) !masked(j, pj) << k;
+                    }
+
+                    check = live == 0;
+
+                    return live;
+                };
+
+                uint32_t j0 = 0;
+                for (; j0 + 16 <= n_kv; j0 += 16) {
+                    st.keep_n(idst + j0, scan(j0, std::integral_constant<uint32_t, 16>{}), 16);
+                }
+                if (j0 < n_kv) {
+                    st.keep_n(idst + j0, scan(j0, (uint32_t) (n_kv - j0)), n_kv - j0);
+                }
+
+                continue;
+            }
+
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
                 uint32_t j = jj;
 
@@ -1863,29 +1970,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S 
                     }
                 }
 
-                if (causal) {
-                    // mask future tokens
-                    if (p0 > p1) {
-                        goto skip;
-                    }
-
-                    // M-RoPE causal mask
-                    if (is_2d) {
-                        if (p0 == p1) {
-                            const auto & p0_ext = cells.ext_get(j);
-
-                            if (p0_ext.is_2d_gt(p1_x, p1_y)) {
-                                goto skip;
-                            }
-                        }
-                    }
-                }
-
-                // apply SWA if any
-                if (swa) {
-                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
-                        goto skip;
-                    }
+                if (masked(j, p0)) {
+                    goto skip;
                 }
 
                 if (alibi) {
@@ -1956,6 +2042,11 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_start = ggml_time_us();
 
+    static const bool scan_cells = [] {
+        const char * v = getenv("LLAMA_KQ_MASK_SCAN_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
@@ -1966,6 +2057,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.scan_cells       =*/ scan_cells,
     };
 
     switch (dst->type) {
