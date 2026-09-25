@@ -200,6 +200,16 @@ struct server_batch {
     }
 };
 
+// LLAMA_CHECKPOINT_SPARE_LEGACY=1: a dropped context checkpoint's buffers are freed, and each new checkpoint allocates
+// its own (the behaviour before the slot kept a spare)
+static bool checkpoint_spare_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_CHECKPOINT_SPARE_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return legacy;
+}
+
 struct server_slot {
     int id;
 
@@ -220,6 +230,20 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // the state buffers of a context checkpoint the slot dropped, which its next checkpoint takes: a state copied into
+    // buffers of its size lands in pages already mapped, where a new buffer's pages are faulted in and zeroed first
+    std::vector<uint8_t> ckpt_spare_tgt;
+    std::vector<uint8_t> ckpt_spare_dft;
+
+    // keeps a checkpoint's buffers as the spare before the checkpoint is dropped, unless one is kept already
+    void checkpoint_spare(common_prompt_checkpoint & ckpt) {
+        if (checkpoint_spare_legacy() || !ckpt_spare_tgt.empty()) {
+            return;
+        }
+        ckpt_spare_tgt.swap(ckpt.data_tgt);
+        ckpt_spare_dft.swap(ckpt.data_dft);
+    }
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -298,6 +322,10 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+
+        if (!prompt.checkpoints.empty()) {
+            checkpoint_spare(prompt.checkpoints.back());
+        }
 
         prompt.clear();
     }
@@ -2701,6 +2729,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                slot.checkpoint_spare(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2711,15 +2740,20 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto & cur = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            slot.checkpoint_spare(cur);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
+
+        // the spare buffers, if the slot keeps any: update_tgt and update_dft resize them to the state and copy it in
+        cur.data_tgt.swap(slot.ckpt_spare_tgt);
+        cur.data_dft.swap(slot.ckpt_spare_dft);
 
         cur.id_task = id_task;
         cur.pinned  = pinned;
@@ -3770,9 +3804,10 @@ private:
                             {
                                 // erase any checkpoints with pos_max > pos_next
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                                    const auto & cur = *it;
+                                    auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        slot.checkpoint_spare(cur);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
