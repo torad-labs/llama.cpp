@@ -10,9 +10,11 @@ to reproduce them, then shows how to put the server behind Claude Code with
 ## Headline
 
 One RTX 5070 Ti (16 GB), the public pack, and PrismML's latest release (`prism-b10709-9a9394a`)
-against this fork at `c54ace8`. Both were built with the flags in step 1.
+against this fork at `c008fe8`, the engine rig 0.1.2 and later install. Both were built with the
+flags in step 1, and the benchmarks ran only once the shared host had been quiet for two minutes
+(1-minute load under 6; at most 4.4 during the run, [`quiet-rerun.sh`](runs/2026-09-24-headline/quiet-rerun.sh)).
 
-**Long context is where the fork pays.** At 131,072 tokens of context it decodes 1.83× and
+**Long context is where the fork pays.** At 131,072 tokens of context it decodes 1.89× and
 prefills 2.0× faster, mostly because the attention reads the q4_0 cache directly instead of
 converting it to fp16 first. Prefill also carries the chunked Gated DeltaNet kernel, which is
 worth +9 % at 32K on its own (row `b120f63` below). From [`bench-matrix.sh`](bench-matrix.sh) (llama-bench, q4_0 K/V, flash attention
@@ -20,14 +22,19 @@ on, no draft head on either side, 3 repetitions):
 
 | context depth | prefill (pp512), Prism → fork | decode (tg128), Prism → fork |
 |---|---|---|
-| 0 | 1,736 → 1,937 tok/s | 78.8 → 76.3 tok/s |
-| 16,384 | 1,475 → 1,742 | 67.5 → 73.9 |
-| 65,536 | 804 → 1,323 | 46.4 → 66.1 |
-| 131,072 | 492 → 985 | 32.1 → 58.6 |
+| 0 | 1,888 → 2,164 tok/s | 85.8 → 85.8 tok/s |
+| 16,384 | 1,626 → 1,994 | 71.2 → 81.9 |
+| 65,536 | 874 → 1,479 | 50.3 → 75.0 |
+| 131,072 | 547 → 1,104 | 35.5 → 67.3 |
 
-At depth 0 the decode rows are within the card's drift. A-B-A-B with 5 repetitions each gives
-Prism 78.3 / 77.2 and the fork 77.6 / 75.8, and setting every fork off switch leaves 75.7
-([`d0-decode.tsv`](runs/2026-09-22-headline/d0-decode.tsv)).
+At depth 0 the fork decodes 1.3 % slower than Prism. A-B-A-B with 5 repetitions each gives Prism
+88.4 / 88.2 and the fork 87.1 / 87.1 tok/s, and the fork with every off switch set gives 87.4, so
+the gap comes from none of the switchable changes
+([`d0-decode.tsv`](runs/2026-09-24-headline/d0-decode.tsv)).
+
+The served rows below are from the 2026-09-22 run, with the fork at `c54ace8`. The 2026-09-24
+directory also has served rows for `c008fe8`'s tree, but they ran while the host's load was 20-50.
+That load moves decode by 8-12 tok/s, so they are kept as a record and not used here.
 
 **Served, the MTP draft head is the fork's largest single gain.** From
 [`bench-server.sh`](bench-server.sh): one conversation, 65,536-token window, six prompts of 512
