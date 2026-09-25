@@ -166,6 +166,28 @@ static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & 
 // f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
 // block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
 // draws no block) has masked cells and a wrong bit order fails.
+// PQ2_0 blocks written directly: every 2-bit code (3, the +2 that the reference quantizer never emits from absmax-scaled
+// data, included) and a scale per block log-uniform over two decades. Uniform data quantized gives every block d ~ 0.99
+// and no code 3, so a kernel that drops or misplaces a block's scale, or decodes +2 wrong, still passes on it.
+static void init_tensor_pq2_raw(ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_PQ2_0 && ggml_is_contiguous(tensor));
+    GGML_ASSERT(ggml_type_size(GGML_TYPE_PQ2_0) == 34 && ggml_blck_size(GGML_TYPE_PQ2_0) == 128); // fp16 d, then 32 B of codes
+
+    std::mt19937 gen(std::random_device{}());
+    std::uniform_real_distribution<float> log_d(std::log(0.01f), std::log(1.0f));
+    std::uniform_int_distribution<int> byte(0, 255);
+
+    std::vector<uint8_t> data(ggml_nbytes(tensor));
+    for (size_t i = 0; i < data.size(); i += 34) {
+        const ggml_fp16_t d = ggml_fp32_to_fp16(std::exp(log_d(gen)));
+        memcpy(data.data() + i, &d, sizeof(d));
+        for (size_t j = 2; j < 34; ++j) {
+            data[i + j] = (uint8_t) byte(gen);
+        }
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
+}
+
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_I16);
     const bool bits = tensor->type == GGML_TYPE_I16;
@@ -4905,6 +4927,26 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// MUL_MAT on PQ2_0 blocks written directly (init_tensor_pq2_raw): every code, block scales over two decades
+struct test_mul_mat_pq2_raw : public test_mul_mat {
+    test_mul_mat_pq2_raw(int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",raw_blocks=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_PQ2_0) {
+                init_tensor_pq2_raw(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -7082,7 +7124,11 @@ struct test_mul_mat_vec_fusion : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         if (!use_id) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-                init_tensor_uniform(t);
+                if (t->type == GGML_TYPE_PQ2_0) {
+                    init_tensor_pq2_raw(t); // every code and varied block scales, not d ~ 0.99 everywhere
+                } else {
+                    init_tensor_uniform(t);
+                }
             }
         } else {
             init_mul_mat_id_tensors(ctx, n_mats);
@@ -10909,6 +10955,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (const auto & mk : std::vector<std::array<int64_t, 2>>{
                  {5120, 17408}, {17408, 5120}, {5120, 6144}, {1000, 5120}, {48, 5120}, {33, 1024}, {4096, 2048} }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+    // and on blocks written directly (init_tensor_pq2_raw), where a block's scale and the code for +2 matter
+    for (int64_t n : { 1, 2, 3, 8 }) {
+        for (const auto & mk : std::vector<std::array<int64_t, 2>>{ {1000, 5120}, {33, 1024}, {4096, 2048} }) {
+            test_cases.emplace_back(new test_mul_mat_pq2_raw(mk[0], n, mk[1]));
         }
     }
 
