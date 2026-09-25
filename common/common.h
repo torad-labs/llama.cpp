@@ -341,6 +341,10 @@ struct common_params_speculative_draft {
     bool    mtp_decode_only = false;
     int32_t mtp_window      = 16384;
 
+    // the MTP draft head attends to the last mtp_swa positions of each sequence only, prompt and generated, and its
+    // KV cache holds that window plus a ubatch per sequence; the verify is untouched (0 = the whole context)
+    int32_t mtp_swa = 0;
+
     // the MTP draft head's vocabulary: a file of strictly increasing int32 token ids; a draft step scores
     // their rows of the LM head only and every other token's draft logit is -inf (empty = the full vocabulary)
     std::string mtp_vocab;
