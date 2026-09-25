@@ -281,6 +281,31 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+static bool      gpu_node_bound = false;
+static cpu_set_t gpu_node_unbound; // the affinity common_bind_to_gpu_node replaced
+
+// every thread, also the ones the backends started
+static int set_all_threads_affinity(const cpu_set_t & mask) {
+    int n_threads = 0;
+    std::error_code ec;
+    for (const auto & task : std::filesystem::directory_iterator("/proc/self/task", ec)) {
+        n_threads += sched_setaffinity(std::atoi(task.path().filename().c_str()), sizeof(mask), &mask) == 0;
+    }
+    return n_threads;
+}
+#endif
+
+// layers on the CPU compute on every node the process may use
+static void common_unbind_gpu_node() {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (gpu_node_bound) {
+        gpu_node_bound = false;
+        COM_INF("the model has layers on the CPU: %d threads back on their CPUs\n", set_all_threads_affinity(gpu_node_unbound));
+    }
+#endif
+}
+
 void common_bind_to_gpu_node(const common_params & params) {
 #if defined(__linux__) && !defined(__ANDROID__)
     // LLAMA_GPU_NODE_BIND_LEGACY=1 leaves the placement to the scheduler
@@ -343,13 +368,9 @@ void common_bind_to_gpu_node(const common_params & params) {
     if (CPU_COUNT(&both) == 0 || CPU_EQUAL(&both, &cur)) {
         return;
     }
-    // every thread, also the ones the backends started
-    int n_threads = 0;
-    std::error_code ec;
-    for (const auto & task : std::filesystem::directory_iterator("/proc/self/task", ec)) {
-        n_threads += sched_setaffinity(std::atoi(task.path().filename().c_str()), sizeof(both), &both) == 0;
-    }
-    COM_INF("%d threads on CPUs %s, the NUMA node of %s\n", n_threads, cpus.c_str(), ggml_backend_dev_name(devs[0]));
+    gpu_node_bound   = true;
+    gpu_node_unbound = cur;
+    COM_INF("%d threads on CPUs %s, the NUMA node of %s\n", set_all_threads_affinity(both), cpus.c_str(), ggml_backend_dev_name(devs[0]));
 #else
     GGML_UNUSED(params);
 #endif
@@ -1407,6 +1428,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
+    }
+
+    const int32_t n_layer_offload = llama_model_n_layer(model) + llama_model_n_layer_nextn(model) + 1; // with the output layer
+    if ((mparams.n_gpu_layers >= 0 && mparams.n_gpu_layers < n_layer_offload) ||
+        (mparams.tensor_buft_overrides && mparams.tensor_buft_overrides[0].pattern)) {
+        common_unbind_gpu_node();
     }
 
     pimpl->model.reset(model);
