@@ -373,9 +373,9 @@ static bool pq2_mma_legacy() {
 
 bool ggml_cuda_mmvq_pq2_mma_usable(int cc, const void * vx, int64_t ncols_x, int64_t nrows_x, int64_t stride_row_x,
                                    int64_t ncols_dst) {
-    return !pq2_mma_legacy() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN &&
+    return !pq2_mma_legacy() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_DGX_SPARK &&
         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
-        ncols_dst >= 2 && ncols_dst <= PQ2_MMA_MAX_COLS &&
+        ncols_dst >= 1 && ncols_dst <= PQ2_MMA_MAX_COLS &&
         ncols_x % 1024 == 0 && stride_row_x*(int64_t) sizeof(block_pq2_0) % 16 == 0 && (uintptr_t) vx % 16 == 0 &&
         nrows_x < (int64_t) 1 << 31 && ncols_x*(int64_t) sizeof(block_pq2_0)/QK_PQ2_0 < ((int64_t) 1 << 32);
 }
