@@ -11,6 +11,8 @@
 bool ggml_cuda_mmvq_pq2_mma_usable(int cc, const void * vx, int64_t ncols_x, int64_t nrows_x, int64_t stride_row_x,
                                    int64_t ncols_dst);
 
-void ggml_cuda_mmvq_pq2_mma(ggml_backend_cuda_context & ctx, const void * vx, const void * vy, const float * x_bias,
+// false: nothing was launched (a graph capture met a matrix with more tiles than the stream's counters hold), and the
+// caller runs mul_mat_vec_q instead
+bool ggml_cuda_mmvq_pq2_mma(ggml_backend_cuda_context & ctx, const void * vx, const void * vy, const float * x_bias,
                             float * dst, int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x,
                             int64_t stride_col_y, int64_t stride_col_dst, cudaStream_t stream);

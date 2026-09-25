@@ -1473,9 +1473,9 @@ void ggml_cuda_mul_mat_vec_q(
     // PQ2_0 at an MTP verify's 2-8 columns: int8 tensor cores fed by TMA rings (mmvq-pq2-mma.cu)
     if (src0->type == GGML_TYPE_PQ2_0 && !ids && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             fusion_local.gate == nullptr && fusion_local.gate_bias == nullptr &&
-            ggml_cuda_mmvq_pq2_mma_usable(ggml_cuda_info().devices[ctx.device].cc, src0->data, ne00, ne01, s01, ne1)) {
-        ggml_cuda_mmvq_pq2_mma(ctx, src0->data, src1_q8_1.get(), (const float *) fusion_local.x_bias, dst_d,
-            ne00, ne01, ne1, s01, s11, s1, stream);
+            ggml_cuda_mmvq_pq2_mma_usable(ggml_cuda_info().devices[ctx.device].cc, src0->data, ne00, ne01, s01, ne1) &&
+            ggml_cuda_mmvq_pq2_mma(ctx, src0->data, src1_q8_1.get(), (const float *) fusion_local.x_bias, dst_d,
+                ne00, ne01, ne1, s01, s11, s1, stream)) {
         return;
     }
 
