@@ -5271,21 +5271,26 @@ struct test_fwht_signed : public test_case {
     const ggml_type type_x;
     const int n_mm;
     const int norm;
+    const int64_t perm_nk; // x copied from [128, perm_nk, rep] to [128, rep, perm_nk] order first, as build_lora_mm does
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32, int n_mm = 0, int norm = 0)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), n_mm(n_mm), norm(norm) {}
+                     ggml_type type_x = GGML_TYPE_F32, int n_mm = 0, int norm = 0, int64_t perm_nk = 0)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), n_mm(n_mm), norm(norm), perm_nk(perm_nk) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(blk, width, n_tokens, type_x, n_mm, norm);
+        std::string v = VARS_TO_STR6(blk, width, n_tokens, type_x, n_mm, norm);
+        if (perm_nk > 0) {
+            v += "," + VAR_TO_STR(perm_nk);
+        }
+        return v;
     }
 
     double max_nmse_err() override {
         return n_mm > 0 ? 5e-4 : 1e-7; // the matmuls quantize their activations, as in test_mul_mat
     }
 
-    // the norm fold spans several nodes: evaluated one node at a time, it would not run
-    bool run_whole_graph() override { return norm > 0; }
+    // the norm fold and the permuted read span several nodes: evaluated one node at a time, neither would run
+    bool run_whole_graph() override { return norm > 0 || perm_nk > 0; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5303,6 +5308,10 @@ struct test_fwht_signed : public test_case {
         ggml_tensor * xn = x;
         if (norm > 0) {
             xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width));
+        }
+        if (perm_nk > 0) {
+            xn = ggml_reshape_4d(ctx, xn, 128, perm_nk, width / (128 * perm_nk), n_tokens);
+            xn = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, xn, 0, 2, 1, 3)), width, n_tokens);
         }
         ggml_tensor * cur = ggml_mul(ctx, xn, norm == 3 ? ggml_scale(ctx, s, 1.0f) : s);
         cur = ggml_reshape_2d(ctx, cur, blk, width / blk * n_tokens);
@@ -10301,6 +10310,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 3, GGML_TYPE_F32, 1, 1));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, 2, 2));
     test_cases.emplace_back(new test_fwht_signed(2048, 4096, 2, GGML_TYPE_F32, 1, 3));
+    // the Gated DeltaNet output's grouped head order (6144 = 128 x 16 x 3), read through the permute by the transform
+    for (int64_t n_tokens : {1, 3, 8, 32}) {
+        for (int n_mm : {0, 1}) {
+            test_cases.emplace_back(new test_fwht_signed(1024, 6144, n_tokens, GGML_TYPE_F32, n_mm, 0, 16));
+        }
+    }
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120, 3, GGML_TYPE_F32, 1, 0, 10));
+    test_cases.emplace_back(new test_fwht_signed(2048, 4096, 2, GGML_TYPE_F32, 0, 0, 8));
+    test_cases.emplace_back(new test_fwht_signed(1024, 6144, 3, GGML_TYPE_F16, 1, 0, 16)); // F16: copied
     test_cases.emplace_back(new test_lora_rank1(5120, 6144, 1.0f));
     test_cases.emplace_back(new test_lora_rank1(17408, 5120, 0.5f));
     test_cases.emplace_back(new test_lora_rank1(6144, 5120, 1.0f));

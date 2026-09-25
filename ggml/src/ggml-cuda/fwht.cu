@@ -208,10 +208,17 @@ static __device__ __forceinline__ void fwht_block_store(const float (&reg)[N / N
     }
 }
 
-template <int N, int NT, typename T, bool has_signs>
+// A source read through a 4-D view, as a CONT of it would copy it: element g of the contiguous rows is src[i0*s0 + i1*s1
+// + i2*s2 + i3*s3], (i0, i1, i2, i3) being g unravelled over the view's ne0, ne1 and ne2 (fastdiv values).
+struct fwht_src_view {
+    uint3   ne0, ne1, ne2;
+    int64_t s0, s1, s2, s3;
+};
+
+template <int N, int NT, typename T, bool has_signs, bool has_view = false>
 __launch_bounds__(NT, 1)
 __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
-                                const float * signs, const int n_blk, const bool pdl_trigger) {
+                                const float * signs, const int n_blk, const bool pdl_trigger, const fwht_src_view view) {
     if (pdl_trigger) {
         ggml_cuda_pdl_lc();
     }
@@ -224,7 +231,9 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
         return;
     }
 
-    src += r * N;
+    if constexpr (!has_view) {
+        src += r * N;
+    }
     dst += r * N;
 
     const int tid = threadIdx.x;
@@ -235,7 +244,16 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
     float reg[NE];
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
-        reg[i] = fwht_load(src[i * NT + tid]) * scale;
+        if constexpr (has_view) {
+            const uint32_t g  = (uint32_t) (r * N + i * NT + tid);
+            const uint32_t q0 = fastdiv(g,  view.ne0);
+            const uint32_t q1 = fastdiv(q0, view.ne1);
+            const uint32_t i3 = fastdiv(q1, view.ne2);
+            reg[i] = fwht_load(src[(g - q0 * view.ne0.z) * view.s0 + (q0 - q1 * view.ne1.z) * view.s1 +
+                                   (q1 - i3 * view.ne2.z) * view.s2 + i3 * view.s3]) * scale;
+        } else {
+            reg[i] = fwht_load(src[i * NT + tid]) * scale;
+        }
         if (has_signs) {
             reg[i] *= signs_row[i * NT + tid];
         }
@@ -312,7 +330,9 @@ static bool fwht_pdl_trigger() {
 template <typename T>
 static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
                         const int n, const int64_t rows, const float scale,
-                        const float * signs, const int n_blk) {
+                        const float * signs, const int n_blk, const fwht_src_view * view = nullptr) {
+    // only fwht_cuda_block reads through a view, and only an F32 source with signs
+    GGML_ASSERT(view == nullptr || (std::is_same_v<T, float> && signs != nullptr && n >= 512 && !fwht_legacy()));
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int rows_per_block = 4;
     const int64_t num_blocks = (rows + rows_per_block - 1) / rows_per_block;
@@ -357,10 +377,16 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         case NN: { \
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1); \
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
+            if constexpr (std::is_same_v<T, float>) { \
+                if (view) { \
+                    ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true, true>, lp, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger, *view); \
+                    return true; \
+                } \
+            } \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger, fwht_src_view{}); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, pdl_trigger); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, pdl_trigger, fwht_src_view{}); \
             } \
             return true; \
         }
@@ -429,6 +455,27 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
                               const ggml_tensor * signs, ggml_tensor * dst) {
     return fwht_dispatch(ctx, src, dst, signs);
+}
+
+bool ggml_cuda_op_fwht_view(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * signs,
+                            ggml_tensor * dst) {
+    const int     n    = dst->ne[0];
+    const int64_t rows = ggml_nelements(dst) / n;
+    const size_t  ts   = ggml_type_size(src->type);
+    const bool block_kernel = n >= 512 && n <= 8192 && (n & (n - 1)) == 0 && !fwht_legacy();
+    if (!block_kernel || src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            ggml_nelements(src) != ggml_nelements(dst) || ggml_nelements(dst) > INT_MAX ||
+            signs->type != GGML_TYPE_F32 || !ggml_is_contiguous(signs) || signs->ne[0] % n != 0 ||
+            src->nb[0] % ts != 0 || src->nb[1] % ts != 0 || src->nb[2] % ts != 0 || src->nb[3] % ts != 0) {
+        return false;
+    }
+
+    const fwht_src_view view = {
+        init_fastdiv_values(src->ne[0]), init_fastdiv_values(src->ne[1]), init_fastdiv_values(src->ne[2]),
+        (int64_t) (src->nb[0] / ts), (int64_t) (src->nb[1] / ts), (int64_t) (src->nb[2] / ts), (int64_t) (src->nb[3] / ts),
+    };
+    return fwht_launch<float>(ctx, (const float *) src->data, (float *) dst->data, n, rows, 1 / sqrtf(n),
+                              (const float *) signs->data, signs->ne[0] / n, &view);
 }
 
 bool ggml_cuda_rms_norm_fwht_supported(const ggml_tensor * rms_norm, const ggml_tensor * w, const ggml_tensor * normed,

@@ -4105,6 +4105,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // CONT of a view + reshape + the sign flip, reshape and FWHT-hint matmul below (the grouped head order qwen35's Gated
+    // DeltaNet output takes for ssm_out): the transform reads its input through the view, so the copy is not made.
+    // GGML_CUDA_FWHT_VIEW_LEGACY=1 makes the copy first.
+    static const bool fwht_view_legacy = [] {
+        const char * env = getenv("GGML_CUDA_FWHT_VIEW_LEGACY");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!fwht_view_legacy && ggml_can_fuse_subgraph(cgraph, i,
+            { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 4 })) {
+        const ggml_tensor * cont  = cgraph->nodes[i];
+        const ggml_tensor * mul   = cgraph->nodes[i + 2];
+        ggml_tensor *       mm    = cgraph->nodes[i + 4];
+        const ggml_tensor * signs = mul->src[1];
+        const int out_nodes[] = { i + 4 };
+
+        const bool pattern_ok = ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            cgraph->nodes[i + 1]->src[0] == cont && mul->src[0] == cgraph->nodes[i + 1] &&
+            cgraph->nodes[i + 3]->src[0] == mul && mm->src[1] == cgraph->nodes[i + 3] &&
+            cont->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) &&
+            signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 && signs->ne[0] == mul->ne[0] &&
+            ggml_nelements(mul) == ggml_nelements(cont);
+
+        if (pattern_ok && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 1) &&
+                ggml_cuda_op_fwht_view(*cuda_ctx, cont->src[0], signs, mm)) {
+            return 4;
+        }
+    }
+
     // Hadamard sign flip + reshape + FWHT-hint matmul: multiply the sign
     // vector during the transform's load instead of a separate full pass
     if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {
