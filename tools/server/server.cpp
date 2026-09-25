@@ -140,6 +140,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     common_params_print_info(params, !is_router_server);
 
     if (!is_router_server) {
+        common_bind_to_gpu_node(params);
+
         // validate batch size for embeddings
         // embeddings require all tokens to be processed in a single ubatch
         // see https://github.com/ggml-org/llama.cpp/issues/12836
