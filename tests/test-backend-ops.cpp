@@ -10914,7 +10914,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // the same model at an MTP verify's width and around the fused-column limit (MMVQ_MAX_FUSED_NCOLS, 3): the FFN's
     // gate/up + GLU (fused at 1 column only), and a residual add (a bias with the output's shape) after the FFN down
-    // (17408 -> 5120) and after a Gated DeltaNet layer's output projection (6144 -> 5120); 4-5 columns do not fuse
+    // (17408 -> 5120) and after a Gated DeltaNet layer's output projection (6144 -> 5120); 4-5 columns do not fuse. Those
+    // are mul_mat_vec_q's limits: on sm_120 the PQ2_0 tensor-core kernel (mmvq-pq2-mma.cu) fuses both at every width here
     for (ggml_type type : { GGML_TYPE_PQ2_0, GGML_TYPE_Q8_0 }) {
         for (int64_t m : { 1, 2, 3, 4, 5 }) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 17408, 5120,
