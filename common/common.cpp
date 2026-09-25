@@ -368,6 +368,12 @@ void common_bind_to_gpu_node(const common_params & params) {
     if (CPU_COUNT(&both) == 0 || CPU_EQUAL(&both, &cur)) {
         return;
     }
+    // fewer CPUs than the CPU backend's threads (a node smaller than a socket, or a cpuset): threads spinning in ggml_barrier would share them
+    const int n_threads = std::max(params.cpuparams.n_threads, params.cpuparams_batch.n_threads);
+    if (CPU_COUNT(&both) < n_threads) {
+        COM_INF("%d threads for %d CPUs on the NUMA node of %s: the placement stays with the scheduler\n", n_threads, CPU_COUNT(&both), ggml_backend_dev_name(devs[0]));
+        return;
+    }
     gpu_node_bound   = true;
     gpu_node_unbound = cur;
     COM_INF("%d threads on CPUs %s, the NUMA node of %s\n", set_all_threads_affinity(both), cpus.c_str(), ggml_backend_dev_name(devs[0]));
