@@ -403,14 +403,39 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
+        // a speculative rollback removes the few cells placed last, just below the head: up to 1024 cells are found
+        // walking backward from it, stopping at the last one, instead of scanning every cell of the cache
+        static const bool scan_all = [] {
+            const char * v = getenv("LLAMA_KV_SEQ_RM_SCAN_LEGACY");
+            return v != nullptr && atoi(v) != 0;
+        }();
+        uint32_t n_rm = scan_all ? UINT32_MAX : cells.seq_pos_count(seq_id, p0, p1, 1024);
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+        if (n_rm <= 1024) {
+            const auto visit = [&](uint32_t i) {
+                if (cells.pos_in(i, p0, p1) && cells.seq_has(i, seq_id)) {
+                    --n_rm;
+                    if (cells.seq_rm(i, seq_id)) {
+                        new_head = std::min(new_head, i);
+                    }
+                }
+            };
+            for (uint32_t i = head; n_rm > 0 && i-- > 0;) {
+                visit(i);
+            }
+            for (uint32_t i = cells.size(); n_rm > 0 && i-- > head;) {
+                visit(i);
+            }
+        } else {
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.pos_in(i, p0, p1)) {
+                    continue;
+                }
+
+                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                    if (new_head == cells.size()) {
+                        new_head = i;
+                    }
                 }
             }
         }
