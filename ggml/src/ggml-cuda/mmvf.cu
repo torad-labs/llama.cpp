@@ -722,6 +722,50 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
 }
 
+void ggml_cuda_mul_mat_vec_f_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_a, const ggml_tensor * src0_b,
+    const ggml_tensor * src1, ggml_tensor * dst_a, ggml_tensor * dst_b) {
+    GGML_ASSERT(ggml_cuda_mmvf_pair_supports(src0_a, src0_b, src1, dst_a, dst_b));
+
+    const size_t ts_src0 = ggml_type_size(src0_a->type);
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst_a->op_params[0]) : GGML_PREC_F32;
+
+    const float * src1_d = (const float *) src1->data;
+    float       *  dst_d = (float       *) dst_a->data;
+
+    const int64_t ne00 = src0_a->ne[0];
+    const int64_t ne01 = src0_a->ne[1];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t s01  = src0_a->nb[1] / ts_src0;
+    const int64_t s11  = src1->nb[1] / sizeof(float);
+    const int64_t s1   = dst_a->nb[1] / sizeof(float);
+    // channel 1: the second weights and output, at their offsets from the first; both channels read the same src1
+    const int64_t s02  = ((const char *) src0_b->data - (const char *) src0_a->data) / (int64_t) ts_src0;
+    const int64_t s2   = ((const char *)  dst_b->data - (const char *)  dst_a->data) / (int64_t) sizeof(float);
+
+    const ggml_cuda_mm_fusion_args_device fusion{};
+    switch (src0_a->type) {
+        case GGML_TYPE_F32: {
+            const float * src0_d = (const float *) src0_a->data;
+            mul_mat_vec_f_cuda(src0_d, src1_d, nullptr, fusion, dst_d, ne00, ne01, ne11, s01, s11, s1,
+                2, 2, 2, s02, 0, s2, 1, 1, 0, 0, 0, 0, prec, ctx.stream());
+        } break;
+        case GGML_TYPE_F16: {
+            const half * src0_d = (const half *) src0_a->data;
+            mul_mat_vec_f_cuda(src0_d, src1_d, nullptr, fusion, dst_d, ne00, ne01, ne11, s01, s11, s1,
+                2, 2, 2, s02, 0, s2, 1, 1, 0, 0, 0, 0, prec, ctx.stream());
+        } break;
+        case GGML_TYPE_BF16: {
+            const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0_a->data;
+            mul_mat_vec_f_cuda(src0_d, src1_d, nullptr, fusion, dst_d, ne00, ne01, ne11, s01, s11, s1,
+                2, 2, 2, s02, 0, s2, 1, 1, 0, 0, 0, 0, prec, ctx.stream());
+        } break;
+        default:
+            GGML_ABORT("unsupported type: %s", ggml_type_name(src0_a->type));
+    }
+}
+
 void ggml_cuda_op_mul_mat_vec_f(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -797,6 +841,22 @@ static bool ggml_cuda_mmvf_can_read(const ggml_tensor * t) {
 
 bool ggml_cuda_mmvf_supports(const ggml_tensor * src0, const ggml_tensor * src1) {
     return src1->type == GGML_TYPE_F32 && ggml_cuda_mmvf_can_read(src0) && ggml_cuda_mmvf_can_read(src1);
+}
+
+bool ggml_cuda_mmvf_pair_supports(const ggml_tensor * src0_a, const ggml_tensor * src0_b, const ggml_tensor * src1,
+        const ggml_tensor * dst_a, const ggml_tensor * dst_b) {
+    // b's offset from a in elements, as the kernel's int channel stride
+    const auto channel_stride_ok = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const int64_t ts   = ggml_type_size(a->type);
+        const int64_t offs = (const char *) b->data - (const char *) a->data;
+        return a->buffer != nullptr && a->buffer == b->buffer && offs % ts == 0 && offs/ts >= INT_MIN && offs/ts <= INT_MAX;
+    };
+    return src0_a->ne[2] == 1 && src0_a->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] <= MMVF_MAX_BATCH_SIZE
+        && src0_a->type == src0_b->type && ggml_are_same_shape(src0_a, src0_b) && ggml_are_same_stride(src0_a, src0_b)
+        && dst_a->type == GGML_TYPE_F32 && dst_b->type == GGML_TYPE_F32 && dst_a->nb[0] == sizeof(float)
+        && ggml_are_same_shape(dst_a, dst_b) && ggml_are_same_stride(dst_a, dst_b) && dst_a->op_params[0] == dst_b->op_params[0]
+        && ggml_cuda_mmvf_supports(src0_a, src1) && ggml_cuda_mmvf_supports(src0_b, src1)
+        && channel_stride_ok(src0_a, src0_b) && channel_stride_ok(dst_a, dst_b);
 }
 
 bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, const ggml_tensor * src1, int cc, int64_t ne11) {

@@ -5173,6 +5173,62 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+// Two MUL_MATs of one activation by two weights of one shape, as qwen35's ssm_beta and ssm_alpha, which CUDA runs as one
+// mul_mat_vec_f launch when the kernel takes both. The first product passes through `views` reshapes before its reader,
+// so they sit between the two in the graph (CUDA pairs across up to 4). Both products are compared.
+struct test_mul_mat_pair : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int views;
+
+    ggml_tensor * ya = nullptr;
+    ggml_tensor * yb = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, views);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { ya, yb }; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_PAIR";
+    }
+
+    test_mul_mat_pair(ggml_type type_a = GGML_TYPE_BF16, int64_t m = 48, int64_t n = 1, int64_t k = 5120, int views = 0)
+        : type_a(type_a), m(m), n(n), k(k), views(views) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(wa, "wa");
+        ggml_set_name(wb, "wb");
+        ggml_set_name(x, "x");
+
+        ya = ggml_mul_mat(ctx, wa, x);
+        ggml_set_name(ya, "ya");
+        ggml_tensor * ya_read = ya;
+        for (int v = 0; v < views; ++v) {
+            ya_read = ggml_reshape_2d(ctx, ya_read, m, n);
+        }
+        yb = ggml_mul_mat(ctx, wb, x);
+        ggml_set_name(yb, "yb");
+
+        ggml_tensor * out = ggml_sub(ctx, ya_read, yb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // sign flip + reshape + FWHT-hint matmul, the fusable Hadamard activation path
 struct test_fwht_signed : public test_case {
     const int64_t blk;
@@ -11275,6 +11331,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_group({ 24, 40 }, n, k));
             test_cases.emplace_back(new test_mul_mat_group({ 8, 1000, 24 }, n, k));
             test_cases.emplace_back(new test_mul_mat_group({ 40, 8, 24, 16, 8 }, n, k));
+        }
+    }
+
+    // two float projections of one activation (qwen35's ssm_beta and ssm_alpha, 48 x 5120 bf16): rows and columns on
+    // both sides of where CUDA runs them on the vector kernel, past MMVF_MAX_BATCH_SIZE, and past the pair's view window
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t m : {48, 80, 1024}) {
+            for (int64_t n : {1, 2, 3, 4, 8, 9}) {
+                for (int views : {0, 2}) {
+                    test_cases.emplace_back(new test_mul_mat_pair(type, m, n, 5120, views));
+                }
+            }
+        }
+    }
+    for (int64_t n : {1, 3}) {
+        for (int views : {1, 4, 5}) {
+            test_cases.emplace_back(new test_mul_mat_pair(GGML_TYPE_BF16, 48, n, 5120, views));
         }
     }
 

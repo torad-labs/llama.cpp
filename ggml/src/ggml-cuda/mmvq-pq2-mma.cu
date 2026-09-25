@@ -115,10 +115,22 @@ static __device__ __forceinline__ void pq2_mbar_wait(uint64_t * bar, uint32_t pa
     } while (!done);
 }
 
+// The box lands in this block's own shared memory: the kernel is never launched as a cluster. Addressed as
+// .shared::cluster, the load compiles on sm_120 to a branch whose other side is a driver syscall for a peer block's
+// address (__cuda_syscall_cp_async_bulk_tensor_2d_tile_unicast), and the driver gives every resident thread of a kernel
+// that can make a syscall the syscall's stack: 14,512 bytes, which on a 70-SM RTX 5070 Ti took 1,430 MiB of device
+// memory from the first launch on. .shared::cta is the TMA load alone. It needs PTX ISA 8.6, which every toolkit that
+// targets sm_120 (12.8 and later) emits; an older one builds the cluster form for the Hopper code it can target.
+#if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8)
+#define PQ2_TMA_DST "shared::cta"
+#else
+#define PQ2_TMA_DST "shared::cluster"
+#endif
+
 static __device__ __forceinline__ void pq2_tma_load_2d(void * dst, const CUtensorMap * tmap, int c0, int c1, uint64_t * bar,
                                                        uint64_t policy) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
+        "cp.async.bulk.tensor.2d." PQ2_TMA_DST ".global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
         " [%0], [%1, {%2, %3}], [%4], %5;"
         :: "r"(pq2_smem_u32(dst)), "l"((uint64_t) tmap), "r"(c0), "r"(c1), "r"(pq2_smem_u32(bar)), "l"(policy)
         : "memory");

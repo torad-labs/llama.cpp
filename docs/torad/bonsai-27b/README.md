@@ -10,7 +10,7 @@ to reproduce them, then shows how to put the server behind Claude Code with
 ## Headline
 
 One RTX 5070 Ti (16 GB), the public pack, and PrismML's latest release (`prism-b10709-9a9394a`)
-against this fork at `c008fe8`, the engine rig 0.1.2 and later install. Both were built with the
+against this fork at `c008fe8`, the engine rig 0.1.2 to 0.1.6 installed. Both were built with the
 flags in step 1, and the benchmarks ran only once the shared host had been quiet for two minutes
 (1-minute load under 6; at most 4.4 during the run, [`quiet-rerun.sh`](runs/2026-09-24-headline/quiet-rerun.sh)).
 
@@ -117,9 +117,11 @@ rig up bonsai-2-27b
 
 `rig up`:
 - checks the card and driver;
-- installs this fork's published build ([`engine-c008fe8`](https://github.com/torad-labs/llama.cpp/releases/tag/engine-c008fe8)) and NVIDIA's CUDA 13.3 runtime, each checked by sha256, with no toolkit or compiler;
+- installs this fork's published build ([`engine-3c7e643`](https://github.com/torad-labs/llama.cpp/releases/tag/engine-3c7e643)) and NVIDIA's CUDA 13.3 runtime, each checked by sha256, with no toolkit or compiler;
 - fetches the pack from step 2 by sha256, then writes our retrained MTP draft head over the pack's own ([`bonsai-2-27b-mtp-r2`](https://github.com/torad-labs/rig/releases/tag/bonsai-2-27b-mtp-r2), also checked by sha256; it raises the share of drafted tokens accepted from 0.670 to 0.733 on the pack as published);
-- starts it as a systemd user service on `127.0.0.1:8099`, with step 3's flags and `-c`/`-np` sized to the card.
+- starts it as a systemd user service on `127.0.0.1:8099`, with step 3's flags and `-c`/`-np` sized to the card. Its draft head
+  drafts three tokens a round and scores a 98,304-id draft vocabulary (step 3 drafts two over the whole vocabulary). On an
+  RTX 5080, over 48 held-out requests at 40,960 tokens of context, rig 0.1.7 decodes 190.2 tok/s and rig 0.1.6 141.9 (+36.8 %).
 
 On a fresh Ubuntu 24.04 with only the driver, the engine install took about 45 seconds, plus the
 7.66 GB pack and the 451 MB head. `rig describe bonsai-2-27b` prints what step 4 needs as JSON. In step 4, use
