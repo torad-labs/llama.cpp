@@ -49,6 +49,10 @@ void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 
+// how many of the last tokens accepted with is_generated false the state depends on: after a reset, accepting only
+// these leaves the sampler as accepting the whole history would (a history replayed before sampling)
+int32_t common_sampler_n_history(const struct common_sampler * gsmpl);
+
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 
