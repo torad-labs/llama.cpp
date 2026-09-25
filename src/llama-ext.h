@@ -16,6 +16,11 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Restrict the MTP draft head to these token ids (strictly increasing): a draft step then reads their rows of
+// the LM head only, and every other token's draft logit is -inf. Call before the MTP context is created.
+// Returns false (and logs why) for a model whose MTP graph cannot score a trimmed head.
+LLAMA_API bool llama_model_set_draft_vocab(struct llama_model * model, const llama_token * ids, size_t n_ids);
+
 // True while a lazy grammar sampler waits for its trigger: its apply leaves every logit as it is until then.
 // False for any other sampler, and for a grammar that constrains (triggered, or not lazy).
 LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);

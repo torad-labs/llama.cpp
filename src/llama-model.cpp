@@ -2937,6 +2937,87 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     return llm->res->get_gf();
 }
 
+void llama_model::set_draft_vocab(const llama_token * ids, size_t n_ids) {
+    // only an MTP graph that scores output_draft may be handed one: any other would keep drafting over the full
+    // vocabulary while its caller believes the head trimmed
+    if (arch != LLM_ARCH_QWEN35 || hparams.n_layer_nextn == 0) {
+        throw std::runtime_error(format("draft vocab: the %s graph has no MTP head that scores a trimmed vocabulary", llm_arch_name(arch)));
+    }
+    if (output_draft) {
+        throw std::runtime_error("draft vocab: already set");
+    }
+    const auto & nextn = layers[hparams.n_layer()].nextn;
+    ggml_tensor * head   = nextn.shared_head_head ? nextn.shared_head_head   : output;
+    ggml_tensor * head_s = nextn.shared_head_head ? nextn.shared_head_head_s : output_s;
+    if (head == nullptr || head->buffer == nullptr) {
+        throw std::runtime_error("draft vocab: the MTP graph's LM head is not loaded");
+    }
+    if (head_s) {
+        throw std::runtime_error(format("draft vocab: %s carries a scale tensor, which a row subset would not", head->name));
+    }
+    const int64_t n_vocab = head->ne[1];
+    if (n_ids == 0 || (int64_t) n_ids >= n_vocab) {
+        throw std::runtime_error(format("draft vocab: %zu ids, needs 1 to %lld", n_ids, (long long) n_vocab - 1));
+    }
+    for (size_t i = 0; i < n_ids; ++i) {
+        if (ids[i] < 0 || ids[i] >= n_vocab || (i > 0 && ids[i] <= ids[i - 1])) {
+            throw std::runtime_error(format("draft vocab: id %d at %zu is not a strictly increasing token id below %lld",
+                    ids[i], i, (long long) n_vocab));
+        }
+    }
+    // the rows are cut from the head's bytes as stored: a CPU buffer that repacks them has no readable layout
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(head->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!ggml_backend_buffer_is_host(head->buffer) && (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        throw std::runtime_error(format("draft vocab: %s is in %s, whose rows are not stored as a row-major copy", head->name, ggml_backend_buft_name(buft)));
+    }
+    const size_t row = ggml_row_size(head->type, head->ne[0]);
+    GGML_ASSERT(ggml_is_contiguous(head) && head->nb[1] == row);
+
+    std::vector<uint8_t> all(ggml_nbytes(head));
+    ggml_backend_tensor_get(head, all.data(), 0, all.size());
+    std::vector<uint8_t> hot(n_ids * row);
+    for (size_t i = 0; i < n_ids; ++i) {
+        memcpy(hot.data() + i * row, all.data() + (size_t) ids[i] * row, row);
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("draft vocab: failed to create its context");
+    }
+    ggml_tensor * w = ggml_new_tensor_2d(ctx.get(), head->type, head->ne[0], (int64_t) n_ids);
+    ggml_set_name(w, "output_draft.weight");
+    ggml_tensor * w_ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) n_ids);
+    ggml_set_name(w_ids, "output_draft.ids");
+    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buffer) {
+        throw std::runtime_error(format("draft vocab: unable to allocate its %s buffer", ggml_backend_buft_name(buft)));
+    }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(w, hot.data(), 0, hot.size());
+    ggml_backend_tensor_set(w_ids, ids, 0, n_ids * sizeof(llama_token));
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(std::move(buffer));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+
+    // the rows keep the activation-side transform of the head they were cut from
+    const auto rot = hadamard_rotations.find(head);
+    if (rot != hadamard_rotations.end()) {
+        const llama_hadamard_transform t = rot->second;
+        hadamard_rotations[w] = t;
+    }
+    output_draft     = w;
+    output_draft_ids = w_ids;
+
+    LLAMA_LOG_INFO("%s: MTP draft vocabulary: %zu of %lld tokens, %.2f of %.2f MiB of %s (%s)\n", __func__,
+            n_ids, (long long) n_vocab, hot.size() / 1048576.0, all.size() / 1048576.0, head->name, ggml_backend_buft_name(buft));
+}
+
 
 //
 // interface implementation
@@ -2999,6 +3080,16 @@ int32_t llama_model_n_layer(const llama_model * model) {
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
+}
+
+bool llama_model_set_draft_vocab(llama_model * model, const llama_token * ids, size_t n_ids) {
+    try {
+        model->set_draft_vocab(ids, n_ids);
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
