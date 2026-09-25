@@ -31,6 +31,10 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// n MUL_MATs (2 to PQ2_MMA_MAX_GROUP) on one src1, each of which ggml_cuda_mul_mat_vec_q would send unfused to the PQ2_0
+// tensor-core kernel: src1 quantized once, one launch over all their tiles (ggml_cuda_mmvq_pq2_mma_group).
+void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

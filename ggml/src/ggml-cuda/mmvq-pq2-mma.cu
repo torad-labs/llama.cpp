@@ -29,6 +29,10 @@
 // The pointers carry no __restrict__: with PDL a restrict load may compile to ld.global.nc, which the compiler can move
 // above the grid dependency wait (upstream #24030), and the tokens and the bias are written by the kernels before this
 // one. Only the weights, which no kernel writes, are requested before that wait.
+//
+// A group launch (mmvq_pq2_mma_group) runs several matrices that read one activation, such as qkv and z, or q, k and v:
+// the launch's tiles are the first matrix's, then the second's, and so on, and each tile takes its matrix's map, output
+// and rows. The blocks split the whole sequence, so the group streams as one matrix of all the rows.
 
 #define PQ2_MMA_NW        8                                // consumer warps, and one producer warp
 #define PQ2_MMA_MAX_COLS  8
@@ -39,6 +43,28 @@
 static_assert(sizeof(block_pq2_0) == 34, "PQ2_0 block layout");
 static_assert(PQ2_MMA_KB_BYTES % 16 == 0, "a box row is a whole number of 16-byte TMA units");
 static_assert(PQ2_MMA_MAX_M * PQ2_MMA_KB_BYTES / 8 <= 256, "a TMA box is at most 256 8-byte elements wide");
+
+// a group launch's matrices in tile order: matrix g's tiles are [tile_end[g - 1], tile_end[g]), from 0 for g = 0
+struct pq2_mma_group {
+    CUtensorMap tmap[PQ2_MMA_MAX_GROUP];
+    float *     dst[PQ2_MMA_MAX_GROUP];
+    int         nrows[PQ2_MMA_MAX_GROUP];
+    int         stride_col_dst[PQ2_MMA_MAX_GROUP];
+    int         tile_end[PQ2_MMA_MAX_GROUP];
+    int         n;
+};
+
+static __device__ __forceinline__ int pq2_mma_group_of(const pq2_mma_group * grp, const int tile) {
+    int g = 0;
+    while (g + 1 < grp->n && tile >= grp->tile_end[g]) {
+        ++g;
+    }
+    return g;
+}
+
+static __device__ __forceinline__ int pq2_mma_group_begin(const pq2_mma_group * grp, const int g) {
+    return g > 0 ? grp->tile_end[g - 1] : 0;
+}
 
 // one matrix's box: 16 rows x m*272 bytes, a multiple of 128 bytes (16*272 = 34*128), so every box starts aligned
 static constexpr __host__ __device__ int pq2_mma_box_bytes(int m) {
@@ -121,16 +147,17 @@ static __device__ __forceinline__ float pq2_mma_dot(const int c) {
 }
 #endif // PQ2_MMA_AVAILABLE
 
-// nmat 1: dst = W x (+ x_bias); nmat 2: dst = (W x) * silu(G x), W's map in tmap and G's in tmap_gate.
+// nmat 1: dst = W x (+ x_bias); nmat 2: dst = (W x) * silu(G x), W's map in tmap and G's in tmap_gate. grouped: each
+// tile's map, output, rows and output stride come from its matrix in grp, not from tmap, dst, nrows and stride_col_dst.
 // M: the box's width in 1,024-weight units, and each consumer warp's share of it in PQ2_0 blocks; nb: PQ2_0 blocks per
 // row; nkb: boxes per row (the last one may reach past the row: TMA fills that part with zeros, and it is skipped).
-template <int M, int nmat, bool has_bias>
-__launch_bounds__((PQ2_MMA_NW + 1)*32, 1)
-static __global__ void mmvq_pq2_mma(
-        const __grid_constant__ CUtensorMap tmap, const __grid_constant__ CUtensorMap tmap_gate, const block_q8_1 * y,
+template <int M, int nmat, bool has_bias, bool grouped>
+static __device__ __forceinline__ void mmvq_pq2_mma_body(
+        const CUtensorMap * tmap, const CUtensorMap * tmap_gate, const pq2_mma_group * grp, const block_q8_1 * y,
         const float * x_bias, float * dst, const int nrows, const int ncols, const int nb, const int n_tiles,
         const int nkb, const int nslots, const int evict_first, const int stride_col_y, const int stride_col_dst) {
     static_assert(nmat == 1 || (nmat == 2 && !has_bias), "a gated product fuses no bias");
+    static_assert(!grouped || (nmat == 1 && !has_bias), "a group's matrices fuse nothing");
 #ifdef PQ2_MMA_AVAILABLE
     constexpr int box_bytes = pq2_mma_box_bytes(M);
     constexpr int row_bytes = M * PQ2_MMA_KB_BYTES; // a box row
@@ -170,22 +197,35 @@ static __global__ void mmvq_pq2_mma(
             } else {
                 asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;" : "=l"(policy));
             }
-            asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t) &tmap) : "memory");
-            if constexpr (nmat == 2) {
-                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t) &tmap_gate) : "memory");
+            if constexpr (grouped) {
+                for (int g = 0; g < grp->n; ++g) {
+                    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t) &grp->tmap[g]) : "memory");
+                }
+            } else {
+                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t) tmap) : "memory");
+                if constexpr (nmat == 2) {
+                    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t) tmap_gate) : "memory");
+                }
             }
             for (int i = 0; i < n_boxes; ++i) {
                 const int s = i % nslots;
                 if (i >= nslots) {
                     pq2_mbar_wait(&empty[s], (uint32_t) ((i / nslots - 1) & 1));
                 }
+                const int tile = t_begin + i / nkb;
+                const CUtensorMap * map = tmap;
+                int row0 = tile * 16; // the tile's first row in its matrix
+                if constexpr (grouped) {
+                    const int g = pq2_mma_group_of(grp, tile);
+                    map  = &grp->tmap[g];
+                    row0 = (tile - pq2_mma_group_begin(grp, g)) * 16;
+                }
                 const int c0 = (i % nkb) * (row_bytes / 8);  // 8-byte elements
-                const int c1 = (t_begin + i / nkb) * 16;
                 char * slot = ring + (size_t) s * nmat * box_bytes;
                 pq2_mbar_arrive_expect_tx(&full[s], nmat * box_bytes);
-                pq2_tma_load_2d(slot, &tmap, c0, c1, &full[s], policy);
+                pq2_tma_load_2d(slot, map, c0, row0, &full[s], policy);
                 if constexpr (nmat == 2) {
-                    pq2_tma_load_2d(slot + box_bytes, &tmap_gate, c0, c1, &full[s], policy);
+                    pq2_tma_load_2d(slot + box_bytes, tmap_gate, c0, row0, &full[s], policy);
                 }
             }
         }
@@ -236,13 +276,25 @@ static __global__ void mmvq_pq2_mma(
 
     int i = 0; // the block's box sequence
     for (int tile = t_begin; tile < t_end; ++tile) {
-        const int row_out = tile*16 + (l_out >> 2) + (r_out >= 2 ? 8 : 0);
+        // the tile's matrix: its output, rows and output stride, and the tile's first row in it
+        float * dst_t    = dst;
+        int     nrows_t  = nrows;
+        int     stride_t = stride_col_dst;
+        int     row0     = tile*16;
+        if constexpr (grouped) {
+            const int g = pq2_mma_group_of(grp, tile);
+            dst_t    = grp->dst[g];
+            nrows_t  = grp->nrows[g];
+            stride_t = grp->stride_col_dst[g];
+            row0     = (tile - pq2_mma_group_begin(grp, g))*16;
+        }
+        const int row_out = row0 + (l_out >> 2) + (r_out >= 2 ? 8 : 0);
         const int col_out = 2*(l_out & 3) + (r_out & 1);
-        const bool writes = j_out < 128 && row_out < nrows && col_out < ncols;
+        const bool writes = j_out < 128 && row_out < nrows_t && col_out < ncols;
         float bias = 0.0f;
         if constexpr (has_bias) {
             if (writes) {
-                bias = x_bias[(int64_t) col_out*stride_col_dst + row_out];
+                bias = x_bias[(int64_t) col_out*stride_t + row_out];
             }
         }
 
@@ -329,15 +381,34 @@ static __global__ void mmvq_pq2_mma(
                 if constexpr (has_bias) {
                     out += bias;
                 }
-                dst[(int64_t) col_out*stride_col_dst + row_out] = out;
+                dst_t[(int64_t) col_out*stride_t + row_out] = out;
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(tmap, tmap_gate, y, x_bias, dst, nrows, ncols, nb, n_tiles, nkb, nslots, evict_first, stride_col_y,
-        stride_col_dst);
+    GGML_UNUSED_VARS(tmap, tmap_gate, grp, y, x_bias, dst, nrows, ncols, nb, n_tiles, nkb, nslots, evict_first,
+        stride_col_y, stride_col_dst);
     NO_DEVICE_CODE;
 #endif // PQ2_MMA_AVAILABLE
+}
+
+template <int M, int nmat, bool has_bias>
+__launch_bounds__((PQ2_MMA_NW + 1)*32, 1)
+static __global__ void mmvq_pq2_mma(
+        const __grid_constant__ CUtensorMap tmap, const __grid_constant__ CUtensorMap tmap_gate, const block_q8_1 * y,
+        const float * x_bias, float * dst, const int nrows, const int ncols, const int nb, const int n_tiles,
+        const int nkb, const int nslots, const int evict_first, const int stride_col_y, const int stride_col_dst) {
+    mmvq_pq2_mma_body<M, nmat, has_bias, false>(&tmap, &tmap_gate, nullptr, y, x_bias, dst, nrows, ncols, nb, n_tiles,
+        nkb, nslots, evict_first, stride_col_y, stride_col_dst);
+}
+
+template <int M>
+__launch_bounds__((PQ2_MMA_NW + 1)*32, 1)
+static __global__ void mmvq_pq2_mma_group(
+        const __grid_constant__ pq2_mma_group grp, const block_q8_1 * y, const int ncols, const int nb, const int n_tiles,
+        const int nkb, const int nslots, const int evict_first, const int stride_col_y) {
+    mmvq_pq2_mma_body<M, 1, false, true>(nullptr, nullptr, &grp, y, nullptr, nullptr, 0, ncols, nb, n_tiles, nkb, nslots,
+        evict_first, stride_col_y, 0);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -494,5 +565,56 @@ void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy
     } else {
         pq2_mma_launch_m<1, false>(p, tmap, tmap_gate, y, nullptr, dst, (int) nrows_x, (int) ncols_dst, nb, n_tiles,
             (int) stride_col_y, (int) stride_col_dst, stream);
+    }
+}
+
+template <int M>
+static void pq2_mma_launch_group(const pq2_mma_plan & p, const pq2_mma_group & grp, const block_q8_1 * y, int ncols,
+        int nb, int n_tiles, int stride_col_y, cudaStream_t stream) {
+    const int nsm     = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int nblocks = std::min(nsm, n_tiles);
+    const ggml_cuda_kernel_launch_params params(dim3(nblocks), dim3((PQ2_MMA_NW + 1)*32),
+        pq2_mma_smem_bytes(M, 1, p.nslots), stream);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mmvq_pq2_mma_group<M>), PQ2_MMA_SMEM_MAX);
+    ggml_cuda_kernel_launch(mmvq_pq2_mma_group<M>, params, grp, y, ncols, nb, n_tiles, p.nkb, p.nslots,
+        (int) pq2_mma_get_config().evict_first, stride_col_y);
+}
+
+void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
+                                  const int64_t * stride_row_x, const int64_t * stride_col_dst, const void * vy,
+                                  int64_t ncols_x, int64_t ncols_dst, int64_t stride_col_y, cudaStream_t stream) {
+    GGML_ASSERT(n >= 2 && n <= PQ2_MMA_MAX_GROUP);
+    const pq2_mma_plan p = pq2_mma_make_plan(ncols_x, 1);
+    GGML_ASSERT(p.m > 0 && "ggml_cuda_mmvq_pq2_mma_usable holds a plan");
+
+    const int64_t row_bytes = ncols_x / QK_PQ2_0 * (int64_t) sizeof(block_pq2_0);
+    const int     nb        = (int) (ncols_x / QK_PQ2_0);
+
+    pq2_mma_group grp{};
+    int64_t n_tiles = 0;
+    for (int g = 0; g < n; ++g) {
+        grp.tmap[g]           = pq2_mma_tensor_map(vx[g], row_bytes, nrows_x[g], stride_row_x[g], p.m);
+        grp.dst[g]            = dst[g];
+        grp.nrows[g]          = (int) nrows_x[g];
+        grp.stride_col_dst[g] = (int) stride_col_dst[g];
+        n_tiles              += (nrows_x[g] + 15) / 16;
+        grp.tile_end[g]       = (int) n_tiles;
+    }
+    grp.n = n;
+    GGML_ASSERT(n_tiles < ((int64_t) 1 << 31) / 16);
+
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    switch (p.m) {
+#define PQ2_MMA_CASE(M) case M: pq2_mma_launch_group<M>(p, grp, y, (int) ncols_dst, nb, (int) n_tiles, (int) stride_col_y, \
+                                    stream); break;
+        PQ2_MMA_CASE(1)
+        PQ2_MMA_CASE(2)
+        PQ2_MMA_CASE(3)
+        PQ2_MMA_CASE(4)
+        PQ2_MMA_CASE(5)
+        PQ2_MMA_CASE(6)
+        PQ2_MMA_CASE(7)
+#undef PQ2_MMA_CASE
+        default: GGML_ABORT("%s: no instance for m %d", __func__, p.m);
     }
 }

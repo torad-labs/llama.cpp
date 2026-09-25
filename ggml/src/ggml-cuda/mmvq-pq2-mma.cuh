@@ -17,3 +17,12 @@ bool ggml_cuda_mmvq_pq2_mma_usable(int cc, const void * vx, const void * vgate, 
 void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy, const float * x_bias, float * dst,
                             int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x,
                             int64_t stride_col_y, int64_t stride_col_dst, cudaStream_t stream);
+
+#define PQ2_MMA_MAX_GROUP 4
+
+// n (2 to PQ2_MMA_MAX_GROUP) matrices of ncols_x columns on one activation vy, in one launch: matrix g (vx[g], nrows_x[g]
+// rows of stride_row_x[g] blocks) writes dst[g], column c at dst[g] + c*stride_col_dst[g]. Each matrix must be one
+// ggml_cuda_mmvq_pq2_mma_usable serves unfused, and each gets that launch's result.
+void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
+                                  const int64_t * stride_row_x, const int64_t * stride_col_dst, const void * vy,
+                                  int64_t ncols_x, int64_t ncols_dst, int64_t stride_col_y, cudaStream_t stream);
