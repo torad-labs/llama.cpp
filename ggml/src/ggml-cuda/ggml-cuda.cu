@@ -3012,7 +3012,8 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 }
                 // the output the kernel writes (SILU fused or not) may sit exactly on x, which it reads first; any
                 // other overlap would have a thread overwrite another's inputs, and none may touch ids
-                for (const ggml_tensor * out : { n, cgraph->nodes[j + 1] }) {
+                const ggml_tensor * outs[] = { n, cgraph->nodes[j + 1] };
+                for (const ggml_tensor * out : outs) {
                     if ((ggml_cuda_ranges_overlap(out, x) && !(out->data == x->data && out->nb[1] == x->nb[1])) ||
                             ggml_cuda_ranges_overlap(out, ids)) {
                         return false;
