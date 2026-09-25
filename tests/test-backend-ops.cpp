@@ -1235,6 +1235,9 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // nodes the graph expands before its output, as a model's graph builder forward-expands a side effect (a cache
+    // write) ahead of the tensor it returns, which places them earlier in the node order
+    virtual std::vector<ggml_tensor *> forward_first() { return {}; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1416,6 +1419,9 @@ struct test_case {
         }
 
         // build graph
+        for (ggml_tensor * t : forward_first()) {
+            ggml_build_forward_expand(gf, t);
+        }
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
@@ -1588,6 +1594,9 @@ struct test_case {
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        for (ggml_tensor * t : forward_first()) {
+            ggml_build_forward_expand(gf, t);
+        }
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -4085,6 +4094,86 @@ struct test_ssm_conv : public test_case {
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
         return out;
+    }
+};
+
+// GGML_OP_SSM_CONV + SILU behind build_conv_state's chain (delta-net-base.cpp), one sequence: GET_ROWS(cache,
+// [state_row]) -> RESHAPE -> CONCAT(state, TRANSPOSE(x)) -> a CPY of a window into the cache per rollback snapshot, which
+// CUDA runs as one kernel at the SSM_CONV (ggml_cuda_try_ssm_conv_state_update). The output is the whole cache, read
+// after the SSM_CONV, beside the conv output: a wrong window, row or column shows in one or the other.
+struct test_ssm_conv_state_update : public test_case {
+    const int64_t n_channels;
+    const int64_t n_t;         // new tokens
+    const int64_t n_snapshots; // rollback slots, n_rs_seq + 1
+    const int64_t mem_size;    // rows per slot
+    const int64_t kv_head;     // the sequence's row in each slot
+    const int64_t state_row;   // the row the state is gathered from
+    const int64_t x_pad;       // > 0: x is a view of wider rows, as a projection shared with other outputs lays it out
+
+    std::vector<ggml_tensor *> cpys;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STATE_UPDATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> forward_first() override { return cpys; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_channels, n_t, n_snapshots, mem_size, kv_head, state_row, x_pad);
+    }
+
+    test_ssm_conv_state_update(int64_t n_channels = 256, int64_t n_t = 1, int64_t n_snapshots = 3,
+            int64_t mem_size = 4, int64_t kv_head = 1, int64_t state_row = 1, int64_t x_pad = 0)
+        : n_channels(n_channels), n_t(n_t), n_snapshots(n_snapshots), mem_size(mem_size), kv_head(kv_head),
+          state_row(state_row), x_pad(x_pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d_conv = 4;
+        const int64_t row    = (d_conv - 1) * n_channels;
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, mem_size * n_snapshots);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels + x_pad, n_t, 1);
+        if (x_pad > 0) {
+            x = ggml_view_3d(ctx, x, n_channels, n_t, 1, x->nb[1], x->nb[2], 0);
+        }
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_channels);
+
+        ggml_tensor * state      = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, ids), d_conv - 1, n_channels, 1);
+        ggml_tensor * conv_input = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+
+        // build_conv_state's snapshots: window t of K at column max(0, n_t - K + t) into slot K - t
+        cpys.clear();
+        for (int64_t t = 1; t <= n_snapshots; ++t) {
+            const int64_t col  = std::max<int64_t>(0, n_t - n_snapshots + t);
+            const int64_t slot = n_snapshots - t;
+            ggml_tensor * src  = ggml_view_3d(ctx, conv_input, d_conv - 1, n_channels, 1, conv_input->nb[1],
+                                              conv_input->nb[2], ggml_row_size(GGML_TYPE_F32, col));
+            ggml_tensor * dst  = ggml_view_2d(ctx, cache, row, 1, cache->nb[1], (slot * mem_size + kv_head) * cache->nb[1]);
+            cpys.push_back(ggml_cpy(ctx, src, dst));
+        }
+
+        ggml_tensor * conv = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+        ggml_tensor * out  = ggml_concat(ctx, ggml_view_1d(ctx, cache, ggml_nelements(cache), 0),
+                                         ggml_reshape_1d(ctx, conv, ggml_nelements(conv)), 0);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                const int32_t r = (int32_t) state_row;
+                ggml_backend_tensor_set(t, &r, 0, sizeof(r));
+            } else {
+                // the cache too: every row different, so reading or writing another row fails
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -11438,6 +11527,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
+
+    // build_conv_state's chain: decode (1 token) and a draft verify (3), one snapshot or three, the state row the slot-0
+    // snapshot overwrites or another, x strided; 9 tokens is over the fused kernel's 8 and keeps the chain
+    for (int64_t n_t : { 1, 3, 8, 9 }) {
+        for (int64_t n_snapshots : { 1, 3 }) {
+            for (int64_t kv_head : { 0, 1 }) {
+                for (int64_t state_row : { kv_head, (int64_t) 4 * n_snapshots - 1 }) {
+                    test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, n_snapshots, 4, kv_head, state_row, 0));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 4, 1, 1, 64));
+    }
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill

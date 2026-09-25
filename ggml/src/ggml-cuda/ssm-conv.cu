@@ -123,6 +123,68 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
 }
 
+// The fused conv-state update (ggml_cuda_ssm_conv_state_update), one sequence: a thread per channel reads its
+// d_conv - 1 state columns out of the cache row ids[0] and its n_t new inputs out of the projection, writes its n_t
+// outputs, then its window of every snapshot. All its reads come before any of its writes, and a thread touches only
+// its own channel in every row and every column, so a snapshot that overwrites the row being read, and an output the
+// allocator placed exactly on the inputs (the matcher declines any other overlap), read the old values.
+template <bool apply_silu, int d_conv, int max_n_t>
+static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_update u, const float * w,
+                                                 const int w_stride, float * dst, const int dst_stride, const int n_t) {
+    ggml_cuda_pdl_lc();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float x[d_conv - 1 + max_n_t];
+    float wc[d_conv];
+
+    ggml_cuda_pdl_sync();
+    const float * state = u.cache + (int64_t) u.ids[0] * u.row_stride + (int64_t) c * (d_conv - 1);
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; ++j) {
+        x[j] = state[j];
+    }
+#pragma unroll
+    for (int t = 0; t < max_n_t; ++t) {
+        if (t < n_t) {
+            x[d_conv - 1 + t] = u.x[t * u.x_stride + c];
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wc[j] = w[c * w_stride + j];
+    }
+
+    // the same sum as ssm_conv_f32, including its zero bias (it turns a -0.0f sum into +0.0f)
+    const float b = 0.0f;
+#pragma unroll
+    for (int t = 0; t < max_n_t; ++t) {
+        if (t < n_t) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                sumf += x[t + j] * wc[j];
+            }
+            sumf += b;
+            dst[t * dst_stride + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        }
+    }
+
+    for (int k = 0; k < u.n_snapshots; ++k) {
+        float *   out = u.snapshot_dst[k] + (int64_t) c * (d_conv - 1);
+        const int col = u.snapshot_col[k];
+        // a compile-time index per candidate column keeps x in registers
+#pragma unroll
+        for (int c0 = 0; c0 <= max_n_t; ++c0) {
+            if (c0 == col) {
+#pragma unroll
+                for (int j = 0; j < d_conv - 1; ++j) {
+                    out[j] = x[c0 + j];
+                }
+            }
+        }
+    }
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
@@ -194,6 +256,24 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(bias->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(bias));
         GGML_ASSERT(ggml_nelements(bias) == nr);
+    }
+
+    // the chain ggml_cuda_try_ssm_conv_state_update matched: src0 (the CONCAT) was never written, the kernel builds it
+    if (const ggml_cuda_ssm_conv_state_update * u = ctx.ssm_conv_updates().find(dst)) {
+        constexpr int threads = 128;
+        GGML_ASSERT(!fuse_bias && nc == GGML_CUDA_SSM_CONV_UPDATE_D_CONV && n_s == 1 && nr % threads == 0 &&
+                    n_t <= GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T);
+        const ggml_cuda_kernel_launch_params launch_params(dim3(nr / threads), dim3(threads), 0, stream);
+        const int w_stride   = src1->nb[1] / sizeof(float);
+        const int dst_stride = out->nb[1] / sizeof(float);
+        if (fuse_silu) {
+            ggml_cuda_kernel_launch(ssm_conv_state_update_f32<true, GGML_CUDA_SSM_CONV_UPDATE_D_CONV, GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T>,
+                                    launch_params, *u, src1_d, w_stride, dst_d, dst_stride, (int) n_t);
+        } else {
+            ggml_cuda_kernel_launch(ssm_conv_state_update_f32<false, GGML_CUDA_SSM_CONV_UPDATE_D_CONV, GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T>,
+                                    launch_params, *u, src1_d, w_stride, dst_d, dst_stride, (int) n_t);
+        }
+        return;
     }
 
     if (fuse_silu) {
