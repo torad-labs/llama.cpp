@@ -21,6 +21,9 @@
 // int8, which go to the fragment's two k halves, and the token's 8 int8 are split the same way, so each MMA is exactly
 // one 32-weight chunk's integer dot for 16 rows x 8 columns, rescaled per chunk as vec_dot_pq2_0_q8_1 does (d2 * d8 * sumi).
 //
+// The pointers carry no __restrict__: with PDL a restrict load may compile to ld.global.nc, which the compiler can move
+// above the grid dependency wait (upstream #24030), and the tokens and the bias are written by the kernels before this one.
+//
 // Work: the (16*RG-row tile, box) iterations split evenly over all warps of a one-block-per-SM grid (stream-K). A warp
 // whose share covers a whole tile writes it; a tile shared by several warps is summed from their partials by the last to
 // arrive, in warp order, so the result does not depend on timing.
@@ -115,9 +118,8 @@ static __device__ __forceinline__ int64_t pq2_share_begin(int64_t w, int64_t T, 
 template <int nwarps, int nslots, int rg, bool evict_first, bool pre_sync_issue, bool has_bias>
 __launch_bounds__(nwarps*32, 1)
 static __global__ void mmvq_pq2_mma(
-        const __grid_constant__ CUtensorMap tmap, const block_q8_1 * GGML_CUDA_RESTRICT y,
-        const float * GGML_CUDA_RESTRICT x_bias, float * GGML_CUDA_RESTRICT dst, float * GGML_CUDA_RESTRICT ws,
-        int * GGML_CUDA_RESTRICT counters,
+        const __grid_constant__ CUtensorMap tmap, const block_q8_1 * y, const float * x_bias, float * dst, float * ws,
+        int * counters,
         const int nrows, const int ncols, const int nk, const int64_t total_iters,
         const int stride_col_y, const int stride_col_dst) {
 #ifdef PQ2_MMA_AVAILABLE
