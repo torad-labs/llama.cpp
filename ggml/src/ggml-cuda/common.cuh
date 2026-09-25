@@ -30,6 +30,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1486,6 +1487,89 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Fused recurrent-state gather for GATED_DELTA_NET (PrismML-Eng/llama.cpp#220, plus a q8_0 cache): build_rs
+// materialises GET_ROWS(cache, s_copy) into a temp that only the GDN kernel reads; the graph evaluator skips that
+// GET_ROWS (ggml_cuda_try_gdn_gather_skip) and records the gather here, so the kernel reads each sequence's state
+// row ids[seq] out of the cache itself.
+struct ggml_cuda_gated_delta_net_gather {
+    const void *    base       = nullptr; // cache rows, f32 or q8_0
+    const int32_t * ids        = nullptr; // per-seq row index
+    int64_t         row_stride = 0;       // between rows, in elements
+    bool            q8_0       = false;   // a q8_0 cache (-cts q8_0): the kernel dequantizes as it loads
+};
+
+// Owned by the backend context that evaluates the graph: registrations are keyed by node pointer, so they only mean
+// something for the evaluation that made them. Cleared at the start of every graph evaluation/capture.
+struct ggml_cuda_gdn_gather_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_gated_delta_net_gather> gathers;
+
+    void reset() {
+        gathers.clear();
+    }
+
+    void set(const ggml_tensor * gdn, const ggml_cuda_gated_delta_net_gather & gather) {
+        gathers[gdn] = gather;
+    }
+
+    const ggml_cuda_gated_delta_net_gather * find(const ggml_tensor * gdn) const {
+        const auto it = gathers.find(gdn);
+        return it == gathers.end() ? nullptr : &it->second;
+    }
+};
+
+// Fused conv-state update for the GDN's causal conv (build_conv_state): GET_ROWS(conv cache, s_copy) -> RESHAPE ->
+// CONCAT(state, transposed new inputs) -> the rollback snapshots' CPYs into the cache, and the SSM_CONV reading the
+// CONCAT. The graph evaluator skips the GET_ROWS, the CONCAT and the CPYs (ggml_cuda_try_ssm_conv_state_update) and
+// records the chain here under the SSM_CONV, whose kernel then reads the sequence's state row out of the cache and the
+// new inputs out of their projection, and writes the snapshots itself.
+#define GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS  8
+#define GGML_CUDA_SSM_CONV_UPDATE_D_CONV  4 // the kernel width it is built for (Qwen3-Next, Qwen3.5)
+#define GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T 8 // new tokens per step it holds in registers
+#define GGML_CUDA_SSM_CONV_UPDATE_THREADS 128 // channels per block, and so the head width the L2 fold takes
+
+struct ggml_cuda_ssm_conv_state_update {
+    const float *   cache      = nullptr; // conv cache rows, f32
+    const int32_t * ids        = nullptr; // the sequence's state row, ids[0]
+    int64_t         row_stride = 0;       // between cache rows, in floats
+    const float *   x          = nullptr; // the new tokens' inputs, [channels, n_t]
+    int64_t         x_stride   = 0;       // between tokens, in floats
+    int             n_snapshots = 0;
+    float *         snapshot_dst[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // a snapshot CPY's cache row
+    int             snapshot_col[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // the CONCAT column its window starts at
+    // the L2_NORM over the leading heads of the SILU output (Qwen3.5's joint q/k norm), folded in: 0 heads, not
+    float *         l2_dst   = nullptr; // [GGML_CUDA_SSM_CONV_UPDATE_THREADS, l2_heads, n_t], contiguous
+    int             l2_heads = 0;
+    float           l2_eps   = 0.0f;
+};
+
+// Registrations are keyed by node pointer, like ggml_cuda_gdn_gather_context, and cleared at the start of every graph
+// evaluation/capture.
+struct ggml_cuda_ssm_conv_update_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_ssm_conv_state_update> updates;  // by SSM_CONV
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *>             l2_norms; // SSM_CONV -> its L2_NORM
+    std::unordered_set<const ggml_tensor *>                                  skipped;  // the CONCATs, CPYs, L2_NORMs
+
+    void reset() {
+        updates.clear();
+        l2_norms.clear();
+        skipped.clear();
+    }
+
+    const ggml_cuda_ssm_conv_state_update * find(const ggml_tensor * conv) const {
+        const auto it = updates.find(conv);
+        return it == updates.end() ? nullptr : &it->second;
+    }
+
+    const ggml_tensor * l2_norm_of(const ggml_tensor * conv) const {
+        const auto it = l2_norms.find(conv);
+        return it == l2_norms.end() ? nullptr : it->second;
+    }
+
+    bool skips(const ggml_tensor * node) const {
+        return skipped.count(node) != 0;
+    }
+};
+
 // Names one ggml graph across computes, to find its CUDA graph. The first node's address alone names the memory a
 // graph is built in, and graphs of different shapes built there in turn (a speculative draft context's catch-up batch
 // and its one-row draft step) would share one CUDA graph, each finding the other's capture stale on every compute and
@@ -1589,6 +1673,8 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+    ggml_cuda_gdn_gather_context gdn_gather_context;
+    ggml_cuda_ssm_conv_update_context ssm_conv_update_context;
 
     ~ggml_backend_cuda_context();
 
@@ -1603,6 +1689,10 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
+
+    ggml_cuda_gdn_gather_context & gdn_gathers() { return gdn_gather_context; }
+
+    ggml_cuda_ssm_conv_update_context & ssm_conv_updates() { return ssm_conv_update_context; }
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
