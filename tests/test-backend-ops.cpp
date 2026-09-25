@@ -10905,6 +10905,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the same model at an MTP verify's width and around the fused-column limit (MMVQ_MAX_FUSED_NCOLS, 3): the FFN's
     // gate/up + GLU (fused at 1 column only), and a residual add (a bias with the output's shape) after the FFN down
     // (17408 -> 5120) and after a Gated DeltaNet layer's output projection (6144 -> 5120); 4-5 columns do not fuse
+    // PQ2_0 at an MTP verify's 2-8 columns on the tensor-core kernel (mmvq-pq2-mma.cu; 1 column is the mmvq control):
+    // Ternary Bonsai 2 27B's shapes (K 5120 / 6144 / 17408), rows that are not a multiple of 16, a matrix with fewer
+    // tiles than warps, and K 1024 / 2048 (one and two TMA boxes a row)
+    for (int64_t n : { 1, 2, 3, 4, 5, 8 }) {
+        for (const auto & mk : std::vector<std::array<int64_t, 2>>{
+                 {5120, 17408}, {17408, 5120}, {5120, 6144}, {1000, 5120}, {48, 5120}, {33, 1024}, {4096, 2048} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+
     for (ggml_type type : { GGML_TYPE_PQ2_0, GGML_TYPE_Q8_0 }) {
         for (int64_t m : { 1, 2, 3, 4, 5 }) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 17408, 5120,
