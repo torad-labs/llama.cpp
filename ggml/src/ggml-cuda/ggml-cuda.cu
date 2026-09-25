@@ -3500,6 +3500,33 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
+    std::initializer_list<enum ggml_op> rms_norm_mul_glu_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_GLU };
+
+    if (is_equal(rms_norm_mul_glu_ops, ops)) {
+        // Qwen3.5's gated norm: silu(gate) * (rms_norm(x) * w), w one row (ggml_cuda_op_rms_norm_mul_gate_fused)
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * glu      = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * x        = rms_norm->src[0];
+        const ggml_tensor * w        = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        const ggml_tensor * gate     = glu->src[0];
+        if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] != mul || gate == nullptr ||
+            (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+            return false;
+        }
+        if (x->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_are_same_shape(mul, rms_norm) || !ggml_are_same_shape(x, glu) || !ggml_are_same_shape(gate, glu) ||
+            !ggml_is_contiguous(glu) || x->nb[0] != sizeof(float) || gate->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(w) || ggml_nrows(w) != 1 || w->ne[0] != x->ne[0]) {
+            return false;
+        }
+        int out_nodes[] = { node_idx + 2 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+    }
+
     if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
@@ -4532,6 +4559,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
+    // GGML_CUDA_RMS_NORM_GATE_LEGACY=1: the gated norm's GLU runs on its own after the fused RMS_NORM -> MUL
+    static const bool rms_norm_gate_legacy = [] {
+        const char * s = getenv("GGML_CUDA_RMS_NORM_GATE_LEGACY");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    if (!rms_norm_gate_legacy && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_GLU }, {})) {
+        ggml_cuda_op_rms_norm_mul_gate_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
     }
 
