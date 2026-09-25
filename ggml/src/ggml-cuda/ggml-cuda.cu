@@ -4892,6 +4892,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // CONT of a view + the unary + MUL below (qwen35's attention gate, every other head's slice of the joint Q/gate
+    // projection): the fused unary + mul reads the view in place, so the copy is not made.
+    // GGML_CUDA_UNARY_MUL_VIEW_LEGACY=1 makes the copy first.
+    static const bool unary_mul_view_legacy = [] {
+        const char * env = getenv("GGML_CUDA_UNARY_MUL_VIEW_LEGACY");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!unary_mul_view_legacy && node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * unary = cgraph->nodes[i + 1];
+        ggml_tensor * mul   = cgraph->nodes[i + 2];
+        const ggml_op ops[]       = { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL };
+        const int     out_nodes[] = { i + 2 };
+        if (unary->op == GGML_OP_UNARY && unary->src[0] == node && mul->op == GGML_OP_MUL &&
+                (mul->src[0] == unary || mul->src[1] == unary) && ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 1) &&
+                ggml_cuda_op_unary_mul_view(*cuda_ctx, node->src[0], unary, mul)) {
+            return 2;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {

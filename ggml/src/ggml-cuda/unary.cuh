@@ -91,6 +91,11 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// The fused unary + mul with the unary's input the source of a CONT, a view read in place; false (nothing launched) when
+// the view's rows are not evenly spaced, the operands are not contiguous, or the output overlaps what it reads.
+bool ggml_cuda_op_unary_mul_view(ggml_backend_cuda_context & ctx, const ggml_tensor * view, ggml_tensor * unary_node,
+                                 ggml_tensor * mul_node);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {

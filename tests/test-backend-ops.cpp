@@ -3959,6 +3959,20 @@ struct test_unary_mul : public test_case {
         } else if (layout == "bcast") {
             a = ggml_new_tensor(ctx, type, 4, ne.data());
             b = ggml_new_tensor_4d(ctx, type, ne[0], 1, 1, 1);
+        } else if (layout == "gate" || layout == "gate_t") {
+            // qwen35's attention gate: every other ne[0]-wide slice of a joint tensor, copied 2D by a CONT that the
+            // fused kernel reads through ("gate_t": a transposed view, whose rows are not contiguous, must be copied)
+            std::array<int64_t, 4> ne_w = ne;
+            ne_w[0] *= 2;
+            ggml_tensor * base = ggml_new_tensor(ctx, type, 4, ne_w.data());
+            ggml_set_name(base, "base");
+            ggml_tensor * g = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3], base->nb[1], base->nb[2], base->nb[3],
+                                           ne[0] * base->nb[0]);
+            if (layout == "gate_t") {
+                g = ggml_transpose(ctx, ggml_view_2d(ctx, base, ne[0], ne[1], base->nb[1], 0));
+            }
+            a = ggml_cont_2d(ctx, g, g->ne[0] * g->ne[1], ggml_nelements(g) / (g->ne[0] * g->ne[1]));
+            b = ggml_new_tensor_2d(ctx, type, a->ne[0], a->ne[1]);
         } else {
             GGML_ABORT("unknown layout %s", layout.c_str());
         }
@@ -9406,6 +9420,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "strided_dim1"));
             test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "bcast"));
             test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "packed", "reuse"));
+            // the CONT of a view read in place by the fused kernel (the model's order is swap: MUL(attn, gate))
+            for (bool swap : { false, true }) {
+                test_cases.emplace_back(new test_unary_mul(op, type, { 256, 24, 1, 1 }, swap, "gate"));
+                test_cases.emplace_back(new test_unary_mul(op, type, { 256, 24, 3, 1 }, swap, "gate"));
+            }
+            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 16, 8, 2 }, true, "gate"));
+            test_cases.emplace_back(new test_unary_mul(op, type, { 5, 7, 11, 1 }, true, "gate"));
+            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 16, 1, 1 }, true, "gate", "consumer"));
+            // must be copied first
+            test_cases.emplace_back(new test_unary_mul(op, type, { 64, 12, 1, 1 }, true, "gate_t"));
         }
     }
 

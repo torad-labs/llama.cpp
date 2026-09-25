@@ -627,6 +627,59 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+// As the fused unary + mul, with the unary's input the source of a CONT (a view) read in place: rows of ne0 elements,
+// nb1 apart through dims 1-3, instead of the CONT's copy. The MUL's other operand is contiguous and is read at the
+// output's own index, so the output may be it; it must not overlap the view.
+template <float (*op)(float)>
+static bool ggml_cuda_op_unary_mul_view_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * view,
+                                             const ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    const ggml_tensor * other = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+    const size_t        es    = ggml_element_size(view);
+
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    const bool rows_even = view->nb[0] == es && view->nb[1] % es == 0 &&
+        view->nb[2] == view->nb[1]*view->ne[1] && view->nb[3] == view->nb[2]*view->ne[2];
+    if (!rows_even || (view->type != GGML_TYPE_F32 && view->type != GGML_TYPE_F16) ||
+            other->type != view->type || mul_node->type != view->type ||
+            !ggml_is_contiguous(other) || !ggml_is_contiguous(mul_node) || !ggml_are_same_shape(other, unary_node) ||
+            ggml_nelements(view) != ggml_nelements(mul_node) || overlap(mul_node, view) ||
+            (overlap(mul_node, other) && mul_node->data != other->data)) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t k  = ggml_nelements(mul_node);
+    const int64_t nc = view->ne[0];
+
+    if (view->type == GGML_TYPE_F16) {
+        unary_gated_cuda<op>((const half *) view->data, (const half *) other->data, (half *) mul_node->data, k, nc,
+                             view->nb[1] / es, nc, stream);
+    } else {
+        unary_gated_cuda<op>((const float *) view->data, (const float *) other->data, (float *) mul_node->data, k, nc,
+                             view->nb[1] / es, nc, stream);
+    }
+    return true;
+}
+
+bool ggml_cuda_op_unary_mul_view(ggml_backend_cuda_context & ctx, const ggml_tensor * view, ggml_tensor * unary_node,
+                                 ggml_tensor * mul_node) {
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SILU:
+            return ggml_cuda_op_unary_mul_view_impl<op_silu>(ctx, view, unary_node, mul_node);
+        case GGML_UNARY_OP_SIGMOID:
+            return ggml_cuda_op_unary_mul_view_impl<op_sigmoid>(ctx, view, unary_node, mul_node);
+        case GGML_UNARY_OP_SOFTPLUS:
+            return ggml_cuda_op_unary_mul_view_impl<op_softplus>(ctx, view, unary_node, mul_node);
+        default:
+            return false;
+    }
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
