@@ -2276,13 +2276,27 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+// A partial state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, what a context checkpoint stores) is what trimming a sequence's
+// cells cannot bring back: a sliding window's cells, reused as they fall out of the window. A cache without a window is
+// restored by seq_rm, as the hybrid and iswa memories restore their full-attention parts, so its partial state is empty.
+// LLAMA_KV_PARTIAL_STATE_LEGACY=1 writes and reads the whole sequence under the flag, as before.
+static bool llama_kv_cache_partial_state_empty(llama_state_seq_flags flags, llama_swa_type swa_type) {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_KV_PARTIAL_STATE_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return !legacy && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE;
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
 
-    GGML_UNUSED(flags);
+    if (llama_kv_cache_partial_state_empty(flags, swa_type)) {
+        return;
+    }
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -2352,7 +2366,9 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         return;
     }
 
-    GGML_UNUSED(flags);
+    if (llama_kv_cache_partial_state_empty(flags, swa_type)) {
+        return;
+    }
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
