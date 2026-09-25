@@ -25,6 +25,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int  * __restrict__ KV_live, // the live KV steps (flash_attn_mask_to_KV_live), read by the mma kernel only
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -837,6 +838,239 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_min[sequence*ne31 + jt] = 0;
 }
 
+// KV_live, the live KV steps of the mma kernel (nbatch_fa cells each) for n = Q tiles x sequences:
+// [0, n) live steps per (sequence, Q tile), at least 1 | [n] blocks done | [n+1, 2n+1) its first live step within its sequence |
+// [ne03] live steps per sequence | [ne03 + 1] a sequence's first unit of work (its steps times its output tiles per Q tile), then the total |
+// n*nwords words, a bit per step.
+static __host__ __device__ int fattn_kv_live_size(const int n, const int ne03, const int iter_k) {
+    return 2*n + 1 + 2*ne03 + 1 + n*((iter_k + 31)/32);
+}
+
+struct fattn_kv_live {
+    const int      * n_steps;
+    const int      * step0;
+    const int      * seq_steps;
+    const int      * seq_start;
+    const uint32_t * bits;
+    int iter_j;
+    int ne03;
+    int nwords;
+};
+
+static __device__ __forceinline__ fattn_kv_live fattn_kv_live_view(const int * KV_live, const int iter_j, const int ne03, const int iter_k) {
+    fattn_kv_live live = {};
+    if (KV_live) {
+        const int n = iter_j*ne03;
+        live.n_steps   = KV_live;
+        live.step0     = KV_live + n + 1;
+        live.seq_steps = live.step0 + n;
+        live.seq_start = live.seq_steps + ne03;
+        live.bits      = (const uint32_t *) (live.seq_start + ne03 + 1);
+        live.iter_j    = iter_j;
+        live.ne03      = ne03;
+        live.nwords    = (iter_k + 31)/32;
+    }
+    return live;
+}
+
+// The output tile of unit of work w in the live mode's stream-k order (the kernel's tile order, a tile being its live steps).
+struct fattn_kv_live_tile {
+    int sequence;
+    int zt; // z_KV*iter_z_gqa + zt_gqa
+    int jt;
+    int start;
+    int n;
+};
+
+static __device__ __forceinline__ fattn_kv_live_tile fattn_kv_live_find(const fattn_kv_live & live, const int w) {
+    fattn_kv_live_tile tile;
+    tile.sequence = 0;
+    while (tile.sequence + 1 < live.ne03 && live.seq_start[tile.sequence + 1] <= w) {
+        tile.sequence++;
+    }
+    const int r     = w - live.seq_start[tile.sequence];
+    const int steps = live.seq_steps[tile.sequence];
+    tile.zt         = r / steps;
+    const int r_seq = r - tile.zt*steps;
+
+    const int * step0 = live.step0 + tile.sequence*live.iter_j;
+    int lo = 0;
+    int hi = live.iter_j - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1)/2;
+        if (step0[mid] <= r_seq) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    tile.jt    = lo;
+    tile.start = w - (r_seq - step0[lo]);
+    tile.n     = live.n_steps[tile.sequence*live.iter_j + lo];
+    return tile;
+}
+
+// The step of the i-th live bit of bits[0, nwords), found by a whole warp.
+template <int warp_size>
+static __device__ __forceinline__ int fattn_kv_live_select(const uint32_t * bits, const int nwords, const int i) {
+    const int lane = threadIdx.x % warp_size;
+    int base = 0;
+    for (int w0 = 0; w0 < nwords; w0 += warp_size) {
+        const uint32_t word  = w0 + lane < nwords ? bits[w0 + lane] : 0u;
+        const int      incl  = warp_prefix_inclusive_sum<int, warp_size>(__popc(word));
+        const int      total = __shfl_sync(0xFFFFFFFF, incl, warp_size - 1, warp_size);
+        if (base + total > i) {
+            const int src = warp_reduce_sum<warp_size>(int(base + incl <= i)); // the lane whose word holds bit i
+            uint32_t  sel = __shfl_sync(0xFFFFFFFF, word, src, warp_size);
+            for (int k = i - base - (__shfl_sync(0xFFFFFFFF, incl, src, warp_size) - __popc(sel)); k > 0; --k) {
+                sel &= sel - 1;
+            }
+            return (w0 + src)*32 + __ffs(sel) - 1;
+        }
+        base += total;
+    }
+    return 0;
+}
+
+// The next live step after kb, which must exist.
+static __device__ __forceinline__ int fattn_kv_live_next(const uint32_t * bits, const int kb) {
+    int      w    = (kb + 1)/32;
+    uint32_t word = bits[w] & (0xFFFFFFFFu << ((kb + 1) % 32));
+    while (word == 0) {
+        word = bits[++w];
+    }
+    return w*32 + __ffs(word) - 1;
+}
+
+#define FATTN_KV_LIVE_THREADS 256
+
+// KV_live for the mma kernel: per (sequence, Q tile) a bit per nbatch_fa KV cells, set when a row of the tile has a live cell
+// there, and the sums its stream-k partition splits the live steps by, written by the last block to finish. n_steps and the
+// blocks-done count must be zero.
+template <int ncols1, bool packed, int nbatch_fa>
+__launch_bounds__(FATTN_KV_LIVE_THREADS, 1)
+static __global__ void flash_attn_mask_to_KV_live(
+        const void * mask_ptr, int * KV_live, const int iter_k, const int nrows, const int ne33, const int64_t s31, const int64_t s33,
+        const int ntiles_per_q_tile) {
+    const half2    * GGML_CUDA_RESTRICT mask  = (const half2    *) mask_ptr;
+    const uint16_t * GGML_CUDA_RESTRICT maskw = (const uint16_t *) mask_ptr;
+
+    const int iter_j   = gridDim.y;
+    const int ne03     = gridDim.z;
+    const int n        = iter_j*ne03;
+    const int nwords   = (iter_k + 31)/32;
+    const int jt       = blockIdx.y;
+    const int sequence = blockIdx.z;
+    const int tid      = threadIdx.x;
+    const int t        = blockIdx.x*FATTN_KV_LIVE_THREADS + tid; // the step this thread tests
+    const int ncols1_v = min(ncols1, nrows - jt*ncols1);
+
+    int      * n_steps   = KV_live;
+    int      * done      = KV_live + n;
+    int      * step0     = KV_live + n + 1;
+    int      * seq_steps = step0 + n;
+    int      * seq_start = seq_steps + ne03;
+    uint32_t * bits      = (uint32_t *) (seq_start + ne03 + 1);
+
+    mask  += (sequence % ne33)*s33 + jt*ncols1*s31;
+    maskw += (sequence % ne33)*s33 + jt*ncols1*s31;
+
+    __shared__ uint32_t words[FATTN_KV_LIVE_THREADS/32];
+    __shared__ int      warp_sums[FATTN_KV_LIVE_THREADS/WARP_SIZE];
+    __shared__ bool     last;
+    if (tid < FATTN_KV_LIVE_THREADS/32) {
+        words[tid] = 0;
+    }
+    ggml_cuda_pdl_sync();
+    __syncthreads();
+
+    bool live = false;
+    for (int j = 0; t < iter_k && j < ncols1_v && !live; ++j) {
+        if constexpr (packed) {
+            if constexpr (nbatch_fa == 32) {
+                live = *(const uint32_t *) (maskw + j*s31 + 2*t) != 0;
+            } else {
+                const uint2 v = *(const uint2 *) (maskw + j*s31 + 4*t);
+                live = (v.x | v.y) != 0;
+            }
+        } else {
+            const uint4 * m = (const uint4 *) (mask + j*s31 + t*(nbatch_fa/2));
+            uint32_t any = 0;
+#pragma unroll
+            for (int i = 0; i < nbatch_fa/8; ++i) {
+                const uint4 v = m[i];
+                any |= ((v.x & 0x7FFF7FFF) ^ 0x7C007C00) | ((v.y & 0x7FFF7FFF) ^ 0x7C007C00) |
+                       ((v.z & 0x7FFF7FFF) ^ 0x7C007C00) | ((v.w & 0x7FFF7FFF) ^ 0x7C007C00);
+            }
+            live = any != 0;
+        }
+    }
+    if (live) {
+        atomicOr(&words[tid/32], 1u << (tid % 32));
+    }
+    __syncthreads();
+
+    const int w = blockIdx.x*(FATTN_KV_LIVE_THREADS/32) + tid;
+    if (tid < FATTN_KV_LIVE_THREADS/32 && w < nwords) {
+        bits[(sequence*iter_j + jt)*nwords + w] = words[tid];
+        if (words[tid] != 0) {
+            atomicAdd(n_steps + sequence*iter_j + jt, __popc(words[tid]));
+        }
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        last = atomicAdd(done, 1) == int(gridDim.x*gridDim.y*gridDim.z) - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+
+    int total = 0;
+    for (int s = 0; s < ne03; ++s) {
+        int carry = 0;
+        for (int j0 = 0; j0 < iter_j; j0 += FATTN_KV_LIVE_THREADS) {
+            const int j = j0 + tid;
+            int v = 0;
+            if (j < iter_j) {
+                v = ((volatile int *) n_steps)[s*iter_j + j];
+                if (v == 0) { // no live cell: step 0 as a masked iteration, as KV_max = 0 gives
+                    v = 1;
+                    n_steps[s*iter_j + j] = 1;
+                    bits[(s*iter_j + j)*nwords] = 1;
+                }
+            }
+            const int incl = warp_prefix_inclusive_sum<int, WARP_SIZE>(v);
+            if (tid % WARP_SIZE == WARP_SIZE - 1) {
+                warp_sums[tid/WARP_SIZE] = incl;
+            }
+            __syncthreads();
+            int before = carry;
+            int chunk  = 0;
+            for (int k = 0; k < FATTN_KV_LIVE_THREADS/WARP_SIZE; ++k) {
+                before += k < tid/WARP_SIZE ? warp_sums[k] : 0;
+                chunk  += warp_sums[k];
+            }
+            if (j < iter_j) {
+                step0[s*iter_j + j] = before + incl - v;
+            }
+            __syncthreads();
+            carry += chunk;
+        }
+        if (tid == 0) {
+            seq_steps[s] = carry;
+            seq_start[s] = total;
+        }
+        total += carry*ntiles_per_q_tile;
+    }
+    if (tid == 0) {
+        seq_start[ne03] = total;
+    }
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1030,6 +1264,98 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
+// flash_attn_stream_k_fixup_general for the live mode: a block's range is of live steps (KV_live), its tiles found with fattn_kv_live_find.
+template <int D, int ncols1, int ncols2> // D == head size
+__launch_bounds__(D, 1)
+static __global__ void flash_attn_stream_k_fixup_live(
+        float * dst_ptr,
+        const float2 * dst_fixup_ptr,
+        const int * KV_live,
+        const int ne01, const int ne02, const int ne03,
+        const int gqa_ratio, const int iter_k, const int iter_j, const int iter_z_gqa) {
+    float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
+    const float2 * GGML_CUDA_RESTRICT dst_fixup = dst_fixup_ptr;
+    constexpr int ncols = ncols1*ncols2;
+
+    const int bidx0 = blockIdx.x;
+    const int j     = blockIdx.y;
+    const int c     = blockIdx.z;
+    const int jc    = j*ncols2 + c;
+    const int tid   = threadIdx.x;
+
+    const float * dst_fixup_data = ((const float *) dst_fixup) + gridDim.x*(2*2*ncols);
+
+    ggml_cuda_pdl_sync();
+    const fattn_kv_live live = fattn_kv_live_view(KV_live, iter_j, ne03, iter_k);
+    const int total_work = live.seq_start[ne03];
+
+    const int kbc0      = int64_t(bidx0 + 0)*total_work / gridDim.x;
+    const int kbc0_stop = int64_t(bidx0 + 1)*total_work / gridDim.x;
+    if (kbc0 == kbc0_stop) {
+        return; // did not have any data
+    }
+    const fattn_kv_live_tile tile = fattn_kv_live_find(live, kbc0);
+    if (kbc0 == tile.start || kbc0_stop < tile.start + tile.n) {
+        return; // wrote the beginning of the tile, or did not write its last part
+    }
+
+    const int z_KV   = tile.zt / iter_z_gqa;
+    const int zt_gqa = tile.zt - z_KV*iter_z_gqa;
+    const int zt_Q   = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
+
+    if (tile.jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+        return;
+    }
+
+    dst += tile.sequence*ne02*ne01*D + tile.jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+
+    float dst_val = *dst;
+    float max_val;
+    float rowsum;
+    {
+        const float2 tmp = dst_fixup[bidx0*ncols + jc];
+        max_val = tmp.x;
+        rowsum  = tmp.y;
+    }
+
+    // Combine with the previous blocks back to the one that started the tile.
+    int bidx     = bidx0 - 1;
+    int kbc_stop = kbc0;
+    while (true) {
+        const int kbc = int64_t(bidx)*total_work / gridDim.x;
+        if (kbc == kbc_stop) { // Did not have any data.
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
+
+        const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
+
+        const float2 tmp = dst_fixup[(gridDim.x + bidx)*ncols + jc];
+
+        const float max_val_new = fmaxf(max_val, tmp.x);
+
+        const float diff_val = max_val - max_val_new;
+        const float diff_add = tmp.x   - max_val_new;
+
+        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
+        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
+
+        dst_val = scale_val*dst_val + scale_add*dst_add;
+        rowsum  = scale_val*rowsum  + scale_add*tmp.y;
+
+        max_val = max_val_new;
+
+        if (kbc <= tile.start) {
+            break;
+        }
+        bidx--;
+        kbc_stop = kbc;
+    }
+
+    *dst = dst_val / rowsum;
+}
+
 template<int D> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
@@ -1091,7 +1417,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool kv_live_ok = false // the kernel reads KV_live
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1126,6 +1453,7 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<int>    KV_live(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1221,7 +1549,46 @@ void launch_fattn(
     }();
     const bool kv_range = !kv_range_legacy && mask && Q->ne[1] <= 16 && K->ne[1] >= 4096 &&
         (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0; // 16-byte mask reads
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_range)) {
+
+    // kv_live: the mma kernel reads only the KV steps a row of its Q tile sees, the masked tiles between them skipped too (with
+    //     --kv-unified the slots' turns interleave, so a slot's range spans the others' cells), and splits its blocks over those
+    //     steps alone. At any batch size, prefill included. GGML_CUDA_FATTN_LIVE_TILES_LEGACY=1: off.
+    static const bool kv_live_legacy = [] {
+        const char * v = getenv("GGML_CUDA_FATTN_LIVE_TILES_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    const bool kv_live = kv_live_ok && !kv_live_legacy && stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && mask && K->ne[1] >= 4096 &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0 && (nbatch_fa == 32 || nbatch_fa == 64) &&
+        (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0;
+    if (kv_live) {
+        const size_t  unit = mask_packed ? sizeof(uint16_t) : sizeof(half2);
+        const int64_t s31  = mask->nb[1] / unit;
+        const int64_t s33  = mask->nb[3] / unit;
+
+        const int iter_k = K->ne[1] / nbatch_fa;
+        const int n      = ntiles_x*Q->ne[3];
+        const int nrows  = mask->ne[1];
+        const int ne33   = mask->ne[3];
+
+        KV_live.alloc(fattn_kv_live_size(n, Q->ne[3], iter_k));
+        CUDA_CHECK(cudaMemsetAsync(KV_live.ptr, 0, (n + 1)*sizeof(int), main_stream)); // the step counts and the blocks done
+
+        const dim3 blocks_num_KV_live((iter_k + FATTN_KV_LIVE_THREADS - 1)/FATTN_KV_LIVE_THREADS, ntiles_x, Q->ne[3]);
+        const dim3 block_dim_KV_live(FATTN_KV_LIVE_THREADS, 1, 1);
+        const int  ntiles_per_q_tile = ntiles_z_gqa*K->ne[2];
+
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_live, block_dim_KV_live, 0, main_stream);
+        if (mask_packed && nbatch_fa == 32) {
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, true,  32>, launch_params, mask->data, KV_live.ptr, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
+        } else if (mask_packed) {
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, true,  64>, launch_params, mask->data, KV_live.ptr, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
+        } else if (nbatch_fa == 32) {
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, false, 32>, launch_params, mask->data, KV_live.ptr, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
+        } else {
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, false, 64>, launch_params, mask->data, KV_live.ptr, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    } else if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_range)) {
         const size_t  unit = mask_packed ? sizeof(uint16_t) : sizeof(half2);
         const int64_t s31 = mask->nb[1] / unit;
         const int64_t s33 = mask->nb[3] / unit;
@@ -1269,23 +1636,23 @@ void launch_fattn(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        if(use_stream_k) {
+        if(use_stream_k || kv_live) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
             // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
-            // Only do this if the occupancy loss from rounding is acceptable.
+            // Only do this if the occupancy loss from rounding is acceptable. Live tiles differ in their steps, so never then.
             const int nblocks_stream_k_rounded = (nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
             const int max_efficiency_loss_percent = 5;
             const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
                 ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
                 : 100;
-            const int nblocks_stream_k = efficiency_loss_percent <= max_efficiency_loss_percent
+            const int nblocks_stream_k = !kv_live && efficiency_loss_percent <= max_efficiency_loss_percent
                 ? nblocks_stream_k_rounded
                 : nblocks_stream_k_raw;
 
             blocks_num.x = nblocks_stream_k;
         }
 
-        if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
+        if (kv_live || ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
@@ -1355,6 +1722,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
+        KV_live.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
@@ -1367,7 +1735,15 @@ void launch_fattn(
     CUDA_CHECK(cudaGetLastError());
 
     if (stream_k) {
-        if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
+        if (kv_live) {
+            const dim3 block_dim_combine(DV, 1, 1);
+            const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
+
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_live<DV, ncols1, ncols2>, launch_params,
+                (float *) KQV->data, dst_tmp_meta.ptr, KV_live.ptr,
+                 Q->ne[1], Q->ne[2], Q->ne[3], gqa_ratio, K->ne[1] / nbatch_fa, ntiles_x, ntiles_z_gqa);
+        } else if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
             // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
             const int nblocks_sk  = (int)blocks_num.x;
             const int bpt         = nblocks_sk / ntiles_dst;
