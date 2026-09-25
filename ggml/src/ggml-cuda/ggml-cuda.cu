@@ -3245,6 +3245,20 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
     return false;
 }
 
+// Whether a node the evaluation reaches is folded into a later kernel and must not run: the recurrent-state gather its
+// GATED_DELTA_NET reads itself, the conv-state chain's GET_ROWS (registered for its SSM_CONV), and the CONCAT and snapshot
+// CPYs that chain skips. Asked for every node the graph loop reaches and for the nodes a fusion runs ahead of its own
+// launch (rms_norm + FWHT), so a fold is found wherever its first node runs.
+static bool ggml_cuda_node_is_folded(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
+        bool concurrent_event_active) {
+    const ggml_tensor * node = cgraph->nodes[node_idx];
+    if (node->op == GGML_OP_GET_ROWS && !concurrent_event_active &&
+            (ggml_cuda_try_gdn_gather_skip(ctx, cgraph, node_idx) || ggml_cuda_try_ssm_conv_state_update(ctx, cgraph, node_idx))) {
+        return true;
+    }
+    return ctx.ssm_conv_updates().skips(node);
+}
+
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 static int ggml_cuda_try_gdn_cache_fusion(
@@ -4715,10 +4729,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // rms_norm + weight multiply + Hadamard sign flip + reshape + FWHT-hint matmul in one launch at decode.
-    // The graph may order a few nodes that read none of these between the multiply and the sign flip: they run first.
-    // GGML_CUDA_NORM_FWHT_LEGACY=1 restores the separate launches.
+    // The graph may order a few nodes that read none of these between the multiply and the sign flip: they run first,
+    // through the folds the graph loop applies (on qwen35 they hold each Gated DeltaNet layer after the first's conv-state
+    // GET_ROWS, whose chain the SSM_CONV runs). GGML_CUDA_NORM_FWHT_LEGACY=1 restores the separate launches;
+    // GGML_CUDA_NORM_FWHT_FOLDS_LEGACY=1 runs the nodes in between as they are, without the folds.
     static const bool norm_fwht_legacy = [] {
         const char * env = getenv("GGML_CUDA_NORM_FWHT_LEGACY");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static const bool norm_fwht_folds_legacy = [] {
+        const char * env = getenv("GGML_CUDA_NORM_FWHT_FOLDS_LEGACY");
         return env != nullptr && std::atoi(env) != 0;
     }();
     if (!norm_fwht_legacy && node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes && cuda_ctx->curr_stream_no == 0 &&
@@ -4783,7 +4803,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ok) {
                 for (int k = i + 2; k < j; ++k) {
                     ggml_tensor * t = cgraph->nodes[k];
-                    if (!ggml_cuda_is_view_or_noop(t) && (t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                    if (!ggml_cuda_is_view_or_noop(t) && (t->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                            (norm_fwht_folds_legacy || !ggml_cuda_node_is_folded(*cuda_ctx, cgraph, k, false))) {
                         GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, t));
                     }
                 }
@@ -5097,19 +5118,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // the recurrent-state gather whose only reader is a GATED_DELTA_NET: its kernel reads the cache rows
-                if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active &&
-                        ggml_cuda_try_gdn_gather_skip(*cuda_ctx, cgraph, i)) {
-                    continue;
-                }
-
-                // the conv-state chain: its GET_ROWS here, its CONCAT and snapshot CPYs as they come; the SSM_CONV
-                // runs all of it
-                if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active &&
-                        ggml_cuda_try_ssm_conv_state_update(*cuda_ctx, cgraph, i)) {
-                    continue;
-                }
-                if (cuda_ctx->ssm_conv_updates().skips(node)) {
+                // the recurrent-state gather whose only reader is a GATED_DELTA_NET (its kernel reads the cache rows), and
+                // the conv-state chain: its GET_ROWS here, its CONCAT and snapshot CPYs as they come; the SSM_CONV runs all of it
+                if (ggml_cuda_node_is_folded(*cuda_ctx, cgraph, i, is_concurrent_event_active)) {
                     continue;
                 }
 
