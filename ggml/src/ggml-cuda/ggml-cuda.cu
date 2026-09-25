@@ -2814,14 +2814,21 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+static bool ggml_cuda_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
 // GET_ROWS(cache, ids) -> [RESHAPE] -> GATED_DELTA_NET src[5], build_rs's recurrent-state gather: skip the GET_ROWS and
 // register the gather for the GDN node, whose kernel then reads each sequence's cache row ids[seq] itself (f32, or q8_0
 // dequantized as it loads) instead of the temp, which the allocator still reserved. One sequence only: with several, a
 // sequence's source row can be another's destination (a copied sequence), which the GET_ROWS read before any write and
 // the kernel's blocks would race on; with one, the block that reads a region is the only one that writes it, after.
 // Declined when anything else reads the temp, when a node between the two writes the cache (build_rs's extra-states
-// copy relocates rows there; the GET_ROWS read them before it, the kernel would read after), and when the GDN takes
-// the chunked prefill path (its pipeline reads a gathered s0). From PrismML-Eng/llama.cpp#220 (f32), plus a q8_0
+// copy relocates rows there; the GET_ROWS read them before it, the kernel would read after), when a node up to the GDN
+// was allocated over ids (freed after the GET_ROWS if it was their last reader), and when the GDN takes the chunked
+// prefill path (its pipeline reads a gathered s0). From PrismML-Eng/llama.cpp#220 (f32), plus a q8_0
 // cache (-cts q8_0), the one the served head runs. GGML_CUDA_GDN_STATE_GATHER_LEGACY=1 keeps the GET_ROWS.
 static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     static const bool legacy = [] {
@@ -2851,6 +2858,11 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
     const ggml_tensor * cur = gr;
     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
+        // the kernel reads ids at the GDN, and the GET_ROWS it skips may have been ids' last reader (the last recurrent
+        // layer's), after which the allocator hands ids' memory on: nothing up to and including the GDN may be on it
+        if (!ggml_cuda_is_view_or_noop(n) && ggml_cuda_ranges_overlap(n, ids)) {
+            return false;
+        }
         if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == cur) {
             const ggml_tensor * v = n->src[2];
             const int64_t       D = v->ne[0] * v->ne[0] * v->ne[1];
