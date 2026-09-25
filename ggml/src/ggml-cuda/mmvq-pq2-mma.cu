@@ -32,11 +32,11 @@
 static_assert(sizeof(block_pq2_0) == 34, "PQ2_0 block layout");
 static_assert(PQ2_MMA_ROW_BYTES % 16 == 0, "a box row must be a whole number of 16-byte TMA units");
 
-static constexpr int pq2_mma_slot_bytes(int rg) {
+static constexpr __host__ __device__ int pq2_mma_slot_bytes(int rg) {
     return 16 * rg * PQ2_MMA_ROW_BYTES;
 }
 
-static constexpr int pq2_mma_slot_stride(int rg) {
+static constexpr __host__ __device__ int pq2_mma_slot_stride(int rg) {
     return (pq2_mma_slot_bytes(rg) + 127) / 128 * 128; // TMA destinations are 128-byte aligned
 }
 
