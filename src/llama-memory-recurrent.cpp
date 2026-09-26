@@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_reach.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -160,6 +161,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_reach.begin(), rs_reach.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -200,12 +202,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // partial rollback via per-token snapshot index (bounded by the snapshots the last batch wrote)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) rs_reach[seq_id]) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -292,6 +294,9 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+        // the destination rolls back only into a batch of its own: the source's snapshots count from the batch end,
+        // and a rollback the source has pending already moved the cell back
+        rs_reach[seq_id_dst] = 0;
     }
 }
 
@@ -876,6 +881,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
     }
+
+    // a restored state comes without the snapshots of the batch that reached it
+    if (seq_id < 0) {
+        std::fill(rs_reach.begin(), rs_reach.end(), 0);
+    } else {
+        rs_reach[seq_id] = 0;
+    }
 }
 
 void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
@@ -1238,8 +1250,14 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    const llama_ubatch & ubatch = ubatches[i_next];
+
+    mem->find_slot(ubatch);
     mem->zero_rs_z();
+
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        mem->rs_reach[ubatch.seq_id_unq[s]] = std::min(mem->n_rs_seq, ubatch.n_seq_tokens - 1);
+    }
 
     return true;
 }
