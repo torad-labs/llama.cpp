@@ -372,8 +372,12 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
-    // the sampler chain is attached to the context and the decode draws this slot's tokens on the backend
+    // the sampler chain, or smpl_top_k, is attached to the context and the decode draws this slot's tokens, or takes each
+    // row's top k, on the backend
     bool backend_sampler = false;
+
+    // the chain's top-k alone, taken on the backend for the chain drawing on the CPU (see launch_slot_with_task)
+    llama_sampler_ptr smpl_top_k;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -428,6 +432,7 @@ struct server_slot {
 
         llama_set_sampler(ctx_tgt, id, nullptr);
         backend_sampler = false;
+        smpl_top_k.reset();
 
         // clear alora start
         alora_invocation_start = -1;
@@ -442,6 +447,7 @@ struct server_slot {
         if (backend_sampler && !common_sampler_backend_passive(smpl.get())) {
             llama_set_sampler(ctx_tgt, id, nullptr);
             backend_sampler = false;
+            smpl_top_k.reset();
             SLT_INF(*this, "%s", "grammar or reasoning budget constrains the next token, sampling on the CPU\n");
         }
     }
@@ -1930,6 +1936,21 @@ private:
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
                 slot.backend_sampler = false;
+            }
+            slot.smpl_top_k.reset(); // attached to no sequence after the calls above
+
+            // a chain drawing on the CPU from a row's k largest logits (common_sampler_backend_top_k) has the backend take
+            // them in the graph: a decode copies k logits a row instead of n_vocab and the CPU scans none, while the same
+            // chain and RNG draw, so each token is the one the CPU's top k gives. Not with a reader of every logit (the
+            // pre-sampling probabilities, the pull detector, the lens), and taken off as the chain is when a grammar or a
+            // reasoning budget starts to constrain (release_backend_sampler_if_constrained)
+            const int32_t top_k   = common_sampler_backend_top_k(slot.smpl.get());
+            const bool    lens_on = !params_base.lens_out.empty() && llama_n_lens_layers(ctx_tgt) > 0;
+            if (!slot.backend_sampler && top_k > 0 && !need_pre_sample_logits && pull_k.empty() && !lens_on &&
+                    common_sampler_backend_passive(slot.smpl.get())) {
+                slot.smpl_top_k.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                llama_sampler_chain_add(slot.smpl_top_k.get(), llama_sampler_init_top_k(top_k));
+                slot.backend_sampler = llama_set_sampler(ctx_tgt, slot.id, slot.smpl_top_k.get());
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());

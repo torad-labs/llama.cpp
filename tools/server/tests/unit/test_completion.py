@@ -628,6 +628,45 @@ def test_backend_sampling_until_constrained(constraint, expected):
     assert expected in on["content"]
     assert on["tokens"] == off["tokens"]
 
+@pytest.mark.parametrize("temperature,constraint,expected", [
+    # every one of the k candidates keeps a probability (no top-p or min-p cut), so one missing or out of place changes
+    # the draws or the probabilities
+    (1.0, {"top_p": 1.0, "min_p": 0.0}, None),
+    # a lazy grammar that triggers mid-generation, and a reasoning budget that runs out and forces its end
+    (0.0, {"grammar": 'root ::= "girl named Zo" [a-z]* "."', "grammar_lazy": True,
+           "grammar_triggers": [{"type": 1, "value": "girl named"}]}, "girl named Zo"),
+    (0.0, {"reasoning_budget_tokens": 3, "reasoning_budget_start_tag": "there", "reasoning_budget_end_tag": "end",
+           "reasoning_budget_message": "Zoo"}, "Zoo end"),
+])
+def test_top_k_prefilter(monkeypatch, temperature, constraint, expected):
+    """The chain's top-k taken on the backend: the CPU chain draws the tokens and gives the probabilities it does from the
+    top k it takes itself (LLAMA_TOP_K_PREFILTER_LEGACY=1), and reads every logit once a grammar or budget constrains."""
+    global server
+    bodies = []
+    for legacy in ("0", "1"):
+        monkeypatch.setenv("LLAMA_TOP_K_PREFILTER_LEGACY", legacy)
+        server = ServerPreset.tinyllama2()
+        server.start()
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "Once upon a time",
+            "n_predict": 40,
+            "temperature": temperature,
+            "seed": 42,
+            "n_probs": 5,
+            "post_sampling_probs": True,
+            "return_tokens": True,
+            **constraint,
+        })
+        server.stop()
+        assert res.status_code == 200
+        bodies.append(res.body)
+
+    if expected is not None:
+        assert expected in bodies[0]["content"]
+    assert len(bodies[0]["tokens"]) >= 8
+    assert bodies[0]["tokens"] == bodies[1]["tokens"]
+    assert bodies[0]["completion_probabilities"] == bodies[1]["completion_probabilities"]
+
 @pytest.mark.parametrize("tokenize,openai_style", [(False, False), (False, True), (True, False), (True, True)])
 def test_logit_bias(tokenize, openai_style):
     global server

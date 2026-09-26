@@ -106,6 +106,10 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 // one awaiting its trigger or held off while reasoning; a budget not forcing), so a backend-sampled token is valid
 bool common_sampler_backend_passive(const struct common_sampler * gsmpl);
 
+// k when the chain reads only the k largest logits of a row (its top-k picks first, no sampler before it changing a
+// logit), so a backend may take them in the graph for the CPU chain while the sampler is passive; 0 when it reads all
+int32_t common_sampler_backend_top_k(const struct common_sampler * gsmpl);
+
 // helpers
 
 // access the internal list of current candidate tokens
