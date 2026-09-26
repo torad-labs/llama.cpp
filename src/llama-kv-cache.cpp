@@ -2670,6 +2670,24 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         return false;
     }
 
+    // cells scattered among other sequences' cells (a shared pool) are written a run at a time: the state holds its rows
+    // in the order of their cells, so the rows of cells that follow each other in the cache are one copy [cell, n_cells),
+    // instead of one copy per cell (at 200K cells, 17 layers: 6.8M copies, tens of seconds)
+    static const bool per_cell = [] {
+        const char * v = getenv("LLAMA_KV_RESTORE_PER_CELL_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    if (!sinfo.is_contiguous()) {
+        for (const uint32_t idx : sinfo.idxs[0]) {
+            if (!per_cell && !runs.empty() && idx == runs.back().first + runs.back().second) {
+                runs.back().second++;
+            } else {
+                runs.emplace_back(idx, 1);
+            }
+        }
+    }
+
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
@@ -2701,10 +2719,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 // Fast path: contiguous cells, single memcpy
                 io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
             } else {
-                // Slow path: scatter to non-contiguous positions
-                for (uint32_t i = 0; i < cell_count; ++i) {
-                    const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
-                    io.read_tensor(k, dst_offset, k_size_row);
+                // Slow path: scatter to non-contiguous positions, a run of cells at a time
+                for (const auto & [c0, n] : runs) {
+                    io.read_tensor(k, c0 * k_size_row, n * k_size_row);
                 }
             }
         }
@@ -2744,10 +2761,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                     // Fast path: contiguous cells, single memcpy
                     io.read_tensor(v, sinfo.head() * v_size_row, cell_count * v_size_row);
                 } else {
-                    // Slow path: scatter to non-contiguous positions
-                    for (uint32_t i = 0; i < cell_count; ++i) {
-                        const size_t dst_offset = sinfo.idxs[0][i] * v_size_row;
-                        io.read_tensor(v, dst_offset, v_size_row);
+                    // Slow path: scatter to non-contiguous positions, a run of cells at a time
+                    for (const auto & [c0, n] : runs) {
+                        io.read_tensor(v, c0 * v_size_row, n * v_size_row);
                     }
                 }
             }
@@ -2799,11 +2815,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                         io.read_tensor(v, dst_offset, cell_count * v_size_el);
                     }
                 } else {
-                    // Slow path: scatter to non-contiguous positions
+                    // Slow path: scatter to non-contiguous positions, a run of cells at a time
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        for (uint32_t i = 0; i < cell_count; ++i) {
-                            const size_t dst_offset = (sinfo.idxs[0][i] + j * cells.size()) * v_size_el;
-                            io.read_tensor(v, dst_offset, v_size_el);
+                        for (const auto & [c0, n] : runs) {
+                            io.read_tensor(v, (c0 + j * cells.size()) * v_size_el, n * v_size_el);
                         }
                     }
                 }
