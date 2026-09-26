@@ -848,6 +848,9 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     try {
         res = res && state_read_data(io, cell_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        res = false;
     } catch (...) {
         res = false;
     }
