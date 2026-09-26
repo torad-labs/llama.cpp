@@ -162,10 +162,6 @@ static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & 
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
-// generate an F16 mask where certain blocks are randomly masked with -INF value
-// f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
-// block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
-// draws no block) has masked cells and a wrong bit order fails.
 // PQ2_0 blocks written directly: every 2-bit code (3, the +2 that the reference quantizer never emits from absmax-scaled
 // data, included) and a scale per block log-uniform over [d_min, d_max], two decades by default. Uniform data quantized
 // gives every block d ~ 0.99 and no code 3, so a kernel that drops or misplaces a block's scale, or decodes +2 wrong,
@@ -189,6 +185,10 @@ static void init_tensor_pq2_raw(ggml_tensor * tensor, float d_min = 0.01f, float
     ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
 }
 
+// generate an F16 mask where certain blocks are randomly masked with -INF value
+// f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
+// block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
+// draws no block) has masked cells and a wrong bit order fails.
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_I16);
     const bool bits = tensor->type == GGML_TYPE_I16;
