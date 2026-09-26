@@ -2766,6 +2766,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_MINIMAX_01 || arch == LLM_ARCH_GLM5NEXT) {
+                        // the draft runs only the NextN block, so it gets a cache for that one layer. the trunk's
+                        // cache would let the KDA layers take cells it can never roll back (n_rs_seq = 0), and a
+                        // rejected draft then fails seq_rm
                         const bool mtp_ctx = arch == LLM_ARCH_GLM5NEXT &&
                             params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                             hparams.n_layer_all > hparams.n_layer();
@@ -2779,6 +2782,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return !mtp_ctx && il < hparams.n_layer() && hparams.is_recr(il);
                         };
                         if (arch == LLM_ARCH_GLM5NEXT && hparams.indexer_head_size > 0) {
+                            // unified is fine, the pool map is per SEQUENCE. see [TAG_KPOOL_SEQ_PARTITION]
                             filter_idx = [&, mtp_ctx](uint32_t il) {
                                 if (mtp_ctx) {
                                     return il >= hparams.n_layer() && il < hparams.n_layer_all;
@@ -2795,6 +2799,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                        // llama_memory_hybrid_iswa has no indexer cache, so SWA would silently lose it
                         GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(

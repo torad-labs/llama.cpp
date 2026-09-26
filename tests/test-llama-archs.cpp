@@ -224,6 +224,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
         }
     } else if (arch == LLM_ARCH_GLM5NEXT) {
+        // nope-only MLA: the cache holds the bare latent, so n_rot must be an explicit 0
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(512));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(0));
@@ -285,10 +286,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
     } else if (arch == LLM_ARCH_GLM5NEXT) {
-        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4)); // build_hc_pre asserts exactly 4 streams
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1.0e-6f);
+        // the only arch that pools indexer keys; top_k must be a whole number of pools and the
+        // selection width must stay under n_ctx or the sparse path goes unused
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,              uint32_t(4));
+        // glm5next reads these unconditionally; the if (moe) block below never sets them
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                 1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
     }

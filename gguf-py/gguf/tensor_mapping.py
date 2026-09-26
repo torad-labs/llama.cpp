@@ -2709,6 +2709,8 @@ class TensorNameMap:
             ),
         },
         MODEL_ARCH.GLM5NEXT: {
+            # the converter appends the .weight the checkpoint omits, so these
+            # match through the usual try_suffixes path
             MODEL_TENSOR.HC_ATTN_FN: (
                 "model.layers.{bid}.hc_attn_fn",
             ),

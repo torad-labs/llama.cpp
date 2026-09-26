@@ -1664,7 +1664,7 @@ mtmd_image_preprocessor_glm5next::geometry mtmd_image_preprocessor_glm5next::get
     return geo;
 }
 
-mtmd_image_preproc_out mtmd_image_preprocessor_glm5next::preprocess(const clip_image_u8 & img) const {
+mtmd_image_preproc_out mtmd_image_preprocessor_glm5next::preprocess(const clip_image_u8 & img) {
     const geometry geo = get_geometry(hparams, img.get_size());
 
     clip_image_u8 content;
