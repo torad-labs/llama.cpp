@@ -4362,6 +4362,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-rollback"}, "N",
+        "with a draft model on a recurrent target: the longest draft rolled back in place, from one state snapshot per slot "
+        "per token; a longer one (an n-gram's copy past --spec-draft-n-max) is verified through a host checkpoint and "
+        "replayed on rejection (default: --spec-draft-n-max)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 256) {
+                throw std::invalid_argument("--spec-rollback must be between 0 and 256 inclusive");
+            }
+            params.speculative.n_rollback = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",

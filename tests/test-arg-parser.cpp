@@ -197,6 +197,26 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
 
+    // the recurrent rollback covers the draft model's drafts, and an n-gram's longer copy when asked to
+    {
+        common_params spec_params;
+        argv = {"binary_name", "--spec-type", "ngram-mod,draft-mtp", "--spec-draft-n-max", "3", "--spec-ngram-mod-n-max", "15"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_params, LLAMA_EXAMPLE_SERVER));
+        assert(spec_params.speculative.need_n_rs_seq() == 3);
+
+        argv = {"binary_name", "--spec-type", "ngram-mod,draft-mtp", "--spec-draft-n-max", "3", "--spec-rollback", "15"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_params, LLAMA_EXAMPLE_SERVER));
+        assert(spec_params.speculative.need_n_rs_seq() == 15);
+
+        common_params ngram_only;
+        argv = {"binary_name", "--spec-type", "ngram-mod", "--spec-rollback", "15"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ngram_only, LLAMA_EXAMPLE_SERVER));
+        assert(ngram_only.speculative.need_n_rs_seq() == 0); // no draft model: nothing rolls back in place
+
+        argv = {"binary_name", "--spec-rollback", "257"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
