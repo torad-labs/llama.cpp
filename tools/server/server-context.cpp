@@ -4132,8 +4132,17 @@ private:
                             is_last_user_message || near_prompt_end || is_requested ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
 
-                    // none where one already is: the first batch after a resume starts at the checkpoint it resumed from
-                    do_checkpoint = do_checkpoint && (checkpoint_dedup_legacy() || !has_checkpoint_at(n_tokens_start));
+                    // none where one already is (the first batch after a resume starts at the checkpoint it resumed from): the task
+                    // takes that one as its own, as it would a new one there, so the min-step thinning keeps it for the next tasks
+                    if (do_checkpoint && !checkpoint_dedup_legacy()) {
+                        for (auto & cur : slot.prompt.checkpoints) {
+                            if (cur.n_tokens == n_tokens_start) {
+                                cur.id_task   = slot.task->id;
+                                do_checkpoint = false;
+                                break;
+                            }
+                        }
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
