@@ -2524,6 +2524,9 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+            res = false;
         } catch (...) {
             res = false;
         }
