@@ -114,7 +114,8 @@ def test_backend_sampling_lazy_grammar_mid_draft():
 @pytest.mark.parametrize("post_sampling", [False, True])
 def test_draft_token_probs(post_sampling: bool):
     # The model drafts for itself, so after the first token every token comes out of a verification: each carries the
-    # probabilities plain decoding gives it
+    # probabilities plain decoding gives it. The two runs may round differently and sample apart at temperature 0.2 (at
+    # the 15th token with the default threads of a 128-CPU host, not with 8), so the tokens are compared until they part
     global server
     request = {
         "prompt": "I believe the meaning of life is",
@@ -146,8 +147,10 @@ def test_draft_token_probs(post_sampling: bool):
 
     key, top = ("prob", "top_probs") if post_sampling else ("logprob", "top_logprobs")
     probs_plain, probs_drafted = plain["completion_probabilities"], drafted["completion_probabilities"]
-    assert [t["id"] for t in probs_drafted] == [t["id"] for t in probs_plain]
-    for a, b in zip(probs_drafted, probs_plain):
+    n = next((i for i, (a, b) in enumerate(zip(probs_drafted, probs_plain)) if a["id"] != b["id"]),
+             min(len(probs_drafted), len(probs_plain)))
+    assert n >= 4
+    for a, b in zip(probs_drafted[:n], probs_plain[:n]):
         assert a[key] == pytest.approx(b[key], abs=1e-2)
         assert len(a[top]) == len(b[top]) > 0
 
