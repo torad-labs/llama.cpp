@@ -364,10 +364,7 @@ llama_kv_cache::llama_kv_cache(
 
     // the rotations never change: they are set once in a buffer of the first layer's type instead of being built as
     // inputs that every graph uploads again; a cache sharing another's cells takes that cache's
-    static const bool attn_rot_input_legacy = [] {
-        const char * v = getenv("LLAMA_ATTN_ROT_INPUT_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool attn_rot_input_legacy = ggml_env_switch("LLAMA_ATTN_ROT_INPUT_LEGACY");
 
     if (other) {
         attn_rot_k_t = other->attn_rot_k_t;
@@ -460,10 +457,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         // a speculative rollback removes the few cells placed last, just below the head: up to 1024 cells are found
         // walking backward from it, stopping at the last one, instead of scanning every cell of the cache
-        static const bool scan_all = [] {
-            const char * v = getenv("LLAMA_KV_SEQ_RM_SCAN_LEGACY");
-            return v != nullptr && atoi(v) != 0;
-        }();
+        static const bool scan_all = ggml_env_switch("LLAMA_KV_SEQ_RM_SCAN_LEGACY");
         uint32_t n_rm = scan_all ? UINT32_MAX : cells.seq_pos_count(seq_id, p0, p1, 1024);
 
         if (n_rm <= 1024) {
@@ -2173,15 +2167,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_start = ggml_time_us();
 
-    static const bool scan_cells = [] {
-        const char * v = getenv("LLAMA_KQ_MASK_SCAN_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool scan_cells = ggml_env_switch("LLAMA_KQ_MASK_SCAN_LEGACY");
 
-    static const bool seq_bits = [] {
-        const char * v = getenv("LLAMA_KQ_MASK_SEQ_BITS_LEGACY");
-        return v == nullptr || atoi(v) == 0;
-    }();
+    static const bool seq_bits = !ggml_env_switch("LLAMA_KQ_MASK_SEQ_BITS_LEGACY");
 
     llama_kv_cache_set_input_kq_mask(dst, ubatch, causal_attn, hparams, v_cells, seq_to_stream, n_swa, swa_type, scan_cells, seq_bits);
 
@@ -2409,10 +2397,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 // restored by seq_rm, as the hybrid and iswa memories restore their full-attention parts, so its partial state is empty.
 // LLAMA_KV_PARTIAL_STATE_LEGACY=1 writes and reads the whole sequence under the flag, as before.
 static bool llama_kv_cache_partial_state_empty(llama_state_seq_flags flags, llama_swa_type swa_type) {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_KV_PARTIAL_STATE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_KV_PARTIAL_STATE_LEGACY");
     return !legacy && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE;
 }
 
@@ -2821,10 +2806,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     // cells scattered among other sequences' cells (a shared pool) are written a run at a time: the state holds its rows
     // in the order of their cells, so the rows of cells that follow each other in the cache are one copy [cell, n_cells),
     // instead of one copy per cell (at 200K cells, 17 layers: 6.8M copies, tens of seconds)
-    static const bool per_cell = [] {
-        const char * v = getenv("LLAMA_KV_RESTORE_PER_CELL_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool per_cell = ggml_env_switch("LLAMA_KV_RESTORE_PER_CELL_LEGACY");
     std::vector<std::pair<uint32_t, uint32_t>> runs;
     if (!sinfo.is_contiguous()) {
         for (const uint32_t idx : sinfo.idxs[0]) {

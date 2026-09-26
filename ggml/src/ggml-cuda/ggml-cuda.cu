@@ -1815,10 +1815,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
     // A MUL_MAT fuses its bias or residual add up to MMVQ_MAX_FUSED_NCOLS columns, the kernel reading one per column at
     // dst's column stride (ggml_cuda_mmvq_fusion_operand_ok), so an MTP verify of 2-3 rows fuses its residual adds as
     // decode does. GGML_CUDA_MMVQ_FUSION_MULTICOL_LEGACY=1 fuses one column only.
-    static const bool multicol_legacy = [] {
-        const char * e = getenv("GGML_CUDA_MMVQ_FUSION_MULTICOL_LEGACY");
-        return e != nullptr && atoi(e) != 0;
-    }();
+    static const bool multicol_legacy = ggml_env_switch("GGML_CUDA_MMVQ_FUSION_MULTICOL_LEGACY");
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > (multicol_legacy || with_gate ? 1 : MMVQ_MAX_FUSED_NCOLS)) {
         return false;
     }
@@ -1856,10 +1853,9 @@ static bool ggml_cuda_pq2_mma_fuses(ggml_backend_cuda_context & ctx, const ggml_
 // does GGML_CUDA_GRAPH_OPT=1, whose concurrent streams give q, k and v a stream each.
 static bool ggml_cuda_pq2_mma_group_enabled() {
     static const bool enabled = [] {
-        const char * legacy    = getenv("GGML_CUDA_PQ2_MMA_GROUP_LEGACY");
         const char * no_fusion = getenv("GGML_CUDA_DISABLE_FUSION");
         const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
-        return !(legacy != nullptr && atoi(legacy) != 0) && !(no_fusion != nullptr && atoi(no_fusion) != 0) &&
+        return !ggml_env_switch("GGML_CUDA_PQ2_MMA_GROUP_LEGACY") && !(no_fusion != nullptr && atoi(no_fusion) != 0) &&
             !(graph_opt != nullptr && atoi(graph_opt) == 1);
     }();
     return enabled;
@@ -1985,10 +1981,7 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_ten
 // GGML_CUDA_MMVF_UNTILED_LEGACY=1 restores cuBLAS here too. The kernel must be able to read both operands
 // (ggml_cuda_mmvf_supports: types, strides and data addresses).
 static bool ggml_cuda_should_use_mmvf_untiled(const ggml_tensor * src0, const ggml_tensor * src1, int64_t ne11) {
-    static const bool legacy = [] {
-        const char * e = getenv("GGML_CUDA_MMVF_UNTILED_LEGACY");
-        return e != nullptr && atoi(e) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("GGML_CUDA_MMVF_UNTILED_LEGACY");
     return !legacy && ne11 <= MMVF_MAX_BATCH_SIZE && src0->ne[1]*ne11 <= 512
         && ggml_cuda_mmvf_supports(src0, src1);
 }
@@ -2792,7 +2785,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
 static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // GGML_CUDA_GRAPH_KEY_LEGACY=1: the first node's address alone, one CUDA graph for every shape built there
-    static const bool legacy = getenv("GGML_CUDA_GRAPH_KEY_LEGACY") != nullptr;
+    static const bool legacy = ggml_env_switch("GGML_CUDA_GRAPH_KEY_LEGACY");
 
     ggml_cuda_graph_key key;
     key.first_node = cgraph->nodes[0];
@@ -2992,10 +2985,7 @@ static bool ggml_cuda_ranges_overlap(const ggml_tensor * a, const ggml_tensor * 
 // prefill path (its pipeline reads a gathered s0). From PrismML-Eng/llama.cpp#220 (f32), plus a q8_0
 // cache (-cts q8_0), the one the served head runs. GGML_CUDA_GDN_STATE_GATHER_LEGACY=1 keeps the GET_ROWS.
 static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
-    static const bool legacy = [] {
-        const char * e = getenv("GGML_CUDA_GDN_STATE_GATHER_LEGACY");
-        return e != nullptr && atoi(e) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("GGML_CUDA_GDN_STATE_GATHER_LEGACY");
     if (legacy) {
         return false;
     }
@@ -3068,10 +3058,7 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
 // sequence only, for the reason ggml_cuda_try_gdn_gather_skip gives. GGML_CUDA_SSM_CONV_STATE_UPDATE_LEGACY=1 keeps
 // the chain.
 static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
-    static const bool legacy = [] {
-        const char * e = getenv("GGML_CUDA_SSM_CONV_STATE_UPDATE_LEGACY");
-        return e != nullptr && atoi(e) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("GGML_CUDA_SSM_CONV_STATE_UPDATE_LEGACY");
     if (legacy || !ctx.stream_context().concurrent_events.empty()) {
         return false;
     }
@@ -3325,10 +3312,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
     // 32-lane warp, a head width that is a multiple of 32, the scalar gate, and the recurrent kernel (the
     // chunked prefill pipeline writes f32; its cpy stays)
     // GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate cpy.
-    static const bool q8_legacy = [] {
-        const char * e = getenv("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
-        return e != nullptr && atoi(e) != 0;
-    }();
+    static const bool q8_legacy = ggml_env_switch("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
     if (q8 && (q8_legacy || S_v % QK8_0 != 0 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != QK8_0 ||
                gdn->src[3]->ne[0] == S_v || ggml_cuda_should_use_chunked_gdn(gdn))) {
         return 0;
@@ -3501,10 +3485,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 // writes dst, so its src1 stays checked (the dispatch tries it first; it takes only float src0, mul_mat_vec_q only
 // quantized). GGML_CUDA_MMVQ_FUSION_SRC1_LEGACY=1 checks src1 for mul_mat_vec_q too.
 static const ggml_tensor * ggml_cuda_mmvq_staged_src1(const ggml_tensor * mm) {
-    static const bool legacy = [] {
-        const char * e = getenv("GGML_CUDA_MMVQ_FUSION_SRC1_LEGACY");
-        return e != nullptr && atoi(e) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("GGML_CUDA_MMVQ_FUSION_SRC1_LEGACY");
     // no gate: a gate only adds constraints to mul_mat_vec_f, so without one this errs toward keeping src1 checked. A PQ2_0
     // matmul at 1-8 columns that mul_mat_vec_q does not fuse can only fuse into the tensor-core kernel
     // (ggml_cuda_pq2_mma_fuses), which reads src1 through the same q8_1 copy.
@@ -4108,10 +4089,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // CONT of a view + reshape + the sign flip, reshape and FWHT-hint matmul below (the grouped head order qwen35's Gated
     // DeltaNet output takes for ssm_out): the transform reads its input through the view, so the copy is not made.
     // GGML_CUDA_FWHT_VIEW_LEGACY=1 makes the copy first.
-    static const bool fwht_view_legacy = [] {
-        const char * env = getenv("GGML_CUDA_FWHT_VIEW_LEGACY");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
+    static const bool fwht_view_legacy = ggml_env_switch("GGML_CUDA_FWHT_VIEW_LEGACY");
     if (!fwht_view_legacy && ggml_can_fuse_subgraph(cgraph, i,
             { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 4 })) {
         const ggml_tensor * cont  = cgraph->nodes[i];
@@ -4761,14 +4739,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // through the folds the graph loop applies (on qwen35 they hold each Gated DeltaNet layer after the first's conv-state
     // GET_ROWS, whose chain the SSM_CONV runs). GGML_CUDA_NORM_FWHT_LEGACY=1 restores the separate launches;
     // GGML_CUDA_NORM_FWHT_FOLDS_LEGACY=1 runs the nodes in between as they are, without the folds.
-    static const bool norm_fwht_legacy = [] {
-        const char * env = getenv("GGML_CUDA_NORM_FWHT_LEGACY");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
-    static const bool norm_fwht_folds_legacy = [] {
-        const char * env = getenv("GGML_CUDA_NORM_FWHT_FOLDS_LEGACY");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
+    static const bool norm_fwht_legacy = ggml_env_switch("GGML_CUDA_NORM_FWHT_LEGACY");
+    static const bool norm_fwht_folds_legacy = ggml_env_switch("GGML_CUDA_NORM_FWHT_FOLDS_LEGACY");
     if (!norm_fwht_legacy && node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes && cuda_ctx->curr_stream_no == 0 &&
             cuda_ctx->stream_context().concurrent_events.empty()) {
         ggml_tensor * mul_w = cgraph->nodes[i + 1];
@@ -4850,10 +4822,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // Two MUL_MATs of one src1 by float weights of one shape, up to 4 views between them, that ggml_cuda_mul_mat runs on
     // mul_mat_vec_f one after the other (qwen35's ssm_beta and ssm_alpha at decode and verify): one launch runs both.
     // GGML_CUDA_MMVF_PAIR_LEGACY=1 launches them one by one.
-    static const bool mmvf_pair_legacy = [] {
-        const char * env = getenv("GGML_CUDA_MMVF_PAIR_LEGACY");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
+    static const bool mmvf_pair_legacy = ggml_env_switch("GGML_CUDA_MMVF_PAIR_LEGACY");
     if (!mmvf_pair_legacy && node->op == GGML_OP_MUL_MAT && cuda_ctx->curr_stream_no == 0 &&
             cuda_ctx->stream_context().concurrent_events.empty()) {
         int j = i + 1;
@@ -4896,10 +4865,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // GGML_CUDA_RMS_NORM_GATE_LEGACY=1: the gated norm's GLU runs on its own after the fused RMS_NORM -> MUL
-    static const bool rms_norm_gate_legacy = [] {
-        const char * s = getenv("GGML_CUDA_RMS_NORM_GATE_LEGACY");
-        return s != nullptr && atoi(s) != 0;
-    }();
+    static const bool rms_norm_gate_legacy = ggml_env_switch("GGML_CUDA_RMS_NORM_GATE_LEGACY");
     if (!rms_norm_gate_legacy && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_GLU }, {})) {
         ggml_cuda_op_rms_norm_mul_gate_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -4923,10 +4889,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // CONT of a view + the unary + MUL below (qwen35's attention gate, every other head's slice of the joint Q/gate
     // projection): the fused unary + mul reads the view in place, so the copy is not made.
     // GGML_CUDA_UNARY_MUL_VIEW_LEGACY=1 makes the copy first.
-    static const bool unary_mul_view_legacy = [] {
-        const char * env = getenv("GGML_CUDA_UNARY_MUL_VIEW_LEGACY");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
+    static const bool unary_mul_view_legacy = ggml_env_switch("GGML_CUDA_UNARY_MUL_VIEW_LEGACY");
     if (!unary_mul_view_legacy && node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes) {
         ggml_tensor * unary = cgraph->nodes[i + 1];
         ggml_tensor * mul   = cgraph->nodes[i + 2];
@@ -4994,10 +4957,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     // counted at the first read, so an evaluation that never reaches the GB10 shared Q8 path (another GPU, a replayed CUDA graph) does not build the map
     // GGML_CUDA_GB10_Q8_COUNT_LEGACY=1: counted on every evaluation, as before
-    static const bool gb10_q8_count_legacy = [] {
-        const char * env = getenv("GGML_CUDA_GB10_Q8_COUNT_LEGACY");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
+    static const bool gb10_q8_count_legacy = ggml_env_switch("GGML_CUDA_GB10_Q8_COUNT_LEGACY");
     std::map<const ggml_tensor *, std::array<int, GGML_TYPE_COUNT>> gb10_shared_q8_consumer_counts;
     bool gb10_shared_q8_counted = false;
     const auto gb10_shared_q8_count = [&]() {

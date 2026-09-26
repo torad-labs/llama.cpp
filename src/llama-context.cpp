@@ -1373,18 +1373,12 @@ void llama_context::set_warmup(bool value) {
 
 // LLAMA_SAMPLER_DETACH_RESERVE_LEGACY=1: a sampler leaving the graph re-reserves the scheduler, as attaching one does
 static bool sampler_detach_reserve_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLER_DETACH_RESERVE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLER_DETACH_RESERVE_LEGACY");
     return legacy;
 }
 
 static bool sampler_attach_reserve_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLER_ATTACH_RESERVE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLER_ATTACH_RESERVE_LEGACY");
     return legacy;
 }
 

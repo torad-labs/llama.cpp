@@ -34,10 +34,7 @@
 // LLAMA_MTP_PENDING_H_LEGACY=1: the MTP head pairs a batch's first token with the last h row it kept whatever position
 // that row was at, so a new prompt's first row took the previous request's last h (the behaviour before pending_pos)
 static bool mtp_pending_h_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_MTP_PENDING_H_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_MTP_PENDING_H_LEGACY");
     return legacy;
 }
 

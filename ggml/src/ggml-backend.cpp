@@ -1606,10 +1606,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 // GGML_SCHED_ASYNC_INPUTS_LEGACY=1: every input is copied after its split's backend has finished all its work (the
 // behaviour before the staging slots)
 static bool ggml_backend_sched_async_inputs_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("GGML_SCHED_ASYNC_INPUTS_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("GGML_SCHED_ASYNC_INPUTS_LEGACY");
     return legacy;
 }
 

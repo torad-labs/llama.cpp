@@ -312,8 +312,7 @@ static void common_unbind_gpu_node() {
 void common_bind_to_gpu_node(const common_params & params) {
 #if defined(__linux__) && !defined(__ANDROID__)
     // LLAMA_GPU_NODE_BIND_LEGACY=1 leaves the placement to the scheduler
-    const char * legacy = getenv("LLAMA_GPU_NODE_BIND_LEGACY");
-    if ((legacy && atoi(legacy) != 0) || params.n_gpu_layers == 0 || params.numa != GGML_NUMA_STRATEGY_DISABLED || params.cpuparams.mask_valid) {
+    if (ggml_env_switch("LLAMA_GPU_NODE_BIND_LEGACY") || params.n_gpu_layers == 0 || params.numa != GGML_NUMA_STRATEGY_DISABLED || params.cpuparams.mask_valid) {
         return;
     }
     std::vector<ggml_backend_dev_t> devs;

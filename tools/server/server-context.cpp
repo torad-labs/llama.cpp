@@ -203,40 +203,28 @@ struct server_batch {
 // LLAMA_SAMPLER_REPLAY_LEGACY=1: a slot's sampler is initialised by accepting every text token of the prompt, not only
 // the last common_sampler_n_history of them
 static bool sampler_replay_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLER_REPLAY_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLER_REPLAY_LEGACY");
     return legacy;
 }
 
 // LLAMA_CHECKPOINT_DEDUP_LEGACY=1: a context checkpoint is also created where one already is (the first batch after a
 // resume starts at the checkpoint it resumed from), copying the same state again
 static bool checkpoint_dedup_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_CHECKPOINT_DEDUP_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_CHECKPOINT_DEDUP_LEGACY");
     return legacy;
 }
 
 // LLAMA_CHECKPOINT_SPARE_LEGACY=1: a dropped context checkpoint's buffers are freed, and each new checkpoint allocates
 // its own (the behaviour before the slot kept a spare)
 static bool checkpoint_spare_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_CHECKPOINT_SPARE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_CHECKPOINT_SPARE_LEGACY");
     return legacy;
 }
 
 // LLAMA_SPEC_PROMPT_COPY_LEGACY=1: every draft round copies the prompt's text tokens for the drafters, even when the
 // slot's list is text only
 static bool spec_prompt_copy_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SPEC_PROMPT_COPY_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SPEC_PROMPT_COPY_LEGACY");
     return legacy;
 }
 

@@ -8158,6 +8158,43 @@ void ggml_log_set(ggml_log_callback log_callback, void * user_data) {
     g_logger_state.log_callback_user_data = user_data;
 }
 
+// the value is the word, in any case
+static bool ggml_env_value_is(const char * value, const char * word) {
+    for (; *value != '\0' && *word != '\0'; ++value, ++word) {
+        const char c = *value >= 'A' && *value <= 'Z' ? (char) (*value - 'A' + 'a') : *value;
+        if (c != *word) {
+            return false;
+        }
+    }
+    return *value == '\0' && *word == '\0';
+}
+
+bool ggml_env_switch(const char * name) {
+    const char * value = getenv(name);
+    if (value == NULL) {
+        return false;
+    }
+    static const char * const off[] = { "", "0", "false", "no", "off" };
+    static const char * const on[]  = { "1", "true", "yes", "on" };
+    for (size_t i = 0; i < sizeof(off)/sizeof(off[0]); ++i) {
+        if (ggml_env_value_is(value, off[i])) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < sizeof(on)/sizeof(on[0]); ++i) {
+        if (ggml_env_value_is(value, on[i])) {
+            return true;
+        }
+    }
+    char * end = NULL;
+    const long number = strtol(value, &end, 10);
+    if (end != value && *end == '\0') {
+        return number != 0;
+    }
+    GGML_LOG_WARN("%s=%s is none of 1/0, true/false, yes/no, on/off: taken as on\n", name, value);
+    return true;
+}
+
 void ggml_threadpool_params_init(struct ggml_threadpool_params * p, int n_threads) {
     p->n_threads  = n_threads;
     p->prio       = 0;     // default priority (usually means normal or inherited)

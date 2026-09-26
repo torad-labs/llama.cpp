@@ -284,6 +284,20 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "overwritten.gguf");
     assert(params.cpuparams.n_threads == 1010);
+
+    printf("test-arg-parser: test the values of an off switch (ggml_env_switch, every *_LEGACY variable)\n\n");
+
+    unsetenv("LLAMA_TEST_SWITCH_LEGACY");
+    assert(!ggml_env_switch("LLAMA_TEST_SWITCH_LEGACY"));
+    for (const char * off : { "", "0", "00", "false", "No", "OFF" }) {
+        setenv("LLAMA_TEST_SWITCH_LEGACY", off, true);
+        assert(!ggml_env_switch("LLAMA_TEST_SWITCH_LEGACY"));
+    }
+    for (const char * on : { "1", "2", "-1", "true", "YES", "On", "enable" }) { // "enable" with a warning
+        setenv("LLAMA_TEST_SWITCH_LEGACY", on, true);
+        assert(ggml_env_switch("LLAMA_TEST_SWITCH_LEGACY"));
+    }
+    unsetenv("LLAMA_TEST_SWITCH_LEGACY");
 #endif // _WIN32
 
     printf("test-arg-parser: test download functions\n\n");

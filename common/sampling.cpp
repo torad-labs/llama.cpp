@@ -113,10 +113,7 @@ struct ring_buffer {
 // LLAMA_TOP_K_PREFILTER_LEGACY=1: a chain drawing on the CPU reads every logit of a row, with no top-k taken on the
 // backend (the behaviour before common_sampler_backend_top_k), and a backend's candidates stay in the order it gave
 static bool top_k_prefilter_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_TOP_K_PREFILTER_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_TOP_K_PREFILTER_LEGACY");
     return legacy;
 }
 
@@ -263,20 +260,14 @@ std::string common_params_sampling::print() const {
 // LLAMA_SAMPLING_BACKEND_PASSIVE_LEGACY=1: backend sampling is off for any request with a grammar or a reasoning
 // budget, passive or not (the behaviour before common_sampler_backend_passive)
 static bool backend_passive_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLING_BACKEND_PASSIVE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLING_BACKEND_PASSIVE_LEGACY");
     return legacy;
 }
 
 // LLAMA_SAMPLING_TOP_K_FIRST_LEGACY=1: the chain always starts from every token's logit (the behaviour before
 // sampler_top_k_first)
 static bool top_k_first_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLING_TOP_K_FIRST_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLING_TOP_K_FIRST_LEGACY");
     return legacy;
 }
 
