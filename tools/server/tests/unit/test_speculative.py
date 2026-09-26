@@ -240,3 +240,17 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
     for res in results:
         assert res.status_code == 200
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+
+def test_mtp_vocab_without_draft_mtp_is_refused(tmp_path):
+    # the draft-mtp options are read only when the MTP head drafts: without --spec-type draft-mtp no draft context
+    # is built and the file would never be opened, so the server refuses them at load instead of serving without them
+    global server
+    server.model_draft = None
+    server.spec_type = None
+    vocab = tmp_path / "vocab.i32"
+    vocab.write_bytes(b"\x00\x00\x00\x00")
+    server.spec_draft_mtp_vocab = str(vocab)
+    with pytest.raises(RuntimeError, match="Server process died"):
+        server.start()
+

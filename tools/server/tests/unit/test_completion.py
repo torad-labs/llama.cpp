@@ -628,6 +628,40 @@ def test_backend_sampling_until_constrained(constraint, expected):
     assert expected in on["content"]
     assert on["tokens"] == off["tokens"]
 
+def test_backend_sampling_off_names_the_constraint(tmp_path):
+    """A slot that starts on the CPU because a constraint is active from its first token says which one: here the
+    budget, forcing from the start, while the lazy grammar beside it still waits for its trigger."""
+    global server
+    server.backend_sampling = True
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Once upon a time",
+        "n_predict": 4,
+        "temperature": 0.0,
+        "grammar": 'root ::= "girl named Zo" [a-z]* "."', "grammar_lazy": True,
+        "grammar_triggers": [{"type": 1, "value": "girl named"}],
+        "generation_prompt": " there",  # the start tag already in the prompt: the budget of 0 forces from the first token
+        "reasoning_budget_tokens": 0, "reasoning_budget_start_tag": "there", "reasoning_budget_end_tag": "end",
+        "reasoning_budget_message": "Zoo",
+    })
+    assert res.status_code == 200
+    log = (tmp_path / "server.log").read_text()
+    assert "backend sampling is not compatible with this reasoning budget" in log
+    assert "backend sampling is not compatible with this grammar" not in log
+
+@pytest.mark.parametrize("backend_sampling", [True, False])
+def test_backend_sampling_with_pull_detector_is_named_at_load(tmp_path, backend_sampling):
+    """The pull detector reads the served logits before the sampler, so no slot samples on the backend while it runs:
+    -bs given with it is said once at load, not left to look like it was taken."""
+    global server
+    server.backend_sampling = backend_sampling
+    server.pull_layers = "2"
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    log = (tmp_path / "server.log").read_text()
+    assert ("backend sampling (-bs) is off while the pull detector runs" in log) == backend_sampling
+
 @pytest.mark.parametrize("temperature,constraint,expected", [
     # every one of the k candidates keeps a probability (no top-p or min-p cut), so one missing or out of place changes
     # the draws or the probabilities

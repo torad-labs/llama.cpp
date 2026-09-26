@@ -1124,6 +1124,16 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
+        // the MTP head's options are read only where it drafts: without draft-mtp no draft context is built and the
+        // server would serve as if they had been taken (a vocabulary file never opened, a window never applied)
+        const auto & draft_opts = params_base.speculative.draft;
+        if (!spec_mtp && (!draft_opts.mtp_vocab.empty() || draft_opts.mtp_swa > 0 || draft_opts.mtp_decode_only ||
+                          draft_opts.mtp_window != common_params_speculative_draft{}.mtp_window)) {
+            SRV_ERR("%s", "--spec-draft-mtp-vocab, --spec-draft-mtp-swa, --spec-draft-mtp-decode-only and "
+                          "--spec-draft-mtp-window need the MTP head drafting (--spec-type draft-mtp)\n");
+            return false;
+        }
+
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {
@@ -1250,6 +1260,10 @@ private:
                 }
                 SRV_INF("training-pull detector on %zu layers, fires at p >= %.2f on a content token the prompt never states, action %s\n",
                         pull_k.size(), (double) params_base.pull_p, params_base.pull_action.c_str());
+                if (params_base.sampling.backend_sampling) {
+                    SRV_WRN("%s", "backend sampling (-bs) is off while the pull detector runs: it reads, and may edit, "
+                                  "the served logits before the sampler, so every slot samples on the CPU\n");
+                }
             }
             if (params_base.lens_out.empty()) {
                 SRV_WRN("%s", "--lens-layers without --lens-out: the lens is computed and never written\n");

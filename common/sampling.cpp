@@ -551,7 +551,9 @@ struct common_sampler * common_sampler_init(
     // the server takes the slot off the backend when either turns active. A sampler that constrains from the first
     // token (a grammar that is not lazy, llguidance, a budget that starts forcing) keeps the CPU path throughout.
     if (params.backend_sampling && (backend_passive_legacy() ? (grmr || rbudget) : !common_sampler_backend_passive(result))) {
-        LOG_WRN("%s: backend sampling is not compatible with %s, disabling\n", __func__, grmr ? "this grammar" : "this reasoning budget");
+        // a forcing budget holds the grammar off, so it is the budget that constrains even beside a grammar
+        const bool forcing = rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING;
+        LOG_WRN("%s: backend sampling is not compatible with %s, disabling\n", __func__, grmr && !forcing ? "this grammar" : "this reasoning budget");
 
         params.backend_sampling         = false;
         result->params.backend_sampling = false;

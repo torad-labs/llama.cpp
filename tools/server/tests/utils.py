@@ -99,6 +99,7 @@ class ServerProcess:
     spec_type: str | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
+    spec_draft_mtp_vocab: str | None = None
     no_ui: bool | None = None
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
@@ -115,6 +116,7 @@ class ServerProcess:
     log_path: str | None = None
     ui_mcp_proxy: bool = False
     backend_sampling: bool = False
+    pull_layers: str | None = None  # also the lens layers, with --lens-channels, which the detector reads
     gcp_compat: bool = False
     server_tools: str | None = None
     server_tools_runtime: str | None = None
@@ -243,6 +245,8 @@ class ServerProcess:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:
             server_args.extend(["--spec-draft-n-max", self.spec_draft_n_max])
+        if self.spec_draft_mtp_vocab:
+            server_args.extend(["--spec-draft-mtp-vocab", self.spec_draft_mtp_vocab])
         if self.spec_draft_n_min:
             server_args.extend(["--spec-draft-n-min", self.spec_draft_n_min])
         if self.no_ui:
@@ -285,6 +289,8 @@ class ServerProcess:
             server_args.extend(["--mcp-servers-json", self.mcp_servers_json])
         if self.backend_sampling:
             server_args.append("--backend_sampling")
+        if self.pull_layers:
+            server_args.extend(["--lens-layers", self.pull_layers, "--lens-channels", "--pull-layers", self.pull_layers])
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
 
