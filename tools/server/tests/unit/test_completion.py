@@ -570,6 +570,32 @@ def test_n_probs_post_backend_sampling():
         for (aa, bb) in zip(a["top_probs"], b["top_probs"]):
             verify_token(aa, bb)
 
+def test_attn_rot_resident_matches_input(monkeypatch):
+    """With a quantized KV cache (head size 256: K and V rotated, base and SWA caches), the rotations set once in the
+    cache's buffer give the tokens and probabilities of the rotations built as graph inputs."""
+    global server
+    bodies = []
+    for legacy in ("0", "1"):
+        monkeypatch.setenv("LLAMA_ATTN_ROT_INPUT_LEGACY", legacy)
+        server = ServerPreset.tinygemma3()
+        server.ctk = "q8_0"
+        server.ctv = "q8_0"
+        server.fa = "on"
+        server.start()
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "The quick brown fox jumps over the lazy dog.",
+            "n_probs": 5,
+            "temperature": 0.0,
+            "n_predict": 8,
+        })
+        server.stop()
+        assert res.status_code == 200
+        bodies.append(res.body)
+
+    assert len(bodies[0]["completion_probabilities"]) == 8
+    assert bodies[0]["content"] == bodies[1]["content"]
+    assert bodies[0]["completion_probabilities"] == bodies[1]["completion_probabilities"]
+
 @pytest.mark.parametrize("constraint,expected", [
     # a lazy grammar that triggers mid-generation ("girl named" is generated at tokens 5-8)
     ({"grammar": 'root ::= "girl named Zo" [a-z]* "."', "grammar_lazy": True,

@@ -275,6 +275,14 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // the rotations as tensors in the buffer type of the first layer, set once, or null when they are graph inputs
+    // env: LLAMA_ATTN_ROT_INPUT_LEGACY
+    ggml_tensor * attn_rot_k_t = nullptr;
+    ggml_tensor * attn_rot_v_t = nullptr;
+
+    ggml_context_ptr        attn_rot_ctx;
+    ggml_backend_buffer_ptr attn_rot_buf;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
@@ -319,6 +327,10 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    // the side of the K and V rotations
+    int attn_rot_k_n() const;
+    int attn_rot_v_n() const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,

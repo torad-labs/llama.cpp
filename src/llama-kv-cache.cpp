@@ -343,7 +343,6 @@ llama_kv_cache::llama_kv_cache(
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
     // pre-compute the haramard matrices and keep them in host memory
-    // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
     if (attn_rot_k || attn_rot_v) {
         for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
             attn_rot_hadamard[n] = std::vector<float>(n*n);
@@ -360,6 +359,62 @@ llama_kv_cache::llama_kv_cache(
             tmp->data = attn_rot_hadamard[n].data();
 
             ggml_gen_hadamard(tmp);
+        }
+    }
+
+    // the rotations never change: they are set once in a buffer of the first layer's type instead of being built as
+    // inputs that every graph uploads again; a cache sharing another's cells takes that cache's
+    static const bool attn_rot_input_legacy = [] {
+        const char * v = getenv("LLAMA_ATTN_ROT_INPUT_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+
+    if (other) {
+        attn_rot_k_t = other->attn_rot_k_t;
+        attn_rot_v_t = other->attn_rot_v_t;
+    } else if ((attn_rot_k || attn_rot_v) && !layers.empty() && !attn_rot_input_legacy) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+
+        attn_rot_ctx.reset(ggml_init(params));
+        if (!attn_rot_ctx) {
+            throw std::runtime_error("failed to create ggml context for kv cache rotations");
+        }
+
+        if (attn_rot_k) {
+            attn_rot_k_t = ggml_new_tensor_2d(attn_rot_ctx.get(), GGML_TYPE_F32, attn_rot_k_n(), attn_rot_k_n());
+            ggml_set_name(attn_rot_k_t, "attn_rot_k");
+        }
+
+        if (attn_rot_v) {
+            attn_rot_v_t = ggml_new_tensor_2d(attn_rot_ctx.get(), GGML_TYPE_F32, attn_rot_v_n(), attn_rot_v_n());
+            ggml_set_name(attn_rot_v_t, "attn_rot_v");
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layers[0].k->buffer);
+
+        if (hparams.no_alloc) {
+            attn_rot_buf.reset(ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0)); // dummy buffer, as for K and V
+            for (ggml_tensor * t = ggml_get_first_tensor(attn_rot_ctx.get()); t != nullptr; t = ggml_get_next_tensor(attn_rot_ctx.get(), t)) {
+                t->buffer = attn_rot_buf.get();
+            }
+        } else {
+            attn_rot_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(attn_rot_ctx.get(), buft));
+        }
+
+        if (!attn_rot_buf) {
+            throw std::runtime_error("failed to allocate buffer for kv cache rotations");
+        }
+
+        if (!hparams.no_alloc) {
+            for (ggml_tensor * t : { attn_rot_k_t, attn_rot_v_t }) {
+                if (t) {
+                    ggml_backend_tensor_set(t, attn_rot_hadamard.at(t->ne[0]).data(), 0, ggml_nbytes(t));
+                }
+            }
         }
     }
 
@@ -720,6 +775,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
             ret[buft] += ggml_backend_buffer_get_size(buf.get());
         }
+    }
+
+    if (attn_rot_buf) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(attn_rot_buf.get());
+
+        ret[buft] += hparams.no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(attn_rot_ctx.get(), buft) : ggml_backend_buffer_get_size(attn_rot_buf.get());
     }
 
     return ret;
@@ -1639,18 +1700,40 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
+int llama_kv_cache::attn_rot_k_n() const {
+    int nrot = 64;
+
+    // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+    // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+    do {
+        nrot *= 2;
+    } while (n_embd_head_k_all % nrot == 0);
+    nrot /= 2;
+
+    return nrot;
+}
+
+int llama_kv_cache::attn_rot_v_n() const {
+    int nrot = 64;
+    // using smaller rotation matrices for V seems beneficial
+    // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
+    //do {
+    //    nrot *= 2;
+    //} while (hparams.n_embd_head_v() % nrot == 0);
+    //nrot /= 2;
+
+    return nrot;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+    if (attn_rot_k_t) {
+        return attn_rot_k_t;
+    }
+
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        int nrot = 64;
-
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
+        const int nrot = attn_rot_k_n();
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -1661,16 +1744,14 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 }
 
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
+    if (attn_rot_v_t) {
+        return attn_rot_v_t;
+    }
+
     ggml_tensor * res = nullptr;
 
     if (attn_rot_v) {
-        int nrot = 64;
-        // using smaller rotation matrices for V seems beneficial
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
-        //do {
-        //    nrot *= 2;
-        //} while (hparams.n_embd_head_v() % nrot == 0);
-        //nrot /= 2;
+        const int nrot = attn_rot_v_n();
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -2135,6 +2216,11 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    // the cache's own tensor was set when the cache was made
+    if (dst == attn_rot_k_t) {
+        return;
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -2144,6 +2230,11 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    // the cache's own tensor was set when the cache was made
+    if (dst == attn_rot_v_t) {
+        return;
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
