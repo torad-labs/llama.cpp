@@ -8077,10 +8077,11 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const bool mask_bits; // bit-packed mask (GGML_TYPE_I16, 16 cells per element) instead of f16
     const int mask_band; // 0: random mask; else every row sees only a band of the cells, see kq_mask_band
+    const bool mask_prefix; // ggml_flash_attn_ext_set_mask_prefix: a hint only, the result must not depend on it
 
     std::string vars() override {
         return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k)
-            + "," + VAR_TO_STR(mask_bits) + (mask_band ? "," + VAR_TO_STR(mask_band) : "");
+            + "," + VAR_TO_STR(mask_bits) + (mask_band ? "," + VAR_TO_STR(mask_band) : "") + (mask_prefix ? "," + VAR_TO_STR(mask_prefix) : "");
     }
 
     double max_nmse_err() override {
@@ -8097,9 +8098,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, bool mask_bits = false, int mask_band = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, bool mask_bits = false, int mask_band = 0, bool mask_prefix = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_bits(mask_bits), mask_band(mask_band) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_bits(mask_bits), mask_band(mask_band),
+          mask_prefix(mask_prefix) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8161,6 +8163,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
+        ggml_flash_attn_ext_set_mask_prefix(out, mask_prefix);
         ggml_set_name(out, "out");
 
         return out;
@@ -11247,6 +11250,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, 5));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 8192,  75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, 5));
 
+    // the mask-prefix hint on masks that are no prefix (random, banded): a backend may skip its mask scans on the hint, never
+    // the mask, so the result is the same; nb 17 is past the decode sizes the hint applies to
+    for (int mask_band : { 0, 1, 5, 6, }) {
+        for (int nb : { 1, 4, 16, 17, }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, true, mask_band, true));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, false, 5, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, 0, true));
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
@@ -11916,6 +11931,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : { 4096, 65536, 262144, }) {
         for (int nb : { 1, 2, }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
+    // ... one slot's decode and MTP verify at the served depth, bit mask, without and with the mask-prefix hint
+    for (bool mask_prefix : { false, true, }) {
+        for (int nb : { 1, 4, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 245760, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, 0, mask_prefix));
         }
     }
 

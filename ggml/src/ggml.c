@@ -5532,6 +5532,21 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_mask_prefix(
+        struct ggml_tensor * a,
+        bool                 mask_prefix) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    ggml_set_op_params_i32(a, 4, mask_prefix ? 1 : 0); // after scale, max_bias, logit_softcap and prec
+}
+
+bool ggml_flash_attn_ext_get_mask_prefix(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 4) != 0;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
