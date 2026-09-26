@@ -1758,6 +1758,8 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
 
     bool scan_cells; // LLAMA_KQ_MASK_SCAN_LEGACY=1: every row's first scan tests cell by cell, not 16 cells at a time
+    bool seq_bits;   // off with LLAMA_KQ_MASK_SEQ_BITS_LEGACY=1: a group of 64 cells before the batch is scanned, not taken
+                     // whole from the sequence's bits (llama_kv_cells::seq_cells64)
 };
 
 // How a mask cell is stored: an additive f16/f32 value, or one bit of a 16-bit word (set = attend; GGML_TYPE_I16, 16 cells per element).
@@ -1926,6 +1928,28 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S 
                 };
 
                 uint32_t j0 = 0;
+
+                // a group of 64 cells with no position from p_idx on holds no cell the batch's positions can mask and none
+                // for the bookkeeping: without a window the sequence's bits are the row there, read in one word instead of
+                // 64 cells' positions and sequence sets. The groups with a later position (the batch's own cells, the cells
+                // a rejected draft freed and the batch took) are scanned 16 cells at a time
+                if (args.seq_bits && !swa) {
+                    for (; j0 + 64 <= n_kv; j0 += 64) {
+                        const uint64_t bits = cells.seq_cells64(seq_id, j0/64);
+
+                        if (bits == 0 || cells.pos_max64(j0/64) < p_idx) {
+                            for (uint32_t k = 0; k < 64; k += 16) {
+                                st.keep_n(idst + j0 + k, (uint32_t) (bits >> k) & 0xffff, 16);
+                            }
+                            continue;
+                        }
+
+                        for (uint32_t k = 0; k < 64; k += 16) {
+                            st.keep_n(idst + j0 + k, scan(j0 + k, std::integral_constant<uint32_t, 16>{}), 16);
+                        }
+                    }
+                }
+
                 for (; j0 + 16 <= n_kv; j0 += 16) {
                     st.keep_n(idst + j0, scan(j0, std::integral_constant<uint32_t, 16>{}), 16);
                 }
@@ -2027,10 +2051,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S 
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache_set_input_kq_mask(
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_hparams & hparams,
+        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream,
+        uint32_t n_swa, llama_swa_type swa_type, bool scan_cells, bool seq_bits) {
     const uint32_t n_tokens = ubatch->n_tokens;
-
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const int64_t n_kv     = dst->type == GGML_TYPE_I16 ? 16*dst->ne[0] : dst->ne[0]; // a bit-packed mask holds 16 cells per element
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
@@ -2039,13 +2064,6 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
-
-    //const int64_t t_start = ggml_time_us();
-
-    static const bool scan_cells = [] {
-        const char * v = getenv("LLAMA_KQ_MASK_SCAN_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -2058,6 +2076,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.scan_cells       =*/ scan_cells,
+        /*.seq_bits         =*/ seq_bits,
     };
 
     switch (dst->type) {
@@ -2066,6 +2085,24 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         case GGML_TYPE_I16: set_input_kq_mask_impl(args, llama_kq_mask_bits              {(uint16_t    *) dst->data}, causal_attn); break;
         default: GGML_ABORT("unsupported KQ mask type %s", ggml_type_name(dst->type));
     }
+}
+
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    //const int64_t t_start = ggml_time_us();
+
+    static const bool scan_cells = [] {
+        const char * v = getenv("LLAMA_KQ_MASK_SCAN_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+
+    static const bool seq_bits = [] {
+        const char * v = getenv("LLAMA_KQ_MASK_SEQ_BITS_LEGACY");
+        return v == nullptr || atoi(v) == 0;
+    }();
+
+    llama_kv_cache_set_input_kq_mask(dst, ubatch, causal_attn, hparams, v_cells, seq_to_stream, n_swa, swa_type, scan_cells, seq_bits);
 
     //const int64_t t_end = ggml_time_us();
 

@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -45,7 +46,10 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            std::fill(seq_bits[s].begin(), seq_bits[s].end(), 0);
         }
+
+        std::fill(pos_max_g.begin(), pos_max_g.end(), -1);
     }
 
     void reset_shift() {
@@ -53,6 +57,14 @@ public:
 
         for (uint32_t i = 0; i < shift.size(); ++i) {
             shift[i] = 0;
+        }
+
+        // the positions moved, some of them down: the bounds are made exact again
+        std::fill(pos_max_g.begin(), pos_max_g.end(), -1);
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (pos[i] != -1) {
+                pos_max_raise(i);
+            }
         }
     }
 
@@ -65,6 +77,11 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            seq_bits[s].clear(); // sized again at the first cell of the sequence
+        }
+        pos_max_g.resize((n + 63)/64);
 
         reset();
     }
@@ -173,6 +190,7 @@ public:
 
             if (pos[idx] != -1) {
                 seq_pos_rm(i + j);
+                seq_bits_clr(i + j);
             }
 
             pos[idx] = other.pos[j];
@@ -181,6 +199,10 @@ public:
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
+                seq_bits_set(i + j);
+                pos_max_raise(i + j);
+            } else {
+                pos_max_drop(i + j);
             }
 
             assert(shift[idx] == 0);
@@ -204,6 +226,7 @@ public:
 
             if (pos[idx] != -1) {
                 seq_pos_rm(idx);
+                seq_bits_clr(idx);
             }
 
             pos[idx] = other.pos[j];
@@ -212,6 +235,10 @@ public:
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
+                seq_bits_set(idx);
+                pos_max_raise(idx);
+            } else {
+                pos_max_drop(idx);
             }
 
             assert(shift[idx] == 0);
@@ -224,6 +251,7 @@ public:
         assert(pos[i] != -1);
 
         seq_pos_rm(i);
+        seq_bits_clr(i);
         seq[i].reset();
 
         pos[i] = -1;
@@ -231,6 +259,7 @@ public:
         shift[i] = 0;
 
         used.erase(i);
+        pos_max_drop(i);
     }
 
     // note: call only if the cell has seq_id
@@ -242,6 +271,7 @@ public:
         assert(seq_id >= 0);
 
         seq[i].reset(seq_id);
+        seq_bit_clr(i, seq_id);
         seq_pos_dec(seq_id, pos[i]);
 
         if (seq[i].none()) {
@@ -250,6 +280,7 @@ public:
             shift[i] = 0;
 
             used.erase(i);
+            pos_max_drop(i);
 
             return true;
         }
@@ -263,9 +294,11 @@ public:
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
+            seq_bits_clr(i);
             seq[i].reset();
 
             seq[i].set(seq_id);
+            seq_bit_set(i, seq_id);
             seq_pos_inc(seq_id, pos[i]);
 
             return false;
@@ -273,6 +306,7 @@ public:
 
         if (seq[i].any()) {
             seq_pos_rm(i);
+            seq_bits_clr(i);
             seq[i].reset();
 
             pos[i] = -1;
@@ -280,6 +314,7 @@ public:
             shift[i] = 0;
 
             used.erase(i);
+            pos_max_drop(i);
 
             return true;
         }
@@ -312,6 +347,7 @@ public:
         assert(!seq[i].test(seq_id));
 
         seq[i].set(seq_id);
+        seq_bit_set(i, seq_id);
         seq_pos_inc(seq_id, pos[i]);
     }
 
@@ -357,6 +393,24 @@ public:
         assert(seq_pos[seq_id].rbegin()->second > 0);
 
         return seq_pos[seq_id].rbegin()->first;
+    }
+
+    // the cells in groups of 64, for a KQ mask row to take a group whole where no position in it can be masked
+    // (llama_kv_cache_set_input_kq_mask): bit k set = cell 64*g + k holds seq_id
+    uint64_t seq_cells64(llama_seq_id seq_id, uint32_t g) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        assert(g < pos_max_g.size());
+
+        return g < seq_bits[seq_id].size() ? seq_bits[seq_id][g] : 0;
+    }
+
+    // no cell among [64*g, 64*g + 64) is at a position above pos_max64(g): raised with every position placed or moved up,
+    // -1 once the 64 cells are empty, exact again when a shift is applied (reset_shift). A cell emptied or moved down
+    // leaves it above the largest position until then
+    llama_pos pos_max64(uint32_t g) const {
+        assert(g < pos_max_g.size());
+
+        return pos_max_g[g];
     }
 
     // the number of cells of sequence seq_id with a position in [p0, p1), counted until it exceeds n_max
@@ -413,6 +467,7 @@ public:
         pos[i] = p;
 
         used.insert(i);
+        pos_max_raise(i);
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
@@ -435,16 +490,19 @@ public:
         has_shift = true;
 
         if (pos[i] < 0) {
+            seq_bits_clr(i);
             seq[i].reset();
             pos[i] = -1;
             shift[i] = 0;
 
             used.erase(i);
+            pos_max_drop(i);
 
             return true;
         }
 
         seq_pos_add(i);
+        pos_max_raise(i);
 
         return false;
     }
@@ -510,6 +568,53 @@ private:
     //  - some vision models have input embeddings with repeating positions
     //
     std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
+
+    // seq_bits[s]: the bits of seq_cells64() for sequence s, sized at its first cell (a sequence never placed has none);
+    // pos_max_g: the bounds of pos_max64()
+    std::vector<uint64_t> seq_bits[LLAMA_MAX_SEQ];
+    std::vector<llama_pos> pos_max_g;
+
+    void seq_bit_set(uint32_t i, llama_seq_id s) {
+        auto & bits = seq_bits[s];
+        if (bits.empty()) {
+            bits.resize(pos_max_g.size(), 0);
+        }
+        bits[i/64] |= (uint64_t) 1 << (i%64);
+    }
+
+    void seq_bit_clr(uint32_t i, llama_seq_id s) {
+        seq_bits[s][i/64] &= ~((uint64_t) 1 << (i%64));
+    }
+
+    // every sequence of cell i, before the cell's set is changed
+    void seq_bits_clr(uint32_t i) {
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (seq[i].test(s)) {
+                seq_bit_clr(i, s);
+            }
+        }
+    }
+
+    void seq_bits_set(uint32_t i) {
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (seq[i].test(s)) {
+                seq_bit_set(i, s);
+            }
+        }
+    }
+
+    void pos_max_raise(uint32_t i) {
+        pos_max_g[i/64] = std::max(pos_max_g[i/64], pos[i]);
+    }
+
+    // after cell i was emptied: a group left with no used cell bounds nothing
+    void pos_max_drop(uint32_t i) {
+        const uint32_t g0 = i - i%64;
+        const auto it = used.lower_bound(g0);
+        if (it == used.end() || *it >= g0 + 64) {
+            pos_max_g[i/64] = -1;
+        }
+    }
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
