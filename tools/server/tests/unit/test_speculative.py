@@ -155,7 +155,9 @@ def test_draft_token_probs(post_sampling: bool):
     for a, b in zip(probs_drafted[:n], probs_plain[:n]):
         assert a[key] == pytest.approx(b[key], abs=0.25)
         # a probability the server never set goes out as exactly 1 (logprob 0), which the tolerance takes where plain
-        # decoding gives 0.75 or more; rounding cannot make exactly 1 of 0.999 (the other tokens' 1e-3 to under 6e-8)
+        # decoding gives 0.75 or more. A real exact 1 (top-p or min-p left one candidate, or the rest round to nothing
+        # after the temperature) has plain decoding at 0.999 or more: parting them takes 1.5 nats of logit or more,
+        # where the runs differ by 0.1
         assert a[key] != one or b[key] == pytest.approx(one, abs=1e-3)
         assert len(a[top]) == len(b[top]) > 0
 
