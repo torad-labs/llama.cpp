@@ -620,7 +620,7 @@ static void test_all(const std::string & lang, std::function<void(const TestCase
             char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
             decimal-part ::= [0-9]{1,16}
             integral-part ::= [0] | [1-9] [0-9]{0,15}
-            item ::= object
+            item ::= value
             null ::= "null"
             number ::= ("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)?
             object ::= "{" space ( string ":" space value ("," space string ":" space value)* )? space "}"
@@ -645,7 +645,7 @@ static void test_all(const std::string & lang, std::function<void(const TestCase
             char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
             decimal-part ::= [0-9]{1,16}
             integral-part ::= [0] | [1-9] [0-9]{0,15}
-            item ::= object
+            item ::= value
             null ::= "null"
             number ::= ("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)?
             object ::= "{" space ( string ":" space value ("," space string ":" space value)* )? space "}"
