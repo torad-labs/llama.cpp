@@ -4421,6 +4421,9 @@ private:
             // ids[i] was sampled from output row lens_rows[i]: the lens reads those rows after acceptance
             std::vector<int> lens_rows;
 
+            // the probabilities of ids[i] [n_probs], read as the verify loop samples it, as the plain path reads them
+            std::vector<completion_token_output> spec_probs;
+
             // verify and try to accept the draft
             {
                 // the saved sampler is read only when a partial acceptance restores the checkpoint (below):
@@ -4436,7 +4439,17 @@ private:
                 for (const auto idx : slot.spec_i_batch) {
                     pull_eval(slot, (int) idx);
                 }
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                std::function<void(size_t, llama_token)> on_sample;
+                if (slot.task->params.sampling.n_probs > 0) {
+                    on_sample = [&](size_t i, llama_token id) {
+                        completion_token_output out;
+                        out.tok  = id;
+                        out.prob = 1.0f;
+                        populate_token_probs(slot, out, slot.task->params.post_sampling_probs, params_base.special, slot.spec_i_batch[i]);
+                        spec_probs.push_back(std::move(out));
+                    };
+                }
+                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_sample);
                 // here, before a checkpoint restore rewinds the sampler to its passive state: the replay must sample the
                 // row after the switching token on the CPU, or it stops at the same token on every pass
                 slot.release_backend_sampler_if_constrained();
@@ -4532,9 +4545,12 @@ private:
 
                 result.tok          = ids[i];
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // set later
+                result.prob         = 1.0f;
 
-                // TODO: set result.probs
+                if (i < spec_probs.size()) {
+                    result.prob  = spec_probs[i].prob;
+                    result.probs = std::move(spec_probs[i].probs);
+                }
 
                 slot.stats.n_gen += 1;
 
