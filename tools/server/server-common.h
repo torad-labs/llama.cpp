@@ -209,6 +209,9 @@ public:
 
     llama_tokens get_text_tokens() const;
 
+    // the text tokens without a copy: the list itself when no media can be in it (!has_mtmd), else a copy into buf
+    const llama_tokens & get_text_tokens(llama_tokens & buf) const;
+
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
 

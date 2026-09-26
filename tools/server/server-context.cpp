@@ -210,6 +210,16 @@ static bool checkpoint_spare_legacy() {
     return legacy;
 }
 
+// LLAMA_SPEC_PROMPT_COPY_LEGACY=1: every draft round copies the prompt's text tokens for the drafters, even when the
+// slot's list is text only
+static bool spec_prompt_copy_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("LLAMA_SPEC_PROMPT_COPY_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return legacy;
+}
+
 struct server_slot {
     int id;
 
@@ -3434,14 +3444,18 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        // the drafters that read the prompt (the n-gram ones) are given the slot's own list when it holds only
+                        // text; a copy each round is ~1 MB at 245,760 tokens, host time before every draft
+                        const llama_tokens & spec_prompt = spec_prompt_copy_legacy()
+                            ? (slot.spec_prompt = slot.prompt.tokens.get_text_tokens())
+                            : slot.prompt.tokens.get_text_tokens(slot.spec_prompt);
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
+                            /* .prompt   = */ &spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                         };
 

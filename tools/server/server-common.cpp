@@ -628,6 +628,14 @@ llama_tokens server_tokens::get_text_tokens() const {
     return res;
 }
 
+const llama_tokens & server_tokens::get_text_tokens(llama_tokens & buf) const {
+    if (!has_mtmd) {
+        return tokens; // no media chunk can be in the list: every token is text
+    }
+    buf = get_text_tokens();
+    return buf;
+}
+
 void server_tokens::set_token(llama_pos pos, llama_token id) {
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens[pos] = id;
