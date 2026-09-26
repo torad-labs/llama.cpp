@@ -249,6 +249,10 @@ struct common_peg_schema_parser {
 
     // Indicates if the GBNF should accept a raw string that matches the schema.
     bool raw;
+
+    // The schema is a value's (a tool argument's): empty, it accepts any value, where at the top of tool arguments or a
+    // response format it accepts any object.
+    bool value = false;
 };
 
 struct common_peg_rule_parser {
@@ -491,6 +495,9 @@ class common_peg_parser_builder {
     // Wraps a parser with JSON schema metadata for grammar generation.
     // Used internally to convert JSON schemas to GBNF grammar rules.
     common_peg_parser schema(const common_peg_parser & p, const std::string & name, const common_json & schema, bool raw = false);
+
+    // Marks p's schema as a value's (common_peg_schema_parser::value) when p is a schema; returns p.
+    common_peg_parser value_schema(const common_peg_parser & p);
 
     // Creates a named rule, stores it in the grammar, and returns a ref.
     // If trigger=true, marks this rule as an entry point for lazy grammar generation.

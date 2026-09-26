@@ -1068,7 +1068,7 @@ public:
             out << ")";
             return _add_rule(rule_name, out.str());
         }
-        if (schema.empty() || schema_type == "object") {
+        if (schema_type == "object") {
             return _add_rule(rule_name, _add_primitive("object", PRIMITIVE_RULES.at("object")));
         }
         if (schema_type.is_null() && schema.is_object()) {
@@ -1241,6 +1241,9 @@ std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf) 
     return build_grammar([&](const common_grammar_builder & callbacks) {
         auto copy = schema;
         callbacks.resolve_refs(copy);
+        if (copy.is_object() && copy.empty()) {
+            copy["type"] = "object"; // an empty root accepts any object; {} below it accepts any value
+        }
         callbacks.add_schema("", copy);
     });
 }
