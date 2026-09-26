@@ -203,6 +203,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_deepseek4(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
+        case LLM_ARCH_GLM5NEXT:
+            return new llama_model_glm5next(params);
         case LLM_ARCH_MISTRAL4:
             return new llama_model_mistral4(params);
         case LLM_ARCH_CHATGLM:
@@ -943,6 +945,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_288B_A19B:     return "288B.A19B";
         case LLM_TYPE_300B_A47B:     return "300B.A47B";
         case LLM_TYPE_310B_A15B:     return "310B.A15B";
+        case LLM_TYPE_313B_A17B:     return "313B.A17B";
         case LLM_TYPE_355B_A32B:     return "355B.A32B";
         case LLM_TYPE_397B_A17B:     return "397B.A17B";
         case LLM_TYPE_685B_A37B:     return "685B.A37B";
@@ -2750,6 +2753,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
+                    llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+                    ggml_type type_idx = GGML_TYPE_F16;
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
@@ -2760,16 +2765,37 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
+                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_MINIMAX_01 || arch == LLM_ARCH_GLM5NEXT) {
+                        const bool mtp_ctx = arch == LLM_ARCH_GLM5NEXT &&
+                            params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                            hparams.n_layer_all > hparams.n_layer();
+                        filter_attn = [&, mtp_ctx](uint32_t il) {
+                            if (mtp_ctx) {
+                                return il >= hparams.n_layer() && il < hparams.n_layer_all;
+                            }
                             return il < hparams.n_layer() && !hparams.is_recr(il);
                         };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                        filter_recr = [&, mtp_ctx](uint32_t il) {
+                            return !mtp_ctx && il < hparams.n_layer() && hparams.is_recr(il);
                         };
+                        if (arch == LLM_ARCH_GLM5NEXT && hparams.indexer_head_size > 0) {
+                            filter_idx = [&, mtp_ctx](uint32_t il) {
+                                if (mtp_ctx) {
+                                    return il >= hparams.n_layer() && il < hparams.n_layer_all;
+                                }
+                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                            };
+                            type_idx = params.type_k;
+                            if (ggml_is_quantized(type_idx)) {
+                                LLAMA_LOG_WARN("%s: indexer key cache stays %s rather than %s: it also holds the compressor gates\n",
+                                        __func__, ggml_type_name(GGML_TYPE_F16), ggml_type_name(type_idx));
+                                type_idx = GGML_TYPE_F16;
+                            }
+                        }
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                        GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
@@ -2807,7 +2833,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* type_idx          */ type_idx);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -3234,6 +3262,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
         case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_POCKETTTS:

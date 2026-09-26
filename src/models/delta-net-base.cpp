@@ -330,9 +330,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     cb(b, "b_in", il);
     cb(g, "g_in", il);
 
-    // GDA: [1,  1,  H_v, n_seqs]
-    // KDA: [1, S_k, H_v, n_seqs]
-    g = ggml_reshape_4d(ctx0, g, 1, g->ne[0], H_v, n_seqs);
+    // the state is indexed [key, value]: ne0 is the key axis, so KDA's per-key-channel
+    // decay must broadcast over ne1, not ne0 (for GDA g->ne[0] is 1 and both agree)
+    g = ggml_reshape_4d(ctx0, g, g->ne[0], 1, H_v, n_seqs);
     b = ggml_reshape_4d(ctx0, b, 1,        1, H_v, n_seqs);
 
     // [S_v, S_v, H_v, n_seqs]
@@ -506,9 +506,15 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
-            const int64_t s_slot = K - t;
+        // slot s holds the window s tokens before the batch's end. A rollback of r rows reads slot r after a batch of
+        // more than r (a verify rolls back its rejected draft rows, never the row the draft grew from), so, as
+        // build_recurrent_attn does for the state, only the last min(n_seq_tokens, K) slots are written: a verify of 4
+        // rows under --spec-rollback 15 copies 4 windows a layer, not 16
+        const int64_t n_seq_tokens = conv_input->ne[0] - conv_states->ne[0];
+        const int64_t n_written    = std::min<int64_t>(n_seq_tokens, K);
+
+        for (int64_t s_slot = 0; s_slot < n_written; ++s_slot) {
+            const int64_t s_idx = n_seq_tokens - s_slot;
 
             ggml_tensor * conv_state_last =
                 ggml_view_3d(ctx0, conv_input,

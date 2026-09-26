@@ -2708,6 +2708,32 @@ class TensorNameMap:
                 "model.layers.{bid}.post_attention_layernorm",
             ),
         },
+        MODEL_ARCH.GLM5NEXT: {
+            MODEL_TENSOR.HC_ATTN_FN: (
+                "model.layers.{bid}.hc_attn_fn",
+            ),
+            MODEL_TENSOR.HC_ATTN_BASE: (
+                "model.layers.{bid}.hc_attn_base",
+            ),
+            MODEL_TENSOR.HC_ATTN_SCALE: (
+                "model.layers.{bid}.hc_attn_scale",
+            ),
+            MODEL_TENSOR.HC_FFN_FN: (
+                "model.layers.{bid}.hc_ffn_fn",
+            ),
+            MODEL_TENSOR.HC_FFN_BASE: (
+                "model.layers.{bid}.hc_ffn_base",
+            ),
+            MODEL_TENSOR.HC_FFN_SCALE: (
+                "model.layers.{bid}.hc_ffn_scale",
+            ),
+            MODEL_TENSOR.INDEXER_COMPRESSOR_WGATE: (
+                "model.layers.{bid}.self_attn.indexer.index_kpool_compress_gate",
+            ),
+            MODEL_TENSOR.INDEXER_COMPRESSOR_APE: (
+                "model.layers.{bid}.self_attn.indexer.index_kpool_compress_ape",
+            ),
+        },
     }
 
     mapping: dict[str, tuple[MODEL_TENSOR, str]]
