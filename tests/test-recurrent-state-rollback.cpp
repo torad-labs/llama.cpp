@@ -6,6 +6,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static llama_context * make_ctx(const common_params & params, llama_model * model) {
@@ -207,6 +208,118 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
+// The recurrent state of seq 0 as the context serializes it (the snapshot slot a pending rollback selects): its conv
+// windows and its state, without the attention cache
+static std::vector<float> recurrent_state(llama_context * ctx) {
+    std::vector<uint8_t> buf(llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    buf.resize(llama_state_seq_get_data_ext(ctx, buf.data(), buf.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    std::vector<float> words(buf.size() / sizeof(float));
+    std::memcpy(words.data(), buf.data(), words.size() * sizeof(float));
+    return words;
+}
+
+// The speculative shape: a verify batch of fewer rows than n_rs_seq + 1, rolled back by r of them (r < the batch, as a
+// verify rolls back its rejected draft rows). Each depth is compared with a reference context that decoded only the
+// accepted rows: first the recurrent state itself (a small model's recurrent branch can sit below the rounding of its
+// residual stream, so its logits alone would not see a wrong window), then the logits over a correction token and the
+// tokens after it. The snapshots a short batch writes must hold every slot such a rollback reads.
+static bool test_short_verify_rollback(const common_params & params, llama_model * model, const int n_vocab) {
+    constexpr uint32_t n_prompt = 19;
+    constexpr uint32_t n_verify = 4;
+    constexpr uint32_t n_after  = 3;
+
+    const auto tok = [&](llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 1) % (uint32_t) n_vocab);
+    };
+    const auto decode_range = [&](llama_context * ctx, llama_pos p0, llama_pos p1) {
+        llama_batch batch = llama_batch_init(p1 - p0, 0, 1);
+        for (llama_pos pos = p0; pos < p1; ++pos) {
+            common_batch_add(batch, tok(pos), pos, { 0 }, true);
+        }
+        const bool ok = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    for (uint32_t r = 1; r < n_verify; ++r) {
+        llama_context * ctx_roll = make_ctx(params, model);
+        llama_context * ctx_ref  = make_ctx(params, model);
+        const auto cleanup = [&]() {
+            llama_free(ctx_roll);
+            llama_free(ctx_ref);
+        };
+        if (ctx_roll == nullptr || ctx_ref == nullptr) {
+            fprintf(stderr, "%s : failed to init contexts\n", __func__);
+            cleanup();
+            return false;
+        }
+        if (llama_n_rs_seq(ctx_roll) + 1 <= n_verify) {
+            fprintf(stderr, "%s : skipping because n_rs_seq + 1 does not exceed the verify batch\n", __func__);
+            cleanup();
+            return true;
+        }
+
+        const llama_pos p_keep = n_prompt + n_verify - r;
+
+        bool ok = decode_range(ctx_roll, 0, n_prompt) && decode_range(ctx_ref, 0, n_prompt);
+        ok = ok && decode_range(ctx_roll, n_prompt, n_prompt + n_verify);
+        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), 0, p_keep, -1);
+        ok = ok && decode_range(ctx_ref, n_prompt, p_keep);
+        if (!ok) {
+            fprintf(stderr, "%s : decode or rollback of %u rows failed\n", __func__, r);
+            cleanup();
+            return false;
+        }
+
+        // the serialized state holds positions and counts beside the f32 rows: a word is equal when its bits are, and
+        // otherwise within eps as a float (a NaN word is never within it)
+        const std::vector<float> s_roll = recurrent_state(ctx_roll);
+        const std::vector<float> s_ref  = recurrent_state(ctx_ref);
+        float state_diff = s_roll.size() == s_ref.size() && !s_ref.empty() ? 0.0f : INFINITY;
+        for (size_t w = 0; w < s_ref.size() && std::isfinite(state_diff); ++w) {
+            if (std::memcmp(&s_roll[w], &s_ref[w], sizeof(float)) != 0) {
+                const float d = std::fabs(s_roll[w] - s_ref[w]);
+                state_diff = std::isnan(d) ? INFINITY : std::max(state_diff, d);
+            }
+        }
+        fprintf(stderr, "%s : %u of %u rows rolled back, %zu state words, max diff %g\n",
+                __func__, r, n_verify, s_ref.size(), (double) state_diff);
+        if (!(state_diff <= 1e-6f)) {
+            fprintf(stderr, "%s : the recurrent state after rolling back %u rows differs from the reference\n", __func__, r);
+            cleanup();
+            return false;
+        }
+
+        float diff_max = 0.0f;
+        for (uint32_t i = 0; i < n_after; ++i) {
+            // a correction first: the token the rolled-back row did not hold
+            const llama_pos   pos = p_keep + (llama_pos) i;
+            const llama_token t   = i == 0 ? (llama_token) ((tok(pos) + 3) % n_vocab) : tok(pos);
+            if (!decode_one(ctx_roll, t, pos) || !decode_one(ctx_ref, t, pos)) {
+                fprintf(stderr, "%s : replay after rolling back %u rows failed at position %d\n", __func__, r, pos);
+                cleanup();
+                return false;
+            }
+            const float * l_roll = llama_get_logits_ith(ctx_roll, 0);
+            const float * l_ref  = llama_get_logits_ith(ctx_ref,  0);
+            for (int token = 0; token < n_vocab; ++token) {
+                diff_max = std::max(diff_max, std::fabs(l_roll[token] - l_ref[token]));
+            }
+        }
+        cleanup();
+
+        // the reference decodes the accepted rows as a batch of their own, so the states agree to rounding, not bitwise
+        constexpr float eps = 1e-4f;
+        fprintf(stderr, "%s : %u of %u rows rolled back, logits max diff %g\n", __func__, r, n_verify, (double) diff_max);
+        if (diff_max > eps) {
+            fprintf(stderr, "%s : logits after rolling back %u rows differ from the reference\n", __func__, r);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -394,6 +507,10 @@ int main(int argc, char ** argv) {
     llama_free(ctx_dirty);
 
     if (!test_multi_seq_split_replay(params, model, n_vocab)) {
+        return 1;
+    }
+
+    if (!test_short_verify_rollback(params, model, n_vocab)) {
         return 1;
     }
 
