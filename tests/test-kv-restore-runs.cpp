@@ -5,13 +5,15 @@
 // Three sequences are decoded in turns of `turn` tokens, so their cells interleave in runs of `turn`. Sequence 1 is saved
 // and removed; with `refill`, sequence 0 then takes the first holes, so the restore fills the holes left and then cells
 // past every sequence (the runs change length). Each cache layout the restore writes differently: V transposed (no
-// flash attention, f16), V in rows (flash attention, f16), and the served q4_0 rows (flash attention).
+// flash attention, f16), V in rows (flash attention, f16), and the served q4_0 rows (flash attention), skipped on a model
+// whose heads are not a whole number of q4_0 blocks wide (the CI model's are 48).
 // LLAMA_KV_RESTORE_PER_CELL_LEGACY=1 runs the same checks on the per-cell copies.
 
 #include "llama.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -30,6 +32,20 @@ static void add(llama_batch & batch, llama_token token, llama_pos pos, llama_seq
 // a token that differs by sequence and position, so every cell holds different K and V rows
 static llama_token token_at(const llama_vocab * vocab, int seq, int pos) {
     return 1 + (seq*997 + pos*31) % (llama_vocab_n_tokens(vocab) - 1);
+}
+
+// a K or V head's width as the model loads it: <arch>.attention.key_length or value_length, else n_embd / n_head
+static int64_t head_width(const llama_model * model, const char * length) {
+    char arch[64];
+    char key[128];
+    char val[32];
+    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0) {
+        snprintf(key, sizeof(key), "%s.attention.%s", arch, length);
+        if (llama_model_meta_val_str(model, key, val, sizeof(val)) > 0) {
+            return atoll(val);
+        }
+    }
+    return llama_model_n_embd(model) / llama_model_n_head(model);
 }
 
 static bool check(llama_model * model, bool fa, ggml_type type, int turn, bool refill) {
@@ -149,6 +165,13 @@ int main(int argc, char ** argv) {
     };
     int n_fail = 0;
     for (const auto & layout : layouts) {
+        // llama_init_from_model refuses a quantized cache whose blocks do not divide the heads
+        const int64_t blck = ggml_blck_size(layout.type);
+        if (head_width(model, "key_length") % blck != 0 || head_width(model, "value_length") % blck != 0) {
+            fprintf(stderr, "fa %d, %s: skipped, the model's heads are not a multiple of %lld wide\n", layout.fa,
+                    ggml_type_name(layout.type), (long long) blck);
+            continue;
+        }
         for (const int turn : { 1, 5 }) {
             for (const bool refill : { false, true }) {
                 n_fail += check(model, layout.fa, layout.type, turn, refill) ? 0 : 1;
