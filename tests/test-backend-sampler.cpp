@@ -1601,6 +1601,44 @@ static void test_backend_reattach_no_reserve(const test_params & params) {
     printf("backend reattach without reserve test PASSED\n");
 }
 
+static void test_backend_reattach_same_address(const test_params & params) {
+    const int seq_id = 0;
+
+    // a backend sampler that can be initialized again after it was released (a chain holding top-k or dist cannot)
+    test_single_output_backend_sampler * sampler_ctx = nullptr;
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), test_single_output_backend_sampler_init(&sampler_ctx));
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, chain.get() }};
+    test_context test_ctx(params, backend_sampler_configs);
+    llama_context * ctx = test_ctx.ctx.get();
+
+    const llama_token token = llama_vocab_bos(test_ctx.vocab);
+    if (!test_ctx.decode({{seq_id, "Hello"}}) || !test_ctx.decode_token(token, seq_id)) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    // the same sampler map and ubatch shape reuse the graph: the check below can fail
+    const int n_reused = llama_perf_context(ctx).n_reused;
+    if (!test_ctx.decode_token(token, seq_id)) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+    GGML_ASSERT(llama_perf_context(ctx).n_reused == n_reused + 1);
+
+    // a request ends and the next one attaches before any decode, its chain at the address the last one had (the
+    // allocator handing back the freed chain's memory; here the same chain): the map compares equal, but the graph
+    // was built with the chain that left and whose backend state the detach released, so the next graph is built anew
+    llama_set_sampler(ctx, seq_id, nullptr);
+    GGML_ASSERT(llama_set_sampler(ctx, seq_id, chain.get()));
+    if (!test_ctx.decode_token(token, seq_id)) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+    printf("graphs reused: %d before the chain left, %d after it came back\n",
+           n_reused + 1, llama_perf_context(ctx).n_reused - n_reused - 1);
+    GGML_ASSERT(llama_perf_context(ctx).n_reused == n_reused + 1);
+
+    printf("backend reattach at the same address test PASSED\n");
+}
+
 static void test_backend_cpu_mixed_batch(const test_params & params) {
     // Sequence 0 uses backend sampling
     struct llama_sampler_chain_params chain_params_0 = llama_sampler_chain_default_params();
@@ -2102,6 +2140,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "set_sampler",     test_backend_set_sampler,             true  },
     { "release_to_cpu",  test_backend_release_to_cpu,          true  },
     { "reattach_no_reserve", test_backend_reattach_no_reserve, true  },
+    { "reattach_same_address", test_backend_reattach_same_address, true },
     { "multi_output_limit",    test_backend_multi_output_limit,      true },
     { "multi_sequence_multi_output_dist", test_backend_multi_sequence_multi_output_dist, true },
     { "multi_output_dist_transaction", test_backend_multi_output_dist_transaction, true },
@@ -2197,7 +2236,7 @@ static std::vector<const backend_test_case *> collect_tests_to_run(const std::st
 #ifdef GGML_USE_HIP
             // TODO: remove this when https://github.com/ggml-org/llama.cpp/pull/26592 is merged
             if (test.name == "penalties" || test.name == "set_sampler" || test.name == "release_to_cpu" ||
-                test.name == "reattach_no_reserve" ||
+                test.name == "reattach_no_reserve" || test.name == "reattach_same_address" ||
                 test.name == "mixed"     || test.name == "top_p"       ||
                 test.name == "multi_output_sampling_chain" ||
                 test.name == "multi_output_cpu") {

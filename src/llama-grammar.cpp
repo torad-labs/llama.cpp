@@ -398,10 +398,7 @@ static bool llama_grammar_unescape_literal(const std::string & pattern, std::str
 
 llama_grammar_trigger_pattern llama_grammar_trigger_pattern_init(const std::string & pattern) {
     // LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY=1: every trigger is a regex searched over the whole buffer again
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY");
     llama_grammar_trigger_pattern trigger;
     trigger.pattern = pattern;
     trigger.regex = std::regex(pattern);

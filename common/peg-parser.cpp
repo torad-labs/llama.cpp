@@ -1123,6 +1123,13 @@ common_peg_parser common_peg_parser_builder::schema(const common_peg_parser & p,
     return wrap(arena_.add_parser(common_peg_schema_parser{p.id(), name, std::make_shared<common_json>(schema), raw}));
 }
 
+common_peg_parser common_peg_parser_builder::value_schema(const common_peg_parser & p) {
+    if (auto * s = std::get_if<common_peg_schema_parser>(&arena_.get(p.id()))) {
+        s->value = true;
+    }
+    return p;
+}
+
 common_peg_parser common_peg_parser_builder::rule(const std::string & name, const common_peg_parser & p, bool trigger) {
     auto clean_name = rule_name(name);
     auto rule_id = arena_.add_parser(common_peg_rule_parser{clean_name, p.id(), trigger});
@@ -1731,6 +1738,10 @@ void common_peg_arena::build_grammar(const common_grammar_builder & builder, boo
                 if (schema_delegates(p)) {
                     return to_gbnf(p.child);
                 }
+                // empty, a value's schema accepts any value and the top of tool arguments or a response format any object
+                if (!p.value && p.schema->is_object() && p.schema->empty()) {
+                    return builder.add_schema(p.name, common_json{{"type", "object"}});
+                }
                 return builder.add_schema(p.name, *p.schema);
             } else if constexpr (std::is_same_v<T, common_peg_rule_parser>) {
                 return p.name;
@@ -1860,7 +1871,8 @@ static common_json serialize_parser_variant(const common_peg_parser_variant & va
                 {"child", p.child},
                 {"name", p.name},
                 {"schema", p.schema ? *p.schema : json(nullptr)},
-                {"raw", p.raw}
+                {"raw", p.raw},
+                {"value", p.value}
             };
         } else if constexpr (std::is_same_v<T, common_peg_rule_parser>) {
             return json{
@@ -2009,6 +2021,7 @@ static common_peg_parser_variant deserialize_parser_variant(const common_json & 
             parser.schema = std::make_shared<common_json>(j["schema"]);
         }
         parser.raw = j["raw"].get<bool>();
+        parser.value = j.value("value", false);
         return parser;
     }
     if (type == "rule") {

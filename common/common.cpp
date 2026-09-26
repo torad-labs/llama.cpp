@@ -289,8 +289,11 @@ static cpu_set_t gpu_node_unbound; // the affinity common_bind_to_gpu_node repla
 static int set_all_threads_affinity(const cpu_set_t & mask) {
     int n_threads = 0;
     std::error_code ec;
-    for (const auto & task : std::filesystem::directory_iterator("/proc/self/task", ec)) {
-        n_threads += sched_setaffinity(std::atoi(task.path().filename().c_str()), sizeof(mask), &mask) == 0;
+    for (std::filesystem::directory_iterator it("/proc/self/task", ec), end; !ec && it != end; it.increment(ec)) {
+        n_threads += sched_setaffinity(std::atoi(it->path().filename().c_str()), sizeof(mask), &mask) == 0;
+    }
+    if (ec) {
+        COM_WRN("cannot list the process's threads in /proc/self/task (%s): %d of them moved\n", ec.message().c_str(), n_threads);
     }
     return n_threads;
 }
@@ -309,8 +312,7 @@ static void common_unbind_gpu_node() {
 void common_bind_to_gpu_node(const common_params & params) {
 #if defined(__linux__) && !defined(__ANDROID__)
     // LLAMA_GPU_NODE_BIND_LEGACY=1 leaves the placement to the scheduler
-    const char * legacy = getenv("LLAMA_GPU_NODE_BIND_LEGACY");
-    if ((legacy && atoi(legacy) != 0) || params.n_gpu_layers == 0 || params.numa != GGML_NUMA_STRATEGY_DISABLED || params.cpuparams.mask_valid) {
+    if (ggml_env_switch("LLAMA_GPU_NODE_BIND_LEGACY") || params.n_gpu_layers == 0 || params.numa != GGML_NUMA_STRATEGY_DISABLED || params.cpuparams.mask_valid) {
         return;
     }
     std::vector<ggml_backend_dev_t> devs;
@@ -368,8 +370,10 @@ void common_bind_to_gpu_node(const common_params & params) {
     if (CPU_COUNT(&both) == 0 || CPU_EQUAL(&both, &cur)) {
         return;
     }
-    // fewer CPUs than the CPU backend's threads (a node smaller than a socket, or a cpuset): threads spinning in ggml_barrier would share them
-    const int n_threads = std::max(params.cpuparams.n_threads, params.cpuparams_batch.n_threads);
+    // fewer CPUs than the CPU backend's threads, the draft model's included (a node smaller than a socket, or a cpuset): threads
+    // spinning in ggml_barrier would share them
+    const int n_threads = std::max({ params.cpuparams.n_threads, params.cpuparams_batch.n_threads,
+        params.speculative.draft.cpuparams.n_threads, params.speculative.draft.cpuparams_batch.n_threads });
     if (CPU_COUNT(&both) < n_threads) {
         COM_INF("%d threads for %d CPUs on the NUMA node of %s: the placement stays with the scheduler\n", n_threads, CPU_COUNT(&both), ggml_backend_dev_name(devs[0]));
         return;

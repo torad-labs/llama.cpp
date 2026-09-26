@@ -115,10 +115,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 // GGML_CUDA_FATTN_Q4_0_LEGACY restores the stock kernels (the f16 copy, the vector kernel for decode): the A/B for
 // this path within one binary, and its off switch.
 static bool ggml_cuda_fattn_mma_q4_0(const int cc, const ggml_tensor * dst) {
-    static const bool legacy = [] {
-        const char * e = getenv("GGML_CUDA_FATTN_Q4_0_LEGACY");
-        return e != nullptr && atoi(e) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("GGML_CUDA_FATTN_Q4_0_LEGACY");
     if (legacy) {
         return false;
     }

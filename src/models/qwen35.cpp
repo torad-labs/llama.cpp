@@ -446,10 +446,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    // rows mode reads the state row in place, so it needs an f32 cache: a quantized cache (-cts q8_0) takes the
-    // gathered path, whose get_rows dequantizes and whose set_rows quantizes back, as every non-Metal GPU already does.
+    // rows mode reads the state row in place, so it needs an f32 cache (ggml_gated_delta_net_rows asserts it): any
+    // other type (-cts f16, bf16, q8_0) takes the gathered path, whose get_rows converts the row to f32 and whose
+    // set_rows converts the snapshots back, as every non-Metal GPU already does.
     const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 &&
-                                !ggml_is_quantized(ssm_states_all->type);
+                                ssm_states_all->type == GGML_TYPE_F32;
 
     ggml_tensor * state;
     if (gdn_state_rows) {
@@ -541,10 +542,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // The output projection takes a 2D input, [n_heads * head_dim, n_tokens * n_seqs], so it emits the layer's
     // [n_embd, n_tokens] itself: no reshape node sits between it and the residual ADD, which a backend's
     // mul_mat + add fusion needs adjacent. LLAMA_GDN_OUT_PROJ_3D_LEGACY=1 projects the 3D form and reshapes after.
-    static const bool out_proj_3d_legacy = [] {
-        const char * v = getenv("LLAMA_GDN_OUT_PROJ_3D_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool out_proj_3d_legacy = ggml_env_switch("LLAMA_GDN_OUT_PROJ_3D_LEGACY");
     if (!out_proj_3d_legacy) {
         ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
         cb(final_output, "final_output", il);
@@ -705,10 +703,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     // a batch with no outputs (the catch-up of the verified rows, a prompt) only leaves its K and V in the cache for the draft steps: store them as build_attn() does and skip the query, the attention, the FFN and the LM head
     // LLAMA_MTP_KV_ONLY_LEGACY=1: the whole head runs on every row, as before
-    static const bool kv_only_legacy = [] {
-        const char * v = getenv("LLAMA_MTP_KV_ONLY_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool kv_only_legacy = ggml_env_switch("LLAMA_MTP_KV_ONLY_LEGACY");
     if (n_outputs == 0 && !kv_only_legacy) {
         if (inp_attn->self_k_rot) {
             Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);

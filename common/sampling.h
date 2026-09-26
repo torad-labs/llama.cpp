@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -87,7 +88,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+// on_sample, if set, is called with each returned token's index and the token right after it is sampled and accepted,
+// while common_sampler_get_candidates still holds that token's row
+//
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false,
+        const std::function<void(size_t, llama_token)> & on_sample = nullptr);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
@@ -100,6 +105,10 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 // true while neither the grammar nor the reasoning budget would change the logits of the next token (no grammar, a lazy
 // one awaiting its trigger or held off while reasoning; a budget not forcing), so a backend-sampled token is valid
 bool common_sampler_backend_passive(const struct common_sampler * gsmpl);
+
+// k when the chain reads only the k largest logits of a row (its top-k picks first, no sampler before it changing a
+// logit), so a backend may take them in the graph for the CPU chain while the sampler is passive; 0 when it reads all
+int32_t common_sampler_backend_top_k(const struct common_sampler * gsmpl);
 
 // helpers
 

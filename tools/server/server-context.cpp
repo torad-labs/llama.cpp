@@ -203,40 +203,28 @@ struct server_batch {
 // LLAMA_SAMPLER_REPLAY_LEGACY=1: a slot's sampler is initialised by accepting every text token of the prompt, not only
 // the last common_sampler_n_history of them
 static bool sampler_replay_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLER_REPLAY_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLER_REPLAY_LEGACY");
     return legacy;
 }
 
 // LLAMA_CHECKPOINT_DEDUP_LEGACY=1: a context checkpoint is also created where one already is (the first batch after a
 // resume starts at the checkpoint it resumed from), copying the same state again
 static bool checkpoint_dedup_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_CHECKPOINT_DEDUP_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_CHECKPOINT_DEDUP_LEGACY");
     return legacy;
 }
 
 // LLAMA_CHECKPOINT_SPARE_LEGACY=1: a dropped context checkpoint's buffers are freed, and each new checkpoint allocates
 // its own (the behaviour before the slot kept a spare)
 static bool checkpoint_spare_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_CHECKPOINT_SPARE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_CHECKPOINT_SPARE_LEGACY");
     return legacy;
 }
 
 // LLAMA_SPEC_PROMPT_COPY_LEGACY=1: every draft round copies the prompt's text tokens for the drafters, even when the
 // slot's list is text only
 static bool spec_prompt_copy_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SPEC_PROMPT_COPY_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SPEC_PROMPT_COPY_LEGACY");
     return legacy;
 }
 
@@ -372,8 +360,12 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
-    // the sampler chain is attached to the context and the decode draws this slot's tokens on the backend
+    // the sampler chain, or smpl_top_k, is attached to the context and the decode draws this slot's tokens, or takes each
+    // row's top k, on the backend
     bool backend_sampler = false;
+
+    // the chain's top-k alone, taken on the backend for the chain drawing on the CPU (see launch_slot_with_task)
+    llama_sampler_ptr smpl_top_k;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -428,6 +420,7 @@ struct server_slot {
 
         llama_set_sampler(ctx_tgt, id, nullptr);
         backend_sampler = false;
+        smpl_top_k.reset();
 
         // clear alora start
         alora_invocation_start = -1;
@@ -442,6 +435,7 @@ struct server_slot {
         if (backend_sampler && !common_sampler_backend_passive(smpl.get())) {
             llama_set_sampler(ctx_tgt, id, nullptr);
             backend_sampler = false;
+            smpl_top_k.reset();
             SLT_INF(*this, "%s", "grammar or reasoning budget constrains the next token, sampling on the CPU\n");
         }
     }
@@ -1130,6 +1124,16 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
+        // the MTP head's options are read only where it drafts: without draft-mtp no draft context is built and the
+        // server would serve as if they had been taken (a vocabulary file never opened, a window never applied)
+        const auto & draft_opts = params_base.speculative.draft;
+        if (!spec_mtp && (!draft_opts.mtp_vocab.empty() || draft_opts.mtp_swa > 0 || draft_opts.mtp_decode_only ||
+                          draft_opts.mtp_window != common_params_speculative_draft{}.mtp_window)) {
+            SRV_ERR("%s", "--spec-draft-mtp-vocab, --spec-draft-mtp-swa, --spec-draft-mtp-decode-only and "
+                          "--spec-draft-mtp-window need the MTP head drafting (--spec-type draft-mtp)\n");
+            return false;
+        }
+
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {
@@ -1256,6 +1260,10 @@ private:
                 }
                 SRV_INF("training-pull detector on %zu layers, fires at p >= %.2f on a content token the prompt never states, action %s\n",
                         pull_k.size(), (double) params_base.pull_p, params_base.pull_action.c_str());
+                if (params_base.sampling.backend_sampling) {
+                    SRV_WRN("%s", "backend sampling (-bs) is off while the pull detector runs: it reads, and may edit, "
+                                  "the served logits before the sampler, so every slot samples on the CPU\n");
+                }
             }
             if (params_base.lens_out.empty()) {
                 SRV_WRN("%s", "--lens-layers without --lens-out: the lens is computed and never written\n");
@@ -1673,6 +1681,14 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+
+                // the caller defers the task while the slot is busy: nothing is saved or loaded under the running task
+                if (ret->is_processing()) {
+                    return ret;
+                }
+
+                // a slot with no tokens (an idle slot saved and cleared) keeps nothing, so its context can only come from the prompt cache
+                update_cache = ret->prompt.tokens.empty();
             }
         }
 
@@ -1713,7 +1729,7 @@ private:
                 }
             }
 
-            if (ret != nullptr) {
+            if (ret != nullptr && !ret->prompt.tokens.empty()) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
@@ -1922,6 +1938,21 @@ private:
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
                 slot.backend_sampler = false;
+            }
+            slot.smpl_top_k.reset(); // attached to no sequence after the calls above
+
+            // a chain drawing on the CPU from a row's k largest logits (common_sampler_backend_top_k) has the backend take
+            // them in the graph: a decode copies k logits a row instead of n_vocab and the CPU scans none, while the same
+            // chain and RNG draw, so each token is the one the CPU's top k gives. Not with a reader of every logit (the
+            // pre-sampling probabilities, the pull detector, the lens), and taken off as the chain is when a grammar or a
+            // reasoning budget starts to constrain (release_backend_sampler_if_constrained)
+            const int32_t top_k   = common_sampler_backend_top_k(slot.smpl.get());
+            const bool    lens_on = !params_base.lens_out.empty() && llama_n_lens_layers(ctx_tgt) > 0;
+            if (!slot.backend_sampler && top_k > 0 && !need_pre_sample_logits && pull_k.empty() && !lens_on &&
+                    common_sampler_backend_passive(slot.smpl.get())) {
+                slot.smpl_top_k.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                llama_sampler_chain_add(slot.smpl_top_k.get(), llama_sampler_init_top_k(top_k));
+                slot.backend_sampler = llama_set_sampler(ctx_tgt, slot.id, slot.smpl_top_k.get());
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -4124,8 +4155,17 @@ private:
                             is_last_user_message || near_prompt_end || is_requested ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
 
-                    // none where one already is: the first batch after a resume starts at the checkpoint it resumed from
-                    do_checkpoint = do_checkpoint && (checkpoint_dedup_legacy() || !has_checkpoint_at(n_tokens_start));
+                    // none where one already is (the first batch after a resume starts at the checkpoint it resumed from): the task
+                    // takes that one as its own, as it would a new one there, so the min-step thinning keeps it for the next tasks
+                    if (do_checkpoint && !checkpoint_dedup_legacy()) {
+                        for (auto & cur : slot.prompt.checkpoints) {
+                            if (cur.n_tokens == n_tokens_start) {
+                                cur.id_task   = slot.task->id;
+                                do_checkpoint = false;
+                                break;
+                            }
+                        }
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
@@ -4413,6 +4453,9 @@ private:
             // ids[i] was sampled from output row lens_rows[i]: the lens reads those rows after acceptance
             std::vector<int> lens_rows;
 
+            // the probabilities of ids[i] [n_probs], read as the verify loop samples it, as the plain path reads them
+            std::vector<completion_token_output> spec_probs;
+
             // verify and try to accept the draft
             {
                 // the saved sampler is read only when a partial acceptance restores the checkpoint (below):
@@ -4428,7 +4471,17 @@ private:
                 for (const auto idx : slot.spec_i_batch) {
                     pull_eval(slot, (int) idx);
                 }
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                std::function<void(size_t, llama_token)> on_sample;
+                if (slot.task->params.sampling.n_probs > 0) {
+                    on_sample = [&](size_t i, llama_token id) {
+                        completion_token_output out;
+                        out.tok  = id;
+                        out.prob = 1.0f;
+                        populate_token_probs(slot, out, slot.task->params.post_sampling_probs, params_base.special, slot.spec_i_batch[i]);
+                        spec_probs.push_back(std::move(out));
+                    };
+                }
+                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_sample);
                 // here, before a checkpoint restore rewinds the sampler to its passive state: the replay must sample the
                 // row after the switching token on the CPU, or it stops at the same token on every pass
                 slot.release_backend_sampler_if_constrained();
@@ -4524,9 +4577,12 @@ private:
 
                 result.tok          = ids[i];
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // set later
+                result.prob         = 1.0f;
 
-                // TODO: set result.probs
+                if (i < spec_probs.size()) {
+                    result.prob  = spec_probs[i].prob;
+                    result.probs = std::move(spec_probs[i].probs);
+                }
 
                 slot.stats.n_gen += 1;
 

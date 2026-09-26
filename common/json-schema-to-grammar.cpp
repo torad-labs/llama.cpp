@@ -1068,7 +1068,7 @@ public:
             out << ")";
             return _add_rule(rule_name, out.str());
         }
-        if (schema.empty() || schema_type == "object") {
+        if (schema_type == "object") {
             return _add_rule(rule_name, _add_primitive("object", PRIMITIVE_RULES.at("object")));
         }
         if (schema_type.is_null() && schema.is_object()) {
@@ -1231,15 +1231,18 @@ bool common_schema_info::resolves_to_string(const common_json & schema) {
 }
 
 std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf) {
+    auto copy = schema;
+    if (copy.is_object() && copy.empty()) {
+        copy["type"] = "object"; // an empty root accepts any object, with llguidance too; {} below it accepts any value
+    }
 #ifdef LLAMA_USE_LLGUIDANCE
     if (!force_gbnf) {
-        return "%llguidance {}\nstart: %json " + schema.dump();
+        return "%llguidance {}\nstart: %json " + copy.dump();
     }
 #else
     (void)force_gbnf;
 #endif // LLAMA_USE_LLGUIDANCE
     return build_grammar([&](const common_grammar_builder & callbacks) {
-        auto copy = schema;
         callbacks.resolve_refs(copy);
         callbacks.add_schema("", copy);
     });

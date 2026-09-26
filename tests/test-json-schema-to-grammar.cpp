@@ -350,6 +350,44 @@ static void test_all(const std::string & lang, std::function<void(const TestCase
 
     test({
         SUCCESS,
+        "empty sub-schemas (any value)",
+        R"""({
+            "type": "object",
+            "properties": {
+                "outputSchema": {"type": "object", "additionalProperties": {}},
+                "items": {"type": "array", "items": {}},
+                "anything": {}
+            }
+        })""",
+        R"""(
+            anything ::= value
+            anything-kv ::= "\"anything\"" space ":" space anything
+            array ::= "[" space ( value ("," space value)* )? space "]"
+            boolean ::= ("true" | "false")
+            char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+            decimal-part ::= [0-9]{1,16}
+            integral-part ::= [0] | [1-9] [0-9]{0,15}
+            items ::= "[" space (items-item ("," space items-item)*)? space "]"
+            items-item ::= value
+            items-kv ::= "\"items\"" space ":" space items
+            items-rest ::= ( "," space anything-kv )?
+            null ::= "null"
+            number ::= ("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)?
+            object ::= "{" space ( string ":" space value ("," space string ":" space value)* )? space "}"
+            outputSchema ::= "{" space  (outputSchema-additional-kv ( "," space outputSchema-additional-kv )* )? space "}"
+            outputSchema-additional-kv ::= string ":" space outputSchema-additional-value
+            outputSchema-additional-value ::= value
+            outputSchema-kv ::= "\"outputSchema\"" space ":" space outputSchema
+            outputSchema-rest ::= ( "," space items-kv )? items-rest
+            root ::= "{" space  (outputSchema-kv outputSchema-rest | items-kv items-rest | anything-kv )? space "}"
+            space ::= | " " | "\n"{1,2} [ \t]{0,20}
+            string ::= "\"" char* "\""
+            value ::= object | array | string | number | boolean | null
+        )"""
+    });
+
+    test({
+        SUCCESS,
         "exotic formats",
         R"""({
             "items": [
@@ -582,7 +620,7 @@ static void test_all(const std::string & lang, std::function<void(const TestCase
             char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
             decimal-part ::= [0-9]{1,16}
             integral-part ::= [0] | [1-9] [0-9]{0,15}
-            item ::= object
+            item ::= value
             null ::= "null"
             number ::= ("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)?
             object ::= "{" space ( string ":" space value ("," space string ":" space value)* )? space "}"
@@ -607,7 +645,7 @@ static void test_all(const std::string & lang, std::function<void(const TestCase
             char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
             decimal-part ::= [0-9]{1,16}
             integral-part ::= [0] | [1-9] [0-9]{0,15}
-            item ::= object
+            item ::= value
             null ::= "null"
             number ::= ("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)?
             object ::= "{" space ( string ":" space value ("," space string ":" space value)* )? space "}"

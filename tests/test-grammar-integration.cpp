@@ -1490,8 +1490,7 @@ static void test_trigger_literal_window() {
     const auto cls   = llama_grammar_trigger_pattern_init("\\d+");
     const auto empty = llama_grammar_trigger_pattern_init("");
     // LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY=1 keeps every trigger a regex; the equivalence below holds either way
-    const char * legacy_env = getenv("LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY");
-    const bool legacy = legacy_env != nullptr && atoi(legacy_env) != 0;
+    const bool legacy = ggml_env_switch("LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY");
     assert(word.is_literal == !legacy && (legacy || word.literal == "<function=write_file>"));
     assert(dots.is_literal == !legacy && (legacy || dots.literal == "a.b(c)"));
     assert(!regex.is_literal && !cls.is_literal && !empty.is_literal);

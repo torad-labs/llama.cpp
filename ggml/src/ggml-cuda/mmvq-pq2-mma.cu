@@ -452,10 +452,7 @@ static const pq2_mma_config & pq2_mma_get_config() {
 }
 
 static bool pq2_mma_legacy() {
-    static const bool legacy = [] {
-        const char * s = getenv("GGML_CUDA_PQ2_MMA_LEGACY");
-        return s != nullptr && atoi(s) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("GGML_CUDA_PQ2_MMA_LEGACY");
     return legacy;
 }
 

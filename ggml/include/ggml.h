@@ -2457,6 +2457,15 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // a hint that every row of the mask attends a prefix of the KV cells (one sequence per stream, causal, no window), so a
+    // backend that scans the mask for tiles to skip finds none at a decode-sized batch; the mask applies as always
+    GGML_API void ggml_flash_attn_ext_set_mask_prefix(
+            struct ggml_tensor * a,
+            bool                 mask_prefix);
+
+    GGML_API bool ggml_flash_attn_ext_get_mask_prefix(
+            const struct ggml_tensor * a);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2880,6 +2889,11 @@ extern "C" {
     // If this is not called, or NULL is supplied, everything is output on stderr.
     GGML_API void ggml_log_get(ggml_log_callback * log_callback, void ** user_data);
     GGML_API void ggml_log_set(ggml_log_callback   log_callback, void *  user_data);
+
+    // an off switch in the environment (the *_LEGACY variables): false when unset or set to "", 0, false, no or off, true
+    // when set to 1, true, yes, on or another number but 0 (words in any case, spaces around the value dropped); any other
+    // value is taken as on, with a warning
+    GGML_API bool ggml_env_switch(const char * name);
 
     GGML_API struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor);
 

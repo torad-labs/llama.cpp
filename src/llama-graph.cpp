@@ -2798,6 +2798,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
+        // one sequence, causal attention and no window: every row's mask is a prefix of the cells
+        ggml_flash_attn_ext_set_mask_prefix(cur, cparams.n_seq_max == 1 && cparams.causal_attn && il >= 0 && !hparams.is_swa(il));
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
@@ -3645,9 +3648,9 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
-    // A quantized state cannot be scaled in the graph (GGML_OP_SCALE is f32/f16 only); the memory
-    // context zeroes that row's bytes on the host before the graph runs (llama_memory_recurrent::zero_rs_z).
-    if (!ggml_is_quantized(s->type)) {
+    // Only an f32 state is scaled in the graph (GGML_OP_SCALE takes f32 only on the CPU and CUDA); the memory
+    // context zeroes any other type's row on the host before the graph runs (llama_memory_recurrent::zero_rs_z).
+    if (s->type == GGML_TYPE_F32) {
         ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
         ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
     }
@@ -3737,9 +3740,9 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
     // decode path, but it is a real multi-sequence hazard; the correct fix is
     // to order the relocation AFTER the GDN read (build_rs's read-before-write
     // ordering), which is a graph-dependency refactor left as follow-up.
-    // A quantized state cannot be scaled in the graph (GGML_OP_SCALE is f32/f16 only); the memory
-    // context zeroes that row's bytes on the host before the graph runs (llama_memory_recurrent::zero_rs_z).
-    if (!ggml_is_quantized(s->type)) {
+    // Only an f32 state is scaled in the graph (GGML_OP_SCALE takes f32 only on the CPU and CUDA); the memory
+    // context zeroes any other type's row on the host before the graph runs (llama_memory_recurrent::zero_rs_z).
+    if (s->type == GGML_TYPE_F32) {
         ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
         ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
     }

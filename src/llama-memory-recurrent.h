@@ -84,7 +84,7 @@ public:
     // first zero-ed state
     int32_t rs_z = -1;
 
-    // zero the rs_z row of every quantized S tensor on the host (see llm_graph_context::build_rs)
+    // zero the rs_z row of every non-f32 S tensor on the host (see llm_graph_context::build_rs)
     void zero_rs_z();
 
     // TODO: optimize for recurrent state needs

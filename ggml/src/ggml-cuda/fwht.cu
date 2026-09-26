@@ -311,7 +311,7 @@ __global__ void rms_norm_fwht_cuda(const float * x, const float * w, const float
 }
 
 static bool fwht_legacy() {
-    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
+    static const bool legacy = ggml_env_switch("GGML_CUDA_FWHT_LEGACY");
     return legacy;
 }
 
@@ -320,10 +320,7 @@ static bool fwht_legacy() {
 // writes. Until now they launched only after it finished, which put a launch between every Hadamard rotation and its
 // matmul and kept the matmul from requesting its weights early. GGML_CUDA_FWHT_PDL_LEGACY=1 restores that.
 static bool fwht_pdl_trigger() {
-    static const bool pdl_trigger = [] {
-        const char * s = getenv("GGML_CUDA_FWHT_PDL_LEGACY");
-        return s == nullptr || atoi(s) == 0;
-    }();
+    static const bool pdl_trigger = !ggml_env_switch("GGML_CUDA_FWHT_PDL_LEGACY");
     return pdl_trigger;
 }
 

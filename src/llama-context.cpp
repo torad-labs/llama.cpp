@@ -1373,18 +1373,12 @@ void llama_context::set_warmup(bool value) {
 
 // LLAMA_SAMPLER_DETACH_RESERVE_LEGACY=1: a sampler leaving the graph re-reserves the scheduler, as attaching one does
 static bool sampler_detach_reserve_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLER_DETACH_RESERVE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLER_DETACH_RESERVE_LEGACY");
     return legacy;
 }
 
 static bool sampler_attach_reserve_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLER_ATTACH_RESERVE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLER_ATTACH_RESERVE_LEGACY");
     return legacy;
 }
 
@@ -1394,13 +1388,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     }
 
     // the scheduler and its buffers were reserved with this sequence's sampler in the graph (graph_max_nodes counts
-    // its nodes): the graph without it fits them, and a changed sampler map already fails graph reuse, so a sampler
-    // that only leaves costs no reserve (~18 ms on a 27B hybrid, a stall of every slot mid-generation)
+    // its nodes): the graph without it fits them, so a sampler that only leaves costs no reserve (~18 ms on a 27B
+    // hybrid, a stall of every slot mid-generation)
     const bool reserve_on_detach = sampler_detach_reserve_legacy();
 
-    // the sampler this sequence drew from on the backend goes back to the CPU (a caller may keep sampling with it)
+    // the sampler this sequence drew from on the backend goes back to the CPU (a caller may keep sampling with it),
+    // and the graph built with it is not reused: graph reuse compares the sampler map by address, and a chain freed
+    // after it left and the next one allocated at its address before a decode compare equal to the graph built with
+    // the old one (its k, its temperature, the inputs released here). The reserve this replaced reset that graph too
     if (const auto it = sampling.samplers.find(seq_id); it != sampling.samplers.end() && it->second != sampler) {
         llama_sampler_backend_release(it->second);
+        gf_res_prev->reset();
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
