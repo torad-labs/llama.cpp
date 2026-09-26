@@ -3648,9 +3648,9 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
-    // A quantized state cannot be scaled in the graph (GGML_OP_SCALE is f32/f16 only); the memory
-    // context zeroes that row's bytes on the host before the graph runs (llama_memory_recurrent::zero_rs_z).
-    if (!ggml_is_quantized(s->type)) {
+    // Only an f32 state is scaled in the graph (GGML_OP_SCALE takes f32 only on the CPU and CUDA); the memory
+    // context zeroes any other type's row on the host before the graph runs (llama_memory_recurrent::zero_rs_z).
+    if (s->type == GGML_TYPE_F32) {
         ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
         ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
     }
@@ -3740,9 +3740,9 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
     // decode path, but it is a real multi-sequence hazard; the correct fix is
     // to order the relocation AFTER the GDN read (build_rs's read-before-write
     // ordering), which is a graph-dependency refactor left as follow-up.
-    // A quantized state cannot be scaled in the graph (GGML_OP_SCALE is f32/f16 only); the memory
-    // context zeroes that row's bytes on the host before the graph runs (llama_memory_recurrent::zero_rs_z).
-    if (!ggml_is_quantized(s->type)) {
+    // Only an f32 state is scaled in the graph (GGML_OP_SCALE takes f32 only on the CPU and CUDA); the memory
+    // context zeroes any other type's row on the host before the graph runs (llama_memory_recurrent::zero_rs_z).
+    if (s->type == GGML_TYPE_F32) {
         ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
         ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
     }

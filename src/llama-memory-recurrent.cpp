@@ -127,15 +127,15 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
-// the graph zeroes the rs_z row of a float state in place (llm_graph_context::build_rs); a quantized
-// state has no in-graph scale op, so its row is zeroed here, before the graph runs. All-zero bytes
-// are an exact zero for every block type (scale 0, quants 0).
+// the graph zeroes the rs_z row of an f32 state in place (llm_graph_context::build_rs); any other
+// state type (f16, bf16, a block type) has no in-graph scale op, so its row is zeroed here, before the
+// graph runs. All-zero bytes are an exact zero for f16, bf16 and every block type (scale 0, quants 0).
 void llama_memory_recurrent::zero_rs_z() {
     if (rs_z < 0) {
         return;
     }
     for (ggml_tensor * s : s_l) {
-        if (s == nullptr || !ggml_is_quantized(s->type)) {
+        if (s == nullptr || s->type == GGML_TYPE_F32) {
             continue;
         }
         ggml_backend_tensor_memset(s, 0, (size_t) rs_z * s->nb[1], s->nb[1]);
