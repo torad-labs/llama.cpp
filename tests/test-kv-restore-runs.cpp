@@ -163,18 +163,22 @@ int main(int argc, char ** argv) {
         { true,  GGML_TYPE_F16  }, // V in rows
         { true,  GGML_TYPE_Q4_0 }, // the served cache
     };
-    int n_fail = 0;
+    int n_fail    = 0;
+    int n_checked = 0;
+    int n_skipped = 0; // layouts
     for (const auto & layout : layouts) {
         // llama_init_from_model refuses a quantized cache whose blocks do not divide the heads
         const int64_t blck = ggml_blck_size(layout.type);
         if (head_width(model, "key_length") % blck != 0 || head_width(model, "value_length") % blck != 0) {
             fprintf(stderr, "fa %d, %s: skipped, the model's heads are not a multiple of %lld wide\n", layout.fa,
                     ggml_type_name(layout.type), (long long) blck);
+            n_skipped++;
             continue;
         }
         for (const int turn : { 1, 5 }) {
             for (const bool refill : { false, true }) {
                 n_fail += check(model, layout.fa, layout.type, turn, refill) ? 0 : 1;
+                n_checked++;
             }
         }
     }
@@ -182,6 +186,8 @@ int main(int argc, char ** argv) {
     llama_model_free(model);
     llama_backend_free();
 
-    fprintf(stderr, "%s\n", n_fail == 0 ? "all restores match" : "FAILED");
+    // the exit code says the restores checked match; the verdict also says how many layouts were not checked
+    fprintf(stderr, "%s: %d restores checked, %d failed, %d of %d layouts skipped\n", n_fail == 0 ? "all restores match" : "FAILED",
+            n_checked, n_fail, n_skipped, (int) (sizeof(layouts) / sizeof(layouts[0])));
     return n_fail == 0 ? 0 : 1;
 }
