@@ -446,10 +446,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    // rows mode reads the state row in place, so it needs an f32 cache: a quantized cache (-cts q8_0) takes the
-    // gathered path, whose get_rows dequantizes and whose set_rows quantizes back, as every non-Metal GPU already does.
+    // rows mode reads the state row in place, so it needs an f32 cache (ggml_gated_delta_net_rows asserts it): any
+    // other type (-cts f16, bf16, q8_0) takes the gathered path, whose get_rows converts the row to f32 and whose
+    // set_rows converts the snapshots back, as every non-Metal GPU already does.
     const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 &&
-                                !ggml_is_quantized(ssm_states_all->type);
+                                ssm_states_all->type == GGML_TYPE_F32;
 
     ggml_tensor * state;
     if (gdn_state_rows) {
