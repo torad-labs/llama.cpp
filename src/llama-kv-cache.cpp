@@ -2662,7 +2662,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                 // Read each range of cells of v_size_el length and write out
                 for (const auto & range : cr.data) {
                     const size_t range_size = range.second - range.first;
-                    const size_t src_offset = (range.first + j * kv_size) * v_size_el;
+                    // in 64 bits: n_embd_v_gqa * kv_size can reach 2^32
+                    const size_t src_offset = (range.first + (size_t) j * kv_size) * v_size_el;
                     const size_t buf_size = range_size * v_size_el;
                     io.write_tensor(v, src_offset, buf_size);
                 }
@@ -2950,19 +2951,20 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
+            // the offsets in 64 bits: n_embd_v_gqa * kv_size can reach 2^32
             if (cell_count) {
                 if (sinfo.is_contiguous()) {
                     // Fast path: contiguous cells
                     const uint32_t h = sinfo.head();
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        const size_t dst_offset = (h + j * cells.size()) * v_size_el;
+                        const size_t dst_offset = (h + (size_t) j * cells.size()) * v_size_el;
                         io.read_tensor(v, dst_offset, cell_count * v_size_el);
                     }
                 } else {
                     // Slow path: scatter to non-contiguous positions, a run of cells at a time
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                         for (const auto & [c0, n] : runs) {
-                            io.read_tensor(v, (c0 + j * cells.size()) * v_size_el, n * v_size_el);
+                            io.read_tensor(v, (c0 + (size_t) j * cells.size()) * v_size_el, n * v_size_el);
                         }
                     }
                 }
