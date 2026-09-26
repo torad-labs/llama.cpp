@@ -1273,10 +1273,13 @@ static __global__ void flash_attn_stream_k_fixup_live(
         const float2 * dst_fixup_ptr,
         const int * KV_live,
         const int ne01, const int ne02, const int ne03, const int ne12, const int nblocks,
-        const int gqa_ratio, const int iter_k, const int iter_j, const int iter_z_gqa) {
+        const int gqa_ratio, const int iter_k, const int iter_j, const int iter_z_gqa, const int fixup_legacy) {
     float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
     const float2 * GGML_CUDA_RESTRICT dst_fixup = dst_fixup_ptr;
     constexpr int ncols = ncols1*ncols2;
+    if (!fixup_legacy) {
+        ggml_cuda_pdl_lc();
+    }
 
     const int tile = blockIdx.x; // ((sequence*ne12 + z_KV)*iter_z_gqa + zt_gqa)*iter_j + jt
     const int j    = blockIdx.y;
@@ -1323,8 +1326,11 @@ static __global__ void flash_attn_stream_k_fixup_live(
         rowsum  = tmp.y;
     }
 
+    // A block can have no unit of work only when there are fewer units than blocks; the test is two 64-bit divisions ahead of
+    // every load, so it runs only then.
+    const bool maybe_empty = fixup_legacy || total_work < nblocks;
     for (int bidx = b_last - 1; bidx >= b_first; --bidx) {
-        if (int64_t(bidx)*total_work / nblocks == int64_t(bidx + 1)*total_work / nblocks) {
+        if (maybe_empty && int64_t(bidx)*total_work / nblocks == int64_t(bidx + 1)*total_work / nblocks) {
             continue; // Did not have any data.
         }
 
@@ -1550,6 +1556,12 @@ void launch_fattn(
         const char * v = getenv("GGML_CUDA_FATTN_LIVE_TILES_LEGACY");
         return v != nullptr && atoi(v) != 0;
     }();
+    // The live fixup tests the blocks it combines for an empty range only when there can be one (fewer units of work than
+    // blocks), and lets the next kernel launch as it starts. GGML_CUDA_FATTN_LIVE_FIXUP_LEGACY=1: it tests every block and does not.
+    static const bool kv_live_fixup_legacy = [] {
+        const char * v = getenv("GGML_CUDA_FATTN_LIVE_FIXUP_LEGACY");
+        return v != nullptr && atoi(v) != 0;
+    }();
     const bool kv_live = kv_live_ok && !kv_live_legacy && stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && mask && K->ne[1] >= 4096 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 && (nbatch_fa == 32 || nbatch_fa == 64) &&
         (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0;
@@ -1736,7 +1748,7 @@ void launch_fattn(
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_live<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr, KV_live.ptr,
                  Q->ne[1], Q->ne[2], Q->ne[3], K->ne[2], (int)blocks_num.x,
-                 gqa_ratio, K->ne[1] / nbatch_fa, ntiles_x, ntiles_z_gqa);
+                 gqa_ratio, K->ne[1] / nbatch_fa, ntiles_x, ntiles_z_gqa, kv_live_fixup_legacy ? 1 : 0);
         } else if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
             // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
             const int nblocks_sk  = (int)blocks_num.x;
