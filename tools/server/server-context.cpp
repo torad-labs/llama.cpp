@@ -1673,6 +1673,14 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+
+                // the caller defers the task while the slot is busy: nothing is saved or loaded under the running task
+                if (ret->is_processing()) {
+                    return ret;
+                }
+
+                // a slot with no tokens (an idle slot saved and cleared) keeps nothing, so its context can only come from the prompt cache
+                update_cache = ret->prompt.tokens.empty();
             }
         }
 
@@ -1713,7 +1721,7 @@ private:
                 }
             }
 
-            if (ret != nullptr) {
+            if (ret != nullptr && !ret->prompt.tokens.empty()) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
