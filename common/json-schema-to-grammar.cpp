@@ -1231,19 +1231,19 @@ bool common_schema_info::resolves_to_string(const common_json & schema) {
 }
 
 std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf) {
+    auto copy = schema;
+    if (copy.is_object() && copy.empty()) {
+        copy["type"] = "object"; // an empty root accepts any object, with llguidance too; {} below it accepts any value
+    }
 #ifdef LLAMA_USE_LLGUIDANCE
     if (!force_gbnf) {
-        return "%llguidance {}\nstart: %json " + schema.dump();
+        return "%llguidance {}\nstart: %json " + copy.dump();
     }
 #else
     (void)force_gbnf;
 #endif // LLAMA_USE_LLGUIDANCE
     return build_grammar([&](const common_grammar_builder & callbacks) {
-        auto copy = schema;
         callbacks.resolve_refs(copy);
-        if (copy.is_object() && copy.empty()) {
-            copy["type"] = "object"; // an empty root accepts any object; {} below it accepts any value
-        }
         callbacks.add_schema("", copy);
     });
 }
