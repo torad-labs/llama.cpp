@@ -814,7 +814,7 @@ struct ggml_backend_sched {
     // staging slot (host memory of the backend's device) and set asynchronously on the backend's stream, which runs it
     // after the work still reading the destination; the two slots alternate per compute, each waited on before its reuse
     bool async_inputs;
-    bool staging_off[GGML_SCHED_MAX_BACKENDS]; // the backend has no host buffer type, events or async set
+    bool staging_off[GGML_SCHED_MAX_BACKENDS]; // the backend has no host buffer type, events or async set in its compute's queue
     struct {
         ggml_backend_buffer_t buf;
         ggml_backend_event_t  event;    // recorded after the copies out of buf
@@ -1625,6 +1625,18 @@ static bool ggml_backend_sched_input_stageable(ggml_backend_sched_t sched, int b
         ggml_nbytes(input) <= GGML_SCHED_STAGING_MAX_INPUT;
 }
 
+// the backend runs an async set in the queue of its compute, after the work still reading the destination: a CUDA stream
+// (CUDA, ROCm, MUSA). Another may run it in a queue of its own (Vulkan's transfer queue on AMD) and overwrite an input copy
+// its last compute still reads, so its inputs keep the synchronous copy
+static bool ggml_backend_sched_set_async_in_order(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == NULL) {
+        return false;
+    }
+    const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+    return strcmp(reg, "CUDA") == 0 || strcmp(reg, "ROCm") == 0 || strcmp(reg, "MUSA") == 0;
+}
+
 // the staging slot of a backend for this compute, with room for size bytes; false when the backend cannot stage
 static bool ggml_backend_sched_staging_reserve(ggml_backend_sched_t sched, int backend_id, int slot, size_t size) {
     auto & st = sched->staging[backend_id][slot];
@@ -1634,9 +1646,16 @@ static bool ggml_backend_sched_staging_reserve(ggml_backend_sched_t sched, int b
 
     if (st.event == NULL) {
         // the async set writes into the backend's own buffer type, where the scheduler keeps the input copies
-        const bool own_buft = sched->bufts[backend_id] == ggml_backend_get_default_buffer_type(backend);
-        st.event = own_buft && host_buft != NULL && backend->iface.event_record != NULL ? ggml_backend_event_new(dev) : NULL;
+        const bool own_buft  = sched->bufts[backend_id] == ggml_backend_get_default_buffer_type(backend);
+        const bool can_stage = own_buft && host_buft != NULL && backend->iface.event_record != NULL &&
+            ggml_backend_sched_set_async_in_order(backend);
+        st.event = can_stage ? ggml_backend_event_new(dev) : NULL;
         if (st.event == NULL) {
+            if (can_stage) {
+                GGML_LOG_WARN("%s: no event on %s: its inputs are copied synchronously\n", __func__, ggml_backend_name(backend));
+            } else {
+                GGML_LOG_DEBUG("%s: %s cannot stage its inputs: they are copied synchronously\n", __func__, ggml_backend_name(backend));
+            }
             sched->staging_off[backend_id] = true;
             return false;
         }
@@ -1650,6 +1669,8 @@ static bool ggml_backend_sched_staging_reserve(ggml_backend_sched_t sched, int b
         ggml_backend_buffer_free(st.buf);
         st.buf = ggml_backend_buft_alloc_buffer(host_buft, std::max<size_t>(2*size, 64*1024));
         if (st.buf == NULL) {
+            GGML_LOG_WARN("%s: no staging buffer of %zu bytes for %s: its inputs are copied synchronously from now on\n",
+                __func__, std::max<size_t>(2*size, 64*1024), ggml_backend_name(backend));
             sched->staging_off[backend_id] = true;
             return false;
         }
