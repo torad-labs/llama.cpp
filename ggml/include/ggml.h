@@ -2891,7 +2891,8 @@ extern "C" {
     GGML_API void ggml_log_set(ggml_log_callback   log_callback, void *  user_data);
 
     // an off switch in the environment (the *_LEGACY variables): false when unset or set to "", 0, false, no or off, true
-    // when set to 1, true, yes, on or another number but 0 (words in any case); any other value is taken as on, with a warning
+    // when set to 1, true, yes, on or another number but 0 (words in any case, spaces around the value dropped); any other
+    // value is taken as on, with a warning
     GGML_API bool ggml_env_switch(const char * name);
 
     GGML_API struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor);

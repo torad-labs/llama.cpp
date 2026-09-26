@@ -289,11 +289,11 @@ static void test(void) {
 
     unsetenv("LLAMA_TEST_SWITCH_LEGACY");
     assert(!ggml_env_switch("LLAMA_TEST_SWITCH_LEGACY"));
-    for (const char * off : { "", "0", "00", "false", "No", "OFF" }) {
+    for (const char * off : { "", "0", "00", "false", "No", "OFF", " \t", "0\r", " off\n" }) {
         setenv("LLAMA_TEST_SWITCH_LEGACY", off, true);
         assert(!ggml_env_switch("LLAMA_TEST_SWITCH_LEGACY"));
     }
-    for (const char * on : { "1", "2", "-1", "true", "YES", "On", "enable" }) { // "enable" with a warning
+    for (const char * on : { "1", "2", "-1", "true", "YES", "On", "1\r", " yes ", "enable", "0 0" }) { // the last two with a warning
         setenv("LLAMA_TEST_SWITCH_LEGACY", on, true);
         assert(ggml_env_switch("LLAMA_TEST_SWITCH_LEGACY"));
     }

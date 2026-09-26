@@ -8158,15 +8158,20 @@ void ggml_log_set(ggml_log_callback log_callback, void * user_data) {
     g_logger_state.log_callback_user_data = user_data;
 }
 
-// the value is the word, in any case
-static bool ggml_env_value_is(const char * value, const char * word) {
-    for (; *value != '\0' && *word != '\0'; ++value, ++word) {
-        const char c = *value >= 'A' && *value <= 'Z' ? (char) (*value - 'A' + 'a') : *value;
-        if (c != *word) {
+static bool ggml_env_space(char c) {
+    return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
+// value[0, n) is the word, in any case
+static bool ggml_env_value_is(const char * value, size_t n, const char * word) {
+    size_t i = 0;
+    for (; i < n && word[i] != '\0'; ++i) {
+        const char c = value[i] >= 'A' && value[i] <= 'Z' ? (char) (value[i] - 'A' + 'a') : value[i];
+        if (c != word[i]) {
             return false;
         }
     }
-    return *value == '\0' && *word == '\0';
+    return i == n && word[i] == '\0';
 }
 
 bool ggml_env_switch(const char * name) {
@@ -8174,24 +8179,32 @@ bool ggml_env_switch(const char * name) {
     if (value == NULL) {
         return false;
     }
+    // the spaces around the value are dropped: an env file with CRLF lines ends every value with \r
+    while (ggml_env_space(*value)) {
+        ++value;
+    }
+    size_t n = strlen(value);
+    while (n > 0 && ggml_env_space(value[n - 1])) {
+        --n;
+    }
     static const char * const off[] = { "", "0", "false", "no", "off" };
     static const char * const on[]  = { "1", "true", "yes", "on" };
     for (size_t i = 0; i < sizeof(off)/sizeof(off[0]); ++i) {
-        if (ggml_env_value_is(value, off[i])) {
+        if (ggml_env_value_is(value, n, off[i])) {
             return false;
         }
     }
     for (size_t i = 0; i < sizeof(on)/sizeof(on[0]); ++i) {
-        if (ggml_env_value_is(value, on[i])) {
+        if (ggml_env_value_is(value, n, on[i])) {
             return true;
         }
     }
     char * end = NULL;
     const long number = strtol(value, &end, 10);
-    if (end != value && *end == '\0') {
+    if (end != value && end == value + n) {
         return number != 0;
     }
-    GGML_LOG_WARN("%s=%s is none of 1/0, true/false, yes/no, on/off: taken as on\n", name, value);
+    GGML_LOG_WARN("%s=%.*s is none of 1/0, true/false, yes/no, on/off: taken as on\n", name, (int) n, value);
     return true;
 }
 
