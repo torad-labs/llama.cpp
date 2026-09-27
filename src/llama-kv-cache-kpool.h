@@ -44,6 +44,20 @@ void llama_kv_cache_set_input_kpool(
         const llama_ubatch   * ubatch,
               uint32_t         kpool);
 
+// current decode geometry for the reuse check below, in the same units the
+// builder sizes the tensors with (llm_graph_context::build_inp_kpool)
+struct llm_graph_input_kpool_dims {
+    int64_t n_kv      = 0;
+    int64_t n_tokens  = 0;
+    int64_t n_stream  = 0;
+    int64_t n_tps     = 0;
+    int64_t n_ps      = 0;
+    int64_t n_pools   = 0;
+    int64_t n_new_max = 0;
+    bool    rebuild   = false;
+    bool    scoring   = false;
+};
+
 // one map per ubatch; valid only while every indexer layer sees the same candidate set
 class llm_graph_input_kpool : public llm_graph_input_i {
 public:
@@ -55,6 +69,19 @@ public:
     ~llm_graph_input_kpool() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // gather the geometry the builder sizes the tensors with, for the check below
+    static llm_graph_input_kpool_dims current_dims(
+            const llama_kv_cache_context * mctx_attn,
+            const llama_ubatch           & ubatch,
+            const llama_cparams          & cparams,
+            const llama_hparams          & hparams,
+            uint32_t                       kpool);
+
+    // pure shape check, unit-testable without a memory context
+    static bool shapes_match(const llm_graph_input_kpool_dims & dims, const llm_graph_input_kpool & inp);
 
     ggml_tensor * k_idxs     = nullptr;   // I32 [n_tokens]
     ggml_tensor * pool_cells = nullptr;   // I32 [kpool*n_pools, n_stream]

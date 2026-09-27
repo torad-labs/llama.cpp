@@ -568,6 +568,98 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
     return res;
 }
 
+llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
+        const llama_kv_cache_context * mctx_attn,
+        const llama_ubatch           & ubatch,
+        const llama_cparams          & cparams,
+        const llama_hparams          & hparams,
+        uint32_t                       kpool) {
+    llm_graph_input_kpool_dims dims;
+
+    if (kpool == 0) {
+        return dims;
+    }
+
+    dims.n_kv     = mctx_attn->get_n_kv();
+    dims.n_tokens = ubatch.n_tokens;
+    dims.n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    if (dims.n_stream < 1) {
+        return dims;
+    }
+    dims.n_tps   = ubatch.n_tokens/dims.n_stream;
+    dims.n_ps    = ubatch.n_seqs_unq/dims.n_stream;
+    dims.n_pools = dims.n_kv/kpool + 2*dims.n_ps;
+    dims.rebuild = mctx_attn->get_kv()->get_kpool_dirty();
+    dims.n_new_max = dims.rebuild ? dims.n_pools : dims.n_tps/kpool + dims.n_ps;
+    // same gate as the builder (glm5next_n_select == indexer_top_k + kpool - 1)
+    dims.scoring = cparams.n_ctx > hparams.indexer_top_k + kpool - 1;
+
+    return dims;
+}
+
+bool llm_graph_input_kpool::shapes_match(const llm_graph_input_kpool_dims & dims, const llm_graph_input_kpool & inp) {
+    bool res = true;
+
+    res &= dims.n_stream >= 1;
+    res &= inp.k_idxs && inp.k_idxs->ne[0] == dims.n_tokens;
+
+    // the scoring structure is fixed per context; a flip means a different graph
+    res &= (inp.pool_cells != nullptr) == dims.scoring;
+    if (inp.pool_cells == nullptr) {
+        return res;
+    }
+
+    res &= inp.pool_cells->ne[0] == (int64_t) inp.kpool*dims.n_pools;
+    res &= inp.pool_cells->ne[1] == dims.n_stream;
+
+    res &= inp.pool_bias->ne[0] == dims.n_pools;
+    res &= inp.pool_bias->ne[1] == dims.n_tps;
+    res &= inp.pool_bias->ne[2] == dims.n_stream;
+
+    if (inp.pool_bias_f16) {
+        res &= inp.pool_bias_f16->ne[0] == dims.n_pools;
+        res &= inp.pool_bias_f16->ne[1] == dims.n_tps;
+        res &= inp.pool_bias_f16->ne[2] == 1;
+        res &= inp.pool_bias_f16->ne[3] == dims.n_stream;
+    }
+
+    res &= inp.sel_mask->ne[0] == dims.n_kv;
+    res &= inp.sel_mask->ne[1] == dims.n_tps;
+    res &= inp.sel_mask->ne[2] == 1;
+    res &= inp.sel_mask->ne[3] == dims.n_stream;
+
+    res &= inp.cand_mask->ne[0] == dims.n_kv;
+    res &= inp.cand_mask->ne[1] == dims.n_tps;
+    res &= inp.cand_mask->ne[2] == 1;
+    res &= inp.cand_mask->ne[3] == dims.n_stream;
+
+    res &= inp.pool_reps->ne[0] == dims.n_pools;
+    res &= inp.pool_reps->ne[1] == dims.n_stream;
+
+    res &= inp.rebuild == dims.rebuild;
+    res &= (int64_t) inp.n_new_max == dims.n_new_max;
+
+    res &= inp.new_pool_cells->ne[0] == (int64_t) inp.kpool*dims.n_new_max;
+    res &= inp.new_pool_cells->ne[1] == dims.n_stream;
+
+    res &= inp.new_pool_reps->ne[0] == dims.n_new_max*dims.n_stream;
+
+    return res;
+}
+
+bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+
+    mctx_attn = mctx_hyb->get_attn();
+    mctx_idx  = mctx_hyb->get_idx();
+
+    if (mctx_attn == nullptr || mctx_idx == nullptr) {
+        return false;
+    }
+
+    return shapes_match(current_dims(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool), *this);
+}
+
 llm_graph_input_attn_kv_msa::llm_graph_input_attn_kv_msa(
         const llama_hparams & hparams,
         const llama_cparams & cparams,
