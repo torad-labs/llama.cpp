@@ -11212,9 +11212,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // GQA 6 (Qwen3.5-27B) with a q4_0 cache: odd head groups, all kernel choices from vec to mma
-    for (int nb : { 1, 3, 32, 75, 512, }) {
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    // GQA 6 (Qwen3.5-27B) with a q4_0 or q8_0 cache: odd head groups, all kernel choices from vec to mma
+    // (8 and 13 tokens, a drafted verify batch, take the 8 token x 8 head tile, full and partial)
+    for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, }) {
+        for (int kv : { 2048, 4096, }) {
+            for (int nb : { 1, 3, 8, 13, 32, 75, 512, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
     }
 
     // bit-packed mask: the served head's shape through every kernel choice (vec at nb 1 with an f16 cache, q4_0 mma, mma prefill),
@@ -11923,14 +11928,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
-    // Qwen3.5-27B: 4 KV heads, GQA 6, q4_0 cache, prefill ubatch at depth
-    for (int kv : { 16384, 65536, 131072, }) {
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    // Qwen3.5-27B: 4 KV heads, GQA 6, q4_0 or q8_0 cache, prefill ubatch at depth
+    for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, }) {
+        for (int kv : { 16384, 65536, 131072, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
     }
     // ... and decode, one and two sequences, at depth
-    for (int kv : { 4096, 65536, 262144, }) {
-        for (int nb : { 1, 2, }) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, }) {
+        for (int kv : { 2048, 4096, 65536, 262144, }) {
+            for (int nb : { 1, 2, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
         }
     }
     // ... one slot's decode and MTP verify at the served depth, bit mask, without and with the mask-prefix hint

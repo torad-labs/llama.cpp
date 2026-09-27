@@ -110,23 +110,35 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 }
 
-// q4_0 K/V with head size 256 and GQA > 4 are read by the MMA kernel directly, without the f16 copy of K and V.
-// Must match the ncols2 == 8 choice of ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2, it also sizes the f16 buffer.
-// GGML_CUDA_FATTN_Q4_0_LEGACY restores the stock kernels (the f16 copy, the vector kernel for decode): the A/B for
-// this path within one binary, and its off switch.
-static bool ggml_cuda_fattn_mma_q4_0(const int cc, const ggml_tensor * dst) {
-    static const bool legacy = ggml_env_switch("GGML_CUDA_FATTN_Q4_0_LEGACY");
-    if (legacy) {
-        return false;
-    }
+// q4_0 or q8_0 K/V (both of one type) with head size 256 and GQA > 4 are read by the MMA kernel directly, without the
+// f16 copy of K and V. Must match the ncols2 == 8 choice of ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2, it also
+// sizes the f16 buffer. GGML_CUDA_FATTN_Q4_0_LEGACY / GGML_CUDA_FATTN_Q8_0_LEGACY restore the stock kernels for that
+// type (the f16 copy, the vector kernel for decode): the A/B for each path within one binary, and its off switch.
+static bool ggml_cuda_fattn_mma_raw(const int cc, const ggml_tensor * dst) {
+    static const bool legacy_q4_0 = ggml_env_switch("GGML_CUDA_FATTN_Q4_0_LEGACY");
+    static const bool legacy_q8_0 = ggml_env_switch("GGML_CUDA_FATTN_Q8_0_LEGACY");
 
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
-    if (K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0 || K->ne[0] != 256 || V->ne[0] != 256) {
+    if (K->type != V->type || K->ne[0] != 256 || V->ne[0] != 256) {
         return false;
+    }
+    switch (K->type) {
+        case GGML_TYPE_Q4_0:
+            if (legacy_q4_0) {
+                return false;
+            }
+            break;
+        case GGML_TYPE_Q8_0:
+            if (legacy_q8_0) {
+                return false;
+            }
+            break;
+        default:
+            return false;
     }
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc)) {
         return false; // needs cp.async and the int8 m16n8k32 MMA
@@ -147,8 +159,8 @@ static bool ggml_cuda_fattn_mma_q4_0(const int cc, const ggml_tensor * dst) {
     return true;
 }
 
-template <int DKQ, int DV>
-static void ggml_cuda_flash_attn_ext_mma_q4_0_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <int DKQ, int DV, ggml_type type_KV>
+static void ggml_cuda_flash_attn_ext_mma_raw_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr int ncols2 = 8;
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -159,21 +171,21 @@ static void ggml_cuda_flash_attn_ext_mma_q4_0_switch_ncols1(ggml_backend_cuda_co
     // tile of the same width has no padding, and every K/V tile it reads serves 64 Q columns instead of 48.
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     if (gqa_ratio % 8 != 0 && gqa_ratio % 2 == 0 && Q->ne[1] >= 32) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32, 2, true>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32, 2, type_KV, type_KV>(ctx, dst);
         return;
     }
 
     // A single token also takes the 2 token tile: K*Q with 16 Q columns per warp runs on int8 tensor cores
-    // (flash_attn_ext_q4_0_KQ), which beat the 1 token tile at every context length tried (4096 to 262144).
+    // (flash_attn_ext_raw_KQ), which beat the 1 token tile at every context length tried (4096 to 262144).
     if (Q->ne[1] <= 16/ncols2) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, true>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, type_KV, type_KV>(ctx, dst);
         return;
     }
     if (Q->ne[1] <= 32/ncols2) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, true>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, type_KV, type_KV>(ctx, dst);
         return;
     }
-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, true>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, type_KV, type_KV>(ctx, dst);
 }
 
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -223,8 +235,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         } break;
         case 256:
             GGML_ASSERT(V->ne[0] == 256);
-            if (ggml_cuda_fattn_mma_q4_0(cc, dst)) {
-                ggml_cuda_flash_attn_ext_mma_q4_0_switch_ncols1<256, 256>(ctx, dst);
+            if (ggml_cuda_fattn_mma_raw(cc, dst)) {
+                if (K->type == GGML_TYPE_Q4_0) {
+                    ggml_cuda_flash_attn_ext_mma_raw_switch_ncols1<256, 256, GGML_TYPE_Q4_0>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_mma_raw_switch_ncols1<256, 256, GGML_TYPE_Q8_0>(ctx, dst);
+                }
                 break;
             }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);
@@ -546,9 +562,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    // The vector kernel reads K and V once per Q head, the q4_0 MMA kernel once per GQA group.
-                    // Decoding on an RTX 5080 the MMA kernel is ahead from 4096 tokens of context on (llama-bench tg64).
-                    if (Q->ne[1] <= 2 && !(K->ne[1] >= 4096 && ggml_cuda_fattn_mma_q4_0(cc, dst))) {
+                    // The vector kernel reads K and V once per Q head, the raw q4_0 / q8_0 MMA kernel once per GQA group.
+                    // Decoding on an RTX 5080 the MMA kernel is ahead from 4096 tokens of context on (llama-bench tg64);
+                    // q8_0 on an RTX 5090 too: level at 4096, +4 % at 8192, +10 % at 16384, 1.86x at 245760.
+                    if (Q->ne[1] <= 2 && !(K->ne[1] >= 4096 && ggml_cuda_fattn_mma_raw(cc, dst))) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
@@ -635,7 +652,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = true;
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = !ggml_cuda_fattn_mma_q4_0(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_K = !ggml_cuda_fattn_mma_raw(ggml_cuda_info().devices[device].cc, dst);
             need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC:
