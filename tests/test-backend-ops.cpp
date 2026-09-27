@@ -11687,6 +11687,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Ternary Bonsai 2 27B's attention as served (q4_0 K/V, a bit-packed mask, 4 KV heads at GQA 6, head size 256) at
+    // the depths it serves, for a decode token and an MTP verify at n_max 3. K and V are laid out as the KV cache's
+    // views are (llama_kv_cache::get_k, permuted in build_attn_mha): the 4 heads of a cell together, a head's cells
+    // 4*144 bytes apart
+    for (int64_t kv : { 16384, 65536, 131072, 245760 }) {
+        for (int64_t nb : { 1, 4 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, false, false, /*mask_bits=*/true));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
