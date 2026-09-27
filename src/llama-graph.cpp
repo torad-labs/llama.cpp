@@ -375,20 +375,26 @@ void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mct
 }
 
 bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mctx_cur, const llm_graph_params & params) {
-    bool res = true;
+    const int64_t n_write = s_write_rows ?
+        std::min<int64_t>(params.ubatch.n_seq_tokens, s_write_K) * params.ubatch.n_seqs : 0;
 
-    res &= s_copy->ne[0] == mctx_cur->get_n_rs();
+    const bool ok_copy  = s_copy->ne[0] == mctx_cur->get_n_rs();
+    const bool ok_main  = s_copy_main->ne[0]  == params.ubatch.n_seqs;
+    const bool ok_extra = s_copy_extra->ne[0] == mctx_cur->get_n_rs() - params.ubatch.n_seqs;
+    const bool ok_write = !s_write_rows || s_write_rows->ne[0] == n_write;
+    const bool ok_head  = head == mctx_cur->get_head();
+    const bool ok_rs_z  = rs_z == mctx_cur->get_rs_z();
 
-    res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= s_copy_extra->ne[0] == mctx_cur->get_n_rs() - params.ubatch.n_seqs;
+    const bool res = ok_copy && ok_main && ok_extra && ok_write && ok_head && ok_rs_z;
 
-    if (s_write_rows) {
-        res &= s_write_rows->ne[0] ==
-            std::min<int64_t>(params.ubatch.n_seq_tokens, s_write_K) * params.ubatch.n_seqs;
+    // LLAMA_GRAPH_INPUT_DEBUG=2: which of the checks refused, with both sides of the ones baked into the graph
+    if (debug > 1 && !res) {
+        LLAMA_LOG_DEBUG("%s: s_copy=%d main=%d extra=%d write=%d (%lld vs %lld) head=%d (%u vs %u) "
+                "rs_z=%d (%d vs %d), n_rs %u, ubatch %u tokens x %u seqs\n", __func__,
+                ok_copy, ok_main, ok_extra, ok_write, (long long) (s_write_rows ? s_write_rows->ne[0] : 0), (long long) n_write,
+                ok_head, head, mctx_cur->get_head(), ok_rs_z, rs_z, mctx_cur->get_rs_z(),
+                mctx_cur->get_n_rs(), params.ubatch.n_seq_tokens, params.ubatch.n_seqs);
     }
-
-    res &= head == mctx_cur->get_head();
-    res &= rs_z == mctx_cur->get_rs_z();
 
     return res;
 }
