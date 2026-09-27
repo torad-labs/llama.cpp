@@ -580,6 +580,14 @@ static constexpr __host__ __device__ int fattn_raw_row_bytes() {
     return (D/QK8_0)*fattn_raw_block_bytes<type>();
 }
 
+// The K tile's shared memory in half2, the multi-stage pipeline's: f16 K, nbatch_fa rows of stride_tile_K; raw K, none, K*Q
+// reads the raw tile (flash_attn_ext_raw_KQ). An f16-sized region for raw K was 16 KB of the 43 KB that held the head-256
+// decode tile at 2 blocks per SM; at 26 KB it runs 3.
+static constexpr __host__ __device__ int fattn_mma_tile_K_h2(
+        const ggml_type type_K, const int nbatch_fa, const int stride_tile_K) {
+    return type_K == GGML_TYPE_F16 ? nbatch_fa*stride_tile_K : 0;
+}
+
 template<ggml_type type, int D, int nwarps, int nbatch_fa>
 static __device__ __forceinline__ void flash_attn_ext_raw_load(
         const char * const __restrict__ KV, char * const __restrict__ tile_raw, const int stride_KV) {
@@ -607,6 +615,10 @@ static __device__ __forceinline__ void flash_attn_ext_raw_load(
 // Each thread converts 2 blocks (36 bytes for q4_0, 68 for q8_0, 4-byte aligned). The result is bit-identical to
 // dequantize_block_q4_0 and dequantize_block_q8_0: the integer values are exact in f16 and one __hmul2 rounds the
 // product with the block scale once, as the f32 product converted to f16 does.
+// 8 consecutive threads take the same block pair of 8 consecutive rows. A 16-byte store is served 8 threads at a time,
+// and a row stride of an odd number of 16 bytes puts 8 rows in 8 distinct bank quads; 8 threads on 2 rows hit 2, a
+// 4-way conflict that was 3.2M of the 4.4M shared store wavefronts (ncu, RTX 5080, head 256 at 65,536 cells). A warp
+// still loads 8 rows x 4 block pairs, the same conflict-free set of raw words as before.
 template<ggml_type type, int D, int nwarps, int nbatch_fa, int stride_tile>
 static __device__ __forceinline__ void flash_attn_ext_raw_dequant_tile(
         const char * const __restrict__ tile_raw, half2 * const __restrict__ tile) {
@@ -616,6 +628,8 @@ static __device__ __forceinline__ void flash_attn_ext_raw_dequant_tile(
     constexpr int npairs        = nbatch_fa*pairs_per_row;
     constexpr int pair_words    = 2*fattn_raw_block_bytes<type>()/sizeof(int);
     static_assert(D % (2*QK8_0) == 0, "bad D");
+    static_assert(nbatch_fa % 8 == 0, "bad nbatch_fa");
+    static_assert(stride_tile*sizeof(half2) % 32 == 16, "the row stride must be an odd number of 16 bytes");
 
 #pragma unroll
     for (int p0 = 0; p0 < npairs; p0 += nwarps*warp_size) {
@@ -625,8 +639,8 @@ static __device__ __forceinline__ void flash_attn_ext_raw_dequant_tile(
             break;
         }
 
-        const int i  = p / pairs_per_row;
-        const int bp = p % pairs_per_row;
+        const int i  = p % 8 + 8*(p / (8*pairs_per_row));
+        const int bp = (p / 8) % pairs_per_row;
 
         const int * src = (const int *) (tile_raw + i*fattn_raw_row_bytes<type, D>() + bp*(2*fattn_raw_block_bytes<type>()));
         int w[pair_words];
@@ -771,27 +785,6 @@ static __device__ __forceinline__ void flash_attn_ext_raw_quantize_Q(
     }
 }
 
-// The scale of every block of a raw tile as float: tile_d[b*nbatch_fa + i] is block b of row i.
-template<ggml_type type, int D, int nwarps, int nbatch_fa>
-static __device__ __forceinline__ void flash_attn_ext_raw_load_d(
-        const char * const __restrict__ tile_raw, float * const __restrict__ tile_d) {
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int nd        = nbatch_fa*(D/QK4_0);
-
-#pragma unroll
-    for (int i0 = 0; i0 < nd; i0 += nwarps*warp_size) {
-        const int i = i0 + threadIdx.y*warp_size + threadIdx.x;
-
-        if (i0 + nwarps*warp_size > nd && i >= nd) {
-            break;
-        }
-
-        const int row = i % nbatch_fa;
-        const int b   = i / nbatch_fa;
-        tile_d[i] = __half2float(*((const half *) (tile_raw + row*fattn_raw_row_bytes<type, D>() + b*fattn_raw_block_bytes<type>())));
-    }
-}
-
 // KQ for the warp's 16 Q columns and its K rows of a raw tile: one int8 m16n8k32 MMA per 32 value block. The result is
 // the float 12582912 + dot (C input 0x4B400000), exact for |dot| < 2^22 (here <= 32*127*128), so one FADD recovers the
 // integer dot product of the block and one FFMA applies the block's scale in f32: the arithmetic of
@@ -800,10 +793,12 @@ static __device__ __forceinline__ void flash_attn_ext_raw_load_d(
 // exactly the B fragment of thread (g, t) for K row g. The nibbles enter unsigned (s8 x u8); the C input
 // 0x4B400000 - 8*sum(q) removes the q4_0 offset of 8.
 // q8_0: qs words t and 4+t of a block hold values 4t..4t+3 and 16+4t..16+4t+3, the B fragment as stored (s8 x s8).
+// The block scales of the C fragment's K rows 2t and 2t+1 are read as f16 from the raw rows: 4 addresses a warp, in 4
+// distinct banks. Converted to a float tile first, they took a pass and a barrier of their own each step, its loads 4-way
+// bank conflicts.
 template<ggml_type type_K, int D, int nbatch_fa, int np, typename T_C_KQ>
 static __device__ __forceinline__ void flash_attn_ext_raw_KQ(
-        const char * const __restrict__ tile_raw, const float * const __restrict__ tile_d,
-        const fattn_raw_Q8<D> & Q8, T_C_KQ * const __restrict__ KQ_C) {
+        const char * const __restrict__ tile_raw, const fattn_raw_Q8<D> & Q8, T_C_KQ * const __restrict__ KQ_C) {
 #ifdef AMPERE_MMA_AVAILABLE
     static_assert(type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q8_0, "no raw K*Q of this type");
     static_assert(T_C_KQ::I == 16 && T_C_KQ::J == 16, "bad KQ tile");
@@ -818,8 +813,8 @@ static __device__ __forceinline__ void flash_attn_ext_raw_KQ(
         const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int   * src = (const int *) (tile_raw + (i0 + 8*h + g)*fattn_raw_row_bytes<type_K, D>());
-            const float * d   = tile_d + i0 + 8*h + 2*t;
+            const int  * src = (const int *) (tile_raw + (i0 + 8*h + g)*fattn_raw_row_bytes<type_K, D>());
+            const char * d   = tile_raw + (i0 + 8*h + 2*t)*fattn_raw_row_bytes<type_K, D>();
             float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
             for (int bp = 0; bp < D/(2*QK8_0); ++bp) {
@@ -846,7 +841,9 @@ static __device__ __forceinline__ void flash_attn_ext_raw_KQ(
                             : "r"(Q8.a[b][0]), "r"(Q8.a[b][1]), "r"(Q8.a[b][2]), "r"(Q8.a[b][3]), "r"(lo), "r"(hi),
                               "r"(0x4B400000));
                     }
-                    const float2 dk = *((const float2 *) (d + b*nbatch_fa));
+                    const float2 dk = make_float2(
+                        __half2float(*((const half *) (d                                     + b*fattn_raw_block_bytes<type_K>()))),
+                        __half2float(*((const half *) (d + fattn_raw_row_bytes<type_K, D>() + b*fattn_raw_block_bytes<type_K>()))));
                     acc[0] = fmaf(__int_as_float(dot[0]) - bias, dk.x, acc[0]);
                     acc[1] = fmaf(__int_as_float(dot[1]) - bias, dk.y, acc[1]);
                     acc[2] = fmaf(__int_as_float(dot[2]) - bias, dk.x, acc[2]);
@@ -861,7 +858,7 @@ static __device__ __forceinline__ void flash_attn_ext_raw_KQ(
         }
     }
 #else
-    GGML_UNUSED_VARS(tile_raw, tile_d, Q8, KQ_C);
+    GGML_UNUSED_VARS(tile_raw, Q8, KQ_C);
     NO_DEVICE_CODE;
 #endif // AMPERE_MMA_AVAILABLE
 }
@@ -913,6 +910,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool raw_KV          = type_K != GGML_TYPE_F16;
     static_assert(raw_KV == (type_V != GGML_TYPE_F16), "K and V are both raw or both f16");
     static_assert(!raw_KV || cols_per_warp == 16, "raw K*Q needs 16 Q columns per warp");
+    // The next raw K tile loads as soon as K*Q has read this one, in flight beside this step's V through the softmax,
+    // where 2 blocks share an SM: the 4-warp tiles of a verify, whose K then loaded only after V arrived, 1-3 % slower at
+    // 65,536 cells. With 3 blocks an SM (a decode token's 2-warp tile) K loads after V arrives: loaded early it ran 1-2 %
+    // slower at 16,384 and 245,760 cells (RTX 5080, head 256).
+    constexpr bool raw_K_early     = raw_KV && ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols) <= 2;
 
     constexpr int stride_tile_K = nbatch_K2 + 4;
 
@@ -935,12 +937,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         cp_async_wait_all();
         __syncthreads();
         if constexpr (raw_KV) {
-            // The raw K tile has arrived: start loading the raw V tile. K*Q reads the K values raw
-            // (flash_attn_ext_raw_KQ) and needs only the block scales as float, kept where tile_K would be.
+            // The raw K tile has arrived: start loading the raw V tile. K*Q reads K raw (flash_attn_ext_raw_KQ).
             flash_attn_ext_raw_load<type_V, DV, nwarps, nbatch_fa>
                 ((const char *) V_h2 + int64_t(k_VKQ_0)*stride_V, tile_raw + nbatch_fa*fattn_raw_row_bytes<type_K, DKQ>(), stride_V);
-            flash_attn_ext_raw_load_d<type_K, DKQ, nwarps, nbatch_fa>(tile_raw, (float *) tile_K);
-            __syncthreads();
+            if constexpr (raw_K_early) {
+                cp_async_commit_group(); // the raw V tile, which the wait before the VKQ tile waits for alone
+            }
         } else {
             flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
@@ -973,7 +975,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         // Calculate tile of KQ:
         if constexpr (raw_KV) {
-            flash_attn_ext_raw_KQ<type_K, DKQ, nbatch_fa, np>(tile_raw, (const float *) tile_K, Q8, KQ_C);
+            flash_attn_ext_raw_KQ<type_K, DKQ, nbatch_fa, np>(tile_raw, Q8, KQ_C);
+            if constexpr (raw_K_early && !last_iter) {
+                __syncthreads(); // every warp has read the raw K tile
+                flash_attn_ext_raw_load<type_K, DKQ, nwarps, nbatch_fa>
+                    ((const char *) K_h2 + int64_t(kb0_next)*nbatch_fa*stride_K, tile_raw, stride_K);
+                cp_async_commit_group();
+            }
         } else if constexpr (Q_in_reg) {
 #pragma unroll
             for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
@@ -1292,9 +1300,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     if constexpr (nstages > 1) {
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
-        // Preload K tile for next iteration:
+        // Preload K tile for next iteration (raw_K_early: loading since K*Q, the wait is for this step's V alone):
         constexpr bool use_cp_async = true;
-        cp_async_wait_all();
+        if constexpr (raw_K_early) {
+            cp_async_wait_group<last_iter ? 0 : 1>();
+        } else {
+            cp_async_wait_all();
+        }
         __syncthreads();
         if (!last_iter) {
             if (ncols2 > 1 || mask_h) {
@@ -1302,8 +1314,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, mask_packed);
             }
             if constexpr (raw_KV) {
-                flash_attn_ext_raw_load<type_K, DKQ, nwarps, nbatch_fa>
-                    ((const char *) K_h2 + int64_t(kb0_next)*nbatch_fa*stride_K, tile_raw, stride_K);
+                if constexpr (!raw_K_early) {
+                    flash_attn_ext_raw_load<type_K, DKQ, nwarps, nbatch_fa>
+                        ((const char *) K_h2 + int64_t(kb0_next)*nbatch_fa*stride_K, tile_raw, stride_K);
+                }
             } else {
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (K_h2 + int64_t(kb0_next)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
@@ -1547,7 +1561,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     extern __shared__ half2 tile_Q[];
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
-    half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
+    half2 * tile_V    =           nstages > 1 ? tile_K + fattn_mma_tile_K_h2(type_K, nbatch_fa, stride_tile_K) : tile_K;
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
     char  * tile_raw  = (char *) (tile_mask + ncols1*(nbatch_fa + 8)); // raw K/V only: raw K tile, then raw V tile
 
@@ -2040,7 +2054,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     const int j_dst = jc_dst / ncols2;
                     const int c_dst = jc_dst % ncols2;
 
-                    if (!is_fixup && ((ncols1 > 1 && jt*ncols1 + j_dst >= int(ne01.z)) || (ncols2 > 1 && zt_gqa*ncols2 + c_dst >= gqa_ratio))) {
+                    // A column past the Q rows or the GQA group is padding. Its partial is not written for the stream-k fixup
+                    // either, which skips the same columns: 10 of the 16 of a decode token (2 rows x 8 heads for 1 x 6),
+                    // whose blocks write 6 KB each instead of 16 as they finish.
+                    if ((ncols1 > 1 && jt*ncols1 + j_dst >= int(ne01.z)) || (ncols2 > 1 && zt_gqa*ncols2 + c_dst >= gqa_ratio)) {
                         continue;
                     }
 
@@ -2318,7 +2335,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     constexpr bool raw_KV      = type_K != GGML_TYPE_F16;
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_KV_2stage = (fattn_mma_tile_K_h2(type_K, nbatch_fa, nbatch_K2 + 4) + nbatch_fa*(nbatch_V2 + 4))
+                                                                                                          * sizeof(half2);
     const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
     const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
