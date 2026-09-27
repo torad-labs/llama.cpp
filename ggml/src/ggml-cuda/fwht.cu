@@ -215,10 +215,12 @@ struct fwht_src_view {
     int64_t s0, s1, s2, s3;
 };
 
+// prewait: the signs, which no kernel writes, are requested before the dependency wait (fwht_prewait)
 template <int N, int NT, typename T, bool has_signs, bool has_view = false>
 __launch_bounds__(NT, 1)
 __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
-                                const float * signs, const int n_blk, const bool pdl_trigger, const fwht_src_view view) {
+                                const float * signs, const int n_blk, const bool pdl_trigger, const bool prewait,
+                                const fwht_src_view view) {
     if (pdl_trigger) {
         ggml_cuda_pdl_lc();
     }
@@ -238,8 +240,21 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
 
     const int tid = threadIdx.x;
 
-    ggml_cuda_pdl_sync();
     const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
+    float sg[NE];
+    const auto load_signs = [&]() {
+#pragma unroll
+        for (int i = 0; i < NE; ++i) {
+            sg[i] = signs_row[i * NT + tid];
+        }
+    };
+    if (has_signs && prewait) {
+        load_signs();
+    }
+    ggml_cuda_pdl_sync();
+    if (has_signs && !prewait) {
+        load_signs();
+    }
 
     float reg[NE];
 #pragma unroll
@@ -255,7 +270,7 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
             reg[i] = fwht_load(src[i * NT + tid]) * scale;
         }
         if (has_signs) {
-            reg[i] *= signs_row[i * NT + tid];
+            reg[i] *= sg[i];
         }
     }
 
@@ -265,10 +280,12 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
 
 // rms_norm with its weight multiply (as rms_norm_f32<1024, true>), the sign flip and the transform in one launch.
 // Block (c, t) reduces token t's whole row as rms_norm does, then transforms its chunk c. normed: the multiply's result or nullptr.
+// prewait: w and the signs, which no kernel writes, are requested before the dependency wait (fwht_prewait).
 template <int N>
 __launch_bounds__(1024, 1)
 __global__ void rms_norm_fwht_cuda(const float * x, const float * w, const float * signs, float * normed, float * dst,
-                                   const int ncols, const float eps, const float scale, const bool pdl_trigger) {
+                                   const int ncols, const float eps, const float scale, const bool pdl_trigger,
+                                   const bool prewait) {
     if (pdl_trigger) {
         ggml_cuda_pdl_lc();
     }
@@ -284,7 +301,23 @@ __global__ void rms_norm_fwht_cuda(const float * x, const float * w, const float
 
     float tmp = 0.0f;
 
+    float wr[NE];
+    float sg[NE];
+    const auto load_weights = [&]() {
+#pragma unroll
+        for (int i = 0; i < NE; ++i) {
+            const int col = blockIdx.x * N + i * NT + tid;
+            wr[i] = w[col];
+            sg[i] = signs[col];
+        }
+    };
+    if (prewait) {
+        load_weights();
+    }
     ggml_cuda_pdl_sync();
+    if (!prewait) {
+        load_weights();
+    }
     for (int col = tid; col < ncols; col += NT) {
         const float xi = x[col];
         tmp += xi * xi;
@@ -298,12 +331,12 @@ __global__ void rms_norm_fwht_cuda(const float * x, const float * w, const float
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
         const int   col = blockIdx.x * N + i * NT + tid;
-        const float v   = rms_scale * x[col] * w[col];
+        const float v   = rms_scale * x[col] * wr[i];
         if (normed != nullptr) {
             normed[e0 + i * NT + tid] = v;
         }
         reg[i] = v * scale;
-        reg[i] *= signs[col];
+        reg[i] *= sg[i];
     }
 
     fwht_block_transform<N, NT>(reg, s);
@@ -324,6 +357,15 @@ static bool fwht_pdl_trigger() {
     return pdl_trigger;
 }
 
+// rms_norm_fwht_cuda and fwht_cuda_block request their weights (the norm's w and the signs, which no kernel writes)
+// before the dependency wait, so they arrive while the kernel before them ends. The matmul after a rotation starts under
+// it (PDL), and its ring fill and the L2 prefetch of its head (ggml_cuda_pq2_prefetch) take DRAM for the microseconds the
+// rotation runs: read after the wait, the weights queued behind them. GGML_CUDA_FWHT_PREWAIT_LEGACY=1 reads them after.
+static bool fwht_prewait() {
+    static const bool prewait = !ggml_env_switch("GGML_CUDA_FWHT_PREWAIT_LEGACY");
+    return prewait;
+}
+
 template <typename T>
 static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
                         const int n, const int64_t rows, const float scale,
@@ -340,6 +382,7 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 
     const bool pdl_trigger = fwht_pdl_trigger();
+    const bool prewait     = fwht_prewait();
 
     switch (n) {
 #define FWHT_CASE(NN) \
@@ -376,14 +419,14 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
             if constexpr (std::is_same_v<T, float>) { \
                 if (view) { \
-                    ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true, true>, lp, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger, *view); \
+                    ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true, true>, lp, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger, prewait, *view); \
                     return true; \
                 } \
             } \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger, fwht_src_view{}); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, pdl_trigger, prewait, fwht_src_view{}); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, pdl_trigger, fwht_src_view{}); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, pdl_trigger, prewait, fwht_src_view{}); \
             } \
             return true; \
         }
@@ -508,18 +551,19 @@ void ggml_cuda_op_rms_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_tens
     const float   scale    = 1 / sqrtf(n);
 
     const bool pdl_trigger = fwht_pdl_trigger();
+    const bool prewait     = fwht_prewait();
 
     const dim3 grid(ncols / n, ntok, 1), block(1024, 1, 1);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, block, 0, ctx.stream());
     switch (n) {
         case 1024:
-            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<1024>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger);
+            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<1024>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger, prewait);
             break;
         case 2048:
-            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<2048>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger);
+            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<2048>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger, prewait);
             break;
         default:
-            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<4096>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger);
+            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<4096>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger, prewait);
             break;
     }
 }
