@@ -1503,10 +1503,14 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
 
     const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
 
+    // the row's probabilities over every token, taken on the backend beside its top k (row-probs): no softmax of the k
+    const float * probs = llama_get_sampled_probs_ith(ctx, idx);
+    const bool row_probs = sampled_ids && probs && (int) llama_get_sampled_probs_count_ith(ctx, idx) == n_logits;
+
     cur.resize(n_logits);
     if (sampled_ids) {
         for (int i = 0; i < n_logits; i++) {
-            cur[i] = llama_token_data{sampled_ids[i], logits[i], 0.0f};
+            cur[i] = llama_token_data{sampled_ids[i], logits[i], row_probs ? probs[i] : 0.0f};
         }
     } else {
         for (llama_token token_id = 0; token_id < n_logits; token_id++) {
@@ -1523,6 +1527,10 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
             [](const llama_token_data & a, const llama_token_data & b) {
                 return a.logit > b.logit;
             });
+    }
+
+    if (row_probs) {
+        return cur;
     }
 
     // apply softmax

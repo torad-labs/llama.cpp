@@ -1541,6 +1541,13 @@ static void llama_sampler_top_k_backend_apply(
     data->logits = ggml_get_rows(ctx, logits_rows, top_k);
     ggml_set_name(data->logits, "top_k_rows");
 
+    // probabilities a sampler before this one gave the row stay aligned with its candidates
+    if (data->probs) {
+        struct ggml_tensor * probs_rows = ggml_reshape_2d(ctx, data->probs, 1, ggml_nelements(data->probs));
+        data->probs = ggml_get_rows(ctx, probs_rows, top_k);
+        ggml_set_name(data->probs, "top_k_probs");
+    }
+
     GGML_UNUSED(gf);
 }
 
@@ -1571,6 +1578,85 @@ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
         /* .ctx   = */ new llama_sampler_top_k {
             ("top-k"),
             /* .k = */ k,
+        }
+    );
+}
+
+// row-probs: the row's probabilities over every token (a softmax of its logits), taken on the backend and changing no
+// logit. The samplers after it keep them aligned with their candidates (top-k), so a chain [row-probs, top-k] hands
+// the host each of the k candidates' probability under the whole row (llama_get_sampled_probs_ith)
+
+struct llama_sampler_row_probs : public llama_sampler_backend {
+};
+
+static const char * llama_sampler_row_probs_name(const struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_row_probs *) smpl->ctx;
+    return sctx->get_name();
+}
+
+static void llama_sampler_row_probs_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    // the probabilities are the backend's output for the caller; on the CPU no sampler after this one reads them
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(cur_p);
+}
+
+static struct llama_sampler * llama_sampler_row_probs_clone(const struct llama_sampler * smpl) {
+    GGML_UNUSED(smpl);
+    return llama_sampler_init_row_probs();
+}
+
+static void llama_sampler_row_probs_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_row_probs *) smpl->ctx;
+}
+
+static bool llama_sampler_row_probs_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    auto * sctx = (llama_sampler_row_probs *) smpl->ctx;
+    GGML_UNUSED(n_outputs_max_per_seq);
+
+    const bool res = llama_sampler_backend_support(smpl, buft);
+
+    sctx->init(res);
+
+    return res;
+}
+
+static void llama_sampler_row_probs_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(gf);
+
+    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+
+    data->probs = ggml_soft_max(ctx, logits);
+    ggml_set_name(data->probs, "row_probs");
+}
+
+static struct llama_sampler_i llama_sampler_row_probs_i = {
+    /* .name              = */ llama_sampler_row_probs_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ llama_sampler_row_probs_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ llama_sampler_row_probs_clone,
+    /* .free              = */ llama_sampler_row_probs_free,
+    /* .backend_init      = */ llama_sampler_row_probs_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_row_probs_backend_apply,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_row_probs>,
+};
+
+struct llama_sampler * llama_sampler_init_row_probs(void) {
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_row_probs_i,
+        /* .ctx   = */ new llama_sampler_row_probs {
+            ("row-probs"),
         }
     );
 }

@@ -411,6 +411,57 @@ static void test_backend_top_k_sampling(const test_params & params) {
     printf("backend top-k hybrid sampling test PASSED\n");
 }
 
+// [row-probs, top-k] on the backend: the k candidates are the row's k largest logits, and each one's probability is
+// its softmax under the whole row (not renormalized over the k), as the CPU computes it from the full logits of the
+// same prompt on a sequence without a backend sampler
+static void test_backend_row_probs_top_k(const test_params & params) {
+    const int32_t k = 8;
+    llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_row_probs());
+    llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_top_k(k));
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ 0, backend_sampler_chain.get() }};
+
+    test_context test_ctx(params, backend_sampler_configs, 2);
+
+    if (!test_ctx.decode({{0, "Hello"}, {1, "Hello"}})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    const int32_t idx_backend = test_ctx.idx_for_seq(0);
+    const int32_t idx_cpu     = test_ctx.idx_for_seq(1);
+
+    const float       * probs      = llama_get_sampled_probs_ith(test_ctx.ctx.get(), idx_backend);
+    const llama_token * candidates = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), idx_backend);
+    GGML_ASSERT(probs != nullptr);
+    GGML_ASSERT(llama_get_sampled_probs_count_ith(test_ctx.ctx.get(), idx_backend) == (uint32_t) k);
+    GGML_ASSERT(llama_get_sampled_candidates_count_ith(test_ctx.ctx.get(), idx_backend) == (uint32_t) k);
+
+    const float * logits = llama_get_logits_ith(test_ctx.ctx.get(), idx_cpu);
+    GGML_ASSERT(logits != nullptr);
+    const float max_l = *std::max_element(logits, logits + test_ctx.n_vocab);
+    double sum = 0.0;
+    for (int i = 0; i < test_ctx.n_vocab; i++) {
+        sum += std::exp((double) logits[i] - max_l);
+    }
+    std::vector<float> sorted(logits, logits + test_ctx.n_vocab);
+    std::nth_element(sorted.begin(), sorted.begin() + (k - 1), sorted.end(), std::greater<float>());
+    const float kth = sorted[k - 1];
+
+    double mass = 0.0;
+    for (int32_t i = 0; i < k; i++) {
+        const llama_token id = candidates[i];
+        GGML_ASSERT(id >= 0 && id < test_ctx.n_vocab);
+        GGML_ASSERT(logits[id] >= kth);
+        const double p = std::exp((double) logits[id] - max_l) / sum;
+        printf("row-probs candidate[%d] = %d: backend %.8f, cpu %.8f\n", i, id, probs[i], p);
+        GGML_ASSERT(std::fabs(probs[i] - p) <= 1e-5 + 1e-4 * p);
+        mass += probs[i];
+    }
+    GGML_ASSERT(mass <= 1.0 + 1e-5);
+
+    printf("backend row-probs top-k test PASSED\n");
+}
+
 static void test_backend_temp_sampling(const test_params & params) {
     {
         const float temp_0 = 0.8f;
@@ -2134,6 +2185,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "temp",            test_backend_temp_sampling,           true  },
     { "temp_ext",        test_backend_temp_ext_sampling,       true  },
     { "top_k",           test_backend_top_k_sampling,          true  },
+    { "row_probs_top_k", test_backend_row_probs_top_k,         true  },
     { "multi_sequence",  test_backend_multi_sequence_sampling, true  },
     { "dist",            test_backend_dist_sampling,           true  },
     { "dist_and_cpu",    test_backend_dist_sampling_and_cpu,   true  },
