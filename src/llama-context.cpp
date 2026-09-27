@@ -786,6 +786,16 @@ void llama_context::sched_reserve() {
         n_nodes_tg  = ggml_graph_n_nodes(gf);
     }
 
+    // the most one graph slot's scheduler allocates (process_ubatch): a graph of graph_slot_max_tokens rows over every
+    // sequence, with as many outputs as a batch of it can have, measured and not allocated; a slot's buffers grow to
+    // the graphs it holds, so graph_slots_max of these bound what the slots add to the buffers above
+    std::vector<size_t> slot_buf_size(backend_ptrs.size(), 0);
+    if (!graph_reuse_disable && !model.hparams.no_alloc) {
+        const uint32_t n_tokens_slot = std::min(graph_slot_max_tokens, n_tokens);
+        graph_reserve(n_tokens_slot, std::min(n_seqs, n_tokens_slot), std::min(n_tokens_slot, cparams.n_outputs_max),
+                mctx.get(), true, slot_buf_size.data());
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: not sure if the following graph would be worst case for multi-stream KV caches:
@@ -808,6 +818,11 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
+        }
+        if (slot_buf_size[i] > 1) {
+            LLAMA_LOG_INFO("%s: %10s graph slot buffer size <= %8.2f MiB, %zu slots\n", __func__,
+                    ggml_backend_buft_name(buft),
+                    slot_buf_size[i] / 1024.0 / 1024.0, graph_slots_max);
         }
     }
 
