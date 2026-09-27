@@ -1083,7 +1083,35 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         split_state.ne[j] *= tensor->ne[split_state.axis];
                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
                             const int64_t div = tensor->src[i]->ne[src_ss[i].axis] * split_state.nr[0];
-                            GGML_ASSERT(split_state.ne[j] % div == 0);
+                            if (split_state.ne[j] % div != 0) {
+                                char segbuf[256];
+                                int segpos = 0;
+                                for (size_t s = 0; s < src_ss[i].n_segments && segpos < 200; s++) {
+                                    segpos += snprintf(segbuf + segpos, sizeof(segbuf) - segpos, "%s[%lld]*%u",
+                                        s > 0 ? "+" : "", (long long) src_ss[i].ne[s*n_bufs + j],
+                                        src_ss[i].nr[s]);
+                                }
+                                char chainbuf[512];
+                                int chainpos = 0;
+                                // names/ops/dims only: calling back into the split computer here
+                                // recursed without bound (its cache is being filled by this walk)
+                                const ggml_tensor * anc = tensor;
+                                for (int depth = 0; depth < 6 && anc != nullptr && chainpos < 430; depth++) {
+                                    chainpos += snprintf(chainbuf + chainpos, sizeof(chainbuf) - chainpos,
+                                        "%s%s:%s[%lld]", depth > 0 ? " <- " : "",
+                                        anc->name, ggml_op_name(anc->op), (long long) anc->ne[0]);
+                                    anc = anc->src[0] == anc ? nullptr : anc->src[0];
+                                }
+                                GGML_ABORT("tensor split ratio is not integral: node=%s op=%s dst=[%lld,%lld,%lld,%lld] dstaxis=%d src%zu=[%lld,%lld,%lld,%lld] axis=%d segs=%s num=%lld den=%lld chain=%s",
+                                    tensor->name, ggml_op_name(tensor->op),
+                                    (long long) tensor->ne[0], (long long) tensor->ne[1],
+                                    (long long) tensor->ne[2], (long long) tensor->ne[3],
+                                    split_state.axis, i,
+                                    (long long) tensor->src[i]->ne[0], (long long) tensor->src[i]->ne[1],
+                                    (long long) tensor->src[i]->ne[2], (long long) tensor->src[i]->ne[3],
+                                    src_ss[i].axis, segbuf, (long long) split_state.ne[j], (long long) div,
+                                    chainbuf);
+                            }
                             split_state.ne[j] /= div;
                         }
                     }
