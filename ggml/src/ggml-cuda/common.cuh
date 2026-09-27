@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 
@@ -1530,6 +1531,70 @@ struct ggml_cuda_gdn_gather_context {
     }
 };
 
+// The flash attention's live KV steps (flash_attn_mask_to_KV_live) for the graph being evaluated: every attention layer of a
+// graph reads the same mask, so the first one scans it and the others read what it found. What the scan read and how it
+// split the steps is the key; a different mask, shape or stream scans again. The memory is the context's and outlives every
+// graph evaluation: a CUDA graph captured with the scan writes it again on each replay, before the layers after it read it.
+// A buffer too small for a later scan is kept, not freed, since a graph captured earlier may still name it.
+struct ggml_cuda_fattn_kv_live_context {
+    struct key_t {
+        const void * mask;
+        const void * mask_data;
+        cudaStream_t stream;
+        int64_t      ne[4];      // the mask's
+        size_t       nb[4];      // the mask's
+        int          geometry[6]; // ncols1, nbatch_fa, iter_k, the Q tiles, the output tiles per Q tile, the sequences
+
+        bool operator==(const key_t & o) const {
+            return mask == o.mask && mask_data == o.mask_data && stream == o.stream &&
+                memcmp(ne, o.ne, sizeof(ne)) == 0 && memcmp(nb, o.nb, sizeof(nb)) == 0 &&
+                memcmp(geometry, o.geometry, sizeof(geometry)) == 0;
+        }
+    };
+
+    bool                valid = false; // filled in this graph evaluation
+    key_t               key   = {};
+    int *               ptr   = nullptr;
+    size_t              size  = 0;     // ints
+    std::vector<int *>  kept;          // smaller buffers graphs captured before may still name
+
+    void reset() {
+        valid = false;
+    }
+
+    // the steps a scan of this key found in this graph evaluation, or nullptr
+    const int * find(const key_t & k) const {
+        return valid && k == key ? ptr : nullptr;
+    }
+
+    // n ints for a scan of this key to fill, found by the next find() with the same key until reset()
+    int * fill(const key_t & k, const size_t n) {
+        if (n > size) {
+            if (ptr != nullptr) {
+                kept.push_back(ptr);
+            }
+            CUDA_CHECK(cudaMalloc(&ptr, n*sizeof(int)));
+            size = n;
+        }
+        key   = k;
+        valid = true;
+        return ptr;
+    }
+
+    void release() {
+        for (int * p : kept) {
+            CUDA_CHECK(cudaFree(p));
+        }
+        kept.clear();
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+            ptr = nullptr;
+        }
+        size  = 0;
+        valid = false;
+    }
+};
+
 // Fused conv-state update for the GDN's causal conv (build_conv_state): GET_ROWS(conv cache, s_copy) -> RESHAPE ->
 // CONCAT(state, transposed new inputs) -> the rollback snapshots' CPYs into the cache, and the SSM_CONV reading the
 // CONCAT. The graph evaluator skips the GET_ROWS, the CONCAT and the CPYs (ggml_cuda_try_ssm_conv_state_update) and
@@ -1725,6 +1790,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context concurrent_stream_context;
     ggml_cuda_gdn_gather_context gdn_gather_context;
     ggml_cuda_ssm_conv_update_context ssm_conv_update_context;
+    ggml_cuda_fattn_kv_live_context fattn_kv_live_context;
     ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
 
     ~ggml_backend_cuda_context();
@@ -1744,6 +1810,8 @@ struct ggml_backend_cuda_context {
     ggml_cuda_gdn_gather_context & gdn_gathers() { return gdn_gather_context; }
 
     ggml_cuda_ssm_conv_update_context & ssm_conv_updates() { return ssm_conv_update_context; }
+
+    ggml_cuda_fattn_kv_live_context & fattn_kv_live() { return fattn_kv_live_context; }
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
