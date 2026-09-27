@@ -1209,6 +1209,8 @@ struct ggml_cuda_device_info {
         int     physical_device;                // backing physical CUDA device for this (virtual) device
         int     physical_share_count;           // number of (virtual) devices sharing this device's physical GPU
         int     virtual_index;                  // index of this (virtual) device among those sharing its physical GPU
+        size_t  l2_bytes;                       // L2 cache (NVIDIA; 0 elsewhere)
+        double  dram_gbs;                       // DRAM peak, GB/s, from the memory clock and bus (NVIDIA; 0 elsewhere)
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
@@ -1498,6 +1500,17 @@ struct ggml_cuda_gated_delta_net_gather {
     ggml_type       type       = GGML_TYPE_F32; // f32, or the -cts cache f16 or q8_0, converted as the kernel loads it
 };
 
+// The head of the next PQ2_0 launch's weights, which a launch prefetches into L2 once it has requested all of its own
+// (mmvq-pq2-mma.cu): every block of a launch starts on the tiles at its matrices' heads, so while the small kernels
+// between two matmuls run, DRAM streams what the next one reads first. x is the next launch's first matrix and gate the
+// one it streams beside it, or null; bytes of each from its start, a multiple of 16 (0: none). A hint: no result depends
+// on it. The graph evaluation sets the context's before each node it dispatches (ggml_cuda_pq2_prefetch_plan).
+struct ggml_cuda_pq2_prefetch {
+    const void * x     = nullptr;
+    const void * gate  = nullptr;
+    int64_t      bytes = 0;
+};
+
 // Owned by the backend context that evaluates the graph: registrations are keyed by node pointer, so they only mean
 // something for the evaluation that made them. Cleared at the start of every graph evaluation/capture.
 struct ggml_cuda_gdn_gather_context {
@@ -1712,6 +1725,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context concurrent_stream_context;
     ggml_cuda_gdn_gather_context gdn_gather_context;
     ggml_cuda_ssm_conv_update_context ssm_conv_update_context;
+    ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
 
     ~ggml_backend_cuda_context();
 

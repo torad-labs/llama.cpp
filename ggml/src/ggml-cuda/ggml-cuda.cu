@@ -376,6 +376,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
                           prop.sharedMemPerBlockOptin / 1024, v[THREADS_SM], v[BLOCKS_SM], v[L2] / 1024,
                           v[L2_PERSIST] / 1024, 2.0 * v[MEM_KHZ] * v[BUS_BITS] / 8 / 1e6, v[MEM_KHZ] / 1000,
                           v[BUS_BITS]);
+            info.devices[id].l2_bytes = (size_t) v[L2];
+            info.devices[id].dram_gbs = 2.0 * v[MEM_KHZ] * v[BUS_BITS] / 8 / 1e6;
         }
         std::string device_name(prop.name);
         if (device_name == "NVIDIA GeForce MX450") {
@@ -1926,6 +1928,82 @@ static int ggml_cuda_pq2_mma_group_size(ggml_backend_cuda_context & ctx, const g
         ++n;
     }
     return n > 1 ? n : 0;
+}
+
+// GGML_CUDA_PQ2_PREFETCH_US=<us>: how much of the next PQ2_0 launch a launch prefetches into L2, as the time the card's
+// DRAM takes to read it, at most a quarter of its L2; 0 turns it off. The kernels between two matmuls are latencies,
+// the same microseconds on every card, so one value sizes it on each from its own profile. Default 2: Ternary Bonsai 2
+// 27B's decode, graphs on, per-rep medians against the tiles in contiguous runs and no prefetch, 20 reps a cell, the
+// order rotated each round: an RTX 5080 +2.4 % at depth 16,384 and +2.7 % at 0; an RTX 5070 Ti +1.6 % and +1.1 %
+// (1 us: +1.3 to +1.7 %; 4 us: +0.6 to +2.8 %; the interleaved tiles alone: 0.0 to +0.7 %).
+static double ggml_cuda_pq2_prefetch_us() {
+    static const double us = [] {
+        const char * env = getenv("GGML_CUDA_PQ2_PREFETCH_US");
+        return env != nullptr ? std::max(0.0, atof(env)) : 2.0;
+    }();
+    return us;
+}
+
+// For each node the evaluation may dispatch as a PQ2_0 tensor-core launch, the heads of the launch after it; after the
+// graph's last launch, its first (the next evaluation of a decode graph starts there). A launch is the members that read
+// one src1 (a group, or a gated pair whose GLU reads both); its heads are its first member's weights and, for a gated
+// pair, the other's, which it streams beside them. Empty when nothing is prefetched.
+static std::vector<ggml_cuda_pq2_prefetch> ggml_cuda_pq2_prefetch_plan(ggml_backend_cuda_context & ctx,
+                                                                       const ggml_cgraph * cgraph) {
+    const ggml_cuda_device_info::cuda_device_info & dev = ggml_cuda_info().devices[ctx.device];
+    const int64_t budget = std::min((int64_t) (ggml_cuda_pq2_prefetch_us() * dev.dram_gbs * 1e3), (int64_t) dev.l2_bytes / 4);
+    if (budget < 16) {
+        return {};
+    }
+    struct launch {
+        const ggml_tensor * members[PQ2_MMA_MAX_GROUP];
+        int                 at[PQ2_MMA_MAX_GROUP]; // their node indices
+        int                 n;
+    };
+    std::vector<launch> launches;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * mm = cgraph->nodes[i];
+        if (!ggml_cuda_pq2_mma_group_member(ctx, mm)) {
+            continue;
+        }
+        launch * l = launches.empty() ? nullptr : &launches.back();
+        if (l != nullptr && l->members[0]->src[1] == mm->src[1] && l->n < PQ2_MMA_MAX_GROUP) {
+            l->members[l->n] = mm;
+            l->at[l->n++]    = i;
+            continue;
+        }
+        launches.push_back({ { mm }, { i }, 1 });
+    }
+    if (launches.empty()) {
+        return {};
+    }
+    std::vector<ggml_cuda_pq2_prefetch> heads(launches.size());
+    for (size_t k = 0; k < launches.size(); ++k) {
+        const launch &      l     = launches[k];
+        const ggml_tensor * first = l.members[0];
+        const ggml_tensor * gate  = nullptr;
+        if (l.n == 2) {
+            for (int j = l.at[1] + 1; j < std::min(l.at[1] + 5, cgraph->n_nodes); ++j) {
+                const ggml_tensor * glu = cgraph->nodes[j];
+                if (glu->op == GGML_OP_GLU && ((glu->src[0] == l.members[0] && glu->src[1] == l.members[1]) ||
+                                               (glu->src[0] == l.members[1] && glu->src[1] == l.members[0]))) {
+                    gate = l.members[1]->src[0];
+                }
+            }
+        }
+        int64_t bytes = std::min(gate != nullptr ? budget / 2 : budget, (int64_t) ggml_nbytes(first->src[0]));
+        if (gate != nullptr) {
+            bytes = std::min(bytes, (int64_t) ggml_nbytes(gate));
+        }
+        heads[k] = { first->src[0]->data, gate != nullptr ? gate->data : nullptr, bytes & ~(int64_t) 15 };
+    }
+    std::vector<ggml_cuda_pq2_prefetch> plan(cgraph->n_nodes);
+    for (size_t k = 0; k < launches.size(); ++k) {
+        for (int m = 0; m < launches[k].n; ++m) {
+            plan[launches[k].at[m]] = heads[(k + 1) % launches.size()];
+        }
+    }
+    return plan;
 }
 
 static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
@@ -5147,6 +5225,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_gathers().reset();
             cuda_ctx->ssm_conv_updates().reset();
 
+            const std::vector<ggml_cuda_pq2_prefetch> pq2_plan = ggml_cuda_pq2_prefetch_plan(*cuda_ctx, cgraph);
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -5196,6 +5276,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 const ggml_cuda_nvtx_range nvtx_node(node);
+                cuda_ctx->pq2_next = pq2_plan.empty() ? ggml_cuda_pq2_prefetch{} : pq2_plan[i];
 
                 // The normalized pre-attention residual is consumed only by a
                 // group of low-bit projections. Preserve residual + one scale per
@@ -5341,6 +5422,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            cuda_ctx->pq2_next = {};
         }
 
 #ifdef USE_CUDA_GRAPH
