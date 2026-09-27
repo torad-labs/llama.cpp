@@ -8,6 +8,14 @@ set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common llama ${CMAKE_THREAD_LIBS_INIT})
 
+# the generation's NVTX range (llama-bench.cpp): NVTX is header-only, and a CUDA build has it in the toolkit
+if (GGML_CUDA)
+    find_package(CUDAToolkit)
+    if (TARGET CUDA::nvtx3)
+        target_link_libraries(${TARGET} PRIVATE CUDA::nvtx3)
+    endif()
+endif()
+
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)
 endif()
