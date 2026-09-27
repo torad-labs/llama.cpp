@@ -1645,6 +1645,43 @@ struct ggml_backend_cuda_context {
         return it->second.get();
     }
 
+    // The most CUDA graph executables a context keeps (GGML_CUDA_GRAPH_MAX, 0 for no cap). Each holds device memory
+    // beside the buffers the scheduler sizes, and the graphs a context computes follow its traffic (one per graph shape,
+    // and per graph slot for the same shape), so without a count they would be bounded only by the 10 s eviction above:
+    // a new one evicts the least recently used.
+    static size_t cuda_graphs_max() {
+        static const size_t n = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_MAX");
+            return env != nullptr ? (size_t) std::max(0, atoi(env)) : (size_t) 8;
+        }();
+        return n;
+    }
+    size_t cuda_graphs_held_max = 0; // the most executables held at once here
+    size_t cuda_graph_bytes_max = 0; // the most device memory one took to instantiate here (cudaMemGetInfo around it)
+
+    // before `graph` gets an executable: evict the least recently used others until it fits under the cap; returns how
+    // many are held with it
+    size_t cuda_graph_make_room(const ggml_cuda_graph * graph) {
+        const size_t max = cuda_graphs_max();
+        for (;;) {
+            size_t held = 0;
+            auto   lru  = cuda_graphs.end();
+            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ++it) {
+                if (it->second->instance == nullptr || it->second.get() == graph) {
+                    continue;
+                }
+                ++held;
+                if (lru == cuda_graphs.end() || it->second->last_used_time < lru->second->last_used_time) {
+                    lru = it;
+                }
+            }
+            if (max == 0 || held < max) {
+                return held + 1;
+            }
+            cuda_graphs.erase(lru);
+        }
+    }
+
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
     bool any_cuda_graph_enabled() const {

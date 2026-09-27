@@ -2853,6 +2853,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
+// create `graph`'s executable from its captured graph, first evicting what the cap needs (cuda_graphs_max); the device
+// memory that takes is measured, and logged whenever it or the count held is the most on this context so far
+static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
+    const size_t held = cuda_ctx->cuda_graph_make_room(graph);
+
+    size_t free_before;
+    size_t free_after;
+    size_t total;
+    CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+    CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+    CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+    const size_t bytes = free_before > free_after ? free_before - free_after : 0;
+
+    if (held > cuda_ctx->cuda_graphs_held_max || bytes > cuda_ctx->cuda_graph_bytes_max) {
+        cuda_ctx->cuda_graphs_held_max = std::max(cuda_ctx->cuda_graphs_held_max, held);
+        cuda_ctx->cuda_graph_bytes_max = std::max(cuda_ctx->cuda_graph_bytes_max, bytes);
+        GGML_LOG_INFO("%s: %s (context %p): %zu CUDA graphs held at most (cap %zu), the largest took %.2f MiB to instantiate\n",
+                __func__, cuda_ctx->name.c_str(), (void *) cuda_ctx, cuda_ctx->cuda_graphs_held_max,
+                ggml_backend_cuda_context::cuda_graphs_max(), cuda_ctx->cuda_graph_bytes_max / 1024.0 / 1024.0);
+    }
+}
+
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -2875,7 +2897,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        ggml_cuda_graph_instantiate(cuda_ctx, graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -5308,7 +5330,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            ggml_cuda_graph_instantiate(cuda_ctx, graph);
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -6685,6 +6707,14 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
     }
+
+#ifdef USE_CUDA_GRAPH
+    static std::once_flag cuda_graphs_max_logged;
+    std::call_once(cuda_graphs_max_logged, [] {
+        GGML_LOG_INFO("%s: at most %zu CUDA graphs kept per context (GGML_CUDA_GRAPH_MAX; 0 = no cap)\n", __func__,
+                ggml_backend_cuda_context::cuda_graphs_max());
+    });
+#endif // USE_CUDA_GRAPH
 
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),
