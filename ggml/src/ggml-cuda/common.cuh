@@ -1487,15 +1487,15 @@ struct ggml_cuda_stream_context {
     }
 };
 
-// Fused recurrent-state gather for GATED_DELTA_NET (PrismML-Eng/llama.cpp#220, plus a q8_0 cache): build_rs
+// Fused recurrent-state gather for GATED_DELTA_NET (PrismML-Eng/llama.cpp#220, plus an f16 or q8_0 cache): build_rs
 // materialises GET_ROWS(cache, s_copy) into a temp that only the GDN kernel reads; the graph evaluator skips that
 // GET_ROWS (ggml_cuda_try_gdn_gather_skip) and records the gather here, so the kernel reads each sequence's state
 // row ids[seq] out of the cache itself.
 struct ggml_cuda_gated_delta_net_gather {
-    const void *    base       = nullptr; // cache rows, f32 or q8_0
-    const int32_t * ids        = nullptr; // per-seq row index
-    int64_t         row_stride = 0;       // between rows, in elements
-    bool            q8_0       = false;   // a q8_0 cache (-cts q8_0): the kernel dequantizes as it loads
+    const void *    base       = nullptr;       // cache rows of type
+    const int32_t * ids        = nullptr;       // per-seq row index
+    int64_t         row_stride = 0;             // between rows, in elements
+    ggml_type       type       = GGML_TYPE_F32; // f32, or the -cts cache f16 or q8_0, converted as the kernel loads it
 };
 
 // Owned by the backend context that evaluates the graph: registrations are keyed by node pointer, so they only mean

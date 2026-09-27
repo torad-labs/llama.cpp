@@ -4755,7 +4755,8 @@ struct test_gated_delta_net : public test_case {
 
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion: the kernel writes the snapshots
 // straight into the cache view and the cpy is skipped). From upstream test-backend-ops. cache_type q8_0
-// is -cts q8_0: the kernel quantizes as it writes, and the cache must hold what the cpy would have.
+// is -cts q8_0 and f16 -cts f16: the kernel quantizes or converts as it writes, and the cache must hold what the cpy
+// would have.
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -11562,13 +11563,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 256, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 256, 2, 1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 200, 2, 3));
-    // a q8_0 cache (-cts q8_0), fused: the served Bonsai 2 27B layer (16 k-heads, 48 v-heads, raw gates, K = 3) at
-    // decode and MTP verify over 1-4 seqs, activated gates, and the 32/64 head widths
-    for (int64_t n_seqs : { 1, 2, 4 }) {
-        for (int64_t n_tokens : { 1, 2, 3 }) {
-            test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, n_seqs, 3, 3, true, GGML_TYPE_Q8_0));
+    // a q8_0 or f16 cache (-cts q8_0 / f16), fused: the served Bonsai 2 27B layer (16 k-heads, 48 v-heads, raw gates,
+    // K = 3) at decode and MTP verify over 1-4 seqs, activated gates, and the 32/64 head widths (f16 also the 16-wide
+    // head, which q8_0's warp-wide blocks cannot take)
+    for (ggml_type cache_type : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t n_seqs : { 1, 2, 4 }) {
+            for (int64_t n_tokens : { 1, 2, 3 }) {
+                test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, n_seqs, 3, 3, true, cache_type));
+            }
         }
     }
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4, 128, 3, 2, 3, 1, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  64, 4, 2, 4, 1, true,  GGML_TYPE_F16));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_F16));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, 1, 1, 3, true,  GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4, 128, 3, 2, 3, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
@@ -11581,12 +11588,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, n_seqs, 3, 3, true, GGML_TYPE_Q8_0, n_seqs + 2, 1));
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_Q8_0, n_seqs + 2, 1));
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_F32,  n_seqs + 2, 1));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, n_seqs, 3, 3, true, GGML_TYPE_F16,  n_seqs + 2, 1));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_F16,  n_seqs + 2, 1));
     }
     // build_rs's gather of the initial state from the cache (GET_ROWS -> RESHAPE -> GATED_DELTA_NET), folded into the
     // kernel on CUDA: the served layer at decode and at the 3-token verify, the state read from the row the newest
     // snapshot overwrites (1, kv_head in slot 0) and from a rollback slot's row the verify also writes (4, slot 1), a
     // q8_0 and an f32 cache; and the chunked prefill ubatch, which keeps the GET_ROWS
-    for (ggml_type cache_type : { GGML_TYPE_Q8_0, GGML_TYPE_F32 }) {
+    for (ggml_type cache_type : { GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32 }) {
         for (int64_t n_tokens : { 1, 3 }) {
             for (int64_t state_row : { 1, 4 }) {
                 test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3, 3, true, cache_type, 3, 1, state_row));
@@ -11594,9 +11603,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0, 3, 1, 4));
-    // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_F16,  3, 1, 4));
+    // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch (an f16 one too)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_F16));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).

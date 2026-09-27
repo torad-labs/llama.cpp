@@ -2974,6 +2974,13 @@ static bool ggml_cuda_ranges_overlap(const ggml_tensor * a, const ggml_tensor * 
     return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
 }
 
+// the recurrent cache types the GATED_DELTA_NET kernel reads and writes itself: f32, q8_0 (-cts q8_0) and f16 (-cts f16),
+// the last unless GGML_CUDA_GDN_F16_CACHE_LEGACY=1 keeps its GET_ROWS and CPY
+static bool ggml_cuda_gdn_cache_type_fusable(ggml_type type) {
+    static const bool f16_legacy = ggml_env_switch("GGML_CUDA_GDN_F16_CACHE_LEGACY");
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_Q8_0 || (type == GGML_TYPE_F16 && !f16_legacy);
+}
+
 // GET_ROWS(cache, ids) -> [RESHAPE] -> GATED_DELTA_NET src[5], build_rs's recurrent-state gather: skip the GET_ROWS and
 // register the gather for the GDN node, whose kernel then reads each sequence's cache row ids[seq] itself (f32, or q8_0
 // dequantized as it loads) instead of the temp, which the allocator still reserved. One sequence only: with several, a
@@ -2983,7 +2990,8 @@ static bool ggml_cuda_ranges_overlap(const ggml_tensor * a, const ggml_tensor * 
 // copy relocates rows there; the GET_ROWS read them before it, the kernel would read after), when a node up to the GDN
 // was allocated over ids (freed after the GET_ROWS if it was their last reader), and when the GDN takes the chunked
 // prefill path (its pipeline reads a gathered s0). From PrismML-Eng/llama.cpp#220 (f32), plus a q8_0
-// cache (-cts q8_0), the one the served head runs. GGML_CUDA_GDN_STATE_GATHER_LEGACY=1 keeps the GET_ROWS.
+// cache (-cts q8_0) and an f16 one (-cts f16, the one the served head runs). GGML_CUDA_GDN_STATE_GATHER_LEGACY=1 keeps
+// the GET_ROWS, GGML_CUDA_GDN_F16_CACHE_LEGACY=1 an f16 cache's.
 static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     static const bool legacy = ggml_env_switch("GGML_CUDA_GDN_STATE_GATHER_LEGACY");
     if (legacy) {
@@ -2998,7 +3006,7 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
     const ggml_tensor * cache = gr->src[0];
     const ggml_tensor * ids   = gr->src[1];
     const bool          q8    = cache->type == GGML_TYPE_Q8_0;
-    if ((cache->type != GGML_TYPE_F32 && !q8) || ids->type != GGML_TYPE_I32 || cache->data == nullptr ||
+    if (!ggml_cuda_gdn_cache_type_fusable(cache->type) || ids->type != GGML_TYPE_I32 || cache->data == nullptr ||
             ids->data == nullptr || cache->ne[0] != gr->ne[0] || cache->nb[0] != ggml_type_size(cache->type) ||
             cache->nb[1] % ggml_type_size(cache->type) != 0 || !ggml_is_contiguous(ids) || ids->ne[0] != gr->ne[1] ||
             ggml_nelements(ids) != gr->ne[1] || ggml_node_get_use_count(cgraph, node_idx) != 1) {
@@ -3025,7 +3033,7 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
             gather.base       = cache->data;
             gather.ids        = (const int32_t *) ids->data;
             gather.row_stride = (int64_t) (cache->nb[1] / ggml_type_size(cache->type)) * ggml_blck_size(cache->type);
-            gather.q8_0       = q8;
+            gather.type       = cache->type;
             ctx.gdn_gathers().set(n, gather);
             return true;
         }
@@ -3296,31 +3304,33 @@ static int ggml_cuda_try_gdn_cache_fusion(
         return 0;
     }
 
-    // dst is the [D, n_seqs, n_written] cache view, f32 or q8_0 (-cts q8_0); require nb[1] == one row of D (the
-    // per-seq stride the kernel assumes) and nb[2] a whole number of blocks (the slot stride below is nb[2] in
-    // elements; a remainder would be truncated and every slot after the first written shifted). ggml_cpy pins src to
-    // the same element count.
+    // dst is the [D, n_seqs, n_written] cache view, f32, f16 (-cts f16) or q8_0 (-cts q8_0); require nb[1] == one row
+    // of D (the per-seq stride the kernel assumes) and nb[2] a whole number of blocks (the slot stride below is nb[2]
+    // in elements; a remainder would be truncated and every slot after the first written shifted). ggml_cpy pins src
+    // to the same element count.
     const bool q8 = dst->type == GGML_TYPE_Q8_0;
     const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
-    if (dst->op != GGML_OP_VIEW || (dst->type != GGML_TYPE_F32 && !q8) || dst->data == nullptr ||
+    if (dst->op != GGML_OP_VIEW || !ggml_cuda_gdn_cache_type_fusable(dst->type) || dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
         dst->nb[0] != ggml_type_size(dst->type) || dst->nb[1] != (size_t) ggml_row_size(dst->type, D) ||
         dst->nb[2] % ggml_type_size(dst->type) != 0) {
         return 0;
     }
-    // q8_0: the kernel quantizes one block per warp-wide slice of a state column (gdn_store_state), so a
-    // 32-lane warp, a head width that is a multiple of 32, the scalar gate, and the recurrent kernel (the
-    // chunked prefill pipeline writes f32; its cpy stays)
+    // f16 and q8_0: the scalar gate and the recurrent kernel (the chunked prefill pipeline writes f32; its cpy stays).
+    // q8_0 besides: the kernel quantizes one block per warp-wide slice of a state column (gdn_store_state), so a
+    // 32-lane warp and a head width that is a multiple of 32.
     // GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate cpy.
     static const bool q8_legacy = ggml_env_switch("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
-    if (q8 && (q8_legacy || S_v % QK8_0 != 0 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != QK8_0 ||
-               gdn->src[3]->ne[0] == S_v || ggml_cuda_should_use_chunked_gdn(gdn))) {
+    if (dst->type != GGML_TYPE_F32 && (gdn->src[3]->ne[0] == S_v || ggml_cuda_should_use_chunked_gdn(gdn))) {
+        return 0;
+    }
+    if (q8 && (q8_legacy || S_v % QK8_0 != 0 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != QK8_0)) {
         return 0;
     }
 
     fused_state_cpy.data        = dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / ggml_type_size(dst->type) * ggml_blck_size(dst->type)) : 0;
-    fused_state_cpy.q8_0        = q8;
+    fused_state_cpy.type        = dst->type;
     return skip;
 }
 
