@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-recurrent-rollback-rounding.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -238,6 +239,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+    # DeepSeek V4's memory serializes its own layout, which the test does not read
+    foreach(model qwen35-dense nemotron_h-dense)
+        llama_test(
+            test-recurrent-rollback-rounding
+            NAME test-recurrent-rollback-rounding-${model}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf"
+        )
+        set_tests_properties(test-recurrent-rollback-rounding-${model} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
     llama_build_and_test(test-kv-mean-center.cpp)
 endif()
 
