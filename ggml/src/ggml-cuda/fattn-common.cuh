@@ -1709,9 +1709,20 @@ void launch_fattn(
             const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
                 ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
                 : 100;
-            const int nblocks_stream_k = !kv_live && efficiency_loss_percent <= max_efficiency_loss_percent
-                ? nblocks_stream_k_rounded
+            // kv_live: the output tiles of a Q tile (its KV heads x GQA groups) share its live steps, so a block count that is a
+            // multiple of them gives every head the same blocks over the same steps. A cell's K and V rows hold the heads side by
+            // side (q4_0, head 256: 144 bytes each), so neighbouring heads share the 64-byte units the L2 fetches from DRAM, and
+            // only blocks reading a cell's rows together fetch a shared unit once. 510 blocks (3 an SM on an RTX 5090) split 4
+            // heads 127.5 ways, the heads' blocks half a block apart: 12 units fetched a cell row where 9 hold it, 4/3 the K/V
+            // bytes from DRAM. At most ntiles_per_q_tile - 1 blocks go. GGML_CUDA_FATTN_LIVE_BLOCKS_ALIGN_LEGACY=1: every block the
+            // SMs hold.
+            static const bool kv_live_align_legacy = ggml_env_switch("GGML_CUDA_FATTN_LIVE_BLOCKS_ALIGN_LEGACY");
+            const int ntiles_per_q_tile = ntiles_z_gqa*K->ne[2];
+            const int nblocks_live = !kv_live_align_legacy && nblocks_stream_k_raw >= ntiles_per_q_tile
+                ? nblocks_stream_k_raw - nblocks_stream_k_raw % ntiles_per_q_tile
                 : nblocks_stream_k_raw;
+            const int nblocks_stream_k = kv_live ? nblocks_live :
+                efficiency_loss_percent <= max_efficiency_loss_percent ? nblocks_stream_k_rounded : nblocks_stream_k_raw;
 
             blocks_num.x = nblocks_stream_k;
         }
