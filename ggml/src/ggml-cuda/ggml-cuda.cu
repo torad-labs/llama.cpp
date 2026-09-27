@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-pq2-mma.cuh"
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/nvtx.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -355,6 +356,27 @@ static ggml_cuda_device_info ggml_cuda_init() {
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s, VRAM: %zu MiB\n",
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
                       device_vram_mib);
+        {
+            // the device's profile, what a roofline or a launch shape is sized from; rig's roofline probe reads this
+            // line. DRAM is the peak the memory clock and bus give (two transfers a clock), not a measured rate.
+            enum { SM_KHZ, MEM_KHZ, BUS_BITS, REGS_SM, SMEM_SM, THREADS_SM, BLOCKS_SM, L2, L2_PERSIST, N_ATTR };
+            const cudaDeviceAttr attrs[N_ATTR] = {
+                cudaDevAttrClockRate, cudaDevAttrMemoryClockRate, cudaDevAttrGlobalMemoryBusWidth,
+                cudaDevAttrMaxRegistersPerMultiprocessor, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                cudaDevAttrMaxThreadsPerMultiProcessor, cudaDevAttrMaxBlocksPerMultiprocessor, cudaDevAttrL2CacheSize,
+                cudaDevAttrMaxPersistingL2CacheSize,
+            };
+            int v[N_ATTR] = {};
+            for (int a = 0; a < N_ATTR; ++a) {
+                CUDA_CHECK(cudaDeviceGetAttribute(&v[a], attrs[a], physical_id));
+            }
+            GGML_LOG_INFO("    profile: %d SMs at %d MHz, %d regs/SM, %d KiB smem/SM (%zu KiB/block opt-in), "
+                          "%d threads/SM, %d blocks/SM, L2 %d KiB (persisting %d KiB), DRAM %.0f GB/s (%d MHz x %d bit)\n",
+                          prop.multiProcessorCount, v[SM_KHZ] / 1000, v[REGS_SM], v[SMEM_SM] / 1024,
+                          prop.sharedMemPerBlockOptin / 1024, v[THREADS_SM], v[BLOCKS_SM], v[L2] / 1024,
+                          v[L2_PERSIST] / 1024, 2.0 * v[MEM_KHZ] * v[BUS_BITS] / 8 / 1e6, v[MEM_KHZ] / 1000,
+                          v[BUS_BITS]);
+        }
         std::string device_name(prop.name);
         if (device_name == "NVIDIA GeForce MX450") {
             turing_devices_without_mma.push_back({ id, device_name });
@@ -4952,6 +4974,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// the nodes after i that the launch at i consumed, marked inside i's NVTX range
+static void ggml_cuda_nvtx_mark_fused(const ggml_cgraph * cgraph, const int i, const int n) {
+    if (!ggml_cuda_nvtx_enabled()) {
+        return;
+    }
+    for (int j = i + 1; j <= i + n; ++j) {
+        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ggml_cuda_nvtx_mark_fused(cgraph->nodes[j]);
+        }
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5161,6 +5195,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const ggml_cuda_nvtx_range nvtx_node(node);
+
                 // The normalized pre-attention residual is consumed only by a
                 // group of low-bit projections. Preserve residual + one scale per
                 // row and let their shared Q8 quantizer apply the norm weight.
@@ -5214,6 +5250,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_op_add_rms_norm_scale_fused(
                             *cuda_ctx, node, rms, (float *) row_scale_ptr->get());
                         gb10_virtual_rms.push_back({ mul, node, weight, consumer_type, row_scale_ptr, consumers });
+                        ggml_cuda_nvtx_mark_fused(cgraph, i, 2);
                         i += 2;
                         continue;
                     }
@@ -5228,6 +5265,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    ggml_cuda_nvtx_mark_fused(cgraph, i, nodes_to_skip);
                     i += nodes_to_skip;
                     continue;
                 }
@@ -5419,6 +5457,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    const ggml_cuda_nvtx_range nvtx_graph("graph");
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
     return GGML_STATUS_SUCCESS;
