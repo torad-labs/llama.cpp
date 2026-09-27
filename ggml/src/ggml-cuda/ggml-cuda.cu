@@ -2769,9 +2769,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
-#ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
-#endif
+                // unguarded, so a Release build names it under -lv: this is the line a missing replay is read from
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type: %s (%s, src0 %s, ne2 %" PRId64 ")\n",
+                        __func__, node->name, ggml_op_name(node->op), ggml_type_name(node->src[0]->type), node->ne[2]);
             }
         }
 
@@ -2888,9 +2888,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 #endif // CUDART_VERSION >= 12000
 
     if (stat == cudaErrorGraphExecUpdateFailure) {
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
-#endif
+        GGML_LOG_DEBUG("%s: CUDA graph update failed, re-instantiating\n", __func__);
 
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate

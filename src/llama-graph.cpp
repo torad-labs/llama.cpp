@@ -588,7 +588,7 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
     }
     dims.n_tps   = ubatch.n_tokens/dims.n_stream;
     dims.n_ps    = ubatch.n_seqs_unq/dims.n_stream;
-    dims.n_pools = dims.n_kv/kpool + 2*dims.n_ps;
+    dims.n_pools = llama_kpool_n_pools(dims.n_kv, kpool, dims.n_ps);
     dims.rebuild = mctx_attn->get_kv()->get_kpool_dirty();
     dims.n_new_max = dims.rebuild ? dims.n_pools : dims.n_tps/kpool + dims.n_ps;
     // same gate as the builder (glm5next_n_select == indexer_top_k + kpool - 1)
