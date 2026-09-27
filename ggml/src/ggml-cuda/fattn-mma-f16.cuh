@@ -864,7 +864,7 @@ static __device__ __forceinline__ void flash_attn_ext_raw_KQ(
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
-    bool use_logit_softcap, bool V_is_K_view, ggml_type type_K, ggml_type type_V, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
+    bool use_logit_softcap, bool V_is_K_view, ggml_type type_K, ggml_type type_V, bool last_iter, bool oob_check,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
 static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const float2 * const __restrict__ Q_f2,
@@ -1496,7 +1496,11 @@ template<int DV, int ncols> struct mma_tile_sizes {
 };
 #endif // defined(TURING_MMA_AVAILABLE)
 
-template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, ggml_type type_K, ggml_type type_V, bool needs_fixup, bool is_fixup>
+// needs_fixup: the block ends a tile it did not start; its result goes to dst unnormalized, its KQ max and rowsum to the fixup
+// buffer. is_fixup: the block ends inside the tile; its result and meta go to the fixup buffer. Neither: it did the whole tile.
+// They are arguments, not template parameters: one copy of the tile's code serves every block, so the few blocks that end a
+// tile run instructions the rest have already brought into the SM's instruction cache.
+template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, ggml_type type_K, ggml_type type_V>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -1523,7 +1527,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int kb0_start,
         const int kb0_stop,
         const uint32_t * const __restrict__ live_bits, // if set, [kb0_start, kb0_stop) index the Q tile's live steps
-        const int nwords) {
+        const int nwords,
+        const bool needs_fixup,
+        const bool is_fixup) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1673,7 +1679,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             constexpr int  k_VKQ_sup = nbatch_fa;
             const     int  kb0_next  = live_bits ? fattn_kv_live_next(live_bits, kb0) : kb0 + 1;
             flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K, type_V, needs_fixup, is_fixup, last_iter, oob_check,
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K, type_V, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, mask_packed, tile_Q, tile_K, tile_V, tile_mask, tile_raw, Q_B, Q8, VKQ_C,
@@ -1683,7 +1689,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
         flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K, type_V, needs_fixup, is_fixup, last_iter, oob_check,
+            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K, type_V, last_iter, oob_check,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, mask_packed, tile_Q, tile_K, tile_V, tile_mask, tile_raw, Q_B, Q8, VKQ_C,
@@ -1695,7 +1701,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             constexpr int  k_VKQ_sup = nbatch_fa;
             const     int  kb0_next  = live_bits ? fattn_kv_live_next(live_bits, kb0) : kb0 + 1;
             flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K, type_V, needs_fixup, is_fixup, last_iter, oob_check,
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K, type_V, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, mask_packed, tile_Q, tile_K, tile_V, tile_mask, tile_raw, Q_B, Q8, VKQ_C,
@@ -1705,7 +1711,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
         flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K, type_V, needs_fixup, is_fixup, last_iter, oob_check,
+            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K, type_V, last_iter, oob_check,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, mask_packed, tile_Q, tile_K, tile_V, tile_mask, tile_raw, Q_B, Q8, VKQ_C,
@@ -2098,7 +2104,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, mask_packed,
-        jt, kb0_start, kb0_stop, live_bits, nwords);
+        jt, kb0_start, kb0_stop, live_bits, nwords, needs_fixup, is_fixup);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -2274,28 +2280,14 @@ static __global__ void flash_attn_ext_f16(
             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
             kb0_live = max(kb0_start, min(KV_max[iter_j*ne03 + sequence*iter_j + jt] / nbatch_fa, kb0_stop - 1));
         }
-        if (last_tile) {
-            constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-            constexpr bool needs_fixup = false;
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K_arch, type_V_arch, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, mask_packed != 0, jt, zt_gqa, kb0_live, kb0_stop,
-                 live_bits, live.nwords);
-        } else if (kb0_start == 0) {
-            constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-            constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K_arch, type_V_arch, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, mask_packed != 0, jt, zt_gqa, kb0_live, kb0_stop,
-                 live_bits, live.nwords);
-        } else {
-            constexpr bool is_fixup = false;
-            constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K_arch, type_V_arch, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, mask_packed != 0, jt, zt_gqa, kb0_live, kb0_stop,
-                 live_bits, live.nwords);
-        }
+        // A block that ends inside the tile writes to the fixup buffer, to avoid data races with the blocks after it; one that ends
+        // a tile it did not start writes to dst and needs the fixup; one that did the whole tile writes its final result.
+        const bool is_fixup    = last_tile;
+        const bool needs_fixup = !last_tile && kb0_start != 0;
+        flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, type_K_arch, type_V_arch>
+            (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+             ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, mask_packed != 0, jt, zt_gqa, kb0_live, kb0_stop,
+             live_bits, live.nwords, needs_fixup, is_fixup);
     }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_live_ptr, dst_ptr, dst_meta_ptr, scale,
