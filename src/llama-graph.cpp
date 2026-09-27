@@ -383,16 +383,16 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
     const bool ok_extra = s_copy_extra->ne[0] == mctx_cur->get_n_rs() - params.ubatch.n_seqs;
     const bool ok_write = !s_write_rows || s_write_rows->ne[0] == n_write;
     const bool ok_head  = head == mctx_cur->get_head();
-    const bool ok_rs_z  = rs_z == mctx_cur->get_rs_z();
+    const bool ok_rs_z  = !rs_z_baked || rs_z == mctx_cur->get_rs_z();
 
     const bool res = ok_copy && ok_main && ok_extra && ok_write && ok_head && ok_rs_z;
 
     // LLAMA_GRAPH_INPUT_DEBUG=2: which of the checks refused, with both sides of the ones baked into the graph
     if (debug > 1 && !res) {
         LLAMA_LOG_DEBUG("%s: s_copy=%d main=%d extra=%d write=%d (%lld vs %lld) head=%d (%u vs %u) "
-                "rs_z=%d (%d vs %d), n_rs %u, ubatch %u tokens x %u seqs\n", __func__,
+                "rs_z=%d (%d vs %d, baked %d), n_rs %u, ubatch %u tokens x %u seqs\n", __func__,
                 ok_copy, ok_main, ok_extra, ok_write, (long long) (s_write_rows ? s_write_rows->ne[0] : 0), (long long) n_write,
-                ok_head, head, mctx_cur->get_head(), ok_rs_z, rs_z, mctx_cur->get_rs_z(),
+                ok_head, head, mctx_cur->get_head(), ok_rs_z, rs_z, mctx_cur->get_rs_z(), rs_z_baked,
                 mctx_cur->get_n_rs(), params.ubatch.n_seq_tokens, params.ubatch.n_seqs);
     }
 
@@ -542,14 +542,21 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
-    bool res = true;
-
-    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    const bool ok_idxs = self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    const bool ok_mask = can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
-    return res;
+    // LLAMA_GRAPH_INPUT_DEBUG=2: which check refused, with the graph's shapes against the step's
+    if (debug > 1 && !(ok_idxs && ok_mask)) {
+        LLAMA_LOG_DEBUG("%s: k_idxs=%d (%lld vs %u tokens) kq_mask=%d (%s %lld x %lld x %lld vs n_kv %lld, %u tokens, %u seqs)\n",
+                __func__, ok_idxs, (long long) self_k_idxs->ne[0], params.ubatch.n_tokens, ok_mask,
+                ggml_type_name(self_kq_mask->type), (long long) self_kq_mask->ne[0], (long long) self_kq_mask->ne[1],
+                (long long) self_kq_mask->ne[3], (long long) mctx->get_n_kv(), params.ubatch.n_tokens,
+                params.ubatch.n_seqs_unq);
+    }
+
+    return ok_idxs && ok_mask;
 }
 
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
@@ -3816,6 +3823,8 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
+    inp->rs_z_baked |= s->type == GGML_TYPE_F32;
+
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
@@ -3831,6 +3840,8 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
     const uint32_t n_rs     = kv_state->get_n_rs();
     const uint32_t rs_head  = kv_state->get_head();
     const  int32_t rs_zero  = kv_state->get_rs_z();
+
+    inp->rs_z_baked |= s->type == GGML_TYPE_F32;
 
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 

@@ -329,6 +329,11 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // rs_z is part of the graph only through an f32 state's in-graph zeroing view (build_rs, build_rs_cache_view);
+    // any other state type is zeroed on the host (llama_memory_recurrent::zero_rs_z) and a graph with no recurrent
+    // state never reads it, so reuse compares rs_z only when a graph baked it
+    bool rs_z_baked = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
