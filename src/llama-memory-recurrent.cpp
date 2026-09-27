@@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_reach.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -127,15 +128,15 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
-// the graph zeroes the rs_z row of a float state in place (llm_graph_context::build_rs); a quantized
-// state has no in-graph scale op, so its row is zeroed here, before the graph runs. All-zero bytes
-// are an exact zero for every block type (scale 0, quants 0).
+// the graph zeroes the rs_z row of an f32 state in place (llm_graph_context::build_rs); any other
+// state type (f16, bf16, a block type) has no in-graph scale op, so its row is zeroed here, before the
+// graph runs. All-zero bytes are an exact zero for f16, bf16 and every block type (scale 0, quants 0).
 void llama_memory_recurrent::zero_rs_z() {
     if (rs_z < 0) {
         return;
     }
     for (ggml_tensor * s : s_l) {
-        if (s == nullptr || !ggml_is_quantized(s->type)) {
+        if (s == nullptr || s->type == GGML_TYPE_F32) {
             continue;
         }
         ggml_backend_tensor_memset(s, 0, (size_t) rs_z * s->nb[1], s->nb[1]);
@@ -160,6 +161,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_reach.begin(), rs_reach.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -189,29 +191,37 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         // could be fatal
         return false;
     }
+    // a cache with no resident recurrent layers holds no state that could be partially
+    // erased, so the restriction does not apply to it. this is the glm5next MTP draft
+    // context, which runs only the NextN block and filters every KDA layer out.
+    const bool has_state = std::any_of(s_l.begin(), s_l.end(),
+            [](const ggml_tensor * t) { return t != nullptr; });
+
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // partial rollback via per-token snapshot index (bounded by the snapshots the last batch wrote)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) rs_reach[seq_id]) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
                 }
-                return false;
+                if (has_state) {
+                    return false;
+                }
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 tail_id = -1;
             }
         }
-    } else {
+    } else if (seq_id < 0) {
         // seq_id is negative, then the range should include everything or nothing
         if (p0 != p1 && (p0 != 0 || p1 != std::numeric_limits<llama_pos>::max())) {
             //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: `seq_id` is negative, so returning false\n");
@@ -284,6 +294,9 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+        // the destination rolls back only into a batch of its own: the source's snapshots count from the batch end,
+        // and a rollback the source has pending already moved the cell back
+        rs_reach[seq_id_dst] = 0;
     }
 }
 
@@ -848,6 +861,9 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     try {
         res = res && state_read_data(io, cell_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        res = false;
     } catch (...) {
         res = false;
     }
@@ -864,6 +880,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
+    }
+
+    // a restored state comes without the snapshots of the batch that reached it
+    if (seq_id < 0) {
+        std::fill(rs_reach.begin(), rs_reach.end(), 0);
+    } else {
+        rs_reach[seq_id] = 0;
     }
 }
 
@@ -1227,8 +1250,14 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    const llama_ubatch & ubatch = ubatches[i_next];
+
+    mem->find_slot(ubatch);
     mem->zero_rs_z();
+
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        mem->rs_reach[ubatch.seq_id_unq[s]] = std::min(mem->n_rs_seq, ubatch.n_seq_tokens - 1);
+    }
 
     return true;
 }

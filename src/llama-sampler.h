@@ -36,6 +36,9 @@ struct llama_sampler_chain {
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+// whether a backend sampler of the chain writes graph inputs (.backend_set_input, e.g. the dist sampler's uniforms): it
+// holds those of the graph it was applied to last, so no other graph with it can be computed without a rebuild
+bool llama_sampler_backend_has_inputs(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 // the context no longer runs the sampler: the chain applies every sampler on the CPU again and the dist sampler draws
 // from its own RNG outside any backend transaction (a sequence goes back to the backend with a fresh sampler)

@@ -5532,6 +5532,21 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_mask_prefix(
+        struct ggml_tensor * a,
+        bool                 mask_prefix) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    ggml_set_op_params_i32(a, 4, mask_prefix ? 1 : 0); // after scale, max_bias, logit_softcap and prec
+}
+
+bool ggml_flash_attn_ext_get_mask_prefix(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 4) != 0;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -8141,6 +8156,56 @@ void ggml_log_get(ggml_log_callback * log_callback, void ** user_data) {
 void ggml_log_set(ggml_log_callback log_callback, void * user_data) {
     g_logger_state.log_callback = log_callback ? log_callback : ggml_log_callback_default;
     g_logger_state.log_callback_user_data = user_data;
+}
+
+static bool ggml_env_space(char c) {
+    return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
+// value[0, n) is the word, in any case
+static bool ggml_env_value_is(const char * value, size_t n, const char * word) {
+    size_t i = 0;
+    for (; i < n && word[i] != '\0'; ++i) {
+        const char c = value[i] >= 'A' && value[i] <= 'Z' ? (char) (value[i] - 'A' + 'a') : value[i];
+        if (c != word[i]) {
+            return false;
+        }
+    }
+    return i == n && word[i] == '\0';
+}
+
+bool ggml_env_switch(const char * name) {
+    const char * value = getenv(name);
+    if (value == NULL) {
+        return false;
+    }
+    // the spaces around the value are dropped: an env file with CRLF lines ends every value with \r
+    while (ggml_env_space(*value)) {
+        ++value;
+    }
+    size_t n = strlen(value);
+    while (n > 0 && ggml_env_space(value[n - 1])) {
+        --n;
+    }
+    static const char * const off[] = { "", "0", "false", "no", "off" };
+    static const char * const on[]  = { "1", "true", "yes", "on" };
+    for (size_t i = 0; i < sizeof(off)/sizeof(off[0]); ++i) {
+        if (ggml_env_value_is(value, n, off[i])) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < sizeof(on)/sizeof(on[0]); ++i) {
+        if (ggml_env_value_is(value, n, on[i])) {
+            return true;
+        }
+    }
+    char * end = NULL;
+    const long number = strtol(value, &end, 10);
+    if (end != value && end == value + n) {
+        return number != 0;
+    }
+    GGML_LOG_WARN("%s=%.*s is none of 1/0, true/false, yes/no, on/off: taken as on\n", name, (int) n, value);
+    return true;
 }
 
 void ggml_threadpool_params_init(struct ggml_threadpool_params * p, int n_threads) {

@@ -111,6 +111,57 @@ def test_backend_sampling_lazy_grammar_mid_draft():
     assert on["tokens"] == off["tokens"]
 
 
+@pytest.mark.parametrize("post_sampling", [False, True])
+def test_draft_token_probs(post_sampling: bool):
+    # The model drafts for itself, so after the first token every token comes out of a verification: each carries the
+    # probabilities plain decoding gives it, up to rounding. A verification computes its tokens as one batch and plain
+    # decoding one at a time, and the two round apart: up to 0.10 in logprob and 0.11 post-sampling over seed 4242 and
+    # 0 to 63 on the CPU, where a prompt batch of the same tokens gives the drafted values; the tolerance is about twice
+    # that. The runs may also sample apart at temperature 0.2, so the tokens are compared until they part
+    global server
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.2,
+        "top_k": 5,
+        "seed": 4242,
+        "n_predict": 16,
+        "n_probs": 3,
+        "post_sampling_probs": post_sampling,
+    }
+
+    def run(draft: bool):
+        global server
+        create_server()
+        server.model_hf_repo = None
+        server.model_hf_file = None
+        server.model_file = server.model_draft
+        if not draft:
+            server.model_draft = None
+            server.spec_type = None
+        server.start()
+        res = server.make_request("POST", "/completion", data=request)
+        server.stop()
+        assert res.status_code == 200
+        return res.body
+
+    plain, drafted = run(False), run(True)
+    assert drafted["timings"]["draft_n_accepted"] > 0
+
+    key, top, one = ("prob", "top_probs", 1.0) if post_sampling else ("logprob", "top_logprobs", 0.0)
+    probs_plain, probs_drafted = plain["completion_probabilities"], drafted["completion_probabilities"]
+    n = next((i for i, (a, b) in enumerate(zip(probs_drafted, probs_plain)) if a["id"] != b["id"]),
+             min(len(probs_drafted), len(probs_plain)))
+    assert n >= 4
+    for a, b in zip(probs_drafted[:n], probs_plain[:n]):
+        assert a[key] == pytest.approx(b[key], abs=0.25)
+        # a probability the server never set goes out as exactly 1 (logprob 0), which the tolerance takes where plain
+        # decoding gives 0.75 or more. A real exact 1 (the other tokens' share rounds to nothing; post-sampling also
+        # top-p or min-p leaving one candidate, which cut before the temperature) has plain decoding at 0.999 or more:
+        # parting them takes 1.5 nats of logit or more, where the runs differ by 0.1
+        assert a[key] != one or b[key] == pytest.approx(one, abs=1e-3)
+        assert len(a[top]) == len(b[top]) > 0
+
+
 def test_different_draft_min_draft_max():
     global server
     test_values = [
@@ -189,3 +240,17 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
     for res in results:
         assert res.status_code == 200
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+
+def test_mtp_vocab_without_draft_mtp_is_refused(tmp_path):
+    # the draft-mtp options are read only when the MTP head drafts: without --spec-type draft-mtp no draft context
+    # is built and the file would never be opened, so the server refuses them at load instead of serving without them
+    global server
+    server.model_draft = None
+    server.spec_type = None
+    vocab = tmp_path / "vocab.i32"
+    vocab.write_bytes(b"\x00\x00\x00\x00")
+    server.spec_draft_mtp_vocab = str(vocab)
+    with pytest.raises(RuntimeError, match="Server process died"):
+        server.start()
+

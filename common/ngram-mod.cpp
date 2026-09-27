@@ -12,36 +12,40 @@ common_ngram_mod::common_ngram_mod(uint16_t n, size_t size) : n(n), used(0) {
     reset();
 }
 
-size_t common_ngram_mod::idx(const entry_t * tokens) const {
-    size_t res = 0;
+uint64_t common_ngram_mod::hash(const entry_t * tokens) const {
+    uint64_t res = 0;
 
     for (size_t i = 0; i < n; ++i) {
         res = res*6364136223846793005ULL + tokens[i];
     }
 
-    res = res % entries.size();
-
     return res;
 }
 
-void common_ngram_mod::add(const entry_t * tokens) {
-    const size_t i = idx(tokens);
+size_t common_ngram_mod::idx(const entry_t * tokens) const {
+    return hash(tokens) % entries.size();
+}
 
-    if (entries[i] == EMPTY) {
+void common_ngram_mod::add(const entry_t * tokens) {
+    const uint64_t h = hash(tokens);
+    slot & s = entries[h % entries.size()];
+
+    if (s.tok == EMPTY) {
         used++;
     }
 
-    entries[i] = tokens[n];
+    s = { (uint32_t) (h >> 32), tokens[n] };
 }
 
 common_ngram_mod::entry_t common_ngram_mod::get(const entry_t * tokens) const {
-    const size_t i = idx(tokens);
+    const uint64_t h = hash(tokens);
+    const slot & s = entries[h % entries.size()];
 
-    return entries[i];
+    return s.key == (uint32_t) (h >> 32) ? s.tok : EMPTY;
 }
 
 void common_ngram_mod::reset() {
-    std::fill(entries.begin(), entries.end(), EMPTY);
+    std::fill(entries.begin(), entries.end(), slot { 0, EMPTY });
     used = 0;
 }
 

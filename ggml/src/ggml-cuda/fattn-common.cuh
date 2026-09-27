@@ -1542,27 +1542,23 @@ void launch_fattn(
     //     tiles before or after this batch's; the scan bounds the range from both ends. One thread reads every row of
     //     its tile, so the batch is bounded (a decode, or an MTP verify of up to 5 sequences at 2 drafts): at a 512-row
     //     ubatch the scan cost more than the attention it saved. GGML_CUDA_FATTN_KV_RANGE_LEGACY=1: off.
-    static const bool kv_range_legacy = [] {
-        const char * v = getenv("GGML_CUDA_FATTN_KV_RANGE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
-    const bool kv_range = !kv_range_legacy && mask && Q->ne[1] <= 16 && K->ne[1] >= 4096 &&
+    static const bool kv_range_legacy = ggml_env_switch("GGML_CUDA_FATTN_KV_RANGE_LEGACY");
+    // mask_prefix: the graph's hint that every row's mask is a prefix of the cells (one sequence per stream, causal, no window).
+    //     At a decode-sized batch neither the range scan nor the live steps below find a tile to skip, so both are left out and
+    //     the kernel applies the mask over the whole range. GGML_CUDA_FATTN_MASK_PREFIX_LEGACY=1: the hint is ignored.
+    static const bool mask_prefix_legacy = ggml_env_switch("GGML_CUDA_FATTN_MASK_PREFIX_LEGACY");
+    const bool mask_prefix = !mask_prefix_legacy && mask && Q->ne[1] <= 16 && ggml_flash_attn_ext_get_mask_prefix(KQV);
+    const bool kv_range = !kv_range_legacy && !mask_prefix && mask && Q->ne[1] <= 16 && K->ne[1] >= 4096 &&
         (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0; // 16-byte mask reads
 
     // kv_live: the mma kernel reads only the KV steps a row of its Q tile sees, the masked tiles between them skipped too (with
     //     --kv-unified the slots' turns interleave, so a slot's range spans the others' cells), and splits its blocks over those
     //     steps alone. At any batch size, prefill included. GGML_CUDA_FATTN_LIVE_TILES_LEGACY=1: off.
-    static const bool kv_live_legacy = [] {
-        const char * v = getenv("GGML_CUDA_FATTN_LIVE_TILES_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool kv_live_legacy = ggml_env_switch("GGML_CUDA_FATTN_LIVE_TILES_LEGACY");
     // The live fixup tests the blocks it combines for an empty range only when there can be one (fewer units of work than
     // blocks), and lets the next kernel launch as it starts. GGML_CUDA_FATTN_LIVE_FIXUP_LEGACY=1: it tests every block and does not.
-    static const bool kv_live_fixup_legacy = [] {
-        const char * v = getenv("GGML_CUDA_FATTN_LIVE_FIXUP_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
-    const bool kv_live = kv_live_ok && !kv_live_legacy && stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && mask && K->ne[1] >= 4096 &&
+    static const bool kv_live_fixup_legacy = ggml_env_switch("GGML_CUDA_FATTN_LIVE_FIXUP_LEGACY");
+    const bool kv_live = kv_live_ok && !kv_live_legacy && !mask_prefix && stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && mask && K->ne[1] >= 4096 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 && (nbatch_fa == 32 || nbatch_fa == 64) &&
         (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0;
     if (kv_live) {

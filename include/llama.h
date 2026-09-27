@@ -357,6 +357,9 @@ extern "C" {
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+                                        // a rollback reaches back at most min(n_rs_seq, n - 1) positions, n the seq's rows in the
+                                        // last batch that decoded it (a verify rolls back rejected draft rows, never the row the
+                                        // draft grew from): llama_memory_seq_rm refuses one reaching further
         uint32_t n_swa_mtp;             // MTP context: attend to the last n_swa_mtp positions of a sequence only, the KV cache sized to them (0 = the whole context)
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)

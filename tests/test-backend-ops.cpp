@@ -162,10 +162,6 @@ static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & 
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
-// generate an F16 mask where certain blocks are randomly masked with -INF value
-// f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
-// block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
-// draws no block) has masked cells and a wrong bit order fails.
 // PQ2_0 blocks written directly: every 2-bit code (3, the +2 that the reference quantizer never emits from absmax-scaled
 // data, included) and a scale per block log-uniform over [d_min, d_max], two decades by default. Uniform data quantized
 // gives every block d ~ 0.99 and no code 3, so a kernel that drops or misplaces a block's scale, or decodes +2 wrong,
@@ -189,6 +185,10 @@ static void init_tensor_pq2_raw(ggml_tensor * tensor, float d_min = 0.01f, float
     ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
 }
 
+// generate an F16 mask where certain blocks are randomly masked with -INF value
+// f16: random values with 20% blocks of -inf or 0. I16 (bit-packed, 16 cells per element, bit set = attend): the same
+// block pattern over the cells plus one cell in eight dropped at random, so every shape (a single row included, which
+// draws no block) has masked cells and a wrong bit order fails.
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_I16);
     const bool bits = tensor->type == GGML_TYPE_I16;
@@ -4755,7 +4755,8 @@ struct test_gated_delta_net : public test_case {
 
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion: the kernel writes the snapshots
 // straight into the cache view and the cpy is skipped). From upstream test-backend-ops. cache_type q8_0
-// is -cts q8_0: the kernel quantizes as it writes, and the cache must hold what the cpy would have.
+// is -cts q8_0 and f16 -cts f16: the kernel quantizes or converts as it writes, and the cache must hold what the cpy
+// would have.
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -8077,10 +8078,11 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const bool mask_bits; // bit-packed mask (GGML_TYPE_I16, 16 cells per element) instead of f16
     const int mask_band; // 0: random mask; else every row sees only a band of the cells, see kq_mask_band
+    const bool mask_prefix; // ggml_flash_attn_ext_set_mask_prefix: a hint only, the result must not depend on it
 
     std::string vars() override {
         return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k)
-            + "," + VAR_TO_STR(mask_bits) + (mask_band ? "," + VAR_TO_STR(mask_band) : "");
+            + "," + VAR_TO_STR(mask_bits) + (mask_band ? "," + VAR_TO_STR(mask_band) : "") + (mask_prefix ? "," + VAR_TO_STR(mask_prefix) : "");
     }
 
     double max_nmse_err() override {
@@ -8097,9 +8099,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, bool mask_bits = false, int mask_band = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, bool mask_bits = false, int mask_band = 0, bool mask_prefix = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_bits(mask_bits), mask_band(mask_band) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_bits(mask_bits), mask_band(mask_band),
+          mask_prefix(mask_prefix) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8161,6 +8164,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
+        ggml_flash_attn_ext_set_mask_prefix(out, mask_prefix);
         ggml_set_name(out, "out");
 
         return out;
@@ -11209,9 +11213,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // GQA 6 (Qwen3.5-27B) with a q4_0 cache: odd head groups, all kernel choices from vec to mma
-    for (int nb : { 1, 3, 32, 75, 512, }) {
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    // GQA 6 (Qwen3.5-27B) with a q4_0 or q8_0 cache: odd head groups, all kernel choices from vec to mma
+    // (8 and 13 tokens, a drafted verify batch, take the 8 token x 8 head tile, full and partial)
+    for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, }) {
+        for (int kv : { 2048, 4096, }) {
+            for (int nb : { 1, 3, 8, 13, 32, 75, 512, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
     }
 
     // bit-packed mask: the served head's shape through every kernel choice (vec at nb 1 with an f16 cache, q4_0 mma, mma prefill),
@@ -11246,6 +11255,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, 5));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 8192,  75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, 5));
+
+    // the mask-prefix hint on masks that are no prefix (random, banded): a backend may skip its mask scans on the hint, never
+    // the mask, so the result is the same; nb 17 is past the decode sizes the hint applies to
+    for (int mask_band : { 0, 1, 5, 6, }) {
+        for (int nb : { 1, 4, 16, 17, }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, true, mask_band, true));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, false, 5, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, 0, true));
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
@@ -11542,13 +11563,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 256, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 256, 2, 1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 200, 2, 3));
-    // a q8_0 cache (-cts q8_0), fused: the served Bonsai 2 27B layer (16 k-heads, 48 v-heads, raw gates, K = 3) at
-    // decode and MTP verify over 1-4 seqs, activated gates, and the 32/64 head widths
-    for (int64_t n_seqs : { 1, 2, 4 }) {
-        for (int64_t n_tokens : { 1, 2, 3 }) {
-            test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, n_seqs, 3, 3, true, GGML_TYPE_Q8_0));
+    // a q8_0 or f16 cache (-cts q8_0 / f16), fused: the served Bonsai 2 27B layer (16 k-heads, 48 v-heads, raw gates,
+    // K = 3) at decode and MTP verify over 1-4 seqs, activated gates, and the 32/64 head widths (f16 also the 16-wide
+    // head, which q8_0's warp-wide blocks cannot take)
+    for (ggml_type cache_type : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t n_seqs : { 1, 2, 4 }) {
+            for (int64_t n_tokens : { 1, 2, 3 }) {
+                test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, n_seqs, 3, 3, true, cache_type));
+            }
         }
     }
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4, 128, 3, 2, 3, 1, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  64, 4, 2, 4, 1, true,  GGML_TYPE_F16));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_F16));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, 1, 1, 3, true,  GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4, 128, 3, 2, 3, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
@@ -11561,12 +11588,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, n_seqs, 3, 3, true, GGML_TYPE_Q8_0, n_seqs + 2, 1));
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_Q8_0, n_seqs + 2, 1));
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_F32,  n_seqs + 2, 1));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, n_seqs, 3, 3, true, GGML_TYPE_F16,  n_seqs + 2, 1));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 3, n_seqs, 3, 3, true, GGML_TYPE_F16,  n_seqs + 2, 1));
     }
     // build_rs's gather of the initial state from the cache (GET_ROWS -> RESHAPE -> GATED_DELTA_NET), folded into the
     // kernel on CUDA: the served layer at decode and at the 3-token verify, the state read from the row the newest
     // snapshot overwrites (1, kv_head in slot 0) and from a rollback slot's row the verify also writes (4, slot 1), a
     // q8_0 and an f32 cache; and the chunked prefill ubatch, which keeps the GET_ROWS
-    for (ggml_type cache_type : { GGML_TYPE_Q8_0, GGML_TYPE_F32 }) {
+    for (ggml_type cache_type : { GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32 }) {
         for (int64_t n_tokens : { 1, 3 }) {
             for (int64_t state_row : { 1, 4 }) {
                 test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3, 3, true, cache_type, 3, 1, state_row));
@@ -11574,9 +11603,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0, 3, 1, 4));
-    // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_F16,  3, 1, 4));
+    // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch (an f16 one too)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_F16));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
@@ -11908,14 +11939,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
-    // Qwen3.5-27B: 4 KV heads, GQA 6, q4_0 cache, prefill ubatch at depth
-    for (int kv : { 16384, 65536, 131072, }) {
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    // Qwen3.5-27B: 4 KV heads, GQA 6, q4_0 or q8_0 cache, prefill ubatch at depth
+    for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, }) {
+        for (int kv : { 16384, 65536, 131072, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
     }
     // ... and decode, one and two sequences, at depth
-    for (int kv : { 4096, 65536, 262144, }) {
-        for (int nb : { 1, 2, }) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, }) {
+        for (int kv : { 2048, 4096, 65536, 262144, }) {
+            for (int nb : { 1, 2, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+    // ... one slot's decode and MTP verify at the served depth, bit mask, without and with the mask-prefix hint
+    for (bool mask_prefix : { false, true, }) {
+        for (int nb : { 1, 4, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 245760, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, true, 0, mask_prefix));
         }
     }
 

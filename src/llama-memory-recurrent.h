@@ -76,6 +76,11 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // per-seq rollback reach: min(n_rs_seq, rows - 1) for the seq's rows in the last ubatch that carried it. A batch
+    // of n rows writes the snapshots 0..n-1 (the state s rows before its end): the state before the batch and those of
+    // earlier batches are kept in no slot, so seq_rm refuses a rollback past this reach instead of reading one
+    std::vector<uint32_t> rs_reach;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build
@@ -84,7 +89,7 @@ public:
     // first zero-ed state
     int32_t rs_z = -1;
 
-    // zero the rs_z row of every quantized S tensor on the host (see llm_graph_context::build_rs)
+    // zero the rs_z row of every non-f32 S tensor on the host (see llm_graph_context::build_rs)
     void zero_rs_z();
 
     // TODO: optimize for recurrent state needs

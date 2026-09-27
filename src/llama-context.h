@@ -253,7 +253,8 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    // sched_gf: the scheduler that allocated gf (nullptr: the context's own)
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_gf = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -262,13 +263,18 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    // sched_gf: the scheduler the graph is built for (nullptr: the context's own)
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                    ggml_backend_sched_t   sched_gf = nullptr) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_gf) const;
+
+    // the graphs process_ubatch keeps (gf_res_prev and the slots') are rebuilt before their next use
+    void graph_results_reset();
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -384,6 +390,25 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // graphs of up to graph_slot_max_tokens rows kept beside gf_res_prev, each with a scheduler of its own: splitting a
+    // graph rewrites its nodes' sources to the scheduler's input copies, so a graph stays computable only while the
+    // scheduler that split it holds it. A speculative verify alternates shapes (an n-gram draft of 7 rows, then MTP's
+    // 3), and with gf_res_prev alone every change rebuilt the graph: ~5 ms to build, split and allocate it, and ~5 ms
+    // more to launch its kernels uncaptured while the backend's CUDA graph warms up again (27B hybrid on a 5080, whose
+    // verify round takes ~15 ms)
+    struct graph_slot {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+        uint64_t               t_used = 0;
+    };
+    static constexpr uint32_t graph_slot_max_tokens = 32;
+    static constexpr size_t   graph_slots_max       = 3;
+    std::vector<graph_slot> graph_slots;
+    uint64_t graph_clock = 0; // process_ubatch calls, the slots' use times
+
+    // the scheduler that allocated the graph process_ubatch last computed: its outputs' backends are looked up there
+    ggml_backend_sched_t sched_res = nullptr;
 
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;

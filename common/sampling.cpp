@@ -110,6 +110,13 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// LLAMA_TOP_K_PREFILTER_LEGACY=1: a chain drawing on the CPU reads every logit of a row, with no top-k taken on the
+// backend (the behaviour before common_sampler_backend_top_k), and a backend's candidates stay in the order it gave
+static bool top_k_prefilter_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_TOP_K_PREFILTER_LEGACY");
+    return legacy;
+}
+
 // the k largest logits as candidates, sorted by logit (ties by id): the set top-k's partial sort of every token keeps,
 // without the n_vocab-long array; a block of logits is skipped with one compare pass when none beats the k-th so far
 static void top_k_candidates(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
@@ -199,6 +206,16 @@ struct common_sampler {
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
+            // a backend's top-k gives its candidates in no fixed order among equal logits: sorted by logit, ties by id,
+            // as top_k_candidates sorts them, the chain draws from them as from the k the CPU takes (a row the backend
+            // did not cut, its device lacking an op, stays as every token's)
+            if (!top_k_prefilter_legacy() && sampled_logits_count < (uint32_t) n_vocab) {
+                std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                    return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+                });
+                cur_p = { cur.data(), cur.size(), -1, true };
+                return;
+            }
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
@@ -243,20 +260,14 @@ std::string common_params_sampling::print() const {
 // LLAMA_SAMPLING_BACKEND_PASSIVE_LEGACY=1: backend sampling is off for any request with a grammar or a reasoning
 // budget, passive or not (the behaviour before common_sampler_backend_passive)
 static bool backend_passive_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLING_BACKEND_PASSIVE_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLING_BACKEND_PASSIVE_LEGACY");
     return legacy;
 }
 
 // LLAMA_SAMPLING_TOP_K_FIRST_LEGACY=1: the chain always starts from every token's logit (the behaviour before
 // sampler_top_k_first)
 static bool top_k_first_legacy() {
-    static const bool legacy = [] {
-        const char * v = getenv("LLAMA_SAMPLING_TOP_K_FIRST_LEGACY");
-        return v != nullptr && atoi(v) != 0;
-    }();
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLING_TOP_K_FIRST_LEGACY");
     return legacy;
 }
 
@@ -540,7 +551,9 @@ struct common_sampler * common_sampler_init(
     // the server takes the slot off the backend when either turns active. A sampler that constrains from the first
     // token (a grammar that is not lazy, llguidance, a budget that starts forcing) keeps the CPU path throughout.
     if (params.backend_sampling && (backend_passive_legacy() ? (grmr || rbudget) : !common_sampler_backend_passive(result))) {
-        LOG_WRN("%s: backend sampling is not compatible with %s, disabling\n", __func__, grmr ? "this grammar" : "this reasoning budget");
+        // a forcing budget holds the grammar off, so it is the budget that constrains even beside a grammar
+        const bool forcing = rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING;
+        LOG_WRN("%s: backend sampling is not compatible with %s, disabling\n", __func__, grmr && !forcing ? "this grammar" : "this reasoning budget");
 
         params.backend_sampling         = false;
         result->params.backend_sampling = false;
@@ -584,6 +597,10 @@ bool common_sampler_backend_passive(const struct common_sampler * gsmpl) {
         return true;  // no grammar, or a lazy one held off while reasoning
     }
     return llama_sampler_grammar_awaiting_trigger(gsmpl->grmr);
+}
+
+int32_t common_sampler_backend_top_k(const struct common_sampler * gsmpl) {
+    return gsmpl && !top_k_prefilter_legacy() ? gsmpl->top_k_first : 0;
 }
 
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
@@ -769,6 +786,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
+    // a row a backend cut to its top k holds no other token: as for a sampled token, a grammar or reasoning budget that
+    // would change these logits must have taken the slot off the backend
+    GGML_ASSERT((common_sampler_backend_passive(gsmpl) || llama_get_sampled_logits_ith(ctx, idx) == nullptr) &&
+            "backend top-k candidates while the grammar or reasoning budget constrains");
+
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
 
@@ -816,7 +838,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first,
+        const std::function<void(size_t, llama_token)> & on_sample) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
@@ -830,13 +853,19 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
+        if (on_sample) {
+            on_sample(i, id);
+        }
+
         if (draft[i] != id) {
             break;
         }
 
-        // the rows after this one were sampled on the backend without the constraint this token just switched on
-        // (a lazy grammar's trigger, the reasoning budget forcing): end here with a valid sample as the last token
-        if (llama_get_sampled_token_ith(ctx, idxs[i + 1]) != LLAMA_TOKEN_NULL && !common_sampler_backend_passive(gsmpl)) {
+        // the rows after this one were sampled, or cut to their top k, on the backend without the constraint this token
+        // just switched on (a lazy grammar's trigger, the reasoning budget forcing): end here with a valid sample as the
+        // last token
+        if (!common_sampler_backend_passive(gsmpl) && (llama_get_sampled_token_ith(ctx, idxs[i + 1]) != LLAMA_TOKEN_NULL ||
+                                                       llama_get_sampled_logits_ith(ctx, idxs[i + 1]) != nullptr)) {
             return result;
         }
     }
@@ -847,6 +876,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+
+        if (on_sample) {
+            on_sample(i, id);
+        }
     }
 
     return result;

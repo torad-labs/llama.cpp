@@ -150,7 +150,7 @@ public:
 
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
-    void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+    void update_rs_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
 private:
     llama_hparams hparams_raw;
@@ -162,6 +162,12 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;
+
+    // per-seq rollback reach: min(n_rs_seq, rows - 1) for the seq's rows in the last ubatch that carried it. Snapshot
+    // plane d past that ubatch's rows holds its starting state, not the one d rows back; plane rows itself is right here,
+    // but the reach stops short of it to keep the one contract llama.h states for n_rs_seq, which the recurrent memory
+    // (whose batches write no slot for their starting state) sets
+    std::vector<uint32_t> rs_reach;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;

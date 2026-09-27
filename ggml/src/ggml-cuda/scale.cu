@@ -34,10 +34,7 @@ static void scale_f32_cuda(const float * x, float * dst, const float scale, cons
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
     // GeForce Blackwell takes the float4 path too; GGML_CUDA_SCALE_VEC4_SM120_LEGACY=1 keeps it on GB10 only.
-    static const bool sm120_legacy = [] {
-        const char * e = getenv("GGML_CUDA_SCALE_VEC4_SM120_LEGACY");
-        return e != nullptr && atoi(e) != 0;
-    }();
+    static const bool sm120_legacy = ggml_env_switch("GGML_CUDA_SCALE_VEC4_SM120_LEGACY");
     if ((cc == GGML_CUDA_CC_DGX_SPARK || (cc == GGML_CUDA_CC_BLACKWELL && !sm120_legacy)) &&
             nelements >= 1024 && nelements % 4 == 0 &&
             (uintptr_t(x) & 0x0F) == 0 && (uintptr_t(dst) & 0x0F) == 0) {

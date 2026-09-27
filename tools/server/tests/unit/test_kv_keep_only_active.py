@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import pytest
 from utils import *
 
@@ -87,6 +88,84 @@ def test_clear_and_restore():
     })
     assert res.status_code == 200
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
+
+
+# the same, with the returning request naming the slot it was on: the slot is empty, and its prompt comes from cache-ram
+def test_clear_and_restore_named_slot():
+    global server
+    server.start()
+    log = LogReader(server.log_path)
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    original_prompt_n = res.body["timings"]["prompt_n"]
+
+    # Launching slot 1 clears idle slot 0
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.drain()
+
+    # Re-send the same prompt to slot 0 by id: it restores from cache-ram
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert "updating prompt cache" in log.drain()
+    assert res.body["timings"]["cache_n"] > 0
+    assert res.body["timings"]["prompt_n"] < original_prompt_n
+
+
+# a request for a busy slot waits for it: the prompt cache does not save or replace the slot's state under the running request
+def test_named_busy_slot_left_alone():
+    global server
+    server.start()
+    log = LogReader(server.log_path)
+
+    other = {"prompt": "The little dog ran to the park with a red ball.", "id_slot": 0, "cache_prompt": True}
+    res = server.make_request("POST", "/completion", data=other)
+    assert res.status_code == 200
+
+    # Launching slot 1 saves idle slot 0 to cache-ram and clears it
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    long_run = {"prompt": LONG_PROMPT, "id_slot": 0, "n_predict": 160, "ignore_eos": True, "cache_prompt": False}
+    res = server.make_request("POST", "/completion", data=long_run)
+    assert res.status_code == 200
+    expected = res.body["content"]
+    log.drain()
+
+    # the same run streamed, and once slot 0 generates, the other prompt asks for slot 0: its cached state is the best match
+    other_res = []
+    thread = None
+    content = ""
+    for data in server.make_stream_request("POST", "/completion", data={**long_run, "stream": True}):
+        if thread is None:
+            thread = threading.Thread(target=lambda: other_res.append(server.make_request("POST", "/completion", data=other)))
+            thread.start()
+        if not data["stop"]:
+            content += data["content"]
+    assert thread is not None
+    thread.join()
+    assert other_res[0].status_code == 200
+
+    if "requested slot is unavailable" not in log.drain():
+        pytest.skip("the other request did not reach the server while slot 0 was generating")  # ty: ignore[too-many-positional-arguments]
+    assert content == expected
 
 
 def test_disabled_with_flag():

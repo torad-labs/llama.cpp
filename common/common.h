@@ -398,6 +398,11 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    // the longest draft a recurrent target rolls back in place, one state snapshot per slot per token: a longer draft (an
+    // n-gram's copy past the draft model's n_max) is verified through a host checkpoint and replayed on rejection
+    // (0 = the draft model's n_max)
+    int32_t n_rollback = 0;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -407,7 +412,7 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        return needs_rs_seq ? (uint32_t) std::max(draft.n_max, n_rollback) : 0u;
     }
 };
 

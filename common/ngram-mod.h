@@ -19,7 +19,7 @@ struct common_ngram_mod {
 
     size_t  idx(const entry_t * tokens) const;
     void    add(const entry_t * tokens);
-    entry_t get(const entry_t * tokens) const; // return -1 if not found
+    entry_t get(const entry_t * tokens) const; // return -1 if not found, a slot another n-gram holds included
 
     void reset();
 
@@ -34,5 +34,15 @@ private:
 
     size_t used;
 
-    std::vector<entry_t> entries;
+    // a slot keeps the high half of its n-gram's hash beside the token that followed it: the slot is chosen by the low
+    // half, so without the key a lookup landing on a slot another n-gram filled returned that n-gram's token, at a rate
+    // equal to the occupancy (up to the 25% the drafter resets at), and each such draft took a draft model's round
+    struct slot {
+        uint32_t key;
+        entry_t  tok;
+    };
+
+    uint64_t hash(const entry_t * tokens) const;
+
+    std::vector<slot> entries;
 };

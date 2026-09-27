@@ -14,9 +14,11 @@
 bool ggml_cuda_mmvq_pq2_mma_usable(int cc, const void * vx, const void * vgate, int64_t ncols_x, int64_t nrows_x,
                                    int64_t stride_row_x, int64_t ncols_dst);
 
+// next: the head of the launch after this one, which this one prefetches into L2 (ggml_cuda_pq2_prefetch, common.cuh)
 void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy, const float * x_bias, float * dst,
                             int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x,
-                            int64_t stride_col_y, int64_t stride_col_dst, cudaStream_t stream);
+                            int64_t stride_col_y, int64_t stride_col_dst, const ggml_cuda_pq2_prefetch & next,
+                            cudaStream_t stream);
 
 #define PQ2_MMA_MAX_GROUP 4
 
@@ -25,4 +27,5 @@ void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy
 // ggml_cuda_mmvq_pq2_mma_usable serves unfused, and each gets that launch's result.
 void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
                                   const int64_t * stride_row_x, const int64_t * stride_col_dst, const void * vy,
-                                  int64_t ncols_x, int64_t ncols_dst, int64_t stride_col_y, cudaStream_t stream);
+                                  int64_t ncols_x, int64_t ncols_dst, int64_t stride_col_y,
+                                  const ggml_cuda_pq2_prefetch & next, cudaStream_t stream);

@@ -570,6 +570,32 @@ def test_n_probs_post_backend_sampling():
         for (aa, bb) in zip(a["top_probs"], b["top_probs"]):
             verify_token(aa, bb)
 
+def test_attn_rot_resident_matches_input(monkeypatch):
+    """With a quantized KV cache (head size 256: K and V rotated, base and SWA caches), the rotations set once in the
+    cache's buffer give the tokens and probabilities of the rotations built as graph inputs."""
+    global server
+    bodies = []
+    for legacy in ("0", "1"):
+        monkeypatch.setenv("LLAMA_ATTN_ROT_INPUT_LEGACY", legacy)
+        server = ServerPreset.tinygemma3()
+        server.ctk = "q8_0"
+        server.ctv = "q8_0"
+        server.fa = "on"
+        server.start()
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "The quick brown fox jumps over the lazy dog.",
+            "n_probs": 5,
+            "temperature": 0.0,
+            "n_predict": 8,
+        })
+        server.stop()
+        assert res.status_code == 200
+        bodies.append(res.body)
+
+    assert len(bodies[0]["completion_probabilities"]) == 8
+    assert bodies[0]["content"] == bodies[1]["content"]
+    assert bodies[0]["completion_probabilities"] == bodies[1]["completion_probabilities"]
+
 @pytest.mark.parametrize("constraint,expected", [
     # a lazy grammar that triggers mid-generation ("girl named" is generated at tokens 5-8)
     ({"grammar": 'root ::= "girl named Zo" [a-z]* "."', "grammar_lazy": True,
@@ -601,6 +627,79 @@ def test_backend_sampling_until_constrained(constraint, expected):
     assert on["generation_settings"]["backend_sampling"] is True
     assert expected in on["content"]
     assert on["tokens"] == off["tokens"]
+
+def test_backend_sampling_off_names_the_constraint(tmp_path):
+    """A slot that starts on the CPU because a constraint is active from its first token says which one: here the
+    budget, forcing from the start, while the lazy grammar beside it still waits for its trigger."""
+    global server
+    server.backend_sampling = True
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Once upon a time",
+        "n_predict": 4,
+        "temperature": 0.0,
+        "grammar": 'root ::= "girl named Zo" [a-z]* "."', "grammar_lazy": True,
+        "grammar_triggers": [{"type": 1, "value": "girl named"}],
+        "generation_prompt": " there",  # the start tag already in the prompt: the budget of 0 forces from the first token
+        "reasoning_budget_tokens": 0, "reasoning_budget_start_tag": "there", "reasoning_budget_end_tag": "end",
+        "reasoning_budget_message": "Zoo",
+    })
+    assert res.status_code == 200
+    log = (tmp_path / "server.log").read_text()
+    assert "backend sampling is not compatible with this reasoning budget" in log
+    assert "backend sampling is not compatible with this grammar" not in log
+
+@pytest.mark.parametrize("backend_sampling", [True, False])
+def test_backend_sampling_with_pull_detector_is_named_at_load(tmp_path, backend_sampling):
+    """The pull detector reads the served logits before the sampler, so no slot samples on the backend while it runs:
+    -bs given with it is said once at load, not left to look like it was taken."""
+    global server
+    server.backend_sampling = backend_sampling
+    server.pull_layers = "2"
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    log = (tmp_path / "server.log").read_text()
+    assert ("backend sampling (-bs) is off while the pull detector runs" in log) == backend_sampling
+
+@pytest.mark.parametrize("temperature,constraint,expected", [
+    # every one of the k candidates keeps a probability (no top-p or min-p cut), so one missing or out of place changes
+    # the draws or the probabilities
+    (1.0, {"top_p": 1.0, "min_p": 0.0}, None),
+    # a lazy grammar that triggers mid-generation, and a reasoning budget that runs out and forces its end
+    (0.0, {"grammar": 'root ::= "girl named Zo" [a-z]* "."', "grammar_lazy": True,
+           "grammar_triggers": [{"type": 1, "value": "girl named"}]}, "girl named Zo"),
+    (0.0, {"reasoning_budget_tokens": 3, "reasoning_budget_start_tag": "there", "reasoning_budget_end_tag": "end",
+           "reasoning_budget_message": "Zoo"}, "Zoo end"),
+])
+def test_top_k_prefilter(monkeypatch, temperature, constraint, expected):
+    """The chain's top-k taken on the backend: the CPU chain draws the tokens and gives the probabilities it does from the
+    top k it takes itself (LLAMA_TOP_K_PREFILTER_LEGACY=1), and reads every logit once a grammar or budget constrains."""
+    global server
+    bodies = []
+    for legacy in ("0", "1"):
+        monkeypatch.setenv("LLAMA_TOP_K_PREFILTER_LEGACY", legacy)
+        server = ServerPreset.tinyllama2()
+        server.start()
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "Once upon a time",
+            "n_predict": 40,
+            "temperature": temperature,
+            "seed": 42,
+            "n_probs": 5,
+            "post_sampling_probs": True,
+            "return_tokens": True,
+            **constraint,
+        })
+        server.stop()
+        assert res.status_code == 200
+        bodies.append(res.body)
+
+    if expected is not None:
+        assert expected in bodies[0]["content"]
+    assert len(bodies[0]["tokens"]) >= 8
+    assert bodies[0]["tokens"] == bodies[1]["tokens"]
+    assert bodies[0]["completion_probabilities"] == bodies[1]["completion_probabilities"]
 
 @pytest.mark.parametrize("tokenize,openai_style", [(False, False), (False, True), (True, False), (True, True)])
 def test_logit_bias(tokenize, openai_style):

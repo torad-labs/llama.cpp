@@ -1209,6 +1209,8 @@ struct ggml_cuda_device_info {
         int     physical_device;                // backing physical CUDA device for this (virtual) device
         int     physical_share_count;           // number of (virtual) devices sharing this device's physical GPU
         int     virtual_index;                  // index of this (virtual) device among those sharing its physical GPU
+        size_t  l2_bytes;                       // L2 cache (NVIDIA; 0 elsewhere)
+        double  dram_gbs;                       // DRAM peak, GB/s, from the memory clock and bus (NVIDIA; 0 elsewhere)
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
@@ -1487,15 +1489,26 @@ struct ggml_cuda_stream_context {
     }
 };
 
-// Fused recurrent-state gather for GATED_DELTA_NET (PrismML-Eng/llama.cpp#220, plus a q8_0 cache): build_rs
+// Fused recurrent-state gather for GATED_DELTA_NET (PrismML-Eng/llama.cpp#220, plus an f16 or q8_0 cache): build_rs
 // materialises GET_ROWS(cache, s_copy) into a temp that only the GDN kernel reads; the graph evaluator skips that
 // GET_ROWS (ggml_cuda_try_gdn_gather_skip) and records the gather here, so the kernel reads each sequence's state
 // row ids[seq] out of the cache itself.
 struct ggml_cuda_gated_delta_net_gather {
-    const void *    base       = nullptr; // cache rows, f32 or q8_0
-    const int32_t * ids        = nullptr; // per-seq row index
-    int64_t         row_stride = 0;       // between rows, in elements
-    bool            q8_0       = false;   // a q8_0 cache (-cts q8_0): the kernel dequantizes as it loads
+    const void *    base       = nullptr;       // cache rows of type
+    const int32_t * ids        = nullptr;       // per-seq row index
+    int64_t         row_stride = 0;             // between rows, in elements
+    ggml_type       type       = GGML_TYPE_F32; // f32, or the -cts cache f16 or q8_0, converted as the kernel loads it
+};
+
+// The head of the next PQ2_0 launch's weights, which a launch prefetches into L2 once it has requested all of its own
+// (mmvq-pq2-mma.cu): every block of a launch starts on the tiles at its matrices' heads, so while the small kernels
+// between two matmuls run, DRAM streams what the next one reads first. x is the next launch's first matrix and gate the
+// one it streams beside it, or null; bytes of each from its start, a multiple of 16 (0: none). A hint: no result depends
+// on it. The graph evaluation sets the context's before each node it dispatches (ggml_cuda_pq2_prefetch_plan).
+struct ggml_cuda_pq2_prefetch {
+    const void * x     = nullptr;
+    const void * gate  = nullptr;
+    int64_t      bytes = 0;
 };
 
 // Owned by the backend context that evaluates the graph: registrations are keyed by node pointer, so they only mean
@@ -1645,6 +1658,43 @@ struct ggml_backend_cuda_context {
         return it->second.get();
     }
 
+    // The most CUDA graph executables a context keeps (GGML_CUDA_GRAPH_MAX, 0 for no cap). Each holds device memory
+    // beside the buffers the scheduler sizes, and the graphs a context computes follow its traffic (one per graph shape,
+    // and per graph slot for the same shape), so without a count they would be bounded only by the 10 s eviction above:
+    // a new one evicts the least recently used.
+    static size_t cuda_graphs_max() {
+        static const size_t n = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_MAX");
+            return env != nullptr ? (size_t) std::max(0, atoi(env)) : (size_t) 8;
+        }();
+        return n;
+    }
+    size_t cuda_graphs_held_max = 0; // the most executables held at once here
+    size_t cuda_graph_bytes_max = 0; // the most device memory one took to instantiate here (cudaMemGetInfo around it)
+
+    // before `graph` gets an executable: evict the least recently used others until it fits under the cap; returns how
+    // many are held with it
+    size_t cuda_graph_make_room(const ggml_cuda_graph * graph) {
+        const size_t max = cuda_graphs_max();
+        for (;;) {
+            size_t held = 0;
+            auto   lru  = cuda_graphs.end();
+            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ++it) {
+                if (it->second->instance == nullptr || it->second.get() == graph) {
+                    continue;
+                }
+                ++held;
+                if (lru == cuda_graphs.end() || it->second->last_used_time < lru->second->last_used_time) {
+                    lru = it;
+                }
+            }
+            if (max == 0 || held < max) {
+                return held + 1;
+            }
+            cuda_graphs.erase(lru);
+        }
+    }
+
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
     bool any_cuda_graph_enabled() const {
@@ -1675,6 +1725,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context concurrent_stream_context;
     ggml_cuda_gdn_gather_context gdn_gather_context;
     ggml_cuda_ssm_conv_update_context ssm_conv_update_context;
+    ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
 
     ~ggml_backend_cuda_context();
 

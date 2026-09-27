@@ -683,7 +683,7 @@ class SchemaConverter:
             out.append(")")
             return self._add_rule(rule_name, ''.join(out))
 
-        elif (schema_type == 'object') or (len(schema) == 0):
+        elif schema_type == 'object':
             return self._add_rule(rule_name, self._add_primitive('object', PRIMITIVE_RULES['object']))
 
         elif schema_type is None and isinstance(schema, dict):
@@ -831,7 +831,8 @@ def main(args_in = None):
         dotall=args.dotall,
         raw_pattern=args.raw_pattern)
     schema = converter.resolve_refs(schema, url)
-    converter.visit(schema, '')
+    # an empty root accepts any object; {} below it accepts any value
+    converter.visit(schema if schema != {} else {'type': 'object'}, '')
     print(converter.format_grammar())
 
 

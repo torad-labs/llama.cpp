@@ -3511,6 +3511,37 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reconstruction()
             .run();
 
+        // {} below a parameter's schema and a parameter's own {} (zod's z.any()) accept any value; json-schema-to-grammar
+        // made them "object", so the grammar refused outputSchema's flat {"type": "object", ...} and a bare 42
+        common_chat_tool any_value_tool {
+            /* .name = */ "agent_run",
+            /* .description = */ "",
+            /* .parameters = */ R"({
+                "type": "object",
+                "properties": {
+                    "outputSchema": {"type": "object", "additionalProperties": {}},
+                    "anything": {}
+                },
+                "required": ["outputSchema", "anything"]
+            })",
+        };
+        tst.test(
+               "<tool_call>\n"
+               "<function=agent_run>\n"
+               "<parameter=outputSchema>\n"
+               "{\"type\": \"object\", \"required\": [\"a\"]}\n"
+               "</parameter>\n"
+               "<parameter=anything>\n"
+               "42\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ any_value_tool })
+            .expect_tool_calls({
+                { "agent_run", R"({"outputSchema": {"type": "object", "required": ["a"]}, "anything": 42})", {} },
+            })
+            .run();
+
         // Some models skip the opening <tool_call> and go straight to <function=>
         tst.test(
                "<function=special_function>\n"

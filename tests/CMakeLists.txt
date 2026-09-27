@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-recurrent-rollback-rounding.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -160,6 +161,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
     llama_build_and_test(test-kv-mask.cpp)
+    llama_build_and_test(test-kpool-can-reuse.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -238,6 +240,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+    # DeepSeek V4's memory serializes its own layout, which the test does not read
+    foreach(model qwen35-dense nemotron_h-dense)
+        llama_test(
+            test-recurrent-rollback-rounding
+            NAME test-recurrent-rollback-rounding-${model}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf"
+        )
+        set_tests_properties(test-recurrent-rollback-rounding-${model} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
     llama_build_and_test(test-kv-mean-center.cpp)
 endif()
 
@@ -282,6 +296,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-ngram-mod.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -318,6 +333,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-cpu-repack-buffer.cpp)
     llama_build_and_test(test-cuda-graph-key.cpp)
     llama_build_and_test(test-cuda-graph-src-type.cpp)
+    llama_build_and_test(test-cuda-graph-cap.cpp)
     llama_build_and_test(test-pq2-mma-device-memory.cpp)
 llama_build_and_test(test-ptq1_0-element-map.cpp)
 llama_build_and_test(test-ptq1_0-cuda-dot.cpp)

@@ -1,0 +1,8 @@
+// q8_0 K/V read by the MMA kernel without an f16 copy, see flash_attn_ext_raw_load.
+
+#include "../fattn-mma-f16.cuh"
+
+DECL_FATTN_MMA_RAW_CASE(256, 256,  2, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+DECL_FATTN_MMA_RAW_CASE(256, 256,  4, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+DECL_FATTN_MMA_RAW_CASE(256, 256,  8, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+DECL_FATTN_MMA_RAW_CASE(256, 256, 32, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
