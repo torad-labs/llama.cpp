@@ -36,11 +36,43 @@
 #    include <windows.h>
 #endif
 
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#    include <nvtx3/nvToolsExt.h>
+#    define LLAMA_BENCH_NVTX
+#endif
+
 // utils
 static uint64_t get_time_ns() {
     using clock = std::chrono::high_resolution_clock;
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
 }
+
+// An NVTX range "gen" in the domain "llama-bench" around each repetition's generation, so a profiler can capture the
+// tokens and none of the depth prefill before them: nsys profile -c nvtx -p gen@llama-bench --capture-range-end=stop
+// records the first repetition's generation (Ternary Bonsai 2 27B at a depth of 245,760: 16 tokens launch 18,816 kernels,
+// the prefill before them 1.19M). The message is a registered string, which nsys matches without NSYS_NVTX_PROFILER_REGISTER_ONLY=0. Without
+// the NVTX headers (a build without the CUDA toolkit) the range compiles out.
+struct bench_phase_range {
+#ifdef LLAMA_BENCH_NVTX
+    static nvtxDomainHandle_t domain() {
+        static const nvtxDomainHandle_t d = nvtxDomainCreateA("llama-bench");
+        return d;
+    }
+
+    explicit bench_phase_range(const char * name) {
+        nvtxEventAttributes_t attr = {};
+        attr.version            = NVTX_VERSION;
+        attr.size               = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+        attr.messageType        = NVTX_MESSAGE_TYPE_REGISTERED;
+        attr.message.registered = nvtxDomainRegisterStringA(domain(), name);
+        nvtxDomainRangePushEx(domain(), &attr);
+    }
+
+    ~bench_phase_range() { nvtxDomainRangePop(domain()); }
+#else
+    explicit bench_phase_range(const char *) {}
+#endif
+};
 
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
     if (a.pattern != b.pattern) {
@@ -2508,6 +2540,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
+                const bench_phase_range gen_range("gen");
                 bool res = test_gen(ctx, t.n_gen, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
