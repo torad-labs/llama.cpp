@@ -1418,6 +1418,11 @@ extern "C" {
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);
 
+    /// @details The row's probabilities over every token (a softmax of its logits), changing no logit. Backend only: a
+    /// backend chain [row-probs, top-k] hands the host each candidate's probability under the whole row
+    /// (llama_get_sampled_probs_ith); on the CPU it does nothing
+    LLAMA_API struct llama_sampler * llama_sampler_init_row_probs(void);
+
     /// @details Nucleus sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     LLAMA_API struct llama_sampler * llama_sampler_init_top_p      (float   p, size_t min_keep);
 

@@ -1596,6 +1596,11 @@ void launch_fattn(
     const bool kv_live = kv_live_ok && !kv_live_legacy && !mask_prefix && stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && mask && K->ne[1] >= 4096 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 && (nbatch_fa == 32 || nbatch_fa == 64) &&
         (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0;
+    // The live steps depend on the mask and the split alone, and every attention layer of a graph reads the same mask: the
+    // first layer scans it into the context's memory and the others read what it found (ggml_cuda_fattn_kv_live_context),
+    // one memset and one scan a graph instead of one a layer. GGML_CUDA_FATTN_LIVE_SCAN_EACH_LEGACY=1: every layer scans.
+    static const bool kv_live_scan_each_legacy = ggml_env_switch("GGML_CUDA_FATTN_LIVE_SCAN_EACH_LEGACY");
+    const int * KV_live_ptr = nullptr;
     if (kv_live) {
         const size_t  unit = mask_packed ? sizeof(uint16_t) : sizeof(half2);
         const int64_t s31  = mask->nb[1] / unit;
@@ -1605,25 +1610,48 @@ void launch_fattn(
         const int n      = ntiles_x*Q->ne[3];
         const int nrows  = mask->ne[1];
         const int ne33   = mask->ne[3];
+        const int ntiles_per_q_tile = ntiles_z_gqa*K->ne[2];
 
-        KV_live.alloc(fattn_kv_live_size(n, Q->ne[3], iter_k));
-        CUDA_CHECK(cudaMemsetAsync(KV_live.ptr, 0, (n + 1)*sizeof(int), main_stream)); // the step counts and the blocks done
-
-        const dim3 blocks_num_KV_live((iter_k + FATTN_KV_LIVE_THREADS - 1)/FATTN_KV_LIVE_THREADS, ntiles_x, Q->ne[3]);
-        const dim3 block_dim_KV_live(FATTN_KV_LIVE_THREADS, 1, 1);
-        const int  ntiles_per_q_tile = ntiles_z_gqa*K->ne[2];
-
-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_live, block_dim_KV_live, 0, main_stream);
-        if (mask_packed && nbatch_fa == 32) {
-            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, true,  32>, launch_params, mask->data, KV_live.ptr, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
-        } else if (mask_packed) {
-            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, true,  64>, launch_params, mask->data, KV_live.ptr, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
-        } else if (nbatch_fa == 32) {
-            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, false, 32>, launch_params, mask->data, KV_live.ptr, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
-        } else {
-            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, false, 64>, launch_params, mask->data, KV_live.ptr, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
+        ggml_cuda_fattn_kv_live_context::key_t key = {};
+        key.mask      = mask;
+        key.mask_data = mask->data;
+        key.stream    = main_stream;
+        for (int i = 0; i < 4; ++i) {
+            key.ne[i] = mask->ne[i];
+            key.nb[i] = mask->nb[i];
         }
-        CUDA_CHECK(cudaGetLastError());
+        const int geometry[6] = {ncols1, nbatch_fa, iter_k, ntiles_x, ntiles_per_q_tile, (int) Q->ne[3]};
+        memcpy(key.geometry, geometry, sizeof(geometry));
+
+        ggml_cuda_fattn_kv_live_context & scans = ctx.fattn_kv_live();
+        KV_live_ptr = kv_live_scan_each_legacy ? nullptr : scans.find(key);
+        if (KV_live_ptr == nullptr) {
+            const size_t size = fattn_kv_live_size(n, Q->ne[3], iter_k);
+            int * live;
+            if (kv_live_scan_each_legacy) {
+                KV_live.alloc(size);
+                live = KV_live.ptr;
+            } else {
+                live = scans.fill(key, size);
+            }
+            CUDA_CHECK(cudaMemsetAsync(live, 0, (n + 1)*sizeof(int), main_stream)); // the step counts and the blocks done
+
+            const dim3 blocks_num_KV_live((iter_k + FATTN_KV_LIVE_THREADS - 1)/FATTN_KV_LIVE_THREADS, ntiles_x, Q->ne[3]);
+            const dim3 block_dim_KV_live(FATTN_KV_LIVE_THREADS, 1, 1);
+
+            ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_live, block_dim_KV_live, 0, main_stream);
+            if (mask_packed && nbatch_fa == 32) {
+                ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, true,  32>, launch_params, mask->data, live, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
+            } else if (mask_packed) {
+                ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, true,  64>, launch_params, mask->data, live, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
+            } else if (nbatch_fa == 32) {
+                ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, false, 32>, launch_params, mask->data, live, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
+            } else {
+                ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1, false, 64>, launch_params, mask->data, live, iter_k, nrows, ne33, s31, s33, ntiles_per_q_tile);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            KV_live_ptr = live;
+        }
     } else if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_range)) {
         const size_t  unit = mask_packed ? sizeof(uint16_t) : sizeof(half2);
         const int64_t s31 = mask->nb[1] / unit;
@@ -1681,9 +1709,20 @@ void launch_fattn(
             const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
                 ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
                 : 100;
-            const int nblocks_stream_k = !kv_live && efficiency_loss_percent <= max_efficiency_loss_percent
-                ? nblocks_stream_k_rounded
+            // kv_live: the output tiles of a Q tile (its KV heads x GQA groups) share its live steps, so a block count that is a
+            // multiple of them gives every head the same blocks over the same steps. A cell's K and V rows hold the heads side by
+            // side (q4_0, head 256: 144 bytes each), so neighbouring heads share the 64-byte units the L2 fetches from DRAM, and
+            // only blocks reading a cell's rows together fetch a shared unit once. 510 blocks (3 an SM on an RTX 5090) split 4
+            // heads 127.5 ways, the heads' blocks half a block apart: 12 units fetched a cell row where 9 hold it, 4/3 the K/V
+            // bytes from DRAM. At most ntiles_per_q_tile - 1 blocks go. GGML_CUDA_FATTN_LIVE_BLOCKS_ALIGN_LEGACY=1: every block the
+            // SMs hold.
+            static const bool kv_live_align_legacy = ggml_env_switch("GGML_CUDA_FATTN_LIVE_BLOCKS_ALIGN_LEGACY");
+            const int ntiles_per_q_tile = ntiles_z_gqa*K->ne[2];
+            const int nblocks_live = !kv_live_align_legacy && nblocks_stream_k_raw >= ntiles_per_q_tile
+                ? nblocks_stream_k_raw - nblocks_stream_k_raw % ntiles_per_q_tile
                 : nblocks_stream_k_raw;
+            const int nblocks_stream_k = kv_live ? nblocks_live :
+                efficiency_loss_percent <= max_efficiency_loss_percent ? nblocks_stream_k_rounded : nblocks_stream_k_raw;
 
             blocks_num.x = nblocks_stream_k;
         }
@@ -1758,7 +1797,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        KV_live.ptr,
+        KV_live_ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
@@ -1777,7 +1816,7 @@ void launch_fattn(
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_live<DV, ncols1, ncols2>, launch_params,
-                (float *) KQV->data, dst_tmp_meta.ptr, KV_live.ptr,
+                (float *) KQV->data, dst_tmp_meta.ptr, KV_live_ptr,
                  Q->ne[1], Q->ne[2], Q->ne[3], K->ne[2], (int)blocks_num.x,
                  gqa_ratio, K->ne[1] / nbatch_fa, ntiles_x, ntiles_z_gqa, kv_live_fixup_legacy ? 1 : 0);
         } else if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {

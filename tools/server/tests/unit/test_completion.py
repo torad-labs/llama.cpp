@@ -701,6 +701,42 @@ def test_top_k_prefilter(monkeypatch, temperature, constraint, expected):
     assert bodies[0]["tokens"] == bodies[1]["tokens"]
     assert bodies[0]["completion_probabilities"] == bodies[1]["completion_probabilities"]
 
+@pytest.mark.parametrize("temperature,n_probs", [(0.0, 5), (1.0, 5), (1.0, 40)])
+def test_top_k_prefilter_pre_sampling_probs(monkeypatch, temperature, n_probs):
+    """Pre-sampling probabilities of at most k tokens keep the top k on the backend (row-probs beside it): the same tokens,
+    and each token's top n_probs by id with their log-probabilities under the whole row, as with every logit on the CPU
+    (LLAMA_TOP_K_PREFILTER_LEGACY=1) up to the order of the softmax's sum."""
+    global server
+    bodies = []
+    for legacy in ("0", "1"):
+        monkeypatch.setenv("LLAMA_TOP_K_PREFILTER_LEGACY", legacy)
+        server = ServerPreset.tinyllama2()
+        server.start()
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "Once upon a time",
+            "n_predict": 40,
+            "temperature": temperature,
+            "top_k": 40,
+            "seed": 42,
+            "n_probs": n_probs,
+            "return_tokens": True,
+        })
+        server.stop()
+        assert res.status_code == 200
+        bodies.append(res.body)
+
+    assert len(bodies[0]["tokens"]) >= 8
+    assert bodies[0]["tokens"] == bodies[1]["tokens"]
+    probs = [b["completion_probabilities"] for b in bodies]
+    assert len(probs[0]) == len(probs[1]) == len(bodies[0]["tokens"])
+    for on, legacy in zip(*probs):
+        assert on["id"] == legacy["id"]
+        assert on["logprob"] == pytest.approx(legacy["logprob"], abs=2e-5)
+        assert [t["id"] for t in on["top_logprobs"]] == [t["id"] for t in legacy["top_logprobs"]]
+        assert len(on["top_logprobs"]) == n_probs
+        for a, b in zip(on["top_logprobs"], legacy["top_logprobs"]):
+            assert a["logprob"] == pytest.approx(b["logprob"], abs=2e-5)
+
 @pytest.mark.parametrize("tokenize,openai_style", [(False, False), (False, True), (True, False), (True, True)])
 def test_logit_bias(tokenize, openai_style):
     global server

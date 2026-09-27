@@ -1943,14 +1943,20 @@ private:
 
             // a chain drawing on the CPU from a row's k largest logits (common_sampler_backend_top_k) has the backend take
             // them in the graph: a decode copies k logits a row instead of n_vocab and the CPU scans none, while the same
-            // chain and RNG draw, so each token is the one the CPU's top k gives. Not with a reader of every logit (the
-            // pre-sampling probabilities, the pull detector, the lens), and taken off as the chain is when a grammar or a
-            // reasoning budget starts to constrain (release_backend_sampler_if_constrained)
+            // chain and RNG draw, so each token is the one the CPU's top k gives. The pre-sampling probabilities of at most
+            // k tokens ride along: row-probs gives the row's softmax over every token and the top k keeps the k's, which
+            // get_token_probabilities reads. Not with a reader of every logit (more pre-sampling probabilities than k, the
+            // pull detector, the lens), and taken off as the chain is when a grammar or a reasoning budget starts to
+            // constrain (release_backend_sampler_if_constrained)
             const int32_t top_k   = common_sampler_backend_top_k(slot.smpl.get());
             const bool    lens_on = !params_base.lens_out.empty() && llama_n_lens_layers(ctx_tgt) > 0;
-            if (!slot.backend_sampler && top_k > 0 && !need_pre_sample_logits && pull_k.empty() && !lens_on &&
+            const bool    pre_probs_in_k = !need_pre_sample_logits || task.params.sampling.n_probs <= top_k;
+            if (!slot.backend_sampler && top_k > 0 && pre_probs_in_k && pull_k.empty() && !lens_on &&
                     common_sampler_backend_passive(slot.smpl.get())) {
                 slot.smpl_top_k.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                if (need_pre_sample_logits) {
+                    llama_sampler_chain_add(slot.smpl_top_k.get(), llama_sampler_init_row_probs());
+                }
                 llama_sampler_chain_add(slot.smpl_top_k.get(), llama_sampler_init_top_k(top_k));
                 slot.backend_sampler = llama_set_sampler(ctx_tgt, slot.id, slot.smpl_top_k.get());
             }
