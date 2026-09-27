@@ -1270,15 +1270,20 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
-    bool res = true;
+    const bool ok_idxs = inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
-    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    const bool ok_mask = can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    const bool ok_rs = inp_rs->can_reuse_rs(mctx->get_recr(), params);
 
-    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: k_idxs=%d kq_mask=%d rs=%d (head %u vs %u, rs_z %d vs %d)\n", __func__,
+                ok_idxs, ok_mask, ok_rs,
+                inp_rs->head, mctx->get_recr()->get_head(),
+                inp_rs->rs_z, mctx->get_recr()->get_rs_z());
+    }
 
-    return res;
+    return ok_idxs && ok_mask && ok_rs;
 }
 
 void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
@@ -1518,14 +1523,17 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
+    int input_idx = 0;
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
 
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+            LLAMA_LOG_DEBUG("%s: input %d can_reuse = %d\n", __func__, input_idx, cur);
         }
 
         res = res && cur;
+
+        input_idx++;
     }
 
     if (debug > 0) {
