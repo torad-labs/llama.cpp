@@ -7233,14 +7233,17 @@ struct test_mul_mat_vec_fusion : public test_case {
     // PQ2_0 block scales 1e-4..1e-3: the products stay far under the bias, which a kernel that drops it then fails by
     // ~100 % (at K 5120 and block scales 0.01..1 a dropped bias moves the output by ~0.1 %, under the tolerance)
     const bool small_scales;
+    // > 0: a SwiGLU limit (GLM-5.3, DeepSeek-V4): gate clamped to [-inf, limit], up to [-limit, limit], then the GLU.
+    // Small enough that most products clamp, so a kernel that drops it fails.
+    const float glu_limit;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
                         bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool alias_out = false,
-                        bool full_bias = false, bool small_scales = false)
+                        bool full_bias = false, bool small_scales = false, float glu_limit = 0.0f)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
         with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), alias_out(alias_out),
-        full_bias(full_bias), small_scales(small_scales) {
+        full_bias(full_bias), small_scales(small_scales), glu_limit(glu_limit) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
@@ -7256,6 +7259,9 @@ struct test_mul_mat_vec_fusion : public test_case {
         }
         if (small_scales) {
             v += "," + VAR_TO_STR(small_scales);
+        }
+        if (glu_limit > 0.0f) {
+            v += "," + VAR_TO_STR(glu_limit);
         }
         return v;
     }
@@ -7275,6 +7281,11 @@ struct test_mul_mat_vec_fusion : public test_case {
                 constexpr float alpha = 1.702f;
                 constexpr float limit = 7.0f;
                 out = ggml_swiglu_oai(ctx, ffn_gate, ffn_up, alpha, limit);
+            } else if (glu_limit > 0.0f) {
+                // as llama-graph builds it: the GLU's first source is the gate's clamp
+                ffn_gate = ggml_clamp(ctx, ffn_gate, -INFINITY, glu_limit);
+                ffn_up   = ggml_clamp(ctx, ffn_up, -glu_limit, glu_limit);
+                out = ggml_glu_split(ctx, ffn_gate, ffn_up, glu_op);
             } else {
                 out = ggml_glu_split(ctx, ffn_gate, ffn_up, glu_op);
             }
@@ -10614,6 +10625,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // GLM-5.3-Flash's routed experts (IQ3_XXS, 8 used; 32 experts here, of its 288) at decode and an MTP verify, where
+    // the CUDA backend streams them through mmvq-moe.cu's ring: gate/up rows of 4,096 weights with a token's vector
+    // shared by its experts, down rows of 2,048 with a vector each, and three tokens that share experts
+    for (int n : { 1, 3 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, true,  2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, false, 4096, n, 2048));
+    }
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
@@ -11382,6 +11401,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // a SwiGLU limit (GLM-5.3's experts, shared experts and dense FFN clamp at 10): its clamps fuse into the mat-vec
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q4_0 }) {
+        for (bool use_id : { false, true }) {
+            for (int64_t m_batch : { 1, 3 }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 32, 256,
+                    use_id, 16, 8, false, false, true, false, {1, 1}, false, false, false, 0.5f));
+            }
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 32, 256,
+                use_id, 16, 8, false, false, true, false, {4, 2}, false, false, false, 0.5f));
+        }
+    }
+    // and at GLM-5.3-Flash's routed gate/up (IQ3_XXS, 4,096 -> 2,048, 8 of 32 experts), a gated ring tile in mmvq-moe.cu
+    for (int64_t m_batch : { 1, 3 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_XXS, GGML_GLU_OP_SWIGLU, m_batch, 2048, 4096,
+            true, 32, 8, false, false, true, false, {1, 1}, false, false, false, 0.5f));
     }
 
     // Ternary Bonsai 2 27B's FFN at decode (qwen35: n_embd 5120, n_ff 17408, PQ2_0; its MTP layer Q8_0), also with the

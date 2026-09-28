@@ -1379,39 +1379,72 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
 #define VDR_IQ3_XXS_Q8_1_MMQ  2
 
-static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+// One lane's 32 weights of an IQ3_XXS block (its quant ints iqs and iqs + 1): the 8 grid indices, the signs and scale,
+// and the block's d, all a lane reads of the block, so a caller can take them out of shared memory and free it before
+// the math (mmvq-moe.cu)
+struct iq3_xxs_frag {
+    int2     q3;
+    uint32_t aux32;
+    float    d;
+};
 
-    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+static __device__ __forceinline__ iq3_xxs_frag iq3_xxs_frag_load(const block_iq3_xxs * bq3, const int iqs) {
+    return { make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1)), (uint32_t) get_int_b2(bq3->qs, QK_K/16 + iqs/2),
+             __half2float(bq3->d) };
+}
 
-    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
-    const uint8_t * q3 = (const uint8_t *) &q3_packed;
-    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+// A fragment against the 8 ints u of the q8_1 block it meets and its scale d8. grid(i) and ksigns(i) read iq3xxs_grid
+// and ksigns64 wherever the caller keeps them (mmvq-moe.cu: the grid a copy per lane in shared memory, so a warp's 32
+// gathers meet no bank conflict).
+template <typename grid_t, typename ksigns_t>
+static __device__ __forceinline__ float vec_dot_iq3_xxs_frag(
+    const iq3_xxs_frag & w, const int * u, const float d8, grid_t grid, ksigns_t ksigns) {
+
+    const uint8_t * q3    = (const uint8_t *) &w.q3;
+    const uint32_t  aux32 = w.aux32;
 
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(grid(q3[l0 + 0]), grid(q3[l0 + 1]));
+        // the 8 weights' signs as byte masks, 0xFF where negative (the 8th: the parity of the 7 stored), and a negative
+        // weight as ~g + 1, with no carry into the next byte as every grid byte is 4-62: 3 integer ops for 4 weights,
+        // where __vcmpne4 and __vsub4 are emulated in several each (built with -DGGML_CUDA_IQ3_XXS_SIGNS_LEGACY)
+#ifdef GGML_CUDA_IQ3_XXS_SIGNS_LEGACY
+        GGML_UNUSED(ksigns);
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
-
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-
-        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#else
+        const uint64_t signs  = ksigns((aux32 >> (7*l0/2)) & 0x7F);
+        const int      signs0 = (int) (uint32_t) signs;
+        const int      signs1 = (int) (uint32_t) (signs >> 32);
+        const int      grid_l = (grid_pos.x ^ signs0) + (signs0 & 0x01010101);
+        const int      grid_h = (grid_pos.y ^ signs1) + (signs1 & 0x01010101);
+#endif // GGML_CUDA_IQ3_XXS_SIGNS_LEGACY
 
-        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
-
-        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
-        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+        sumi = ggml_cuda_dp4a(grid_l, u[l0 + 0], sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u[l0 + 1], sumi);
     }
 
     const int ls = aux32 >> 28;
     sumi = (ls*sumi + sumi/2)/2;
-    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    return w.d * d8 * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+    int u[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        u[l] = get_int_b4(bq8_1[iqs/2].qs, l);
+    }
+    return vec_dot_iq3_xxs_frag(iq3_xxs_frag_load(bq3, iqs), u, __low2float(bq8_1[iqs/2].ds),
+        [](const int i) { return iq3xxs_grid[i]; }, [](const int i) { return ksigns64[i]; });
 }
 
 #define VDR_IQ3_S_Q8_1_MMVQ 2
@@ -1587,4 +1620,68 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
 
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
+}
+
+// The mat-vec dot product of each type against q8_1, and the quant ints a thread takes of a block per call: the
+// entry points of the MMVQ kernels (mmvq.cu, mmvq-moe.cu).
+typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
+        case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
+        case GGML_TYPE_PQ2_0: return vec_dot_pq2_0_q8_1;
+        case GGML_TYPE_PTQ1_0: return vec_dot_ptq1_0_q8_1;
+        case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
+        case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
+        case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
+        case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
+        case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
+        case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
+        case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
+        case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
+        case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
+        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
+        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
+        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
+        case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
+        case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
+        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
+        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
+        case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
+        case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
+        case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
+        case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
+        case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
+        default:                return nullptr;
+    }
+}
+
+static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
+        case GGML_TYPE_PQ2_0: return VDR_PQ2_0_Q8_1_MMVQ;
+        case GGML_TYPE_PTQ1_0: return VDR_PTQ1_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
+        case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
+        case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
+        case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
+        case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
+        case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q6_K:    return VDR_Q6_K_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
+        case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
+        default:                return 1;
+    }
 }

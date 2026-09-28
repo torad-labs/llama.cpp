@@ -1512,10 +1512,11 @@ struct ggml_cuda_pq2_prefetch {
     int64_t      bytes = 0;
 };
 
-// One tile counter a stream for the PQ2_0 tensor-core launches (mmvq-pq2-mma.cu): past its own first tiles a block takes
-// the next by an atomic add on it, and the block that takes the launch's last ticket sets it back to 0. A launch takes
-// tickets only after its dependency wait, when every launch before it on the stream has ended, so one counter serves
-// every launch of a stream, CUDA graph replays included. Made zeroed before a graph evaluation, never inside a capture.
+// One tile counter a stream for the ring launches (the PQ2_0 tensor-core ones, mmvq-pq2-mma.cu, and the routed experts',
+// mmvq-moe.cu): past its own first tiles a block takes the next by an atomic add on it, and the block that takes the
+// launch's last ticket sets it back to 0. A launch takes tickets only after its dependency wait, when every launch before
+// it on the stream has ended, so one counter serves every launch of a stream, CUDA graph replays included. Made zeroed
+// before a graph evaluation, never inside a capture.
 struct ggml_cuda_pq2_tile_counters {
     int * ptr = nullptr; // GGML_CUDA_MAX_STREAMS ints
 
@@ -1881,6 +1882,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    float glu_limit = 0.0f; // > 0: before the GLU, the gate clamped to at most glu_limit and x to +-glu_limit (a SwiGLU limit)
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1889,6 +1891,7 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    float glu_limit = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {
