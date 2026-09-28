@@ -5074,6 +5074,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // A weightless RMS_NORM read only by a MUL_MAT that runs on mul_mat_vec_f (the hyper-connection mixes of DeepSeek V4
+    // and GLM-5.3, hc_fn times the normalized streams): the matvec reads the norm's input and scales its dot products by
+    // the norm's scale, one per column, so the normalized copy is neither written nor read.
+    // GGML_CUDA_RMS_NORM_MMVF_LEGACY=1 launches the norm on its own.
+    static const bool rms_norm_mmvf_legacy = ggml_env_switch("GGML_CUDA_RMS_NORM_MMVF_LEGACY");
+    if (!rms_norm_mmvf_legacy && node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
+        ggml_tensor       * mm = cgraph->nodes[i + 1];
+        const ggml_tensor * x  = node->src[0];
+        const ggml_op ops[]    = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT };
+        const int out_nodes[]  = { i + 1 };
+        // ggml_can_fuse wants every node the shape of the one before it; the subgraph check counts the norm's readers only
+        if (mm->op == GGML_OP_MUL_MAT && mm->src[1] == node && mm->src[0] != node && x->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(x) && ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1) &&
+                ggml_cuda_should_fuse_mul_mat_vec_f(mm, /*gate =*/ nullptr) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.rms_norm = node;
+            ggml_cuda_mul_mat_vec_f(*cuda_ctx, mm->src[0], x, /*ids =*/ nullptr, mm, &fusion_data);
+            return 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;

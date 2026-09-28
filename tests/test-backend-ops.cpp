@@ -3734,6 +3734,47 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM without a weight straight into GGML_OP_MUL_MAT (the hyper-connection mixes of DeepSeek V4 and
+// GLM-5.3); CUDA runs both as one matvec at one column
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type_w;
+    const int64_t k;
+    const int64_t m;
+    const int64_t n;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, k, m, n, eps);
+    }
+
+    double max_nmse_err() override {
+        return type_w == GGML_TYPE_F32 ? 1e-7 : 5e-4;
+    }
+
+    test_rms_norm_mul_mat(ggml_type type_w = GGML_TYPE_BF16, int64_t k = 16384, int64_t m = 24, int64_t n = 1, float eps = 1e-6f)
+        : type_w(type_w), k(k), m(m), n(n), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, k, m);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, x, eps));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_GLU (Qwen3.5's gated norm, silu(gate) * (rms_norm(x) * w), fused operation)
 struct test_rms_norm_mul_glu : public test_case {
     const std::array<int64_t, 4> ne;
@@ -10270,6 +10311,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+    }
+
+    for (ggml_type type_w : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t k : {256, 4096, 16384}) {
+            for (int64_t n : {1, 3}) {
+                test_cases.emplace_back(new test_rms_norm_mul_mat(type_w, k, 24, n));
+            }
+        }
     }
 
     for (auto multi_add : {false, true}) {

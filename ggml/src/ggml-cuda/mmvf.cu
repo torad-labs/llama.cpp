@@ -55,6 +55,7 @@ static __global__ void mul_mat_vec_f(
     bool use_gate = false;
     bool use_bias = false;
     bool use_gate_bias = false;
+    bool use_norm = false;
     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
     const T * gate_x = nullptr;
     const float * x_bias = nullptr;
@@ -64,6 +65,7 @@ static __global__ void mul_mat_vec_f(
         use_gate = fusion.gate != nullptr;
         use_bias = fusion.x_bias != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr;
+        use_norm = fusion.rms_norm;
         glu_op = fusion.glu_op;
 
         if (use_gate) {
@@ -99,8 +101,10 @@ static __global__ void mul_mat_vec_f(
     extern __shared__ char data_mmv[];
     float * buf_iw = (float *) data_mmv;
     [[maybe_unused]] float * buf_iw_gate = nullptr;
+    [[maybe_unused]] float * buf_iw_sq   = nullptr;
     if constexpr (has_fusion) {
         buf_iw_gate = (float *) (data_mmv + warp_size*sizeof(float));
+        buf_iw_sq   = (float *) (data_mmv + 2*warp_size*sizeof(float));
     }
 
     if (block_size > warp_size) {
@@ -110,6 +114,9 @@ static __global__ void mul_mat_vec_f(
                 if (use_gate) {
                     buf_iw_gate[tid] = 0.0f;
                 }
+                if (use_norm) {
+                    buf_iw_sq[tid] = 0.0f;
+                }
             }
         }
         __syncthreads();
@@ -117,10 +124,12 @@ static __global__ void mul_mat_vec_f(
 
     float sumf[ncols_dst] = {0.0f};
     float sumf_gate[ncols_dst];
+    float sumsq[ncols_dst]; // with use_norm: the sum of squares of src1's column, for the RMS norm's scale
     if constexpr (has_fusion) {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
             sumf_gate[j] = 0.0f;
+            sumsq[j]     = 0.0f;
         }
     }
 
@@ -145,6 +154,12 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const float2 tmpy = y2[j*stride_col_y2 + col2];
+                if constexpr (has_fusion) {
+                    if (use_norm) {
+                        ggml_cuda_mad(sumsq[j], tmpy.x, tmpy.x);
+                        ggml_cuda_mad(sumsq[j], tmpy.y, tmpy.y);
+                    }
+                }
                 ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
                 ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
 
@@ -177,6 +192,12 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
                     const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    if constexpr (has_fusion) {
+                        if (use_norm) {
+                            ggml_cuda_mad(sumsq[j], tmpy.x, tmpy.x);
+                            ggml_cuda_mad(sumsq[j], tmpy.y, tmpy.y);
+                        }
+                    }
                     ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
                     ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
 
@@ -204,6 +225,12 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
                     const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    if constexpr (has_fusion) {
+                        if (use_norm) {
+                            ggml_cuda_mad(sumsq[j], tmpy.x, tmpy.x);
+                            ggml_cuda_mad(sumsq[j], tmpy.y, tmpy.y);
+                        }
+                    }
                     sumh2[j] += tmpx * make_half2(tmpy.x, tmpy.y);
 
                     if constexpr (has_fusion) {
@@ -252,6 +279,12 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const float2 tmpy = y2[j*stride_col_y2 + col2];
+                if constexpr (has_fusion) {
+                    if (use_norm) {
+                        ggml_cuda_mad(sumsq[j], tmpy.x, tmpy.x);
+                        ggml_cuda_mad(sumsq[j], tmpy.y, tmpy.y);
+                    }
+                }
                 const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
                 const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
                 ggml_cuda_mad(sumf[j], tmpx0, tmpy.x);
@@ -286,6 +319,12 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const float2 tmpy = y2[j*stride_col_y2 + col2];
+                if constexpr (has_fusion) {
+                    if (use_norm) {
+                        ggml_cuda_mad(sumsq[j], tmpy.x, tmpy.x);
+                        ggml_cuda_mad(sumsq[j], tmpy.y, tmpy.y);
+                    }
+                }
                 ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
                 ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
 
@@ -311,6 +350,9 @@ static __global__ void mul_mat_vec_f(
             if (use_gate) {
                 sumf_gate[j] = warp_reduce_sum<warp_size>(sumf_gate[j]);
             }
+            if (use_norm) {
+                sumsq[j] = warp_reduce_sum<warp_size>(sumsq[j]);
+            }
         }
 
         if (block_size > warp_size) {
@@ -318,6 +360,9 @@ static __global__ void mul_mat_vec_f(
             if constexpr (has_fusion) {
                 if (use_gate) {
                     buf_iw_gate[tid/warp_size] = sumf_gate[j];
+                }
+                if (use_norm) {
+                    buf_iw_sq[tid/warp_size] = sumsq[j];
                 }
             }
             __syncthreads();
@@ -328,6 +373,10 @@ static __global__ void mul_mat_vec_f(
                     if (use_gate) {
                         sumf_gate[j] = buf_iw_gate[tid];
                         sumf_gate[j] = warp_reduce_sum<warp_size>(sumf_gate[j]);
+                    }
+                    if (use_norm) {
+                        sumsq[j] = buf_iw_sq[tid];
+                        sumsq[j] = warp_reduce_sum<warp_size>(sumsq[j]);
                     }
                 }
             }
@@ -344,13 +393,22 @@ static __global__ void mul_mat_vec_f(
 
     float value = sumf[tid];
 
+    // the RMS norm's scale is one per column of src1, so it scales the dot products: W(s y) = s W y
+    [[maybe_unused]] float norm_scale = 1.0f;
+    if constexpr (has_fusion) {
+        if (use_norm) {
+            norm_scale = rsqrtf(sumsq[tid]/(2*ncols2) + fusion.rms_norm_eps);
+            value *= norm_scale;
+        }
+    }
+
     if constexpr (has_fusion) {
         if (use_bias) {
             value += x_bias[tid*stride_col_dst + row];
         }
 
         if (use_gate) {
-            float gate_value = sumf_gate[tid];
+            float gate_value = sumf_gate[tid] * norm_scale;
             if (use_gate_bias) {
                 gate_value += gate_bias[tid*stride_col_dst + row];
             }
@@ -374,7 +432,7 @@ static __global__ void mul_mat_vec_f(
     dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_norm, glu_op, gate_x, x_bias, gate_bias, sumf_gate, sumsq);
     }
 }
 
@@ -389,7 +447,7 @@ static void mul_mat_vec_f_switch_fusion(
 
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr || fusion.rms_norm;
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
@@ -444,9 +502,9 @@ void launch_mul_mat_vec_f_cuda(
         }
     }
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr || fusion.rms_norm;
 
-    const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
+    const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? 2*warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
     switch (block_size_best) {
@@ -673,6 +731,11 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
+        }
+        if (fusion->rms_norm) {
+            GGML_ASSERT(fusion->rms_norm->op == GGML_OP_RMS_NORM && fusion->rms_norm->src[0] == src1);
+            fusion_local.rms_norm     = true;
+            fusion_local.rms_norm_eps = ggml_get_op_params_f32(fusion->rms_norm, 0);
         }
         fusion_local.glu_op = fusion->glu_op;
     }
