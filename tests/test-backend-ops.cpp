@@ -11918,14 +11918,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // GLM-5.3-Flash (glm5next): 288 routed experts, 8 used, gate/up 4096 -> 2048 and down 2048 -> 4096, IQ3_XXS as the
+    // GLM-5.3-Flash (glm5next): routed experts, 8 used, gate/up 4096 -> 2048 and down 2048 -> 4096, IQ3_XXS as the
     // public GGUF serves them (Q8_0 in its MTP layer, IQ4_XS the requantization candidate); a decode token, an MTP verify
-    // of 2 drafts and a ubatch. Then its dense Q8_0 projections: KDA q/k/v and output, MLA output.
+    // of 2 drafts and a ubatch. 32 experts of its 288: the case quantizes every expert on the CPU at setup (all 288 took
+    // over 10 minutes), and 32 are still past a 5080's L2. Then its dense Q8_0 projections: KDA q/k/v and output, MLA output.
     for (int bs : {1, 3, 512}) {
         for (ggml_type type_a : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 2048, bs, 4096));
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 4096, bs, 2048));
-            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 288, 8, false, 2048, bs, 4096, 1));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 8, false, 2048, bs, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 8, false, 4096, bs, 2048));
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 32, 8, false, 2048, bs, 4096, 1));
         }
     }
     for (int bs : {1, 3}) {

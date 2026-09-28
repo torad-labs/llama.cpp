@@ -368,10 +368,11 @@ static void topk_radix_launch(const int nblocks, const float * src, const uint32
 
 static bool ggml_cuda_top_k_radix(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int nrows,
                                   const int k, const int cc, cudaStream_t stream) {
-    // Narrow rows stay with the bitonic sort, and a small k with the tiled path, whose blocks split a row.
-    // GGML_CUDA_TOPK_RADIX_LEGACY=1: never taken.
+    // A wide row with a small k stays with the tiled path, whose blocks split the row. A narrow row (no tiling) at any k
+    // is taken here: the other route is CUB's top-k one row after another, four launches a row (a 512-token ubatch of a
+    // DSA indexer under 4,096 cells: 2,048 launches a layer). GGML_CUDA_TOPK_RADIX_LEGACY=1: never taken.
     static const bool legacy = ggml_env_switch("GGML_CUDA_TOPK_RADIX_LEGACY");
-    if (legacy || ncols <= TOPK_CAND || k < TOPK_RADIX_MIN_K || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_VOLTA) {
+    if (legacy || (ncols > TOPK_CAND && k < TOPK_RADIX_MIN_K) || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_VOLTA) {
         return false;
     }
     if (ncols <= 16*TOPK_RADIX_BLOCK) {
