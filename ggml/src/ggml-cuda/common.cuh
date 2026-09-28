@@ -1535,6 +1535,99 @@ struct ggml_cuda_pq2_tile_counters {
     }
 };
 
+// The q8_1 copies of the F32 inputs that two or more quantized MUL_MAT / MUL_MAT_ID of one graph evaluation read on
+// mul_mat_vec_q (the q, k and v projections of one input; a shared expert's and the routed experts' gate/up): the first
+// reader quantizes into a pool allocation the evaluation holds (ggml_cuda_graph_evaluate_and_capture makes it before
+// that node), and the others read the copy (ggml_cuda_mul_mat_vec_q). A copy is keyed by its input's first byte and rows,
+// and its next reader quantizes it again once a node has written over any of those bytes (an in-place op, or ggml-alloc
+// handing them to a later tensor).
+struct ggml_cuda_mmvq_shared_q8_1 {
+    // an input as nrows rows of ne0 floats, row r at data + r*row_stride in the order quantize_row_q8_1_cuda writes them
+    // (r = i1 + ne1*(i2 + ne2*i3))
+    struct key {
+        const char * data;
+        int64_t      ne0;
+        int64_t      nrows;
+        size_t       row_stride;
+
+        bool operator==(const key & other) const {
+            return data == other.data && ne0 == other.ne0 && nrows == other.nrows && row_stride == other.row_stride;
+        }
+    };
+    struct entry {
+        key    k;
+        char * q8_1;
+        size_t size;
+        bool   quantized;
+    };
+    std::vector<entry> entries;
+    // The MUL_MAT that leads the node group being run, or nullptr: only its input is read from a copy. The evaluation
+    // learns of a group's writes after the group, and a MUL_MAT further in a group may read what an earlier node wrote.
+    const ggml_tensor * head = nullptr;
+
+    void reset() {
+        entries.clear();
+        head = nullptr;
+    }
+
+    // false when t's rows are not evenly strided
+    static bool key_of(const ggml_tensor * t, key & k) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float)) {
+            return false;
+        }
+        k.data       = (const char *) t->data;
+        k.ne0        = t->ne[0];
+        k.nrows      = t->ne[1]*t->ne[2]*t->ne[3];
+        k.row_stride = t->nb[1];
+        bool   first = true;
+        size_t next  = 0; // the stride the next dim of more than one element must have
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            if (t->ne[d] == 1) {
+                continue;
+            }
+            if (first) {
+                k.row_stride = t->nb[d];
+                first        = false;
+            } else if (t->nb[d] != next) {
+                return false;
+            }
+            next = t->nb[d]*t->ne[d];
+        }
+        return k.row_stride >= k.ne0*sizeof(float);
+    }
+
+    // the bytes the q8_1 rows take on mul_mat_vec_q (rows padded to MATRIX_ROW_PADDING)
+    static size_t q8_1_size(const key & k) {
+        return k.nrows*GGML_PAD(k.ne0, MATRIX_ROW_PADDING)*sizeof(block_q8_1)/QK8_1;
+    }
+
+    // the copy of t, when t is the input of head
+    entry * find(const ggml_tensor * t) {
+        key k;
+        key head_k;
+        if (entries.empty() || head == nullptr || !key_of(t, k) || !key_of(head->src[1], head_k) || !(k == head_k)) {
+            return nullptr;
+        }
+        for (entry & e : entries) {
+            if (e.k == k) {
+                GGML_ASSERT(e.size >= q8_1_size(k));
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    // a node wrote [data, data + nbytes)
+    void written(const char * data, size_t nbytes) {
+        for (entry & e : entries) {
+            const char * end = e.k.data + (e.k.nrows - 1)*e.k.row_stride + e.k.ne0*sizeof(float);
+            if (data < end && e.k.data < data + nbytes) {
+                e.quantized = false;
+            }
+        }
+    }
+};
+
 // Owned by the backend context that evaluates the graph: registrations are keyed by node pointer, so they only mean
 // something for the evaluation that made them. Cleared at the start of every graph evaluation/capture.
 struct ggml_cuda_gdn_gather_context {
@@ -1838,6 +1931,10 @@ struct ggml_backend_cuda_context {
     ggml_cuda_fattn_kv_live_context fattn_kv_live_context;
     ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
     ggml_cuda_pq2_tile_counters pq2_tile_counters;
+    ggml_cuda_mmvq_shared_q8_1 mmvq_shared_q8_1; // filled during a graph evaluation only
+    // the stream is being captured with the rest of an evaluation across backends (ggml_backend_cuda_capture_begin):
+    // the graphs computed meanwhile are evaluated into it, with no CUDA graph of their own
+    bool outer_capture = false;
 
     ~ggml_backend_cuda_context();
 
@@ -1905,6 +2002,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f; // > 0: before the GLU, the gate clamped to at most glu_limit and x to +-glu_limit (a SwiGLU limit)
+    const ggml_tensor * rms_norm = nullptr; // a weightless RMS_NORM whose input src1 is: the dot products take its scale (mmvf)
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1914,6 +2012,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    bool  rms_norm = false;
+    float rms_norm_eps = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {

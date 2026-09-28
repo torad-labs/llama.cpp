@@ -1623,9 +1623,18 @@ static bool ggml_backend_sched_input_stageable(ggml_backend_sched_t sched, int b
 }
 
 // the backend runs an async set in the queue of its compute, after the work still reading the destination: a CUDA stream
-// (CUDA, ROCm, MUSA). Another may run it in a queue of its own (Vulkan's transfer queue on AMD) and overwrite an input copy
-// its last compute still reads, so its inputs keep the synchronous copy
+// (CUDA, ROCm, MUSA), and a meta backend whose devices' backends all do (it sets each device's part on that device's
+// backend). Another may run it in a queue of its own (Vulkan's transfer queue on AMD) and overwrite an input copy its last
+// compute still reads, so its inputs keep the synchronous copy
 static bool ggml_backend_sched_set_async_in_order(ggml_backend_t backend) {
+    if (ggml_backend_is_meta(backend)) {
+        for (size_t j = 0; j < ggml_backend_meta_n_backends(backend); j++) {
+            if (!ggml_backend_sched_set_async_in_order(ggml_backend_meta_simple_backend(backend, j))) {
+                return false;
+            }
+        }
+        return true;
+    }
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == NULL) {
         return false;

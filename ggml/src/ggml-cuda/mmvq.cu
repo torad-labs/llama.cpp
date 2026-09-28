@@ -1395,12 +1395,19 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    // an input other MUL_MATs of the evaluation read too is quantized once, into the copy it holds for them
+    ggml_cuda_mmvq_shared_q8_1::entry * shared = ctx.mmvq_shared_q8_1.find(src1);
+    ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
+    char * src1_q8_1 = shared != nullptr ? shared->q8_1 :
+        src1_q8_1_own.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    if (shared == nullptr || !shared->quantized) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        if (shared != nullptr) {
+            shared->quantized = true;
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1434,7 +1441,7 @@ void ggml_cuda_mul_mat_vec_q(
         args.type                   = src0->type;
         args.vx                     = src0->data;
         args.vgate                  = fusion_local.gate;
-        args.y                      = src1_q8_1.get();
+        args.y                      = src1_q8_1;
         args.ids                    = ids_d;
         args.x_bias                 = (const float *) fusion_local.x_bias;
         args.gate_bias              = (const float *) fusion_local.gate_bias;
@@ -1459,13 +1466,13 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     if (pq2_mma) {
-        ggml_cuda_mmvq_pq2_mma(src0->data, fusion_local.gate, src1_q8_1.get(), (const float *) fusion_local.x_bias,
+        ggml_cuda_mmvq_pq2_mma(src0->data, fusion_local.gate, src1_q8_1, (const float *) fusion_local.x_bias,
             dst_d, ne00, ne01, ne1, s01, s11, s1, ctx.pq2_next, ctx.pq2_tile_counter(), stream);
         return;
     }
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
