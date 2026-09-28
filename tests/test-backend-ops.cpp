@@ -7607,6 +7607,94 @@ struct test_mul_mat_group : public test_case {
     }
 };
 
+// Quantized matmuls that read one F32 input at mul_mat_vec_q's columns: the CUDA backend quantizes it once and the later
+// readers take the copy (ggml_cuda_mmvq_shared_q8_1; GGML_CUDA_MMVQ_SHARED_Q8_1_LEGACY=1: each reader quantizes it).
+// Every reader's output is checked. overwrite: the input is scaled in place after the second reader and the third reads
+// the scaled values; strided: the first and third read every other row of the input and the second all of it (the same
+// first byte, other rows); with_id: a MUL_MAT_ID reads the rows first, as one token each for the routed experts.
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type;
+    const int64_t   n; // the rows each reader takes (the second takes twice as many when strided)
+    const int64_t   k;
+    const bool      overwrite;
+    const bool      strided;
+    const bool      with_id;
+
+    static constexpr int64_t m      = 64; // a reader's output rows
+    static constexpr int     n_mats = 4;
+    static constexpr int     n_used = 2;
+
+    std::vector<ggml_tensor *> order; // the readers and the in-place scale, in graph order
+    std::vector<ggml_tensor *> mms;
+
+    test_mul_mat_shared_src1(ggml_type type, int64_t n, int64_t k, bool overwrite, bool strided, bool with_id)
+        : type(type), n(n), k(k), overwrite(overwrite), strided(strided), with_id(with_id) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n, k, overwrite, strided, with_id);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> forward_first() override { return order; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return mms; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, strided ? 2*n : n);
+        ggml_set_name(x, "x");
+        // the rows the first and third readers take
+        const auto rows = [&](ggml_tensor * t) {
+            return strided ? ggml_view_2d(ctx, t, k, n, 2*t->nb[1], 0) : t;
+        };
+
+        order.clear();
+        mms.clear();
+        const auto read = [&](ggml_tensor * src1, const char * name) {
+            ggml_tensor * w  = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * mm = ggml_mul_mat(ctx, w, src1);
+            ggml_set_name(mm, name);
+            order.push_back(mm);
+            mms.push_back(mm);
+            return mm;
+        };
+
+        if (with_id) {
+            ggml_tensor * as  = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+            ggml_set_name(ids, "ids");
+            // n tokens of one row each, broadcast to their experts
+            ggml_tensor * tokens = ggml_view_3d(ctx, x, k, 1, n, x->nb[1], strided ? 2*x->nb[1] : x->nb[1], 0);
+            ggml_tensor * mm_id  = ggml_mul_mat_id(ctx, as, tokens, ids);
+            ggml_set_name(mm_id, "mm_id");
+            order.push_back(mm_id);
+            mms.push_back(mm_id);
+        }
+        read(rows(x), "mm0");
+        read(x, "mm1");
+        ggml_tensor * third = x;
+        if (overwrite) {
+            third = ggml_scale_inplace(ctx, x, -0.5f);
+            ggml_set_name(third, "x_scaled");
+            order.push_back(third);
+        }
+        ggml_tensor * out = read(rows(third), "mm2");
+        order.pop_back(); // out is expanded last
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -11601,6 +11689,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_group({ 24, 40 }, n, k));
             test_cases.emplace_back(new test_mul_mat_group({ 8, 1000, 24 }, n, k));
             test_cases.emplace_back(new test_mul_mat_group({ 40, 8, 24, 16, 8 }, n, k));
+        }
+    }
+
+    // quantized matmuls on one input: at up to MMVQ_MAX_BATCH_SIZE columns CUDA quantizes it once for all of them (16:
+    // past it, each on its own)
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q4_0 }) {
+        for (int64_t n : { 1, 3, 8, 16 }) {
+            for (bool overwrite : { false, true }) {
+                for (bool strided : { false, true }) {
+                    for (bool with_id : { false, true }) {
+                        test_cases.emplace_back(new test_mul_mat_shared_src1(type, n, 1024, overwrite, strided, with_id));
+                    }
+                }
+            }
         }
     }
 

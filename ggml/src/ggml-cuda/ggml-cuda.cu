@@ -5239,6 +5239,37 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         return it == gb10_shared_q8_consumer_counts.end() ? 0 : it->second[type];
     };
 
+    // An F32 input that two or more quantized MUL_MAT / MUL_MAT_ID read at mul_mat_vec_q's columns is quantized once
+    // (ggml_cuda_mmvq_shared_q8_1): its copy is made before its first reader and held to the end of the evaluation, and
+    // the readers are counted by the input's first byte at the first candidate. Off while the graph has concurrent streams.
+    // GGML_CUDA_MMVQ_SHARED_Q8_1_LEGACY=1 quantizes it at each reader.
+    static const bool mmvq_shared_q8_1_legacy = ggml_env_switch("GGML_CUDA_MMVQ_SHARED_Q8_1_LEGACY");
+    const auto mmvq_shared_q8_1_candidate = [](const ggml_tensor * node) {
+        if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || node->src[0] == nullptr ||
+                node->src[1] == nullptr || !ggml_is_quantized(node->src[0]->type) || node->src[1]->type != GGML_TYPE_F32 ||
+                (node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD)) {
+            return false;
+        }
+        // mul_mat_vec_q's columns: a MUL_MAT's src1 rows, a MUL_MAT_ID's tokens
+        return (node->op == GGML_OP_MUL_MAT ? node->src[1]->ne[1] : node->src[1]->ne[2]) <= MMVQ_MAX_BATCH_SIZE;
+    };
+    std::unordered_map<const void *, int> mmvq_shared_q8_1_readers;
+    bool mmvq_shared_q8_1_counted = false;
+    const auto mmvq_shared_q8_1_reader_count = [&](const ggml_tensor * src1) {
+        if (!mmvq_shared_q8_1_counted) {
+            for (int j = 0; j < cgraph->n_nodes; ++j) {
+                const ggml_tensor * candidate = cgraph->nodes[j];
+                if ((candidate->flags & GGML_TENSOR_FLAG_COMPUTE) && mmvq_shared_q8_1_candidate(candidate)) {
+                    ++mmvq_shared_q8_1_readers[candidate->src[1]->data];
+                }
+            }
+            mmvq_shared_q8_1_counted = true;
+        }
+        const auto it = mmvq_shared_q8_1_readers.find(src1->data);
+        return it == mmvq_shared_q8_1_readers.end() ? 0 : it->second;
+    };
+    cuda_ctx->mmvq_shared_q8_1.reset();
+
     static const bool virtual_rms_q8_enabled = [] {
         const char * env = getenv("GGML_CUDA_GB10_VIRTUAL_RMS_Q8");
         return !env || std::atoi(env) != 0;
@@ -5271,6 +5302,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         for (auto & entry : gb10_shared_q8) {
             entry.quantized = false;
             entry.remaining = gb10_shared_q8_consumer_count(entry.src1, entry.type);
+        }
+        for (auto & entry : cuda_ctx->mmvq_shared_q8_1.entries) {
+            entry.quantized = false;
         }
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -5345,6 +5379,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             const std::vector<ggml_cuda_pq2_prefetch> pq2_plan = ggml_cuda_pq2_prefetch_plan(*cuda_ctx, cgraph);
 
+            int mmvq_shared_q8_1_seen = 0; // the nodes before it have been checked for writes over a q8_1 copy's input
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -5378,6 +5414,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 prev_i = i;
+
+                // the nodes since the last iteration have run (or were fused, or folded into a node that ran), and a q8_1
+                // copy of an input any of them wrote over is stale
+                if (!cuda_ctx->mmvq_shared_q8_1.entries.empty()) {
+                    for (int k = mmvq_shared_q8_1_seen; k < i; ++k) {
+                        const ggml_tensor * ran = cgraph->nodes[k];
+                        if (!ggml_cuda_is_view_or_noop(ran) && (ran->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                            cuda_ctx->mmvq_shared_q8_1.written((const char *) ran->data, ggml_nbytes(ran));
+                        }
+                    }
+                }
+                mmvq_shared_q8_1_seen          = i;
+                cuda_ctx->mmvq_shared_q8_1.head = nullptr;
 
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
@@ -5452,6 +5501,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_nvtx_mark_fused(cgraph, i, 2);
                         i += 2;
                         continue;
+                    }
+                }
+
+                // a MUL_MAT whose input other MUL_MATs read too leads its group: the first to run makes the input's copy
+                if (!mmvq_shared_q8_1_legacy && !should_launch_concurrent_events && mmvq_shared_q8_1_candidate(node) &&
+                        mmvq_shared_q8_1_reader_count(node->src[1]) > 1) {
+                    ggml_cuda_mmvq_shared_q8_1 & shared = cuda_ctx->mmvq_shared_q8_1;
+                    ggml_cuda_mmvq_shared_q8_1::key k;
+                    if (ggml_cuda_mmvq_shared_q8_1::key_of(node->src[1], k)) {
+                        shared.head = node;
+                        if (shared.find(node->src[1]) == nullptr) {
+                            const size_t size = ggml_cuda_mmvq_shared_q8_1::q8_1_size(k);
+                            auto data = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), size);
+                            shared.entries.push_back({ k, data->get(), size, false });
+                            gb10_pool_allocations.push_back(std::move(data));
+                        }
                     }
                 }
 
@@ -5582,6 +5647,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     // The VMM scratch pool is stack-like, so release all persistent allocations
     // explicitly in reverse order across both shared-Q8 and row-scale buffers.
+    cuda_ctx->mmvq_shared_q8_1.reset();
     for (auto it = gb10_pool_allocations.rbegin(); it != gb10_pool_allocations.rend(); ++it) {
         it->reset();
     }
