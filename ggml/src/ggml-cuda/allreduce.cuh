@@ -27,3 +27,11 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// Whether the AllReduce of a tensor like t (same preconditions) can be captured
+// into a CUDA graph and replayed: it runs on the chunked kernel, which takes its
+// tokens and slots from the device, and not over the copy engines, whose
+// events the host syncs on.
+bool ggml_cuda_ar_capturable(
+    const ggml_cuda_ar_pipeline * pipeline,
+    const ggml_tensor           * t);
+

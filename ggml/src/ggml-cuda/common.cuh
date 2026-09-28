@@ -1932,6 +1932,9 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
     ggml_cuda_pq2_tile_counters pq2_tile_counters;
     ggml_cuda_mmvq_shared_q8_1 mmvq_shared_q8_1; // filled during a graph evaluation only
+    // the stream is being captured with the rest of an evaluation across backends (ggml_backend_cuda_capture_begin):
+    // the graphs computed meanwhile are evaluated into it, with no CUDA graph of their own
+    bool outer_capture = false;
 
     ~ggml_backend_cuda_context();
 

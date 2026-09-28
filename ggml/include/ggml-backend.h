@@ -208,6 +208,18 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Whether that AllReduce of these tensors can be captured with the rest of an evaluation (below)
+    typedef bool   (*ggml_backend_comm_allreduce_capturable_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+
+    // Capture of a whole evaluation across backends, into one graph a backend replayed with one launch (meta backend):
+    // begin starts capturing what is queued on the backend, the graphs computed on it meanwhile included, and end returns
+    // the executable (NULL if the capture failed), which launch replays and free destroys. graph_capturable tells whether
+    // a graph can be computed into such a capture.
+    typedef bool   (*ggml_backend_graph_capturable_t)(ggml_backend_t backend, struct ggml_cgraph * cgraph);
+    typedef void   (*ggml_backend_capture_begin_t)(ggml_backend_t backend);
+    typedef void * (*ggml_backend_capture_end_t)(ggml_backend_t backend);
+    typedef void   (*ggml_backend_capture_launch_t)(ggml_backend_t backend, void * exec);
+    typedef void   (*ggml_backend_capture_free_t)(ggml_backend_t backend, void * exec);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

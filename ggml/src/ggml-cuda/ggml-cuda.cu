@@ -1110,12 +1110,10 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 }
 #endif // GGML_USE_NCCL
 
-// Run the internal AR pipeline.  Returns false on unsupported / failed input
-// -- the caller decides whether to abort (env-forced) or fall back silently.
-static bool ggml_backend_cuda_comm_allreduce_internal(
+// Whether the internal AR pipeline takes these tensors: F32, F16 or BF16 of one
+// shape on both devices, contiguously allocated and 16-byte aligned, or empty.
+static bool ggml_backend_cuda_comm_internal_supports(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
-
     const size_t n_backends = comm_ctx->backends.size();
     GGML_ASSERT(n_backends == 2);
     GGML_ASSERT(tensors[0] != nullptr);
@@ -1154,6 +1152,22 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
             return false;
         }
         GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
+    }
+
+    return true;
+}
+
+// Run the internal AR pipeline.  Returns false on unsupported / failed input
+// -- the caller decides whether to abort (env-forced) or fall back silently.
+static bool ggml_backend_cuda_comm_allreduce_internal(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
+
+    if (!ggml_backend_cuda_comm_internal_supports(comm_ctx, tensors)) {
+        return false;
+    }
+    if (ggml_nelements(tensors[0]) == 0) {
+        return true;
     }
 
     return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
@@ -1295,6 +1309,27 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
+
+// Whether the AllReduce of these tensors can be captured with the rest of an
+// evaluation (ggml_backend_cuda_capture_begin) and replayed: only on the
+// internal pipeline's chunked kernel (ggml_cuda_ar_capturable), since NCCL's is
+// not captured here and the meta backend's own reduction syncs the host.  Nor
+// an empty one, which launches nothing: the graphs evaluated before and after
+// it would meet in the capture with nothing between them, where uncaptured
+// they always have a launch that waits for all before it (a graph launch, or
+// the all-reduce's kernel), which the kernels of an evaluation may rely on
+// where PDL lets the next launch start early.
+#ifdef USE_CUDA_GRAPH
+static bool ggml_backend_cuda_comm_allreduce_capturable(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    return comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal &&
+        ggml_backend_cuda_comm_internal_supports(comm_ctx, tensors) && ggml_nelements(tensors[0]) > 0 &&
+        ggml_cuda_ar_capturable(comm_ctx->ar_pipeline, tensors[0]);
+}
+#endif // USE_CUDA_GRAPH
 
 // host buffer type
 
@@ -5683,6 +5718,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
+    if (cuda_ctx->outer_capture) {
+        const ggml_cuda_nvtx_range nvtx_graph("graph");
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+        return GGML_STATUS_SUCCESS;
+    }
+
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -5730,6 +5771,88 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     return GGML_STATUS_SUCCESS;
 }
+
+#ifdef USE_CUDA_GRAPH
+// An evaluation across backends captured whole, into one CUDA graph a backend (the meta backend's,
+// ggml_backend_meta_graph_compute): capture_begin starts capturing the backend's stream, every graph computed on the
+// backend until capture_end is evaluated into it (outer_capture) beside what the caller queues on the stream meanwhile
+// (the all-reduces), and capture_end returns the executable, which capture_launch replays and capture_free destroys.
+
+// whether a graph computed on this backend can be evaluated into such a capture: CUDA graphs are on for it, and none of
+// its nodes syncs the stream to the host (ggml_cuda_graph_check_compability)
+static bool ggml_backend_cuda_graph_capturable(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    return ggml_cuda_graph_set_enabled(cuda_ctx, ggml_cuda_graph_get_key(cgraph)) &&
+        ggml_cuda_graph_check_compability(cgraph);
+}
+
+static void ggml_backend_cuda_capture_begin(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    GGML_ASSERT(!cuda_ctx->outer_capture);
+    ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+    cuda_ctx->outer_capture = true;
+}
+
+// the executable of what the stream was given since capture_begin, or nullptr if the capture failed
+static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    GGML_ASSERT(cuda_ctx->outer_capture);
+    cuda_ctx->outer_capture = false;
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    cudaGraph_t graph = nullptr;
+    const cudaError_t err = cudaStreamEndCapture(cuda_ctx->stream(), &graph);
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            ggml_cuda_lock_cv.notify_all();
+        }
+    }
+    if (err != cudaSuccess || graph == nullptr) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: %s: capture failed: %s\n", __func__, cuda_ctx->name.c_str(), cudaGetErrorString(err));
+        if (graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
+        return nullptr;
+    }
+
+    size_t n_nodes = 0;
+    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &n_nodes));
+    size_t free_before;
+    size_t free_after;
+    size_t total;
+    CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+    const int64_t t_start_us = ggml_time_us();
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, NULL, NULL, 0));
+    const int64_t t_instantiate_us = ggml_time_us() - t_start_us;
+    CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    GGML_LOG_DEBUG("%s: %s: %zu nodes, instantiating took %.2f MiB and %.2f ms\n", __func__, cuda_ctx->name.c_str(),
+        n_nodes, (free_before > free_after ? free_before - free_after : 0) / 1024.0 / 1024.0, t_instantiate_us / 1e3);
+    return exec;
+}
+
+static void ggml_backend_cuda_capture_launch(ggml_backend_t backend, void * exec) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
+}
+
+static void ggml_backend_cuda_capture_free(ggml_backend_t backend, void * exec) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaGraphExecDestroy((cudaGraphExec_t) exec));
+}
+#endif // USE_CUDA_GRAPH
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
@@ -6929,6 +7052,26 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
+#ifdef USE_CUDA_GRAPH
+    if (strcmp(name, "ggml_backend_comm_allreduce_capturable") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_capturable;
+    }
+    if (strcmp(name, "ggml_backend_graph_capturable") == 0) {
+        return (void *)ggml_backend_cuda_graph_capturable;
+    }
+    if (strcmp(name, "ggml_backend_capture_begin") == 0) {
+        return (void *)ggml_backend_cuda_capture_begin;
+    }
+    if (strcmp(name, "ggml_backend_capture_end") == 0) {
+        return (void *)ggml_backend_cuda_capture_end;
+    }
+    if (strcmp(name, "ggml_backend_capture_launch") == 0) {
+        return (void *)ggml_backend_cuda_capture_launch;
+    }
+    if (strcmp(name, "ggml_backend_capture_free") == 0) {
+        return (void *)ggml_backend_cuda_capture_free;
+    }
+#endif // USE_CUDA_GRAPH
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }
