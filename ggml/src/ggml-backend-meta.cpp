@@ -131,7 +131,7 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .async                 = */ true,
         /* .host_buffer           = */ false, // Not implemented.
         /* .buffer_from_host_ptr  = */ false, // Not implemented.
-        /* .events                = */ false, // Not implemented.
+        /* .events                = */ true,
         /* .mmap_support          = */ true,
     };
     for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
@@ -177,6 +177,12 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
     return true;
 }
 
+static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev);
+
+static void ggml_backend_meta_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event);
+
 static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .get_name             = */ ggml_backend_meta_device_get_name,
     /* .get_description      = */ ggml_backend_meta_device_get_description,
@@ -190,9 +196,9 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
     /* .offload_op           = */ nullptr,
-    /* .event_new            = */ nullptr,
-    /* .event_free           = */ nullptr,
-    /* .event_synchronize    = */ nullptr,
+    /* .event_new            = */ ggml_backend_meta_device_event_new,
+    /* .event_free           = */ ggml_backend_meta_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -210,6 +216,51 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
     return meta_dev_ctx->simple_devs[index];
+}
+
+// A meta event is an event of each simple device, recorded on its simple backend after the work the meta backend queued
+// there: it has completed once each of them has.
+struct ggml_backend_meta_event_context {
+    std::vector<ggml_backend_event_t> simple_events;
+};
+
+static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev) {
+    const size_t n_devs = ggml_backend_meta_dev_n_devs(dev);
+    ggml_backend_meta_event_context * event_ctx = new ggml_backend_meta_event_context;
+    event_ctx->simple_events.reserve(n_devs);
+    for (size_t j = 0; j < n_devs; j++) {
+        ggml_backend_event_t simple_event = ggml_backend_event_new(ggml_backend_meta_dev_simple_dev(dev, j));
+        if (simple_event == nullptr) {
+            for (ggml_backend_event_t e : event_ctx->simple_events) {
+                ggml_backend_event_free(e);
+            }
+            delete event_ctx;
+            return nullptr;
+        }
+        event_ctx->simple_events.push_back(simple_event);
+    }
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ event_ctx,
+    };
+}
+
+static void ggml_backend_meta_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    ggml_backend_meta_event_context * event_ctx = (ggml_backend_meta_event_context *) event->context;
+    for (ggml_backend_event_t simple_event : event_ctx->simple_events) {
+        ggml_backend_event_free(simple_event);
+    }
+    delete event_ctx;
+    delete event;
+}
+
+static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    const ggml_backend_meta_event_context * event_ctx = (const ggml_backend_meta_event_context *) event->context;
+    for (ggml_backend_event_t simple_event : event_ctx->simple_events) {
+        ggml_backend_event_synchronize(simple_event);
+    }
 }
 
 ggml_backend_dev_t ggml_backend_meta_device(
@@ -1882,12 +1933,22 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
-
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+
+    // A copy of the caller's data goes to each device as it is (a mirror) or as one chunk (a split in one segment, set
+    // whole). The rest (a partial sum's shares, made on the host; several segments; a split set from an offset) the
+    // buffer's set writes synchronously, once the devices have finished the work queued before it.
+    const bool mirrored = split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    const bool chunked  = (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+        split_state.axis == GGML_BACKEND_SPLIT_AXIS_2) && split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+        offset == 0 && ggml_is_contiguous(tensor);
+    if (!mirrored && !chunked) {
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, j));
+        }
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -2475,6 +2536,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    const ggml_backend_meta_event_context * event_ctx = (const ggml_backend_meta_event_context *) event->context;
+    GGML_ASSERT(event_ctx->simple_events.size() == n_backends);
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_event_record(event_ctx->simple_events[j], ggml_backend_meta_simple_backend(backend, j));
+    }
+}
+
+static void ggml_backend_meta_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    const ggml_backend_meta_event_context * event_ctx = (const ggml_backend_meta_event_context *) event->context;
+    GGML_ASSERT(event_ctx->simple_events.size() == n_backends);
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_event_wait(ggml_backend_meta_simple_backend(backend, j), event_ctx->simple_events[j]);
+    }
+}
+
 static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_name                = */ ggml_backend_meta_get_name,
     /* .free                    = */ ggml_backend_meta_free,
@@ -2489,8 +2568,8 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_plan_update       = */ nullptr,
     /* .graph_plan_compute      = */ nullptr,
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
-    /* .event_record            = */ nullptr,
-    /* .event_wait              = */ nullptr,
+    /* .event_record            = */ ggml_backend_meta_event_record,
+    /* .event_wait              = */ ggml_backend_meta_event_wait,
     /* .graph_optimize          = */ nullptr,
 };
 
