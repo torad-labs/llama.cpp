@@ -389,6 +389,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
+    // glm5next low-rank attention, KDA state and indexer tensors (all mirrored in stage 1)
+    static const std::regex pattern_glm_q_a         ("blk\\.\\d*\\.attn_q_a\\.weight");
+    static const std::regex pattern_glm_q_a_norm    ("blk\\.\\d*\\.attn_q_a_norm\\.weight");
+    static const std::regex pattern_glm_kv_a_mqa    ("blk\\.\\d*\\.attn_kv_a_mqa\\.weight");
+    static const std::regex pattern_glm_kv_a_norm   ("blk\\.\\d*\\.attn_kv_a_norm\\.weight");
+    static const std::regex pattern_glm_k_b         ("blk\\.\\d*\\.attn_k_b\\.weight");
+    static const std::regex pattern_glm_v_b         ("blk\\.\\d*\\.attn_v_b\\.weight");
+    static const std::regex pattern_glm_ssm         ("blk\\.\\d*\\.ssm_(f_a|f_b|g_a|g_b|norm)\\.weight");
+    static const std::regex pattern_glm_ssm_conv    ("blk\\.\\d*\\.ssm_conv1d_[qkv]\\.weight");
+    static const std::regex pattern_glm_indexer     ("blk\\.\\d*\\.indexer.*\\.(weight|bias)");
+
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
@@ -483,6 +494,36 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
+            if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+        }
+
+        const bool is_glm5next = ud->model->arch == LLM_ARCH_GLM5NEXT;
+        if (is_glm5next) {
+            // Stage 1: split only the FFN/MoE; every KDA and DSA weight and every cache stays
+            // mirrored, so the meta backend only ever splits dense experts, shared experts and
+            // the head, with one all-reduce per layer past the expert adds.
+            if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight) ||
+                    std::regex_match(tensor_name, pattern_attn_out_weight) ||
+                    std::regex_match(tensor_name, pattern_glm_q_a) || std::regex_match(tensor_name, pattern_glm_q_a_norm) ||
+                    std::regex_match(tensor_name, pattern_attn_q_b_weight) ||
+                    std::regex_match(tensor_name, pattern_glm_kv_a_mqa) || std::regex_match(tensor_name, pattern_glm_kv_a_norm) ||
+                    std::regex_match(tensor_name, pattern_glm_k_b) || std::regex_match(tensor_name, pattern_glm_v_b) ||
+                    std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
+                    std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta) ||
+                    std::regex_match(tensor_name, pattern_ssm_beta_alpha) ||
+                    std::regex_match(tensor_name, pattern_glm_ssm) || std::regex_match(tensor_name, pattern_glm_ssm_conv) ||
+                    std::regex_match(tensor_name, pattern_glm_indexer) ||
+                    std::regex_match(tensor_name, pattern_kv_cache) ||
+                    std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            // Shared experts split the way DeepSeek4's do.
             if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                     std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");

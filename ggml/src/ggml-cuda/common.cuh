@@ -1512,6 +1512,28 @@ struct ggml_cuda_pq2_prefetch {
     int64_t      bytes = 0;
 };
 
+// One tile counter a stream for the PQ2_0 tensor-core launches (mmvq-pq2-mma.cu): past its own first tiles a block takes
+// the next by an atomic add on it, and the block that takes the launch's last ticket sets it back to 0. A launch takes
+// tickets only after its dependency wait, when every launch before it on the stream has ended, so one counter serves
+// every launch of a stream, CUDA graph replays included. Made zeroed before a graph evaluation, never inside a capture.
+struct ggml_cuda_pq2_tile_counters {
+    int * ptr = nullptr; // GGML_CUDA_MAX_STREAMS ints
+
+    void ensure() {
+        if (ptr == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ptr, GGML_CUDA_MAX_STREAMS * sizeof(int)));
+            CUDA_CHECK(cudaMemset(ptr, 0, GGML_CUDA_MAX_STREAMS * sizeof(int)));
+        }
+    }
+
+    void release() {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+            ptr = nullptr;
+        }
+    }
+};
+
 // Owned by the backend context that evaluates the graph: registrations are keyed by node pointer, so they only mean
 // something for the evaluation that made them. Cleared at the start of every graph evaluation/capture.
 struct ggml_cuda_gdn_gather_context {
@@ -1792,8 +1814,12 @@ struct ggml_backend_cuda_context {
     ggml_cuda_ssm_conv_update_context ssm_conv_update_context;
     ggml_cuda_fattn_kv_live_context fattn_kv_live_context;
     ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
+    ggml_cuda_pq2_tile_counters pq2_tile_counters;
 
     ~ggml_backend_cuda_context();
+
+    // the current stream's PQ2_0 tile counter, or nullptr before the first graph evaluation made them
+    int * pq2_tile_counter() { return pq2_tile_counters.ptr != nullptr ? pq2_tile_counters.ptr + curr_stream_no : nullptr; }
 
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
