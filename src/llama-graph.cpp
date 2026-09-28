@@ -2874,7 +2874,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+                bool   mask_is_prefix) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2912,8 +2913,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
-        // one sequence, causal attention and no window: every row's mask is a prefix of the cells
-        ggml_flash_attn_ext_set_mask_prefix(cur, cparams.n_seq_max == 1 && cparams.causal_attn && il >= 0 && !hparams.is_swa(il));
+        // one sequence, causal attention and no window: every row's mask is a prefix of the cells, unless the caller's
+        // mask selects cells (sparse attention's top-k), whose live cells the kernel then finds by scanning the mask.
+        // LLAMA_ATTN_SPARSE_MASK_PREFIX_LEGACY=1 tags the sparse masks too: the kernel then walks every cell
+        static const bool sparse_prefix_legacy = ggml_env_switch("LLAMA_ATTN_SPARSE_MASK_PREFIX_LEGACY");
+        ggml_flash_attn_ext_set_mask_prefix(cur, (mask_is_prefix || sparse_prefix_legacy) && cparams.n_seq_max == 1 &&
+                                                 cparams.causal_attn && il >= 0 && !hparams.is_swa(il));
 
         if (v_mla) {
 #if 0
@@ -3342,7 +3347,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -4112,7 +4117,7 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false);
     cb(cur, "kqv_out", il);
 
     if (wo) {
