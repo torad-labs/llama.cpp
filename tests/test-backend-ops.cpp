@@ -4324,6 +4324,109 @@ struct test_dsv4_hc_weights : public test_dsv4_hc {
     }
 };
 
+// The front of a hyper-connection cycle as the models build it (build_hc_pre, then the sublayer's norm): the weightless
+// RMS_NORM of the flat streams, their MUL_MAT by hc_fn, DSV4_HC_WEIGHTS, DSV4_HC_PRE on the pre weights' view, then
+// RMS_NORM and MUL by the norm's weight, compared at the weights and the output; CUDA runs the six as two kernels at up
+// to 16 tokens. ffn_order: the post and comb weights' views expanded between DSV4_HC_PRE and the norm, as the FFN
+// cycle's builder expands them. weights_buf: hc_fn, scale, base and the norm's weight in a weights buffer, as a model's,
+// which CUDA reads before its kernels' PDL wait (after it otherwise).
+struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int32_t n_iter;
+    const bool ffn_order;
+    const bool weights_buf;
+
+    ggml_tensor * weights = nullptr;
+    ggml_tensor * hc_pre  = nullptr;
+    ggml_tensor * post    = nullptr;
+    ggml_tensor * comb    = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_FUSED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { weights, out }; }
+
+    std::vector<ggml_tensor *> forward_first() override {
+        return ffn_order ? std::vector<ggml_tensor *>{ hc_pre, post, comb } : std::vector<ggml_tensor *>{};
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_w, n_embd, n_tokens, n_iter, ffn_order, weights_buf);
+    }
+
+    bool use_weight_context() override { return weights_buf; }
+
+    // the CPU's mat-vec rounds the normalized streams to the weights' type, CUDA's reads them as F32
+    double max_nmse_err() override {
+        return type_w == GGML_TYPE_F32 ? 1e-7 : 5e-4;
+    }
+
+    test_dsv4_hc_pre_fused(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 4096, int64_t n_tokens = 1,
+            int32_t n_iter = 20, bool ffn_order = false, bool weights_buf = true)
+        : type_w(type_w), n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter), ffn_order(ffn_order),
+          weights_buf(weights_buf) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_context * ctx_w = ctx_weights != nullptr ? ctx_weights : ctx;
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx_w, type_w, hc*n_embd, (2 + hc)*hc);
+        ggml_set_name(hc_fn, "hc_fn");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        ggml_tensor * norm_w = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, n_embd);
+        ggml_set_name(norm_w, "norm_w");
+
+        ggml_tensor * flat   = ggml_reshape_2d(ctx, x, hc*n_embd, n_tokens);
+        ggml_tensor * mixes  = ggml_mul_mat(ctx, hc_fn, ggml_rms_norm(ctx, flat, 1e-5f));
+        weights = ggml_dsv4_hc_weights(ctx, mixes, scale, base, 1e-6f, n_iter);
+        ggml_set_name(weights, "hc_weights");
+
+        ggml_tensor * pre = ggml_view_2d(ctx, weights, hc, n_tokens, weights->nb[1], 0);
+        post = ggml_view_2d(ctx, weights, hc, n_tokens, weights->nb[1], hc*weights->nb[0]);
+        comb = ggml_view_3d(ctx, weights, hc, hc, n_tokens, hc*weights->nb[0], weights->nb[1], 2*hc*weights->nb[0]);
+
+        hc_pre = ggml_dsv4_hc_pre(ctx, x, pre);
+        ggml_set_name(hc_pre, "hc_pre");
+
+        out = ggml_mul(ctx, ggml_rms_norm(ctx, hc_pre, 1e-5f), norm_w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "hc_fn") {
+                // the mixes' standard deviation about 1.5 at any width (0.02 at GLM-5.3's 16,384): inside the sigmoids'
+                // and the softmax's range, and far enough from uniform that a comb of few iterations tells its axes apart
+                const float r = 1.5f*sqrtf(3.0f/(hc*n_embd));
+                init_tensor_uniform(t, -r, r);
+            } else if (name == "norm_w") {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            }
+        }
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -9674,6 +9777,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_weights(31, 17, 20, 1e-6f, true));
     test_cases.emplace_back(new test_dsv4_hc_weights(4096, 1, 20, 1e-6f, true));
     test_cases.emplace_back(new test_dsv4_hc_weights(4096, 3, 20, 1e-6f, true));
+    // fused at up to 16 tokens when hc*n_embd is a multiple of 256; 17 tokens and n_embd 31 run the six nodes
+    for (ggml_type type_w : { GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (int64_t n_tokens : { 1, 2, 3, 16, 17 }) {
+            test_cases.emplace_back(new test_dsv4_hc_pre_fused(type_w, 4096, n_tokens));
+        }
+    }
+    // a comb of few iterations, off its fixed point, at F32's tolerance: the Sinkhorn's axes and order
+    for (int32_t n_iter : { 1, 2, 3 }) {
+        test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 4096, n_iter, n_iter));
+    }
+    // the weights in an ordinary buffer: the kernels read them after their PDL wait
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 2, 20, false, false));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 4096, 2, 2, false, false));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 1, 20, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 3, 20, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 7168, 2, 20));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 64, 2, 1));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 31, 3, 4));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
