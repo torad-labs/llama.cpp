@@ -1,15 +1,25 @@
 // The CUDA backend keeps a CUDA graph per graph shape (test-cuda-graph-key), and each captured graph's executable holds
-// device memory beside the buffers a scheduler sizes. The shapes a context computes follow its traffic, one per graph
-// shape and per graph slot for the same shape, so the executables were bounded only by the 10 s eviction: under four
-// concurrent requests a 27B hybrid's contexts held 84 MiB of them on a 5080. A context keeps at most
-// GGML_CUDA_GRAPH_MAX of them, the least recently used evicted for a new one.
+// device memory beside the buffers a scheduler sizes, a few KiB for each node of the graph. The shapes a context
+// computes follow its traffic, one per graph shape and per graph slot for the same shape, so the executables were
+// bounded only by the 10 s eviction: under four concurrent requests a 27B hybrid's contexts held 84 MiB of them on a
+// 5080. A context keeps at most GGML_CUDA_GRAPH_NODES nodes in them and at most GGML_CUDA_GRAPH_MAX of them, the least
+// recently used evicted for a new one.
 //
-// Here the cap is 4, and y = w x is computed for ten row counts of x, three times each: every shape is captured on its
-// second compute and replayed on its third, every output matching the CPU backend. The backend's log reports the most
-// executables it held at once, which must be the cap: never over it, and reached, since ten shapes were captured. The
-// first shape, evicted by then, is computed again and must be captured again and give the right values. A control
-// first computes one shape three times: a device that does not capture it does not use CUDA graphs and is skipped.
-// Without the eviction all ten are held and it fails.
+// With no argument the cap is 4 graphs, and y = w x is computed for ten row counts of x, three times each: every shape
+// is captured on its second compute and replayed on its third, every output matching the CPU backend. The backend's log
+// reports the most executables it held at once, which must be the cap: never over it, and reached, since ten shapes
+// were captured. The first shape, evicted by then, is computed again and must be captured again and give the right
+// values. Without the eviction all ten are held and it fails.
+//
+// With `nodes` the cap is 100 nodes and none on the count, and each graph halves x eight times, eight nodes, built once
+// and computed again and again, as a -sm tensor split computes its graph for each all-reduce step every token. Twelve
+// row counts in turn, one compute each, five times round: all twelve are held (96 nodes, more graphs than the old cap
+// of 8), so each is captured once, the second time round, and replayed from the third. Then sixteen in turn (128
+// nodes): the nodes held reach the cap and never pass it. Under a cap of 8 graphs the twelve are evicted before their
+// turn comes round again and captured anew every time; without the cap on the nodes all sixteen are held.
+//
+// A control first computes one shape three times: a device that does not capture it does not use CUDA graphs and is
+// skipped.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -24,11 +34,14 @@
 #include <string>
 #include <vector>
 
-static constexpr int cap = 4;
+static constexpr int cap        = 4;   // graphs, with no argument
+static constexpr int cap_nodes  = 100; // nodes, with `nodes`
+static constexpr int n_halvings = 8;   // the nodes of each graph with `nodes`
 
 struct graph_log {
-    int    captured = 0;
-    size_t held_max = 0; // "N CUDA graphs held at most", the most the backend reported
+    int    captured  = 0;
+    size_t held_max  = 0; // "N CUDA graphs held at most", the most the backend reported
+    size_t nodes_max = 0; // "..., K nodes"
 };
 
 static void log_callback(ggml_log_level level, const char * text, void * user_data) {
@@ -37,7 +50,7 @@ static void log_callback(ggml_log_level level, const char * text, void * user_da
         log->captured++;
     }
     if (const char * held = strstr(text, "CUDA graphs held at most")) {
-        // the count is the number right before it: "...: CUDA0: 4 CUDA graphs held at most (cap 4), ..."
+        // the count is the number right before it: "...: CUDA0 (context 0x...): 4 CUDA graphs held at most, 12 nodes ..."
         const char * p = held;
         while (p > text && p[-1] == ' ') {
             --p;
@@ -46,6 +59,10 @@ static void log_callback(ggml_log_level level, const char * text, void * user_da
             --p;
         }
         log->held_max = std::max(log->held_max, (size_t) strtoull(p, nullptr, 10));
+        const char * nodes = "CUDA graphs held at most, ";
+        if (strncmp(held, nodes, strlen(nodes)) == 0) {
+            log->nodes_max = std::max(log->nodes_max, (size_t) strtoull(held + strlen(nodes), nullptr, 10));
+        }
     }
     if (level != GGML_LOG_LEVEL_DEBUG) {
         fputs(text, stderr);
@@ -160,14 +177,97 @@ static bool compute_shapes(ggml_backend_dev_t dev, ggml_backend_t cpu, graph_log
     return ok;
 }
 
-int main(void) {
-    // the cap is read once, when the first CUDA backend is made
-    const std::string cap_env = std::to_string(cap);
+// halves x n_halvings times on one backend for each row count, each graph built once in its own context and buffer and
+// computed again, as a -sm tensor split keeps its graphs; `rounds` times round in turn, one compute each, every output
+// checked (halving is exact). Returns the captures each time round; sets ok to false if an output is wrong.
+static std::vector<int> compute_rounds(ggml_backend_dev_t dev, graph_log & log, const std::vector<int64_t> & rows,
+        int rounds, bool & ok) {
+    const int64_t k = 256;
+    std::mt19937 rng(42);
+    log = graph_log();
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+
+    struct shape {
+        ggml_context *        ctx;
+        ggml_backend_buffer_t buf;
+        ggml_tensor *         x;
+        ggml_tensor *         y;
+        ggml_cgraph *         gf;
+    };
+    std::vector<shape> shapes;
+    for (const int64_t m : rows) {
+        ggml_init_params params = { ggml_tensor_overhead() * (1 + n_halvings) + ggml_graph_overhead(), nullptr, true };
+        shape s;
+        s.ctx = ggml_init(params);
+        s.x   = ggml_new_tensor_2d(s.ctx, GGML_TYPE_F32, k, m);
+        s.y   = s.x;
+        for (int i = 0; i < n_halvings; ++i) {
+            s.y = ggml_scale(s.ctx, s.y, 0.5f);
+        }
+        s.gf = ggml_new_graph(s.ctx);
+        ggml_build_forward_expand(s.gf, s.y);
+        s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, backend);
+        shapes.push_back(s);
+    }
+
+    std::vector<int> captured(rounds, 0);
+    for (int r = 0; r < rounds; ++r) {
+        const int captured_before = log.captured;
+        for (const shape & s : shapes) {
+            const std::vector<float> xv = random_values(rng, ggml_nelements(s.x));
+            ggml_backend_tensor_set(s.x, xv.data(), 0, xv.size() * sizeof(float));
+            GGML_ASSERT(ggml_backend_graph_compute(backend, s.gf) == GGML_STATUS_SUCCESS);
+
+            std::vector<float> yv(xv.size());
+            ggml_backend_tensor_get(s.y, yv.data(), 0, yv.size() * sizeof(float));
+            for (size_t i = 0; i < yv.size(); ++i) {
+                if (yv[i] != xv[i] / (1 << n_halvings)) {
+                    printf("  %lld rows, time %d round: element %zu is %g, not %g: FAILED\n", (long long) s.x->ne[1],
+                           r + 1, i, yv[i], xv[i] / (1 << n_halvings));
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        captured[r] = log.captured - captured_before;
+    }
+
+    for (const shape & s : shapes) {
+        ggml_backend_buffer_free(s.buf);
+        ggml_free(s.ctx);
+    }
+    ggml_backend_free(backend);
+    return captured;
+}
+
+static void set_env(const char * name, const char * value) {
 #ifdef _WIN32
-    _putenv_s("GGML_CUDA_GRAPH_MAX", cap_env.c_str());
+    _putenv_s(name, value != nullptr ? value : "");
 #else
-    setenv("GGML_CUDA_GRAPH_MAX", cap_env.c_str(), 1);
+    if (value != nullptr) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
 #endif
+}
+
+static std::string join(const std::vector<int> & v) {
+    std::string s;
+    for (const int i : v) {
+        s += (s.empty() ? "" : " ") + std::to_string(i);
+    }
+    return s;
+}
+
+int main(int argc, char ** argv) {
+    const bool nodes = argc > 1 && strcmp(argv[1], "nodes") == 0;
+
+    // the caps are read once, when the first CUDA backend is made
+    const std::string cap_env       = std::to_string(cap);
+    const std::string cap_nodes_env = std::to_string(cap_nodes);
+    set_env("GGML_CUDA_GRAPH_MAX", nodes ? nullptr : cap_env.c_str());
+    set_env("GGML_CUDA_GRAPH_NODES", nodes ? cap_nodes_env.c_str() : nullptr);
 
     ggml_backend_load_all();
 
@@ -197,14 +297,38 @@ int main(void) {
             continue;
         }
 
-        // ten shapes, then the first again: evicted by the fifth, it is captured anew
-        printf(" ten shapes, then the first again, under a cap of %d:\n", cap);
-        ok &= compute_shapes(dev, cpu, log, { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1 }, 3, supported);
-        const bool all_captured = log.captured == 11;
-        const bool at_cap       = log.held_max == (size_t) cap;
-        ok &= all_captured && at_cap;
-        printf("  captures %d (11 expected), held at most %zu (the cap, %d, expected): %s\n", log.captured, log.held_max,
-               cap, all_captured && at_cap ? "ok" : "FAILED");
+        if (!nodes) {
+            // ten shapes, then the first again: evicted by the fifth, it is captured anew
+            printf(" ten shapes, then the first again, under a cap of %d:\n", cap);
+            ok &= compute_shapes(dev, cpu, log, { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1 }, 3, supported);
+            const bool all_captured = log.captured == 11;
+            const bool at_cap       = log.held_max == (size_t) cap;
+            ok &= all_captured && at_cap;
+            printf("  captures %d (11 expected), held at most %zu (the cap, %d, expected): %s\n", log.captured,
+                   log.held_max, cap, all_captured && at_cap ? "ok" : "FAILED");
+        } else {
+            // twelve shapes in turn fit under the cap: each captured once, then replayed every time round
+            printf(" twelve shapes in turn, five times round, under a cap of %d nodes:\n", cap_nodes);
+            bool values = true;
+            const std::vector<int> each = compute_rounds(dev, log, { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, 5, values);
+            const bool replayed = each == std::vector<int>{ 0, 12, 0, 0, 0 };
+            const bool all_held = log.held_max == 12 && log.nodes_max == 12 * n_halvings;
+            ok &= values && replayed && all_held;
+            printf("  captures each time round %s (0 12 0 0 0 expected), held at most %zu graphs of %zu nodes (12 of "
+                   "%d expected), outputs %s: %s\n", join(each).c_str(), log.held_max, log.nodes_max,
+                   12 * n_halvings, values ? "exact" : "WRONG", values && replayed && all_held ? "ok" : "FAILED");
+
+            // sixteen do not: the nodes held reach the cap and never pass it
+            printf(" sixteen shapes in turn, four times round, under a cap of %d nodes:\n", cap_nodes);
+            values = true;
+            const std::vector<int> over = compute_rounds(dev, log,
+                    { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, 4, values);
+            const bool under_cap = log.nodes_max <= (size_t) cap_nodes && log.nodes_max > (size_t) (cap_nodes - n_halvings);
+            ok &= values && under_cap;
+            printf("  captures each time round %s, held at most %zu graphs of %zu nodes (at most %d, more than %d "
+                   "expected), outputs %s: %s\n", join(over).c_str(), log.held_max, log.nodes_max, cap_nodes,
+                   cap_nodes - n_halvings, values ? "exact" : "WRONG", values && under_cap ? "ok" : "FAILED");
+        }
         n_tested++;
     }
     ggml_backend_free(cpu);

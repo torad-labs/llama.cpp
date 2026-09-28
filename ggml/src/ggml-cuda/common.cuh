@@ -1300,7 +1300,7 @@ struct ggml_cuda_graph {
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
-    size_t num_nodes = 0;
+    size_t num_nodes = 0; // the captured graph's: its executable holds device memory for each (cuda_graph_make_room)
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
@@ -1746,38 +1746,60 @@ struct ggml_backend_cuda_context {
         return it->second.get();
     }
 
-    // The most CUDA graph executables a context keeps (GGML_CUDA_GRAPH_MAX, 0 for no cap). Each holds device memory
-    // beside the buffers the scheduler sizes, and the graphs a context computes follow its traffic (one per graph shape,
-    // and per graph slot for the same shape), so without a count they would be bounded only by the 10 s eviction above:
-    // a new one evicts the least recently used.
+    // The CUDA graph executables a context keeps. Each holds device memory beside the buffers the scheduler sizes, a few
+    // KiB for each node of its graph (2.75 on an RTX 5080), from a pool of the driver's that never shrinks: destroying
+    // one returns nothing to the device, a later one reuses it, and the pool stays at the most nodes held at once. The
+    // graphs a context computes follow its traffic (one per graph shape, and per graph slot for the same shape), bounded
+    // otherwise only by the 10 s eviction above, so a new one evicts the least recently used others until the nodes held
+    // fit under GGML_CUDA_GRAPH_NODES (default 32768, 88 MiB on that card; 0 for no cap) and the executables under
+    // GGML_CUDA_GRAPH_MAX (default 0, no cap). The memory follows the nodes, not the count: a -sm tensor split computes a
+    // small graph for each all-reduce step on each device, hundreds a token, and a cap on the count below that evicts
+    // every one of them before its turn comes round again, to be captured anew every token.
     static size_t cuda_graphs_max() {
         static const size_t n = [] {
             const char * env = getenv("GGML_CUDA_GRAPH_MAX");
-            return env != nullptr ? (size_t) std::max(0, atoi(env)) : (size_t) 8;
+            return env != nullptr ? (size_t) std::max(0, atoi(env)) : (size_t) 0;
         }();
         return n;
     }
-    size_t cuda_graphs_held_max = 0; // the most executables held at once here
-    size_t cuda_graph_bytes_max = 0; // the most device memory one took to instantiate here (cudaMemGetInfo around it)
+    static size_t cuda_graph_nodes_max() {
+        static const size_t n = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_NODES");
+            return env != nullptr ? (size_t) std::max(0, atoi(env)) : (size_t) 32768;
+        }();
+        return n;
+    }
+    size_t cuda_graphs_held_max      = 0; // the most executables held at once here
+    size_t cuda_graph_nodes_held_max = 0; // the most nodes they held at once here
+    size_t cuda_graph_bytes_max      = 0; // the most device memory one took to instantiate here (cudaMemGetInfo around it)
+    size_t cuda_graph_bytes          = 0; // and all of them
 
-    // before `graph` gets an executable: evict the least recently used others until it fits under the cap; returns how
-    // many are held with it
-    size_t cuda_graph_make_room(const ggml_cuda_graph * graph) {
-        const size_t max = cuda_graphs_max();
+    struct cuda_graphs_held {
+        size_t graphs;
+        size_t nodes;
+    };
+
+    // before `graph` gets an executable: evict the least recently used others until it fits under the caps (alone, it is
+    // kept whatever its nodes); returns what is held with it
+    cuda_graphs_held cuda_graph_make_room(const ggml_cuda_graph * graph) {
+        const size_t max       = cuda_graphs_max();
+        const size_t max_nodes = cuda_graph_nodes_max();
         for (;;) {
-            size_t held = 0;
-            auto   lru  = cuda_graphs.end();
+            cuda_graphs_held held = { 1, graph->num_nodes };
+            auto             lru  = cuda_graphs.end();
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ++it) {
                 if (it->second->instance == nullptr || it->second.get() == graph) {
                     continue;
                 }
-                ++held;
+                held.graphs++;
+                held.nodes += it->second->num_nodes;
                 if (lru == cuda_graphs.end() || it->second->last_used_time < lru->second->last_used_time) {
                     lru = it;
                 }
             }
-            if (max == 0 || held < max) {
-                return held + 1;
+            const bool fits = (max == 0 || held.graphs <= max) && (max_nodes == 0 || held.nodes <= max_nodes);
+            if (fits || lru == cuda_graphs.end()) {
+                return held;
             }
             cuda_graphs.erase(lru);
         }

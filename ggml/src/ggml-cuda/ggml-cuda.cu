@@ -2986,10 +2986,12 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-// create `graph`'s executable from its captured graph, first evicting what the cap needs (cuda_graphs_max); the device
-// memory that takes is measured, and logged whenever it or the count held is the most on this context so far
+// create `graph`'s executable from its captured graph, first evicting what the caps need (cuda_graph_make_room); the
+// device memory that takes is measured (what the driver's pool grew by, if it did), and logged whenever what is held or
+// the most one took is the most on this context so far: at INFO when that is the most memory, or the nodes held reach a
+// power of two (a -sm tensor split's context holds hundreds of small graphs), at DEBUG otherwise
 static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
-    const size_t held = cuda_ctx->cuda_graph_make_room(graph);
+    const ggml_backend_cuda_context::cuda_graphs_held held = cuda_ctx->cuda_graph_make_room(graph);
 
     size_t free_before;
     size_t free_after;
@@ -2998,13 +3000,29 @@ static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, gg
     CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
     CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
     const size_t bytes = free_before > free_after ? free_before - free_after : 0;
+    cuda_ctx->cuda_graph_bytes += bytes;
 
-    if (held > cuda_ctx->cuda_graphs_held_max || bytes > cuda_ctx->cuda_graph_bytes_max) {
-        cuda_ctx->cuda_graphs_held_max = std::max(cuda_ctx->cuda_graphs_held_max, held);
-        cuda_ctx->cuda_graph_bytes_max = std::max(cuda_ctx->cuda_graph_bytes_max, bytes);
-        GGML_LOG_INFO("%s: %s (context %p): %zu CUDA graphs held at most (cap %zu), the largest took %.2f MiB to instantiate\n",
+    if (held.graphs > cuda_ctx->cuda_graphs_held_max || held.nodes > cuda_ctx->cuda_graph_nodes_held_max ||
+            bytes > cuda_ctx->cuda_graph_bytes_max) {
+        const auto pow2_floor = [](size_t n) {
+            size_t p = 0;
+            for (size_t q = 1; q != 0 && q <= n; q <<= 1) {
+                p = q;
+            }
+            return p;
+        };
+        const bool info = bytes > cuda_ctx->cuda_graph_bytes_max ||
+            pow2_floor(held.nodes) > pow2_floor(cuda_ctx->cuda_graph_nodes_held_max);
+        cuda_ctx->cuda_graphs_held_max      = std::max(cuda_ctx->cuda_graphs_held_max, held.graphs);
+        cuda_ctx->cuda_graph_nodes_held_max = std::max(cuda_ctx->cuda_graph_nodes_held_max, held.nodes);
+        cuda_ctx->cuda_graph_bytes_max      = std::max(cuda_ctx->cuda_graph_bytes_max, bytes);
+        ggml_log_internal(info ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_DEBUG,
+                "%s: %s (context %p): %zu CUDA graphs held at most, %zu nodes (caps %zu and %zu, 0 for none); "
+                "instantiating one took %.2f MiB at most, all of them %.2f MiB\n",
                 __func__, cuda_ctx->name.c_str(), (void *) cuda_ctx, cuda_ctx->cuda_graphs_held_max,
-                ggml_backend_cuda_context::cuda_graphs_max(), cuda_ctx->cuda_graph_bytes_max / 1024.0 / 1024.0);
+                cuda_ctx->cuda_graph_nodes_held_max, ggml_backend_cuda_context::cuda_graphs_max(),
+                ggml_backend_cuda_context::cuda_graph_nodes_max(), cuda_ctx->cuda_graph_bytes_max / 1024.0 / 1024.0,
+                cuda_ctx->cuda_graph_bytes / 1024.0 / 1024.0);
     }
 }
 
@@ -5509,6 +5527,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &graph->num_nodes));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6906,7 +6925,8 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
 #ifdef USE_CUDA_GRAPH
     static std::once_flag cuda_graphs_max_logged;
     std::call_once(cuda_graphs_max_logged, [] {
-        GGML_LOG_INFO("%s: at most %zu CUDA graphs kept per context (GGML_CUDA_GRAPH_MAX; 0 = no cap)\n", __func__,
+        GGML_LOG_INFO("%s: CUDA graphs kept per context: at most %zu nodes (GGML_CUDA_GRAPH_NODES) and %zu graphs "
+                "(GGML_CUDA_GRAPH_MAX); 0 = no cap\n", __func__, ggml_backend_cuda_context::cuda_graph_nodes_max(),
                 ggml_backend_cuda_context::cuda_graphs_max());
     });
 #endif // USE_CUDA_GRAPH
