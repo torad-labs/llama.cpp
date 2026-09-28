@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-moe.cuh"
 #include "mmvq-pq2-mma.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -6,68 +7,6 @@
 
 #include <cstdint>
 #include <type_traits>
-
-typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
-
-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
-        case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
-        case GGML_TYPE_PQ2_0: return vec_dot_pq2_0_q8_1;
-        case GGML_TYPE_PTQ1_0: return vec_dot_ptq1_0_q8_1;
-        case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
-        case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
-        case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
-        case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
-        case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
-        case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
-        case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
-        case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
-        case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
-        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
-        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
-        case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
-        case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
-        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
-        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
-        case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
-        case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
-        case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
-        case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
-        case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
-        default:                return nullptr;
-    }
-}
-
-static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
-        case GGML_TYPE_PQ2_0: return VDR_PQ2_0_Q8_1_MMVQ;
-        case GGML_TYPE_PTQ1_0: return VDR_PTQ1_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
-        case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
-        case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
-        case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
-        case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q6_K:    return VDR_Q6_K_Q8_1_MMVQ;
-        case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
-        case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
-        case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
-        case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
-        case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
-        case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
-        case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
-        default:                return 1;
-    }
-}
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
@@ -1485,6 +1424,39 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    // routed experts at 1-8 tokens, each SM streaming its tiles of expert rows through a ring of bulk copies, and each
+    // distinct expert read once (mmvq-moe.cu)
+    if (ids && ne03 == 1 && ne13 == 1 && (fusion == nullptr || (fusion->x_scale == nullptr && fusion->gate_scale == nullptr)) &&
+            ggml_cuda_mmvq_moe_usable(ggml_cuda_info().devices[ctx.device].cc, src0->type, src0->data,
+                fusion_local.gate, ne00, ne01, s01, s02, ne1, ne2)) {
+        ggml_cuda_mmvq_moe_args args{};
+        args.type                   = src0->type;
+        args.vx                     = src0->data;
+        args.vgate                  = fusion_local.gate;
+        args.y                      = src1_q8_1.get();
+        args.ids                    = ids_d;
+        args.x_bias                 = (const float *) fusion_local.x_bias;
+        args.gate_bias              = (const float *) fusion_local.gate_bias;
+        args.dst                    = dst_d;
+        args.glu_op                 = fusion_local.glu_op;
+        args.glu_limit              = fusion_local.glu_limit;
+        args.ncols_x                = ne00;
+        args.nrows_x                = ne01;
+        args.stride_channel_x_bytes = s02 * (int64_t) ts_src0;
+        args.n_used                 = ne1;
+        args.ntokens                = ne2;
+        args.ids_stride             = ids_stride;
+        args.nchannels_y            = nchannels_y;
+        args.stride_col_y           = stride_col_y;
+        args.stride_channel_y       = stride_channel_y;
+        args.stride_col_dst         = stride_col_dst;
+        args.stride_channel_dst     = stride_channel_dst;
+        args.stride_bias            = stride_channel_dst; // as mul_mat_vec_q reads an expert's bias
+        args.tile_ctr               = ctx.pq2_tile_counter();
+        ggml_cuda_mmvq_moe(args, stream);
+        return;
+    }
 
     if (pq2_mma) {
         ggml_cuda_mmvq_pq2_mma(src0->data, fusion_local.gate, src1_q8_1.get(), (const float *) fusion_local.x_bias,

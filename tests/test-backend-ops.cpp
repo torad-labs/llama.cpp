@@ -10625,6 +10625,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // GLM-5.3-Flash's routed experts (IQ3_XXS, 8 used; 32 experts here, of its 288) at decode and an MTP verify, where
+    // the CUDA backend streams them through mmvq-moe.cu's ring: gate/up rows of 4,096 weights with a token's vector
+    // shared by its experts, down rows of 2,048 with a vector each, and three tokens that share experts
+    for (int n : { 1, 3 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, true,  2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, false, 4096, n, 2048));
+    }
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
@@ -11405,6 +11413,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 32, 256,
                 use_id, 16, 8, false, false, true, false, {4, 2}, false, false, false, 0.5f));
         }
+    }
+    // and at GLM-5.3-Flash's routed gate/up (IQ3_XXS, 4,096 -> 2,048, 8 of 32 experts), a gated ring tile in mmvq-moe.cu
+    for (int64_t m_batch : { 1, 3 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_XXS, GGML_GLU_OP_SWIGLU, m_batch, 2048, 4096,
+            true, 32, 8, false, false, true, false, {1, 1}, false, false, false, 0.5f));
     }
 
     // Ternary Bonsai 2 27B's FFN at decode (qwen35: n_embd 5120, n_ff 17408, PQ2_0; its MTP layer Q8_0), also with the
