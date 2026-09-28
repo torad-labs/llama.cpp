@@ -118,10 +118,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4
-            || arch == LLM_ARCH_GLM5NEXT) {
+            || arch == LLM_ARCH_MISTRAL4) {
         n_embd = 128;
         n_head = 1;
+        n_ff   = 192;
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        n_embd = 128;
+        n_head = 4; // split two ways, each device gets 2 KDA and 2 DSA heads (2 DSA heads are the fewest with 128-row q_b blocks)
         n_ff   = 192;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
@@ -180,7 +183,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         std::vector<uint32_t> n_head_kv_per_layer;
         n_head_kv_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
-            n_head_kv_per_layer.push_back(il == 1 ? 0 : n_head_kv);
+            n_head_kv_per_layer.push_back(il == 1 ? 0 : 1); // KDA, and DSA's one latent KV head as the served file has
         }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_per_layer);
@@ -363,7 +366,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, const std::vector<float> & tensor_split = {}) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -371,6 +374,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    model_params.tensor_split = tensor_split.empty() ? nullptr : tensor_split.data();
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -628,9 +632,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         std::vector<ggml_backend_dev_t> devs;
         std::string                     label;
         llama_split_mode                split_mode;
+        std::vector<float>              tensor_split; // empty: the default, even split
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, std::vector<float> tensor_split = {})
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), tensor_split(std::move(tensor_split)) {}
     };
 
     std::vector<device_config> dev_configs;
@@ -650,8 +655,21 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 }
             }
         }
+        // one GPU twice splits as two GPUs do, so that a machine with one tests the splits too
+        if (devices_meta.size() == 1) {
+            devices_meta.push_back(devices_meta[0]);
+        }
 
         dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+
+        // 3:7 puts the boundaries off every power-of-two granularity, so a tensor that splits out of step with the ones
+        // it is computed with (a weight and its bias, the heads of q and of the output projection) fails here
+        std::vector<float> tensor_split_uneven(llama_max_devices(), 0.0f);
+        for (size_t j = 0; j < devices_meta.size(); j++) {
+            tensor_split_uneven[j] = j % 2 == 0 ? 3.0f : 7.0f;
+        }
+        dev_configs.emplace_back(devices_meta, "Meta 3:7", LLAMA_SPLIT_MODE_TENSOR, tensor_split_uneven);
+        max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
     }
 
     size_t max_arch_name_length = 0;
@@ -722,7 +740,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode, dc.tensor_split);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

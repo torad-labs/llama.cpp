@@ -570,6 +570,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis != concat_axis) {
             return src_ss[0];
         }
+        // Both split along the axis they are concatenated on, in the same ratio (checked below): each device
+        // concatenates its own slices, so the result holds the devices' [src0 src1] one after the other, as a fused
+        // projection's output holds its parts. glm5next concatenates its KDA q, k and v for one short conv so.
+        if (src_ss[0].axis == concat_axis && src_ss[1].axis == concat_axis) {
+            return {concat_axis, {0}, {1}, 1};
+        }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
