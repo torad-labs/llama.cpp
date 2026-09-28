@@ -10979,6 +10979,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k, true));
         }
     }
+    // the GLM-5.3 DSA indexer: 512 of a context's pools, at the radix path's three row widths
+    for (int64_t cols : {3520, 16384, 109020}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 3, 1, 1}, 512));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 3, 1, 1}, 512, true));
+    }
 
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
@@ -11913,6 +11918,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // GLM-5.3-Flash (glm5next): 288 routed experts, 8 used, gate/up 4096 -> 2048 and down 2048 -> 4096, IQ3_XXS as the
+    // public GGUF serves them (Q8_0 in its MTP layer, IQ4_XS the requantization candidate); a decode token, an MTP verify
+    // of 2 drafts and a ubatch. Then its dense Q8_0 projections: KDA q/k/v and output, MLA output.
+    for (int bs : {1, 3, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 2048, bs, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 4096, bs, 2048));
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 288, 8, false, 2048, bs, 4096, 1));
+        }
+    }
+    for (int bs : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192,  bs, 4096,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096,  bs, 8192,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096,  bs, 16384, {1, 1}, {1, 1}));
+    }
+
     for (int K : {3, 5}) {
         for (int IC : {256, 2560}) {
             for (int IW_IH : {32, 64, 256}) {
@@ -12053,6 +12074,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto k : {1, 4, 8, 10, 16, 32, 40, 400}) {
         for (auto nrows : {1, 16}) {
             for (auto cols : {k, 1000, 65000, 200000}) {
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, k));
+            }
+        }
+    }
+    // the GLM-5.3 DSA indexer's 512 pools: a decode, an MTP verify and a ubatch, from 14k cells of context to 436k
+    for (int64_t cols : {3520, 8192, 32768, 109020}) {
+        for (int64_t nrows : {1, 3, 512}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
+        }
+    }
+    // around the radix path's k threshold
+    for (auto k : {32, 64, 128}) {
+        for (auto cols : {8192, 151936}) {
+            for (auto nrows : {1, 16}) {
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, k));
             }
         }
