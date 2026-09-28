@@ -1701,13 +1701,38 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+// A SwiGLU limit (GLM-5.3, DeepSeek-V4): the gate clamped to [-inf, L] and the up projection to [-L, L] before the GLU,
+// two CLAMP nodes the mat-vec epilogue takes as one float. 0 when the pair is not exactly that.
+static float ggml_cuda_glu_limit(const ggml_tensor * gate_clamp, const ggml_tensor * up_clamp) {
+    if (gate_clamp->op != GGML_OP_CLAMP || up_clamp->op != GGML_OP_CLAMP) {
+        return 0.0f;
+    }
+    const float limit = ggml_get_op_params_f32(up_clamp, 1);
+    if (!(limit > 0.0f) || !std::isfinite(limit) || ggml_get_op_params_f32(up_clamp, 0) != -limit ||
+        ggml_get_op_params_f32(gate_clamp, 0) != -INFINITY || ggml_get_op_params_f32(gate_clamp, 1) != limit) {
+        return 0.0f;
+    }
+    return limit;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
                                           const ggml_tensor * ffn_up_bias = nullptr,
                                           const ggml_tensor * ffn_gate_bias = nullptr,
                                           const ggml_tensor * ffn_up_scale = nullptr,
-                                          const ggml_tensor * ffn_gate_scale = nullptr) {
+                                          const ggml_tensor * ffn_gate_scale = nullptr,
+                                          const ggml_tensor * ffn_up_clamp = nullptr,
+                                          const ggml_tensor * ffn_gate_clamp = nullptr) {
+    const bool has_clamp = ffn_up_clamp != nullptr || ffn_gate_clamp != nullptr;
+    if (has_clamp) {
+        // a limit fuses alone: no bias or scale between the mat-vec and its clamp, and only into a SwiGLU
+        if (!ffn_up_clamp || !ffn_gate_clamp || ffn_up_bias || ffn_gate_bias || ffn_up_scale || ffn_gate_scale ||
+            ffn_up_clamp->src[0] != ffn_up || ffn_gate_clamp->src[0] != ffn_gate ||
+            ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_cuda_glu_limit(ffn_gate_clamp, ffn_up_clamp) == 0.0f) {
+            return false;
+        }
+    }
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1730,8 +1755,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
     const ggml_tensor * ffn_up_bias_src   = has_scale ? ffn_up_scale   : ffn_up;
     const ggml_tensor * ffn_gate_bias_src = has_scale ? ffn_gate_scale : ffn_gate;
-    const ggml_tensor * ffn_up_out        = has_bias ? ffn_up_bias     : ffn_up_bias_src;
-    const ggml_tensor * ffn_gate_out      = has_bias ? ffn_gate_bias   : ffn_gate_bias_src;
+    const ggml_tensor * ffn_up_out        = has_clamp ? ffn_up_clamp   : has_bias ? ffn_up_bias   : ffn_up_bias_src;
+    const ggml_tensor * ffn_gate_out      = has_clamp ? ffn_gate_clamp : has_bias ? ffn_gate_bias : ffn_gate_bias_src;
 
     if (glu->src[0] != ffn_gate_out || glu->src[1] != ffn_up_out) {
         return false;
@@ -3738,6 +3763,26 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    std::initializer_list<enum ggml_op> mul_mat_id_clamp_glu_ops = { GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_GLU };
+    std::initializer_list<enum ggml_op> mul_mat_clamp_glu_ops    = { GGML_OP_MUL_MAT,    GGML_OP_CLAMP, GGML_OP_MUL_MAT,    GGML_OP_CLAMP, GGML_OP_GLU };
+
+    if ((is_equal(mul_mat_id_clamp_glu_ops, ops) || is_equal(mul_mat_clamp_glu_ops, ops)) &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 })) {
+        // each mat-vec is followed by its clamp; the GLU's first source names which pair is the gate
+        const ggml_tensor * glu        = cgraph->nodes[node_idx + 4];
+        const bool          gate_first = glu->src[0] == cgraph->nodes[node_idx + 1];
+        const ggml_tensor * ffn_gate   = cgraph->nodes[node_idx + (gate_first ? 0 : 2)];
+        const ggml_tensor * gate_clamp = cgraph->nodes[node_idx + (gate_first ? 1 : 3)];
+        const ggml_tensor * ffn_up     = cgraph->nodes[node_idx + (gate_first ? 2 : 0)];
+        const ggml_tensor * up_clamp   = cgraph->nodes[node_idx + (gate_first ? 3 : 1)];
+
+        if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu, nullptr, nullptr, nullptr, nullptr, up_clamp, gate_clamp)) {
+            int out_nodes[] = { node_idx + 4 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1, false,
+                                                        ggml_cuda_mmvq_staged_src1(ffn_up));
+        }
+    }
+
     if ((is_equal(mul_mat_id_glu_ops, ops) || is_equal(mul_mat_glu_ops, ops)) &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
         const ggml_tensor * ffn_gate = cgraph->nodes[node_idx];
@@ -4426,7 +4471,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return bias == nullptr || ids != nullptr || ggml_cuda_mmvq_fusion_operand_ok(bias, out);
     };
 
-    // gate + glu + up, with optional scale/bias on both lanes.
+    // gate + glu + up, with optional scale/bias on both lanes, or a SwiGLU limit's two clamps.
+    // GGML_CUDA_GLU_LIMIT_FUSE_LEGACY=1: the clamps stay nodes of their own and the mat-vecs run apart.
+    static const bool glu_limit_legacy = ggml_env_switch("GGML_CUDA_GLU_LIMIT_FUSE_LEGACY");
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
@@ -4710,6 +4757,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
+                break;
+            }
+        } else if (!glu_limit_legacy && ggml_cuda_can_fuse(cgraph, i, { op, GGML_OP_CLAMP, op, GGML_OP_CLAMP, GGML_OP_GLU }, {})) {
+            // a SwiGLU limit (GLM-5.3's experts, shared experts and dense FFN): the two clamps ride the quantized
+            // mat-vec's epilogue with the GLU, one launch for five nodes
+            ggml_tensor * glu        = cgraph->nodes[i + 4];
+            const bool    gate_first = glu->src[0] == cgraph->nodes[i + 1];
+            ggml_tensor * gate       = cgraph->nodes[i + (gate_first ? 0 : 2)];
+            ggml_tensor * up         = cgraph->nodes[i + (gate_first ? 2 : 0)];
+
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*with_gate =*/ true)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.gate      = gate->src[0];
+                fusion_data.glu_op    = ggml_get_glu_op(glu);
+                fusion_data.glu_limit = ggml_cuda_glu_limit(glu->src[0], glu->src[1]);
+
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], glu, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 5;
                 break;
             }
         }

@@ -609,6 +609,7 @@ static __global__ void mul_mat_vec_q(
     const float * x_scale = nullptr;
     const float * gate_scale = nullptr;
     ggml_glu_op active_glu;
+    float glu_limit = 0.0f;
 
     if constexpr (has_fusion) {
         use_bias      = fusion.x_bias    != nullptr;
@@ -617,6 +618,7 @@ static __global__ void mul_mat_vec_q(
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
+        glu_limit     = fusion.glu_limit;
         if constexpr (type == GGML_TYPE_NVFP4) {
             use_scale      = fusion.x_scale    != nullptr;
             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
@@ -819,6 +821,10 @@ static __global__ void mul_mat_vec_q(
                             gate_value *= gate_scales;
                         }
                         gate_value += gate_biases[j];
+                        if (glu_limit > 0.0f) {
+                            gate_value = fminf(gate_value, glu_limit);
+                            result     = fminf(fmaxf(result, -glu_limit), glu_limit);
+                        }
                         switch (active_glu) {
                             case GGML_GLU_OP_SWIGLU:
                                 result *= ggml_cuda_op_silu_single(gate_value);
@@ -841,7 +847,7 @@ static __global__ void mul_mat_vec_q(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -1390,6 +1396,7 @@ void ggml_cuda_mul_mat_vec_q(
     // which also takes a gated FFN (SWIGLU, no biases) and a residual add at columns past MMVQ_MAX_FUSED_NCOLS
     const bool pq2_mma = src0->type == GGML_TYPE_PQ2_0 && !ids && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
         (fusion == nullptr || (fusion->gate_bias == nullptr && fusion->x_scale == nullptr && fusion->gate_scale == nullptr &&
+            fusion->glu_limit == 0.0f &&
             (fusion->gate == nullptr || (fusion->x_bias == nullptr && fusion->glu_op == GGML_GLU_OP_SWIGLU)))) &&
         ggml_cuda_mmvq_pq2_mma_usable(ggml_cuda_info().devices[ctx.device].cc, src0->data,
             fusion && fusion->gate ? fusion->gate->data : nullptr, ne00, ne01, nb01 / ts_src0, ne1);
@@ -1433,7 +1440,8 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
             fusion_local.gate_scale = fusion->gate_scale->data;
         }
-        fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_op    = fusion->glu_op;
+        fusion_local.glu_limit = fusion->glu_limit;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
