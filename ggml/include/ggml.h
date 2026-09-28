@@ -580,6 +580,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_WEIGHTS,
 
         GGML_OP_UNARY,
 
@@ -2694,6 +2695,20 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_weights: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
+    //             -> [(2 + hc)*hc, n_tokens], the weights hc_pre and hc_post take, in one op:
+    //   [0, hc)             pre[h, t]  = sigmoid(mixes[h, t]*scale[0] + base[h]) + eps
+    //   [hc, 2*hc)          post[h, t] = 2*sigmoid(mixes[hc + h, t]*scale[1] + base[hc + h])
+    //   [2*hc, (2 + hc)*hc) comb[dst + hc*src, t] as ggml_dsv4_hc_comb computes it
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_weights(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
 
     // custom operators
 

@@ -4230,6 +4230,59 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// chain: hc_pre and hc_post read their weights as the strided views of the one weights tensor the models take
+struct test_dsv4_hc_weights : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int32_t n_iter;
+    const float eps;
+    const bool chain;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_WEIGHTS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, n_tokens, n_iter, eps, chain);
+    }
+
+    test_dsv4_hc_weights(int64_t n_embd = 31, int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f, bool chain = false)
+        : n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter), eps(eps), chain(chain) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
+        ggml_set_name(mixes, "mixes");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        out = ggml_dsv4_hc_weights(ctx, mixes, scale, base, eps, n_iter);
+        ggml_set_name(out, "hc_weights");
+        if (!chain) {
+            return out;
+        }
+
+        ggml_tensor * weights = out;
+        ggml_tensor * pre  = ggml_view_2d(ctx, weights, hc, n_tokens, weights->nb[1], 0);
+        ggml_tensor * post = ggml_view_2d(ctx, weights, hc, n_tokens, weights->nb[1], hc*weights->nb[0]);
+        ggml_tensor * comb = ggml_view_3d(ctx, weights, hc, hc, n_tokens, hc*weights->nb[0], weights->nb[1], 2*hc*weights->nb[0]);
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * sub = ggml_dsv4_hc_pre(ctx, x, pre);
+        ggml_set_name(sub, "hc_pre");
+
+        out = ggml_dsv4_hc_post(ctx, sub, x, post, comb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -9484,6 +9537,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
+
+    test_cases.emplace_back(new test_dsv4_hc_weights(31, 1, 1));
+    test_cases.emplace_back(new test_dsv4_hc_weights(31, 17, 4));
+    test_cases.emplace_back(new test_dsv4_hc_weights(31, 257, 8));
+    test_cases.emplace_back(new test_dsv4_hc_weights(31, 1, 20));
+    test_cases.emplace_back(new test_dsv4_hc_weights(31, 17, 20, 1e-6f, true));
+    test_cases.emplace_back(new test_dsv4_hc_weights(4096, 1, 20, 1e-6f, true));
+    test_cases.emplace_back(new test_dsv4_hc_weights(4096, 3, 20, 1e-6f, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
