@@ -1238,7 +1238,9 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
                 ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
             }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                if (tensor->nb[i] > tensor->nb[split_dim]) {
+                // A dim of extent 1 has the stride of the dim after it, so equal strides are ordered by dim: when the
+                // split dim itself has extent 1 (one head split two ways) the dims after it are outer and scale too.
+                if (tensor->nb[i] > tensor->nb[split_dim] || (tensor->nb[i] == tensor->nb[split_dim] && i > split_dim)) {
                     nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
                 }
             }
