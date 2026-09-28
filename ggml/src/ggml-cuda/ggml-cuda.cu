@@ -5079,6 +5079,55 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return n - 1;
     }
 
+    // Three quantized MUL_MATs of one input on mul_mat_vec_q whose outputs two CONCATs join along dim 0 (GLM-5.3's KDA q,
+    // k and v): the weights, one stride from each other as create_tensor_qkv's three tensors are laid out, are the channels
+    // of one launch writing the second CONCAT (ggml_cuda_mul_mat_vec_q_concat), which was five launches.
+    // GGML_CUDA_MMVQ_CONCAT_LEGACY=1 runs the five nodes.
+    static const bool mmvq_concat_legacy = ggml_env_switch("GGML_CUDA_MMVQ_CONCAT_LEGACY");
+    if (!mmvq_concat_legacy && node->op == GGML_OP_MUL_MAT && cuda_ctx->curr_stream_no == 0 &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        // the next node after j that is neither a view nor a no-op, or -1
+        auto next = [&](int j) {
+            if (j < 0) {
+                return -1;
+            }
+            for (++j; j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+            }
+            return j < cgraph->n_nodes ? j : -1;
+        };
+        const int i1 = next(i);
+        const int i2 = next(i1);
+        const int i3 = next(i2);
+        const int i4 = next(i3);
+        if (i4 >= 0) {
+            // q, k, concat(q, k), v, concat(qk, v) as a graph orders the concats' sources, or q, k, v and the two concats
+            const bool    v_last = cgraph->nodes[i2]->op == GGML_OP_CONCAT;
+            ggml_tensor * mm[3]  = { node, cgraph->nodes[i1], cgraph->nodes[v_last ? i3 : i2] };
+            ggml_tensor * qk     = cgraph->nodes[v_last ? i2 : i3];
+            ggml_tensor * qkv    = cgraph->nodes[i4];
+            const ggml_op ops[]  = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, v_last ? GGML_OP_CONCAT : GGML_OP_MUL_MAT,
+                                     v_last ? GGML_OP_MUL_MAT : GGML_OP_CONCAT, GGML_OP_CONCAT };
+            const int     idxs[] = { i, i1, i2, i3, i4 };
+            const int     outs[] = { i4 };
+            bool ok = qk->op == GGML_OP_CONCAT && qkv->op == GGML_OP_CONCAT && ggml_get_op_params_i32(qk, 0) == 0 &&
+                ggml_get_op_params_i32(qkv, 0) == 0 && qk->src[0] == mm[0] && qk->src[1] == mm[1] && qkv->src[0] == qk &&
+                qkv->src[1] == mm[2];
+            const ggml_tensor * w[3];
+            for (int g = 0; ok && g < 3; ++g) {
+                ok = mm[g]->op == GGML_OP_MUL_MAT && mm[g]->src[1] == node->src[1] &&
+                    ggml_get_op_params_i32(mm[g], 1) != GGML_HINT_SRC0_IS_HADAMARD;
+                w[g] = mm[g]->src[0];
+            }
+            if (ok && ggml_can_fuse_subgraph_ext(cgraph, idxs, 5, ops, outs, 1) &&
+                    ggml_cuda_mul_mat_vec_q_concat_supported(w, 3, node->src[1], qkv,
+                        ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, i4 - i + 1, outs, 1)) {
+                ggml_cuda_mul_mat_vec_q_concat(*cuda_ctx, w, 3, node->src[1], qkv);
+                return i4 - i;
+            }
+        }
+    }
+
     // Two MUL_MATs of one src1 by float weights of one shape, up to 4 views between them, that ggml_cuda_mul_mat runs on
     // mul_mat_vec_f one after the other (qwen35's ssm_beta and ssm_alpha at decode and verify): one launch runs both.
     // GGML_CUDA_MMVF_PAIR_LEGACY=1 launches them one by one.

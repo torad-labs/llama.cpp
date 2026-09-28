@@ -4427,6 +4427,75 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     }
 };
 
+// GLM-5.3's KDA q, k and v: three MUL_MATs of one input by weights of m rows, created one after another as
+// create_tensor_qkv creates them, joined along dim 0 by two CONCATs; CUDA runs the five as one launch at up to 8 tokens
+// when the weights lie one stride from each other. spacer: a tensor made between k's weight and v's, so they do not.
+// weights_buf: the weights in a weights buffer, as a model's.
+struct test_mul_mat_concat : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t k;
+    const int64_t n;
+    const bool spacer;
+    const bool weights_buf;
+
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_CONCAT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, m, k, n, spacer, weights_buf);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    bool use_weight_context() override { return weights_buf; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_concat(ggml_type type = GGML_TYPE_Q8_0, int64_t m = 256, int64_t k = 512, int64_t n = 1,
+            bool spacer = false, bool weights_buf = true)
+        : type(type), m(m), k(k), n(n), spacer(spacer), weights_buf(weights_buf) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_context * ctx_w = ctx_weights != nullptr ? ctx_weights : ctx;
+
+        // without the sentinel this harness puts after each tensor, so the weights lie next to each other as a model's
+        // do; the sentinels before and after the three still catch a write outside them
+        ggml_tensor * wq = ::ggml_new_tensor_2d(ctx_w, type, k, m);
+        ggml_set_name(wq, "wq");
+        ggml_tensor * wk = ::ggml_new_tensor_2d(ctx_w, type, k, m);
+        ggml_set_name(wk, "wk");
+        if (spacer) {
+            ggml_set_name(::ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, 64), "spacer");
+        }
+        ggml_tensor * wv = ::ggml_new_tensor_2d(ctx_w, type, k, m);
+        ggml_set_name(wv, "wv");
+        add_sentinel(ctx_w);
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * q  = ggml_mul_mat(ctx, wq, x);
+        ggml_tensor * kk = ggml_mul_mat(ctx, wk, x);
+        ggml_tensor * v  = ggml_mul_mat(ctx, wv, x);
+        out = ggml_concat(ctx, ggml_concat(ctx, q, kk, 0), v, 0);
+        ggml_set_name(out, "qkv");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -9796,6 +9865,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 64, 2, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 31, 3, 4));
+
+    // KDA's q, k and v: one launch on CUDA at 1 to 8 tokens; unfused at 9, with the weights' stride broken, and at 101
+    // rows, where a block of 2 rows would cross from one weight's rows into the next
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (int64_t n : {1, 2, 3, 5, 8, 9}) {
+            test_cases.emplace_back(new test_mul_mat_concat(type, 256, 512, n));
+        }
+    }
+    for (int64_t n : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat_concat(GGML_TYPE_Q8_0, 4096, 4096, n));
+        test_cases.emplace_back(new test_mul_mat_concat(GGML_TYPE_Q8_0, 256, 512, n, false, false));
+        test_cases.emplace_back(new test_mul_mat_concat(GGML_TYPE_Q8_0, 256, 512, n, true));
+    }
+    test_cases.emplace_back(new test_mul_mat_concat(GGML_TYPE_Q8_0, 101, 4096, 2));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

@@ -35,6 +35,13 @@ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
 // tensor-core kernel: src1 quantized once, one launch over all their tiles (ggml_cuda_mmvq_pq2_mma_group).
 void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n);
 
+// n MUL_MATs of src1 by the weights w[0..n) whose outputs dst concatenates in that order along dim 0 (KDA's q, k and v):
+// whether one mul_mat_vec_q launch runs them, the weights as its channels, which needs them one stride from each other.
+bool ggml_cuda_mul_mat_vec_q_concat_supported(const ggml_tensor * const * w, int n, const ggml_tensor * src1,
+                                              const ggml_tensor * dst, int cc);
+void ggml_cuda_mul_mat_vec_q_concat(ggml_backend_cuda_context & ctx, const ggml_tensor * const * w, int n,
+                                    const ggml_tensor * src1, ggml_tensor * dst);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
