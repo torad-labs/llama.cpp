@@ -738,6 +738,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         fattn_kv_live_context.release();
     }
+    if (pq2_tile_counters.ptr != nullptr) {
+        ggml_cuda_set_device(device);
+        pq2_tile_counters.release();
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -5494,6 +5498,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

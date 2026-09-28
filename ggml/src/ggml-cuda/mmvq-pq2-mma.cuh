@@ -10,15 +10,17 @@
 
 // Whether the kernel serves this matmul, and then it always does: GeForce / RTX PRO Blackwell (sm_120, not yet measured
 // on GB10's sm_121) built for it, 1-8 columns, K a multiple of 1024 (every row a whole number of 16-byte TMA units), the
-// weights 16-byte aligned. It holds no state between launches. GGML_CUDA_PQ2_MMA_LEGACY=1 turns it off.
+// weights 16-byte aligned. Its only state between launches is its stream's tile counter, 0 then (tile_ctr below).
+// GGML_CUDA_PQ2_MMA_LEGACY=1 turns it off.
 bool ggml_cuda_mmvq_pq2_mma_usable(int cc, const void * vx, const void * vgate, int64_t ncols_x, int64_t nrows_x,
                                    int64_t stride_row_x, int64_t ncols_dst);
 
-// next: the head of the launch after this one, which this one prefetches into L2 (ggml_cuda_pq2_prefetch, common.cuh)
+// next: the head of the launch after this one, which this one prefetches into L2 (ggml_cuda_pq2_prefetch, common.cuh).
+// tile_ctr: the stream's tile counter (ggml_cuda_pq2_tile_counters, common.cuh), or nullptr: every tile to its own block.
 void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy, const float * x_bias, float * dst,
                             int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x,
                             int64_t stride_col_y, int64_t stride_col_dst, const ggml_cuda_pq2_prefetch & next,
-                            cudaStream_t stream);
+                            int * tile_ctr, cudaStream_t stream);
 
 #define PQ2_MMA_MAX_GROUP 4
 
@@ -28,4 +30,4 @@ void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy
 void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
                                   const int64_t * stride_row_x, const int64_t * stride_col_dst, const void * vy,
                                   int64_t ncols_x, int64_t ncols_dst, int64_t stride_col_y,
-                                  const ggml_cuda_pq2_prefetch & next, cudaStream_t stream);
+                                  const ggml_cuda_pq2_prefetch & next, int * tile_ctr, cudaStream_t stream);
