@@ -465,6 +465,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
+    // x first: the graph then reaches the state's gather after all that x depends on (the layer's input, and under
+    // -sm tensor the previous layer's all-reduce), so the gather, the CONCAT and the SSM_CONV sit in one of the meta
+    // backend's subgraphs, where the CUDA backend folds them into the conv (ggml_cuda_try_ssm_conv_state_update). A
+    // gather reached first went before the previous layer's all-reduce, a subgraph apart: GLM-5.3 folded 1 of its 33.
+    ggml_build_forward_expand(gf, qkv_mixed);
+
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
