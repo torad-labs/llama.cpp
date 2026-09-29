@@ -360,12 +360,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
         {
             // the device's profile, what a roofline or a launch shape is sized from; rig's roofline probe reads this
             // line. DRAM is the peak the memory clock and bus give (two transfers a clock), not a measured rate.
-            enum { SM_KHZ, MEM_KHZ, BUS_BITS, REGS_SM, SMEM_SM, THREADS_SM, BLOCKS_SM, L2, L2_PERSIST, N_ATTR };
+            enum { SM_KHZ, MEM_KHZ, BUS_BITS, REGS_SM, SMEM_SM, THREADS_SM, BLOCKS_SM, L2, L2_PERSIST, L2_WINDOW, N_ATTR };
             const cudaDeviceAttr attrs[N_ATTR] = {
                 cudaDevAttrClockRate, cudaDevAttrMemoryClockRate, cudaDevAttrGlobalMemoryBusWidth,
                 cudaDevAttrMaxRegistersPerMultiprocessor, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
                 cudaDevAttrMaxThreadsPerMultiProcessor, cudaDevAttrMaxBlocksPerMultiprocessor, cudaDevAttrL2CacheSize,
-                cudaDevAttrMaxPersistingL2CacheSize,
+                cudaDevAttrMaxPersistingL2CacheSize, cudaDevAttrMaxAccessPolicyWindowSize,
             };
             int v[N_ATTR] = {};
             for (int a = 0; a < N_ATTR; ++a) {
@@ -377,8 +377,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
                           prop.sharedMemPerBlockOptin / 1024, v[THREADS_SM], v[BLOCKS_SM], v[L2] / 1024,
                           v[L2_PERSIST] / 1024, 2.0 * v[MEM_KHZ] * v[BUS_BITS] / 8 / 1e6, v[MEM_KHZ] / 1000,
                           v[BUS_BITS]);
-            info.devices[id].l2_bytes = (size_t) v[L2];
-            info.devices[id].dram_gbs = 2.0 * v[MEM_KHZ] * v[BUS_BITS] / 8 / 1e6;
+            info.devices[id].l2_bytes         = (size_t) v[L2];
+            info.devices[id].l2_persist_bytes = (size_t) v[L2_PERSIST];
+            info.devices[id].l2_window_bytes  = (size_t) v[L2_WINDOW];
+            info.devices[id].dram_gbs         = 2.0 * v[MEM_KHZ] * v[BUS_BITS] / 8 / 1e6;
         }
         std::string device_name(prop.name);
         if (device_name == "NVIDIA GeForce MX450") {
@@ -739,6 +741,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaEventDestroy(l2_issue_fork));
         CUDA_CHECK(cudaEventDestroy(l2_issue_join));
     }
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+    if (l2_persisting) {
+        // the lines its launches made persisting return to normal, for what the device runs after it
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaCtxResetPersistingL2Cache());
+    }
+#endif // defined(GGML_CUDA_USE_L2_WINDOW)
     if (fattn_kv_live_context.size != 0) {
         ggml_cuda_set_device(device);
         fattn_kv_live_context.release();
@@ -2088,6 +2097,104 @@ static std::vector<ggml_cuda_pq2_prefetch> ggml_cuda_pq2_prefetch_plan(ggml_back
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t);
 
+// The L2 set-aside each device granted for persisting lines (cudaLimitPersistingL2CacheSize), 0 until a launch first
+// asks for it: what persists there is out of the L2 an issue requests into (ggml_cuda_l2_issue_plan_of).
+static std::atomic<size_t> ggml_cuda_l2_set_aside[GGML_CUDA_MAX_DEVICES];
+
+// KDA's gated_delta_net reads and writes its layer's recurrent state in place every token (the fused gather,
+// ggml_cuda_try_gdn_gather_skip), and the weights the token streams between two such layers evict it: each token reads
+// it from DRAM again, the 2x RTX PRO 6000 head 34 MB a card (-sm tensor, -cts f16), beside the L2 issuer's requests
+// (GGML_CUDA_L2_ISSUE_BUSY_KB's measurements: gated_delta_net 241 against 123 us a token). Its launch persists it in L2
+// instead: an access policy window over the whole buffer the states are in, one for every layer, so that the lines chosen
+// to persist are the same for every launch, at hitRatio set-aside / window, so that those lines fit the set-aside. The
+// set-aside is the smaller of the window and the most the device allows, set once, when the first launch asks. Measured:
+// 34 layers of 1 MB behind 15 MB of streamed weights each, an RTX 5070 Ti with 30 MB set aside, the state kernel
+// 1.67 us a layer against 2.39 without; an idle process holding the lines left another process's L2-resident reads at
+// full speed. (ncu cannot measure it: its kernel profiling returns the lines to normal, 1 % hits with the window or
+// without.) In the model it pays for itself only where the L2 is large beside the states: the 44-layer GLM-5.3 proxy
+// on an RTX 5070 Ti alone (77 MB of states, 30 MB set aside of 48), gated_delta_net 289 -> 211 us a token (nsys), but
+// tg64 -0.1 %, and -1.0 % over the fused KDA store (6a565c9af): what the set-aside takes from the rest costs as much.
+// Off by default; GGML_CUDA_GDN_STATE_PERSIST=1 turns it on (the 2x RTX PRO 6000 head: 34 MB a card of 128). None on a
+// GPU split into virtual devices, whose set-aside would be shared. Returns the window, num_bytes 0 for none.
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+static cudaAccessPolicyWindow ggml_cuda_l2_persist_window(ggml_backend_cuda_context & ctx, const ggml_tensor * state) {
+    static const bool enabled = ggml_env_switch("GGML_CUDA_GDN_STATE_PERSIST");
+    static std::mutex set_mutex;
+
+    cudaAccessPolicyWindow window = {};
+    const ggml_cuda_device_info::cuda_device_info & dev = ggml_cuda_info().devices[ctx.device];
+    const ggml_backend_buffer_t buf = state->view_src ? state->view_src->buffer : state->buffer;
+    if (!enabled || !GGML_CUDA_CC_IS_NVIDIA(dev.cc) || dev.cc < GGML_CUDA_CC_AMPERE || dev.l2_persist_bytes == 0 ||
+            dev.l2_window_bytes == 0 || dev.physical_share_count > 1 || buf == nullptr || !ggml_backend_buffer_is_cuda(buf)) {
+        return window;
+    }
+    char * const base  = (char *) ggml_backend_buffer_get_base(buf);
+    const size_t bytes = std::min(ggml_backend_buffer_get_size(buf), dev.l2_window_bytes);
+    if ((const char *) state->data < base || (const char *) state->data + ggml_nbytes(state) > base + bytes) {
+        return window; // past the largest window
+    }
+
+    std::atomic<size_t> & set_aside = ggml_cuda_l2_set_aside[ctx.device];
+    if (set_aside.load(std::memory_order_acquire) == 0) {
+        std::lock_guard<std::mutex> lock(set_mutex);
+        if (set_aside.load(std::memory_order_relaxed) == 0) {
+            // a relaxed capture allows it, a global one does not: this thread's mode is relaxed for the call
+            ggml_cuda_set_device(ctx.device);
+            cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+            CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+            size_t granted = 0;
+            if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, std::min(bytes, dev.l2_persist_bytes)) != cudaSuccess ||
+                    cudaDeviceGetLimit(&granted, cudaLimitPersistingL2CacheSize) != cudaSuccess || granted == 0) {
+                (void) cudaGetLastError();
+                granted = SIZE_MAX; // refused: never asked again, and no window
+            }
+            CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+            GGML_LOG_INFO("%s: device %d: recurrent states' L2 window %zu KiB, set-aside %zu KiB of %zu\n", __func__,
+                          ctx.device, bytes / 1024, granted == SIZE_MAX ? 0 : granted / 1024, dev.l2_persist_bytes / 1024);
+            set_aside.store(granted, std::memory_order_release);
+        }
+    }
+    const size_t granted = set_aside.load(std::memory_order_acquire);
+    if (granted == SIZE_MAX) {
+        return window;
+    }
+    window.base_ptr  = base;
+    window.num_bytes = bytes;
+    window.hitRatio  = std::min(1.0f, (float) granted / (float) bytes);
+    window.hitProp   = cudaAccessPropertyPersisting;
+    window.missProp  = cudaAccessPropertyStreaming;
+    ctx.l2_persisting = true;
+    return window;
+}
+
+// GGML_CUDA_L2_PERSIST_CHECK=1: after a capture, how many of the graph's kernel nodes hold an access policy window, and
+// the first one's: whether the launch attribute (ggml_cuda_l2_persist_window) reached the graph on this driver
+static void ggml_cuda_l2_persist_check(const ggml_backend_cuda_context & ctx, cudaGraph_t graph) {
+    static const bool check = ggml_env_switch("GGML_CUDA_L2_PERSIST_CHECK");
+    if (!check || !ctx.l2_persisting) {
+        return;
+    }
+    size_t n = 0;
+    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &n));
+    std::vector<cudaGraphNode_t> nodes(n);
+    CUDA_CHECK(cudaGraphGetNodes(graph, nodes.data(), &n));
+    int                    armed = 0;
+    cudaAccessPolicyWindow first = {};
+    for (const cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type;
+        CUDA_CHECK(cudaGraphNodeGetType(node, &type));
+        cudaKernelNodeAttrValue v = {};
+        if (type == cudaGraphNodeTypeKernel &&
+                cudaGraphKernelNodeGetAttribute(node, cudaKernelNodeAttributeAccessPolicyWindow, &v) == cudaSuccess &&
+                v.accessPolicyWindow.num_bytes > 0 && armed++ == 0) {
+            first = v.accessPolicyWindow;
+        }
+    }
+    GGML_LOG_INFO("%s: %s: %d of %zu nodes hold an L2 window; the first: base %p, %zu KiB, hitRatio %.3f\n", __func__,
+                  ctx.name.c_str(), armed, n, first.base_ptr, first.num_bytes / 1024, first.hitRatio);
+}
+#endif // defined(GGML_CUDA_USE_L2_WINDOW)
+
 static double ggml_cuda_l2_issue_env(const char * name, const double def) {
     const char * env = getenv(name);
     return env != nullptr ? std::max(0.0, atof(env)) : def;
@@ -2117,8 +2224,8 @@ static double ggml_cuda_l2_issue_env(const char * name, const double def) {
 //   the meta backend says which graph comes next (ggml_backend_graph_next): the issue after the graph's last heavy launch
 //   then runs on across the all-reduce, through the next graph's first heavy launch, and joins the evaluation's stream
 //   only at the capture's end (or never, uncaptured), not before the all-reduce;
-// - GGML_CUDA_L2_ISSUE_L2_FRAC (default 0.5): the most an issuer requests, a share of the card's L2 (a stream prefetched
-//   alone stays whole in L2 up to ~58 % of it, an RTX 5080);
+// - GGML_CUDA_L2_ISSUE_L2_FRAC (default 0.5): the most an issuer requests, a share of the card's L2 outside a persisting
+//   set-aside (a stream prefetched alone stays whole in L2 up to ~58 % of it, an RTX 5080);
 // - GGML_CUDA_L2_ISSUE_RATE_FRAC (default 0.9): its pace, a share of the card's DRAM peak (a 5070 Ti's L2 took a 17.8 MB
 //   matrix whole at 400-1,000 GB/s of its 896).
 struct ggml_cuda_l2_issue_plan {
@@ -2148,8 +2255,10 @@ static ggml_cuda_l2_issue_plan ggml_cuda_l2_issue_plan_of(ggml_backend_cuda_cont
     if (legacy || !GGML_CUDA_CC_IS_NVIDIA(dev.cc) || dev.cc < GGML_CUDA_CC_HOPPER || dev.dram_gbs <= 0.0 || dev.l2_bytes == 0) {
         return plan;
     }
-    const int64_t budget = (int64_t) (l2_frac * dev.l2_bytes);
-    plan.rate_gbs        = rate_frac * dev.dram_gbs;
+    // of the L2 outside the lines the recurrent states persist in (ggml_cuda_l2_persist_window)
+    const size_t  set_aside = ggml_cuda_l2_set_aside[ctx.device].load(std::memory_order_acquire);
+    const int64_t budget    = (int64_t) (l2_frac * (dev.l2_bytes - (set_aside == SIZE_MAX ? 0 : std::min(set_aside, dev.l2_bytes))));
+    plan.rate_gbs           = rate_frac * dev.dram_gbs;
 
     const auto weights = [](const ggml_tensor * t) {
         return t != nullptr && t->buffer != nullptr &&
@@ -3506,6 +3615,9 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
             gather.ids        = (const int32_t *) ids->data;
             gather.row_stride = (int64_t) (cache->nb[1] / ggml_type_size(cache->type)) * ggml_blck_size(cache->type);
             gather.type       = cache->type;
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+            gather.l2_window  = ggml_cuda_l2_persist_window(ctx, cache);
+#endif // defined(GGML_CUDA_USE_L2_WINDOW)
             ctx.gdn_gathers().set(n, gather);
             return true;
         }
@@ -6146,6 +6258,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &graph->num_nodes));
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+            ggml_cuda_l2_persist_check(*cuda_ctx, graph->graph);
+#endif // defined(GGML_CUDA_USE_L2_WINDOW)
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6326,6 +6441,9 @@ static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
         }
         return nullptr;
     }
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+    ggml_cuda_l2_persist_check(*cuda_ctx, graph);
+#endif // defined(GGML_CUDA_USE_L2_WINDOW)
 
     size_t n_nodes = 0;
     CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &n_nodes));

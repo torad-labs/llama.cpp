@@ -123,6 +123,11 @@
 #    define GGML_CUDA_USE_PDL
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
 
+// the other launch attribute cudaLaunchKernelEx carries: an L2 access policy window (ggml_cuda_kernel_launch_params)
+#if defined(GGML_CUDA_USE_PDL)
+#    define GGML_CUDA_USE_L2_WINDOW
+#endif  // defined(GGML_CUDA_USE_PDL)
+
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
 #if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaGridDependencySynchronize();
@@ -1211,6 +1216,8 @@ struct ggml_cuda_device_info {
         int     physical_share_count;           // number of (virtual) devices sharing this device's physical GPU
         int     virtual_index;                  // index of this (virtual) device among those sharing its physical GPU
         size_t  l2_bytes;                       // L2 cache (NVIDIA; 0 elsewhere)
+        size_t  l2_persist_bytes;               // the most of it a persisting set-aside can take (NVIDIA; 0 elsewhere)
+        size_t  l2_window_bytes;                // the largest L2 access policy window (NVIDIA; 0 elsewhere)
         double  dram_gbs;                       // DRAM peak, GB/s, from the memory clock and bus (NVIDIA; 0 elsewhere)
     };
 
@@ -1499,6 +1506,9 @@ struct ggml_cuda_gated_delta_net_gather {
     const int32_t * ids        = nullptr;       // per-seq row index
     int64_t         row_stride = 0;             // between rows, in elements
     ggml_type       type       = GGML_TYPE_F32; // f32, or the -cts cache f16 or q8_0, converted as the kernel loads it
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+    cudaAccessPolicyWindow l2_window = {};      // the launch's, persisting the recurrent states (ggml_cuda_l2_persist_window)
+#endif // defined(GGML_CUDA_USE_L2_WINDOW)
 };
 
 // The head of the next PQ2_0 launch's weights, which a launch prefetches into L2 once it has requested all of its own
@@ -1939,6 +1949,7 @@ struct ggml_backend_cuda_context {
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
+    bool        l2_persisting = false;   // a launch was given a persisting L2 window (ggml_cuda_l2_persist_window)
     const ggml_cgraph * l2_graph_next = nullptr; // the graph after the next computed, while it computes (ggml_backend_graph_next)
     // the stream is being captured with the rest of an evaluation across backends (ggml_backend_cuda_capture_begin):
     // the graphs computed meanwhile are evaluated into it, with no CUDA graph of their own
@@ -2029,6 +2040,9 @@ struct ggml_cuda_kernel_launch_params {
     dim3 block_dims;
     size_t shmem;
     cudaStream_t stream;
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+    cudaAccessPolicyWindow l2_window = {}; // num_bytes 0: none; else a launch attribute, kept by a capture in the node
+#endif // defined(GGML_CUDA_USE_L2_WINDOW)
 
     // size_t shmem
     ggml_cuda_kernel_launch_params(const dim3& block_nums_, const dim3& block_dims_, const size_t shmem_, const cudaStream_t stream_)
@@ -2041,20 +2055,29 @@ struct ggml_cuda_kernel_launch_params {
 
 #if defined(GGML_CUDA_USE_PDL)
 struct ggml_cuda_pdl_config {
-    cudaLaunchAttribute attr;
+    cudaLaunchAttribute attr[2];
     cudaLaunchConfig_t  cfg;
 
-    ggml_cuda_pdl_config(const ggml_cuda_kernel_launch_params & params) {
-        attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attr.val.programmaticStreamSerializationAllowed = 1;
-
+    // PDL if pdl, and the params' L2 access policy window if it has one
+    ggml_cuda_pdl_config(const ggml_cuda_kernel_launch_params & params, const bool pdl = true) {
         cfg = {};
         cfg.gridDim          = params.block_nums;
         cfg.blockDim         = params.block_dims;
         cfg.dynamicSmemBytes = params.shmem;
         cfg.stream           = params.stream;
-        cfg.attrs            = &attr;
-        cfg.numAttrs         = 1;
+        cfg.attrs            = attr;
+        cfg.numAttrs         = 0;
+
+        if (pdl) {
+            attr[cfg.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attr[cfg.numAttrs].val.programmaticStreamSerializationAllowed = 1;
+            ++cfg.numAttrs;
+        }
+        if (params.l2_window.num_bytes > 0) {
+            attr[cfg.numAttrs].id                     = cudaLaunchAttributeAccessPolicyWindow;
+            attr[cfg.numAttrs].val.accessPolicyWindow = params.l2_window;
+            ++cfg.numAttrs;
+        }
     }
 
     // Delete due to &attr
@@ -2137,8 +2160,9 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
         return env == nullptr || std::atoi(env) != 0;
     }();
 
-    if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {
-        auto pdl_cfg = ggml_cuda_pdl_config(launch_params);
+    const bool pdl = env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel));
+    if (pdl || launch_params.l2_window.num_bytes > 0) {
+        auto pdl_cfg = ggml_cuda_pdl_config(launch_params, pdl);
 
         CUDA_CHECK(cudaLaunchKernelEx(&pdl_cfg.cfg, kernel, std::forward<Args>(args)... ));
         return;
