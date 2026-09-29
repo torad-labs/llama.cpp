@@ -469,6 +469,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
         state_type        = cache->type;
     }
+    // the types the launches below instantiate (ggml_cuda_gdn_cache_type_fusable)
+    GGML_ASSERT(state_type == GGML_TYPE_F32 || state_type == GGML_TYPE_F16 || state_type == GGML_TYPE_Q8_0);
 
     // raw gates: mode 1 the scalar gate's (ggml_gated_delta_net_set_raw_gates), mode 2 KDA's
     // (ggml_gated_delta_net_set_raw_kda_gates)

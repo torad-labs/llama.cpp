@@ -730,6 +730,10 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+static void ggml_cuda_l2_persist_release(int device);
+#endif // defined(GGML_CUDA_USE_L2_WINDOW)
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -743,9 +747,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
 #if defined(GGML_CUDA_USE_L2_WINDOW)
     if (l2_persisting) {
-        // the lines its launches made persisting return to normal, for what the device runs after it
-        ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaCtxResetPersistingL2Cache());
+        ggml_cuda_l2_persist_release(device); // the last on the device returns the persisting lines and the set-aside
     }
 #endif // defined(GGML_CUDA_USE_L2_WINDOW)
     if (fattn_kv_live_context.size != 0) {
@@ -2098,8 +2100,14 @@ static std::vector<ggml_cuda_pq2_prefetch> ggml_cuda_pq2_prefetch_plan(ggml_back
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t);
 
 // The L2 set-aside each device granted for persisting lines (cudaLimitPersistingL2CacheSize), 0 until a launch first
-// asks for it: what persists there is out of the L2 an issue requests into (ggml_cuda_l2_issue_plan_of).
+// asks for it and again once no context persists (ggml_cuda_l2_persist_release), SIZE_MAX if refused: what persists
+// there is out of the L2 an issue requests into (ggml_cuda_l2_issue_plan_of).
 static std::atomic<size_t> ggml_cuda_l2_set_aside[GGML_CUDA_MAX_DEVICES];
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+// under it: the set-aside's grant and return, and each device's contexts whose launches were given a window
+static std::mutex ggml_cuda_l2_persist_mutex;
+static int        ggml_cuda_l2_persisting_contexts[GGML_CUDA_MAX_DEVICES];
+#endif // defined(GGML_CUDA_USE_L2_WINDOW)
 
 // KDA's gated_delta_net reads and writes its layer's recurrent state in place every token (the fused gather,
 // ggml_cuda_try_gdn_gather_skip), and the weights the token streams between two such layers evict it: each token reads
@@ -2107,91 +2115,156 @@ static std::atomic<size_t> ggml_cuda_l2_set_aside[GGML_CUDA_MAX_DEVICES];
 // (GGML_CUDA_L2_ISSUE_BUSY_KB's measurements: gated_delta_net 241 against 123 us a token). Its launch persists it in L2
 // instead: an access policy window over the whole buffer the states are in, one for every layer, so that the lines chosen
 // to persist are the same for every launch, at hitRatio set-aside / window, so that those lines fit the set-aside. The
-// set-aside is the smaller of the window and the most the device allows, set once, when the first launch asks. Measured:
+// set-aside is the smaller of the window and the most the device allows, set when its first launch asks. Measured:
 // 34 layers of 1 MB behind 15 MB of streamed weights each, an RTX 5070 Ti with 30 MB set aside, the state kernel
 // 1.67 us a layer against 2.39 without; an idle process holding the lines left another process's L2-resident reads at
 // full speed. (ncu cannot measure it: its kernel profiling returns the lines to normal, 1 % hits with the window or
 // without.) In the model it pays for itself only where the L2 is large beside the states: the 44-layer GLM-5.3 proxy
 // on an RTX 5070 Ti alone (77 MB of states, 30 MB set aside of 48), gated_delta_net 289 -> 211 us a token (nsys), but
 // tg64 -0.1 %, and -1.0 % over the fused KDA store (6a565c9af): what the set-aside takes from the rest costs as much.
-// Off by default; GGML_CUDA_GDN_STATE_PERSIST=1 turns it on (the 2x RTX PRO 6000 head: 34 MB a card of 128). None on a
-// GPU split into virtual devices, whose set-aside would be shared. Returns the window, num_bytes 0 for none.
+// Off by default; GGML_CUDA_GDN_STATE_PERSIST=1 turns it on (the 2x RTX PRO 6000 head: 34 MB a card of 128), for the
+// launches that take the fused gather: one sequence's. None on a GPU split into virtual devices, whose set-aside would
+// be shared; where the switch asks for a window and none is given, the first reason is logged, once a device. The
+// set-aside is kept while a context given a window lives (ggml_cuda_l2_persist_release). Returns the window, num_bytes
+// 0 for none.
 #if defined(GGML_CUDA_USE_L2_WINDOW)
 static cudaAccessPolicyWindow ggml_cuda_l2_persist_window(ggml_backend_cuda_context & ctx, const ggml_tensor * state) {
-    static const bool enabled = ggml_env_switch("GGML_CUDA_GDN_STATE_PERSIST");
-    static std::mutex set_mutex;
+    static const bool        enabled = ggml_env_switch("GGML_CUDA_GDN_STATE_PERSIST");
+    static std::atomic<bool> told[GGML_CUDA_MAX_DEVICES];
 
     cudaAccessPolicyWindow window = {};
-    const ggml_cuda_device_info::cuda_device_info & dev = ggml_cuda_info().devices[ctx.device];
-    const ggml_backend_buffer_t buf = state->view_src ? state->view_src->buffer : state->buffer;
-    if (!enabled || !GGML_CUDA_CC_IS_NVIDIA(dev.cc) || dev.cc < GGML_CUDA_CC_AMPERE || dev.l2_persist_bytes == 0 ||
-            dev.l2_window_bytes == 0 || dev.physical_share_count > 1 || buf == nullptr || !ggml_backend_buffer_is_cuda(buf)) {
+    if (!enabled) {
         return window;
+    }
+    const char * const fn = __func__; // the lambda's own is operator()
+    const auto none = [&](const std::string & why) {
+        if (!told[ctx.device].exchange(true)) {
+            GGML_LOG_WARN("%s: device %d: GGML_CUDA_GDN_STATE_PERSIST=1, but no L2 window: %s\n", fn, ctx.device,
+                          why.c_str());
+        }
+        return window;
+    };
+    const ggml_cuda_device_info::cuda_device_info & dev = ggml_cuda_info().devices[ctx.device];
+    if (!GGML_CUDA_CC_IS_NVIDIA(dev.cc) || dev.cc < GGML_CUDA_CC_AMPERE || dev.l2_persist_bytes == 0 || dev.l2_window_bytes == 0) {
+        return none("the device has no persisting L2");
+    }
+    if (dev.physical_share_count > 1) {
+        return none("the GPU is split into virtual devices, whose set-aside would be shared");
+    }
+    const ggml_backend_buffer_t buf = state->view_src ? state->view_src->buffer : state->buffer;
+    if (buf == nullptr || !ggml_backend_buffer_is_cuda(buf)) {
+        return none("the recurrent states are not in a CUDA buffer");
     }
     char * const base  = (char *) ggml_backend_buffer_get_base(buf);
     const size_t bytes = std::min(ggml_backend_buffer_get_size(buf), dev.l2_window_bytes);
     if ((const char *) state->data < base || (const char *) state->data + ggml_nbytes(state) > base + bytes) {
-        return window; // past the largest window
+        return none("a layer's recurrent states lie past the largest window, " + std::to_string(dev.l2_window_bytes / 1024) +
+                    " KiB from the base of their " + std::to_string(ggml_backend_buffer_get_size(buf) / 1024) + " KiB buffer");
     }
 
     std::atomic<size_t> & set_aside = ggml_cuda_l2_set_aside[ctx.device];
-    if (set_aside.load(std::memory_order_acquire) == 0) {
-        std::lock_guard<std::mutex> lock(set_mutex);
+    if (!ctx.l2_persisting) {
+        if (set_aside.load(std::memory_order_acquire) == SIZE_MAX) {
+            return window; // refused, and told
+        }
+        // this context's first window: the device's first asks for the set-aside, and it is kept while any lives
+        std::lock_guard<std::mutex> lock(ggml_cuda_l2_persist_mutex);
         if (set_aside.load(std::memory_order_relaxed) == 0) {
             // a relaxed capture allows it, a global one does not: this thread's mode is relaxed for the call
             ggml_cuda_set_device(ctx.device);
             cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
             CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-            size_t granted = 0;
-            if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, std::min(bytes, dev.l2_persist_bytes)) != cudaSuccess ||
-                    cudaDeviceGetLimit(&granted, cudaLimitPersistingL2CacheSize) != cudaSuccess || granted == 0) {
-                (void) cudaGetLastError();
-                granted = SIZE_MAX; // refused: never asked again, and no window
+            size_t            granted = 0;
+            const cudaError_t set     = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, std::min(bytes, dev.l2_persist_bytes));
+            const cudaError_t get     = set == cudaSuccess ? cudaDeviceGetLimit(&granted, cudaLimitPersistingL2CacheSize) : set;
+            if (get != cudaSuccess || granted == 0) {
+                // refused: never asked again, and no window. The failed call's error is this thread's last, cleared so
+                // that no later check takes it for its own; a limit set but not read back returns to 0.
+                if (get != cudaSuccess) {
+                    (void) cudaGetLastError();
+                }
+                if (set == cudaSuccess && cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                }
+                GGML_LOG_WARN("%s: device %d: GGML_CUDA_GDN_STATE_PERSIST=1, but no L2 set-aside: %s\n", __func__,
+                              ctx.device, get != cudaSuccess ? cudaGetErrorString(get) : "0 bytes granted");
+                granted = SIZE_MAX;
+            } else {
+                GGML_LOG_INFO("%s: device %d: recurrent states' L2 window %zu KiB, set-aside %zu KiB of %zu\n", __func__,
+                              ctx.device, bytes / 1024, granted / 1024, dev.l2_persist_bytes / 1024);
             }
             CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-            GGML_LOG_INFO("%s: device %d: recurrent states' L2 window %zu KiB, set-aside %zu KiB of %zu\n", __func__,
-                          ctx.device, bytes / 1024, granted == SIZE_MAX ? 0 : granted / 1024, dev.l2_persist_bytes / 1024);
             set_aside.store(granted, std::memory_order_release);
         }
+        if (set_aside.load(std::memory_order_relaxed) == SIZE_MAX) {
+            return window;
+        }
+        ++ggml_cuda_l2_persisting_contexts[ctx.device];
+        ctx.l2_persisting = true;
     }
     const size_t granted = set_aside.load(std::memory_order_acquire);
-    if (granted == SIZE_MAX) {
-        return window;
-    }
     window.base_ptr  = base;
     window.num_bytes = bytes;
     window.hitRatio  = std::min(1.0f, (float) granted / (float) bytes);
     window.hitProp   = cudaAccessPropertyPersisting;
     window.missProp  = cudaAccessPropertyStreaming;
-    ctx.l2_persisting = true;
     return window;
 }
 
+// A context whose launches were given a window (ggml_cuda_l2_persist_window) goes: the last on its device returns the
+// lines they made persisting to normal and the set-aside to 0, for what the device runs after it (and its L2 issuer's
+// budget, ggml_cuda_l2_issue_plan_of); one before it leaves both to the contexts still persisting.
+static void ggml_cuda_l2_persist_release(const int device) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_l2_persist_mutex);
+    if (--ggml_cuda_l2_persisting_contexts[device] > 0) {
+        return;
+    }
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaCtxResetPersistingL2Cache());
+    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0));
+    ggml_cuda_l2_set_aside[device].store(0, std::memory_order_release);
+}
+
 // GGML_CUDA_L2_PERSIST_CHECK=1: after a capture, how many of the graph's kernel nodes hold an access policy window, and
-// the first one's: whether the launch attribute (ggml_cuda_l2_persist_window) reached the graph on this driver
+// the first one's: whether the launch attribute (ggml_cuda_l2_persist_window) reached the graph on this driver. A node
+// whose attribute cannot be read is counted apart, with the first error.
 static void ggml_cuda_l2_persist_check(const ggml_backend_cuda_context & ctx, cudaGraph_t graph) {
     static const bool check = ggml_env_switch("GGML_CUDA_L2_PERSIST_CHECK");
-    if (!check || !ctx.l2_persisting) {
+    if (!check) {
         return;
     }
     size_t n = 0;
     CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &n));
+    if (!ctx.l2_persisting) {
+        GGML_LOG_INFO("%s: %s: 0 of %zu nodes hold an L2 window: no launch was given one\n", __func__, ctx.name.c_str(), n);
+        return;
+    }
     std::vector<cudaGraphNode_t> nodes(n);
     CUDA_CHECK(cudaGraphGetNodes(graph, nodes.data(), &n));
-    int                    armed = 0;
-    cudaAccessPolicyWindow first = {};
+    int                    armed      = 0;
+    int                    unread     = 0;
+    cudaError_t            unread_err = cudaSuccess;
+    cudaAccessPolicyWindow first      = {};
     for (const cudaGraphNode_t node : nodes) {
         cudaGraphNodeType type;
         CUDA_CHECK(cudaGraphNodeGetType(node, &type));
-        cudaKernelNodeAttrValue v = {};
-        if (type == cudaGraphNodeTypeKernel &&
-                cudaGraphKernelNodeGetAttribute(node, cudaKernelNodeAttributeAccessPolicyWindow, &v) == cudaSuccess &&
-                v.accessPolicyWindow.num_bytes > 0 && armed++ == 0) {
+        if (type != cudaGraphNodeTypeKernel) {
+            continue;
+        }
+        cudaKernelNodeAttrValue v   = {};
+        const cudaError_t       err = cudaGraphKernelNodeGetAttribute(node, cudaKernelNodeAttributeAccessPolicyWindow, &v);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (unread++ == 0) {
+                unread_err = err;
+            }
+        } else if (v.accessPolicyWindow.num_bytes > 0 && armed++ == 0) {
             first = v.accessPolicyWindow;
         }
     }
-    GGML_LOG_INFO("%s: %s: %d of %zu nodes hold an L2 window; the first: base %p, %zu KiB, hitRatio %.3f\n", __func__,
-                  ctx.name.c_str(), armed, n, first.base_ptr, first.num_bytes / 1024, first.hitRatio);
+    GGML_LOG_INFO("%s: %s: %d of %zu nodes hold an L2 window, %d unread (%s); the first: base %p, %zu KiB, hitRatio %.3f\n",
+                  __func__, ctx.name.c_str(), armed, n, unread, unread == 0 ? "-" : cudaGetErrorString(unread_err),
+                  first.base_ptr, first.num_bytes / 1024, first.hitRatio);
 }
 #endif // defined(GGML_CUDA_USE_L2_WINDOW)
 
