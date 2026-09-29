@@ -271,10 +271,11 @@ static __device__ __forceinline__ void dsv4_hc_load8(const nv_bfloat16 * p, floa
 // a block for each slice of DSV4_HC_MIX_SLICE flat columns and each token: each of its 8 warps the dot products of 3 of
 // hc_fn's rows with the token's slice, a lane 8 columns, and the slice's sum of squares, into partials, token it's row
 // r at [(it*(DSV4_HC_MIX + 1) + r)*n_slices + slice] and its sum of squares as row DSV4_HC_MIX. w_prewait: hc_fn is
-// the model's (dsv4_hc_prewait), so it is read before the PDL wait.
+// the model's (dsv4_hc_prewait), so it is read before the PDL wait. No kernel here takes __restrict__ pointers: under
+// PDL they let the compiler load the kernel before's output ahead of the wait (GGML_CUDA_RESTRICT, upstream #24030).
 template <typename T>
 static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_mix_partials(
-        const float * __restrict__ x, const T * __restrict__ w, float * __restrict__ partials,
+        const float * x, const T * w, float * partials,
         const int64_t sx1, const int64_t sw1, const bool w_prewait) {
     constexpr int rows = DSV4_HC_MIX/8;
 
@@ -364,9 +365,9 @@ static __device__ float dsv4_hc_comb_lanes(const float * m, const float * base, 
 // RMS-normalized and multiplied by the norm's weight into dst. base_prewait: base is the model's (dsv4_hc_prewait), so
 // it is read before the PDL wait.
 static __global__ void __launch_bounds__(DSV4_HC_PRE_NORM_THR) dsv4_hc_pre_norm_f32(
-        const float * __restrict__ partials, const int n_slices, const float * __restrict__ x,
-        const float * __restrict__ scale, const float * __restrict__ base, const float * __restrict__ norm_w,
-        float * __restrict__ weights_out, float * __restrict__ dst, const int64_t n_embd, const int64_t k,
+        const float * partials, const int n_slices, const float * x,
+        const float * scale, const float * base, const float * norm_w,
+        float * weights_out, float * dst, const int64_t n_embd, const int64_t k,
         const int64_t sx1, const int64_t sx2, const int64_t ss0, const int64_t sb0, const int64_t sw0,
         const int64_t sw1, const int64_t sd1, const float eps_flat, const float eps_hc, const int32_t n_iter,
         const float eps_norm, const bool base_prewait) {
