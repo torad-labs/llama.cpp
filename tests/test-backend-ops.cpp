@@ -4891,7 +4891,7 @@ struct test_gated_delta_net : public test_case {
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
     const bool    rows_mode; // rows-indexed state read from a 2D cache view (src[6])
     const int64_t cache_rows; // rows-mode cache row count (-1 => n_seqs + 3)
-    const bool    raw_gates; // beta / g pre-activation, folded in by ggml_gated_delta_net_set_raw_gates
+    const bool    raw_gates; // beta / g pre-activation, folded in by ggml_gated_delta_net_set_raw_gates (KDA: _raw_kda_gates)
     const bool    qkv_view;  // q/k/v are views into one fused row per token, as qwen35.cpp builds them
 
     std::string vars() override {
@@ -4981,7 +4981,12 @@ struct test_gated_delta_net : public test_case {
             ggml_set_name(state, "state");
             out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         }
-        if (raw_gates) {
+        if (raw_gates && kda) {
+            // glm5next's gate, lb * sigmoid(-(g * a[h])): its a is negative (-exp(A_log)), lb the reference's -5
+            ggml_tensor * a = ggml_new_tensor_1d(ctx, type, head_count * v_repeat);
+            ggml_set_name(a, "a");
+            ggml_gated_delta_net_set_raw_kda_gates(out, a, -5.0f);
+        } else if (raw_gates) {
             ggml_tensor * dt_bias = ggml_new_tensor_1d(ctx, type, head_count * v_repeat);
             ggml_tensor * a       = ggml_new_tensor_1d(ctx, type, head_count * v_repeat);
             ggml_set_name(dt_bias, "dt_bias");
@@ -11973,6 +11978,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+    // KDA raw gates (lb * sigmoid(-(g * a)) and sigmoid(beta) folded into the op): decode, a verify's 3 tokens with
+    // and without snapshot slots, prefill, other head sizes, strided q/k/v
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  1, 1, 1, false, true, 1, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  1, 2, 1, false, true, 1, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  3, 1, 1, false, true, 1, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  3, 2, 1, false, true, 4, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1, 1, false, true, 1, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  64,  4, 2, 1, false, true, 1, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  16,  4, 2, 1, false, true, 1, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  64,  4, 2, 1, true,  true, 1, false, -1, true));
     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));

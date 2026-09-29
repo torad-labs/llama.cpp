@@ -2639,6 +2639,15 @@ extern "C" {
             struct ggml_tensor  * dt_bias,
             struct ggml_tensor  * a);
 
+    // fold KDA's gate activations into a gated_delta_net op (per-channel gate):
+    //   beta -> sigmoid(beta),  g -> lower_bound * sigmoid(-(g * a[h]))
+    // a is F32 with H_v elements; removes five elementwise ops per layer. op_params[1] names the mode a backend
+    // must implement to take the op: 0 activated gates, 1 ggml_gated_delta_net_set_raw_gates, 2 this
+    GGML_API void ggml_gated_delta_net_set_raw_kda_gates(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * a,
+            float                 lower_bound);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

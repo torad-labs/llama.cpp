@@ -370,6 +370,14 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return {o, s};
 }
 
+void llm_build_delta_net_base::gdn_set_raw_gates(ggml_tensor * gdn) const {
+    if (gdn_raw_dt_bias) {
+        ggml_gated_delta_net_set_raw_gates(gdn, gdn_raw_dt_bias, gdn_raw_a);
+    } else {
+        ggml_gated_delta_net_set_raw_kda_gates(gdn, gdn_raw_a, gdn_raw_kda_lb);
+    }
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_fused(
         ggml_tensor * q,
         ggml_tensor * k,
@@ -399,11 +407,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
+    const bool raw = gdn_raw();
 
     ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, raw ? gdn_raw_alpha : g, raw ? gdn_raw_beta : b, s, /*K=*/1);
     if (raw) {
-        ggml_gated_delta_net_set_raw_gates(result, gdn_raw_dt_bias, gdn_raw_a);
+        gdn_set_raw_gates(result);
     }
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
@@ -585,7 +593,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
-    const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
+    const bool raw = gdn_raw();
     ggml_tensor * gg = raw ? gdn_raw_alpha : g;
     ggml_tensor * bb = raw ? gdn_raw_beta  : b;
 
@@ -599,7 +607,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         gdn_out = ggml_gated_delta_net(ctx0, q, k, v, gg, bb, s, K);
     }
     if (raw) {
-        ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
+        gdn_set_raw_gates(gdn_out);
     }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});

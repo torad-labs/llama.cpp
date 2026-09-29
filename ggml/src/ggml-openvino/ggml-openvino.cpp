@@ -1295,6 +1295,10 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         if (((const int32_t *) op->op_params)[0] > 1) {
             return true;
         }
+        // raw gates (op_params[1], ggml_gated_delta_net_set_raw_gates) not supported by fused op
+        if (((const int32_t *) op->op_params)[1] != 0) {
+            return true;
+        }
         break;
     }
     case GGML_OP_SSM_CONV: {
