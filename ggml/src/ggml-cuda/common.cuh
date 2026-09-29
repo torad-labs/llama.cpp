@@ -1932,6 +1932,10 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
     ggml_cuda_pq2_tile_counters pq2_tile_counters;
     ggml_cuda_mmvq_shared_q8_1 mmvq_shared_q8_1; // filled during a graph evaluation only
+    cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
+    cudaEvent_t l2_issue_join = nullptr;
+    bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
+    const ggml_cgraph * l2_graph_next = nullptr; // the graph after the next computed, while it computes (ggml_backend_graph_next)
     // the stream is being captured with the rest of an evaluation across backends (ggml_backend_cuda_capture_begin):
     // the graphs computed meanwhile are evaluated into it, with no CUDA graph of their own
     bool outer_capture = false;

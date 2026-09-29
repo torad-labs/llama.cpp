@@ -221,6 +221,10 @@ extern "C" {
     typedef void   (*ggml_backend_capture_launch_t)(ggml_backend_t backend, void * exec);
     typedef void   (*ggml_backend_capture_free_t)(ggml_backend_t backend, void * exec);
 
+    // The graph the backend computes after the next one, an all-reduce between them (meta backend), or NULL: a hint the
+    // next graph_compute may plan with (reading ahead the weights it reads); valid until that graph_compute returns
+    typedef void   (*ggml_backend_graph_next_t)(ggml_backend_t backend, const struct ggml_cgraph * next);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
