@@ -4337,11 +4337,13 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     const int32_t n_iter;
     const bool ffn_order;
     const bool weights_buf;
+    const bool with_post; // the streams the previous sublayer's DSV4_HC_POST makes, which CUDA fuses with the front
 
     ggml_tensor * weights = nullptr;
     ggml_tensor * hc_pre  = nullptr;
     ggml_tensor * post    = nullptr;
     ggml_tensor * comb    = nullptr;
+    ggml_tensor * streams = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4350,14 +4352,16 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
 
     bool run_whole_graph() override { return true; }
 
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { weights, out }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return with_post ? std::vector<ggml_tensor *>{ streams, weights, out } : std::vector<ggml_tensor *>{ weights, out };
+    }
 
     std::vector<ggml_tensor *> forward_first() override {
         return ffn_order ? std::vector<ggml_tensor *>{ hc_pre, post, comb } : std::vector<ggml_tensor *>{};
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(type_w, n_embd, n_tokens, n_iter, ffn_order, weights_buf);
+        return VARS_TO_STR7(type_w, n_embd, n_tokens, n_iter, ffn_order, weights_buf, with_post);
     }
 
     bool use_weight_context() override { return weights_buf; }
@@ -4368,9 +4372,9 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     }
 
     test_dsv4_hc_pre_fused(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 4096, int64_t n_tokens = 1,
-            int32_t n_iter = 20, bool ffn_order = false, bool weights_buf = true)
+            int32_t n_iter = 20, bool ffn_order = false, bool weights_buf = true, bool with_post = false)
         : type_w(type_w), n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter), ffn_order(ffn_order),
-          weights_buf(weights_buf) {}
+          weights_buf(weights_buf), with_post(with_post) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         return build_graph(ctx, nullptr);
@@ -4379,8 +4383,22 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         ggml_context * ctx_w = ctx_weights != nullptr ? ctx_weights : ctx;
 
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
-        ggml_set_name(x, "x");
+        ggml_tensor * x = nullptr;
+        if (with_post) {
+            ggml_tensor * xo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(xo, "x");
+            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(residual, "residual");
+            ggml_tensor * post_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(post_w, "post");
+            ggml_tensor * comb_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+            ggml_set_name(comb_w, "comb");
+            x = streams = ggml_dsv4_hc_post(ctx, xo, residual, post_w, comb_w);
+            ggml_set_name(streams, "streams");
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(x, "x");
+        }
 
         ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx_w, type_w, hc*n_embd, (2 + hc)*hc);
         ggml_set_name(hc_fn, "hc_fn");
@@ -9870,6 +9888,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 64, 2, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 31, 3, 4));
+    // the previous sublayer's DSV4_HC_POST before the front, which CUDA's Gram path fuses: its streams are an output
+    for (int64_t n_tokens : { 1, 2, 3, 16, 17 }) {
+        test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, n_tokens, 20, false, true, true));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 4096, 2, 2, false, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 3, 20, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 2, 20, false, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 7168, 2, 20, false, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4, false, true, true));
 
     // KDA's q, k and v: one launch on CUDA at 1 to 8 tokens; unfused at 9, with the weights' stride broken, and at 101
     // rows, where a block of 2 rows would cross from one weight's rows into the next

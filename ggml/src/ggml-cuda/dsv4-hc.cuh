@@ -15,3 +15,14 @@ bool ggml_cuda_dsv4_hc_pre_fused_supported(const ggml_tensor * rms_flat, const g
 void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_flat,
         const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre, const ggml_tensor * rms,
         ggml_tensor * mul);
+
+// The previous sublayer's DSV4_HC_POST (post) and the front after it, seven nodes in two kernels: the front's first
+// makes the streams as the post does and writes them to post's output, pre's streams. Supported where the front is and
+// the post's output and streams are contiguous along n_embd, not under GGML_CUDA_HC_PRE_GRAM_LEGACY; it writes post,
+// weights and mul.
+bool ggml_cuda_dsv4_hc_post_pre_fused_supported(const ggml_tensor * post, const ggml_tensor * rms_flat,
+        const ggml_tensor * mm, const ggml_tensor * weights, const ggml_tensor * pre, const ggml_tensor * rms,
+        const ggml_tensor * mul);
+void ggml_cuda_op_dsv4_hc_post_pre_fused(ggml_backend_cuda_context & ctx, ggml_tensor * post,
+        const ggml_tensor * rms_flat, const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre,
+        const ggml_tensor * rms, ggml_tensor * mul);

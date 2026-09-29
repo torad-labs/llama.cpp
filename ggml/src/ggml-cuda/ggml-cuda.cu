@@ -5165,6 +5165,55 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // A sublayer's DSV4_HC_POST and the front after it (the next sublayer's), where the front fuses on the Gram path: the
+    // front's first kernel makes the streams the post makes and writes them, where the post was a launch of its own and
+    // the front read them back. GGML_CUDA_HC_POST_FUSE_LEGACY=1 launches the post on its own.
+    static const bool hc_post_fuse_legacy = ggml_env_switch("GGML_CUDA_HC_POST_FUSE_LEGACY") ||
+                                            ggml_env_switch("GGML_CUDA_HC_PRE_FUSE_LEGACY");
+    if (!hc_post_fuse_legacy && node->op == GGML_OP_DSV4_HC_POST &&
+            cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty()) {
+        // the next node after j that is neither a view nor a no-op, or -1
+        auto next = [&](int j) {
+            if (j < 0) {
+                return -1;
+            }
+            for (++j; j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+            }
+            return j < cgraph->n_nodes ? j : -1;
+        };
+        const int i_flat = next(i);
+        const int i_mm   = next(i_flat);
+        const int i_w    = next(i_mm);
+        const int i_pre  = next(i_w);
+        const int i_rms  = next(i_pre);
+        const int i_mul  = next(i_rms);
+        if (i_mul >= 0) {
+            ggml_tensor * flat = cgraph->nodes[i_flat];
+            ggml_tensor * mm   = cgraph->nodes[i_mm];
+            ggml_tensor * w    = cgraph->nodes[i_w];
+            ggml_tensor * pre  = cgraph->nodes[i_pre];
+            ggml_tensor * rms  = cgraph->nodes[i_rms];
+            ggml_tensor * mul  = cgraph->nodes[i_mul];
+            const ggml_op ops[]  = { GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_DSV4_HC_WEIGHTS,
+                                     GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            const int     idxs[] = { i, i_flat, i_mm, i_w, i_pre, i_rms, i_mul };
+            const int     outs[] = { i, i_w, i_mul };
+            // the memory check is the front's: the post is the last reader of its inputs, so the allocator places the
+            // weights or the normed mix over them in most sublayers, which the second kernel writes only after its PDL
+            // wait, once the first has read them; the streams over them is dsv4_hc_post_pre_fused_supported's check
+            if (flat->op == GGML_OP_RMS_NORM && mm->op == GGML_OP_MUL_MAT && mm->src[1] == flat &&
+                    w->op == GGML_OP_DSV4_HC_WEIGHTS && w->src[0] == mm && pre->op == GGML_OP_DSV4_HC_PRE &&
+                    rms->op == GGML_OP_RMS_NORM && rms->src[0] == pre && mul->op == GGML_OP_MUL &&
+                    (mul->src[0] == rms) != (mul->src[1] == rms) &&
+                    ggml_can_fuse_subgraph_ext(cgraph, idxs, 7, ops, outs, 3) &&
+                    ggml_cuda_dsv4_hc_post_pre_fused_supported(node, flat, mm, w, pre, rms, mul) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i_flat, i_mul - i_flat + 1, outs + 1, 2)) {
+                ggml_cuda_op_dsv4_hc_post_pre_fused(*cuda_ctx, node, flat, mm, w, pre, rms, mul);
+                return i_mul - i;
+            }
+        }
+    }
+
     // The front of a hyper-connection cycle (DeepSeek V4, GLM-5.3) at a few tokens: the weightless RMS_NORM of the flat
     // streams, their MUL_MAT by hc_fn, DSV4_HC_WEIGHTS, DSV4_HC_PRE on its pre weights' view, and the RMS_NORM and MUL of
     // the sublayer's norm, in two kernels (ggml_cuda_op_dsv4_hc_pre_fused) where they were four to six launches, the
