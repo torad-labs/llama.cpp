@@ -359,11 +359,69 @@ static __device__ float dsv4_hc_comb_lanes(const float * m, const float * base, 
     return c;
 }
 
+// the comb dsv4_hc_comb_lanes makes, bit for bit, in one thread's registers, c[L] its lane L's: a group's sum there is
+// (c0 + c1) + (c2 + c3) in whichever lane holds it (addition commutes), as here. Its 20 iterations were a chain of 78
+// dependent shuffles, each step's four sums waiting on one another's lanes; here a step's four groups are independent
+// instructions, and m is read at constant indices (the lanes' m[2*DSV4_HC + L] kept it in local memory).
+static __device__ __forceinline__ void dsv4_hc_comb_regs(float * c, const float * m, const float * base,
+        const float scale_comb, const float eps, const int32_t n_iter) {
+#pragma unroll
+    for (int s = 0; s < DSV4_HC; ++s) {
+        float v[DSV4_HC];
+#pragma unroll
+        for (int d = 0; d < DSV4_HC; ++d) {
+            v[d] = m[2*DSV4_HC + d + DSV4_HC*s]*scale_comb + base[2*DSV4_HC + d + DSV4_HC*s];
+        }
+        const float max = fmaxf(fmaxf(v[0], v[1]), fmaxf(v[2], v[3]));
+        float e[DSV4_HC];
+#pragma unroll
+        for (int d = 0; d < DSV4_HC; ++d) {
+            e[d] = expf(v[d] - max);
+        }
+        const float sum = (e[0] + e[1]) + (e[2] + e[3]);
+#pragma unroll
+        for (int d = 0; d < DSV4_HC; ++d) {
+            c[d + DSV4_HC*s] = e[d]*(1.0f/sum) + eps;
+        }
+    }
+
+    // a column: one dst over the four srcs (the lanes' xor 4 and 8); a row: one src over the four dsts (xor 1 and 2)
+    auto norm_cols = [&]() {
+#pragma unroll
+        for (int d = 0; d < DSV4_HC; ++d) {
+            const float s = (c[d] + c[d + DSV4_HC]) + (c[d + 2*DSV4_HC] + c[d + 3*DSV4_HC]);
+            const float inv = 1.0f/(s + eps);
+#pragma unroll
+            for (int k = 0; k < DSV4_HC; ++k) {
+                c[d + DSV4_HC*k] *= inv;
+            }
+        }
+    };
+    auto norm_rows = [&]() {
+#pragma unroll
+        for (int r = 0; r < DSV4_HC; ++r) {
+            const float s = (c[DSV4_HC*r] + c[DSV4_HC*r + 1]) + (c[DSV4_HC*r + 2] + c[DSV4_HC*r + 3]);
+            const float inv = 1.0f/(s + eps);
+#pragma unroll
+            for (int k = 0; k < DSV4_HC; ++k) {
+                c[DSV4_HC*r + k] *= inv;
+            }
+        }
+    };
+    norm_cols();
+    for (int32_t i = 1; i < n_iter; ++i) {
+        norm_rows();
+        norm_cols();
+    }
+}
+
 // a block for each token: the mixes from the partials (the dot products summed, times the streams' inverse RMS, as the
 // mat-vec that folds the norm scales them), the weights as dsv4_hc_weights_f32 makes them into weights_out (warp 0,
 // its comb by 16 lanes), and meanwhile, in the other warps, the streams mixed by the pre weights; then the mix
 // RMS-normalized and multiplied by the norm's weight into dst. base_prewait: base is the model's (dsv4_hc_prewait), so
-// it is read before the PDL wait.
+// it is read before the PDL wait. comb_regs: warp 0 makes the comb in each lane's registers (dsv4_hc_comb_regs), the
+// same values; otherwise by 16 lanes (dsv4_hc_comb_lanes).
+template <bool comb_regs>
 static __global__ void __launch_bounds__(DSV4_HC_PRE_NORM_THR) dsv4_hc_pre_norm_f32(
         const float * partials, const int n_slices, const float * x,
         const float * scale, const float * base, const float * norm_w,
@@ -419,14 +477,40 @@ static __global__ void __launch_bounds__(DSV4_HC_PRE_NORM_THR) dsv4_hc_pre_norm_
         for (int r = 0; r < DSV4_HC_MIX; ++r) {
             m[r] = mix[r]*rms_flat;
         }
-        const float c = dsv4_hc_comb_lanes(m, base_s, scale[2*ss0], eps_hc, n_iter);
         float * d = weights_out + it*sw1;
-        if (lane < DSV4_HC*DSV4_HC) {
-            d[(2*DSV4_HC + lane)*sw0] = c;
-        } else if (lane < DSV4_HC*DSV4_HC + DSV4_HC) {
-            const int h = lane - DSV4_HC*DSV4_HC;
-            d[h*sw0]             = pre[h];
-            d[(DSV4_HC + h)*sw0] = 2.0f/(1.0f + expf(-(m[DSV4_HC + h]*scale[ss0] + base_s[DSV4_HC + h])));
+        if constexpr (comb_regs) {
+            // every lane makes the whole comb and picks its element, and a stream's pre and post mix, by constant
+            // indices: an index that varies by lane keeps an array in local memory
+            float c[DSV4_HC*DSV4_HC];
+            dsv4_hc_comb_regs(c, m, base_s, scale[2*ss0], eps_hc, n_iter);
+            float c_lane = c[0];
+#pragma unroll
+            for (int k = 1; k < DSV4_HC*DSV4_HC; ++k) {
+                c_lane = lane == k ? c[k] : c_lane;
+            }
+            const int h     = lane - DSV4_HC*DSV4_HC;
+            float     pre_h = pre[0];
+            float     m_h   = m[DSV4_HC];
+#pragma unroll
+            for (int k = 1; k < DSV4_HC; ++k) {
+                pre_h = h == k ? pre[k]         : pre_h;
+                m_h   = h == k ? m[DSV4_HC + k] : m_h;
+            }
+            if (lane < DSV4_HC*DSV4_HC) {
+                d[(2*DSV4_HC + lane)*sw0] = c_lane;
+            } else if (lane < DSV4_HC*DSV4_HC + DSV4_HC) {
+                d[h*sw0]             = pre_h;
+                d[(DSV4_HC + h)*sw0] = 2.0f/(1.0f + expf(-(m_h*scale[ss0] + base_s[DSV4_HC + h])));
+            }
+        } else {
+            const float c = dsv4_hc_comb_lanes(m, base_s, scale[2*ss0], eps_hc, n_iter);
+            if (lane < DSV4_HC*DSV4_HC) {
+                d[(2*DSV4_HC + lane)*sw0] = c;
+            } else if (lane < DSV4_HC*DSV4_HC + DSV4_HC) {
+                const int h = lane - DSV4_HC*DSV4_HC;
+                d[h*sw0]             = pre[h];
+                d[(DSV4_HC + h)*sw0] = 2.0f/(1.0f + expf(-(m[DSV4_HC + h]*scale[ss0] + base_s[DSV4_HC + h])));
+            }
         }
     } else {
         const float * xt = x + it*sx2;
@@ -540,7 +624,9 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx, const ggml_
 
     const ggml_cuda_kernel_launch_params norm_params =
         ggml_cuda_kernel_launch_params(dim3(n_tokens, 1, 1), dim3(DSV4_HC_PRE_NORM_THR, 1, 1), 0, stream);
-    ggml_cuda_kernel_launch(dsv4_hc_pre_norm_f32, norm_params,
+    // the comb in registers, bit for bit the 16 lanes'; GGML_CUDA_HC_COMB_LANES_LEGACY=1 makes it by the lanes
+    static const bool comb_lanes = ggml_env_switch("GGML_CUDA_HC_COMB_LANES_LEGACY");
+    ggml_cuda_kernel_launch(comb_lanes ? dsv4_hc_pre_norm_f32<false> : dsv4_hc_pre_norm_f32<true>, norm_params,
         (const float *) partials.get(), n_slices, (const float *) x->data, (const float *) scale->data,
         (const float *) base->data, (const float *) norm_w->data, (float *) weights->data, (float *) mul->data,
         n_embd, k, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), scale->nb[0] / sizeof(float),
