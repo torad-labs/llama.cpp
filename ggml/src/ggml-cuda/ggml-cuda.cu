@@ -3506,6 +3506,54 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
     return false;
 }
 
+// KDA builds the SSM_CONV's weights as CONCAT(CONCAT(q, k), v) along rows of three RESHAPEd model weights, every token.
+// When the SSM_CONV at conv_idx reads such a pair, let the fused conv kernel read the three weights itself (w_seg) and
+// return the two CONCATs, for the caller to skip. Needs equal weight rows, nothing else reading the CONCATs.
+// GGML_CUDA_SSM_CONV_W_SEGMENTS_LEGACY=1 keeps them.
+static bool ggml_cuda_ssm_conv_w_segments(const ggml_cgraph * cgraph, const int conv_idx, const int64_t d_conv,
+                                          ggml_cuda_ssm_conv_state_update & u, const ggml_tensor * (&concats)[2]) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_SSM_CONV_W_SEGMENTS_LEGACY");
+    const ggml_tensor * outer = cgraph->nodes[conv_idx]->src[1];
+    if (legacy || outer->op != GGML_OP_CONCAT || ggml_get_op_params_i32(outer, 0) != 1 ||
+            outer->src[0]->op != GGML_OP_CONCAT || ggml_get_op_params_i32(outer->src[0], 0) != 1) {
+        return false;
+    }
+    const ggml_tensor * inner = outer->src[0];
+    const ggml_tensor * segs[3] = { inner->src[0], inner->src[1], outer->src[1] };
+    const int64_t       rows    = segs[0]->ne[1];
+    for (const ggml_tensor * seg : segs) {
+        const ggml_tensor * leaf = seg->view_src;
+        if (seg->op != GGML_OP_RESHAPE || seg->type != GGML_TYPE_F32 || seg->data == nullptr || seg->ne[0] != d_conv ||
+                seg->ne[1] != rows || seg->ne[2] != 1 || seg->ne[3] != 1 || seg->nb[0] != sizeof(float) ||
+                seg->nb[1] != d_conv * sizeof(float) || leaf == nullptr || leaf->op != GGML_OP_NONE ||
+                leaf->buffer == nullptr || ggml_backend_buffer_get_usage(leaf->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return false;
+        }
+    }
+    if (outer->type != GGML_TYPE_F32 || outer->ne[1] != 3 * rows || outer->nb[1] != d_conv * sizeof(float)) {
+        return false;
+    }
+    // the CONCATs come before the SSM_CONV; the outer is read by it alone (checked by the caller), the inner by the outer
+    int found = 0;
+    for (int k = conv_idx - 1; k >= 0 && found < 2; --k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n == outer || n == inner) {
+            if (ggml_node_get_use_count(cgraph, k) != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return false;
+            }
+            concats[found++] = n;
+        }
+    }
+    if (found != 2) {
+        return false;
+    }
+    for (int i = 0; i < 3; ++i) {
+        u.w_seg[i] = (const float *) segs[i]->data;
+    }
+    u.w_seg_channels = (int) rows;
+    return true;
+}
+
 // build_conv_state's chain for one sequence: GET_ROWS(conv cache, ids) -> RESHAPE -> CONCAT(state, TRANSPOSE(x)) ->
 // VIEW -> CPY into the cache per rollback snapshot, and the SSM_CONV reading the CONCAT. Skip the GET_ROWS, the CONCAT
 // and the CPYs and register the chain for the SSM_CONV, whose kernel (ggml_cuda_ssm_conv_state_update) reads the cache
@@ -3547,6 +3595,7 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
     int                             concat_idx = -1;
     const ggml_tensor *             x      = nullptr;
     std::vector<const ggml_tensor *> cpys;
+    std::vector<const ggml_tensor *> over_x; // the nodes after the CONCAT whose output the allocator put over x
     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         // the kernel reads ids at the SSM_CONV, after the GET_ROWS it skips: as in ggml_cuda_try_gdn_gather_skip,
@@ -3625,6 +3674,14 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                         return false;
                     }
                 }
+                const ggml_tensor * w_concats[2] = {};
+                const bool          w_fused      = ggml_cuda_ssm_conv_w_segments(cgraph, j, d_conv, u, w_concats);
+                for (const ggml_tensor * o : over_x) {
+                    if (!w_fused || (o != w_concats[0] && o != w_concats[1])) {
+                        return false;
+                    }
+                }
+
                 u.cache       = (const float *) cache->data;
                 u.ids         = (const int32_t *) ids->data;
                 u.row_stride  = cache->nb[1] / sizeof(float);
@@ -3665,10 +3722,13 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 reg.updates[n] = u;
                 reg.skipped.insert(concat);
                 reg.skipped.insert(cpys.begin(), cpys.end());
+                if (w_fused) {
+                    reg.skipped.insert(w_concats, w_concats + 2);
+                }
                 return true;
             }
             if (!ggml_cuda_is_view_or_noop(n) && ggml_cuda_ranges_overlap(n, x)) {
-                return false;
+                over_x.push_back(n); // only the weight CONCATs this fusion drops may
             }
         }
         if (ggml_cuda_is_view_or_noop(n)) {

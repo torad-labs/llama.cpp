@@ -4542,7 +4542,8 @@ struct test_ssm_conv : public test_case {
 // [state_row]) -> RESHAPE -> CONCAT(state, TRANSPOSE(x)) -> a CPY of a window into the cache per rollback snapshot, which
 // CUDA runs as one kernel at the SSM_CONV (ggml_cuda_try_ssm_conv_state_update), with Qwen3.5's joint q/k L2_NORM over
 // the leading l2_heads heads of 128 channels folded in when there is one. The output is the whole cache, read after the
-// SSM_CONV, beside the conv output and the norm: a wrong window, row, column or head shows in one of them.
+// SSM_CONV, beside the conv output and the norm: a wrong window, row, column or head shows in one of them. With w_segs the
+// weights are CONCAT(CONCAT(q, k), v) of three model weights, as glm5next.cpp builds them, and CUDA reads the three itself.
 struct test_ssm_conv_state_update : public test_case {
     const int64_t n_channels;
     const int64_t n_t;         // new tokens
@@ -4552,6 +4553,7 @@ struct test_ssm_conv_state_update : public test_case {
     const int64_t state_row;   // the row the state is gathered from
     const int64_t x_pad;       // > 0: x is a view of wider rows, as a projection shared with other outputs lays it out
     const int64_t l2_heads;    // > 0: an L2_NORM over that many leading heads of 128 channels of the conv output
+    const bool    w_segs;      // the weights are three concatenated tensors of n_channels / 3 rows, in a weights buffer
 
     std::vector<ggml_tensor *> cpys;
 
@@ -4561,18 +4563,24 @@ struct test_ssm_conv_state_update : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return w_segs; }
     std::vector<ggml_tensor *> forward_first() override { return cpys; }
 
     std::string vars() override {
-        return VARS_TO_STR8(n_channels, n_t, n_snapshots, mem_size, kv_head, state_row, x_pad, l2_heads);
+        return VARS_TO_STR9(n_channels, n_t, n_snapshots, mem_size, kv_head, state_row, x_pad, l2_heads, w_segs);
     }
 
     test_ssm_conv_state_update(int64_t n_channels = 256, int64_t n_t = 1, int64_t n_snapshots = 3,
-            int64_t mem_size = 4, int64_t kv_head = 1, int64_t state_row = 1, int64_t x_pad = 0, int64_t l2_heads = 0)
+            int64_t mem_size = 4, int64_t kv_head = 1, int64_t state_row = 1, int64_t x_pad = 0, int64_t l2_heads = 0,
+            bool w_segs = false)
         : n_channels(n_channels), n_t(n_t), n_snapshots(n_snapshots), mem_size(mem_size), kv_head(kv_head),
-          state_row(state_row), x_pad(x_pad), l2_heads(l2_heads) {}
+          state_row(state_row), x_pad(x_pad), l2_heads(l2_heads), w_segs(w_segs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         const int64_t d_conv = 4;
         const int64_t row    = (d_conv - 1) * n_channels;
 
@@ -4584,7 +4592,18 @@ struct test_ssm_conv_state_update : public test_case {
         if (x_pad > 0) {
             x = ggml_view_3d(ctx, x, n_channels, n_t, 1, x->nb[1], x->nb[2], 0);
         }
-        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_channels);
+        ggml_tensor * w = nullptr;
+        if (w_segs) {
+            GGML_ASSERT(ctx_weights != nullptr && n_channels % 3 == 0);
+            const int64_t rows = n_channels / 3;
+            ggml_tensor * seg[3];
+            for (ggml_tensor *& s : seg) {
+                s = ggml_reshape_2d(ctx, ggml_new_tensor_3d(ctx_weights, GGML_TYPE_F32, d_conv, 1, rows), d_conv, rows);
+            }
+            w = ggml_concat(ctx, ggml_concat(ctx, seg[0], seg[1], 1), seg[2], 1);
+        } else {
+            w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_channels);
+        }
 
         ggml_tensor * state      = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, ids), d_conv - 1, n_channels, 1);
         ggml_tensor * conv_input = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
@@ -10688,6 +10707,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t l2_heads : { 1, 2 }) {
             test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 4, 1, 1, 0, l2_heads));
         }
+        // KDA's weights: three tensors of 128 channels each, concatenated
+        test_cases.emplace_back(new test_ssm_conv_state_update(384, n_t, 3, 4, 1, 1, 0, 0, true));
     }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
