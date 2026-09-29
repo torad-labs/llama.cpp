@@ -1765,6 +1765,13 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }
 
+void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buf, enum ggml_backend_buffer_usage usage) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(buf));
+    for (ggml_backend_buffer_ptr & simple : ((ggml_backend_meta_buffer_context *) buf->context)->bufs) {
+        ggml_backend_buffer_set_usage(simple.get(), usage);
+    }
+}
+
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 

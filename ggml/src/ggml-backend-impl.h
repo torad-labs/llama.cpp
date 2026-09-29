@@ -92,6 +92,10 @@ extern "C" {
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 
+    // the usage of a meta buffer's simple buffers, each device's: its tensors' shards are in them, and a backend computing a
+    // device's graph asks them (weights no kernel writes, which a kernel may read before its dependency wait)
+    GGML_API void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buf, enum ggml_backend_buffer_usage usage);
+
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
