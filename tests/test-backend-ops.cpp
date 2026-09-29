@@ -12324,6 +12324,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n : {4, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 4100, n, 4096, {1, 1}, {1, 1}));
     }
+    // GLM-5.3's float mat-vecs at a decode token and a verify's 3, mul_mat_vec_f's small-shape path: KDA's ssm_f_b and
+    // ssm_g_b (128 -> 8192), ssm_f_a and ssm_g_a (4096 -> 128) and ssm_beta (4096 -> 64), the indexer's q_b
+    // (1536 -> 4096) and proj (F32, 4096 -> 32)
+    for (int64_t n : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, n,  128, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  128, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,   64, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 4096, n, 1536, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   32, n, 4096, {1, 1}, {1, 1}));
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
