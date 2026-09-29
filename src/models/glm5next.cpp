@@ -262,18 +262,19 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     const size_t nb_qkv  = ggml_row_size(conv_out->type, 3*d_inner);
     const size_t nb_head = ggml_row_size(conv_out->type, head_dim);
 
-    Qcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
+    // q and k are adjacent head groups of the same width in the conv output, so one l2_norm over the joint view
+    // normalizes both (each head its own row), and the CUDA backend folds it into the conv; q and k view its result.
+    // 1e-6 is the reference's own constant, not the model's norm eps
+    ggml_tensor * qk = ggml_view_4d(ctx0, conv_out, head_dim, 2*n_head, n_seq_tokens, n_seqs,
             nb_head, nb_qkv, nb_qkv*n_seq_tokens, 0);
-    Kcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
-            nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, d_inner));
+    qk = ggml_l2_norm(ctx0, qk, 1e-6f);
+    cb(qk, "kda_qk_norm", il);
+
+    Qcur = ggml_view_4d(ctx0, qk, head_dim, n_head, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3], 0);
+    Kcur = ggml_view_4d(ctx0, qk, head_dim, n_head, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3],
+            n_head*qk->nb[1]);
     Vcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
             nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, 2*d_inner));
-
-    // 1e-6 is the reference's own constant, not the model's norm eps
-    Qcur = ggml_l2_norm(ctx0, Qcur, 1e-6f);
-    Kcur = ggml_l2_norm(ctx0, Kcur, 1e-6f);
-    cb(Qcur, "kda_q_norm", il);
-    cb(Kcur, "kda_k_norm", il);
 
 
     // g = lower_bound * sigmoid(exp(A_log)*(f_b(f_a(x)) + dt_bias)); it scales, not clamps
