@@ -1324,6 +1324,22 @@ static char * mmvq_src1_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor 
     return q8_1;
 }
 
+bool ggml_cuda_mul_mat_vec_q_moe_gate_fuses(const ggml_tensor * mm, const ggml_tensor * gate, const int cc) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT_ID || src0->ne[3] != 1 || src1->ne[3] != 1 || gate->type != src0->type ||
+            !ggml_are_same_shape(gate, src0) || !ggml_are_same_stride(gate, src0)) {
+        return false;
+    }
+    // the pairs as ggml_cuda_mul_mat_vec_q reads a MUL_MAT_ID's, and src1's q8_1 as mmvq_src1_q8_1 lays it out
+    const int64_t ts      = ggml_type_size(src0->type);
+    const int64_t s11     = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) / QK8_1;
+    const int64_t y_bytes = ggml_cuda_mmvq_moe_y_bytes(src0->ne[0], mm->ne[1], mm->ne[2], src1->ne[1], src1->ne[1]*s11, s11);
+    return ggml_cuda_mmvq_moe_usable(cc, src0->type, src0->data, gate->data, src0->ne[0], src0->ne[1], src0->nb[1]/ts,
+            src0->nb[2]/ts, mm->ne[1], mm->ne[2]) &&
+        ggml_cuda_mmvq_moe_keeps_y(src0->type, src0->ne[0], /*gate =*/ true, y_bytes);
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1361,7 +1377,6 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
-        GGML_ASSERT( !ids || dst->ne[2] == 1);
         GGML_ASSERT(  ids || dst->ne[1] <= MMVQ_MAX_FUSED_NCOLS || pq2_mma);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
@@ -1470,6 +1485,8 @@ void ggml_cuda_mul_mat_vec_q(
         ggml_cuda_mmvq_moe(args, stream);
         return;
     }
+    // past one token only the ring above fuses a routed gate (ggml_cuda_mul_mat_vec_q_moe_gate_fuses)
+    GGML_ASSERT(!fusion || !ids || dst->ne[2] == 1);
 
     if (pq2_mma) {
         ggml_cuda_mmvq_pq2_mma(src0->data, fusion_local.gate, src1_q8_1, (const float *) fusion_local.x_bias,

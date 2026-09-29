@@ -11817,8 +11817,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 use_id, 16, 8, false, false, true, false, {4, 2}, false, false, false, 0.5f));
         }
     }
-    // and at GLM-5.3-Flash's routed gate/up (IQ3_XXS, 4,096 -> 2,048, 8 of 32 experts), a gated ring tile in mmvq-moe.cu
-    for (int64_t m_batch : { 1, 3 }) {
+    // and at GLM-5.3-Flash's routed gate/up (IQ3_XXS, 4,096 -> 2,048, 8 of 32 experts), a gated ring tile in mmvq-moe.cu:
+    // fused at 1-3 tokens with the tokens' vectors in shared memory, unfused at 4, whose vectors leave the fused ring no
+    // room
+    for (int64_t m_batch : { 1, 2, 3, 4 }) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_XXS, GGML_GLU_OP_SWIGLU, m_batch, 2048, 4096,
             true, 32, 8, false, false, true, false, {1, 1}, false, false, false, 0.5f));
     }

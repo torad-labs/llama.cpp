@@ -31,6 +31,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// Whether the MUL_MAT_ID mm (the up projection) fuses its gate (the gate's weights) and GLU past one token, with no
+// scales: the routed-expert ring takes the fused launch (ggml_cuda_mmvq_moe_usable) and keeps the tokens' vectors in
+// shared memory beside it (ggml_cuda_mmvq_moe_keeps_y), which the unfused launches keep too.
+bool ggml_cuda_mul_mat_vec_q_moe_gate_fuses(const ggml_tensor * mm, const ggml_tensor * gate, int cc);
+
 // n MUL_MATs (2 to PQ2_MMA_MAX_GROUP) on one src1, each of which ggml_cuda_mul_mat_vec_q would send unfused to the PQ2_0
 // tensor-core kernel: src1 quantized once, one launch over all their tiles (ggml_cuda_mmvq_pq2_mma_group).
 void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n);

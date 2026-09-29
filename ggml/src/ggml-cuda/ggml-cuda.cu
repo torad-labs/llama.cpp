@@ -1887,7 +1887,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, cons
 
 // with_gate: the fusion carries a gate and GLU (gate/up + GLU), which fuses at one column only (MMVQ_MAX_FUSED_NCOLS).
 // No default: every caller states it, as the kernel aborts on a gate at more than one column.
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool with_gate) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool with_gate,
+                                                const ggml_tensor * gate = nullptr) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1912,7 +1913,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+    // A MUL_MAT_ID fuses at one token, and past it when its gate's weights are given (a fusion with no scales) and the
+    // routed-expert ring takes the fused launch with the tokens' vectors in shared memory: an MTP verify's gate/up and
+    // GLU (and the SwiGLU limit's clamps) in one launch where they were two and three. GGML_CUDA_MMVQ_MOE_GATE_1TOK_LEGACY=1
+    // fuses at one token only.
+    static const bool moe_gate_1tok_legacy = ggml_env_switch("GGML_CUDA_MMVQ_MOE_GATE_1TOK_LEGACY");
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1 && (gate == nullptr || moe_gate_1tok_legacy ||
+            !ggml_cuda_mul_mat_vec_q_moe_gate_fuses(tensor, gate, cc))) {
         return false;
     }
 
@@ -4764,8 +4771,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, /*with_gate =*/ true) && mmvq_bias_ok(up_bias_tensor, ids, glu) &&
-                    mmvq_bias_ok(gate_bias_tensor, ids, glu)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, /*with_gate =*/ true, gate_n->src[0]) &&
+                    mmvq_bias_ok(up_bias_tensor, ids, glu) && mmvq_bias_ok(gate_bias_tensor, ids, glu)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -4804,7 +4811,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*with_gate =*/ true) ||
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*with_gate =*/ true, gate->src[0]) ||
                     ggml_cuda_pq2_mma_fuses(*cuda_ctx, up, gate->src[0], glu)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
@@ -4823,7 +4830,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_tensor * gate       = cgraph->nodes[i + (gate_first ? 0 : 2)];
             ggml_tensor * up         = cgraph->nodes[i + (gate_first ? 2 : 0)];
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*with_gate =*/ true)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*with_gate =*/ true, gate->src[0])) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
