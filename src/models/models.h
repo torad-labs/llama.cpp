@@ -86,11 +86,19 @@ struct llm_build_delta_net_base : public llm_graph_context {
     // backend can fold into the fused op's epilogue.
     // set per layer before build_recurrent_attn: the fused GDN op then receives the
     // pre-activation beta / alpha and folds sigmoid / softplus into its prologue
-    // (ggml_gated_delta_net_set_raw_gates); the non-fused paths keep the activated g / b
+    // (ggml_gated_delta_net_set_raw_gates); the non-fused paths keep the activated g / b.
+    // Without a dt_bias the gate is KDA's, lb * sigmoid(-(alpha * a[h])) with lb = gdn_raw_kda_lb
+    // (ggml_gated_delta_net_set_raw_kda_gates)
     ggml_tensor * gdn_raw_beta    = nullptr;
     ggml_tensor * gdn_raw_alpha   = nullptr;
     ggml_tensor * gdn_raw_dt_bias = nullptr;
     ggml_tensor * gdn_raw_a       = nullptr;
+    float         gdn_raw_kda_lb  = 0.0f;
+
+    bool gdn_raw() const { return gdn_raw_beta && gdn_raw_alpha && gdn_raw_a; }
+
+    // hands a fused GDN op built from gdn_raw_beta / gdn_raw_alpha the activation it applies to them
+    void gdn_set_raw_gates(ggml_tensor * gdn) const;
 
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
@@ -1362,6 +1370,10 @@ struct llama_model_glm5next : public llama_model_base {
 
         // builds nothing: lets graph_mtp reuse the block helpers below without the trunk
         graph(const llm_graph_params & params) : llama_model_deepseek4::graph(params) {}
+
+        // the fused GATED_DELTA_NET takes the KDA gates pre-activation (ggml_gated_delta_net_set_raw_kda_gates):
+        // set by the trunk's constructor where every device implements it
+        bool kda_raw_gates = false;
 
         // not const: the delta-net helpers append to the graph through the base
         ggml_tensor * build_layer_attn(

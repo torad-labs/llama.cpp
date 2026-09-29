@@ -19,6 +19,43 @@ static uint32_t glm5next_n_select(const llama_hparams & hparams) {
     return n_select;
 }
 
+// whether every device of the model takes the fused GATED_DELTA_NET with the KDA gates pre-activation
+// (ggml_gated_delta_net_set_raw_kda_gates), as its supports_op answers for a one-token op of the layers' shape; a
+// tensor-parallel meta device answers for each of its GPUs. A device without it would take the whole op to the CPU,
+// which costs more than the five launches the fold saves. LLAMA_KDA_RAW_GATES_LEGACY=1 keeps the activations as
+// graph nodes.
+static bool glm5next_kda_raw_gates_supported(const llama_model & model, const llama_hparams & hparams) {
+    static const bool legacy = ggml_env_switch("LLAMA_KDA_RAW_GATES_LEGACY");
+    if (legacy || model.devices.empty()) {
+        return false;
+    }
+
+    const int64_t S = hparams.n_embd_head_kda;
+    const int64_t H = hparams.n_head(); // the graph's n_head, build_kda_layer's
+
+    ggml_init_params params = { /*.mem_size =*/ 16*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(params);
+
+    ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+    ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+    ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+    ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+    ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+    ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, 1);
+    ggml_tensor * a     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+
+    ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+    ggml_gated_delta_net_set_raw_kda_gates(gdn, a, hparams.kda_gate_lower_bound);
+
+    bool ok = true;
+    for (const auto & dev : model.devices) {
+        ok = ok && ggml_backend_dev_supports_op(dev.dev, gdn);
+    }
+
+    ggml_free(ctx);
+    return ok;
+}
+
 void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     // indexer k_norm is a LayerNorm with bias; without this key it runs at eps 0
@@ -262,33 +299,45 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     const size_t nb_qkv  = ggml_row_size(conv_out->type, 3*d_inner);
     const size_t nb_head = ggml_row_size(conv_out->type, head_dim);
 
-    Qcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
+    // q and k are adjacent head groups of the same width in the conv output, so one l2_norm over the joint view
+    // normalizes both (each head its own row), and the CUDA backend folds it into the conv; q and k view its result.
+    // 1e-6 is the reference's own constant, not the model's norm eps
+    ggml_tensor * qk = ggml_view_4d(ctx0, conv_out, head_dim, 2*n_head, n_seq_tokens, n_seqs,
             nb_head, nb_qkv, nb_qkv*n_seq_tokens, 0);
-    Kcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
-            nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, d_inner));
+    qk = ggml_l2_norm(ctx0, qk, 1e-6f);
+    cb(qk, "kda_qk_norm", il);
+
+    Qcur = ggml_view_4d(ctx0, qk, head_dim, n_head, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3], 0);
+    Kcur = ggml_view_4d(ctx0, qk, head_dim, n_head, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3],
+            n_head*qk->nb[1]);
     Vcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
             nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, 2*d_inner));
 
-    // 1e-6 is the reference's own constant, not the model's norm eps
-    Qcur = ggml_l2_norm(ctx0, Qcur, 1e-6f);
-    Kcur = ggml_l2_norm(ctx0, Kcur, 1e-6f);
-    cb(Qcur, "kda_q_norm", il);
-    cb(Kcur, "kda_k_norm", il);
-
 
     // g = lower_bound * sigmoid(exp(A_log)*(f_b(f_a(x)) + dt_bias)); it scales, not clamps
-    ggml_tensor * g = ggml_mul_mat(ctx0, layer.ssm_f_b, ggml_mul_mat(ctx0, layer.ssm_f_a, inp));
-    g = ggml_add(ctx0, g, layer.ssm_dt_b);
-    g = ggml_reshape_3d(ctx0, g, head_dim, n_head, n_tokens);
+    ggml_tensor * g_raw = ggml_mul_mat(ctx0, layer.ssm_f_b, ggml_mul_mat(ctx0, layer.ssm_f_a, inp));
+    g_raw = ggml_add(ctx0, g_raw, layer.ssm_dt_b);
+    ggml_tensor * g = ggml_reshape_3d(ctx0, g_raw, head_dim, n_head, n_tokens);
     g = ggml_mul(ctx0, g, ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1));
     g = ggml_sigmoid(ctx0, ggml_scale(ctx0, g, -1.0f));
     g = ggml_scale(ctx0, g, hparams.kda_gate_lower_bound);
     g = ggml_reshape_4d(ctx0, g, head_dim, n_head, n_seq_tokens, n_seqs);
     cb(g, "kda_gate", il);
 
-    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, inp);
-    beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta, 1, n_head, n_seq_tokens, n_seqs));
+    ggml_tensor * beta_raw = ggml_reshape_4d(ctx0, ggml_mul_mat(ctx0, layer.ssm_beta, inp), 1, n_head, n_seq_tokens, n_seqs);
+    ggml_tensor * beta = ggml_sigmoid(ctx0, beta_raw);
     cb(beta, "kda_beta", il);
+
+    // the fused op applies both activations itself where the devices take it (kda_raw_gates): the activated g and
+    // beta above then stay in the graph only on the paths that read them
+    if (kda_raw_gates && layer.ssm_a->type == GGML_TYPE_F32) {
+        gdn_raw_beta   = beta_raw;
+        gdn_raw_alpha  = ggml_reshape_4d(ctx0, g_raw, head_dim, n_head, n_seq_tokens, n_seqs);
+        gdn_raw_a      = layer.ssm_a;
+        gdn_raw_kda_lb = hparams.kda_gate_lower_bound;
+    } else {
+        gdn_raw_beta = gdn_raw_alpha = gdn_raw_a = nullptr;
+    }
 
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
     ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
@@ -296,7 +345,7 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 
     ggml_tensor * out = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g, beta, state, il);
 
-    ggml_tensor * o = ggml_cont_3d(ctx0, out, head_dim, n_head, n_tokens);
+    ggml_tensor * o = ggml_reshape_3d(ctx0, build_cont(out), head_dim, n_head, n_tokens);
     cb(o, "kda_scan_out", il);
 
     ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_g_b, ggml_mul_mat(ctx0, layer.ssm_g_a, inp));
@@ -307,7 +356,7 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     ggml_tensor * gated  = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, gate));
     cb(gated, "kda_normed", il);
 
-    cur = ggml_mul_mat(ctx0, layer.wo, ggml_cont_2d(ctx0, gated, d_inner, n_tokens));
+    cur = ggml_mul_mat(ctx0, layer.wo, ggml_reshape_2d(ctx0, build_cont(gated), d_inner, n_tokens));
     cb(cur, "kda_out", il);
 
     return cur;
@@ -497,7 +546,7 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
 
     q = ggml_mul_mat(ctx0, layer.wk_b, q);
 
-    q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
+    q = build_cont(ggml_permute(ctx0, q, 0, 2, 1, 3));
     cb(q, "dsa_q_absorbed", il);
 
     // absorbed MLA is MQA: one head of keys, and V is the same latent row as K
@@ -597,6 +646,8 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     GGML_ASSERT(ubatch.n_seqs != 0);
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == ubatch.n_seq_tokens * ubatch.n_seqs);
+
+    kda_raw_gates = glm5next_kda_raw_gates_supported(model, hparams);
 
     const int64_t hc = hparams.dsv4_hc_mult;
 

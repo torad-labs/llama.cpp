@@ -1305,6 +1305,41 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// src1 as q8_1, rows of its columns padded to MATRIX_ROW_PADDING: an input other MUL_MATs of the evaluation read too is
+// quantized once, into the copy the evaluation holds for them (ggml_cuda_mmvq_shared_q8_1), any other into own
+static char * mmvq_src1_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const ggml_type type_x,
+                             ggml_cuda_pool_alloc<char> & own) {
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    ggml_cuda_mmvq_shared_q8_1::entry * shared = ctx.mmvq_shared_q8_1.find(src1);
+    char * q8_1 = shared != nullptr ? shared->q8_1 : own.alloc(ggml_nrows(src1) * ne10_padded * sizeof(block_q8_1)/QK8_1);
+    if (shared == nullptr || !shared->quantized) {
+        const size_t ts = ggml_type_size(src1->type);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, q8_1, type_x, src1->ne[0],
+            src1->nb[1] / ts, src1->nb[2] / ts, src1->nb[3] / ts, ne10_padded, src1->ne[1], src1->ne[2], src1->ne[3],
+            ctx.stream());
+        if (shared != nullptr) {
+            shared->quantized = true;
+        }
+    }
+    return q8_1;
+}
+
+bool ggml_cuda_mul_mat_vec_q_moe_gate_fuses(const ggml_tensor * mm, const ggml_tensor * gate, const int cc) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT_ID || src0->ne[3] != 1 || src1->ne[3] != 1 || gate->type != src0->type ||
+            !ggml_are_same_shape(gate, src0) || !ggml_are_same_stride(gate, src0)) {
+        return false;
+    }
+    // the pairs as ggml_cuda_mul_mat_vec_q reads a MUL_MAT_ID's, and src1's q8_1 as mmvq_src1_q8_1 lays it out
+    const int64_t ts      = ggml_type_size(src0->type);
+    const int64_t s11     = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) / QK8_1;
+    const int64_t y_bytes = ggml_cuda_mmvq_moe_y_bytes(src0->ne[0], mm->ne[1], mm->ne[2], src1->ne[1], src1->ne[1]*s11, s11);
+    return ggml_cuda_mmvq_moe_usable(cc, src0->type, src0->data, gate->data, src0->ne[0], src0->ne[1], src0->nb[1]/ts,
+            src0->nb[2]/ts, mm->ne[1], mm->ne[2]) &&
+        ggml_cuda_mmvq_moe_keeps_y(src0->type, src0->ne[0], /*gate =*/ true, y_bytes);
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1327,7 +1362,6 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
-    const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
@@ -1343,7 +1377,6 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
-        GGML_ASSERT( !ids || dst->ne[2] == 1);
         GGML_ASSERT(  ids || dst->ne[1] <= MMVQ_MAX_FUSED_NCOLS || pq2_mma);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
@@ -1395,20 +1428,8 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    // an input other MUL_MATs of the evaluation read too is quantized once, into the copy it holds for them
-    ggml_cuda_mmvq_shared_q8_1::entry * shared = ctx.mmvq_shared_q8_1.find(src1);
     ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
-    char * src1_q8_1 = shared != nullptr ? shared->q8_1 :
-        src1_q8_1_own.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    if (shared == nullptr || !shared->quantized) {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-        if (shared != nullptr) {
-            shared->quantized = true;
-        }
-    }
+    char * src1_q8_1 = mmvq_src1_q8_1(ctx, src1, src0->type, src1_q8_1_own);
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -1464,6 +1485,8 @@ void ggml_cuda_mul_mat_vec_q(
         ggml_cuda_mmvq_moe(args, stream);
         return;
     }
+    // past one token only the ring above fuses a routed gate (ggml_cuda_mul_mat_vec_q_moe_gate_fuses)
+    GGML_ASSERT(!fusion || !ids || dst->ne[2] == 1);
 
     if (pq2_mma) {
         ggml_cuda_mmvq_pq2_mma(src0->data, fusion_local.gate, src1_q8_1, (const float *) fusion_local.x_bias,
@@ -1516,6 +1539,65 @@ void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_ten
 
     ggml_cuda_mmvq_pq2_mma_group(n, vx, dst, nrows, stride_row, stride_col_dst, src1_q8_1.get(), ne10, ne11,
         ne10_padded / QK8_1, ctx.pq2_next, ctx.pq2_tile_counter(), stream);
+}
+
+bool ggml_cuda_mul_mat_vec_q_concat_supported(const ggml_tensor * const * w, const int n, const ggml_tensor * src1,
+                                              const ggml_tensor * dst, const int cc) {
+    const ggml_tensor * w0 = w[0];
+    const size_t        ts = ggml_type_size(w0->type);
+    // PQ2_0 runs on its tensor-core kernel (ggml_cuda_mul_mat_vec_q_pq2_group groups it)
+    if (n < 2 || !ggml_is_quantized(w0->type) || w0->type == GGML_TYPE_PQ2_0 || w0->ne[2] != 1 || w0->ne[3] != 1 ||
+            w0->nb[1] != ggml_row_size(w0->type, w0->ne[0])) {
+        return false;
+    }
+    // the weights' stride, the channel stride of the launch
+    const ptrdiff_t stride = (const char *) w[1]->data - (const char *) w0->data;
+    for (int g = 0; g < n; ++g) {
+        if (w[g]->type != w0->type || !ggml_are_same_shape(w[g], w0) || !ggml_are_same_stride(w[g], w0) ||
+                ggml_backend_buffer_get_usage(w[g]->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+                (const char *) w[g]->data - (const char *) w0->data != g*stride) {
+            return false;
+        }
+    }
+    const int64_t ne01 = w0->ne[1];
+    const int64_t ne11 = src1->ne[1];
+    // the kernel's block offsets are 32-bit; the last row of the last weight bounds them
+    if (stride <= 0 || stride % ts != 0 || (n - 1)*(stride/ts) + ne01*(w0->nb[1]/ts) > INT_MAX) {
+        return false;
+    }
+    // a block's rows are bounded by the column stride, here all n weights' rows: each block must lie inside one weight's,
+    // and a block has at most 8 rows (calc_rows_per_block, at most calc_nwarps)
+    if (ne01 % 8 != 0) {
+        return false;
+    }
+    return src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float) && src1->ne[0] == w0->ne[0] && src1->ne[2] == 1 &&
+        src1->ne[3] == 1 && ne11 <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_should_use_mmvq(w0->type, cc, ne11) &&
+        dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && dst->ne[0] == n*ne01 && dst->ne[1] == ne11 &&
+        dst->ne[2] == 1 && dst->ne[3] == 1;
+}
+
+void ggml_cuda_mul_mat_vec_q_concat(ggml_backend_cuda_context & ctx, const ggml_tensor * const * w, const int n,
+                                    const ggml_tensor * src1, ggml_tensor * dst) {
+    const ggml_tensor * w0 = w[0];
+    const size_t        ts = ggml_type_size(w0->type);
+
+    ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
+    const char * src1_q8_1 = mmvq_src1_q8_1(ctx, src1, w0->type, src1_q8_1_own);
+
+    const int64_t ne00 = w0->ne[0];
+    const int64_t ne01 = w0->ne[1];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t s01  = w0->nb[1] / ts;
+    const int64_t s0w  = ((const char *) w[1]->data - (const char *) w0->data) / (int64_t) ts;
+    const int64_t s11  = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) / QK8_1;
+
+    // channel g: weight g, src1 (a channel stride of 0), and dst's rows [g*ne01, (g + 1)*ne01), n*ne01 to a column
+    ggml_cuda_mm_fusion_args_device fusion{};
+    mul_mat_vec_q_switch_type(
+        w0->data, w0->type, src1_q8_1, /*ids =*/ nullptr, fusion, (float *) dst->data, ne00,
+        ne01, ne11, s01, s11, n*ne01,
+        n, n, n, s0w, 0, ne01,
+        1, 1, 0, 0, 0, /*ids_stride =*/ 0, ctx.stream());
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

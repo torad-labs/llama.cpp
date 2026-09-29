@@ -38,6 +38,12 @@
 // whatever the indices), and a lane keeps its q8_1 fragments in registers, loaded once per token vector, not once per
 // row. The other types read as mul_mat_vec_q does (vec_dot_q_cuda), from the slot, which their team releases after it.
 //
+// The tokens' q8_1 vectors come from a copy in shared memory past the ring when it fits there, which the producer's
+// first bulk copy makes, before any tile: a global load that a consumer issues behind the ring's copies waits for them.
+// Loaded from global memory, a gate/up's first tile took 7 us to its results where the next took 1.8 (GLM-5.3's proxy
+// under -sm tensor, CUDA graphs and PDL, RTX 5070 Ti: both teams at once, the ring full meanwhile and DRAM idle for
+// ~3.5 us), and at 3 tokens every change of vector paid it.
+//
 // No pointer carries __restrict__: with PDL a restrict load may compile to ld.global.nc, which the compiler can move
 // above the grid dependency wait (upstream #24030). Nothing is read before that wait: the experts come from ids.
 
@@ -83,6 +89,7 @@ struct mmvq_moe_dev_args {
     float              glu_limit;
     int                nslots;
     int *              tile_ctr;
+    int                y_bytes;     // > 0: the tokens' vectors, [y, y + y_bytes), copied into shared memory past the ring
 };
 
 // IQ3_XXS: a lane's k iterations at rpw rows a warp, 4 blocks of a row an iteration, the most its registers hold. The
@@ -149,11 +156,12 @@ static __device__ __forceinline__ void mmvq_moe_bulk_load(void * dst, const void
 }
 #endif // MMVQ_MOE_AVAILABLE
 
-// pair p's q8_1 vector: token p / n_used's, for expert slot p % n_used
-static __device__ __forceinline__ const block_q8_1 * mmvq_moe_y(const mmvq_moe_dev_args & a, const int p) {
+// pair p's q8_1 vector: token p / n_used's, for expert slot p % n_used, in y or in its copy at y_base
+static __device__ __forceinline__ const block_q8_1 * mmvq_moe_y(const mmvq_moe_dev_args & a, const block_q8_1 * y_base,
+                                                               const int p) {
     const int t    = p / a.n_used;
     const int slot = p % a.n_used;
-    return a.y + (int64_t) (slot % a.nchannels_y)*a.stride_channel_y + (int64_t) t*a.stride_col_y;
+    return y_base + (int64_t) (slot % a.nchannels_y)*a.stride_channel_y + (int64_t) t*a.stride_col_y;
 }
 
 template <ggml_type type, int nmat, int rpw>
@@ -173,6 +181,7 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
     extern __shared__ __align__(128) char ring[];
     __shared__ uint64_t full[MMVQ_MOE_MAX_SLOTS];
     __shared__ uint64_t empty[MMVQ_MOE_MAX_SLOTS];
+    __shared__ uint64_t y_full;                                           // the tokens' vectors copied (y_bytes > 0)
     __shared__ int      held[MMVQ_MOE_MAX_SLOTS];                         // the tile in each slot, -1: no more
     __shared__ int      expert[MMVQ_MOE_MAX_PAIRS];                       // the distinct experts
     __shared__ int      pair_e[32];                                       // pair t*n_used + s's expert, the first 32
@@ -191,9 +200,14 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
             mmvq_moe_mbar_init(&full[s],  1);
             mmvq_moe_mbar_init(&empty[s], MMVQ_MOE_NG); // the warps of the team the slot's tile goes to
         }
+        mmvq_moe_mbar_init(&y_full, 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads(); // the barriers, before any arrival or wait
+
+    // the tokens' vectors, past the ring (a.y_bytes > 0) or in global memory
+    char * const y_smem = ring + (size_t) a.nslots*nmat*a.box_bytes;
+    const block_q8_1 * const y_base = a.y_bytes > 0 ? (const block_q8_1 *) y_smem : a.y;
 
     if (warp == MMVQ_MOE_NW) {
         // The producer warp alone lists the distinct experts, in the order of their first pairs, as soon as the
@@ -201,6 +215,15 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
         // lists after a slot's barrier, which lane 0's arrival publishes): pairs lane and lane + 32, a pair past the
         // launch's with an expert of its own
         ggml_cuda_pdl_sync(); // ids is a previous kernel's result
+        if (lane == 0 && a.y_bytes > 0) {
+            // the tokens' vectors, previous kernels' results too, before any tile: a global load that the consumers issue
+            // behind the ring's bulk copies waits for them (a gate/up's first tile took 7 us to its results where the
+            // next took 1.8, both teams at once, while the full ring kept the SM's rows from being asked for)
+            uint64_t unchanged;
+            asm volatile("createpolicy.fractional.L2::evict_unchanged.b64 %0, 1.0;" : "=l"(unchanged));
+            mmvq_moe_mbar_arrive_expect_tx(&y_full, a.y_bytes);
+            mmvq_moe_bulk_load(y_smem, a.y, a.y_bytes, &y_full, unchanged);
+        }
         const int npairs = a.ntokens * a.n_used;
         const int p1     = lane + 32;
         const int e0     = lane < npairs ? a.ids[lane % a.n_used + (lane / a.n_used)*a.ids_stride] : -1 - lane;
@@ -316,6 +339,9 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
         asm volatile("bar.sync 1, %0;" :: "n"(MMVQ_MOE_NW*32) : "memory");
     }
     ggml_cuda_pdl_sync(); // the tokens are the previous kernels' results, and dst may still be read
+    if (a.y_bytes > 0) {
+        mmvq_moe_mbar_wait(&y_full, 0); // the producer's copy of the tokens' vectors
+    }
 
     const int team = warp / MMVQ_MOE_NG;                                 // the block's tiles team, team + NT, ...
     const int g    = warp % MMVQ_MOE_NG;                                 // the warp's rows of a tile, [g*rpw, (g+1)*rpw)
@@ -373,7 +399,7 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
             const int p    = __ffsll(pairs) - 1;
             const int t    = p / a.n_used;
             const int slot = p % a.n_used;
-            const block_q8_1 * y = mmvq_moe_y(a, p);
+            const block_q8_1 * y = mmvq_moe_y(a, y_base, p);
 
             float acc[rpw][nmat] = {{0.0f}};
             if constexpr (type == GGML_TYPE_IQ3_XXS) {
@@ -499,35 +525,66 @@ static int64_t mmvq_moe_row_bytes(ggml_type type, int64_t ncols_x) {
     return ncols_x / ggml_blck_size(type) * (int64_t) ggml_type_size(type);
 }
 
-// the static shared memory a block takes past the ring, with room to spare: barriers, experts, pairs and sums (1,960
-// bytes), and at IQ3_XXS its tables (33,792)
-static int mmvq_moe_meta_bytes(ggml_type type) {
-    return type == GGML_TYPE_IQ3_XXS ? 36 * 1024 : 3 * 1024;
+// The shared memory the ring and the tokens' vectors share: MMVQ_MOE_SMEM_MAX past the instance's static shared memory
+// as compiled (barriers and lists, and at IQ3_XXS its tables: 36,232 bytes on sm_120), read once a device. A 36 KiB
+// budget for it left an MTP verify's gate/up without the room for its 3 tokens' vectors beside its ring.
+template <ggml_type type, int nmat, int rpw>
+static int mmvq_moe_dyn_max() {
+    if constexpr (mmvq_moe_fits(type, nmat, rpw)) {
+        static int dyn_max[GGML_CUDA_MAX_DEVICES] = { 0 };
+        const int  id                             = ggml_cuda_get_device();
+        if (dyn_max[id] == 0) {
+            cudaFuncAttributes attr;
+            CUDA_CHECK(cudaFuncGetAttributes(&attr, mmvq_moe<type, nmat, rpw>));
+            dyn_max[id] = MMVQ_MOE_SMEM_MAX - (int) attr.sharedSizeBytes;
+        }
+        return dyn_max[id];
+    } else {
+        return 0;
+    }
 }
 
-static int mmvq_moe_ring_max(ggml_type type) {
-    return MMVQ_MOE_SMEM_MAX - mmvq_moe_meta_bytes(type);
+template <ggml_type type>
+static int mmvq_moe_dyn_max_type(const int nmat, const int rpw) {
+    switch (nmat*8 + rpw) {
+        case 1*8 + 1: return mmvq_moe_dyn_max<type, 1, 1>();
+        case 1*8 + 2: return mmvq_moe_dyn_max<type, 1, 2>();
+        case 1*8 + 4: return mmvq_moe_dyn_max<type, 1, 4>();
+        case 2*8 + 1: return mmvq_moe_dyn_max<type, 2, 1>();
+        case 2*8 + 2: return mmvq_moe_dyn_max<type, 2, 2>();
+        case 2*8 + 4: return mmvq_moe_dyn_max<type, 2, 4>();
+        default:      return 0;
+    }
+}
+
+static int mmvq_moe_dyn_max(const ggml_type type, const int nmat, const int rpw) {
+    switch (type) {
+        case GGML_TYPE_IQ3_XXS: return mmvq_moe_dyn_max_type<GGML_TYPE_IQ3_XXS>(nmat, rpw);
+        case GGML_TYPE_Q8_0:    return mmvq_moe_dyn_max_type<GGML_TYPE_Q8_0>(nmat, rpw);
+        default:                return 0;
+    }
 }
 
 // rpw: rows a row group, the tile 8*rpw rows; the most whose slot stays under MMVQ_MOE_SLOT_TARGET (one row a group in
-// any case), and as many slots as fit, a whole number a team: sequence i's slot is i % nslots and its team i % NT, so a
-// team always uses the same slots, and waits on each slot's full barrier one phase after the last it consumed (a team
-// waiting on a slot another team has not consumed yet could see the parity of the phase before and pass early)
+// any case), and as many slots as fit beside y_bytes of the tokens' vectors, a whole number a team: sequence i's slot is
+// i % nslots and its team i % NT, so a team always uses the same slots, and waits on each slot's full barrier one phase
+// after the last it consumed (a team waiting on a slot another team has not consumed yet could see the parity of the
+// phase before and pass early)
 struct mmvq_moe_plan {
     int rpw       = 0;
     int nslots    = 0;
     int box_bytes = 0;
 };
 
-static mmvq_moe_plan mmvq_moe_make_plan(ggml_type type, int64_t row_bytes, int nmat) {
+static mmvq_moe_plan mmvq_moe_make_plan(ggml_type type, int64_t row_bytes, int nmat, int64_t y_bytes = 0) {
     for (int rpw : { 4, 2, 1 }) {
         const int64_t box  = GGML_PAD(MMVQ_MOE_NG * rpw * row_bytes, 128);
         const int64_t slot = nmat * box;
         if (rpw > 1 && (slot > MMVQ_MOE_SLOT_TARGET || !mmvq_moe_fits(type, nmat, rpw))) {
             continue;
         }
-        const int fit = (int) std::min<int64_t>(mmvq_moe_ring_max(type) / slot, MMVQ_MOE_MAX_SLOTS) / MMVQ_MOE_NT *
-            MMVQ_MOE_NT;
+        const int fit = (int) std::min<int64_t>((mmvq_moe_dyn_max(type, nmat, rpw) - y_bytes) / slot,
+            MMVQ_MOE_MAX_SLOTS) / MMVQ_MOE_NT * MMVQ_MOE_NT;
         if (fit < MMVQ_MOE_NT) {
             return {};
         }
@@ -560,8 +617,8 @@ bool ggml_cuda_mmvq_moe_usable(int cc, ggml_type type, const void * vx, const vo
 template <ggml_type type, int nmat, int rpw>
 static void mmvq_moe_launch(const mmvq_moe_dev_args & a, const int nblocks, cudaStream_t stream) {
     if constexpr (mmvq_moe_fits(type, nmat, rpw)) {
-        const size_t smem = (size_t) a.nslots * nmat * a.box_bytes;
-        CUDA_SET_SHARED_MEMORY_LIMIT((mmvq_moe<type, nmat, rpw>), mmvq_moe_ring_max(type)); // every plan's size, once
+        const size_t smem = (size_t) a.nslots * nmat * a.box_bytes + a.y_bytes;
+        CUDA_SET_SHARED_MEMORY_LIMIT((mmvq_moe<type, nmat, rpw>), (mmvq_moe_dyn_max<type, nmat, rpw>())); // every plan's
         const ggml_cuda_kernel_launch_params params(dim3(nblocks), dim3((MMVQ_MOE_NW + 1)*32), smem, stream);
         ggml_cuda_kernel_launch(mmvq_moe<type, nmat, rpw>, params, a);
     } else {
@@ -583,10 +640,33 @@ static void mmvq_moe_launch_type(const mmvq_moe_dev_args & a, const int nmat, co
     }
 }
 
+int64_t ggml_cuda_mmvq_moe_y_bytes(int64_t ncols_x, int64_t n_used, int64_t ntokens, int64_t nchannels_y,
+                                   int64_t stride_col_y, int64_t stride_channel_y) {
+    const int64_t nchannels = std::min(nchannels_y, n_used); // pair p's vector is its slot's % nchannels_y
+    const int64_t end       = (nchannels - 1)*stride_channel_y + (ntokens - 1)*stride_col_y + ncols_x/QK8_1; // blocks
+    const int64_t bytes     = end * (int64_t) sizeof(block_q8_1);
+    return bytes % 16 == 0 ? bytes : 0;
+}
+
+bool ggml_cuda_mmvq_moe_keeps_y(ggml_type type, int64_t ncols_x, bool gate, int64_t y_bytes) {
+    static const bool y_global = ggml_env_switch("GGML_CUDA_MMVQ_MOE_Y_GLOBAL");
+    const int           nmat      = gate ? 2 : 1;
+    const int64_t       row_bytes = mmvq_moe_row_bytes(type, ncols_x);
+    const mmvq_moe_plan p         = mmvq_moe_make_plan(type, row_bytes, nmat);
+    return !y_global && y_bytes > 0 && p.rpw > 0 && mmvq_moe_make_plan(type, row_bytes, nmat, y_bytes).rpw == p.rpw;
+}
+
 void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t stream) {
-    const int           nmat      = args.vgate != nullptr ? 2 : 1;
-    const int64_t       row_bytes = mmvq_moe_row_bytes(args.type, args.ncols_x);
-    const mmvq_moe_plan p         = mmvq_moe_make_plan(args.type, row_bytes, nmat);
+    const int     nmat      = args.vgate != nullptr ? 2 : 1;
+    const int64_t row_bytes = mmvq_moe_row_bytes(args.type, args.ncols_x);
+
+    // routed experts read the tokens' vectors from the producer's copy past the ring when the plan keeps them there
+    int64_t y_bytes = (uintptr_t) args.y % 16 != 0 ? 0 : ggml_cuda_mmvq_moe_y_bytes(args.ncols_x,
+        args.n_used, args.ntokens, args.nchannels_y, args.stride_col_y, args.stride_channel_y);
+    if (!ggml_cuda_mmvq_moe_keeps_y(args.type, args.ncols_x, nmat == 2, y_bytes)) {
+        y_bytes = 0;
+    }
+    const mmvq_moe_plan p = mmvq_moe_make_plan(args.type, row_bytes, nmat, y_bytes);
     GGML_ASSERT(p.rpw > 0 && "ggml_cuda_mmvq_moe_usable holds a plan");
 
     const int R   = MMVQ_MOE_NG * p.rpw;
@@ -618,6 +698,7 @@ void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t strea
     a.glu_op                 = (int) args.glu_op;
     a.glu_limit              = args.glu_limit;
     a.nslots                 = p.nslots;
+    a.y_bytes                = (int) y_bytes;
     a.tile_ctr               = args.tile_ctr;
 
     // one block an SM, never more than the tiles of the most distinct experts the pairs can name

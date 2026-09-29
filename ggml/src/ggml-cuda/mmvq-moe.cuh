@@ -45,4 +45,15 @@ bool ggml_cuda_mmvq_moe_usable(int cc, ggml_type type, const void * vx, const vo
                                int64_t nrows_x, int64_t stride_row_x, int64_t stride_channel_x, int64_t n_used,
                                int64_t ntokens);
 
+// The bytes from y to the end of the last vector a routed launch's pairs read (the args' layout), or 0 when they are not
+// a multiple of 16: what the producer copies into shared memory past the ring, with one bulk copy, before any tile. A
+// global load that a consumer issues behind the ring's copies waits for them.
+int64_t ggml_cuda_mmvq_moe_y_bytes(int64_t ncols_x, int64_t n_used, int64_t ntokens, int64_t nchannels_y,
+                                   int64_t stride_col_y, int64_t stride_channel_y);
+
+// Whether a routed launch of these weights (a gate beside them or not) keeps y_bytes of the tokens' vectors in shared
+// memory: its plan's tiles and a slot a team fit beside them. Otherwise, and with GGML_CUDA_MMVQ_MOE_Y_GLOBAL=1, the
+// consumers read them from global memory.
+bool ggml_cuda_mmvq_moe_keeps_y(ggml_type type, int64_t ncols_x, bool gate, int64_t y_bytes);
+
 void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t stream);

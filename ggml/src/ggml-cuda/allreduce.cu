@@ -230,6 +230,100 @@ static __global__ void ggml_cuda_ar_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// LL (low latency) kernel: small reductions, 2 GPUs.
+//
+// Each 8 B packet holds 4 B of wire data and the call's token. One st.v2 puts both in host memory and the peer polls the packet
+// itself, so there is no __threadfence_system, no arrival int and no second read for the data: one PCIe write and one read
+// round trip in place of the chunked kernel's three. The wire carries twice the bytes, so it only pays for small tensors
+// (GGML_CUDA_AR_LL_MAX_BYTES). The token comes from the device counter as in ggml_cuda_ar_kernel, and the packets live in their
+// own zeroed staging: a stale packet has the token of a call two back, never this one, and a packet is overwritten only after
+// the peer finished the call that read it (it arrived at the call between). One block, so the token is published by a plain
+// store once every thread has read it. The sum is the chunked kernel's: both sides round through T_wire, so the two devices and
+// the two kernels give the same bits.
+// ---------------------------------------------------------------------------
+
+static constexpr int GGML_CUDA_AR_LL_THREADS = 1024;
+static constexpr int GGML_CUDA_AR_LL_UNROLL  = 4;
+
+static __device__ __forceinline__ void ggml_cuda_ar_ll_store(uint2 * p, uint32_t data, uint32_t flag) {
+    asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};" :: "l"(p), "r"(data), "r"(flag) : "memory");
+}
+
+static __device__ __forceinline__ uint2 ggml_cuda_ar_ll_load(const uint2 * p) {
+    uint2 v;
+    asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p) : "memory");
+    return v;
+}
+
+template <typename T_dst, typename T_wire>
+static __global__ void ggml_cuda_ar_ll_kernel(
+        const T_dst * sendbuf,
+        T_dst       * recvbuf,
+        uint2       * ll_mine,       // slot 0; slot 1 follows at slot_packets
+        const uint2 * ll_other,      // slot 0 of the peer's staging
+        int           slot_packets,
+        int           count,
+        int         * counter) {
+    constexpr int W = 4 / sizeof(T_wire);
+
+    const int tid = threadIdx.x;
+    const int gnt = blockDim.x;
+    const int npk = (count + W - 1) / W;
+
+    const int token = ggml_cuda_ar_signal_get(counter) + 1;
+    ll_mine  += (size_t) (token & 1) * slot_packets;
+    ll_other += (size_t) (token & 1) * slot_packets;
+
+    for (int i = tid; i < npk; i += gnt) {
+        T_wire wire[W];
+        #pragma unroll
+        for (int k = 0; k < W; ++k) {
+            const int j = i * W + k;
+            wire[k] = j < count ? ggml_cuda_cast<T_wire>(sendbuf[j]) : ggml_cuda_cast<T_wire>(0.0f);
+        }
+        uint32_t data;
+        memcpy(&data, wire, sizeof(data));
+        ggml_cuda_ar_ll_store(ll_mine + i, data, (uint32_t) token);
+    }
+
+    // The peer's packets are read LL_UNROLL at a time so their PCIe round trips overlap.
+    for (int i0 = tid; i0 < npk; i0 += GGML_CUDA_AR_LL_UNROLL * gnt) {
+        uint2 v[GGML_CUDA_AR_LL_UNROLL];
+        #pragma unroll
+        for (int u = 0; u < GGML_CUDA_AR_LL_UNROLL; ++u) {
+            if (i0 + u * gnt < npk) {
+                v[u] = ggml_cuda_ar_ll_load(ll_other + i0 + u * gnt);
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < GGML_CUDA_AR_LL_UNROLL; ++u) {
+            const int i = i0 + u * gnt;
+            if (i < npk) {
+                while (v[u].y != (uint32_t) token) {
+                    v[u] = ggml_cuda_ar_ll_load(ll_other + i);
+                }
+                T_wire wire[W];
+                memcpy(wire, &v[u].x, sizeof(v[u].x));
+                #pragma unroll
+                for (int k = 0; k < W; ++k) {
+                    const int j = i * W + k;
+                    if (j < count) {
+                        const T_wire d_low = ggml_cuda_cast<T_wire>(sendbuf[j]);
+                        recvbuf[j] = ggml_cuda_cast<T_dst>(ggml_cuda_cast<float>(d_low) + ggml_cuda_cast<float>(wire[k]));
+                    }
+                }
+            }
+        }
+    }
+
+    // Every thread has read the token: publish it for the next call.
+    __syncthreads();
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(counter, token);
+    }
+}
+
 // Combined load-convert-add kernel.  The peer's contribution arrives as T_src
 // (which may be a lower-precision type than T_dst when the BF16 round-trip is
 // active).  For bit-equivalence between the two GPUs, dst is first rounded
@@ -266,6 +360,9 @@ static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 // Maximum chunk size (bytes per GPU) handled by one chunked kernel launch.
 // Larger tensors are reduced by issuing multiple chunked launches.
 static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
+
+// Largest wire size the LL kernel reduces by default; GGML_CUDA_AR_LL_MAX_BYTES overrides (0 disables).
+static constexpr size_t GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT = 16 * 1024; // 16 KB
 
 // Copy-engine path: largest tensor accepted on this path; sets host_large /
 // dev_tmp allocation size.
@@ -338,10 +435,12 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
+    size_t   ll_max_bytes;   // wire bytes up to which the LL kernel reduces; 0 disables
     uint64_t call_count;
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
+    ggml_cuda_ar_host_mapping ll_buf[GGML_CUDA_MAX_DEVICES];     // pinned packets (LL kernel), 2 slots
     ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
     char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copy-engine path
     cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking
@@ -432,6 +531,11 @@ static ggml_cuda_ar_route ggml_cuda_ar_route_of(const ggml_cuda_ar_pipeline * p,
     return r;
 }
 
+// Packets one slot of the LL staging holds: a packet carries 4 wire bytes.
+static size_t ggml_cuda_ar_ll_slot_packets(const ggml_cuda_ar_pipeline * p) {
+    return (p->ll_max_bytes + 3) / 4;
+}
+
 // Per-AR copy-engine chunk size: env-var override if set, else heuristic
 // (clamp(nbytes/4, HEURISTIC_MIN, HEURISTIC_MAX)).
 static size_t ggml_cuda_ar_chunk_bytes(const ggml_cuda_ar_pipeline * p, size_t nbytes) {
@@ -488,6 +592,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // Wire bytes up to which the LL kernel reduces (0 = chunked kernel only), capped at
+    // what one chunk of the chunked kernel takes.
+    p->ll_max_bytes     = std::min(ggml_cuda_ar_env_u64("GGML_CUDA_AR_LL_MAX_BYTES", GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT),
+                                   (uint64_t) GGML_CUDA_AR_MAX_BYTES);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -578,6 +686,17 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // LL packets: zero, so no slot holds a call's token before the call writes it.
+    const size_t ll_total = (size_t) GGML_CUDA_AR_POOL_SIZE * ggml_cuda_ar_ll_slot_packets(p) * sizeof(uint2);
+    for (size_t i = 0; ll_total > 0 && i < n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        if (p->ll_buf[i].alloc(ll_total) != cudaSuccess || cudaMemset(p->ll_buf[i].dev, 0, ll_total) != cudaSuccess) {
+            GGML_LOG_ERROR("%s: LL staging failed (%zu bytes) on device %d\n", __func__, ll_total, p->devices[i]);
+            ggml_cuda_ar_pipeline_free(p);
+            return nullptr;
+        }
+    }
+
     // Copy-engine path: pinned host staging + device scratch, sized for the
     // largest tensor we accept on this path (GGML_CUDA_AR_COPY_MAX_BYTES).
     // dev_tmp is single-buffered; cross-AR safety is enforced by an explicit
@@ -599,8 +718,8 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     }
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
-                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
-                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
+                  "%zu KB chunked kernel staging + %zu KB LL staging (up to %zu KB on the wire) + %zu MB copy-engine staging per GPU\n",
+                  __func__, n_devices, p->buf_bytes >> 10, ll_total >> 10, p->ll_max_bytes >> 10, p->copy_bytes >> 20);
 
     return p;
 }
@@ -620,6 +739,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 
     for (int i = 0; i < p->n_devices; ++i) {
         p->host_buf[i].free();
+        p->ll_buf[i].free();
         p->host_large[i].free();
         if (p->dev_tmp[i]) {
             ggml_cuda_set_device(p->devices[i]);
@@ -953,6 +1073,9 @@ bool ggml_cuda_ar_allreduce(
         const size_t max_chunk_elems = p->buf_bytes / type_size;
         const size_t input_type_size = ggml_type_size(input_type);
 
+        // Small reductions go as one LL launch (ggml_cuda_ar_ll_kernel); nbytes is the same on both devices.
+        const bool use_ll = nbytes <= p->ll_max_bytes;
+
         // Chunked kernel path runs entirely on the caller's compute stream:
         // since AR is a barrier here, same-stream ordering subsumes any
         // cross-stream event handshake that the copy-engine path needs, and
@@ -983,25 +1106,36 @@ bool ggml_cuda_ar_allreduce(
                 }
 
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
-                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
-                    reinterpret_cast<const T_dst *>(data), \
-                    reinterpret_cast<T_dst *>(data), \
-                    reinterpret_cast<T_wire *>(p->host_buf[i].dev), \
-                    reinterpret_cast<const T_wire *>(p->host_buf[peer].dev), \
-                    p->buf_bytes / sizeof(T_wire), \
-                    static_cast<int>(chunk_elems), \
-                    reinterpret_cast<int *>(p->arrival.dev), \
-                    i, \
-                    p->counter[i])
+                if (use_ll) { \
+                    ggml_cuda_ar_ll_kernel<T_dst, T_wire><<<dim3(1), dim3(GGML_CUDA_AR_LL_THREADS), 0, stream>>>( \
+                        reinterpret_cast<const T_dst *>(data), \
+                        reinterpret_cast<T_dst *>(data), \
+                        reinterpret_cast<uint2 *>(p->ll_buf[i].dev), \
+                        reinterpret_cast<const uint2 *>(p->ll_buf[peer].dev), \
+                        static_cast<int>(ggml_cuda_ar_ll_slot_packets(p)), \
+                        static_cast<int>(chunk_elems), \
+                        p->counter[i]); \
+                } else { \
+                    ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                        reinterpret_cast<const T_dst *>(data), \
+                        reinterpret_cast<T_dst *>(data), \
+                        reinterpret_cast<T_wire *>(p->host_buf[i].dev), \
+                        reinterpret_cast<const T_wire *>(p->host_buf[peer].dev), \
+                        p->buf_bytes / sizeof(T_wire), \
+                        static_cast<int>(chunk_elems), \
+                        reinterpret_cast<int *>(p->arrival.dev), \
+                        i, \
+                        p->counter[i]); \
+                }
 
                 if (use_bf16) {
                     GGML_ASSERT(input_type == GGML_TYPE_F32);
-                    LAUNCH_AR_KERNEL(float, nv_bfloat16);
+                    LAUNCH_AR_KERNEL(float, nv_bfloat16)
                 } else {
                     switch (input_type) {
-                        case GGML_TYPE_F32:  LAUNCH_AR_KERNEL(float,       float);       break;
-                        case GGML_TYPE_F16:  LAUNCH_AR_KERNEL(half,        half);        break;
-                        case GGML_TYPE_BF16: LAUNCH_AR_KERNEL(nv_bfloat16, nv_bfloat16); break;
+                        case GGML_TYPE_F32:  LAUNCH_AR_KERNEL(float,       float)       break;
+                        case GGML_TYPE_F16:  LAUNCH_AR_KERNEL(half,        half)        break;
+                        case GGML_TYPE_BF16: LAUNCH_AR_KERNEL(nv_bfloat16, nv_bfloat16) break;
                         default: GGML_ASSERT(false);
                     }
                 }

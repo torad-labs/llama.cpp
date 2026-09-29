@@ -1734,6 +1734,10 @@ struct ggml_cuda_ssm_conv_state_update {
     float *         l2_dst   = nullptr; // [GGML_CUDA_SSM_CONV_UPDATE_THREADS, l2_heads, n_t], contiguous
     int             l2_heads = 0;
     float           l2_eps   = 0.0f;
+    // KDA's conv weights, when the graph concatenates three tensors of them along rows (ggml_cuda_ssm_conv_w_segments skips
+    // the CONCATs): w_seg_channels rows of the SSM_CONV's src1 from each in turn; 0 channels, src1 itself
+    const float *   w_seg[3]       = {};
+    int             w_seg_channels = 0;
 };
 
 // Registrations are keyed by node pointer, like ggml_cuda_gdn_gather_context, and cleared at the start of every graph
@@ -1932,6 +1936,10 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
     ggml_cuda_pq2_tile_counters pq2_tile_counters;
     ggml_cuda_mmvq_shared_q8_1 mmvq_shared_q8_1; // filled during a graph evaluation only
+    cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
+    cudaEvent_t l2_issue_join = nullptr;
+    bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
+    const ggml_cgraph * l2_graph_next = nullptr; // the graph after the next computed, while it computes (ggml_backend_graph_next)
     // the stream is being captured with the rest of an evaluation across backends (ggml_backend_cuda_capture_begin):
     // the graphs computed meanwhile are evaluated into it, with no CUDA graph of their own
     bool outer_capture = false;

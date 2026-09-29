@@ -1765,6 +1765,13 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }
 
+void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buf, enum ggml_backend_buffer_usage usage) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(buf));
+    for (ggml_backend_buffer_ptr & simple : ((ggml_backend_meta_buffer_context *) buf->context)->bufs) {
+        ggml_backend_buffer_set_usage(simple.get(), usage);
+    }
+}
+
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
@@ -1871,6 +1878,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_graph_next_t            graph_next     = nullptr; // the simple backends' look ahead, or null
 
     // A whole evaluation of a cgraph, every step's subgraph and all-reduce on every device, captured into one graph a
     // device and replayed with one launch a device while the cgraph's uid holds (ggml_backend_meta_graph_compute): the
@@ -1971,6 +1979,7 @@ struct ggml_backend_meta_context {
             capture.end    = (ggml_backend_capture_end_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_end");
             capture.launch = (ggml_backend_capture_launch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_launch");
             capture.free   = (ggml_backend_capture_free_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_free");
+            graph_next     = (ggml_backend_graph_next_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_next");
         }
     }
 
@@ -2595,6 +2604,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
+                if (backend_ctx->graph_next != nullptr) {
+                    backend_ctx->graph_next(bcj.backend,
+                        i + 1 < backend_ctx->n_subgraphs ? bcj.cgraphs[i + 1].cgraph_main : nullptr);
+                }
                 const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;

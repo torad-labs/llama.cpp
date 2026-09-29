@@ -9,9 +9,15 @@
 #define LORA_RANK1_BLOCK 256
 
 static __global__ void lora_rank1_fused_f32(
-        const float * __restrict__ a, const float * __restrict__ x, const float * __restrict__ b,
-        const float * __restrict__ res, float * __restrict__ dst,
+        const float * a_ptr, const float * x_ptr, const float * b_ptr, const float * res_ptr, float * dst_ptr,
         const int K, const int N, const float scale) {
+    // no __restrict__ under PDL (GGML_CUDA_RESTRICT): x and res are the kernels before's output, read after the wait
+    const float * GGML_CUDA_RESTRICT a   = a_ptr;
+    const float * GGML_CUDA_RESTRICT x   = x_ptr;
+    const float * GGML_CUDA_RESTRICT b   = b_ptr;
+    const float * GGML_CUDA_RESTRICT res = res_ptr;
+    float       * GGML_CUDA_RESTRICT dst = dst_ptr;
+
     ggml_cuda_pdl_lc();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     __shared__ float red[LORA_RANK1_BLOCK / warp_size];

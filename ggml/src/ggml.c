@@ -6461,6 +6461,23 @@ void ggml_gated_delta_net_set_raw_gates(
     gdn->src[8] = a;
 }
 
+void ggml_gated_delta_net_set_raw_kda_gates(
+        struct ggml_tensor  * gdn,
+        struct ggml_tensor  * a,
+        float                 lower_bound) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(gdn->src[3]->ne[0] == gdn->src[2]->ne[0]); // KDA: a gate per key channel
+
+    const int64_t H = gdn->src[2]->ne[1];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_nelements(a) == H);
+
+    ggml_set_op_params_i32(gdn, 1, 2);
+    ggml_set_op_params_f32(gdn, 2, lower_bound);
+
+    gdn->src[8] = a;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(

@@ -123,6 +123,17 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
 }
 
+// The weights of channel c: its row of the SSM_CONV's src1, or of the one of the three tensors src1 is a concatenation of
+// that holds it (ggml_cuda_ssm_conv_state_update::w_seg)
+static __device__ __forceinline__ const float * ssm_conv_w_row(const ggml_cuda_ssm_conv_state_update & u, const float * w,
+                                                              const int w_stride, const int c) {
+    if (u.w_seg_channels == 0) {
+        return w + c * w_stride;
+    }
+    const int s = c / u.w_seg_channels;
+    return u.w_seg[s] + (c - s * u.w_seg_channels) * w_stride;
+}
+
 // The fused conv-state update (ggml_cuda_ssm_conv_state_update), one sequence: a thread per channel reads its
 // d_conv - 1 state columns out of the cache row ids[0] and its n_t new inputs out of the projection, writes its n_t
 // outputs, then its window of every snapshot. All its reads come before any of its writes, and a thread touches only
@@ -139,6 +150,7 @@ static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_
 
     float x[d_conv - 1 + max_n_t];
     float wc[d_conv];
+    const float * w_row = ssm_conv_w_row(u, w, w_stride, c);
 
     ggml_cuda_pdl_sync();
     const float * state = u.cache + (int64_t) u.ids[0] * u.row_stride + (int64_t) c * (d_conv - 1);
@@ -154,7 +166,7 @@ static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_
     }
 #pragma unroll
     for (int j = 0; j < d_conv; ++j) {
-        wc[j] = w[c * w_stride + j];
+        wc[j] = w_row[j];
     }
 
     // the same sum as ssm_conv_f32, including its zero bias (it turns a -0.0f sum into +0.0f)
