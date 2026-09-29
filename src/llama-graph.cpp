@@ -1892,6 +1892,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_cont(ggml_tensor * x) const {
+    static const bool legacy = ggml_env_switch("LLAMA_CONT_COPY_LEGACY");
+    if (legacy || !ggml_is_contiguous(x)) {
+        return ggml_cont(ctx0, x);
+    }
+    return ggml_reshape_4d(ctx0, x, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+}
+
 ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * cur,
          ggml_tensor * mw,
@@ -2933,7 +2941,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cur = ggml_mul_mat(ctx0, v_mla, cur);
             cb(cur, "fattn_mla", il);
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
-            cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
+            cur = build_cont(cur); // Needed because ggml_reshape_2d expects contiguous inputs.
 #endif
         }
 

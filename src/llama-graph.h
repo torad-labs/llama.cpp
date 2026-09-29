@@ -1154,6 +1154,12 @@ struct llm_graph_context {
            llm_norm_type   type,
                      int   il) const;
 
+    // x with contiguous strides, as ggml_cont makes it: a reshape of x, which copies nothing, when its data already is
+    // laid out so (a view of a whole block; a permute at one token, which moves only dimensions of size 1). A copy of
+    // contiguous data is a device-to-device memcpy node in a CUDA graph, which breaks the chain of programmatic launches
+    // (GLM-5.3 had 88 a token at decode). LLAMA_CONT_COPY_LEGACY=1 copies always.
+    ggml_tensor * build_cont(ggml_tensor * x) const;
+
     // logit lens: a model calls lens_record with each layer's output inside its layer loop and
     // lens_build once after it (after res->t_logits is set), with the same norm and head it uses for
     // the served logits. The entry for the model's last layer aliases the served logits themselves.
