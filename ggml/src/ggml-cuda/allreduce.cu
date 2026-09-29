@@ -362,7 +362,7 @@ static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
 
 // Largest wire size the LL kernel reduces by default; GGML_CUDA_AR_LL_MAX_BYTES overrides (0 disables).
-static constexpr size_t GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT = 32 * 1024; // 32 KB
+static constexpr size_t GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT = 16 * 1024; // 16 KB
 
 // Copy-engine path: largest tensor accepted on this path; sets host_large /
 // dev_tmp allocation size.
