@@ -2136,9 +2136,10 @@ static cudaAccessPolicyWindow ggml_cuda_l2_persist_window(ggml_backend_cuda_cont
     if (!enabled) {
         return window;
     }
+    const char * const fn = __func__; // the lambda's own is operator()
     const auto none = [&](const std::string & why) {
         if (!told[ctx.device].exchange(true)) {
-            GGML_LOG_WARN("%s: device %d: GGML_CUDA_GDN_STATE_PERSIST=1, but no L2 window: %s\n", __func__, ctx.device,
+            GGML_LOG_WARN("%s: device %d: GGML_CUDA_GDN_STATE_PERSIST=1, but no L2 window: %s\n", fn, ctx.device,
                           why.c_str());
         }
         return window;
