@@ -3848,12 +3848,16 @@ static int ggml_cuda_try_gdn_cache_fusion(
         dst->nb[2] % ggml_type_size(dst->type) != 0) {
         return 0;
     }
-    // f16 and q8_0: the scalar gate and the recurrent kernel (the chunked prefill pipeline writes f32; its cpy stays).
-    // q8_0 besides: the kernel quantizes one block per warp-wide slice of a state column (gdn_store_state), so a
-    // 32-lane warp and a head width that is a multiple of 32.
-    // GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate cpy.
-    static const bool q8_legacy = ggml_env_switch("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
-    if (dst->type != GGML_TYPE_F32 && (gdn->src[3]->ne[0] == S_v || ggml_cuda_should_use_chunked_gdn(gdn))) {
+    // f16 and q8_0: the recurrent kernel, with the scalar gate or KDA's (the chunked prefill pipeline writes f32; its
+    // cpy stays). KDA stores its state as the scalar gate does, one column a warp (gdn_store_state), and until it was
+    // taken here glm5next under -cts f16 paid the f32 -> f16 cpy on every KDA layer: 262 us a token against 289 for the
+    // kernel, the 44-layer GLM-5.3 proxy on an RTX 5070 Ti. q8_0 besides: the kernel quantizes one block per warp-wide
+    // slice of a state column (gdn_store_state), so a 32-lane warp and a head width that is a multiple of 32.
+    // GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate cpy, GGML_CUDA_GDN_KDA_CACHE_LEGACY=1 a KDA
+    // layer's f16 or q8_0 one.
+    static const bool q8_legacy  = ggml_env_switch("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
+    static const bool kda_legacy = ggml_env_switch("GGML_CUDA_GDN_KDA_CACHE_LEGACY");
+    if (dst->type != GGML_TYPE_F32 && ((kda_legacy && gdn->src[3]->ne[0] == S_v) || ggml_cuda_should_use_chunked_gdn(gdn))) {
         return 0;
     }
     if (q8 && (q8_legacy || S_v % QK8_0 != 0 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != QK8_0)) {

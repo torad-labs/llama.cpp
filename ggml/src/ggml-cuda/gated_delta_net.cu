@@ -548,12 +548,19 @@ static void ggml_cuda_op_gated_delta_net_impl(
 #define GDN_LAUNCH_KEEP(KDA_, RAW_, PRE_, T_) \
     if (keep_rs) { GDN_LAUNCH(KDA_, true, RAW_, PRE_, T_); } else { GDN_LAUNCH(KDA_, false, RAW_, PRE_, T_); }
 
-    // an f16 or q8_0 cache is fused for the scalar gate only (ggml_cuda_try_gdn_cache_fusion)
-    GGML_ASSERT(state_type == GGML_TYPE_F32 || !kda);
+    // an f16 or q8_0 cache, fused for the scalar gate and KDA's (ggml_cuda_try_gdn_cache_fusion)
     if (kda && raw) {
-        GDN_LAUNCH_KEEP(true,  true,  false, GGML_TYPE_F32);
+        switch (state_type) {
+            case GGML_TYPE_Q8_0: GDN_LAUNCH_KEEP(true,  true,  false, GGML_TYPE_Q8_0); break;
+            case GGML_TYPE_F16:  GDN_LAUNCH_KEEP(true,  true,  false, GGML_TYPE_F16);  break;
+            default:             GDN_LAUNCH_KEEP(true,  true,  false, GGML_TYPE_F32);  break;
+        }
     } else if (kda) {
-        GDN_LAUNCH_KEEP(true,  false, false, GGML_TYPE_F32);
+        switch (state_type) {
+            case GGML_TYPE_Q8_0: GDN_LAUNCH_KEEP(true,  false, false, GGML_TYPE_Q8_0); break;
+            case GGML_TYPE_F16:  GDN_LAUNCH_KEEP(true,  false, false, GGML_TYPE_F16);  break;
+            default:             GDN_LAUNCH_KEEP(true,  false, false, GGML_TYPE_F32);  break;
+        }
     } else if (g_precomputed) {
         GDN_LAUNCH_KEEP(false, false, true,  GGML_TYPE_F32);
     } else if (raw) {
