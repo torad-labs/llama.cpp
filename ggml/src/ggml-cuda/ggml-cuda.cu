@@ -2108,6 +2108,11 @@ static double ggml_cuda_l2_issue_env(const char * name, const double def) {
 // - GGML_CUDA_L2_ISSUE_NODE_US (default 0.75): the latency a node of the chain beside the issuer stands for; the issuer
 //   requests what DRAM serves in the chain's nodes' time and no more (the 44-layer proxy on an RTX 5070 Ti, tg32 against
 //   no issuer: 0.5 +1.8 %, 0.75 +2.7 %, 1 +2.7 %, 1.25 -1.3 %, 2 0.0 %);
+// - GGML_CUDA_L2_ISSUE_BUSY_KB (default 0, off): a node that moves this much besides weights (its other srcs and its
+//   dst: a recurrence over its state, attention over its cache) keeps DRAM busy, and the chain beside an issuer ends
+//   before it, as before routed experts: requested beside it, the issuer halves its bandwidth for bytes it would have to
+//   read anyway (the 44-layer proxy under -sm tensor, chain to the next heavy launch: KDA's gated_delta_net 241 against
+//   123 us a token on the 5070 Ti, the hyper-connection kernels +13-18 %); 1024 is the value under test;
 // - GGML_CUDA_L2_ISSUE_AR_US (default 4): the latency the all-reduce between this graph and the next stands for, when
 //   the meta backend says which graph comes next (ggml_backend_graph_next): the issue after the graph's last heavy launch
 //   then runs on across the all-reduce, through the next graph's first heavy launch, and joins the evaluation's stream
@@ -2136,6 +2141,7 @@ static ggml_cuda_l2_issue_plan ggml_cuda_l2_issue_plan_of(ggml_backend_cuda_cont
     static const double rate_frac = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_RATE_FRAC", 0.9);
     static const double node_us   = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_NODE_US", 0.75);
     static const double ar_us     = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_AR_US", 4.0);
+    static const double busy_kb   = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_BUSY_KB", 0.0);
 
     ggml_cuda_l2_issue_plan plan;
     const ggml_cuda_device_info::cuda_device_info & dev = ggml_cuda_info().devices[ctx.device];
@@ -2201,12 +2207,28 @@ static ggml_cuda_l2_issue_plan ggml_cuda_l2_issue_plan_of(ggml_backend_cuda_cont
         end();
         return heavy;
     };
-    // the nodes of g in [from, to) that run before one that keeps DRAM busy (routed experts); busy: one was met
+    // routed experts, or a node moving busy_kb besides the weights it reads (which an issue requests itself)
+    const auto keeps_dram_busy = [&](const ggml_tensor * node) {
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            return true;
+        }
+        if (busy_kb <= 0.0) {
+            return false;
+        }
+        int64_t moved = ggml_nbytes(node);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j] != nullptr && !weights(node->src[j])) {
+                moved += ggml_nbytes(node->src[j]);
+            }
+        }
+        return moved >= (int64_t) (busy_kb * 1024);
+    };
+    // the nodes of g in [from, to) that run before one that keeps DRAM busy; busy: one was met
     const auto chain_of = [&](const ggml_cgraph * g, const int from, const int to, bool & busy) {
         int n = 0;
         for (int i = from; i < to && !busy; ++i) {
             if (runs(g->nodes[i])) {
-                busy = g->nodes[i]->op == GGML_OP_MUL_MAT_ID;
+                busy = keeps_dram_busy(g->nodes[i]);
                 n   += !busy;
             }
         }
@@ -2246,10 +2268,10 @@ static ggml_cuda_l2_issue_plan ggml_cuda_l2_issue_plan_of(ggml_backend_cuda_cont
         if (is.crosses && next == nullptr) {
             break;
         }
-        // the chain it runs beside: the nodes up to the next launch that keeps DRAM busy (the next heavy one, or routed
-        // experts), each node_us of latency, and the all-reduce if it crosses one; requested past its end the issuer takes
-        // DRAM from that launch (the 44-layer proxy on an RTX 5070 Ti, L2/2 an issue: the routed experts 5,970 against
-        // 5,280 us a token, qkv 4,506 against 4,252)
+        // the chain it runs beside: the nodes up to the next launch that keeps DRAM busy (the next heavy one, routed
+        // experts, or a node moving busy_kb), each node_us of latency, and the all-reduce if it crosses one; requested
+        // past its end the issuer takes DRAM from that launch (the 44-layer proxy on an RTX 5070 Ti, L2/2 an issue: the
+        // routed experts 5,970 against 5,280 us a token, qkv 4,506 against 4,252)
         bool   busy     = false;
         double chain_us = 0.0;
         if (!is.crosses) {
