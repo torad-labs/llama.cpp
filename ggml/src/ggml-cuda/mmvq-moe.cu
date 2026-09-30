@@ -48,7 +48,8 @@
 //
 // No pointer carries __restrict__: with PDL a restrict load may compile to ld.global.nc, which the compiler can move
 // above the grid dependency wait (upstream #24030). Nothing is read before that wait but ids when they are whole before
-// the launch (ids_ready), and the weights of the tiles they name.
+// the launch (ids_ready), and the weights of the tiles they name; nothing is written but the stop word of the L2 issue
+// beside the stream (ggml_cuda_l2_issue_stop), an atomic add that no kernel on the stream reads.
 //
 // A launch triggers the next only past its dependency wait, so whatever the kernels before it wrote is whole before any
 // kernel after it on the stream starts. The ids a ring launch reads (a MoE layer's top-k, written by the kernels before
