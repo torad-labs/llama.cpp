@@ -762,6 +762,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         ssm_conv_ab_slots.release();
     }
+    if (gdn_norm_tickets.ptr != nullptr) {
+        ggml_cuda_set_device(device);
+        gdn_norm_tickets.release();
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4158,7 +4162,7 @@ static bool ggml_cuda_node_is_folded(ggml_backend_cuda_context & ctx, const ggml
             (ggml_cuda_try_gdn_gather_skip(ctx, cgraph, node_idx) || ggml_cuda_try_ssm_conv_state_update(ctx, cgraph, node_idx))) {
         return true;
     }
-    return ctx.ssm_conv_updates().skips(node);
+    return ctx.ssm_conv_updates().skips(node) || ctx.gdn_gathers().norm_skipped.count(node) != 0;
 }
 
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
@@ -4243,6 +4247,151 @@ static int ggml_cuda_try_gdn_cache_fusion(
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / ggml_type_size(dst->type) * ggml_blck_size(dst->type)) : 0;
     fused_state_cpy.type        = dst->type;
     return skip;
+}
+
+// GATED_DELTA_NET -> [views] -> RMS_NORM -> MUL(w) and SIGMOID(gate) -> MUL, glm5next's KDA output gate: registered for
+// the GDN node, whose kernel then writes the last MUL's output itself (gated_delta_net_cuda's epilogue), and the four nodes
+// skipped. That takes two launches off every KDA layer's chain, and the norm's wait on the recurrence: the norm read the
+// rows the kernel had just stored, the gate's launch the norm's output. The RMS_NORM must be the first node after the GDN
+// to read its attention rows (a contiguous view of them at offset 0), the four nodes in order with only views between,
+// the gate computed before the GDN, and nothing but the last MUL reading the three nodes before it. The output is written
+// at the GDN, so it may share no memory with what the GDN reads or writes, or with the nodes up to the norm, except that
+// it may be exactly the attention rows (glm5next builds the chain in place over them) or the gate (a row is read and
+// written by the same warp). A separate output lands where the allocator puts it, often on the GDN's inputs, which die
+// at the GDN while other heads' blocks still read them. Declined
+// for the chunked prefill path, for rows the unfused norm does not reduce in one pass (the epilogue's sum is its sum), for
+// more than 16 tokens a sequence (a head's rows are taken by one block, a warp a row, after the recurrence), and while
+// the graph forks streams (ggml_cuda_gdn_norm_tickets). GGML_CUDA_GDN_GATED_NORM_LEGACY=1 keeps the four nodes.
+static void ggml_cuda_try_gdn_gated_norm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_GDN_GATED_NORM_LEGACY");
+    ggml_cuda_gdn_gather_context & reg = ctx.gdn_gathers();
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (legacy || reg.concurrent || gdn->type != GGML_TYPE_F32 || ggml_cuda_should_use_chunked_gdn(gdn) ||
+            ggml_cuda_info().devices[ctx.device].warp_size != WARP_SIZE) {
+        return;
+    }
+    const ggml_tensor * v        = gdn->src[2];
+    const int64_t       S_v      = v->ne[0];
+    const int64_t       H        = v->ne[1];
+    const int64_t       n_tokens = v->ne[2];
+    const int64_t       n_seqs   = v->ne[3];
+    const size_t        attn_nb  = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+    if (S_v % WARP_SIZE != 0 || S_v > 128 || n_tokens > 16 || n_seqs * H > ggml_cuda_gdn_norm_tickets::n) {
+        return;
+    }
+
+    // the first node to read the attention rows, a few nodes on (the state's CPY reads only the tail after them)
+    int i_rms = -1;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + 32 && i_rms < 0; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src != nullptr && (src == gdn || src->view_src == gdn) && src->view_offs < attn_nb) {
+                if (n->op != GGML_OP_RMS_NORM || s != 0) {
+                    return;
+                }
+                i_rms = j;
+            }
+        }
+    }
+    if (i_rms < 0) {
+        return;
+    }
+    // the four nodes, with only views between them (glm5next's gate reshape comes after the norm's MUL)
+    int idx[4] = { i_rms, -1, -1, -1 };
+    for (int j = i_rms + 1, k = 1; j < cgraph->n_nodes && k < 4; ++j) {
+        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            idx[k++] = j;
+        }
+    }
+    if (idx[3] < 0) {
+        return;
+    }
+    const ggml_tensor * rms   = cgraph->nodes[idx[0]];
+    const ggml_tensor * mul_w = cgraph->nodes[idx[1]];
+    const ggml_tensor * sig   = cgraph->nodes[idx[2]];
+    const ggml_tensor * out   = cgraph->nodes[idx[3]];
+    const ggml_tensor * x     = rms->src[0];
+    // the three nodes before the last read by it alone (not ggml_can_fuse_subgraph_ext: built in place, the norm and its
+    // weight's MUL are views of the GDN)
+    const ggml_op       ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+    for (int k = 0; k < 4; ++k) {
+        const ggml_tensor * n = cgraph->nodes[idx[k]];
+        if (n->op != ops[k] || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                (k < 3 && ((n->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, idx[k]) != 1))) {
+            return;
+        }
+    }
+    if (x->view_src != gdn || x->view_offs != 0 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] != S_v ||
+            ggml_nrows(x) != H * n_tokens * n_seqs ||
+            mul_w->src[0] != rms || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+            !((out->src[0] == mul_w && out->src[1] == sig) || (out->src[0] == sig && out->src[1] == mul_w))) {
+        return;
+    }
+    const ggml_tensor * w    = mul_w->src[1];
+    const ggml_tensor * gate = sig->src[0];
+    for (const ggml_tensor * t : { rms, mul_w, sig, out, w, gate }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return;
+        }
+    }
+    if (w->ne[0] != S_v || ggml_nrows(w) != 1 || !ggml_are_same_shape(mul_w, rms) ||
+            !ggml_are_same_shape(sig, rms) || !ggml_are_same_shape(gate, rms) || !ggml_are_same_shape(out, rms)) {
+        return;
+    }
+
+    const char * o0 = (const char *) out->data;
+    const char * o1 = o0 + ggml_nbytes(out);
+    const auto overlaps = [&](const void * p, size_t nbytes) {
+        return p != nullptr && o0 < (const char *) p + nbytes && (const char *) p < o1;
+    };
+    const auto base_overlaps = [&](const ggml_tensor * t) {
+        const ggml_tensor * b = t->view_src ? t->view_src : t;
+        return overlaps(b->data, ggml_nbytes(b));
+    };
+    // what the GDN reads and writes: its sources and, gathered, the rows' ids; the output rows and the gate as they are
+    const ggml_cuda_gated_delta_net_gather * gather = reg.find(gdn);
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        if (gdn->src[s] != nullptr && base_overlaps(gdn->src[s])) {
+            return;
+        }
+    }
+    if ((gather != nullptr && overlaps(gather->ids, n_seqs * sizeof(int32_t))) || base_overlaps(w) ||
+            (o0 != gdn->data && overlaps(gdn->data, ggml_nbytes(gdn))) ||
+            (o0 != gate->data && base_overlaps(gate))) {
+        return;
+    }
+    // the nodes up to the norm: none computes the gate, and none reads or writes the output's memory, or writes the gate's
+    const ggml_tensor * gate_base = gate->view_src ? gate->view_src : gate;
+    for (int j = node_idx + 1; j < i_rms; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == gate_base) {
+            return;
+        }
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (overlaps(n->data, ggml_nbytes(n)) || ggml_cuda_ranges_overlap(n, gate)) {
+            return;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] != nullptr && overlaps(n->src[s]->data, ggml_nbytes(n->src[s]))) {
+                return;
+            }
+        }
+    }
+
+    ggml_cuda_gated_delta_net_norm norm;
+    norm.w       = (const float *) w->data;
+    norm.gate    = (const float *) gate->data;
+    norm.out     = (float *) out->data;
+    norm.tickets = ctx.gdn_norm_tickets.ptr;
+    norm.eps     = ggml_get_op_params_f32(rms, 0);
+    reg.norms[gdn] = norm;
+    reg.norm_skipped.insert({ rms, mul_w, sig, out });
 }
 
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
@@ -4890,8 +5039,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+    // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache; and the gated norm after it, which the
+    // kernel writes too (registered for the op, which runs here or below)
     if (node->op == GGML_OP_GATED_DELTA_NET) {
+        ggml_cuda_try_gdn_gated_norm(*cuda_ctx, cgraph, i);
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
@@ -6267,7 +6418,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            cuda_ctx->gdn_gathers().reset();
+            cuda_ctx->gdn_gathers().reset(should_launch_concurrent_events);
             cuda_ctx->ssm_conv_updates().reset();
             cuda_ctx->fattn_kv_live().reset();
 
@@ -6597,6 +6748,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
     cuda_ctx->ssm_conv_ab_slots.ensure();
+    cuda_ctx->gdn_norm_tickets.ensure();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6688,6 +6840,7 @@ static void ggml_backend_cuda_capture_begin(ggml_backend_t backend) {
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
     cuda_ctx->ssm_conv_ab_slots.ensure();
+    cuda_ctx->gdn_norm_tickets.ensure();
     {
         std::lock_guard<std::mutex> lock(ggml_cuda_lock);
         ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);

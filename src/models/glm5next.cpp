@@ -359,9 +359,13 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 
     gate = ggml_reshape_3d(ctx0, gate, head_dim, n_head, n_tokens);
 
-    // plain sigmoid gate, not the SiLU that FusedRMSNormGated defaults to
-    ggml_tensor * normed = build_norm(o, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
-    ggml_tensor * gated  = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, gate));
+    // plain sigmoid gate, not the SiLU that FusedRMSNormGated defaults to. In place over the recurrence's attention rows,
+    // which nothing reads after the norm: the output is those rows in every graph, where the CUDA recurrence writes it
+    // itself (ggml_cuda_try_gdn_gated_norm), never the recurrence's inputs, whose memory a separate output could reuse
+    ggml_tensor * normed = ggml_rms_norm_inplace(ctx0, o, hparams.f_norm_rms_eps);
+    cb(normed, "norm", il);
+    normed = ggml_mul_inplace(ctx0, normed, layer.ssm_o_norm);
+    ggml_tensor * gated  = ggml_mul_inplace(ctx0, normed, ggml_sigmoid(ctx0, gate));
     cb(gated, "kda_normed", il);
 
     cur = ggml_mul_mat(ctx0, layer.wo, ggml_reshape_2d(ctx0, build_cont(gated), d_inner, n_tokens));

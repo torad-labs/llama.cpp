@@ -1553,6 +1553,41 @@ struct ggml_cuda_gated_delta_net_gather {
 #endif // defined(GGML_CUDA_USE_L2_WINDOW)
 };
 
+// The gated RMS norm a GATED_DELTA_NET kernel applies to its own attention output (ggml_cuda_try_gdn_gated_norm):
+// out = sigmoid(gate) * (rms_norm(row) * w) for every row of S_v, the gate and out laid out as the output is. The last
+// block of a (sequence, head) to finish takes the head's rows, by a ticket it then sets back to 0.
+struct ggml_cuda_gated_delta_net_norm {
+    const float *  w       = nullptr; // [S_v]
+    const float *  gate    = nullptr; // pre-activation
+    float *        out     = nullptr; // nullptr: no norm
+    unsigned int * tickets = nullptr; // one a (sequence, head), sequence * H + head (ggml_cuda_gdn_norm_tickets)
+    float          eps     = 0.0f;
+};
+
+// The gated norms' tickets, shared by every GATED_DELTA_NET of an evaluation: a launch's last block of a (sequence,
+// head) sets its ticket back to 0, and the next launch reaches its tickets only after its PDL wait, so after the launch
+// before it has finished (ggml_cuda_try_gdn_gated_norm declines the concurrent streams, where two could overlap). Made
+// zeroed before a graph evaluation, never inside a capture, like ggml_cuda_ssm_conv_ab_slots.
+struct ggml_cuda_gdn_norm_tickets {
+    static constexpr int n = 4096;
+
+    unsigned int * ptr = nullptr;
+
+    void ensure() {
+        if (ptr == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(ptr, 0, n * sizeof(unsigned int)));
+        }
+    }
+
+    void release() {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+            ptr = nullptr;
+        }
+    }
+};
+
 // What a PQ2_0 launch prefetches into L2 once it has requested all of its own weights (mmvq-pq2-mma.cu), as byte ranges
 // its blocks share out laid end to end: first the weights the kernels between it and the next launch read (the Gated
 // DeltaNet's alpha/beta matvec and conv, the norms, the rotations' signs: DRAM misses each token, each read on the chain
@@ -1710,9 +1745,15 @@ struct ggml_cuda_mmvq_shared_q8_1 {
 // something for the evaluation that made them. Cleared at the start of every graph evaluation/capture.
 struct ggml_cuda_gdn_gather_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_gated_delta_net_gather> gathers;
+    std::unordered_map<const ggml_tensor *, ggml_cuda_gated_delta_net_norm>   norms;        // by GATED_DELTA_NET
+    std::unordered_set<const ggml_tensor *>                                   norm_skipped; // the norms' four nodes
+    bool                                                                      concurrent = false; // the graph forks streams
 
-    void reset() {
+    void reset(bool concurrent_streams) {
         gathers.clear();
+        norms.clear();
+        norm_skipped.clear();
+        concurrent = concurrent_streams;
     }
 
     void set(const ggml_tensor * gdn, const ggml_cuda_gated_delta_net_gather & gather) {
@@ -1722,6 +1763,11 @@ struct ggml_cuda_gdn_gather_context {
     const ggml_cuda_gated_delta_net_gather * find(const ggml_tensor * gdn) const {
         const auto it = gathers.find(gdn);
         return it == gathers.end() ? nullptr : &it->second;
+    }
+
+    const ggml_cuda_gated_delta_net_norm * norm_of(const ggml_tensor * gdn) const {
+        const auto it = norms.find(gdn);
+        return it == norms.end() ? nullptr : &it->second;
     }
 };
 
@@ -2099,6 +2145,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pq2_tile_counters pq2_tile_counters;
     ggml_cuda_mmvq_shared_q8_1 mmvq_shared_q8_1; // filled during a graph evaluation only
     ggml_cuda_ssm_conv_ab_slots ssm_conv_ab_slots;
+    ggml_cuda_gdn_norm_tickets gdn_norm_tickets;
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it

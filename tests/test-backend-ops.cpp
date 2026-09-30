@@ -5084,9 +5084,14 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     // for the op, which CUDA folds into the kernel (ggml_cuda_try_gdn_gather_skip); the cache then starts random
     const int64_t state_row;
     const bool    kda; // a gate per key element (glm5next's KDA; raw: ggml_gated_delta_net_set_raw_kda_gates)
+    // glm5next's KDA output gate after the recurrence, sigmoid(gate) * (rms_norm(o) * w), o the attention rows, which
+    // CUDA's kernel writes itself (ggml_cuda_try_gdn_gated_norm): 1 into a tensor of its own, 2 in place over the rows,
+    // as glm5next builds it
+    const int     gated_norm;
 
     ggml_tensor * cpy_node      = nullptr;
     ggml_tensor * readback_node = nullptr;
+    ggml_tensor * gated_node    = nullptr;
 
     std::string vars() override {
         std::string s = VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, K, v_repeat, raw_gates, cache_type);
@@ -5099,16 +5104,19 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         if (kda) {
             s += "," + VAR_TO_STR(kda);
         }
+        if (gated_norm) {
+            s += "," + VAR_TO_STR(gated_norm);
+        }
         return s;
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
             int64_t K = 2, int v_repeat = 1, bool raw_gates = false, ggml_type cache_type = GGML_TYPE_F32,
-            int64_t mem_size = 0, int64_t kv_head = 0, int64_t state_row = -1, bool kda = false)
+            int64_t mem_size = 0, int64_t kv_head = 0, int64_t state_row = -1, bool kda = false, int gated_norm = 0)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
           v_repeat(v_repeat), raw_gates(raw_gates), cache_type(cache_type), mem_size(mem_size), kv_head(kv_head),
-          state_row(state_row), kda(kda) {}
+          state_row(state_row), kda(kda), gated_norm(gated_norm) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -5203,20 +5211,45 @@ struct test_gated_delta_net_cache_fusion : public test_case {
             cached = ggml_cpy(ctx, cpy, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_seqs, n_written));
         }
         ggml_tensor * out = ggml_sum(ctx, cached);
+        if (gated_norm) {
+            // as glm5next builds it: the attention rows' view, reshaped, and the gate a 2D product reshaped after the
+            // norm, so a RESHAPE sits between the norm's MUL and the SIGMOID
+            const int64_t n_tokens = n_seq_tokens * n_seqs;
+            ggml_tensor * o = ggml_view_4d(ctx, gdn_out, S_v, H_v, n_seq_tokens, n_seqs,
+                    ggml_row_size(gdn_out->type, S_v), ggml_row_size(gdn_out->type, S_v * H_v),
+                    ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens), 0);
+            o = ggml_reshape_3d(ctx, o, S_v, H_v, n_tokens);
+            ggml_tensor * w    = ggml_new_tensor_1d(ctx, type, S_v);
+            ggml_tensor * gate = ggml_new_tensor_2d(ctx, type, S_v * H_v, n_tokens);
+            ggml_set_name(w,    "norm_w");
+            ggml_set_name(gate, "gate");
+            ggml_tensor * sig = ggml_sigmoid(ctx, ggml_reshape_3d(ctx, gate, S_v, H_v, n_tokens));
+            if (gated_norm == 2) {
+                gated_node = ggml_mul_inplace(ctx, ggml_mul_inplace(ctx, ggml_rms_norm_inplace(ctx, o, 1e-6f), w), sig);
+            } else {
+                gated_node = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, 1e-6f), w), sig);
+            }
+            ggml_set_name(gated_node, "gated");
+            out = ggml_add(ctx, out, ggml_sum(ctx, gated_node));
+        }
         return out;
     }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "GATED_DELTA_NET_CACHE_FUSION";
+        return gated_norm ? "GATED_DELTA_NET_GATED_NORM" : "GATED_DELTA_NET_CACHE_FUSION";
     }
 
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = { cpy_node };
         if (readback_node != nullptr) {
-            return { cpy_node, readback_node };
+            nodes.push_back(readback_node);
         }
-        return { cpy_node };
+        if (gated_node != nullptr) {
+            nodes.push_back(gated_node);
+        }
+        return nodes;
     }
 
     double max_nmse_err() override {
@@ -5250,6 +5283,10 @@ struct test_gated_delta_net_cache_fusion : public test_case {
             } else if (strcmp(t->name, "ids") == 0) {
                 const std::vector<int32_t> rows(n_seqs, (int32_t) state_row);
                 ggml_backend_tensor_set(t, rows.data(), 0, rows.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "gate") == 0) {
+                init_tensor_uniform(t, -6.0f, 6.0f);
+            } else if (strcmp(t->name, "norm_w") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -12156,6 +12193,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, 1, 1, 1, true, GGML_TYPE_F32, 0, 0, -1, true));
+
+    // the KDA output gate the kernel writes (ggml_cuda_try_gdn_gated_norm), built in place as glm5next builds it: the
+    // served layer at decode and MTP verify over 1-2 seqs on the -cts f16 cache, a q8_0 one, the gather from a rollback
+    // row, the scalar gate on 64- and 32-wide heads, and 20 tokens, which keep the four nodes. Built into a tensor of its
+    // own: the kernel writes it wherever the allocator put it, or the nodes stay where that is on the GDN's inputs
+    for (int gated_norm : { 2, 1 }) {
+        for (int64_t n_seqs : { 1, 2 }) {
+            for (int64_t n_tokens : { 1, 3 }) {
+                test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, n_seqs, 3, 1, true, GGML_TYPE_F16, 0, 0, -1, true, gated_norm));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, 1, 1, 1, true, GGML_TYPE_Q8_0, 0, 0, -1, true, 2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, 1, 3, 1, true, GGML_TYPE_F16, 3, 1, 4, true, 2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  64, 4, 2, 4, 1, true, GGML_TYPE_F32, 0, 0, -1, false, 2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32, 2, 1, 2, 1, false, GGML_TYPE_F32, 0, 0, -1, false, 2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 20, 1, 3, 1, true, GGML_TYPE_F16, 0, 0, -1, true, 2));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
