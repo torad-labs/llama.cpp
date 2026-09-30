@@ -11311,6 +11311,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, true,  2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, false, 4096, n, 2048));
     }
+    // and every token routed to each of 8 experts (the 44-layer proxy's routing), so each expert meets every token: the
+    // ring meets a fragment with 2 to 8 vectors, past its 4 at once at 5 and 8 tokens
+    for (int n : { 2, 3, 5, 8 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, true,  2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, false, 4096, n, 2048));
+    }
     // and its routed FFN, gate/up then down on one ids: its FFN on one card (2,048) and on each of two under -sm tensor
     // (1,024), with and without the SwiGLU limit
     for (int64_t n_ff : { 2048, 1024 }) {
@@ -11319,6 +11325,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 16, 8, 4096, n_ff, n, glu_limit));
             }
         }
+    }
+    // and the proxy's, every token on each of 8 experts, its gated gate/up and down each meeting 3 or 5 vectors a row
+    for (int n : { 3, 5 }) {
+        test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 8, 8, 4096, 2048, n, 7.0f));
     }
     // and the experts' weighted sum after the down: GLM's (4,096 and 8 slots) at a decode, an MTP verify and a batch, and
     // other widths and slot counts (gpt-oss's 2,880 and 4, a row past a block)

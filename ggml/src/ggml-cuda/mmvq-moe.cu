@@ -36,7 +36,9 @@
 // kernel spills. The math is bound by shared memory and L1, not by the dot products: the grid is gathered at random,
 // so past the ring the shared memory holds it a copy per lane (grid_rep[i*32 + lane]: a warp's 32 gathers in 32 banks,
 // whatever the indices), and a lane keeps its q8_1 fragments in registers, loaded once per token vector, not once per
-// row. The other types read as mul_mat_vec_q does (vec_dot_q_cuda), from the slot, which their team releases after it.
+// row. In a launch of several tokens a fragment is decoded once (its grid gathered, its signs applied) and met with the
+// vectors of its expert's pairs in turn (pairs_once). The other types read as mul_mat_vec_q does (vec_dot_q_cuda), from
+// the slot, which their team releases after it.
 //
 // The tokens' q8_1 vectors come from a copy in shared memory past the ring when it fits there, which the producer's
 // first bulk copy makes, before any tile: a global load that a consumer issues behind the ring's copies waits for them.
@@ -63,6 +65,8 @@
 #define MMVQ_MOE_MAX_SLOTS   8
 #define MMVQ_MOE_SMEM_MAX    (99 * 1024)       // the shared memory a block may take on sm_90 - sm_120
 #define MMVQ_MOE_SLOT_TARGET (16 * 1024)       // a slot's bytes past one row a warp: more slots, a shorter tail
+#define MMVQ_MOE_PB          4                 // an expert's pairs a decoded fragment meets at once: an MTP verify's
+                                               // 1-3 drafts and their token in one pass
 
 static_assert(MMVQ_MOE_MAX_PAIRS == 64, "the producer warp lists the pairs, two a lane");
 static_assert(MMVQ_MOE_MAX_PAIRS <= 64, "an expert's pairs are a 64-bit mask");
@@ -115,6 +119,14 @@ static constexpr __host__ __device__ int mmvq_moe_iq3_nit(const int rpw) {
 // what fits, and only what fits is built.
 static constexpr bool mmvq_moe_fits(const ggml_type type, const int nmat, const int rpw) {
     return type != GGML_TYPE_IQ3_XXS || rpw*nmat*mmvq_moe_iq3_nit(rpw) <= 8;
+}
+
+// Whether an instance may decode each fragment once for all the pairs of its expert (pairs_once, a launch of several
+// tokens): IQ3_XXS, whose decode is most of its math, where the decoded fragments and the pairs' sums fit the registers
+// beside the slot's fragments. Its own instance: beside the one-pair path's registers (a vector's fragments kept across
+// tiles) the kernel spilled, and so did the one-pair path (GLM-5.3's proxy at 3 tokens: the gate/up 108 -> 139 us)
+static constexpr __host__ __device__ bool mmvq_moe_pairs_fits(const ggml_type type, const int nmat, const int rpw) {
+    return type == GGML_TYPE_IQ3_XXS && rpw*nmat <= 2;
 }
 
 #ifdef MMVQ_MOE_AVAILABLE
@@ -175,9 +187,10 @@ static __device__ __forceinline__ const block_q8_1 * mmvq_moe_y(const mmvq_moe_d
     return y_base + (int64_t) (slot % a.nchannels_y)*a.stride_channel_y + (int64_t) t*a.stride_col_y;
 }
 
-template <ggml_type type, int nmat, int rpw>
+template <ggml_type type, int nmat, int rpw, bool pairs_once>
 __launch_bounds__((MMVQ_MOE_NW + 1)*32, 1)
 static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
+    static_assert(!pairs_once || mmvq_moe_pairs_fits(type, nmat, rpw), "an instance that decodes once for the pairs");
 #ifdef MMVQ_MOE_AVAILABLE
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int qi              = ggml_cuda_type_traits<type>::qi;
@@ -394,11 +407,11 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
     const int kqs  = vdr * (lane % lanes_per_block);                     // and its quant ints in each
 
     // IQ3_XXS: the lane's q8_1 fragments, a k iteration each (its block's 8 ints and scale), of the vector y_key
-    // (token * nchannels_y + channel), kept across pairs and tiles until the vector changes
+    // (token * nchannels_y + channel), kept across pairs and tiles until the vector changes (not with pairs_once)
     constexpr int nit = type == GGML_TYPE_IQ3_XXS ? mmvq_moe_iq3_nit(rpw) : 1;
-    int   yu[nit][8];
-    float yd[nit];
-    int   y_key = -1;
+    [[maybe_unused]] int   yu[nit][8];
+    [[maybe_unused]] float yd[nit];
+    [[maybe_unused]] int   y_key = -1;
     [[maybe_unused]] const auto grid   = [&](const int i) { return grid_rep[i*32 + lane]; };
     [[maybe_unused]] const auto ksigns = [&](const int i) { return ksigns_s[i]; };
 
@@ -439,11 +452,120 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
             }
         }
 
-        // every pair that routes to the expert, each with its own tokens (a down projection's differ by slot)
-        for (unsigned long long pairs = pairs_of[u]; pairs != 0; pairs &= pairs - 1) {
-            const int p    = __ffsll(pairs) - 1;
+        // a pair's rows: each lane's sums added over the warp, and lane 0 writes them, through the GLU with a gate
+        const auto finish = [&](const int p, float (&acc)[rpw][nmat]) {
             const int t    = p / a.n_used;
             const int slot = p % a.n_used;
+#pragma unroll
+            for (int r = 0; r < rpw; ++r) {
+#pragma unroll
+                for (int m = 0; m < nmat; ++m) {
+                    acc[r][m] = warp_reduce_sum<32>(acc[r][m]);
+                }
+            }
+
+#pragma unroll
+            for (int r = 0; r < rpw; ++r) {
+                const float * v   = acc[r];
+                const int     row = row0 + r;
+                if (lane == 0 && row < a.nrows) {
+                    float result = v[0];
+                    if (a.x_bias != nullptr) {
+                        result += a.x_bias[e*a.stride_bias + row];
+                    }
+                    if constexpr (nmat == 2) {
+                        float gate_value = v[1];
+                        if (a.gate_bias != nullptr) {
+                            gate_value += a.gate_bias[e*a.stride_bias + row];
+                        }
+                        if (a.glu_limit > 0.0f) {
+                            gate_value = fminf(gate_value, a.glu_limit);
+                            result     = fminf(fmaxf(result, -a.glu_limit), a.glu_limit);
+                        }
+                        switch (a.glu_op) {
+                            case GGML_GLU_OP_SWIGLU:
+                                result *= ggml_cuda_op_silu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_GEGLU:
+                                result *= ggml_cuda_op_gelu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_OAI:
+                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                break;
+                            default:
+                                result = result * gate_value;
+                                break;
+                        }
+                    }
+                    a.dst[t*a.stride_col_dst + slot*a.stride_channel_dst + row] = result;
+                }
+            }
+        };
+
+        // pairs_once (IQ3_XXS, a launch of several tokens): the expert's pairs MMVQ_MOE_PB at a time, each fragment
+        // decoded once, its grid gathered and its signs applied, and met with the pairs' vectors in turn, where a pair at
+        // a time decoded it again for each (GLM-5.3's proxy at 3 tokens, every token on each of its 8 experts, RTX 5070
+        // Ti under ncu: the gate/up 113-116 us at 51-53 % of DRAM, its memory pipes 72-74 % busy). A vector's fragments
+        // are read for each tile, not kept across tiles. Each pair's sums are added in the same order, so the same bits
+        if constexpr (pairs_once) {
+            for (unsigned long long pairs = pairs_of[u]; pairs != 0;) {
+                int pc[MMVQ_MOE_PB]; // the pass's pairs, -1 past them
+                int yo[MMVQ_MOE_PB]; // and their vectors, in blocks past y_base
+#pragma unroll
+                for (int q = 0; q < MMVQ_MOE_PB; ++q) {
+                    pc[q] = pairs != 0 ? __ffsll(pairs) - 1 : -1;
+                    yo[q] = pc[q] >= 0 ? (int) (mmvq_moe_y(a, y_base, pc[q]) - y_base) : 0;
+                    pairs &= pairs - 1;
+                }
+                float acc[MMVQ_MOE_PB][rpw][nmat] = {};
+#pragma unroll
+                for (int it = 0; it < nit; ++it) {
+                    const int kb = kb0 + it*blocks_per_iter;
+                    if (kb < a.nb) {
+                        iq3_xxs_frag_q8 wq[rpw][nmat];
+#pragma unroll
+                        for (int r = 0; r < rpw; ++r) {
+#pragma unroll
+                            for (int m = 0; m < nmat; ++m) {
+                                wq[r][m] = iq3_xxs_frag_decode(wf[r][m][it], grid, ksigns);
+                            }
+                        }
+#pragma unroll
+                        for (int q = 0; q < MMVQ_MOE_PB; ++q) {
+                            if (pc[q] >= 0) {
+                                const block_q8_1 * yb = y_base + yo[q] + kb*(qk/QK8_1) + kqs/2;
+                                int u8[8];
+#pragma unroll
+                                for (int l = 0; l < 8; ++l) {
+                                    u8[l] = get_int_b4(yb->qs, l);
+                                }
+                                const float d8 = __low2float(yb->ds);
+#pragma unroll
+                                for (int r = 0; r < rpw; ++r) {
+#pragma unroll
+                                    for (int m = 0; m < nmat; ++m) {
+                                        acc[q][r][m] += vec_dot_iq3_xxs_frag_q8(wq[r][m], u8, d8);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < MMVQ_MOE_PB; ++q) {
+                    if (pc[q] >= 0) {
+                        finish(pc[q], acc[q]);
+                    }
+                }
+            }
+        }
+
+        // every pair that routes to the expert, each with its own tokens (a down projection's differ by slot): with
+        // pairs_once, none past the passes above
+        for (unsigned long long pairs = pairs_once ? 0 : pairs_of[u]; pairs != 0; pairs &= pairs - 1) {
+            const int p    = __ffsll(pairs) - 1;
+            [[maybe_unused]] const int t    = p / a.n_used;
+            [[maybe_unused]] const int slot = p % a.n_used;
             const block_q8_1 * y = mmvq_moe_y(a, y_base, p);
 
             float acc[rpw][nmat] = {{0.0f}};
@@ -490,50 +612,7 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
                     }
                 }
             }
-#pragma unroll
-            for (int r = 0; r < rpw; ++r) {
-#pragma unroll
-                for (int m = 0; m < nmat; ++m) {
-                    acc[r][m] = warp_reduce_sum<32>(acc[r][m]);
-                }
-            }
-
-#pragma unroll
-            for (int r = 0; r < rpw; ++r) {
-                const float * v   = acc[r];
-                const int     row = row0 + r;
-                if (lane == 0 && row < a.nrows) {
-                    float result = v[0];
-                    if (a.x_bias != nullptr) {
-                        result += a.x_bias[e*a.stride_bias + row];
-                    }
-                    if constexpr (nmat == 2) {
-                        float gate_value = v[1];
-                        if (a.gate_bias != nullptr) {
-                            gate_value += a.gate_bias[e*a.stride_bias + row];
-                        }
-                        if (a.glu_limit > 0.0f) {
-                            gate_value = fminf(gate_value, a.glu_limit);
-                            result     = fminf(fmaxf(result, -a.glu_limit), a.glu_limit);
-                        }
-                        switch (a.glu_op) {
-                            case GGML_GLU_OP_SWIGLU:
-                                result *= ggml_cuda_op_silu_single(gate_value);
-                                break;
-                            case GGML_GLU_OP_GEGLU:
-                                result *= ggml_cuda_op_gelu_single(gate_value);
-                                break;
-                            case GGML_GLU_OP_SWIGLU_OAI:
-                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
-                                break;
-                            default:
-                                result = result * gate_value;
-                                break;
-                        }
-                    }
-                    a.dst[t*a.stride_col_dst + slot*a.stride_channel_dst + row] = result;
-                }
-            }
+            finish(p, acc);
         }
 
         if constexpr (type != GGML_TYPE_IQ3_XXS) {
@@ -572,7 +651,8 @@ static int64_t mmvq_moe_row_bytes(ggml_type type, int64_t ncols_x) {
 
 // The shared memory the ring and the tokens' vectors share: MMVQ_MOE_SMEM_MAX past the instance's static shared memory
 // as compiled (barriers and lists, and at IQ3_XXS its tables: 36,232 bytes on sm_120), read once a device. A 36 KiB
-// budget for it left an MTP verify's gate/up without the room for its 3 tokens' vectors beside its ring.
+// budget for it left an MTP verify's gate/up without the room for its 3 tokens' vectors beside its ring. A pairs_once
+// instance declares the same shared memory as its shape's other.
 template <ggml_type type, int nmat, int rpw>
 static int mmvq_moe_dyn_max() {
     if constexpr (mmvq_moe_fits(type, nmat, rpw)) {
@@ -580,7 +660,7 @@ static int mmvq_moe_dyn_max() {
         const int  id                             = ggml_cuda_get_device();
         if (dyn_max[id] == 0) {
             cudaFuncAttributes attr;
-            CUDA_CHECK(cudaFuncGetAttributes(&attr, mmvq_moe<type, nmat, rpw>));
+            CUDA_CHECK(cudaFuncGetAttributes(&attr, mmvq_moe<type, nmat, rpw, false>));
             dyn_max[id] = MMVQ_MOE_SMEM_MAX - (int) attr.sharedSizeBytes;
         }
         return dyn_max[id];
@@ -659,28 +739,41 @@ bool ggml_cuda_mmvq_moe_usable(int cc, ggml_type type, const void * vx, const vo
         (type != GGML_TYPE_IQ3_XXS || (ncols_x/QK_K + 3)/4 <= mmvq_moe_iq3_nit(p.rpw));
 }
 
-template <ggml_type type, int nmat, int rpw>
+template <ggml_type type, int nmat, int rpw, bool pairs_once>
 static void mmvq_moe_launch(const mmvq_moe_dev_args & a, const int nblocks, cudaStream_t stream) {
     if constexpr (mmvq_moe_fits(type, nmat, rpw)) {
         const size_t smem = (size_t) a.nslots * nmat * a.box_bytes + a.y_bytes;
-        CUDA_SET_SHARED_MEMORY_LIMIT((mmvq_moe<type, nmat, rpw>), (mmvq_moe_dyn_max<type, nmat, rpw>())); // every plan's
+        CUDA_SET_SHARED_MEMORY_LIMIT((mmvq_moe<type, nmat, rpw, pairs_once>), (mmvq_moe_dyn_max<type, nmat, rpw>())); // every plan's
         const ggml_cuda_kernel_launch_params params(dim3(nblocks), dim3((MMVQ_MOE_NW + 1)*32), smem, stream);
-        ggml_cuda_kernel_launch(mmvq_moe<type, nmat, rpw>, params, a);
+        ggml_cuda_kernel_launch(mmvq_moe<type, nmat, rpw, pairs_once>, params, a);
     } else {
         GGML_ABORT("%s: no plan takes %d matrices at %d rows a warp for %s", __func__, nmat, rpw, ggml_type_name(type));
     }
 }
 
+// the shape's pairs_once instance where it has one (mmvq_moe_pairs_fits) and pairs_once, its other otherwise
+template <ggml_type type, int nmat, int rpw>
+static void mmvq_moe_launch_pairs(const mmvq_moe_dev_args & a, const bool pairs_once, const int nblocks,
+                                  cudaStream_t stream) {
+    if constexpr (mmvq_moe_pairs_fits(type, nmat, rpw)) {
+        if (pairs_once) {
+            mmvq_moe_launch<type, nmat, rpw, true>(a, nblocks, stream);
+            return;
+        }
+    }
+    mmvq_moe_launch<type, nmat, rpw, false>(a, nblocks, stream);
+}
+
 template <ggml_type type>
-static void mmvq_moe_launch_type(const mmvq_moe_dev_args & a, const int nmat, const int rpw, const int nblocks,
-                                 cudaStream_t stream) {
+static void mmvq_moe_launch_type(const mmvq_moe_dev_args & a, const int nmat, const int rpw, const bool pairs_once,
+                                 const int nblocks, cudaStream_t stream) {
     switch (nmat*8 + rpw) {
-        case 1*8 + 1: mmvq_moe_launch<type, 1, 1>(a, nblocks, stream); break;
-        case 1*8 + 2: mmvq_moe_launch<type, 1, 2>(a, nblocks, stream); break;
-        case 1*8 + 4: mmvq_moe_launch<type, 1, 4>(a, nblocks, stream); break;
-        case 2*8 + 1: mmvq_moe_launch<type, 2, 1>(a, nblocks, stream); break;
-        case 2*8 + 2: mmvq_moe_launch<type, 2, 2>(a, nblocks, stream); break;
-        case 2*8 + 4: mmvq_moe_launch<type, 2, 4>(a, nblocks, stream); break;
+        case 1*8 + 1: mmvq_moe_launch_pairs<type, 1, 1>(a, pairs_once, nblocks, stream); break;
+        case 1*8 + 2: mmvq_moe_launch_pairs<type, 1, 2>(a, pairs_once, nblocks, stream); break;
+        case 1*8 + 4: mmvq_moe_launch_pairs<type, 1, 4>(a, pairs_once, nblocks, stream); break;
+        case 2*8 + 1: mmvq_moe_launch_pairs<type, 2, 1>(a, pairs_once, nblocks, stream); break;
+        case 2*8 + 2: mmvq_moe_launch_pairs<type, 2, 2>(a, pairs_once, nblocks, stream); break;
+        case 2*8 + 4: mmvq_moe_launch_pairs<type, 2, 4>(a, pairs_once, nblocks, stream); break;
         default: GGML_ABORT("%s: no instance for %d matrices at %d rows a warp", __func__, nmat, rpw);
     }
 }
@@ -748,13 +841,18 @@ void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t strea
     a.ids_ready              = args.ids_ready ? 1 : 0;
     a.l2_issue_stop          = args.l2_issue_stop;
 
+    // a launch of several tokens decodes each fragment once for an expert's pairs where the shape has that instance
+    // (mmvq_moe_pairs_fits). GGML_CUDA_MMVQ_MOE_PAIRS_LEGACY=1: each pair decodes it
+    static const bool pairs_legacy = ggml_env_switch("GGML_CUDA_MMVQ_MOE_PAIRS_LEGACY");
+    const bool        pairs_once   = !pairs_legacy && args.ntokens > 1;
+
     // one block an SM, never more than the tiles of the most distinct experts the pairs can name
     const int nsm     = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     const int nblocks = (int) std::min<int64_t>(nsm, args.ntokens*args.n_used*ntr);
 
     switch (args.type) {
-        case GGML_TYPE_IQ3_XXS: mmvq_moe_launch_type<GGML_TYPE_IQ3_XXS>(a, nmat, p.rpw, nblocks, stream); break;
-        case GGML_TYPE_Q8_0:    mmvq_moe_launch_type<GGML_TYPE_Q8_0>   (a, nmat, p.rpw, nblocks, stream); break;
+        case GGML_TYPE_IQ3_XXS: mmvq_moe_launch_type<GGML_TYPE_IQ3_XXS>(a, nmat, p.rpw, pairs_once, nblocks, stream); break;
+        case GGML_TYPE_Q8_0:    mmvq_moe_launch_type<GGML_TYPE_Q8_0>   (a, nmat, p.rpw, pairs_once, nblocks, stream); break;
         default: GGML_ABORT("%s: no instance for %s", __func__, ggml_type_name(args.type));
     }
 }

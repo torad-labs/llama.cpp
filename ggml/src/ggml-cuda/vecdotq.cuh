@@ -1393,43 +1393,84 @@ static __device__ __forceinline__ iq3_xxs_frag iq3_xxs_frag_load(const block_iq3
              __half2float(bq3->d) };
 }
 
-// A fragment against the 8 ints u of the q8_1 block it meets and its scale d8. grid(i) and ksigns(i) read iq3xxs_grid
-// and ksigns64 wherever the caller keeps them (mmvq-moe.cu: the grid a copy per lane in shared memory, so a warp's 32
+// A fragment's 32 weights as signed bytes, 4 an int in the order of the q8_1 ints they meet, and its scale: what
+// vec_dot_iq3_xxs_frag makes of it before the dot products, for a caller that meets one fragment with several q8_1
+// blocks (mmvq-moe.cu, the tokens that route to one expert)
+struct iq3_xxs_frag_q8 {
+    int   q[8];
+    int   ls; // the 4-bit scale
+    float d;
+};
+
+// A fragment's weights 4*l0 to 4*l0 + 7 (l0 even) as signed bytes, 4 an int. grid(i) and ksigns(i) read iq3xxs_grid and
+// ksigns64 wherever the caller keeps them (mmvq-moe.cu: the grid a copy per lane in shared memory, so a warp's 32
 // gathers meet no bank conflict).
 template <typename grid_t, typename ksigns_t>
-static __device__ __forceinline__ float vec_dot_iq3_xxs_frag(
-    const iq3_xxs_frag & w, const int * u, const float d8, grid_t grid, ksigns_t ksigns) {
-
+static __device__ __forceinline__ int2 iq3_xxs_frag_pair(const iq3_xxs_frag & w, const int l0, grid_t grid, ksigns_t ksigns) {
     const uint8_t * q3    = (const uint8_t *) &w.q3;
     const uint32_t  aux32 = w.aux32;
 
+    const int2 grid_pos = make_int2(grid(q3[l0 + 0]), grid(q3[l0 + 1]));
+    // the 8 weights' signs as byte masks, 0xFF where negative (the 8th: the parity of the 7 stored), and a negative
+    // weight as ~g + 1, with no carry into the next byte as every grid byte is 4-62: 3 integer ops for 4 weights,
+    // where __vcmpne4 and __vsub4 are emulated in several each (built with -DGGML_CUDA_IQ3_XXS_SIGNS_LEGACY)
+#ifdef GGML_CUDA_IQ3_XXS_SIGNS_LEGACY
+    GGML_UNUSED(ksigns);
+    const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+    const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+    const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+    const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+    const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#else
+    const uint64_t signs  = ksigns((aux32 >> (7*l0/2)) & 0x7F);
+    const int      signs0 = (int) (uint32_t) signs;
+    const int      signs1 = (int) (uint32_t) (signs >> 32);
+    const int      grid_l = (grid_pos.x ^ signs0) + (signs0 & 0x01010101);
+    const int      grid_h = (grid_pos.y ^ signs1) + (signs1 & 0x01010101);
+#endif // GGML_CUDA_IQ3_XXS_SIGNS_LEGACY
+    return make_int2(grid_l, grid_h);
+}
+
+// The whole fragment decoded (iq3_xxs_frag_pair's grid and ksigns)
+template <typename grid_t, typename ksigns_t>
+static __device__ __forceinline__ iq3_xxs_frag_q8 iq3_xxs_frag_decode(const iq3_xxs_frag & w, grid_t grid, ksigns_t ksigns) {
+    iq3_xxs_frag_q8 wq;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 q = iq3_xxs_frag_pair(w, l0, grid, ksigns);
+        wq.q[l0 + 0] = q.x;
+        wq.q[l0 + 1] = q.y;
+    }
+    wq.ls = w.aux32 >> 28;
+    wq.d  = w.d;
+    return wq;
+}
+
+// A decoded fragment against the 8 ints u of the q8_1 block it meets and its scale d8
+static __device__ __forceinline__ float vec_dot_iq3_xxs_frag_q8(const iq3_xxs_frag_q8 & wq, const int * u, const float d8) {
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        sumi = ggml_cuda_dp4a(wq.q[l], u[l], sumi);
+    }
+    sumi = (wq.ls*sumi + sumi/2)/2;
+    return wq.d * d8 * sumi;
+}
+
+// A fragment against the 8 ints u of the q8_1 block it meets and its scale d8 (iq3_xxs_frag_pair's grid and ksigns),
+// each pair of ints met as it is decoded: the whole fragment decoded first, the one-pair ring's down ran 61.4 -> 66.9 us
+// a layer (GLM-5.3's proxy at 3 tokens, RTX 5070 Ti), its q8_1 reloads branched around where they were predicated
+template <typename grid_t, typename ksigns_t>
+static __device__ __forceinline__ float vec_dot_iq3_xxs_frag(
+    const iq3_xxs_frag & w, const int * u, const float d8, grid_t grid, ksigns_t ksigns) {
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(grid(q3[l0 + 0]), grid(q3[l0 + 1]));
-        // the 8 weights' signs as byte masks, 0xFF where negative (the 8th: the parity of the 7 stored), and a negative
-        // weight as ~g + 1, with no carry into the next byte as every grid byte is 4-62: 3 integer ops for 4 weights,
-        // where __vcmpne4 and __vsub4 are emulated in several each (built with -DGGML_CUDA_IQ3_XXS_SIGNS_LEGACY)
-#ifdef GGML_CUDA_IQ3_XXS_SIGNS_LEGACY
-        GGML_UNUSED(ksigns);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
-#else
-        const uint64_t signs  = ksigns((aux32 >> (7*l0/2)) & 0x7F);
-        const int      signs0 = (int) (uint32_t) signs;
-        const int      signs1 = (int) (uint32_t) (signs >> 32);
-        const int      grid_l = (grid_pos.x ^ signs0) + (signs0 & 0x01010101);
-        const int      grid_h = (grid_pos.y ^ signs1) + (signs1 & 0x01010101);
-#endif // GGML_CUDA_IQ3_XXS_SIGNS_LEGACY
-
-        sumi = ggml_cuda_dp4a(grid_l, u[l0 + 0], sumi);
-        sumi = ggml_cuda_dp4a(grid_h, u[l0 + 1], sumi);
+        const int2 q = iq3_xxs_frag_pair(w, l0, grid, ksigns);
+        sumi = ggml_cuda_dp4a(q.x, u[l0 + 0], sumi);
+        sumi = ggml_cuda_dp4a(q.y, u[l0 + 1], sumi);
     }
-
-    const int ls = aux32 >> 28;
+    const int ls = w.aux32 >> 28;
     sumi = (ls*sumi + sumi/2)/2;
     return w.d * d8 * sumi;
 }
