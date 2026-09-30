@@ -314,8 +314,17 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
             nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, 2*d_inner));
 
 
+    // the output gate reads the layer input, not the recurrence's output: its two low-rank products go into the graph
+    // here, after the convolution, g_a beside f_a (two mat-vecs of one input, which ggml-cuda runs as one launch) and
+    // g_b before the recurrence, so that nothing after the recurrence waits on them
+    ggml_build_forward_expand(gf, qk);
+    ggml_tensor * f_a  = ggml_mul_mat(ctx0, layer.ssm_f_a, inp);
+    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_g_b, ggml_mul_mat(ctx0, layer.ssm_g_a, inp));
+    ggml_build_forward_expand(gf, f_a);
+    ggml_build_forward_expand(gf, gate);
+
     // g = lower_bound * sigmoid(exp(A_log)*(f_b(f_a(x)) + dt_bias)); it scales, not clamps
-    ggml_tensor * g_raw = ggml_mul_mat(ctx0, layer.ssm_f_b, ggml_mul_mat(ctx0, layer.ssm_f_a, inp));
+    ggml_tensor * g_raw = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
     g_raw = ggml_add(ctx0, g_raw, layer.ssm_dt_b);
     ggml_tensor * g = ggml_reshape_3d(ctx0, g_raw, head_dim, n_head, n_tokens);
     g = ggml_mul(ctx0, g, ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1));
@@ -348,7 +357,6 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     ggml_tensor * o = ggml_reshape_3d(ctx0, build_cont(out), head_dim, n_head, n_tokens);
     cb(o, "kda_scan_out", il);
 
-    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_g_b, ggml_mul_mat(ctx0, layer.ssm_g_a, inp));
     gate = ggml_reshape_3d(ctx0, gate, head_dim, n_head, n_tokens);
 
     // plain sigmoid gate, not the SiLU that FusedRMSNormGated defaults to
