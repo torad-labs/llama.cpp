@@ -1616,9 +1616,11 @@ struct ggml_cuda_pq2_tile_counters {
 // The q8_1 copies of the F32 inputs that two or more quantized MUL_MAT / MUL_MAT_ID of one graph evaluation read on
 // mul_mat_vec_q (the q, k and v projections of one input; a shared expert's and the routed experts' gate/up): the first
 // reader quantizes into a pool allocation the evaluation holds (ggml_cuda_graph_evaluate_and_capture makes it before
-// that node), and the others read the copy (ggml_cuda_mul_mat_vec_q). A copy is keyed by its input's first byte and rows,
-// and its next reader quantizes it again once a node has written over any of those bytes (an in-place op, or ggml-alloc
-// handing them to a later tensor).
+// that node), and the others read the copy (ggml_cuda_mul_mat_vec_q). An input whose own kernel can write the copy (the
+// hyper-connection front's normed mix, ggml_cuda_dsv4_hc_writes_q8_1) has it made before any node runs, for one reader
+// or more, and the kernel writes it; the first reader quantizes it where it did not. A copy is keyed by its input's
+// first byte and rows, and its next reader quantizes it again once a node has written over any of those bytes (an
+// in-place op, or ggml-alloc handing them to a later tensor).
 struct ggml_cuda_mmvq_shared_q8_1 {
     // an input as nrows rows of ne0 floats, row r at data + r*row_stride in the order quantize_row_q8_1_cuda writes them
     // (r = i1 + ne1*(i2 + ne2*i3))
@@ -1637,14 +1639,20 @@ struct ggml_cuda_mmvq_shared_q8_1 {
         char * q8_1;
         size_t size;
         bool   quantized;
+        // the index of the last producer to write the copy, or -1: a write by a node up to it, in its fused group or
+        // before it, precedes the copy on the stream and leaves it whole
+        int    made_at = -1;
     };
     std::vector<entry> entries;
+    // the nodes whose kernels write their outputs' copies (the key their copy's), by their index in the graph
+    std::unordered_map<const ggml_tensor *, int> producers;
     // The MUL_MAT that leads the node group being run, or nullptr: only its input is read from a copy. The evaluation
     // learns of a group's writes after the group, and a MUL_MAT further in a group may read what an earlier node wrote.
     const ggml_tensor * head = nullptr;
 
     void reset() {
         entries.clear();
+        producers.clear();
         head = nullptr;
     }
 
@@ -1679,11 +1687,10 @@ struct ggml_cuda_mmvq_shared_q8_1 {
         return k.nrows*GGML_PAD(k.ne0, MATRIX_ROW_PADDING)*sizeof(block_q8_1)/QK8_1;
     }
 
-    // the copy of t, when t is the input of head
-    entry * find(const ggml_tensor * t) {
+    // the copy of t, whoever makes it
+    entry * find_any(const ggml_tensor * t) {
         key k;
-        key head_k;
-        if (entries.empty() || head == nullptr || !key_of(t, k) || !key_of(head->src[1], head_k) || !(k == head_k)) {
+        if (entries.empty() || !key_of(t, k)) {
             return nullptr;
         }
         for (entry & e : entries) {
@@ -1695,11 +1702,33 @@ struct ggml_cuda_mmvq_shared_q8_1 {
         return nullptr;
     }
 
-    // a node wrote [data, data + nbytes)
-    void written(const char * data, size_t nbytes) {
+    // the copy of t, when t is the input of head
+    entry * find(const ggml_tensor * t) {
+        key head_k;
+        if (head == nullptr || !key_of(head->src[1], head_k)) {
+            return nullptr;
+        }
+        entry * e = find_any(t);
+        return e != nullptr && e->k == head_k ? e : nullptr;
+    }
+
+    // the copy of node's output that node's kernel writes, when node is a producer, marked made by it: a caller given
+    // one writes all of it on the stream
+    entry * produce(const ggml_tensor * node) {
+        const auto it = producers.find(node);
+        entry * e = it == producers.end() ? nullptr : find_any(node);
+        if (e != nullptr) {
+            e->quantized = true;
+            e->made_at   = it->second;
+        }
+        return e;
+    }
+
+    // the graph's node at wrote [data, data + nbytes)
+    void written(const char * data, size_t nbytes, const int at) {
         for (entry & e : entries) {
             const char * end = e.k.data + (e.k.nrows - 1)*e.k.row_stride + e.k.ne0*sizeof(float);
-            if (data < end && e.k.data < data + nbytes) {
+            if (data < end && e.k.data < data + nbytes && at > e.made_at) {
                 e.quantized = false;
             }
         }

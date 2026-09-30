@@ -680,13 +680,15 @@ static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_mix_gram(
 // element of the mix, normed, times the norm's weight, into dst. Block 0's warp 0 also makes the post and comb weights
 // (the comb in registers, dsv4_hc_comb_regs) into weights_out, while the other blocks write their slices. The streams'
 // RMS is G's trace's. base_prewait, norm_prewait: base or the norm's weight is the model's (dsv4_hc_prewait).
+// q8 non-null: dst's q8_1 copy as quantize_row_q8_1_cuda writes it (token it's row q8_s1 blocks on), a warp a block
+// with quantize_q8_1's arithmetic on the values dst holds, so its bits: n_embd a multiple of MATRIX_ROW_PADDING
 static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_f32(
         const float * partials, const int n_slices, const float * x,
         const float * scale, const float * base, const float * norm_w,
         float * weights_out, float * dst, const int64_t n_embd, const int64_t k,
         const int64_t sx1, const int64_t sx2, const int64_t ss0, const int64_t sb0, const int64_t sw0,
         const int64_t sw1, const int64_t sd1, const float eps_flat, const float eps_hc, const int32_t n_iter,
-        const float eps_norm, const bool base_prewait, const bool norm_prewait) {
+        const float eps_norm, const bool base_prewait, const bool norm_prewait, block_q8_1 * q8, const int64_t q8_s1) {
     __shared__ float mix[DSV4_HC_GRAM_ROWS];
     __shared__ float base_s[DSV4_HC_MIX];
 
@@ -811,7 +813,22 @@ static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_
         for (int h = 1; h < DSV4_HC; ++h) {
             v += xs[h]*pre[h];
         }
-        dst[it*sd1 + i] = v*rms*nw;
+        const float xi = v*rms*nw;
+        dst[it*sd1 + i] = xi;
+        if (q8 != nullptr) {
+            // the warp's 32 values are a block (n_embd a multiple of 32: a warp is all in or all out)
+            float amax = fabsf(xi);
+            float sum  = xi;
+            amax = warp_reduce_max<QK8_1>(amax);
+            sum  = warp_reduce_sum<QK8_1>(sum);
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+            block_q8_1 * blk = q8 + it*q8_s1 + i/QK8_1;
+            blk->qs[lane] = q;
+            if (lane == 0) {
+                blk->ds = make_half2(d, sum);
+            }
+        }
     }
 }
 
@@ -826,6 +843,16 @@ static bool dsv4_hc_prewait(const ggml_tensor * t) {
 static bool dsv4_hc_pre_gram_legacy() {
     static const bool legacy = ggml_env_switch("GGML_CUDA_HC_PRE_GRAM_LEGACY");
     return legacy;
+}
+
+bool ggml_cuda_dsv4_hc_writes_q8_1(const ggml_tensor * node) {
+    if (dsv4_hc_pre_gram_legacy() || node->op != GGML_OP_MUL || node->type != GGML_TYPE_F32 ||
+            node->ne[0] % MATRIX_ROW_PADDING != 0) {
+        return false;
+    }
+    const ggml_tensor * rms = node->src[0] != nullptr && node->src[0]->op == GGML_OP_RMS_NORM ? node->src[0] : node->src[1];
+    return rms != nullptr && rms->op == GGML_OP_RMS_NORM && rms->src[0] != nullptr &&
+        rms->src[0]->op == GGML_OP_DSV4_HC_PRE;
 }
 
 bool ggml_cuda_dsv4_hc_pre_fused_supported(const ggml_tensor * rms_flat, const ggml_tensor * mm,
@@ -968,6 +995,11 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
                 GGML_ABORT("unsupported hc_fn type %s", ggml_type_name(hc_fn->type));
         }
 
+        // the normed mix's q8_1 copy, when the evaluation holds one for its quantized readers
+        // (ggml_cuda_mmvq_shared_q8_1::produce): written here, not by a q8_1 launch at its first reader
+        ggml_cuda_mmvq_shared_q8_1::entry * q8 = n_embd % MATRIX_ROW_PADDING == 0 ? ctx.mmvq_shared_q8_1.produce(mul) :
+            nullptr;
+
         const int n_blocks = (int) ((n_embd + DSV4_HC_PRE_GRAM_THR - 1) / DSV4_HC_PRE_GRAM_THR);
         const ggml_cuda_kernel_launch_params pre_params =
             ggml_cuda_kernel_launch_params(dim3(n_blocks, n_tokens, 1), dim3(DSV4_HC_PRE_GRAM_THR, 1, 1), 0, stream);
@@ -978,7 +1010,8 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
             base->nb[0] / sizeof(float), weights->nb[0] / sizeof(float), weights->nb[1] / sizeof(float),
             mul->nb[1] / sizeof(float), ggml_get_op_params_f32(rms_flat, 0), ggml_get_op_params_f32(weights, 0),
             ggml_get_op_params_i32(weights, 1), ggml_get_op_params_f32(rms, 0), dsv4_hc_prewait(base),
-            dsv4_hc_prewait(norm_w));
+            dsv4_hc_prewait(norm_w), q8 != nullptr ? (block_q8_1 *) q8->q8_1 : nullptr,
+            (int64_t) (n_embd / QK8_1));
         return;
     }
     GGML_ASSERT(post == nullptr);

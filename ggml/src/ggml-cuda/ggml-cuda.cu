@@ -6178,7 +6178,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // (ggml_cuda_mmvq_shared_q8_1): its copy is made before its first reader and held to the end of the evaluation, and
     // the readers are counted by the input's first byte at the first candidate. Off while the graph has concurrent streams.
     // GGML_CUDA_MMVQ_SHARED_Q8_1_LEGACY=1 quantizes it at each reader.
-    static const bool mmvq_shared_q8_1_legacy = ggml_env_switch("GGML_CUDA_MMVQ_SHARED_Q8_1_LEGACY");
+    // GGML_CUDA_MMVQ_Q8_1_PRODUCER_LEGACY=1: no kernel writes a copy beside its output, the first reader quantizes it
+    static const bool mmvq_shared_q8_1_legacy   = ggml_env_switch("GGML_CUDA_MMVQ_SHARED_Q8_1_LEGACY");
+    static const bool mmvq_q8_1_producer_legacy = ggml_env_switch("GGML_CUDA_MMVQ_Q8_1_PRODUCER_LEGACY");
     const auto mmvq_shared_q8_1_candidate = [](const ggml_tensor * node) {
         if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || node->src[0] == nullptr ||
                 node->src[1] == nullptr || !ggml_is_quantized(node->src[0]->type) || node->src[1]->type != GGML_TYPE_F32 ||
@@ -6335,6 +6337,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             int mmvq_shared_q8_1_seen = 0; // the nodes before it have been checked for writes over a q8_1 copy's input
 
+            // the copies whose producers write them (a hyper-connection front's normed mix with a quantized reader), made
+            // before any node runs: one a key, which each of its producers writes in turn
+            if (!mmvq_shared_q8_1_legacy && !mmvq_q8_1_producer_legacy && !should_launch_concurrent_events) {
+                ggml_cuda_mmvq_shared_q8_1 & shared = cuda_ctx->mmvq_shared_q8_1;
+                for (int j = 0; j < cgraph->n_nodes; ++j) {
+                    const ggml_tensor * node = cgraph->nodes[j];
+                    ggml_cuda_mmvq_shared_q8_1::key k;
+                    if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_cuda_dsv4_hc_writes_q8_1(node) ||
+                            mmvq_shared_q8_1_reader_count(node) == 0 || !ggml_cuda_mmvq_shared_q8_1::key_of(node, k)) {
+                        continue;
+                    }
+                    if (shared.find_any(node) == nullptr) {
+                        const size_t size = ggml_cuda_mmvq_shared_q8_1::q8_1_size(k);
+                        auto data = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), size);
+                        shared.entries.push_back({ k, data->get(), size, false });
+                        gb10_pool_allocations.push_back(std::move(data));
+                    }
+                    shared.producers[node] = j;
+                }
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -6377,7 +6400,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     for (int k = mmvq_shared_q8_1_seen; k < i; ++k) {
                         const ggml_tensor * ran = cgraph->nodes[k];
                         if (!ggml_cuda_is_view_or_noop(ran) && (ran->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-                            cuda_ctx->mmvq_shared_q8_1.written((const char *) ran->data, ggml_nbytes(ran));
+                            cuda_ctx->mmvq_shared_q8_1.written((const char *) ran->data, ggml_nbytes(ran), k);
                         }
                     }
                 }
@@ -6460,9 +6483,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
-                // a MUL_MAT whose input other MUL_MATs read too leads its group: the first to run makes the input's copy
+                // a MUL_MAT whose input other MUL_MATs read too, or has a copy already, leads its group: the first to run
+                // makes the input's copy where no producer has
                 if (!mmvq_shared_q8_1_legacy && !should_launch_concurrent_events && mmvq_shared_q8_1_candidate(node) &&
-                        mmvq_shared_q8_1_reader_count(node->src[1]) > 1) {
+                        (mmvq_shared_q8_1_reader_count(node->src[1]) > 1 || (!mmvq_q8_1_producer_legacy &&
+                             cuda_ctx->mmvq_shared_q8_1.find_any(node->src[1]) != nullptr))) {
                     ggml_cuda_mmvq_shared_q8_1 & shared = cuda_ctx->mmvq_shared_q8_1;
                     ggml_cuda_mmvq_shared_q8_1::key k;
                     if (ggml_cuda_mmvq_shared_q8_1::key_of(node->src[1], k)) {

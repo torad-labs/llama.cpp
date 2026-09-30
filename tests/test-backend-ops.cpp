@@ -4445,6 +4445,47 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     }
 };
 
+// The front's normed mix read by n_readers quantized MUL_MATs of 256 rows (the sublayer's projections), their outputs
+// summed. CUDA's front writes the mix's q8_1 copy beside it where n_embd is a multiple of 512 and a reader runs on
+// mul_mat_vec_q (ggml_cuda_dsv4_hc_writes_q8_1), for one reader or more, and the readers read the copy.
+struct test_dsv4_hc_pre_q8_1 : public test_dsv4_hc_pre_fused {
+    const ggml_type type_q;
+    const int n_readers;
+
+    ggml_tensor * sum = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_Q8_1";
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { weights, out, sum }; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_q, n_readers, n_embd, n_tokens, with_post);
+    }
+
+    // the readers' activations quantized, to q8_1 on CUDA and to the weights' vec_dot_type on the CPU
+    double max_nmse_err() override { return 5e-4; }
+
+    test_dsv4_hc_pre_q8_1(ggml_type type_q, int n_readers, int64_t n_embd, int64_t n_tokens, bool with_post)
+        : test_dsv4_hc_pre_fused(GGML_TYPE_BF16, n_embd, n_tokens, 20, false, true, with_post), type_q(type_q),
+          n_readers(n_readers) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * mix = test_dsv4_hc_pre_fused::build_graph(ctx, ctx_weights);
+        ggml_context * ctx_w = ctx_weights != nullptr ? ctx_weights : ctx;
+        for (int r = 0; r < n_readers; ++r) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx_w, type_q, n_embd, 256);
+            ggml_set_name(w, ("proj" + std::to_string(r)).c_str());
+            ggml_tensor * y = ggml_mul_mat(ctx, w, mix);
+            sum = r == 0 ? y : ggml_add(ctx, sum, y);
+        }
+        ggml_set_name(sum, "sum");
+        return sum;
+    }
+};
+
 // GLM-5.3's KDA q, k and v: three MUL_MATs of one input by weights of m rows, created one after another as
 // create_tensor_qkv creates them, joined along dim 0 by two CONCATs; CUDA runs the five as one launch at up to 8 tokens
 // when the weights lie one stride from each other. spacer: a tensor made between k's weight and v's, so they do not.
@@ -10049,6 +10090,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 2, 20, false, false, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 7168, 2, 20, false, true, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4, false, true, true));
+    // the front's mix read by quantized MUL_MATs: its q8_1 copy written by the front on CUDA and read where the readers
+    // run on mul_mat_vec_q (not Q4_K's at 8 tokens on Blackwell, which run on MMQ); at 256 (not a multiple of 512) and at
+    // 12 tokens (past mul_mat_vec_q's columns) the readers quantize it
+    for (ggml_type type_q : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+        for (int n_readers : { 1, 2 }) {
+            for (int64_t n_tokens : { 1, 3, 8 }) {
+                test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(type_q, n_readers, 4096, n_tokens, false));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q8_0, 2, 4096, 2, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q4_K, 1, 7168, 3, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q8_0, 2, 256, 3, false));
+    test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q8_0, 2, 4096, 12, false));
 
     // KDA's q, k and v: one launch on CUDA at 1 to 8 tokens; unfused at 9, with the weights' stride broken, and at 101
     // rows, where a block of 2 rows would cross from one weight's rows into the next

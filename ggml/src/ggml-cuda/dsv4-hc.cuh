@@ -26,3 +26,8 @@ bool ggml_cuda_dsv4_hc_post_pre_fused_supported(const ggml_tensor * post, const 
 void ggml_cuda_op_dsv4_hc_post_pre_fused(ggml_backend_cuda_context & ctx, ggml_tensor * post,
         const ggml_tensor * rms_flat, const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre,
         const ggml_tensor * rms, ggml_tensor * mul);
+
+// Whether node is a front's mul, the sublayer's normed mix: the fused front writes its q8_1 copy beside it when the
+// evaluation holds one for it (ggml_cuda_mmvq_shared_q8_1::produce) and n_embd is a multiple of MATRIX_ROW_PADDING,
+// not under GGML_CUDA_HC_PRE_GRAM_LEGACY. Where the front does not run fused, its readers quantize it themselves.
+bool ggml_cuda_dsv4_hc_writes_q8_1(const ggml_tensor * node);
