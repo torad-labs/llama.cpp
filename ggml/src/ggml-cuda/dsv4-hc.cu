@@ -1002,7 +1002,7 @@ bool ggml_cuda_dsv4_hc_post_pre_fused_supported(const ggml_tensor * post, const 
 // streams and writes them to post's output, which is pre's streams
 static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * post, const ggml_tensor * rms_flat,
         const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre, const ggml_tensor * rms,
-        ggml_tensor * mul) {
+        ggml_tensor * mul, const bool weights_outlive) {
     const ggml_tensor * hc_fn  = mm->src[0];
     const ggml_tensor * x      = pre->src[0];
     const ggml_tensor * scale  = weights->src[1];
@@ -1073,8 +1073,9 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
         ggml_cuda_mmvq_shared_q8_1::entry * q8 = n_embd % MATRIX_ROW_PADDING == 0 ? ctx.mmvq_shared_q8_1.produce(mul) :
             nullptr;
 
-        // the comb beside the stream (dsv4_hc_comb_side), off the chain to the sublayer's projections
-        const bool comb_side = ctx.hc_comb_side && !dsv4_hc_comb_side_legacy();
+        // the comb beside the stream (dsv4_hc_comb_side), off the chain to the sublayer's projections: written after
+        // this launch, so only into weights whose bytes stay theirs until a join
+        const bool comb_side = ctx.hc_comb_side && weights_outlive && !dsv4_hc_comb_side_legacy();
 
         const int n_blocks = (int) ((n_embd + DSV4_HC_PRE_GRAM_THR - 1) / DSV4_HC_PRE_GRAM_THR);
         const ggml_cuda_kernel_launch_params pre_params =
@@ -1145,14 +1146,14 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
 
 void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_flat,
         const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre, const ggml_tensor * rms,
-        ggml_tensor * mul) {
-    dsv4_hc_front(ctx, nullptr, rms_flat, mm, weights, pre, rms, mul);
+        ggml_tensor * mul, const bool weights_outlive) {
+    dsv4_hc_front(ctx, nullptr, rms_flat, mm, weights, pre, rms, mul, weights_outlive);
 }
 
 void ggml_cuda_op_dsv4_hc_post_pre_fused(ggml_backend_cuda_context & ctx, ggml_tensor * post,
         const ggml_tensor * rms_flat, const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre,
-        const ggml_tensor * rms, ggml_tensor * mul) {
-    dsv4_hc_front(ctx, post, rms_flat, mm, weights, pre, rms, mul);
+        const ggml_tensor * rms, ggml_tensor * mul, const bool weights_outlive) {
+    dsv4_hc_front(ctx, post, rms_flat, mm, weights, pre, rms, mul, weights_outlive);
 }
 
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

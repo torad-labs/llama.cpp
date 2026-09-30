@@ -4790,6 +4790,14 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// whether a hyper-connection front's weights (node i_w) are read past the front, so the allocator keeps their bytes
+// theirs until then: a view of them besides pre's is in the graph (the post and comb views, whose reader waits for the
+// comb, or the evaluation ends first), or they are an output. The use count is the whole graph's, which the meta
+// backend's and the scheduler's subgraphs keep.
+static bool ggml_cuda_dsv4_hc_weights_outlive(const ggml_cgraph * cgraph, const int i_w) {
+    return ggml_node_get_use_count(cgraph, i_w) > 1 || (cgraph->nodes[i_w]->flags & GGML_TENSOR_FLAG_OUTPUT);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5963,7 +5971,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_can_fuse_subgraph_ext(cgraph, idxs, 7, ops, outs, 3) &&
                     ggml_cuda_dsv4_hc_post_pre_fused_supported(node, flat, mm, w, pre, rms, mul) &&
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i_flat, i_mul - i_flat + 1, outs + 1, 2)) {
-                ggml_cuda_op_dsv4_hc_post_pre_fused(*cuda_ctx, node, flat, mm, w, pre, rms, mul);
+                ggml_cuda_op_dsv4_hc_post_pre_fused(*cuda_ctx, node, flat, mm, w, pre, rms, mul,
+                    ggml_cuda_dsv4_hc_weights_outlive(cgraph, i_w));
                 return i_mul - i;
             }
         }
@@ -6007,7 +6016,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_can_fuse_subgraph_ext(cgraph, idxs, 6, ops, outs, 2) &&
                     ggml_cuda_dsv4_hc_pre_fused_supported(node, mm, w, pre, rms, mul) &&
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, i_mul - i + 1, outs, 2)) {
-                ggml_cuda_op_dsv4_hc_pre_fused(*cuda_ctx, node, mm, w, pre, rms, mul);
+                ggml_cuda_op_dsv4_hc_pre_fused(*cuda_ctx, node, mm, w, pre, rms, mul,
+                    ggml_cuda_dsv4_hc_weights_outlive(cgraph, i_w));
                 return i_mul - i;
             }
         }
