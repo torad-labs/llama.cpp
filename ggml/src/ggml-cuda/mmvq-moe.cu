@@ -36,8 +36,8 @@
 // kernel spills. The math is bound by shared memory and L1, not by the dot products: the grid is gathered at random,
 // so past the ring the shared memory holds it a copy per lane (grid_rep[i*32 + lane]: a warp's 32 gathers in 32 banks,
 // whatever the indices), and a lane keeps its q8_1 fragments in registers, loaded once per token vector, not once per
-// row. In a launch of several tokens a fragment is decoded once (its grid gathered, its signs applied) and met with the
-// vectors of its expert's pairs in turn (pairs_once). The other types read as mul_mat_vec_q does (vec_dot_q_cuda), from
+// row. In a launch of several tokens whose pairs are as many as the experts or more, a fragment is decoded once (its grid
+// gathered, its signs applied) and met with the vectors of its expert's pairs in turn (pairs_once). The other types read as mul_mat_vec_q does (vec_dot_q_cuda), from
 // the slot, which their team releases after it.
 //
 // The tokens' q8_1 vectors come from a copy in shared memory past the ring when it fits there, which the producer's
@@ -849,9 +849,15 @@ void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t strea
     }
 
     // a launch of several tokens decodes each fragment once for an expert's pairs where the shape has that instance
-    // (mmvq_moe_pairs_fits). GGML_CUDA_MMVQ_MOE_PAIRS_LEGACY=1: each pair decodes it
+    // (mmvq_moe_pairs_fits) and its pairs are at least as many as the experts. Decoding once pays for an expert that
+    // meets several pairs, and costs its instance's bookkeeping on one that meets one: where 3 tokens route to 8 of 288
+    // experts (GLM-5.3-Flash) nearly every expert a launch reads meets one pair, and that instance ran the gate/up 1.2 %
+    // and the down 2.1 % slower than the one-pair one (a 4-layer proxy with its 288 experts, random routing, RTX 5080),
+    // and GLM-5.3-Flash at 3 and 4 tokens 2.4 and 1.4 % slower end to end (2 RTX PRO 6000, -sm tensor); where each of 3
+    // tokens routes to all 8 of 8 (the 44-layer proxy) its gate/up is 27 % faster. GGML_CUDA_MMVQ_MOE_PAIRS_LEGACY=1:
+    // each pair decodes it, whatever the counts
     static const bool pairs_legacy = ggml_env_switch("GGML_CUDA_MMVQ_MOE_PAIRS_LEGACY");
-    const bool        pairs_once   = !pairs_legacy && args.ntokens > 1;
+    const bool        pairs_once   = !pairs_legacy && args.ntokens > 1 && args.ntokens*args.n_used >= args.n_experts;
 
     // one block an SM, never more than the tiles of the most distinct experts the pairs can name
     const int nsm     = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;

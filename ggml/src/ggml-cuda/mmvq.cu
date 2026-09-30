@@ -1473,6 +1473,7 @@ void ggml_cuda_mul_mat_vec_q(
         args.nrows_x                = ne01;
         args.stride_channel_x_bytes = s02 * (int64_t) ts_src0;
         args.n_used                 = ne1;
+        args.n_experts              = ne02;
         args.ntokens                = ne2;
         args.ids_stride             = ids_stride;
         args.nchannels_y            = nchannels_y;

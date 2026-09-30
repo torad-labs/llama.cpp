@@ -26,6 +26,7 @@ struct ggml_cuda_mmvq_moe_args {
     int64_t            nrows_x;
     int64_t            stride_channel_x_bytes;
     int64_t            n_used;    // experts a token routes to: ids' columns
+    int64_t            n_experts; // the experts ids name: src0's channels
     int64_t            ntokens;
     int64_t            ids_stride;
     int64_t            nchannels_y;

@@ -11321,8 +11321,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // GLM-5.3-Flash's routed experts (IQ3_XXS, 8 used; 32 experts here, of its 288) at decode and an MTP verify, where
     // the CUDA backend streams them through mmvq-moe.cu's ring: gate/up rows of 4,096 weights with a token's vector
-    // shared by its experts, down rows of 2,048 with a vector each, and three tokens that share experts
-    for (int n : { 1, 3 }) {
+    // shared by its experts, down rows of 2,048 with a vector each, and three tokens that share experts (fewer pairs than
+    // experts: each pair decodes its fragments) or four (as many: an expert's pairs decode them once)
+    for (int n : { 1, 3, 4 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, true,  2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, false, 4096, n, 2048));
     }
