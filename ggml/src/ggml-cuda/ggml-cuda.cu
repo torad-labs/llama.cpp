@@ -762,6 +762,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         pq2_tile_counters.release();
     }
+    if (l2_issue_stop.ptr != nullptr) {
+        ggml_cuda_set_device(device);
+        l2_issue_stop.release();
+    }
     if (ssm_conv_ab_slots.ptr != nullptr) {
         ggml_cuda_set_device(device);
         ssm_conv_ab_slots.release();
@@ -2507,7 +2511,9 @@ static ggml_cuda_l2_issue_plan ggml_cuda_l2_issue_plan_of(ggml_backend_cuda_cont
         // the chain it runs beside: the nodes up to the next launch that keeps DRAM busy (the next heavy one, routed
         // experts, or a node moving busy_kb), each node_us of latency, and the all-reduce if it crosses one; requested
         // past its end the issuer takes DRAM from that launch (the 44-layer proxy on an RTX 5070 Ti, L2/2 an issue: the
-        // routed experts 5,970 against 5,280 us a token, qkv 4,506 against 4,252)
+        // routed experts 5,970 against 5,280 us a token, qkv 4,506 against 4,252). A node is not a launch where the
+        // evaluation fuses (a hyper-connection front's, a top-k's), so the chain may be shorter: a routed-expert ring
+        // stops the issue as it starts (ggml_cuda_l2_issue_fork)
         bool   busy     = false;
         double chain_us = 0.0;
         if (!is.crosses) {
@@ -2550,8 +2556,13 @@ static ggml_cuda_l2_issue_plan ggml_cuda_l2_issue_plan_of(ggml_backend_cuda_cont
     return plan;
 }
 
-// Starts the issuer for r on its own stream, after all that the evaluation's stream has been given so far
+// Starts the issuer for r on its own stream, after all that the evaluation's stream has been given so far. It stops at the
+// first launch that bumps the context's stop word (ggml_cuda_l2_issue_stop: a routed-expert ring, whose reads would share
+// DRAM with it: GLM-5.3's proxy at 3 tokens on an RTX 5070 Ti, the issue after the attention output ran ~25 us into the
+// gate/up, 125.0 us against 108.5 with no issuer, where the shared expert it brought into L2 gained back 9.2).
+// GGML_CUDA_L2_ISSUE_STOP_LEGACY=1: it runs its length.
 static void ggml_cuda_l2_issue_fork(ggml_backend_cuda_context & ctx, const ggml_cuda_l2_ranges & r, const double rate_gbs) {
+    static const bool stop_legacy = ggml_env_switch("GGML_CUDA_L2_ISSUE_STOP_LEGACY");
     if (ctx.l2_issue_fork == nullptr) {
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx.l2_issue_fork, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx.l2_issue_join, cudaEventDisableTiming));
@@ -2559,7 +2570,8 @@ static void ggml_cuda_l2_issue_fork(ggml_backend_cuda_context & ctx, const ggml_
     cudaStream_t side = ctx.stream(ctx.device, GGML_CUDA_L2_ISSUE_STREAM);
     CUDA_CHECK(cudaEventRecord(ctx.l2_issue_fork, ctx.stream()));
     CUDA_CHECK(cudaStreamWaitEvent(side, ctx.l2_issue_fork, 0));
-    ggml_cuda_l2_issue(r, rate_gbs, ggml_cuda_info().devices[ctx.device].nsm, side);
+    ggml_cuda_l2_issue(r, rate_gbs, ggml_cuda_info().devices[ctx.device].nsm, stop_legacy ? nullptr : ctx.l2_issue_stop.ptr,
+                       side);
     ctx.l2_issue_open = true;
 }
 
@@ -6692,6 +6704,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
     cuda_ctx->ssm_conv_ab_slots.ensure();
+    cuda_ctx->l2_issue_stop.ensure();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6783,6 +6796,7 @@ static void ggml_backend_cuda_capture_begin(ggml_backend_t backend) {
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
     cuda_ctx->ssm_conv_ab_slots.ensure();
+    cuda_ctx->l2_issue_stop.ensure();
     {
         std::lock_guard<std::mutex> lock(ggml_cuda_lock);
         ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);

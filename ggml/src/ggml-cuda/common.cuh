@@ -1613,6 +1613,28 @@ struct ggml_cuda_pq2_tile_counters {
     }
 };
 
+// The word a launch that keeps DRAM busy bumps as its reads start (the routed experts' ring, mmvq-moe.cu), and the paced
+// L2 issuer beside the stream watches: past a change it requests no more (ggml_cuda_l2_issue), where it would take DRAM
+// from that launch for bytes a later kernel reads. Only its changes mean anything. Made before a graph evaluation, never
+// inside a capture, like ggml_cuda_pq2_tile_counters.
+struct ggml_cuda_l2_issue_stop {
+    unsigned int * ptr = nullptr;
+
+    void ensure() {
+        if (ptr == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ptr, sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(ptr, 0, sizeof(unsigned int)));
+        }
+    }
+
+    void release() {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+            ptr = nullptr;
+        }
+    }
+};
+
 // The q8_1 copies of the F32 inputs that two or more quantized MUL_MAT / MUL_MAT_ID of one graph evaluation read on
 // mul_mat_vec_q (the q, k and v projections of one input; a shared expert's and the routed experts' gate/up): the first
 // reader quantizes into a pool allocation the evaluation holds (ggml_cuda_graph_evaluate_and_capture makes it before
@@ -2135,6 +2157,7 @@ struct ggml_backend_cuda_context {
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
+    ggml_cuda_l2_issue_stop l2_issue_stop;
     // the hyper-connection fronts' combs, made beside the evaluation's stream (dsv4_hc_front): the fork, the join back,
     // the weights tensors written there since the last join, and whether the evaluation lets a front fork (not while
     // the graph runs concurrent streams)

@@ -50,6 +50,8 @@ struct ggml_cuda_l2_ranges {
 
 // Requests r into L2 at rate_gbs on stream: a burst of bulk prefetches beyond what DRAM serves at once is dropped (a
 // 17.8 MB matrix prefetched at once from 70 SMs of an RTX 5070 Ti lands ~4 MB of it, paced at up to 1,000 GB/s all of it),
-// so the kernel spaces its requests out in time. Runs until the last range is requested, total / rate_gbs; nothing waits
-// on it but the end of the graph. NVIDIA from sm_90 (cp.async.bulk.prefetch.L2); nothing elsewhere.
-void ggml_cuda_l2_issue(const ggml_cuda_l2_ranges & r, double rate_gbs, int nsm, cudaStream_t stream);
+// so the kernel spaces its requests out in time. Runs until the last range is requested, total / rate_gbs, or until
+// stop (ggml_cuda_l2_issue_stop, or nullptr) changes from its value when the kernel started; nothing waits on it but the
+// end of the graph. NVIDIA from sm_90 (cp.async.bulk.prefetch.L2); nothing elsewhere.
+void ggml_cuda_l2_issue(const ggml_cuda_l2_ranges & r, double rate_gbs, int nsm, const unsigned int * stop,
+                        cudaStream_t stream);

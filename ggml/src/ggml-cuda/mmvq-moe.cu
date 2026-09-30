@@ -100,6 +100,7 @@ struct mmvq_moe_dev_args {
     int *              tile_ctr;
     int                y_bytes;     // > 0: the tokens' vectors, [y, y + y_bytes), copied into shared memory past the ring
     int                ids_ready;   // ids whole before the launch (ggml_cuda_mmvq_moe_args): read before the dependency wait
+    unsigned int *     l2_issue_stop; // bumped as the reads start (ggml_cuda_l2_issue_stop), or nullptr
 };
 
 // IQ3_XXS: a lane's k iterations at rpw rows a warp, 4 blocks of a row an iteration, the most its registers hold. The
@@ -236,6 +237,10 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
                 mmvq_moe_mbar_arrive_expect_tx(&y_full, a.y_bytes);
                 mmvq_moe_bulk_load(y_smem, a.y, a.y_bytes, &y_full, unchanged);
             }
+        }
+        // the launch's reads start here (past the wait, or before it with ids_ready): an L2 issue beside the stream stops
+        if (a.l2_issue_stop != nullptr && blockIdx.x == 0 && lane == 0) {
+            atomicAdd(a.l2_issue_stop, 1u);
         }
         const int npairs = a.ntokens * a.n_used;
         const int p1     = lane + 32;
@@ -741,6 +746,7 @@ void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t strea
     a.y_bytes                = (int) y_bytes;
     a.tile_ctr               = args.tile_ctr;
     a.ids_ready              = args.ids_ready ? 1 : 0;
+    a.l2_issue_stop          = args.l2_issue_stop;
 
     // one block an SM, never more than the tiles of the most distinct experts the pairs can name
     const int nsm     = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;

@@ -1489,6 +1489,7 @@ void ggml_cuda_mul_mat_vec_q(
         const ggml_tensor *& ids_before = ctx.mmvq_moe_ids[ctx.curr_stream_no];
         args.ids_ready = !ids_early_legacy && ids_before == ids;
         ids_before     = ids;
+        args.l2_issue_stop = ctx.l2_issue_stop.ptr;
         ggml_cuda_mmvq_moe(args, stream);
         return;
     }
