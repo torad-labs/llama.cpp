@@ -2883,7 +2883,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il,
-                bool   mask_is_prefix) const {
+                bool   mask_is_prefix,
+             int64_t   n_kv_max) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2927,6 +2928,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         static const bool sparse_prefix_legacy = ggml_env_switch("LLAMA_ATTN_SPARSE_MASK_PREFIX_LEGACY");
         ggml_flash_attn_ext_set_mask_prefix(cur, (mask_is_prefix || sparse_prefix_legacy) && cparams.n_seq_max == 1 &&
                                                  cparams.causal_attn && il >= 0 && !hparams.is_swa(il));
+
+        // n_kv_max: a bound on each mask row's live cells, which a backend may then read alone (the sparse mode)
+        GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
 
         if (v_mla) {
 #if 0
@@ -3355,7 +3360,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false);
+    // a row's live cells are among its top_k: the kernel may read those alone
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false,
+            top_k->ne[0]);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -4125,7 +4132,13 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false);
+    // a row's live cells: its top_k pools' cells (top_k->ne[0] = r*select_k) and its tail, positions [(q + 1)/r*r, q]
+    // (kpool_mask_row), at most r - 1 cells unless a sequence holds two cells at one position (an rm + add before the first
+    // cell is gone), whose tail then has more. The kernel may read those alone; the bound rounds up to 32 cells, a CUDA
+    // kernel step, so that case keeps every cell at no cost (2051 and 2080 cells are 65 steps either way)
+    const int64_t n_kv_max = GGML_PAD(top_k->ne[0] + hparams.indexer_kpool - 1, 32);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false,
+            n_kv_max);
     cb(cur, "kqv_out", il);
 
     if (wo) {

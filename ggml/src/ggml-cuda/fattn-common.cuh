@@ -838,6 +838,11 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_min[sequence*ne31 + jt] = 0;
 }
 
+// The sparse mode (ggml_flash_attn_ext_set_n_kv_max): each f16 mask row's finite entries as ascending cell indices, n_kv_max
+// a row (sequence, then row, of mask->ne[1] rows), -1 past the row's count. Defined in fattn.cu.
+void ggml_cuda_flash_attn_ext_compact_mask(
+        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
+
 // KV_live, the live KV steps of the mma kernel (nbatch_fa cells each) for n = Q tiles x sequences:
 // [0, n) live steps per (sequence, Q tile), at least 1 | [n] blocks done | [n+1, 2n+1) its first live step within its sequence |
 // [ne03] live steps per sequence | [ne03 + 1] a sequence's first unit of work (its steps times its output tiles per Q tile), then the total |
@@ -1452,7 +1457,8 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
-    const bool kv_live_ok = false // the kernel reads KV_live
+    const bool kv_live_ok = false, // the kernel reads KV_live
+    const bool use_sparse = false  // the kernel reads K, V and the mask by the indices in KV_max, n_kv_max of them
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1570,6 +1576,17 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    // use_sparse: the mask rows compacted to their live cells, which the kernel reads in place of the whole cache, so none
+    // of the scans below
+    const int32_t n_kv_max = use_sparse ? ggml_flash_attn_ext_get_n_kv_max(KQV) : 0;
+    if (use_sparse) {
+        GGML_ASSERT(mask != nullptr && !mask_packed);
+        GGML_ASSERT(n_kv_max > 0);
+
+        KV_max.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+    }
+
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
@@ -1583,7 +1600,7 @@ void launch_fattn(
     //     the kernel applies the mask over the whole range. GGML_CUDA_FATTN_MASK_PREFIX_LEGACY=1: the hint is ignored.
     static const bool mask_prefix_legacy = ggml_env_switch("GGML_CUDA_FATTN_MASK_PREFIX_LEGACY");
     const bool mask_prefix = !mask_prefix_legacy && mask && Q->ne[1] <= 16 && ggml_flash_attn_ext_get_mask_prefix(KQV);
-    const bool kv_range = !kv_range_legacy && !mask_prefix && mask && Q->ne[1] <= 16 && K->ne[1] >= 4096 &&
+    const bool kv_range = !use_sparse && !kv_range_legacy && !mask_prefix && mask && Q->ne[1] <= 16 && K->ne[1] >= 4096 &&
         (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0; // 16-byte mask reads
 
     // kv_live: the mma kernel reads only the KV steps a row of its Q tile sees, the masked tiles between them skipped too (with
@@ -1593,7 +1610,7 @@ void launch_fattn(
     // The live fixup tests the blocks it combines for an empty range only when there can be one (fewer units of work than
     // blocks), and lets the next kernel launch as it starts. GGML_CUDA_FATTN_LIVE_FIXUP_LEGACY=1: it tests every block and does not.
     static const bool kv_live_fixup_legacy = ggml_env_switch("GGML_CUDA_FATTN_LIVE_FIXUP_LEGACY");
-    const bool kv_live = kv_live_ok && !kv_live_legacy && !mask_prefix && stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && mask && K->ne[1] >= 4096 &&
+    const bool kv_live = !use_sparse && kv_live_ok && !kv_live_legacy && !mask_prefix && stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && mask && K->ne[1] >= 4096 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 && (nbatch_fa == 32 || nbatch_fa == 64) &&
         (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0;
     // The live steps depend on the mask and the split alone, and every attention layer of a graph reads the same mask: the
@@ -1652,7 +1669,7 @@ void launch_fattn(
             CUDA_CHECK(cudaGetLastError());
             KV_live_ptr = live;
         }
-    } else if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_range)) {
+    } else if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_range)) {
         const size_t  unit = mask_packed ? sizeof(uint16_t) : sizeof(half2);
         const int64_t s31 = mask->nb[1] / unit;
         const int64_t s33 = mask->nb[3] / unit;
@@ -1685,7 +1702,8 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1]; // the cells the kernel steps over
+    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {
@@ -1801,7 +1819,7 @@ void launch_fattn(
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+        K->ne[0], n_kv,     K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,

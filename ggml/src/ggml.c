@@ -5549,6 +5549,22 @@ bool ggml_flash_attn_ext_get_mask_prefix(
     return ggml_get_op_params_i32(a, 4) != 0;
 }
 
+void ggml_flash_attn_ext_set_n_kv_max(
+        struct ggml_tensor * a,
+        int32_t              n_kv_max) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(n_kv_max >= 0);
+
+    ggml_set_op_params_i32(a, 5, n_kv_max); // after the mask_prefix hint
+}
+
+int32_t ggml_flash_attn_ext_get_n_kv_max(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 5);
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

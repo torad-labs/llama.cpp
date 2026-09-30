@@ -1282,7 +1282,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il,
-                   bool   mask_is_prefix = true) const; // false: kq_mask selects cells (sparse attention's top-k)
+                   bool   mask_is_prefix = true,  // false: kq_mask selects cells (sparse attention's top-k)
+                int64_t   n_kv_max       = 0) const; // > 0: no mask row has more live cells (ggml_flash_attn_ext_set_n_kv_max)
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
