@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -12,6 +13,8 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+
+class llama_kpool_views;
 
 //
 // llama_kv_cache
@@ -164,6 +167,9 @@ public:
     bool get_kpool_dirty() const;
     void clear_kpool_dirty() const;
 
+    // the pooled-key input state kept from one ubatch to the next (llama-kv-cache-kpool.h); made at the first call
+    llama_kpool_views & get_kpool_views() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -267,6 +273,8 @@ private:
 
     // see set_kpool_dirty. mutable: its only consumer runs from set_input, holding a const cache
     mutable bool kpool_dirty = false;
+
+    mutable std::shared_ptr<llama_kpool_views> kpool_views;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
