@@ -31,3 +31,11 @@ void ggml_cuda_op_dsv4_hc_post_pre_fused(ggml_backend_cuda_context & ctx, ggml_t
 // evaluation holds one for it (ggml_cuda_mmvq_shared_q8_1::produce) and n_embd is a multiple of MATRIX_ROW_PADDING,
 // not under GGML_CUDA_HC_PRE_GRAM_LEGACY. Where the front does not run fused, its readers quantize it themselves.
 bool ggml_cuda_dsv4_hc_writes_q8_1(const ggml_tensor * node);
+
+// The fused front's comb weights are made beside the evaluation's stream (GGML_CUDA_HC_COMB_STREAM), off the front's
+// chain, where the evaluation allows it (ctx.hc_comb_side) and not under GGML_CUDA_HC_COMB_SIDE_LEGACY: the stream waits
+// for them before a node that reads the weights (ggml_cuda_dsv4_hc_comb_reads, and every DSV4_HC_POST) and at the end of
+// the evaluation (ggml_cuda_dsv4_hc_comb_join, a no-op with none pending).
+#define GGML_CUDA_HC_COMB_STREAM (GGML_CUDA_MAX_STREAMS - 2)
+bool ggml_cuda_dsv4_hc_comb_reads(const ggml_backend_cuda_context & ctx, const ggml_tensor * node);
+void ggml_cuda_dsv4_hc_comb_join(ggml_backend_cuda_context & ctx);

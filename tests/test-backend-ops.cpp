@@ -4486,6 +4486,30 @@ struct test_dsv4_hc_pre_q8_1 : public test_dsv4_hc_pre_fused {
     }
 };
 
+// The front, then a DSV4_HC_POST that reads its post and comb weights at once (its output the normed mix, its residual
+// the front's streams): no model's order, but a race's. CUDA makes the comb beside the stream, and the post waits for
+// it; without the wait the post reads the comb's inputs.
+struct test_dsv4_hc_pre_post : public test_dsv4_hc_pre_fused {
+    ggml_tensor * post_out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_POST";
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { weights, out, post_out }; }
+
+    test_dsv4_hc_pre_post(ggml_type type_w, int64_t n_embd, int64_t n_tokens, int32_t n_iter)
+        : test_dsv4_hc_pre_fused(type_w, n_embd, n_tokens, n_iter, false, true, false) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * mix = test_dsv4_hc_pre_fused::build_graph(ctx, ctx_weights);
+        post_out = ggml_dsv4_hc_post(ctx, mix, hc_pre->src[0], post, comb);
+        ggml_set_name(post_out, "post_out");
+        return post_out;
+    }
+};
+
 // GLM-5.3's KDA q, k and v: three MUL_MATs of one input by weights of m rows, created one after another as
 // create_tensor_qkv creates them, joined along dim 0 by two CONCATs; CUDA runs the five as one launch at up to 8 tokens
 // when the weights lie one stride from each other. spacer: a tensor made between k's weight and v's, so they do not.
@@ -10104,6 +10128,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q4_K, 1, 7168, 3, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q8_0, 2, 256, 3, false));
     test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q8_0, 2, 4096, 12, false));
+    // a DSV4_HC_POST reading the front's weights at once: on CUDA it waits for the comb made beside the stream. Without
+    // the wait it is a race, which 1,000 iterations (tens of us beside the stream) make the post win every time
+    for (int64_t n_tokens : { 1, 3, 8 }) {
+        test_cases.emplace_back(new test_dsv4_hc_pre_post(GGML_TYPE_BF16, 4096, n_tokens, 20));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_pre_post(GGML_TYPE_BF16, 4096, 3, 1000));
+    test_cases.emplace_back(new test_dsv4_hc_pre_post(GGML_TYPE_F32, 4096, 2, 2));
 
     // KDA's q, k and v: one launch on CUDA at 1 to 8 tokens; unfused at 9, with the weights' stride broken, and at 101
     // rows, where a block of 2 rows would cross from one weight's rows into the next

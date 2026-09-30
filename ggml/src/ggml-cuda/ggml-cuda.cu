@@ -745,6 +745,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaEventDestroy(l2_issue_fork));
         CUDA_CHECK(cudaEventDestroy(l2_issue_join));
     }
+    if (hc_comb_fork != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(hc_comb_fork));
+        CUDA_CHECK(cudaEventDestroy(hc_comb_join));
+    }
 #if defined(GGML_CUDA_USE_L2_WINDOW)
     if (l2_persisting) {
         ggml_cuda_l2_persist_release(device); // the last on the device returns the persisting lines and the set-aside
@@ -6337,6 +6341,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             int mmvq_shared_q8_1_seen = 0; // the nodes before it have been checked for writes over a q8_1 copy's input
 
+            // a front may make its comb beside the stream (dsv4_hc_front), joined by the end of this evaluation
+            cuda_ctx->hc_comb_side = !should_launch_concurrent_events;
+
             // the copies whose producers write them (a hyper-connection front's normed mix with a quantized reader), made
             // before any node runs: one a key, which each of its producers writes in turn
             if (!mmvq_shared_q8_1_legacy && !mmvq_q8_1_producer_legacy && !should_launch_concurrent_events) {
@@ -6419,6 +6426,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // the conv-state chain: its GET_ROWS here, its CONCAT and snapshot CPYs as they come; the SSM_CONV runs all of it
                 if (ggml_cuda_node_is_folded(*cuda_ctx, cgraph, i, is_concurrent_event_active)) {
                     continue;
+                }
+
+                // a node that reads a front's weights waits for the comb made beside the stream
+                if (!cuda_ctx->hc_comb_pending.empty() && ggml_cuda_dsv4_hc_comb_reads(*cuda_ctx, node)) {
+                    ggml_cuda_dsv4_hc_comb_join(*cuda_ctx);
                 }
 
                 const ggml_cuda_nvtx_range nvtx_node(node);
@@ -6591,6 +6603,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (!l2_crossed) { // an issue into the next graph is waited for later, never before the all-reduce between
                 ggml_cuda_l2_issue_join(*cuda_ctx);
             }
+            ggml_cuda_dsv4_hc_comb_join(*cuda_ctx);
+            cuda_ctx->hc_comb_side = false;
         }
 
 #ifdef USE_CUDA_GRAPH
