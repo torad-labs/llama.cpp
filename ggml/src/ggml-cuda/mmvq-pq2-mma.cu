@@ -46,6 +46,21 @@
 #define PQ2_MMA_MAX_M     7                                // a box row of at most 7 x 272 bytes
 #define PQ2_MMA_SMEM_MAX  (99 * 1024)                      // the shared memory a block may take on sm_120
 
+// The group launch writing the inputs of a conv that folds the alpha/beta pair in (the qkv and z projections before it,
+// fold_beside) at most 152 registers a thread. An SM's 65,536 registers are four sub-partitions of 16,384, and a block's
+// warps take them in turn, so one sub-partition holds 3 of this block's 9 warps; a block of the next kernel lands beside
+// it (PDL: the kernels after a matmul start under it and wait there) only if its warp there finds its registers. At 168
+// that sub-partition kept 256 and the conv after the qkv group (40 registers) started only as the group's blocks exited;
+// at 152 it keeps 1,792, a warp of up to 56 (coresid/pdl-regs.cu in rig's roofline research, RTX 5080), and the conv
+// computes the pair under the group. Every other launch keeps 168 (mmvq_pq2_mma_group_168; all of them with
+// GGML_CUDA_PQ2_MMA_GROUP_REGS_LEGACY=1): the norm after an output projection (1,024 threads) finds no room at any count,
+// gate/up ran 1.8 us slower at 152, and alone the cap streams the qkv group 0.7 us slower and buys nothing after it.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || CUDART_VERSION < 12040
+#define PQ2_MMA_GROUP_LAUNCH_BOUNDS __launch_bounds__((PQ2_MMA_NW + 1)*32, 1)
+#else
+#define PQ2_MMA_GROUP_LAUNCH_BOUNDS __maxnreg__(152) // it takes no __launch_bounds__ beside it; 152 x 288 threads fit an SM
+#endif
+
 static_assert(sizeof(block_pq2_0) == 34, "PQ2_0 block layout");
 static_assert(PQ2_MMA_KB_BYTES % 16 == 0, "a box row is a whole number of 16-byte TMA units");
 static_assert(PQ2_MMA_MAX_M * PQ2_MMA_KB_BYTES / 8 <= 256, "a TMA box is at most 256 8-byte elements wide");
@@ -185,7 +200,7 @@ static __device__ __forceinline__ void mmvq_pq2_mma_body(
         const CUtensorMap * tmap, const CUtensorMap * tmap_gate, const pq2_mma_group * grp, const block_q8_1 * y,
         const float * x_bias, float * dst, const int nrows, const int ncols, const int nb, const int n_tiles,
         const int nkb, const int nslots, const int evict_first, const int stride_col_y, const int stride_col_dst,
-        const ggml_cuda_pq2_prefetch & next, int * tile_ctr) {
+        const ggml_cuda_pq2_prefetch & next, int * tile_ctr, const bool lc_after_wait) {
     static_assert(nmat == 1 || (nmat == 2 && !has_bias), "a gated product fuses no bias");
     static_assert(!grouped || (nmat == 1 && !has_bias), "a group's matrices fuse nothing");
 #ifdef PQ2_MMA_AVAILABLE
@@ -203,7 +218,13 @@ static __device__ __forceinline__ void mmvq_pq2_mma_body(
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
 
-    ggml_cuda_pdl_lc();
+    // lc_after_wait: the block lets the next kernel launch only once its consumers have passed the dependency wait, so
+    // that kernel's launch means every kernel before this one has ended (each waited on the one before it): the conv
+    // that folds the alpha/beta pair in then never waits on its handoff slot beside the writer's blocks
+    // (ssm_conv_ab_acquire; the handoff, not this, makes the writer's stores visible to it)
+    if (!lc_after_wait) {
+        ggml_cuda_pdl_lc();
+    }
 
     if (threadIdx.x == 0) {
         for (int s = 0; s < nslots; ++s) {
@@ -300,6 +321,9 @@ static __device__ __forceinline__ void mmvq_pq2_mma_body(
     const int cc1 = min(2*t + 1, ncols - 1);
 
     ggml_cuda_pdl_sync(); // the tokens and the bias are the previous kernels' results, and dst may still be read
+    if (lc_after_wait) {
+        ggml_cuda_pdl_lc();
+    }
 
     const block_q8_1 * y_g  = y + (int64_t) cg  * stride_col_y;
     const block_q8_1 * y_c0 = y + (int64_t) cc0 * stride_col_y;
@@ -454,17 +478,19 @@ static __device__ __forceinline__ void mmvq_pq2_mma_body(
         }
     }
 
-    // every box of this block has landed: its share of the next launch's heads, which the kernels between the two then
-    // stream under (requested with the producer's last box instead, they took DRAM from this launch's tail: +4 us a
-    // gate + up on the 5070 Ti)
+    // every box of this block has landed: its share of the ranges (ggml_cuda_pq2_prefetch) laid end to end, which the
+    // kernels up to the next launch read and then stream under (requested with the producer's last box instead, the
+    // next launch's heads took DRAM from this launch's tail: +4 us a gate + up on the 5070 Ti)
     if (threadIdx.x == 0) {
-        const int64_t share = (next.bytes / gridDim.x + 15) & ~(int64_t) 15;
-        const int64_t off   = (int64_t) blockIdx.x * share;
-        if (off < next.bytes) {
-            const uint32_t n = (uint32_t) min(share, next.bytes - off);
-            pq2_prefetch_l2((const char *) next.x + off, n);
-            if (next.gate != nullptr) {
-                pq2_prefetch_l2((const char *) next.gate + off, n);
+        const int64_t share = (next.total / gridDim.x + 15) & ~(int64_t) 15;
+        const int64_t lo    = (int64_t) blockIdx.x * share;
+        const int64_t hi    = lo + share;
+        int64_t       base  = 0;
+        for (int r = 0; r < next.n && base < hi; base += next.bytes[r++]) {
+            const int64_t b0 = max(lo, base);
+            const int64_t b1 = min(hi, base + next.bytes[r]);
+            if (b0 < b1) {
+                pq2_prefetch_l2((const char *) next.ptr[r] + (b0 - base), (uint32_t) (b1 - b0));
             }
         }
     }
@@ -483,17 +509,27 @@ static __global__ void mmvq_pq2_mma(
         const int nkb, const int nslots, const int evict_first, const int stride_col_y, const int stride_col_dst,
         const ggml_cuda_pq2_prefetch next, int * tile_ctr) {
     mmvq_pq2_mma_body<M, nmat, has_bias, false>(&tmap, &tmap_gate, nullptr, y, x_bias, dst, nrows, ncols, nb, n_tiles,
-        nkb, nslots, evict_first, stride_col_y, stride_col_dst, next, tile_ctr);
+        nkb, nslots, evict_first, stride_col_y, stride_col_dst, next, tile_ctr, false);
+}
+
+template <int M>
+PQ2_MMA_GROUP_LAUNCH_BOUNDS
+static __global__ void mmvq_pq2_mma_group(
+        const __grid_constant__ pq2_mma_group grp, const block_q8_1 * y, const int ncols, const int nb, const int n_tiles,
+        const int nkb, const int nslots, const int evict_first, const int stride_col_y, const ggml_cuda_pq2_prefetch next,
+        int * tile_ctr, const bool lc_after_wait) {
+    mmvq_pq2_mma_body<M, 1, false, true>(nullptr, nullptr, &grp, y, nullptr, nullptr, 0, ncols, nb, n_tiles, nkb, nslots,
+        evict_first, stride_col_y, 0, next, tile_ctr, lc_after_wait);
 }
 
 template <int M>
 __launch_bounds__((PQ2_MMA_NW + 1)*32, 1)
-static __global__ void mmvq_pq2_mma_group(
+static __global__ void mmvq_pq2_mma_group_168(
         const __grid_constant__ pq2_mma_group grp, const block_q8_1 * y, const int ncols, const int nb, const int n_tiles,
         const int nkb, const int nslots, const int evict_first, const int stride_col_y, const ggml_cuda_pq2_prefetch next,
-        int * tile_ctr) {
+        int * tile_ctr, const bool lc_after_wait) {
     mmvq_pq2_mma_body<M, 1, false, true>(nullptr, nullptr, &grp, y, nullptr, nullptr, 0, ncols, nb, n_tiles, nkb, nslots,
-        evict_first, stride_col_y, 0, next, tile_ctr);
+        evict_first, stride_col_y, 0, next, tile_ctr, lc_after_wait);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -660,20 +696,29 @@ void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy
 
 template <int M>
 static void pq2_mma_launch_group(const pq2_mma_plan & p, const pq2_mma_group & grp, const block_q8_1 * y, int ncols,
-        int nb, int n_tiles, int stride_col_y, const ggml_cuda_pq2_prefetch & next, int * tile_ctr, cudaStream_t stream) {
+        int nb, int n_tiles, int stride_col_y, const ggml_cuda_pq2_prefetch & next, int * tile_ctr, bool fold_beside,
+        cudaStream_t stream) {
     const int nsm     = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     const int nblocks = std::min(nsm, n_tiles);
     const ggml_cuda_kernel_launch_params params(dim3(nblocks), dim3((PQ2_MMA_NW + 1)*32),
         pq2_mma_smem_bytes(M, 1, p.nslots), stream);
+    static const bool regs_legacy = ggml_env_switch("GGML_CUDA_PQ2_MMA_GROUP_REGS_LEGACY");
+    if (regs_legacy || !fold_beside) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((mmvq_pq2_mma_group_168<M>), PQ2_MMA_SMEM_MAX);
+        ggml_cuda_kernel_launch(mmvq_pq2_mma_group_168<M>, params, grp, y, ncols, nb, n_tiles, p.nkb, p.nslots,
+            (int) pq2_mma_get_config().evict_first, stride_col_y, next, tile_ctr, fold_beside);
+        return;
+    }
     CUDA_SET_SHARED_MEMORY_LIMIT((mmvq_pq2_mma_group<M>), PQ2_MMA_SMEM_MAX);
     ggml_cuda_kernel_launch(mmvq_pq2_mma_group<M>, params, grp, y, ncols, nb, n_tiles, p.nkb, p.nslots,
-        (int) pq2_mma_get_config().evict_first, stride_col_y, next, tile_ctr);
+        (int) pq2_mma_get_config().evict_first, stride_col_y, next, tile_ctr, fold_beside);
 }
 
 void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
                                   const int64_t * stride_row_x, const int64_t * stride_col_dst, const void * vy,
                                   int64_t ncols_x, int64_t ncols_dst, int64_t stride_col_y,
-                                  const ggml_cuda_pq2_prefetch & next, int * tile_ctr, cudaStream_t stream) {
+                                  const ggml_cuda_pq2_prefetch & next, int * tile_ctr, bool fold_beside,
+                                  cudaStream_t stream) {
     GGML_ASSERT(n >= 2 && n <= PQ2_MMA_MAX_GROUP);
     const pq2_mma_plan p = pq2_mma_make_plan(ncols_x, 1);
     GGML_ASSERT(p.m > 0 && "ggml_cuda_mmvq_pq2_mma_usable holds a plan");
@@ -697,7 +742,7 @@ void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const 
     const block_q8_1 * y = (const block_q8_1 *) vy;
     switch (p.m) {
 #define PQ2_MMA_CASE(M) case M: pq2_mma_launch_group<M>(p, grp, y, (int) ncols_dst, nb, (int) n_tiles, (int) stride_col_y, \
-                                    next, pq2_mma_tile_ctr(tile_ctr), stream); break;
+                                    next, pq2_mma_tile_ctr(tile_ctr), fold_beside, stream); break;
         PQ2_MMA_CASE(1)
         PQ2_MMA_CASE(2)
         PQ2_MMA_CASE(3)

@@ -140,6 +140,48 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// [p, p + nbytes), shrunk to the whole 16-byte units inside it, into L2 with nothing to wait on: a hint, which a kernel
+// can issue before its PDL wait for data no kernel still running writes, so DRAM streams it under those kernels
+// (cp.async.bulk.prefetch, sm_90 on; nothing below it). No result depends on it: L2 is where writes become coherent.
+static __device__ __forceinline__ void ggml_cuda_prefetch_l2(const void * p, const int64_t nbytes) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+    const uintptr_t b = ((uintptr_t) p + 15) & ~(uintptr_t) 15;
+    const uintptr_t e = ((uintptr_t) p + nbytes) & ~(uintptr_t) 15;
+    if (b < e) {
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"((uint64_t) b), "r"((uint32_t) (e - b)) : "memory");
+    }
+#else
+    GGML_UNUSED_VARS(p, nbytes);
+#endif
+}
+
+// A handoff between two kernels in flight together under PDL, one writing what the other reads before its dependency
+// wait. In the PTX memory model a write reaches a thread of another grid only through a release that the reader's acquire
+// reads from (or a barrier, or a fence.sc); griddepcontrol.wait makes a prerequisite grid's writes visible to the waiting
+// grid alone, so a chain of waits proves nothing to a grid further on. The writer's threads end their stores with a block
+// barrier and one of them adds with release semantics (cumulative over what the barrier ordered before it); the reader's
+// thread loads with acquire semantics, then a block barrier hands the order on to its block.
+static __device__ __forceinline__ void ggml_cuda_red_release_add(unsigned int * p, const unsigned int v) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+#else
+    __threadfence();
+    atomicAdd(p, v);
+#endif
+}
+
+static __device__ __forceinline__ unsigned int ggml_cuda_ld_acquire(const unsigned int * p) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    unsigned int v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+#else
+    const unsigned int v = atomicAdd((unsigned int *) p, 0u);
+    __threadfence();
+    return v;
+#endif
+}
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
@@ -1511,15 +1553,41 @@ struct ggml_cuda_gated_delta_net_gather {
 #endif // defined(GGML_CUDA_USE_L2_WINDOW)
 };
 
-// The head of the next PQ2_0 launch's weights, which a launch prefetches into L2 once it has requested all of its own
-// (mmvq-pq2-mma.cu): every block of a launch starts on the tiles at its matrices' heads, so while the small kernels
-// between two matmuls run, DRAM streams what the next one reads first. x is the next launch's first matrix and gate the
-// one it streams beside it, or null; bytes of each from its start, a multiple of 16 (0: none). A hint: no result depends
+// What a PQ2_0 launch prefetches into L2 once it has requested all of its own weights (mmvq-pq2-mma.cu), as byte ranges
+// its blocks share out laid end to end: first the weights the kernels between it and the next launch read (the Gated
+// DeltaNet's alpha/beta matvec and conv, the norms, the rotations' signs: DRAM misses each token, each read on the chain
+// between two matmuls), then the heads of the next launch's weights (its first matrix and, for a gated pair, the one it
+// streams beside it: every block of a launch starts on the tiles at its matrices' heads), which DRAM streams while the
+// kernels between the two run. Each range a multiple of 16 bytes from a 16-byte aligned start. A hint: no result depends
 // on it. The graph evaluation sets the context's before each node it dispatches (ggml_cuda_pq2_prefetch_plan).
 struct ggml_cuda_pq2_prefetch {
-    const void * x     = nullptr;
-    const void * gate  = nullptr;
-    int64_t      bytes = 0;
+    static constexpr int max_ranges = 12;
+
+    const void * ptr[max_ranges]   = {};
+    int64_t      bytes[max_ranges] = {};
+    int          n                 = 0;
+    int64_t      total             = 0; // the ranges' bytes together
+
+    // [p, p + nbytes) shrunk to whole 16-byte units inside it, merged into the last range when it continues it; false
+    // when the ranges are full
+    bool add(const void * p, int64_t nbytes) {
+        const uintptr_t b = ((uintptr_t) p + 15) & ~(uintptr_t) 15;
+        const uintptr_t e = ((uintptr_t) p + nbytes) & ~(uintptr_t) 15;
+        if (e <= b) {
+            return true;
+        }
+        if (n > 0 && (uintptr_t) ptr[n - 1] + bytes[n - 1] == b) {
+            bytes[n - 1] += e - b;
+        } else if (n < max_ranges) {
+            ptr[n]   = (const void *) b;
+            bytes[n] = e - b;
+            ++n;
+        } else {
+            return false;
+        }
+        total += e - b;
+        return true;
+    }
 };
 
 // One tile counter a stream for the ring launches (the PQ2_0 tensor-core ones, mmvq-pq2-mma.cu, and the routed experts',
@@ -1730,6 +1798,7 @@ struct ggml_cuda_fattn_kv_live_context {
 #define GGML_CUDA_SSM_CONV_UPDATE_D_CONV  4 // the kernel width it is built for (Qwen3-Next, Qwen3.5)
 #define GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T 8 // new tokens per step it holds in registers
 #define GGML_CUDA_SSM_CONV_UPDATE_THREADS 128 // channels per block, and so the head width the L2 fold takes
+#define GGML_CUDA_SSM_CONV_AB_MAX_ROWS    4   // alpha/beta rows a block of the fold computes (ggml_cuda_try_ssm_conv_ab)
 
 struct ggml_cuda_ssm_conv_state_update {
     const float *   cache      = nullptr; // conv cache rows, f32
@@ -1748,6 +1817,72 @@ struct ggml_cuda_ssm_conv_state_update {
     // the CONCATs): w_seg_channels rows of the SSM_CONV's src1 from each in turn; 0 channels, src1 itself
     const float *   w_seg[3]       = {};
     int             w_seg_channels = 0;
+    // Qwen3.5's alpha/beta pair, folded in (ggml_cuda_try_ssm_conv_ab): two bf16 matrices of ab_rows rows by ab_ncols
+    // on one activation, which the blocks compute before the dependency wait and write after it; 0 rows, not
+    const nv_bfloat16 * ab_w          = nullptr; // the first matrix; the second is ab_s02 elements on
+    const float *       ab_y          = nullptr; // the activation, [ab_ncols, n_t]
+    float *             ab_dst        = nullptr; // the first output; the second is ab_s2 floats on
+    int64_t             ab_s02        = 0;
+    int64_t             ab_s2         = 0;
+    int64_t             ab_stride_row = 0; // between a matrix's rows, in elements
+    int64_t             ab_stride_y   = 0; // between the activation's tokens, in floats
+    int64_t             ab_stride_dst = 0; // between an output's tokens, in floats
+    int                 ab_rows       = 0;
+    int                 ab_ncols      = 0;
+    // the fold's handoff slot (ggml_cuda_ssm_conv_ab_slots) and the blocks of the activation's writer that release
+    // to it; set whenever that writer released to it, fold or not, since the conv's blocks are what set it back to 0
+    unsigned int *      ab_slot       = nullptr;
+    int                 ab_writers    = 0;
+};
+
+// Whether the conv-state update may fold in the alpha/beta pair (ggml_cuda_try_ssm_conv_ab), and so whether the PQ2_0
+// group launch writing the conv's inputs takes 152 registers, which leaves its SMs room for the conv's blocks, and
+// triggers its dependents only after its own dependency wait, which keeps the fold's wait on its handoff slot from ever
+// spinning beside blocks still to run (ssm_conv_ab_acquire): GGML_CUDA_SSM_CONV_AB_LEGACY=1 keeps the pair's own launch,
+// and every group launch at 168 registers with the trigger at its start.
+static bool ggml_cuda_ssm_conv_ab_enabled() {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_SSM_CONV_AB_LEGACY");
+    return !legacy;
+}
+
+// The alpha/beta pair an SSM_CONV's update may fold in (ggml_cuda_try_ssm_conv_ab): its two MUL_MATs, the pair's
+// activation, the conv's new inputs, the fold's handoff slot, the blocks of the kernel that wrote the activation and
+// released to the slot this evaluation (0: none did), and whether the PQ2_0 group launch writing the new inputs came
+// after that release, set up for the fold (ggml_cuda_ssm_conv_ab_enabled). The conv folds the pair in only with both.
+struct ggml_cuda_ssm_conv_ab_plan {
+    const ggml_tensor * pair[2] = { nullptr, nullptr };
+    const ggml_tensor * y       = nullptr;
+    const ggml_tensor * x       = nullptr;
+    int                 slot    = -1;
+    int                 writers = 0;
+    bool                fed     = false;
+};
+
+// The alpha/beta folds' handoff slots, one unsigned int a fold of an evaluation, in the order the folds are planned.
+// The kernel writing a fold's activation releases to its slot, a block at a time (the low 16 bits, rms_norm_fwht_cuda);
+// every block of the conv acquires it until all the writer's blocks have, then takes a ticket (the high 16 bits), and
+// the block with the grid's last ticket sets it back to 0 (ssm_conv_ab_acquire). A slot is released to and acquired once
+// an evaluation, so every slot is 0 between two evaluations, and a reset reaches the slot's next use across the boundary
+// between them, which PDL does not overlap (a graph launch; the copy and the host's wait for the logits). Made zeroed
+// before a graph evaluation, never inside a capture, like ggml_cuda_pq2_tile_counters.
+struct ggml_cuda_ssm_conv_ab_slots {
+    static constexpr int n = 256;
+
+    unsigned int * ptr = nullptr;
+
+    void ensure() {
+        if (ptr == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(ptr, 0, n * sizeof(unsigned int)));
+        }
+    }
+
+    void release() {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+            ptr = nullptr;
+        }
+    }
 };
 
 // Registrations are keyed by node pointer, like ggml_cuda_gdn_gather_context, and cleared at the start of every graph
@@ -1755,12 +1890,29 @@ struct ggml_cuda_ssm_conv_state_update {
 struct ggml_cuda_ssm_conv_update_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_ssm_conv_state_update> updates;  // by SSM_CONV
     std::unordered_map<const ggml_tensor *, const ggml_tensor *>             l2_norms; // SSM_CONV -> its L2_NORM
-    std::unordered_set<const ggml_tensor *>                                  skipped;  // the CONCATs, CPYs, L2_NORMs
+    std::unordered_map<const ggml_tensor *, ggml_cuda_ssm_conv_ab_plan>      ab_plans; // by SSM_CONV
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *>             ab_by_y;  // a plan's activation -> its SSM_CONV
+    std::unordered_set<const ggml_tensor *>                                  skipped;  // the CONCATs, CPYs, L2_NORMs, pairs
+    int                                                                      ab_slots = 0; // handoff slots planned
 
     void reset() {
         updates.clear();
         l2_norms.clear();
+        ab_plans.clear();
+        ab_by_y.clear();
         skipped.clear();
+        ab_slots = 0;
+    }
+
+    const ggml_cuda_ssm_conv_ab_plan * ab_plan_of(const ggml_tensor * conv) const {
+        const auto it = ab_plans.find(conv);
+        return it == ab_plans.end() ? nullptr : &it->second;
+    }
+
+    // the plan whose activation is y, for the kernel writing it to release to (rms_norm_fwht_cuda)
+    ggml_cuda_ssm_conv_ab_plan * ab_plan_of_y(const ggml_tensor * y) {
+        const auto it = ab_by_y.find(y);
+        return it == ab_by_y.end() ? nullptr : &ab_plans.at(it->second);
     }
 
     const ggml_cuda_ssm_conv_state_update * find(const ggml_tensor * conv) const {
@@ -1946,6 +2098,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
     ggml_cuda_pq2_tile_counters pq2_tile_counters;
     ggml_cuda_mmvq_shared_q8_1 mmvq_shared_q8_1; // filled during a graph evaluation only
+    ggml_cuda_ssm_conv_ab_slots ssm_conv_ab_slots;
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it

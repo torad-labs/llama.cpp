@@ -10,7 +10,13 @@ static __global__ void mul_mat_vec_f(
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride) {
+        const int ids_stride, const bool lc_early) {
+    // lc_early: the next kernel may launch once every block has started, so it lands while this one reads and its
+    // requests before its own wait (the Gated DeltaNet's state, after qwen35's alpha/beta pair) run under this one's;
+    // it still waits for this grid to complete, so no result depends on where the trigger sits
+    if (lc_early) {
+        ggml_cuda_pdl_lc();
+    }
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -341,7 +347,9 @@ static __global__ void mul_mat_vec_f(
         static_assert(std::is_same_v<T, void>, "unsupported type");
     }
 
-    ggml_cuda_pdl_lc();
+    if (!lc_early) {
+        ggml_cuda_pdl_lc();
+    }
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
         sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
@@ -651,13 +659,16 @@ static void mul_mat_vec_f_switch_fusion(
 
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
+    // the kernel triggers the next launch at its start; GGML_CUDA_MMVF_TRIGGER_LEGACY=1 after its dot products
+    static const bool lc_legacy = ggml_env_switch("GGML_CUDA_MMVF_TRIGGER_LEGACY");
+
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr || fusion.rms_norm;
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, !lc_legacy);
             return;
        }
     }
@@ -667,7 +678,7 @@ static void mul_mat_vec_f_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, !lc_legacy);
 
 }
 

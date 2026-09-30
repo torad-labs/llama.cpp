@@ -55,6 +55,14 @@ static __device__ __forceinline__ float gdn_load_state(const void * src, const i
     return ((const float *) src)[e];
 }
 
+// The byte offset of element e of a state source (gdn_load_state's types; in q8_0, e starts a block)
+static __device__ __forceinline__ int64_t gdn_state_byte(const int64_t e, const ggml_type type) {
+    if (type == GGML_TYPE_Q8_0) {
+        return e / QK8_0 * (int64_t) sizeof(block_q8_0);
+    }
+    return e * (type == GGML_TYPE_F16 ? (int64_t) sizeof(half) : (int64_t) sizeof(float));
+}
+
 // RAW: beta and g arrive pre-activation (ggml_gated_delta_net_set_raw_gates; with KDA,
 // ggml_gated_delta_net_set_raw_kda_gates); the kernel applies sigmoid(beta) and raw_a[h] * softplus(g + raw_dt_bias[h]),
 // or with KDA raw_lb * sigmoid(-(g * raw_a[h])), with the unary kernels' formulas.
@@ -92,7 +100,9 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       attn_seq_stride,
                                      const int32_t * s_ids,
                                      int64_t       s_row_stride,
-                                     ggml_type     s_type) {
+                                     ggml_type     s_type,
+                                     bool          state_prefetch,
+                                     bool          lc_early) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // Each warp owns one or more columns, using warp-level primitives to reduce across rows.
@@ -123,6 +133,18 @@ gated_delta_net_cuda(const float * q,
     float         s_shard[cols_per_warp][rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
+    // With the fused gather the state is a cache row, from the previous step: the block that starts a head requests the
+    // head's whole state into L2 before the wait, so DRAM streams it under the kernels before this one (qwen35's
+    // alpha/beta pair, which lets this kernel launch at its start; a hint, ggml_cuda_prefetch_l2). Then this kernel lets
+    // the next launch, so the gated norm lands under it. Neither changes a result.
+    if (state_prefetch && s_ids && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+        const int64_t e0 = (int64_t) s_ids[sequence] * s_row_stride + h_idx * S_v * S_v;
+        const int64_t b0 = gdn_state_byte(e0, s_type);
+        ggml_cuda_prefetch_l2((const char *) curr_state + b0, gdn_state_byte(e0 + S_v * S_v, s_type) - b0);
+    }
+    if (lc_early) {
+        ggml_cuda_pdl_lc();
+    }
     ggml_cuda_pdl_sync();
     const int64_t state_in_offset = (s_ids ? (int64_t) s_ids[sequence] * s_row_stride : (int64_t) sequence * H * S_v * S_v)
                                     + h_idx * S_v * S_v;
@@ -297,13 +319,18 @@ static void launch_gated_delta_net(
         launch_params.l2_window = gather->l2_window; // the recurrent states' L2 persistence (ggml_cuda_l2_persist_window)
     }
 #endif // defined(GGML_CUDA_USE_L2_WINDOW)
+    // the state's L2 prefetch and the next launch's trigger before the wait (the kernel's comment);
+    // GGML_CUDA_GDN_STATE_PREFETCH_LEGACY=1 and GGML_CUDA_GDN_TRIGGER_LEGACY=1 turn them off
+    static const bool state_prefetch = !ggml_env_switch("GGML_CUDA_GDN_STATE_PREFETCH_LEGACY");
+    static const bool lc_early       = !ggml_env_switch("GGML_CUDA_GDN_TRIGGER_LEGACY");
     switch (S_v) {
         case 16:
             if constexpr (STATE_T != GGML_TYPE_Q8_0) { // a q8_0 block is 32 wide: a 16-lane warp cannot own one
                 ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_T>, launch_params,
                     q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
                     n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
+                    state_prefetch, lc_early);
                 break;
             }
             GGML_ABORT("a q8_0 recurrent state needs S_v >= 32");
@@ -311,20 +338,23 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_T>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
+                state_prefetch, lc_early);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_T>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
+                state_prefetch, lc_early);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_T>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
+                state_prefetch, lc_early);
             break;
         }
         default:

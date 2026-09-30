@@ -285,7 +285,7 @@ template <int N>
 __launch_bounds__(1024, 1)
 __global__ void rms_norm_fwht_cuda(const float * x, const float * w, const float * signs, float * normed, float * dst,
                                    const int ncols, const float eps, const float scale, const bool pdl_trigger,
-                                   const bool prewait) {
+                                   const bool prewait, unsigned int * release_to) {
     if (pdl_trigger) {
         ggml_cuda_pdl_lc();
     }
@@ -341,6 +341,15 @@ __global__ void rms_norm_fwht_cuda(const float * x, const float * w, const float
 
     fwht_block_transform<N, NT>(reg, s);
     fwht_block_store<N, NT>(reg, dst + e0);
+
+    // release_to: the alpha/beta fold's handoff (ggml_cuda_ssm_conv_ab_slots), for a conv that reads normed before its
+    // dependency wait; the barrier puts every thread's normed stores before thread 0's release
+    if (release_to != nullptr) {
+        __syncthreads();
+        if (tid == 0) {
+            ggml_cuda_red_release_add(release_to, 1);
+        }
+    }
 }
 
 static bool fwht_legacy() {
@@ -532,8 +541,10 @@ bool ggml_cuda_rms_norm_fwht_supported(const ggml_tensor * rms_norm, const ggml_
         (normed == nullptr || (normed->type == GGML_TYPE_F32 && ggml_is_contiguous(normed)));
 }
 
-void ggml_cuda_op_rms_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * w,
-                                ggml_tensor * normed, const ggml_tensor * signs, ggml_tensor * dst) {
+int ggml_cuda_op_rms_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * w,
+                               ggml_tensor * normed, const ggml_tensor * signs, ggml_tensor * dst,
+                               unsigned int * release_to) {
+    GGML_ASSERT(release_to == nullptr || normed != nullptr);
     GGML_ASSERT(ggml_cuda_rms_norm_fwht_supported(rms_norm, w, normed, signs, dst));
     const ggml_tensor * x = rms_norm->src[0];
     const int     ncols = x->ne[0];
@@ -557,13 +568,14 @@ void ggml_cuda_op_rms_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_tens
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, block, 0, ctx.stream());
     switch (n) {
         case 1024:
-            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<1024>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger, prewait);
+            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<1024>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger, prewait, release_to);
             break;
         case 2048:
-            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<2048>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger, prewait);
+            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<2048>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger, prewait, release_to);
             break;
         default:
-            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<4096>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger, prewait);
+            ggml_cuda_kernel_launch(rms_norm_fwht_cuda<4096>, lp, x_d, w_d, signs_d, normed_d, dst_d, ncols, eps, scale, pdl_trigger, prewait, release_to);
             break;
     }
+    return (int) (grid.x * grid.y);
 }

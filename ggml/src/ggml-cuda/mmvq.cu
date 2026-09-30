@@ -1501,7 +1501,8 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
 
-void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, const int n) {
+void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, const int n,
+                                       const bool feeds_fold) {
     GGML_ASSERT(n >= 2 && n <= PQ2_MMA_MAX_GROUP);
     const ggml_tensor * src1 = dsts[0]->src[1];
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float) && src1->ne[2] == 1 && src1->ne[3] == 1);
@@ -1538,7 +1539,7 @@ void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_ten
     }
 
     ggml_cuda_mmvq_pq2_mma_group(n, vx, dst, nrows, stride_row, stride_col_dst, src1_q8_1.get(), ne10, ne11,
-        ne10_padded / QK8_1, ctx.pq2_next, ctx.pq2_tile_counter(), stream);
+        ne10_padded / QK8_1, ctx.pq2_next, ctx.pq2_tile_counter(), feeds_fold, stream);
 }
 
 bool ggml_cuda_mul_mat_vec_q_concat_supported(const ggml_tensor * const * w, const int n, const ggml_tensor * src1,

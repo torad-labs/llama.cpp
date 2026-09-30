@@ -50,7 +50,8 @@ static uint64_t get_time_ns() {
 // An NVTX range "gen" in the domain "llama-bench" around each repetition's generation, so a profiler can capture the
 // tokens and none of the depth prefill before them: nsys profile -c nvtx -p gen@llama-bench --capture-range-end=stop
 // records the first repetition's generation (Ternary Bonsai 2 27B at a depth of 245,760: 16 tokens launch 18,816 kernels,
-// the prefill before them 1.19M). The message is a registered string, which nsys matches without NSYS_NVTX_PROFILER_REGISTER_ONLY=0. Without
+// the prefill before them 1.19M). "prompt" is the same around the measured prompt pass (-p), not the depth's: a pp4 at a
+// depth, an MTP verify's shape, captured alone. The message is a registered string, which nsys matches without NSYS_NVTX_PROFILER_REGISTER_ONLY=0. Without
 // the NVTX headers (a build without the CUDA toolkit) the range compiles out.
 struct bench_phase_range {
 #ifdef LLAMA_BENCH_NVTX
@@ -2527,6 +2528,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
+                const bench_phase_range prompt_range("prompt");
                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);

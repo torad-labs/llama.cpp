@@ -37,8 +37,9 @@ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
 bool ggml_cuda_mul_mat_vec_q_moe_gate_fuses(const ggml_tensor * mm, const ggml_tensor * gate, int cc);
 
 // n MUL_MATs (2 to PQ2_MMA_MAX_GROUP) on one src1, each of which ggml_cuda_mul_mat_vec_q would send unfused to the PQ2_0
-// tensor-core kernel: src1 quantized once, one launch over all their tiles (ggml_cuda_mmvq_pq2_mma_group).
-void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n);
+// tensor-core kernel: src1 quantized once, one launch over all their tiles (ggml_cuda_mmvq_pq2_mma_group). feeds_fold:
+// the launch writes the inputs of a conv that folds the alpha/beta pair in (ggml_cuda_try_ssm_conv_ab).
+void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, bool feeds_fold);
 
 // n MUL_MATs of src1 by the weights w[0..n) whose outputs dst concatenates in that order along dim 0 (KDA's q, k and v):
 // whether one mul_mat_vec_q launch runs them, the weights as its channels, which needs them one stride from each other.
