@@ -1482,6 +1482,13 @@ void ggml_cuda_mul_mat_vec_q(
         args.stride_channel_dst     = stride_channel_dst;
         args.stride_bias            = stride_channel_dst; // as mul_mat_vec_q reads an expert's bias
         args.tile_ctr               = ctx.pq2_tile_counter();
+        // the ids an earlier ring launch on this stream read in this evaluation (a down projection's, the gate/up's
+        // before it) are whole before this launch starts, so it lists its experts and issues its first tiles before its
+        // dependency wait (mmvq-moe.cu). GGML_CUDA_MMVQ_MOE_IDS_EARLY_LEGACY=1: past it
+        static const bool ids_early_legacy = ggml_env_switch("GGML_CUDA_MMVQ_MOE_IDS_EARLY_LEGACY");
+        const ggml_tensor *& ids_before = ctx.mmvq_moe_ids[ctx.curr_stream_no];
+        args.ids_ready = !ids_early_legacy && ids_before == ids;
+        ids_before     = ids;
         ggml_cuda_mmvq_moe(args, stream);
         return;
     }

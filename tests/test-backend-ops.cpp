@@ -7772,6 +7772,69 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// A routed FFN as llama-graph builds GLM-5.3-Flash's: gate and up of the tokens' input (the SwiGLU limit's clamps when
+// glu_limit > 0), the GLU, then the down projection of its output, the three on one ids. The CUDA backend runs the
+// gate/up and then the down on mmvq-moe.cu's ring, and the down, its ids read by the launch before it, lists its experts
+// and issues its first tiles before its dependency wait (GGML_CUDA_MMVQ_MOE_IDS_EARLY_LEGACY=1: past it).
+struct test_moe_ffn_chain : public test_case {
+    const ggml_type type;
+    const int       n_mats;
+    const int       n_used;
+    const int64_t   n_embd;
+    const int64_t   n_ff;
+    const int64_t   n_tokens;
+    const float     glu_limit;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, n_mats, n_used, n_embd, n_ff, n_tokens, glu_limit);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_FFN_CHAIN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+
+    test_moe_ffn_chain(ggml_type type, int n_mats, int n_used, int64_t n_embd, int64_t n_ff, int64_t n_tokens,
+                       float glu_limit)
+        : type(type), n_mats(n_mats), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens),
+          glu_limit(glu_limit) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * downs = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, n_mats);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+        }
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gates, cur, ids);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ups, cur, ids);
+        if (glu_limit > 0.0f) {
+            gate = ggml_clamp(ctx, gate, -INFINITY, glu_limit);
+            up   = ggml_clamp(ctx, up, -glu_limit, glu_limit);
+        }
+        ggml_tensor * act = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * out = ggml_mul_mat_id(ctx, downs, act, ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // PQ2_0 matmuls on one activation, next to each other in the graph, as qwen35's qkv and z (or q, k and v) sit once
 // ggml_backend_cuda_graph_optimize has moved them: the CUDA backend runs them as one launch over all their tiles
 // (GGML_CUDA_PQ2_MMA_GROUP_LEGACY=1: one launch each). Every matrix's output is checked, and the row counts put partial
@@ -11096,6 +11159,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 1, 3 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, true,  2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, false, 4096, n, 2048));
+    }
+    // and its routed FFN, gate/up then down on one ids: its FFN on one card (2,048) and on each of two under -sm tensor
+    // (1,024), with and without the SwiGLU limit
+    for (int64_t n_ff : { 2048, 1024 }) {
+        for (int n : { 1, 3 }) {
+            for (float glu_limit : { 0.0f, 7.0f }) {
+                test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 16, 8, 4096, n_ff, n, glu_limit));
+            }
+        }
     }
 
     for (ggml_type type_a : all_types) {

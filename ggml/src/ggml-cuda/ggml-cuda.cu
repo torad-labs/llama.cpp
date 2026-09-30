@@ -6163,6 +6163,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         return it == mmvq_shared_q8_1_readers.end() ? 0 : it->second;
     };
     cuda_ctx->mmvq_shared_q8_1.reset();
+    std::fill(std::begin(cuda_ctx->mmvq_moe_ids), std::end(cuda_ctx->mmvq_moe_ids), nullptr);
 
     static const bool virtual_rms_q8_enabled = [] {
         const char * env = getenv("GGML_CUDA_GB10_VIRTUAL_RMS_Q8");
@@ -6569,6 +6570,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // The VMM scratch pool is stack-like, so release all persistent allocations
     // explicitly in reverse order across both shared-Q8 and row-scale buffers.
     cuda_ctx->mmvq_shared_q8_1.reset();
+    std::fill(std::begin(cuda_ctx->mmvq_moe_ids), std::end(cuda_ctx->mmvq_moe_ids), nullptr);
     for (auto it = gb10_pool_allocations.rbegin(); it != gb10_pool_allocations.rend(); ++it) {
         it->reset();
     }

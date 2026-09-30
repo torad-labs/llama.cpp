@@ -45,7 +45,16 @@
 // ~3.5 us), and at 3 tokens every change of vector paid it.
 //
 // No pointer carries __restrict__: with PDL a restrict load may compile to ld.global.nc, which the compiler can move
-// above the grid dependency wait (upstream #24030). Nothing is read before that wait: the experts come from ids.
+// above the grid dependency wait (upstream #24030). Nothing is read before that wait but ids when they are whole before
+// the launch (ids_ready), and the weights of the tiles they name.
+//
+// A launch triggers the next only past its dependency wait, so whatever the kernels before it wrote is whole before any
+// kernel after it on the stream starts. The ids a ring launch reads (a MoE layer's top-k, written by the kernels before
+// it) are then whole when a later ring launch reading the same ids starts: the down projection after a gate/up. That
+// launch lists its experts and issues its block's first tiles before its wait, so its first rows stream during the
+// gate/up's last tiles and the kernels between (the q8_1 of the GLU's output), where they started only past both (RTX
+// 5070 Ti, GLM-5.3's proxy under -sm tensor: the down 18.75 us a layer against 14.5 at the DRAM peak, the gate/up
+// 34.34 against 29.0).
 
 #define MMVQ_MOE_NG          8                 // a team's warps: a tile's row groups
 #define MMVQ_MOE_NT          2                 // teams, each on its own tiles
@@ -90,6 +99,7 @@ struct mmvq_moe_dev_args {
     int                nslots;
     int *              tile_ctr;
     int                y_bytes;     // > 0: the tokens' vectors, [y, y + y_bytes), copied into shared memory past the ring
+    int                ids_ready;   // ids whole before the launch (ggml_cuda_mmvq_moe_args): read before the dependency wait
 };
 
 // IQ3_XXS: a lane's k iterations at rpw rows a warp, 4 blocks of a row an iteration, the most its registers hold. The
@@ -193,8 +203,6 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
 
-    ggml_cuda_pdl_lc();
-
     if (threadIdx.x == 0) {
         for (int s = 0; s < a.nslots; ++s) {
             mmvq_moe_mbar_init(&full[s],  1);
@@ -210,24 +218,29 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
     const block_q8_1 * const y_base = a.y_bytes > 0 ? (const block_q8_1 *) y_smem : a.y;
 
     if (warp == MMVQ_MOE_NW) {
-        // The producer warp alone lists the distinct experts, in the order of their first pairs, as soon as the
-        // dependency wait lets it read ids, and starts the loads while the consumers fill their tables (they read the
-        // lists after a slot's barrier, which lane 0's arrival publishes): pairs lane and lane + 32, a pair past the
-        // launch's with an expert of its own
-        ggml_cuda_pdl_sync(); // ids is a previous kernel's result
-        if (lane == 0 && a.y_bytes > 0) {
-            // the tokens' vectors, previous kernels' results too, before any tile: a global load that the consumers issue
-            // behind the ring's bulk copies waits for them (a gate/up's first tile took 7 us to its results where the
-            // next took 1.8, both teams at once, while the full ring kept the SM's rows from being asked for)
-            uint64_t unchanged;
-            asm volatile("createpolicy.fractional.L2::evict_unchanged.b64 %0, 1.0;" : "=l"(unchanged));
-            mmvq_moe_mbar_arrive_expect_tx(&y_full, a.y_bytes);
-            mmvq_moe_bulk_load(y_smem, a.y, a.y_bytes, &y_full, unchanged);
+        // The producer warp alone lists the distinct experts, in the order of their first pairs, as soon as it may read
+        // ids, and starts the loads while the consumers fill their tables (they read the lists after a slot's barrier,
+        // which lane 0's arrival publishes): pairs lane and lane + 32, a pair past the launch's with an expert of its own.
+        // ids are a previous kernel's result: read past the dependency wait, or before it when they were whole before
+        // the launch (ids_ready), from L2 (ld.global.cg), past any line of theirs an earlier kernel left in this SM's L1.
+        // The tokens' vectors are previous kernels' results too, copied past the wait before any tile: a global load that
+        // the consumers issue behind the ring's bulk copies waits for them (a gate/up's first tile took 7 us to its
+        // results where the next took 1.8, both teams at once, while the full ring kept the SM's rows from being asked
+        // for); with ids_ready the block's first tiles are ahead of the copy, asked for before the wait.
+        uint64_t unchanged;
+        asm volatile("createpolicy.fractional.L2::evict_unchanged.b64 %0, 1.0;" : "=l"(unchanged));
+        if (!a.ids_ready) {
+            ggml_cuda_pdl_sync();
+            ggml_cuda_pdl_lc(); // past the wait: whatever the kernels before this one wrote is whole for the next
+            if (lane == 0 && a.y_bytes > 0) {
+                mmvq_moe_mbar_arrive_expect_tx(&y_full, a.y_bytes);
+                mmvq_moe_bulk_load(y_smem, a.y, a.y_bytes, &y_full, unchanged);
+            }
         }
         const int npairs = a.ntokens * a.n_used;
         const int p1     = lane + 32;
-        const int e0     = lane < npairs ? a.ids[lane % a.n_used + (lane / a.n_used)*a.ids_stride] : -1 - lane;
-        const int e1     = p1   < npairs ? a.ids[p1   % a.n_used + (p1   / a.n_used)*a.ids_stride] : -1 - p1;
+        const int e0     = lane < npairs ? __ldcg(&a.ids[lane % a.n_used + (lane / a.n_used)*a.ids_stride]) : -1 - lane;
+        const int e1     = p1   < npairs ? __ldcg(&a.ids[p1   % a.n_used + (p1   / a.n_used)*a.ids_stride]) : -1 - p1;
         pair_e[lane]   = e0;
         pairs_of[lane] = 0;
         pairs_of[p1]   = 0;
@@ -280,7 +293,43 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
             const int last     = n_tiles - dyn_base + (int) gridDim.x - 1; // the launch's last ticket
             int n_end  = 0;
             int ticket = -1; // the next sequence's, once asked for
-            for (int i = 0;; ++i) {
+
+            // tile into sequence i's slot
+            const auto issue = [&](const int i, const int tile) {
+                const int s = i % a.nslots;
+                held[s] = tile;
+                const int      u     = tile / a.ntr;
+                const int      row0  = (tile % a.ntr) * R;
+                const uint32_t bytes = (uint32_t) (min(R, a.nrows - row0) * a.row_bytes);
+                const int64_t  off   = expert[u]*a.stride_channel_x_bytes + (int64_t) row0*a.row_bytes;
+                char * slot = ring + (size_t) s*nmat*a.box_bytes;
+                mmvq_moe_mbar_arrive_expect_tx(&full[s], nmat*bytes);
+                mmvq_moe_bulk_load(slot, a.vx + off, bytes, &full[s], policy);
+                if constexpr (nmat == 2) {
+                    mmvq_moe_bulk_load(slot + a.box_bytes, a.vgate + off, bytes, &full[s], policy);
+                }
+            };
+
+            int i = 0;
+            if (a.ids_ready) {
+                // the block's first own tiles before the wait, a ring's at most: weights, which no kernel writes. Not the
+                // last own tile, whose issue asks for the launch's first ticket from the stream's counter, which the
+                // launch before may still be taking
+                for (; i < a.nslots && i + 1 < n_own; ++i) {
+                    const int t = (int) blockIdx.x + i * (int) gridDim.x;
+                    if (t >= dyn_base) {
+                        break;
+                    }
+                    issue(i, t);
+                }
+                ggml_cuda_pdl_sync();
+                ggml_cuda_pdl_lc();
+                if (a.y_bytes > 0) {
+                    mmvq_moe_mbar_arrive_expect_tx(&y_full, a.y_bytes);
+                    mmvq_moe_bulk_load(y_smem, a.y, a.y_bytes, &y_full, unchanged);
+                }
+            }
+            for (;; ++i) {
                 const int s = i % a.nslots;
                 if (i >= a.nslots) {
                     mmvq_moe_mbar_wait(&empty[s], (uint32_t) ((i / a.nslots - 1) & 1));
@@ -307,17 +356,7 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
                     }
                     continue;
                 }
-                held[s] = tile;
-                const int      u     = tile / a.ntr;
-                const int      row0  = (tile % a.ntr) * R;
-                const uint32_t bytes = (uint32_t) (min(R, a.nrows - row0) * a.row_bytes);
-                const int64_t  off   = expert[u]*a.stride_channel_x_bytes + (int64_t) row0*a.row_bytes;
-                char * slot = ring + (size_t) s*nmat*a.box_bytes;
-                mmvq_moe_mbar_arrive_expect_tx(&full[s], nmat*bytes);
-                mmvq_moe_bulk_load(slot, a.vx + off, bytes, &full[s], policy);
-                if constexpr (nmat == 2) {
-                    mmvq_moe_bulk_load(slot + a.box_bytes, a.vgate + off, bytes, &full[s], policy);
-                }
+                issue(i, tile);
                 if (i + 1 >= n_own && dyn_base < n_tiles) {
                     ticket = atomicAdd(a.tile_ctr, 1); // the next sequence's tile, asked for now this one is issued
                 }
@@ -339,6 +378,7 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
         asm volatile("bar.sync 1, %0;" :: "n"(MMVQ_MOE_NW*32) : "memory");
     }
     ggml_cuda_pdl_sync(); // the tokens are the previous kernels' results, and dst may still be read
+    ggml_cuda_pdl_lc();
     if (a.y_bytes > 0) {
         mmvq_moe_mbar_wait(&y_full, 0); // the producer's copy of the tokens' vectors
     }
@@ -700,6 +740,7 @@ void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t strea
     a.nslots                 = p.nslots;
     a.y_bytes                = (int) y_bytes;
     a.tile_ctr               = args.tile_ctr;
+    a.ids_ready              = args.ids_ready ? 1 : 0;
 
     // one block an SM, never more than the tiles of the most distinct experts the pairs can name
     const int nsm     = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;

@@ -2098,6 +2098,10 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
     ggml_cuda_pq2_tile_counters pq2_tile_counters;
     ggml_cuda_mmvq_shared_q8_1 mmvq_shared_q8_1; // filled during a graph evaluation only
+    // each stream's last routed-expert ring launch's ids in this graph evaluation (ggml_cuda_mul_mat_vec_q): a later
+    // ring launch there reading the same ids reads them before its dependency wait (mmvq-moe.cu). A graph's tensor is
+    // written once, and ggml-alloc hands its bytes on only past its last reader.
+    const ggml_tensor * mmvq_moe_ids[GGML_CUDA_MAX_STREAMS] = {};
     ggml_cuda_ssm_conv_ab_slots ssm_conv_ab_slots;
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;

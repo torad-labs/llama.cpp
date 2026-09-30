@@ -36,6 +36,9 @@ struct ggml_cuda_mmvq_moe_args {
     int64_t            stride_bias;
     int *              tile_ctr;  // the stream's tile counter (ggml_cuda_pq2_tile_counters), or nullptr: every tile its
                                   // block's own
+    bool               ids_ready; // ids whole before the launch starts (an earlier launch here on the stream read them, and
+                                  // triggers the next only past its dependency wait): the experts listed and the block's
+                                  // first tiles issued before this one's
 };
 
 // Whether ggml_cuda_mmvq_moe takes these weights: an NVIDIA GPU from Hopper on (cp.async.bulk), a type and token count
