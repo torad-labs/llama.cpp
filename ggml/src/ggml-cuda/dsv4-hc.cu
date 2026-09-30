@@ -919,10 +919,13 @@ void ggml_cuda_dsv4_hc_comb_join(ggml_backend_cuda_context & ctx) {
     ctx.hc_comb_pending.clear();
 }
 
-// GGML_CUDA_HC_COMB_SIDE_LEGACY=1: the front's second kernel makes the comb, on the front's chain
-static bool dsv4_hc_comb_side_legacy() {
-    static const bool legacy = ggml_env_switch("GGML_CUDA_HC_COMB_SIDE_LEGACY");
-    return legacy;
+// The comb beside the stream is opt-in, GGML_CUDA_HC_COMB_SIDE=1; by default the front's second kernel makes it, on the
+// front's chain. Beside the stream it took the 5080's and the 5070 Ti's kernel time a token 1.03 % and 0.69 % lower
+// under -sm tensor (the 44-layer GLM-5.3 proxy, node traces), and tg64 0.70 % higher (95 % CI -0.15 to +1.55 %, 4
+// rounds), but GLM-5.3-Flash's tg64 3.7 % lower on 2 RTX PRO 6000 under -sm tensor (4 interleaved pairs of 4)
+static bool dsv4_hc_comb_side_enabled() {
+    static const bool enabled = ggml_env_switch("GGML_CUDA_HC_COMB_SIDE");
+    return enabled;
 }
 
 bool ggml_cuda_dsv4_hc_pre_fused_supported(const ggml_tensor * rms_flat, const ggml_tensor * mm,
@@ -1075,7 +1078,7 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
 
         // the comb beside the stream (dsv4_hc_comb_side), off the chain to the sublayer's projections: written after
         // this launch, so only into weights whose bytes stay theirs until a join
-        const bool comb_side = ctx.hc_comb_side && weights_outlive && !dsv4_hc_comb_side_legacy();
+        const bool comb_side = ctx.hc_comb_side && weights_outlive && dsv4_hc_comb_side_enabled();
 
         const int n_blocks = (int) ((n_embd + DSV4_HC_PRE_GRAM_THR - 1) / DSV4_HC_PRE_GRAM_THR);
         const ggml_cuda_kernel_launch_params pre_params =
