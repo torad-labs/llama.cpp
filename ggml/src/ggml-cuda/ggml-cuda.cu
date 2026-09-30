@@ -4447,8 +4447,11 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     };
 
     bool is_ok = true;
-    // exception for topk-moe, as each row is read entirely before writing
-    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
+    // exception for topk-moe, which reads all its rows before it writes when they fit one block
+    // (ggml_cuda_topk_moe_reads_before_writes). GGML_CUDA_TOPK_MOE_ALIAS_LEGACY=1: at one row only
+    static const bool topk_moe_alias_legacy = ggml_env_switch("GGML_CUDA_TOPK_MOE_ALIAS_LEGACY");
+    const int64_t     topk_moe_rows         = ggml_nrows(cgraph->nodes[node_idx]);
+    if (is_topk_moe && (topk_moe_alias_legacy ? topk_moe_rows == 1 : ggml_cuda_topk_moe_reads_before_writes(topk_moe_rows))) {
         return true;
     }
 
