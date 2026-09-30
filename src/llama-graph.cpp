@@ -4074,6 +4074,7 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
         ggml_tensor * top_k,
+        ggml_tensor * live,
         ggml_tensor * sel_mask,
         ggml_tensor * cand_mask,
             float     kq_scale,
@@ -4098,14 +4099,28 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     GGML_ASSERT(sel_mask->ne[0] == kq_mask->ne[0] && sel_mask->ne[1] == kq_mask->ne[1] &&
                 sel_mask->ne[3] == kq_mask->ne[3]);
 
-    // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy
-    ggml_tensor * mask_all = ggml_dup(ctx0, sel_mask);
+    GGML_ASSERT(ggml_are_same_shape(top_k, live));
+
+    const int64_t n_kv    = sel_mask->ne[0];
+    const int64_t n_slots = top_k->ne[0];
+
+    GGML_ASSERT(n_kv + n_slots < (1 << 24) && "the dump row index is computed in f32");
+
+    // a filler slot scatters to its own dump column past n_kv, so a row's indices stay unique (CPU threads write them)
+    ggml_tensor * dump    = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_slots), 1.0f);
+    ggml_tensor * idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, ggml_cast(ctx0, top_k, GGML_TYPE_F32), dump), live), dump);
+    ggml_tensor * scatter = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
+    cb(scatter, "kpool_scatter", il);
+
+    // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy with the dump columns
+    ggml_tensor * dump_cols = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, sel_mask->type, n_slots, sel_mask->ne[1], 1, sel_mask->ne[3]), 0.0f);
+    ggml_tensor * mask_all  = ggml_concat(ctx0, sel_mask, dump_cols, 0);
 
     mask_all = ggml_view_4d(ctx0, mask_all, 1, mask_all->ne[0], mask_all->ne[1], mask_all->ne[3],
             mask_all->nb[0], mask_all->nb[1], mask_all->nb[2], 0);
 
-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[2], 1,
-            top_k->nb[1], top_k->nb[2], top_k->ne[2]*top_k->nb[2], 0);
+    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, scatter, scatter->ne[0], scatter->ne[1], scatter->ne[2], 1,
+            scatter->nb[1], scatter->nb[2], scatter->ne[2]*scatter->nb[2], 0);
 
     // a constant 0, never the cell's bias: scattering -inf would ERASE a zero granted to the
     // tail. f32 because CUDA only does SET_ROWS for f32
@@ -4114,7 +4129,8 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     ggml_tensor * mask_top_k = ggml_set_rows(ctx0, mask_all, zeros, top_k_3d);
 
-    mask_top_k = ggml_view_4d(ctx0, mask_top_k, mask_top_k->ne[1], mask_top_k->ne[2], 1, mask_top_k->ne[3],
+    // the first n_kv columns are the mask; the dump columns are dropped here
+    mask_top_k = ggml_view_4d(ctx0, mask_top_k, n_kv, mask_top_k->ne[2], 1, mask_top_k->ne[3],
             mask_top_k->nb[2], mask_top_k->nb[3], mask_top_k->nb[3], 0);
 
     mask_top_k = ggml_add(ctx0, mask_top_k, cand_mask);

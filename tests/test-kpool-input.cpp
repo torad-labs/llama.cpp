@@ -418,6 +418,54 @@ enum control {
     CONTROL_CORRUPT, // a byte of the views' output is flipped
 };
 
+// the rows the pooled keys are written to: all different, because set_rows writes them from several threads, and a slot
+// that names the last cell of a block must be the one that computes that cell's pool, because that cell's pooled key is read
+static bool write_rows_safe(const maps & m, const pool & w, int64_t n_ns, uint32_t r, char * what, size_t n_what) {
+    if (m.new_pool_reps == nullptr) {
+        return true;
+    }
+
+    const int64_t  n_slots = m.new_pool_reps->ne[0];
+    const int64_t  n_new_max = n_slots/n_ns;
+    const int64_t  kv_size = w.v_cells[0].size();
+    const int64_t * rows   = (const int64_t *) m.new_pool_reps->data;
+    const int32_t * cells  = (const int32_t *) m.new_pool_cells->data;
+
+    // r 1 has no spare cell (every cell is a pool), so an unused slot repeats a pool and writes the same key again
+    for (int64_t i = 0; r > 1 && i < n_slots; ++i) {
+        for (int64_t j = i + 1; j < n_slots; ++j) {
+            if (rows[i] == rows[j]) {
+                const llama_kv_cells & c = w.v_cells[0];
+                snprintf(what, n_what, "new_pool_reps: row %lld written by slots %lld and %lld of %lld (cell %s, pos %u, n_ns %lld) rows %lld %lld %lld %lld %lld %lld; used %u/%u", (long long) rows[i],
+                        (long long) i, (long long) j, (long long) n_slots, c.is_empty(rows[i] % kv_size) ? "empty" : "used", (unsigned) (c.is_empty(rows[i] % kv_size) ? 9999 : c.pos_get(rows[i] % kv_size)), (long long) n_ns,
+                        (long long) rows[0], (long long) rows[1], (long long) rows[std::min<int64_t>(2, n_slots - 1)], (long long) rows[std::min<int64_t>(3, n_slots - 1)],
+                        (long long) rows[std::min<int64_t>(4, n_slots - 1)], (long long) rows[std::min<int64_t>(5, n_slots - 1)], c.get_used(), c.size());
+                return false;
+            }
+        }
+    }
+
+    for (int64_t i = 0; i < n_slots; ++i) {
+        const int64_t s    = i/n_new_max;
+        const int64_t cell = rows[i] - s*kv_size;
+
+        if (cell < 0 || cell >= kv_size) {
+            snprintf(what, n_what, "new_pool_reps[%lld] = %lld: outside stream %lld", (long long) i, (long long) rows[i], (long long) s);
+            return false;
+        }
+
+        const llama_kv_cells & c = w.v_cells[s];
+
+        if (!c.is_empty(cell) && c.pos_get(cell) % (llama_pos) r == (llama_pos) r - 1 &&
+                cells[s*r*n_new_max + (i % n_new_max)*r + r - 1] != (int32_t) cell) {
+            snprintf(what, n_what, "new_pool_reps[%lld]: cell %lld is the last of its block but the slot computes another pool", (long long) i, (long long) cell);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // the inputs of one ubatch built from the views and from the cells. The ubatch is placed in the cells first, as the cache
 // does (apply_ubatch before the inputs are set). rebuild: re-emit every pool, as after a position mutation
 static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, bool rebuild, std::mt19937 & rng, control ctl, char * what, size_t n_what) {
@@ -515,7 +563,8 @@ static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, 
         ((uint8_t *) inc.sel_mask->data)[0] ^= 0x80;
     }
 
-    return same(inc, ref, what, n_what);
+    return write_rows_safe(ref, w, n_ns, cfg.r, what, n_what) && write_rows_safe(inc, w, n_ns, cfg.r, what, n_what) &&
+           same(inc, ref, what, n_what);
 }
 
 static void run_round(std::mt19937 & rng, const config & cfg, uint32_t size, uint32_t n_seq, int n_ops, llama_kpool_views::stats & total) {

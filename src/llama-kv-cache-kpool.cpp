@@ -67,6 +67,37 @@ static void kpool_mask_row(
     }
 }
 
+// the cell an unused write slot names: empty, or not the last of its block, and not a cell the real slots write, since a pooled key
+// is read at the last cell of a block only. One cell per slot keeps the rows of the write different (set_rows writes them from
+// several threads). -1 when none is left
+struct kpool_spare_cells {
+    const llama_kv_cells & cells;
+    llama_pos              r;
+    const int64_t *        rows; // the rows of the real slots
+    int64_t                n_rows;
+    int64_t                row0; // the row of cell 0
+    std::vector<int64_t>   written;
+    bool                   sorted = false;
+    uint32_t               next   = 0;
+
+    int32_t take() {
+        if (!sorted) {
+            sorted = true;
+            for (int64_t i = 0; i < n_rows; ++i) {
+                written.push_back(rows[i] - row0);
+            }
+            std::sort(written.begin(), written.end());
+        }
+
+        for (; next < cells.size(); ++next) {
+            if ((cells.is_empty(next) || cells.pos_get(next) % r != r - 1) && !std::binary_search(written.begin(), written.end(), (int64_t) next)) {
+                return (int32_t) next++;
+            }
+        }
+        return -1;
+    }
+};
+
 // where one stream's maps go: the tensors of llama_kpool_set_input, at this stream's first element
 struct kpool_stream_out {
     int32_t * pool_cells = nullptr;
@@ -119,7 +150,7 @@ static void kpool_stream_from_view(
 
     int64_t n_new = 0;
 
-    // pads the fixed-size write; recomputing a complete pool is idempotent, so a repeat is safe
+    // the fallback of an unused slot when no spare cell is left: recomputing a complete pool is idempotent
     const int32_t * any_rep_src = nullptr;
 
     if (o.pool_reps) {
@@ -223,10 +254,13 @@ static void kpool_stream_from_view(
     GGML_ASSERT(n_done == o.n_tps && "every query must belong to a sequence of the ubatch");
 
     if (o.pool_reps) {
-        // the fixed row count means unused slots must name a safe destination: repeat a complete
-        // pool (recompute is a no-op), or cell 0 when none exists (nothing reads its pooled third)
+        // the fixed row count means unused slots must name a safe destination: a spare cell each (their members stay cell 0)
+        kpool_spare_cells spare = { cells, (llama_pos) r, o.new_reps, n_new, o.strm_row, {} };
+
         for (int64_t p = n_new; p < o.n_new_max; ++p) {
-            if (any_rep_src) {
+            if (const int32_t cell = spare.take(); cell >= 0) {
+                o.new_reps[p] = o.strm_row + cell;
+            } else if (any_rep_src) {
                 std::copy(any_rep_src, any_rep_src + r, o.new_cells + p*r);
                 o.new_reps[p] = o.strm_row + any_rep_src[r - 1];
             } else {
@@ -390,8 +424,11 @@ void llama_kpool_set_input(
 
         int64_t n_new = 0;
 
-        // pads the fixed-size write; recomputing a complete pool is idempotent, so a repeat is safe
+        // the fallback of an unused slot when no spare cell is left: recomputing a complete pool is idempotent
         const int32_t * any_rep_src = nullptr;
+
+        // the cells named as a rep by the new slots
+        std::vector<uint8_t> emitted(kcache ? kv_size : 0, 0);
 
         if (kcache) {
             // a pool with no rep gathers row 0; such a pool is -INFINITY in pool_bias, so discarded
@@ -586,6 +623,15 @@ void llama_kpool_set_input(
                         continue;
                     }
 
+                    // a rep is written once: sequences that share cells, or cells that share a position, give the same rep twice
+                    const int32_t rep = part_pool_cells[p*r + (r - 1)];
+
+                    if (emitted[rep]) {
+                        continue;
+                    }
+
+                    emitted[rep] = 1;
+
                     // bounded while a sequence's ubatch tokens are a contiguous run (llama-batch.cpp enforces);
                     // fail loudly, clamping would serve a stale key
                     GGML_ASSERT(n_new < n_new_max && "k-pool: more pools completed than the fixed bound");
@@ -593,7 +639,7 @@ void llama_kpool_set_input(
                     std::copy(part_pool_cells + p*r, part_pool_cells + (p + 1)*r,
                             cur_new_cells + n_new*r);
 
-                    cur_new_reps[n_new] = (int64_t) strm_of[s]*kv_size + part_pool_cells[p*r + (r - 1)];
+                    cur_new_reps[n_new] = (int64_t) strm_of[s]*kv_size + rep;
 
                     n_new++;
                 }
@@ -653,10 +699,13 @@ void llama_kpool_set_input(
         GGML_ASSERT(n_done == n_tps && "every query must belong to a sequence of the ubatch");
 
         if (kcache) {
-            // the fixed row count means unused slots must name a safe destination: repeat a complete
-            // pool (recompute is a no-op), or cell 0 when none exists (nothing reads its pooled third)
+            // the fixed row count means unused slots must name a safe destination: a spare cell each (their members stay cell 0)
+            kpool_spare_cells spare = { cells_of(seq_of(s, 0)), (llama_pos) r, cur_new_reps, n_new, (int64_t) strm_of[s]*kv_size, {} };
+
             for (int64_t p = n_new; p < n_new_max; ++p) {
-                if (any_rep_src) {
+                if (const int32_t cell = spare.take(); cell >= 0) {
+                    cur_new_reps[p] = (int64_t) strm_of[s]*kv_size + cell;
+                } else if (any_rep_src) {
                     std::copy(any_rep_src, any_rep_src + r, cur_new_cells + p*r);
                     cur_new_reps[p] = (int64_t) strm_of[s]*kv_size + any_rep_src[r - 1];
                 } else {
