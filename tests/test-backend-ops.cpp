@@ -4416,6 +4416,7 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
         ggml_tensor * mixes  = ggml_mul_mat(ctx, hc_fn, ggml_rms_norm(ctx, flat, 1e-5f));
         weights = ggml_dsv4_hc_weights(ctx, mixes, scale, base, 1e-6f, n_iter);
         ggml_set_name(weights, "hc_weights");
+        ggml_set_output(weights); // read back after the evaluation, as the tests compare it
 
         ggml_tensor * pre = ggml_view_2d(ctx, weights, hc, n_tokens, weights->nb[1], 0);
         post = ggml_view_2d(ctx, weights, hc, n_tokens, weights->nb[1], hc*weights->nb[0]);
@@ -10105,6 +10106,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 64, 2, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 31, 3, 4));
+    // a comb of 1,000 iterations with no reader in the graph: CUDA makes it beside the stream, and the weights are read
+    // back only once the evaluation's end has waited for it
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 3, 1000));
     // the previous sublayer's DSV4_HC_POST before the front, which CUDA's Gram path fuses: its streams are an output
     for (int64_t n_tokens : { 1, 2, 3, 16, 17 }) {
         test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, n_tokens, 20, false, true, true));

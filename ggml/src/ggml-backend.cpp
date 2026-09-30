@@ -2386,9 +2386,10 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
 
     if (num_test_nodes != 0) {
         GGML_ASSERT(test_nodes);
-        // Compute the whole graph and only test the output for specific tensors
-        ggml_backend_graph_compute(backend1, g1);
+        // Compute the whole graph and only test the output for specific tensors: backend1's last, so its outputs are
+        // read as soon as its evaluation returns, and work it leaves running past the return reads as a wrong result
         ggml_backend_graph_compute(backend2, g2);
+        ggml_backend_graph_compute(backend1, g1);
 
         bool verified = false;
         for (int i = 0; i < g1->n_nodes; i++) {
