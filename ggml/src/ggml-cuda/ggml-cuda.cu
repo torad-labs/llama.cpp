@@ -5133,6 +5133,47 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // routed experts' weighted sum as build_moe_ffn writes it: MUL(experts, weights), each slot's view of it, and the
+    // views added in slot order, in one launch (ggml_cuda_op_moe_weighted_sum) where the MUL and the fused ADDs took two.
+    // GGML_CUDA_MOE_WSUM_LEGACY=1: the two
+    static const bool moe_wsum_legacy = ggml_env_switch("GGML_CUDA_MOE_WSUM_LEGACY");
+    if (!moe_wsum_legacy && node->op == GGML_OP_MUL && node->ne[1] >= 2 && 2*node->ne[1] < 32 &&
+            i + 2*node->ne[1] <= cgraph->n_nodes) {
+        const int           n_used  = (int) node->ne[1];
+        const int           n_ops   = 2*n_used; // the MUL, n_used views, n_used - 1 ADDs
+        const ggml_tensor * experts = node->src[0];
+        const ggml_tensor * weights = node->src[1];
+        bool ok = node->type == GGML_TYPE_F32 && experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(node, experts) && node->ne[3] == 1 && weights->ne[0] == 1 &&
+            weights->ne[1] == n_used && weights->ne[2] == node->ne[2] && weights->ne[3] == 1 &&
+            experts->nb[0] == sizeof(float) && ggml_is_contiguous(node);
+        // slot s's view: [n_embd, n_tokens] at s*nb[1], its rows nb[2] apart
+        for (int s = 0; ok && s < n_used; ++s) {
+            const ggml_tensor * v = cgraph->nodes[i + 1 + s];
+            ok = v->op == GGML_OP_VIEW && v->src[0] == node && v->view_offs == s*node->nb[1] &&
+                v->ne[0] == node->ne[0] && v->ne[1] == node->ne[2] && v->ne[2] == 1 && v->nb[1] == node->nb[2];
+        }
+        // ADD(v0, v1), then ADD(the sum so far, v_s)
+        for (int s = 1; ok && s < n_used; ++s) {
+            const ggml_tensor * a    = cgraph->nodes[i + n_used + s];
+            const ggml_tensor * prev = s == 1 ? cgraph->nodes[i + 1] : cgraph->nodes[i + n_used + s - 1];
+            ok = a->op == GGML_OP_ADD && a->type == GGML_TYPE_F32 && a->src[0] == prev &&
+                a->src[1] == cgraph->nodes[i + 1 + s] && a->nb[0] == sizeof(float);
+        }
+        if (ok) {
+            ggml_op ops[32];
+            ops[0] = GGML_OP_MUL;
+            std::fill(ops + 1, ops + 1 + n_used, GGML_OP_VIEW);
+            std::fill(ops + 1 + n_used, ops + n_ops, GGML_OP_ADD);
+            const int out = i + n_ops - 1;
+            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, &out, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, &out, 1)) {
+                ggml_cuda_op_moe_weighted_sum(*cuda_ctx, experts, weights, cgraph->nodes[out]);
+                return n_ops - 1;
+            }
+        }
+    }
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;

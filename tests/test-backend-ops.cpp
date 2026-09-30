@@ -7835,6 +7835,67 @@ struct test_moe_ffn_chain : public test_case {
     }
 };
 
+// Routed experts' weighted sum as build_moe_ffn writes it: MUL(experts, weights), each slot's view, and the views added in
+// slot order. The CUDA backend runs the three as one launch (ggml_cuda_op_moe_weighted_sum, GGML_CUDA_MOE_WSUM_LEGACY=1:
+// the MUL and the fused ADDs), which rounds each product and each sum as the nodes do: the check is bit for bit.
+struct test_moe_weighted_sum : public test_case {
+    const int64_t n_embd;
+    const int     n_used;
+    const int64_t n_tokens;
+
+    std::vector<ggml_tensor *> order;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_used, n_tokens);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_WEIGHTED_SUM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> forward_first() override { return order; }
+
+    // the elements whose bits differ
+    double err(const float * a, const float * b, size_t n) override {
+        size_t differ = 0;
+        for (size_t i = 0; i < n; ++i) {
+            differ += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) differ;
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    test_moe_weighted_sum(int64_t n_embd, int n_used, int64_t n_tokens)
+        : n_embd(n_embd), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(experts, "experts");
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
+        order = { weighted };
+        std::vector<ggml_tensor *> views;
+        for (int s = 0; s < n_used; ++s) {
+            views.push_back(ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], s*weighted->nb[1]));
+            order.push_back(views.back());
+        }
+        ggml_tensor * out = views[0];
+        for (int s = 1; s < n_used; ++s) {
+            out = ggml_add(ctx, out, views[s]);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // PQ2_0 matmuls on one activation, next to each other in the graph, as qwen35's qkv and z (or q, k and v) sit once
 // ggml_backend_cuda_graph_optimize has moved them: the CUDA backend runs them as one launch over all their tiles
 // (GGML_CUDA_PQ2_MMA_GROUP_LEGACY=1: one launch each). Every matrix's output is checked, and the row counts put partial
@@ -11166,6 +11227,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int n : { 1, 3 }) {
             for (float glu_limit : { 0.0f, 7.0f }) {
                 test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 16, 8, 4096, n_ff, n, glu_limit));
+            }
+        }
+    }
+    // and the experts' weighted sum after the down: GLM's (4,096 and 8 slots) at a decode, an MTP verify and a batch, and
+    // other widths and slot counts (gpt-oss's 2,880 and 4, a row past a block)
+    for (int64_t n_embd : { 4096, 2880 }) {
+        for (int n_used : { 8, 4, 2 }) {
+            for (int64_t n : { 1, 3, 8 }) {
+                test_cases.emplace_back(new test_moe_weighted_sum(n_embd, n_used, n));
             }
         }
     }
