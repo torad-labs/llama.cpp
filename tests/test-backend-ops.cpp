@@ -11152,6 +11152,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, 12, 5120, {2, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 40,  3, 5122, {1, 1}, {1, 1}));
     }
+    // a float src0 mmf tiles into fewer blocks than an SM count (glm5next's ssm_beta and ssm_f_a: 64 and 128 x 4096),
+    // which CUDA runs on the vector kernel at 2-8 columns and rows x cols <= 1024: both sides of each limit, plain,
+    // batched and broadcast
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t m : {64, 128}) {
+            for (int64_t n : {2, 3, 5, 8, 9}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 4096, {1, 1}, {1, 1}));
+            }
+        }
+        for (int64_t n : {2, 3}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, 1024, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 3, 256, {2, 3}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 3, 256, {2, 3}, {2, 1}));
+    }
     // operands the float kernels cannot read, which must fall back (test_mul_mat_view). Strides: at 48 rows, an src1
     // stride odd in floats at every batch the vector kernel takes, and under the fused gate/up vector kernel at one
     // token; at 64 rows, which mmf tiles, src1 strides of 1 and 2 mod 4 floats and an src0 row stride of 2 mod 4
@@ -12233,6 +12248,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_pair(GGML_TYPE_BF16, 48, n, 5120, views));
         }
     }
+    // glm5next's ssm_f_a and ssm_g_a (128 x 4096 bf16), which mmf tiles into fewer blocks than an SM count
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t n : {2, 3, 8}) {
+            test_cases.emplace_back(new test_mul_mat_pair(type, 128, n, 4096, 0));
+        }
+    }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
@@ -12648,6 +12669,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,   64, n, 4096, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 4096, n, 1536, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   32, n, 4096, {1, 1}, {1, 1}));
+    }
+    // float weights mmf tiles into fewer blocks than an SM count, which CUDA runs on the vector kernel at 2-8 columns and
+    // rows x cols <= 1024 (GGML_CUDA_MMVF_UNDERFILLED_LEGACY=1: mmf): rows on both sides of that, up to the SM counts
+    // of an RTX 5070 Ti and 5080 times 32
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t m : {64, 128, 256, 512, 1024, 2048}) {
+            for (int64_t k : {1024, 4096, 8192}) {
+                for (int64_t n : {2, 3, 4, 8}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                }
+            }
+        }
+    }
+    for (int64_t m : {64, 1024}) {
+        for (int64_t n : {4, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, 4096, {1, 1}, {1, 1}));
+        }
     }
 
     // FWHT tests

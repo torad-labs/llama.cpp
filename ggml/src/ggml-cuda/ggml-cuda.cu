@@ -2665,6 +2665,24 @@ static bool ggml_cuda_should_use_mmvf_untiled(const ggml_tensor * src0, const gg
         && ggml_cuda_mmvf_supports(src0, src1);
 }
 
+// On NVIDIA from Ampere on, ggml_cuda_should_use_mmvf leaves f16 and bf16 weights past one column (f32 past 3) to
+// mul_mat_f, which launches a block for each MMF_ROWS_PER_BLOCK rows of each dst channel and reads a row's whole K in
+// it: a wide projection to few rows runs on a few SMs. glm5next's ssm_f_a and ssm_g_a (4096 -> 128 bf16) took 8.6 us
+// each on 4 blocks at an MTP verify's 3 columns and ssm_beta (4096 -> 64) 6.4 us on 2, RTX 5070 Ti, where at one column
+// mul_mat_vec_f, a block a row, ran f_a and g_a as one launch in 5.6 us. mul_mat_f's time there follows K, the vector
+// kernel's rows x cols: over f16/bf16 weights of 64-2048 rows, K 1024-8192 and 2-8 columns (test-backend-ops perf, RTX
+// 5070 Ti) the vector kernel took 0.21-0.68 of mul_mat_f's time at rows x cols <= 1024, 0.76-1.13 at 2048 and 1.1-4.4
+// past it. So there, at 2 to MMVF_MAX_BATCH_SIZE columns and rows x cols <= 1024, where mul_mat_f would launch fewer
+// blocks than the device has SMs, mul_mat_vec_f takes the product (and a pair of them on one src1 runs as one launch,
+// ggml_cuda_mul_mat_vec_f_pair). GGML_CUDA_MMVF_UNDERFILLED_LEGACY=1: mul_mat_f.
+static bool ggml_cuda_should_use_mmvf_underfilled(const ggml_tensor * src0, const ggml_tensor * src1,
+                                                  const ggml_tensor * dst, const int cc, const int nsm) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_MMVF_UNDERFILLED_LEGACY");
+    return !legacy && ampere_mma_available(cc) && src1->ne[1] >= 2 && src1->ne[1] <= MMVF_MAX_BATCH_SIZE
+        && src0->ne[1]*src1->ne[1] <= 1024 && ggml_cuda_mmvf_supports(src0, src1)
+        && src0->ne[1]/MMF_ROWS_PER_BLOCK * dst->ne[2]*dst->ne[3] < nsm;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2707,6 +2725,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_should_use_mmf(src0, src1, cc, warp_size, ne11, /*mul_mat_id =*/ false)) {
+        if (ggml_cuda_should_use_mmvf_underfilled(src0, src1, dst, cc, ggml_cuda_info().devices[ctx.device].nsm)) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+            return;
+        }
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -2733,18 +2755,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 // Whether ggml_cuda_mul_mat runs the MUL_MAT dst on ggml_cuda_mul_mat_vec_f with its own operands, as its choices above
 // go at up to MMVF_MAX_BATCH_SIZE columns (where the transposed-vector path cannot apply).
-static bool ggml_cuda_mul_mat_runs_mmvf(const ggml_tensor * dst, const int cc, const int warp_size) {
+static bool ggml_cuda_mul_mat_runs_mmvf(const ggml_tensor * dst, const int cc, const int warp_size, const int nsm) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const int64_t       ne11 = src1->ne[1];
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    return ggml_get_op_params_i32(dst, 1) != GGML_HINT_SRC0_IS_HADAMARD && !bad_padding_clear
-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne11 <= MMVF_MAX_BATCH_SIZE
-        && (ggml_cuda_should_use_mmvf(src0, src1, cc, ne11)
-            || (!ggml_cuda_should_use_mmf(src0, src1, cc, warp_size, ne11, /*mul_mat_id =*/ false)
-                && ggml_cuda_should_use_mmvf_untiled(src0, src1, ne11)));
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD || bad_padding_clear
+            || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ne11 > MMVF_MAX_BATCH_SIZE) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmvf(src0, src1, cc, ne11)) {
+        return true;
+    }
+    return ggml_cuda_should_use_mmf(src0, src1, cc, warp_size, ne11, /*mul_mat_id =*/ false)
+        ? ggml_cuda_should_use_mmvf_underfilled(src0, src1, dst, cc, nsm)
+        : ggml_cuda_should_use_mmvf_untiled(src0, src1, ne11);
 }
 
 // AMD runs a float MUL_MAT_ID of up to MMVF_MAX_BATCH_SIZE tokens on the vector kernel, which can read only operands
@@ -3808,6 +3835,7 @@ static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggm
     }
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int nsm       = ggml_cuda_info().devices[ctx.device].nsm;
     if (warp_size != WARP_SIZE) {
         return;
     }
@@ -3832,7 +3860,7 @@ static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggm
         if (m->op != GGML_OP_MUL_MAT || !(m->flags & GGML_TENSOR_FLAG_COMPUTE) || m->src[1] != y ||
                 w->type != GGML_TYPE_BF16 || w->buffer == nullptr ||
                 ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-                !ggml_cuda_mul_mat_runs_mmvf(m, cc, warp_size)) {
+                !ggml_cuda_mul_mat_runs_mmvf(m, cc, warp_size, nsm)) {
             return;
         }
     }
@@ -5933,9 +5961,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         const int cc          = ggml_cuda_info().devices[cuda_ctx->device].cc;
         const int warp_size   = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+        const int nsm         = ggml_cuda_info().devices[cuda_ctx->device].nsm;
         const int out_nodes[] = { i, j };
         if (mm_b && mm_b->op == GGML_OP_MUL_MAT && (mm_b->flags & GGML_TENSOR_FLAG_COMPUTE) && mm_b->src[1] == node->src[1] &&
-                !reads_first && ggml_cuda_mul_mat_runs_mmvf(node, cc, warp_size) && ggml_cuda_mul_mat_runs_mmvf(mm_b, cc, warp_size) &&
+                !reads_first && ggml_cuda_mul_mat_runs_mmvf(node, cc, warp_size, nsm) &&
+                ggml_cuda_mul_mat_runs_mmvf(mm_b, cc, warp_size, nsm) &&
                 ggml_cuda_mmvf_pair_supports(node->src[0], mm_b->src[0], node->src[1], node, mm_b) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, j - i + 1, out_nodes, 2)) {
             ggml_cuda_mul_mat_vec_f_pair(*cuda_ctx, node->src[0], mm_b->src[0], node->src[1], node, mm_b);
