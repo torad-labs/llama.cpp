@@ -2158,13 +2158,6 @@ struct ggml_backend_cuda_context {
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
     ggml_cuda_l2_issue_stop l2_issue_stop;
-    // the hyper-connection fronts' combs, made beside the evaluation's stream (dsv4_hc_front): the fork, the join back,
-    // the weights tensors written there since the last join, and whether the evaluation lets a front fork (not while
-    // the graph runs concurrent streams)
-    cudaEvent_t hc_comb_fork = nullptr;
-    cudaEvent_t hc_comb_join = nullptr;
-    std::vector<const ggml_tensor *> hc_comb_pending;
-    bool        hc_comb_side = false;
     bool        l2_persisting = false;   // a launch was given a persisting L2 window (ggml_cuda_l2_persist_window)
     const ggml_cgraph * l2_graph_next = nullptr; // the graph after the next computed, while it computes (ggml_backend_graph_next)
     // the stream is being captured with the rest of an evaluation across backends (ggml_backend_cuda_capture_begin):

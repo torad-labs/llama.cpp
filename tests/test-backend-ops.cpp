@@ -4488,8 +4488,8 @@ struct test_dsv4_hc_pre_q8_1 : public test_dsv4_hc_pre_fused {
 };
 
 // The front, then a DSV4_HC_POST that reads its post and comb weights at once (its output the normed mix, its residual
-// the front's streams): no model's order, but a race's. CUDA makes the comb beside the stream, and the post waits for
-// it; without the wait the post reads the comb's inputs.
+// the front's streams): no model's order, but the tightest one, the post's reads of the weights right after the
+// front's writes of them.
 struct test_dsv4_hc_pre_post : public test_dsv4_hc_pre_fused {
     ggml_tensor * post_out = nullptr;
 
@@ -10106,8 +10106,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 64, 2, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 31, 3, 4));
-    // a comb of 1,000 iterations with no reader in the graph: CUDA makes it beside the stream, and the weights are read
-    // back only once the evaluation's end has waited for it
+    // a comb of 1,000 iterations with no reader in the graph: any of it left running past the evaluation's return would
+    // show in the weights read back
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 3, 1000));
     // the previous sublayer's DSV4_HC_POST before the front, which CUDA's Gram path fuses: its streams are an output
     for (int64_t n_tokens : { 1, 2, 3, 16, 17 }) {
@@ -10132,8 +10132,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q4_K, 1, 7168, 3, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q8_0, 2, 256, 3, false));
     test_cases.emplace_back(new test_dsv4_hc_pre_q8_1(GGML_TYPE_Q8_0, 2, 4096, 12, false));
-    // a DSV4_HC_POST reading the front's weights at once: on CUDA it waits for the comb made beside the stream. Without
-    // the wait it is a race, which 1,000 iterations (tens of us beside the stream) make the post win every time
+    // a DSV4_HC_POST reading the front's weights at once: at 1,000 iterations (tens of us) a read of the comb before the
+    // front has written it would show
     for (int64_t n_tokens : { 1, 3, 8 }) {
         test_cases.emplace_back(new test_dsv4_hc_pre_post(GGML_TYPE_BF16, 4096, n_tokens, 20));
     }

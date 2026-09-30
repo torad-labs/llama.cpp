@@ -681,17 +681,14 @@ static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_mix_gram(
 // (the comb in registers, dsv4_hc_comb_regs) into weights_out, while the other blocks write their slices. The streams'
 // RMS is G's trace's. base_prewait, norm_prewait: base or the norm's weight is the model's (dsv4_hc_prewait).
 // q8 non-null: dst's q8_1 copy as quantize_row_q8_1_cuda writes it (token it's row q8_s1 blocks on), a warp a block
-// with quantize_q8_1's arithmetic on the values dst holds, so its bits: n_embd a multiple of MATRIX_ROW_PADDING.
-// comb_side: the comb's slots of weights_out get its inputs (the mixes it is made from), which dsv4_hc_comb_side makes
-// it from beside the stream
+// with quantize_q8_1's arithmetic on the values dst holds, so its bits: n_embd a multiple of MATRIX_ROW_PADDING
 static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_f32(
         const float * partials, const int n_slices, const float * x,
         const float * scale, const float * base, const float * norm_w,
         float * weights_out, float * dst, const int64_t n_embd, const int64_t k,
         const int64_t sx1, const int64_t sx2, const int64_t ss0, const int64_t sb0, const int64_t sw0,
         const int64_t sw1, const int64_t sd1, const float eps_flat, const float eps_hc, const int32_t n_iter,
-        const float eps_norm, const bool base_prewait, const bool norm_prewait, block_q8_1 * q8, const int64_t q8_s1,
-        const bool comb_side) {
+        const float eps_norm, const bool base_prewait, const bool norm_prewait, block_q8_1 * q8, const int64_t q8_s1) {
     __shared__ float mix[DSV4_HC_GRAM_ROWS];
     __shared__ float base_s[DSV4_HC_MIX];
 
@@ -786,21 +783,12 @@ static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_
         for (int r = 0; r < DSV4_HC_MIX; ++r) {
             m[r] = mix[r]*rms_flat;
         }
-        float c_lane;
-        if (comb_side) {
-            c_lane = m[2*DSV4_HC];
+        float c[DSV4_HC*DSV4_HC];
+        dsv4_hc_comb_regs(c, m, base_s, scale[2*ss0], eps_hc, n_iter);
+        float c_lane = c[0];
 #pragma unroll
-            for (int j = 1; j < DSV4_HC*DSV4_HC; ++j) {
-                c_lane = lane == j ? m[2*DSV4_HC + j] : c_lane;
-            }
-        } else {
-            float c[DSV4_HC*DSV4_HC];
-            dsv4_hc_comb_regs(c, m, base_s, scale[2*ss0], eps_hc, n_iter);
-            c_lane = c[0];
-#pragma unroll
-            for (int j = 1; j < DSV4_HC*DSV4_HC; ++j) {
-                c_lane = lane == j ? c[j] : c_lane;
-            }
+        for (int j = 1; j < DSV4_HC*DSV4_HC; ++j) {
+            c_lane = lane == j ? c[j] : c_lane;
         }
         const int h     = lane - DSV4_HC*DSV4_HC;
         float     pre_h = pre[0];
@@ -844,35 +832,6 @@ static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_
     }
 }
 
-// a warp a token: the comb from the inputs dsv4_hc_pre_gram_f32 left in its slots of weights (comb_side), made as that
-// kernel makes it (dsv4_hc_comb_regs on the same values, so its bits) and written over them. Run beside the evaluation's
-// stream: no kernel on the front's chain reads the comb, only the sublayer's DSV4_HC_POST
-static __global__ void __launch_bounds__(WARP_SIZE) dsv4_hc_comb_side(float * weights, const float * scale,
-        const float * base, const int64_t sw0, const int64_t sw1, const int64_t ss0, const int64_t sb0,
-        const float eps_hc, const int32_t n_iter) {
-    const int lane = threadIdx.x;
-    float *   d    = weights + (int64_t) blockIdx.x*sw1;
-
-    float m[DSV4_HC_MIX]      = {};
-    float base_s[DSV4_HC_MIX] = {};
-#pragma unroll
-    for (int j = 0; j < DSV4_HC*DSV4_HC; ++j) {
-        m[2*DSV4_HC + j]      = d[(2*DSV4_HC + j)*sw0];
-        base_s[2*DSV4_HC + j] = base[(2*DSV4_HC + j)*sb0];
-    }
-    float c[DSV4_HC*DSV4_HC];
-    dsv4_hc_comb_regs(c, m, base_s, scale[2*ss0], eps_hc, n_iter);
-    float c_lane = c[0];
-#pragma unroll
-    for (int j = 1; j < DSV4_HC*DSV4_HC; ++j) {
-        c_lane = lane == j ? c[j] : c_lane;
-    }
-    __syncwarp(); // every lane has read the inputs before any writes over them
-    if (lane < DSV4_HC*DSV4_HC) {
-        d[(2*DSV4_HC + lane)*sw0] = c_lane;
-    }
-}
-
 // a tensor a kernel may read before its PDL wait: in a weights buffer, which no kernel writes (a kernel before it may
 // still be running when it starts)
 static bool dsv4_hc_prewait(const ggml_tensor * t) {
@@ -894,38 +853,6 @@ bool ggml_cuda_dsv4_hc_writes_q8_1(const ggml_tensor * node) {
     const ggml_tensor * rms = node->src[0] != nullptr && node->src[0]->op == GGML_OP_RMS_NORM ? node->src[0] : node->src[1];
     return rms != nullptr && rms->op == GGML_OP_RMS_NORM && rms->src[0] != nullptr &&
         rms->src[0]->op == GGML_OP_DSV4_HC_PRE;
-}
-
-bool ggml_cuda_dsv4_hc_comb_reads(const ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
-    for (int j = 0; j < GGML_MAX_SRC; ++j) {
-        const ggml_tensor * src = node->src[j];
-        while (src != nullptr && src->view_src != nullptr) {
-            src = src->view_src;
-        }
-        if (src != nullptr && std::find(ctx.hc_comb_pending.begin(), ctx.hc_comb_pending.end(), src) !=
-                ctx.hc_comb_pending.end()) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void ggml_cuda_dsv4_hc_comb_join(ggml_backend_cuda_context & ctx) {
-    if (ctx.hc_comb_pending.empty()) {
-        return;
-    }
-    CUDA_CHECK(cudaEventRecord(ctx.hc_comb_join, ctx.stream(ctx.device, GGML_CUDA_HC_COMB_STREAM)));
-    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ctx.hc_comb_join, 0));
-    ctx.hc_comb_pending.clear();
-}
-
-// The comb beside the stream is opt-in, GGML_CUDA_HC_COMB_SIDE=1; by default the front's second kernel makes it, on the
-// front's chain. Beside the stream it took the 5080's and the 5070 Ti's kernel time a token 1.03 % and 0.69 % lower
-// under -sm tensor (the 44-layer GLM-5.3 proxy, node traces), and tg64 0.70 % higher (95 % CI -0.15 to +1.55 %, 4
-// rounds), but GLM-5.3-Flash's tg64 3.7 % lower on 2 RTX PRO 6000 under -sm tensor (4 interleaved pairs of 4)
-static bool dsv4_hc_comb_side_enabled() {
-    static const bool enabled = ggml_env_switch("GGML_CUDA_HC_COMB_SIDE");
-    return enabled;
 }
 
 bool ggml_cuda_dsv4_hc_pre_fused_supported(const ggml_tensor * rms_flat, const ggml_tensor * mm,
@@ -1005,7 +932,7 @@ bool ggml_cuda_dsv4_hc_post_pre_fused_supported(const ggml_tensor * post, const 
 // streams and writes them to post's output, which is pre's streams
 static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * post, const ggml_tensor * rms_flat,
         const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre, const ggml_tensor * rms,
-        ggml_tensor * mul, const bool weights_outlive) {
+        ggml_tensor * mul) {
     const ggml_tensor * hc_fn  = mm->src[0];
     const ggml_tensor * x      = pre->src[0];
     const ggml_tensor * scale  = weights->src[1];
@@ -1022,9 +949,6 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
     const bool w_prewait = dsv4_hc_prewait(hc_fn);
 
     if (!dsv4_hc_pre_gram_legacy()) {
-        if (post != nullptr) {
-            ggml_cuda_dsv4_hc_comb_join(ctx); // post reads the comb a front made beside the stream
-        }
         const int n_slices = n_embd / DSV4_HC_GRAM_SLICE;
         ggml_cuda_pool_alloc<float> partials(ctx.pool(), n_tokens*DSV4_HC_GRAM_ROWS*n_slices);
 
@@ -1076,10 +1000,6 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
         ggml_cuda_mmvq_shared_q8_1::entry * q8 = n_embd % MATRIX_ROW_PADDING == 0 ? ctx.mmvq_shared_q8_1.produce(mul) :
             nullptr;
 
-        // the comb beside the stream (dsv4_hc_comb_side), off the chain to the sublayer's projections: written after
-        // this launch, so only into weights whose bytes stay theirs until a join
-        const bool comb_side = ctx.hc_comb_side && weights_outlive && dsv4_hc_comb_side_enabled();
-
         const int n_blocks = (int) ((n_embd + DSV4_HC_PRE_GRAM_THR - 1) / DSV4_HC_PRE_GRAM_THR);
         const ggml_cuda_kernel_launch_params pre_params =
             ggml_cuda_kernel_launch_params(dim3(n_blocks, n_tokens, 1), dim3(DSV4_HC_PRE_GRAM_THR, 1, 1), 0, stream);
@@ -1091,23 +1011,7 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
             mul->nb[1] / sizeof(float), ggml_get_op_params_f32(rms_flat, 0), ggml_get_op_params_f32(weights, 0),
             ggml_get_op_params_i32(weights, 1), ggml_get_op_params_f32(rms, 0), dsv4_hc_prewait(base),
             dsv4_hc_prewait(norm_w), q8 != nullptr ? (block_q8_1 *) q8->q8_1 : nullptr,
-            (int64_t) (n_embd / QK8_1), comb_side);
-
-        if (comb_side) {
-            if (ctx.hc_comb_fork == nullptr) {
-                CUDA_CHECK(cudaEventCreateWithFlags(&ctx.hc_comb_fork, cudaEventDisableTiming));
-                CUDA_CHECK(cudaEventCreateWithFlags(&ctx.hc_comb_join, cudaEventDisableTiming));
-            }
-            cudaStream_t side = ctx.stream(ctx.device, GGML_CUDA_HC_COMB_STREAM);
-            CUDA_CHECK(cudaEventRecord(ctx.hc_comb_fork, stream));
-            CUDA_CHECK(cudaStreamWaitEvent(side, ctx.hc_comb_fork, 0));
-            dsv4_hc_comb_side<<<(unsigned) n_tokens, WARP_SIZE, 0, side>>>((float *) weights->data,
-                (const float *) scale->data, (const float *) base->data, weights->nb[0] / sizeof(float),
-                weights->nb[1] / sizeof(float), scale->nb[0] / sizeof(float), base->nb[0] / sizeof(float),
-                ggml_get_op_params_f32(weights, 0), ggml_get_op_params_i32(weights, 1));
-            CUDA_CHECK(cudaGetLastError());
-            ctx.hc_comb_pending.push_back(weights);
-        }
+            (int64_t) (n_embd / QK8_1));
         return;
     }
     GGML_ASSERT(post == nullptr);
@@ -1149,14 +1053,14 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
 
 void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_flat,
         const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre, const ggml_tensor * rms,
-        ggml_tensor * mul, const bool weights_outlive) {
-    dsv4_hc_front(ctx, nullptr, rms_flat, mm, weights, pre, rms, mul, weights_outlive);
+        ggml_tensor * mul) {
+    dsv4_hc_front(ctx, nullptr, rms_flat, mm, weights, pre, rms, mul);
 }
 
 void ggml_cuda_op_dsv4_hc_post_pre_fused(ggml_backend_cuda_context & ctx, ggml_tensor * post,
         const ggml_tensor * rms_flat, const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre,
-        const ggml_tensor * rms, ggml_tensor * mul, const bool weights_outlive) {
-    dsv4_hc_front(ctx, post, rms_flat, mm, weights, pre, rms, mul, weights_outlive);
+        const ggml_tensor * rms, ggml_tensor * mul) {
+    dsv4_hc_front(ctx, post, rms_flat, mm, weights, pre, rms, mul);
 }
 
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1237,8 +1141,6 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
-
-    ggml_cuda_dsv4_hc_comb_join(ctx); // comb may be a front's, made beside the stream
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
