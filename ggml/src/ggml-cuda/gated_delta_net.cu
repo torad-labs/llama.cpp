@@ -102,8 +102,7 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       s_row_stride,
                                      ggml_type     s_type,
                                      bool          state_prefetch,
-                                     bool          lc_early,
-                                     const ggml_cuda_gated_delta_net_norm norm) {
+                                     bool          lc_early) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // Each warp owns one or more columns, using warp-level primitives to reduce across rows.
@@ -287,58 +286,6 @@ gated_delta_net_cuda(const float * q,
             }
         }
     }
-
-    // The gated norm (ggml_cuda_try_gdn_gated_norm): the head's last block to finish reads the head's rows back and writes
-    // sigmoid(gate) * (rms_norm(row) * w), a warp a row, in the unfused kernels' arithmetic: rms_norm_f32's squares
-    // summed by a butterfly over each 32 columns, the 32-column sums combined as its block_reduce combines its warps'
-    // (the host takes only rows its launch covers in one pass), its scale, then unary_gated_op_kernel's product. So the
-    // values are the RMS_NORM -> MUL -> SIGMOID -> MUL chain's, bit for bit.
-    if constexpr (warp_size == WARP_SIZE && S_v % WARP_SIZE == 0) {
-        if (norm.out != nullptr) {
-            __shared__ bool last;
-            __threadfence(); // this block's rows reach L2 before its ticket
-            __syncthreads();
-            if (threadIdx.x == 0 && threadIdx.y == 0) {
-                unsigned int * ticket = norm.tickets + sequence * H + h_idx;
-                last = atomicAdd(ticket, 1u) == gridDim.z - 1;
-                if (last) {
-                    *ticket = 0;
-                    __threadfence(); // and the other blocks' rows are read after it
-                }
-            }
-            __syncthreads();
-            if (last) {
-                constexpr int n_sums = S_v / WARP_SIZE;
-                for (int t = threadIdx.y; t < n_tokens; t += blockDim.y) {
-                    const int64_t row0 = sequence * attn_seq_stride + (t * H + h_idx) * S_v;
-                    float x[n_sums];
-                    float sum[n_sums];
-#pragma unroll
-                    for (int r = 0; r < n_sums; ++r) {
-                        x[r]   = __ldcg(dst + row0 + r * WARP_SIZE + lane);
-                        sum[r] = warp_reduce_sum(x[r] * x[r]);
-                    }
-#pragma unroll
-                    for (int o = n_sums / 2; o > 0; o /= 2) {
-#pragma unroll
-                        for (int r = 0; r < o; ++r) {
-                            sum[r] += sum[r + o];
-                        }
-                    }
-                    const float mean  = sum[0] / S_v;
-                    const float scale = rsqrtf(mean + norm.eps);
-#pragma unroll
-                    for (int r = 0; r < n_sums; ++r) {
-                        const int   c      = r * WARP_SIZE + lane;
-                        const float normed = scale * x[r] * norm.w[c];
-                        norm.out[row0 + c] = (1.0f / (1.0f + expf(-norm.gate[row0 + c]))) * normed;
-                    }
-                }
-            }
-        }
-    } else {
-        GGML_UNUSED(norm);
-    }
 }
 
 template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, ggml_type STATE_T>
@@ -352,7 +299,7 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, int64_t attn_seq_stride,
-        const ggml_cuda_gated_delta_net_gather * gather, const ggml_cuda_gated_delta_net_norm * norm, cudaStream_t stream) {
+        const ggml_cuda_gated_delta_net_gather * gather, cudaStream_t stream) {
     const int32_t * s_ids        = gather ? gather->ids : nullptr;
     const int64_t   s_row_stride = gather ? gather->row_stride : 0;
     const ggml_type s_type       = gather ? gather->type : GGML_TYPE_F32;
@@ -376,7 +323,6 @@ static void launch_gated_delta_net(
     // GGML_CUDA_GDN_STATE_PREFETCH_LEGACY=1 and GGML_CUDA_GDN_TRIGGER_LEGACY=1 turn them off
     static const bool state_prefetch = !ggml_env_switch("GGML_CUDA_GDN_STATE_PREFETCH_LEGACY");
     static const bool lc_early       = !ggml_env_switch("GGML_CUDA_GDN_TRIGGER_LEGACY");
-    const ggml_cuda_gated_delta_net_norm norm_arg = norm ? *norm : ggml_cuda_gated_delta_net_norm{};
     switch (S_v) {
         case 16:
             if constexpr (STATE_T != GGML_TYPE_Q8_0) { // a q8_0 block is 32 wide: a 16-lane warp cannot own one
@@ -384,7 +330,7 @@ static void launch_gated_delta_net(
                     q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
                     n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                     sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
-                    state_prefetch, lc_early, norm_arg);
+                    state_prefetch, lc_early);
                 break;
             }
             GGML_ABORT("a q8_0 recurrent state needs S_v >= 32");
@@ -393,14 +339,14 @@ static void launch_gated_delta_net(
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
-                state_prefetch, lc_early, norm_arg);
+                state_prefetch, lc_early);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_T>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
-                state_prefetch, lc_early, norm_arg);
+                state_prefetch, lc_early);
             break;
         }
         case 128: {
@@ -408,7 +354,7 @@ static void launch_gated_delta_net(
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
-                state_prefetch, lc_early, norm_arg);
+                state_prefetch, lc_early);
             break;
         }
         default:
@@ -514,8 +460,6 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // the state comes from the cache rows, not from src_state (the skipped GET_ROWS's temp, never written)
     const ggml_cuda_gated_delta_net_gather * gather = ctx.gdn_gathers().find(dst);
     const void *    s_in         = gather ? gather->base : (const void *) s_d;
-    // the gated norm after it, registered the same way (ggml_cuda_try_gdn_gated_norm): the kernel writes the norm's output
-    const ggml_cuda_gated_delta_net_norm * norm = ctx.gdn_gathers().norm_of(dst);
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
@@ -575,7 +519,6 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (ggml_cuda_should_use_chunked_gdn(dst)) {
         GGML_ASSERT(state_type == GGML_TYPE_F32); // the chunk pipeline writes f32 (ggml_cuda_try_gdn_cache_fusion keeps f16/q8_0 off it)
         GGML_ASSERT(!gather);   // and reads a gathered s0 (ggml_cuda_try_gdn_gather_skip keeps the GET_ROWS for it)
-        GGML_ASSERT(!norm);     // and has no epilogue (ggml_cuda_try_gdn_gated_norm keeps the norm's nodes for it)
         const int64_t n_tail      = K - 1;
         const int64_t n_chunked   = n_tokens - n_tail;
         float *       chunk_state = (float *) state_d + n_tail * state_slot_stride;
@@ -611,7 +554,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             launch_gated_delta_net<false, true, RAW_, false, GGML_TYPE_F32>(q_d + t0 * sq2, k_d + t0 * sq2,         \
                 v_d + t0 * sv2, g_d + t0 * sb2, b_d + t0 * sb2, rb_d, ra_d, rlb, chunk_state, dst_d + t0 * S_v * H, state_d, \
                 S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                                 \
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, S_v * H * n_tokens, nullptr, nullptr, stream)
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, S_v * H * n_tokens, nullptr, stream)
             if (raw) { GDN_TAIL_LAUNCH(true); } else { GDN_TAIL_LAUNCH(false); }
 #undef GDN_TAIL_LAUNCH
         }
@@ -637,7 +580,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_, T_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_in, dst_d, state_d, \
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                    \
         sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, S_v * H * n_tokens,                \
-        gather, norm, stream)
+        gather, stream)
 #define GDN_LAUNCH_KEEP(KDA_, RAW_, PRE_, T_) \
     if (keep_rs) { GDN_LAUNCH(KDA_, true, RAW_, PRE_, T_); } else { GDN_LAUNCH(KDA_, false, RAW_, PRE_, T_); }
 
