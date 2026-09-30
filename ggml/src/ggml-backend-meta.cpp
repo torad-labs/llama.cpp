@@ -579,7 +579,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             }
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
-            ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+            // no sources (ARANGE): every device computes the same values
+            ret = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
