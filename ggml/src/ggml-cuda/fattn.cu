@@ -8,8 +8,11 @@
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // A block a mask row: its finite entries' cells, ascending, into the row's n_kv_max indices, -1 past its count (a count
 // over n_kv_max keeps the first n_kv_max: the bound is the graph's to keep).
+// Upstream's scan (8e93a9773): 256 threads, 2048 columns a round of scalar loads. A decode's one row is one block, so
+// a round is a memory round trip: 11 us at 32K columns. GGML_CUDA_FATTN_SPARSE_SCAN_LEGACY=1, or a mask row not
+// 16-byte aligned.
 __launch_bounds__(256, 1)
-static __global__ void flash_attn_mask_to_sparse_indices(
+static __global__ void flash_attn_mask_to_sparse_indices_legacy(
         const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
         const int64_t s31, const int64_t s33) {
     ggml_cuda_pdl_sync();
@@ -89,6 +92,95 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     // the dependent grid reads indices, signal once the row is complete
     ggml_cuda_pdl_lc();
 }
+
+// The same lists, one block of 1024 threads a row: a thread tests 32 consecutive columns from four 16-byte loads issued
+// together, so up to 32768 columns are one round trip, and a block-wide scan of the threads' counts places each
+// thread's cells after the lower columns'. The row is 16-byte aligned and ne30 % 8 == 0.
+static constexpr int sparse_scan_threads = 1024;
+static constexpr int sparse_scan_cols    = 32;
+
+__launch_bounds__(sparse_scan_threads, 1)
+static __global__ void flash_attn_mask_to_sparse_indices(
+        const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
+        const int64_t s31, const int64_t s33) {
+    ggml_cuda_pdl_sync();
+
+    constexpr int nwarps = sparse_scan_threads/WARP_SIZE;
+    static_assert(nwarps == WARP_SIZE, "one warp scans the warps' sums");
+    const int tid      = threadIdx.x;
+    const int warp     = tid / WARP_SIZE;
+    const int lane     = tid % WARP_SIZE;
+    const int sequence = blockIdx.y;
+    const int query    = blockIdx.x;
+
+    const half * mask = mask_ptr + sequence*s33 + query*s31;
+    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + query)*n_kv_max;
+
+    __shared__ int warp_sums[nwarps];
+    int row_count = 0;
+
+    for (int i0 = 0; i0 < ne30; i0 += sparse_scan_threads*sparse_scan_cols) {
+        const int c0 = i0 + tid*sparse_scan_cols;
+
+        // 8 halves a load, -inf past the row (ne30 % 8 == 0: a load is all in or all out)
+        uint4 v[sparse_scan_cols/8];
+#pragma unroll
+        for (int j = 0; j < sparse_scan_cols/8; ++j) {
+            v[j] = c0 + 8*j < ne30 ? ((const uint4 *) (mask + c0))[j] : make_uint4(0xFC00FC00u, 0xFC00FC00u, 0xFC00FC00u, 0xFC00FC00u);
+        }
+
+        // bit c: column c0 + c is finite (a half is inf or nan exactly when its exponent bits are all set)
+        uint32_t finite = 0;
+#pragma unroll
+        for (int j = 0; j < sparse_scan_cols/8; ++j) {
+            const uint32_t w[4] = {v[j].x, v[j].y, v[j].z, v[j].w};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                finite |= uint32_t((w[k] & 0x00007C00u) != 0x00007C00u) << (8*j + 2*k + 0);
+                finite |= uint32_t((w[k] & 0x7C000000u) != 0x7C000000u) << (8*j + 2*k + 1);
+            }
+        }
+        const int count = __popc(finite);
+
+        // inclusive scan of the counts in the warp, then of the warps' sums
+        int incl = count;
+#pragma unroll
+        for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
+            const int t = __shfl_up_sync(0xFFFFFFFF, incl, offset);
+            incl += lane >= offset ? t : 0;
+        }
+        if (lane == WARP_SIZE - 1) {
+            warp_sums[warp] = incl;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            int s = warp_sums[lane];
+#pragma unroll
+            for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
+                const int t = __shfl_up_sync(0xFFFFFFFF, s, offset);
+                s += lane >= offset ? t : 0;
+            }
+            warp_sums[lane] = s;
+        }
+        __syncthreads();
+
+        int dst = row_count + (warp == 0 ? 0 : warp_sums[warp - 1]) + incl - count;
+        while (finite != 0 && dst < n_kv_max) {
+            indices[dst++] = c0 + __ffs(finite) - 1;
+            finite &= finite - 1;
+        }
+        row_count += warp_sums[nwarps - 1];
+        __syncthreads(); // the next chunk rewrites warp_sums
+    }
+
+    for (int i = row_count + tid; i < n_kv_max; i += sparse_scan_threads) {
+        indices[i] = -1;
+    }
+    __syncthreads();
+
+    // the dependent grid reads indices, signal once the row is complete
+    ggml_cuda_pdl_lc();
+}
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_compact_mask(
@@ -98,12 +190,15 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
 #else
     GGML_ASSERT(mask->type == GGML_TYPE_F16);
+    static const bool scan_legacy = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_SCAN_LEGACY");
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
+    const bool aligned = (uintptr_t) mask->data % 16 == 0 && mask->ne[0] % 8 == 0 && s31 % 8 == 0 && s33 % 8 == 0;
+    const bool wide = !scan_legacy && aligned;
     const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
-    const dim3 block_dim(256, 1, 1);
+    const dim3 block_dim(wide ? sparse_scan_threads : 256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
-    ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
+    ggml_cuda_kernel_launch(wide ? flash_attn_mask_to_sparse_indices : flash_attn_mask_to_sparse_indices_legacy, launch_params,
         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

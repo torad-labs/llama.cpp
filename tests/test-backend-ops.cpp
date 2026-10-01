@@ -12089,6 +12089,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2051));
     }
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 2}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2051));
+    // rows past one round of the mask scan (32768 columns): a decode and a verify on one card of two under -sm tensor
+    for (int64_t nb : { 1, 3 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 40960, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+    }
 
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
