@@ -115,8 +115,9 @@ void llama_kpool_set_input(
 // `kv` must be the ATTENTION (MLA) cache; the indexer cache shares its slot layout.
 // LLAMA_KPOOL_INPUT_LEGACY=1 builds the maps from the cells every call; LLAMA_KPOOL_INPUT_CHECK=1 builds them both
 // ways and aborts on a difference.
-//   pool_cells  pool member -> cell, 0 if not resident
+//   pool_cells  pool member -> cell, 0 if not resident; past pool_bias's n_pools, n_dump dump pools of cells n_kv + d*kpool + t
 //   pool_bias   computed, NOT gathered at the last member, which an incomplete pool lacks
+//   sel_mask    n_kv columns, then kpool*n_dump dump columns of -inf (n_kv is cand_mask's)
 //   cand_mask   bounds top-k spills a partial seq_rm would let escape
 // pool_reps / new_pool_cells / new_pool_reps are nullptr when the cache is off, and an entry
 // is emitted only for filled == kpool: cell 0 is real, so writing its 0 slot would clobber
@@ -148,6 +149,7 @@ struct llm_graph_input_kpool_dims {
     int64_t n_tps     = 0;
     int64_t n_ps      = 0;
     int64_t n_pools   = 0;
+    int64_t n_dump    = 0;
     int64_t n_new_max = 0;
     bool    rebuild   = false;
     bool    scoring   = false;
@@ -179,8 +181,15 @@ public:
     static bool shapes_match(const llm_graph_input_kpool_dims & dims, const llm_graph_input_kpool & inp);
 
     ggml_tensor * k_idxs     = nullptr;   // I32 [n_tokens]
-    ggml_tensor * pool_cells = nullptr;   // I32 [kpool*n_pools, n_stream]
+    ggml_tensor * pool_cells = nullptr;   // I32 [kpool*(n_pools + n_dump), n_stream]
     ggml_tensor * pool_bias  = nullptr;   // F32 [n_pools, n_tps, n_stream]
+
+    // the top-k's dump pools, n_dump = select_k of them after the n_pools real ones: each scores -FLT_MAX, above a dead pool's
+    // -inf and under every live score, so a row takes one only where fewer than select_k pools are live, and its cells are its
+    // own, past n_kv (sel_mask's dump columns), so the rows of the mask's scatter stay unique
+    ggml_tensor * pool_dump     = nullptr; // F32 [n_dump, n_tps, n_stream], every element -FLT_MAX
+    ggml_tensor * pool_cells_3d = nullptr; // pool_cells as [kpool, n_pools + n_dump, n_stream]; built once: a view of an input
+                                           // made in each layer is a split input, and a host copy, of its own
 
     // pooled-key cache: a pool's value lives in the row of its LAST member, a pure function of
     // cell content (seq_cp shares it, rebase leaves it alone)
@@ -198,7 +207,7 @@ public:
     // exact, since pool_bias only holds 0.0f or -INFINITY. nullptr if the fused path is off
     ggml_tensor * pool_bias_f16 = nullptr; // F16 [n_pools, n_tps, 1, n_stream]
 
-    ggml_tensor * sel_mask   = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
+    ggml_tensor * sel_mask   = nullptr;   // F16 [n_kv + kpool*n_dump, n_batch, 1, n_stream]; the dump columns -inf
     ggml_tensor * cand_mask  = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
 
     const llama_kv_cache_context * mctx_attn;

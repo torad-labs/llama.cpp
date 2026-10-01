@@ -22,6 +22,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -311,7 +312,8 @@ struct maps {
     ggml_tensor * new_pool_cells = nullptr;
     ggml_tensor * new_pool_reps  = nullptr;
 
-    maps(int64_t n_kv, int64_t n_ns, int64_t n_tps, int64_t n_ps, uint32_t r, bool kcache, bool f16, bool rebuild, int fill) {
+    // n_dump: the top-k's dump pools past the n_pools real ones, with their columns in sel_mask (llm_graph_input_kpool)
+    maps(int64_t n_kv, int64_t n_ns, int64_t n_tps, int64_t n_ps, uint32_t r, bool kcache, bool f16, bool rebuild, int64_t n_dump, int fill) {
         ggml_init_params ip = { 32*ggml_tensor_overhead(), nullptr, true };
         ctx = ggml_init(ip);
 
@@ -319,9 +321,9 @@ struct maps {
         const int64_t n_new_max = rebuild ? n_pools : n_tps/r + n_ps;
         const ggml_type tm      = f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-        pool_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*n_pools, n_ns);
+        pool_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*(n_pools + n_dump), n_ns);
         pool_bias  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_pools, n_tps, n_ns);
-        sel_mask   = ggml_new_tensor_4d(ctx, tm, n_kv, n_tps, 1, n_ns);
+        sel_mask   = ggml_new_tensor_4d(ctx, tm, n_kv + r*n_dump, n_tps, 1, n_ns);
         cand_mask  = ggml_new_tensor_4d(ctx, tm, n_kv, n_tps, 1, n_ns);
 
         if (kcache) {
@@ -466,6 +468,50 @@ static bool write_rows_safe(const maps & m, const pool & w, int64_t n_ns, uint32
     return true;
 }
 
+// the dump pools name cells n_kv + c, one each, and the real pools' cells are under n_kv, so the slots of a row of the top-k,
+// real pools and dump pools together, never name one cell twice (the mask's set_rows writes them from several threads); a
+// dump column is masked in every row, and cand_mask has none
+static bool dump_safe(const maps & m, int64_t n_kv, uint32_t r, char * what, size_t n_what) {
+    const int64_t n_ns    = m.pool_cells->ne[1];
+    const int64_t n_pools = m.pool_bias->ne[0];
+    const int64_t n_all   = m.pool_cells->ne[0]/r;
+    const int64_t n_sel   = m.sel_mask->ne[0];
+    const int64_t n_rows  = m.sel_mask->ne[1];
+
+    if (m.cand_mask->ne[0] != n_kv || n_sel != n_kv + r*(n_all - n_pools)) {
+        snprintf(what, n_what, "dump: sel_mask %lld columns, cand_mask %lld, for n_kv %lld and %lld dump pools", (long long) n_sel,
+                (long long) m.cand_mask->ne[0], (long long) n_kv, (long long) (n_all - n_pools));
+        return false;
+    }
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const int32_t * pc = (const int32_t *) m.pool_cells->data + s*r*n_all;
+
+        for (int64_t c = 0; c < r*n_all; ++c) {
+            const bool ok = c < r*n_pools ? pc[c] >= 0 && pc[c] < n_kv : pc[c] == n_kv + (c - r*n_pools);
+            if (!ok) {
+                snprintf(what, n_what, "dump: stream %lld, pool_cells[%lld] = %d (a %s pool; %lld real pools, n_kv %lld)", (long long) s, (long long) c,
+                        pc[c], c < r*n_pools ? "real" : "dump", (long long) n_pools, (long long) n_kv);
+                return false;
+            }
+        }
+
+        for (int64_t ii = 0; ii < n_rows; ++ii) {
+            for (int64_t j = n_kv; j < n_sel; ++j) {
+                const int64_t k = (s*n_rows + ii)*n_sel + j;
+                const float   x = m.sel_mask->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) m.sel_mask->data)[k]) :
+                                                                       ((const float *) m.sel_mask->data)[k];
+                if (!(std::isinf(x) && x < 0)) {
+                    snprintf(what, n_what, "dump: stream %lld, sel_mask row %lld dump column %lld = %g", (long long) s, (long long) ii, (long long) j, x);
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 // the inputs of one ubatch built from the views and from the cells. The ubatch is placed in the cells first, as the cache
 // does (apply_ubatch before the inputs are set). rebuild: re-emit every pool, as after a position mutation
 static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, bool rebuild, std::mt19937 & rng, control ctl, char * what, size_t n_what) {
@@ -550,8 +596,12 @@ static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, 
         }
     }
 
-    maps ref(n_kv, n_ns, n_tokens/n_ns, n_ps, cfg.r, cfg.kcache, cfg.f16, rebuild, 0xA5);
-    maps inc(n_kv, n_ns, n_tokens/n_ns, n_ps, cfg.r, cfg.kcache, cfg.f16, rebuild, 0x5A);
+    // none, a few, or as many as a top-k over every pool takes
+    const int64_t n_pools = llama_kpool_n_pools(n_kv, cfg.r, n_ps);
+    const int64_t n_dump  = rng() % 3 == 0 ? 0 : rng() % 2 ? 1 + rng() % 4 : n_pools;
+
+    maps ref(n_kv, n_ns, n_tokens/n_ns, n_ps, cfg.r, cfg.kcache, cfg.f16, rebuild, n_dump, 0xA5);
+    maps inc(n_kv, n_ns, n_tokens/n_ns, n_ps, cfg.r, cfg.kcache, cfg.f16, rebuild, n_dump, 0x5A);
 
     // the views go first: the reference never takes the log
     llama_kpool_set_input(cells_of, &views, nullptr, inc.pool_cells, nullptr, inc.pool_bias, inc.sel_mask, inc.cand_mask,
@@ -564,7 +614,7 @@ static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, 
     }
 
     return write_rows_safe(ref, w, n_ns, cfg.r, what, n_what) && write_rows_safe(inc, w, n_ns, cfg.r, what, n_what) &&
-           same(inc, ref, what, n_what);
+           dump_safe(ref, n_kv, cfg.r, what, n_what) && same(inc, ref, what, n_what);
 }
 
 static void run_round(std::mt19937 & rng, const config & cfg, uint32_t size, uint32_t n_seq, int n_ops, llama_kpool_views::stats & total) {

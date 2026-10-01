@@ -378,7 +378,6 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         ggml_tensor * cur,
         ggml_tensor * qr,
         bool scoring,
-        ggml_tensor ** live,
         int il) const {
     const int64_t d_idx   = hparams.indexer_head_size;
     const int64_t n_ihead = hparams.indexer_n_head;
@@ -413,7 +412,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     const int64_t n_kv     = kbuf->ne[2];
     const int64_t n_stream = kbuf->ne[3];
     const int64_t n_tps    = n_tokens/n_stream;
-    const int64_t n_pools  = inp_kp->pool_cells->ne[0]/r;
+    const int64_t n_pools  = inp_kp->pool_bias->ne[0];
 
     GGML_ASSERT(kbuf->ne[0] == d_idx && kbuf->ne[1] == 3 &&
             "the pooled indexer cache needs a key head, a gate head and a pooled head");
@@ -521,23 +520,21 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     // top-k over POOLS then expand: a cell-level top-k is wrong, relu ties span pool bounds
     const int64_t select_k = llama_kpool_select_k(n_pools, hparams.indexer_top_k, r);
     GGML_ASSERT(select_k > 0 && select_k <= n_pools);
+    GGML_ASSERT(inp_kp->pool_dump->ne[0] == select_k && "one dump pool for each slot of the top-k");
+
+    // fewer than select_k live pools (finite scores) fill the top-k with dump pools (-FLT_MAX), never with a dead pool
+    // (-inf), whose cells may be another slot's: each dump pool's cells are its own, past n_kv (llm_graph_input_kpool)
+    pool_score = ggml_concat(ctx0, pool_score, inp_kp->pool_dump, 0);
 
     ggml_tensor * sel = ggml_cont(ctx0, ggml_top_k(ctx0, pool_score, (int) select_k));
     cb(sel, "indexer_top_k_pools", il);
 
-    ggml_tensor * pc3      = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
     ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*n_tps, n_stream);
 
-    ggml_tensor * top_k = ggml_get_rows(ctx0, pc3, sel_flat);
+    ggml_tensor * top_k = ggml_get_rows(ctx0, inp_kp->pool_cells_3d, sel_flat);
     GGML_ASSERT(top_k->type == GGML_TYPE_I32 && "pool_cells is I32, so the gather stays I32");
     top_k = ggml_reshape_3d(ctx0, top_k, r*select_k, n_tps, n_stream);
     cb(top_k, "indexer_top_k", il);
-
-    // a pool with no finite score is in the top-k only because fewer than select_k pools are live: 1 for a live slot, 0 for a filler
-    ggml_tensor * bias_4d   = ggml_reshape_4d(ctx0, inp_kp->pool_bias, 1, n_pools, n_tps, n_stream);
-    ggml_tensor * live_pool = ggml_exp(ctx0, ggml_get_rows(ctx0, bias_4d, sel));
-    *live = ggml_reshape_3d(ctx0, ggml_repeat_4d(ctx0, live_pool, r, select_k, n_tps, n_stream), r*select_k, n_tps, n_stream);
-    cb(*live, "indexer_top_k_live", il);
 
     return top_k;
 }
@@ -562,8 +559,7 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "dsa_q_a_norm", il);
 
-    ggml_tensor * live  = nullptr;
-    ggml_tensor * top_k = inp_kp ? build_indexer(layer, inp_kp, cur, qr, scoring, &live, il) : nullptr;
+    ggml_tensor * top_k = inp_kp ? build_indexer(layer, inp_kp, cur, qr, scoring, il) : nullptr;
 
     ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, qk_head_dim, n_head, n_tokens);
@@ -588,7 +584,7 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
         cur = build_attn_sparse(inp_attn,
                 layer.wo, nullptr, nullptr,
                 q, k, k, nullptr, nullptr, layer.wv_b,
-                top_k, live, inp_kp->sel_mask, inp_kp->cand_mask, kq_scale, il);
+                top_k, inp_kp->sel_mask, inp_kp->cand_mask, kq_scale, il);
     } else {
         cur = build_attn(inp_attn,
                 layer.wo, nullptr, nullptr,

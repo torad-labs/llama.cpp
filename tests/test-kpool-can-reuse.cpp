@@ -35,11 +35,13 @@ static constexpr int64_t N_TPS = 1;
 static constexpr int64_t N_PS = 1;
 static constexpr int64_t N_POOLS = N_KV/KPOOL + 2*N_PS; // 66, llama_kpool_n_pools
 static constexpr int64_t N_NEW_MAX = N_TPS/KPOOL + N_PS; // 1, decode, not rebuilding
+static constexpr int64_t N_DUMP = 64/KPOOL; // 16, llama_kpool_select_k: the top-k's dump pools
 
 struct case_tensors {
     ggml_tensor * k_idxs = nullptr;
     ggml_tensor * pool_cells = nullptr;
     ggml_tensor * pool_bias = nullptr;
+    ggml_tensor * pool_dump = nullptr;
     ggml_tensor * pool_bias_f16 = nullptr;
     ggml_tensor * sel_mask = nullptr;
     ggml_tensor * cand_mask = nullptr;
@@ -54,10 +56,11 @@ static case_tensors make_tensors(ggml_context * ctx, bool scoring, int64_t n_new
     if (!scoring) {
         return t;
     }
-    t.pool_cells     = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPOOL*N_POOLS, N_STREAM);
+    t.pool_cells     = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPOOL*(N_POOLS + N_DUMP), N_STREAM);
     t.pool_bias      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, N_POOLS, N_TPS, N_STREAM);
+    t.pool_dump      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, N_DUMP, N_TPS, N_STREAM);
     t.pool_bias_f16  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, N_POOLS, N_TPS, 1, N_STREAM);
-    t.sel_mask       = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, N_KV, N_TPS, 1, N_STREAM);
+    t.sel_mask       = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, N_KV + KPOOL*N_DUMP, N_TPS, 1, N_STREAM);
     t.cand_mask      = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, N_KV, N_TPS, 1, N_STREAM);
     t.pool_reps      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_POOLS, N_STREAM);
     t.new_pool_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPOOL*n_new_max, N_STREAM);
@@ -70,6 +73,7 @@ static llm_graph_input_kpool make_inp(const case_tensors & t, bool scoring, int6
     inp.k_idxs         = t.k_idxs;
     inp.pool_cells     = t.pool_cells;
     inp.pool_bias      = t.pool_bias;
+    inp.pool_dump      = t.pool_dump;
     inp.pool_bias_f16  = t.pool_bias_f16;
     inp.sel_mask       = t.sel_mask;
     inp.cand_mask      = t.cand_mask;
@@ -90,6 +94,7 @@ static llm_graph_input_kpool_dims base_dims() {
     d.n_tps     = N_TPS;
     d.n_ps      = N_PS;
     d.n_pools   = N_POOLS;
+    d.n_dump    = N_DUMP;
     d.n_new_max = N_NEW_MAX;
     d.rebuild   = false;
     d.scoring   = true;
@@ -160,6 +165,10 @@ int main() {
         d = base_dims();
         d.scoring = false;
         CHECK(!llm_graph_input_kpool::shapes_match(d, inp), "scoring flip must refuse");
+
+        d = base_dims();
+        d.n_dump = N_DUMP - 1;
+        CHECK(!llm_graph_input_kpool::shapes_match(d, inp), "a dump pool count change must refuse");
 
         // non-scoring stored graph asked against a scoring step must refuse
         case_tensors ts = make_tensors(ctx, false, 0);

@@ -606,6 +606,7 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
     dims.n_new_max = dims.rebuild ? dims.n_pools : dims.n_tps/kpool + dims.n_ps;
     // same gate as the builder (glm5next_n_select == indexer_top_k + kpool - 1)
     dims.scoring = cparams.n_ctx > hparams.indexer_top_k + kpool - 1;
+    dims.n_dump  = dims.scoring ? llama_kpool_select_k(dims.n_pools, hparams.indexer_top_k, kpool) : 0;
 
     return dims;
 }
@@ -622,12 +623,16 @@ bool llm_graph_input_kpool::shapes_match(const llm_graph_input_kpool_dims & dims
         return res;
     }
 
-    res &= inp.pool_cells->ne[0] == (int64_t) inp.kpool*dims.n_pools;
+    res &= inp.pool_cells->ne[0] == (int64_t) inp.kpool*(dims.n_pools + dims.n_dump);
     res &= inp.pool_cells->ne[1] == dims.n_stream;
 
     res &= inp.pool_bias->ne[0] == dims.n_pools;
     res &= inp.pool_bias->ne[1] == dims.n_tps;
     res &= inp.pool_bias->ne[2] == dims.n_stream;
+
+    res &= inp.pool_dump->ne[0] == dims.n_dump;
+    res &= inp.pool_dump->ne[1] == dims.n_tps;
+    res &= inp.pool_dump->ne[2] == dims.n_stream;
 
     if (inp.pool_bias_f16) {
         res &= inp.pool_bias_f16->ne[0] == dims.n_pools;
@@ -636,7 +641,7 @@ bool llm_graph_input_kpool::shapes_match(const llm_graph_input_kpool_dims & dims
         res &= inp.pool_bias_f16->ne[3] == dims.n_stream;
     }
 
-    res &= inp.sel_mask->ne[0] == dims.n_kv;
+    res &= inp.sel_mask->ne[0] == dims.n_kv + (int64_t) inp.kpool*dims.n_dump;
     res &= inp.sel_mask->ne[1] == dims.n_tps;
     res &= inp.sel_mask->ne[2] == 1;
     res &= inp.sel_mask->ne[3] == dims.n_stream;
@@ -4007,18 +4012,25 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         GGML_ASSERT(n_ps >= 1 && (int64_t) ubatch.n_seqs_unq == n_ps*n_stream);
 
         const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
+        const int64_t n_dump  = llama_kpool_select_k(n_pools, hparams.indexer_top_k, kpool);
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
 
         GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
 
-        inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_pools, n_stream);
+        inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*(n_pools + n_dump), n_stream);
         ggml_set_input(inp->pool_cells);
         ggml_set_name(inp->pool_cells, "kpool_pool_cells");
+
+        inp->pool_cells_3d = ggml_reshape_3d(ctx0, inp->pool_cells, kpool, n_pools + n_dump, n_stream);
 
         inp->pool_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
         ggml_set_input(inp->pool_bias);
         ggml_set_name(inp->pool_bias, "kpool_pool_bias");
+
+        inp->pool_dump = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_dump, n_tps, n_stream);
+        ggml_set_input(inp->pool_dump);
+        ggml_set_name(inp->pool_dump, "kpool_pool_dump");
 
         // the fused indexer wants f16; built once, shared by every indexer layer
         if (cparams.fused_lid) {
@@ -4029,7 +4041,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         }
 
         // lossless in f16 (only 0.0f and -INFINITY), and f16 + f32 -> f16 adds the KQ mask uncast
-        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv + kpool*n_dump, n_tps, 1, n_stream);
         ggml_set_input(inp->sel_mask);
         ggml_set_name(inp->sel_mask, "kpool_sel_mask");
 
@@ -4074,7 +4086,6 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
         ggml_tensor * top_k,
-        ggml_tensor * live,
         ggml_tensor * sel_mask,
         ggml_tensor * cand_mask,
             float     kq_scale,
@@ -4095,32 +4106,25 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     GGML_ASSERT(sel_mask->type == GGML_TYPE_F16 || sel_mask->type == GGML_TYPE_F32);
     GGML_ASSERT(sel_mask->type == cand_mask->type);
-    GGML_ASSERT(ggml_are_same_shape(sel_mask, cand_mask));
-    GGML_ASSERT(sel_mask->ne[0] == kq_mask->ne[0] && sel_mask->ne[1] == kq_mask->ne[1] &&
-                sel_mask->ne[3] == kq_mask->ne[3]);
+    GGML_ASSERT(cand_mask->ne[0] == kq_mask->ne[0] && cand_mask->ne[1] == kq_mask->ne[1] &&
+                cand_mask->ne[3] == kq_mask->ne[3]);
+    GGML_ASSERT(sel_mask->ne[1] == cand_mask->ne[1] && sel_mask->ne[2] == cand_mask->ne[2] &&
+                sel_mask->ne[3] == cand_mask->ne[3]);
 
-    GGML_ASSERT(ggml_are_same_shape(top_k, live));
+    // sel_mask's columns past n_kv are the dump pools' (llm_graph_input_kpool::pool_dump): a row the top-k fills with
+    // dump pools scatters into them, never twice into one cell, and they are dropped below
+    const int64_t n_kv = cand_mask->ne[0];
 
-    const int64_t n_kv    = sel_mask->ne[0];
-    const int64_t n_slots = top_k->ne[0];
+    GGML_ASSERT(sel_mask->ne[0] >= n_kv);
 
-    GGML_ASSERT(n_kv + n_slots < (1 << 24) && "the dump row index is computed in f32");
-
-    // a filler slot scatters to its own dump column past n_kv, so a row's indices stay unique (CPU threads write them)
-    ggml_tensor * dump    = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_slots), 1.0f);
-    ggml_tensor * idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, ggml_cast(ctx0, top_k, GGML_TYPE_F32), dump), live), dump);
-    ggml_tensor * scatter = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
-    cb(scatter, "kpool_scatter", il);
-
-    // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy with the dump columns
-    ggml_tensor * dump_cols = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, sel_mask->type, n_slots, sel_mask->ne[1], 1, sel_mask->ne[3]), 0.0f);
-    ggml_tensor * mask_all  = ggml_concat(ctx0, sel_mask, dump_cols, 0);
+    // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy
+    ggml_tensor * mask_all = ggml_dup(ctx0, sel_mask);
 
     mask_all = ggml_view_4d(ctx0, mask_all, 1, mask_all->ne[0], mask_all->ne[1], mask_all->ne[3],
             mask_all->nb[0], mask_all->nb[1], mask_all->nb[2], 0);
 
-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, scatter, scatter->ne[0], scatter->ne[1], scatter->ne[2], 1,
-            scatter->nb[1], scatter->nb[2], scatter->ne[2]*scatter->nb[2], 0);
+    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[2], 1,
+            top_k->nb[1], top_k->nb[2], top_k->ne[2]*top_k->nb[2], 0);
 
     // a constant 0, never the cell's bias: scattering -inf would ERASE a zero granted to the
     // tail. f32 because CUDA only does SET_ROWS for f32

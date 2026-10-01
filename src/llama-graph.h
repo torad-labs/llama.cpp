@@ -1494,9 +1494,8 @@ struct llm_graph_context {
             ggml_tensor * kq_b,
             ggml_tensor * sinks,     // [n_head_q]
             ggml_tensor * v_mla,     // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
-            ggml_tensor * top_k,     // I32 [n_select, n_tokens/n_stream, n_stream]
-            ggml_tensor * live,      // F32, shape of top_k: 1 for a slot to scatter, 0 for a filler
-            ggml_tensor * sel_mask,  // F16/F32 [n_kv, n_batch, 1, n_stream]
+            ggml_tensor * top_k,     // I32 [n_select, n_tokens/n_stream, n_stream], no cell twice in a row
+            ggml_tensor * sel_mask,  // F16/F32 [n_kv + dump columns, n_batch, 1, n_stream]
             ggml_tensor * cand_mask, // F16/F32 [n_kv, n_batch, 1, n_stream]
                   float   kq_scale,
                     int   il) const;
