@@ -5049,14 +5049,20 @@ struct test_rwkv_wkv6 : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET
-// KDA's gate ([head_size, heads, tokens, seqs]): a rate per channel and head and a little jitter per token, so a slow
-// channel stays slow. Activated, the rate is log-uniform over the scalar gate's (-20, -1e-4) a token, and about half
-// the channels (those under 1/16) carry their state across a 16-token chunk; raw, the pre-activation is uniform over
-// (-3, 3), and the channels whose g * a[h] is well above 0 carry it. Drawn independently per token, as the scalar gate
-// is, a channel is fast on some token of every chunk, little state reaches a chunk boundary, and nothing tests what
-// carries it there (with it, a mutant decaying each chunk's state row by its neighbour channel's decay passed a 32-head
-// 512-token case at NMSE 9e-8).
-static void init_kda_gate(ggml_tensor * t, bool raw) {
+// Both gates: a rate per (ne0, ne1) slot and a little jitter per token, so a slow row stays slow. For KDA's gate
+// ([head_size, heads, tokens, seqs]) that is a rate per channel and head; for the scalar gate ([1, heads, tokens, seqs])
+// `i % (ne0*ne1)` reduces to the head index, so it is a rate per head. Activated, the rate is log-uniform over the old
+// (-20, -1e-4) a token, and about two thirds of the rows (those under 1/16) carry their state across a 16-token chunk;
+// raw, the pre-activation is uniform over (-3, 3), and the rows whose g * a[h] is well above 0 carry it.
+//
+// Drawn independently per token, as BOTH gates were, a row is fast on some token of every chunk, little state reaches a
+// chunk boundary, and nothing tests what carries it there. The ranges are identical either way; only the correlation
+// across tokens changes, and that correlation is the whole coverage. For the activated gate a row carries when |g| <
+// -ln(1e-3)/16 = 0.43: drawn per token that needs all 16 draws to land in the slowest 2.2 % of the range, which happens
+// with probability 2e-27, while a per-row rate makes it 0.69. With the i.i.d. draw, a mutant decaying each chunk's state
+// row by its neighbour's decay passed a 32-head 512-token case at NMSE 9e-8 (float64 says its true effect is 1e-13 to
+// 2e-11, because the data never stressed it); with this one, all seven chunked KDA cases fail it at NMSE 0.75-1.72.
+static void init_decay_gate(ggml_tensor * t, bool raw) {
     std::mt19937 gen(std::random_device{}());
     std::uniform_real_distribution<float> rate(raw ? -3.0f : logf(1e-4f), raw ? 3.0f : logf(20.0f));
     std::uniform_real_distribution<float> jitter(-0.25f, 0.25f);
@@ -5193,11 +5199,10 @@ struct test_gated_delta_net : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "g") == 0 && kda) {
-                init_kda_gate(t, raw_gates);
-            } else if (strcmp(t->name, "g") == 0) {
+            if (strcmp(t->name, "g") == 0) {
+                // the scalar gate too: its rate is per head, and a head must be able to stay slow across a whole chunk.
                 // raw: pre-softplus alpha; a[h] * softplus(g + dt_bias) lands in the usual decay range
-                init_tensor_uniform(t, raw_gates ? -3.0f : -20.0f, raw_gates ? 3.0f : -1e-4f);
+                init_decay_gate(t, raw_gates);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, raw_gates ? -4.0f : 0.0f, raw_gates ? 4.0f : 1.0f);
             } else if (strcmp(t->name, "dt_bias") == 0) {
@@ -5392,11 +5397,9 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "g") == 0 && kda) {
-                init_kda_gate(t, raw_gates);
-            } else if (strcmp(t->name, "g") == 0) {
-                // raw: see test_gated_delta_net::initialize_tensors
-                init_tensor_uniform(t, raw_gates ? -3.0f : -20.0f, raw_gates ? 3.0f : -1e-4f);
+            if (strcmp(t->name, "g") == 0) {
+                // see test_gated_delta_net::initialize_tensors
+                init_decay_gate(t, raw_gates);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, raw_gates ? -4.0f : 0.0f, raw_gates ? 4.0f : 1.0f);
             } else if (strcmp(t->name, "dt_bias") == 0) {
