@@ -12481,6 +12481,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  64,  4, 2, 1, false, true, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  16,  4, 2, 1, false, true, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  64,  4, 2, 1, true,  true, 1, false, -1, true));
+    // from 32 tokens a sequence CUDA computes KDA's decay once per token, head and channel ahead of the recurrence:
+    // with snapshot slots, two sequences and GQA, and with the rows-indexed state
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 2, 2, false, true, 4, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 32, 2, 1, false, true, 1, true,  -1, true));
     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));
