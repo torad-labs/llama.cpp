@@ -9353,6 +9353,75 @@ struct test_lightning_indexer_view : public test_case {
     }
 };
 
+// ggml_lightning_indexer_rows: kv keys read through random rows (repeats included) of a cache laid out as GLM-5.3's pooled
+// indexer cache, 3 heads a cell and the key the third, so k is a strided view at the third head's offset.
+struct test_lightning_indexer_rows : public test_case {
+    const int64_t nh;     // num indexer heads
+    const int64_t kv;     // keys scored (pools)
+    const int64_t n_rows; // cache cells
+    const int64_t nb;     // batch size
+    const int64_t ns;     // num streams
+    const ggml_type type_K;
+
+    std::string vars() override {
+        return VARS_TO_STR6(nh, kv, n_rows, nb, ns, type_K);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_lightning_indexer_rows(int64_t nh = 32, int64_t kv = 256, int64_t n_rows = 1027, int64_t nb = 1, int64_t ns = 1,
+            ggml_type type_K = GGML_TYPE_F16)
+        : nh(nh), kv(kv), n_rows(n_rows), nb(nb), ns(ns), type_K(type_K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hsk = 128;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * cache = ggml_new_tensor_4d(ctx, type_K, hsk, 3, n_rows, ns);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * k = ggml_view_4d(ctx, cache, hsk, 1, n_rows, ns, cache->nb[1], cache->nb[2], cache->nb[3], 2*cache->nb[1]);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, ns);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer_rows(ctx, q, k, rows, w, m);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x1D3);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue; // k: the cache's values
+            }
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::uniform_int_distribution<int32_t> row(0, (int32_t) n_rows - 1);
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & x : data) {
+                    x = row(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -12529,6 +12598,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_lightning_indexer_view(type_K, 0, 1));
     }
 
+    // keys read through rows of a pooled cache: a decode, an MTP verify and a prefill ubatch, 1 and 2 streams, a count
+    // off the kernel's blocks
+    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t nh : { 32, 64 }) {
+            for (int64_t nb : { 1, 3, 64 }) {
+                for (int64_t ns : { 1, 2 }) {
+                    test_cases.emplace_back(new test_lightning_indexer_rows(nh, 256, 1027, nb, ns, type_K));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_lightning_indexer_rows(32, 77, 311, 3, 1, type_K));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13054,6 +13136,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
+    }
+    // GLM-5.3-Flash's pooled indexer at 32K cached tokens: 8258 pools read by rows from the f16 cache, decode and a 3-token verify
+    for (int bs : { 1, 3 }) {
+        test_cases.emplace_back(new test_lightning_indexer_rows(32, 8258, 33040, bs, 1, GGML_TYPE_F16));
     }
 
     return test_cases;

@@ -2675,6 +2675,19 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // the same with key i of stream s at row k_rows[i, s] of k (a view into a cache, no gathered copy), and the
+    // scores in f32 whatever k's type (as over the f32 rows ggml_get_rows would have copied):
+    // k:       [n_embd_idx, 1, n_rows, ne3]
+    // k_rows:  [n_kv, ne3] I32, each in [0, n_rows)
+    // mask, res: n_kv as above
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * k_rows,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.

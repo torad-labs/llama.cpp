@@ -456,12 +456,16 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_build_forward_expand(gf,
             mctx_idx->cpy_k_part(ctx0, pool_new, inp_kp->new_pool_reps, il, d_idx, 2*d_idx));
 
-    ggml_tensor * pooled_rd = ggml_view_3d(ctx0, kbuf, d_idx, n_kv, n_stream,
-            kbuf->nb[2], kbuf->nb[3], 2*d_idx*kbuf->nb[0]);
+    // every pool's key, gathered into f32 rows (the unfused path, and the fused one under LLAMA_INDEXER_GATHER_LEGACY=1)
+    const auto gather_pool_k = [&]() {
+        ggml_tensor * pooled_rd = ggml_view_3d(ctx0, kbuf, d_idx, n_kv, n_stream,
+                kbuf->nb[2], kbuf->nb[3], 2*d_idx*kbuf->nb[0]);
 
-    ggml_tensor * pool_k = ggml_get_rows(ctx0, pooled_rd, inp_kp->pool_reps);
-    pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
-    cb(pool_k, "indexer_pool_k", il);
+        ggml_tensor * pool_k = ggml_get_rows(ctx0, pooled_rd, inp_kp->pool_reps);
+        pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
+        cb(pool_k, "indexer_pool_k", il);
+        return pool_k;
+    };
 
     // no rope: n_rot() is 0 for the whole text tower
     ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
@@ -478,17 +482,28 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * pool_score = nullptr;
 
     if (cparams.fused_lid) {
-        // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
-        ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
+        static const bool gather_legacy = ggml_env_switch("LLAMA_INDEXER_GATHER_LEGACY");
 
-        pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, inp_kp->pool_bias_f16);
+        if (!gather_legacy) {
+            // the pooled keys read where the cache holds them, pool p at cell pool_reps[p], scored in f32 like the
+            // gathered rows (ggml_lightning_indexer_rows): no copy of every pool's key each token
+            ggml_tensor * pooled = ggml_view_4d(ctx0, kbuf, d_idx, 1, n_kv, n_stream,
+                    kbuf->nb[1], kbuf->nb[2], kbuf->nb[3], 2*d_idx*kbuf->nb[0]);
+
+            pool_score = ggml_lightning_indexer_rows(ctx0, iq, pooled, inp_kp->pool_reps, w, inp_kp->pool_bias_f16);
+        } else {
+            // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
+            ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, gather_pool_k(), d_idx, 1, n_pools, n_stream);
+
+            pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, inp_kp->pool_bias_f16);
+        }
         cb(pool_score, "indexer_pool_score", il);
 
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, pool_score, il});
 
         pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, pool_k, ggml_permute(ctx0, iq, 0, 2, 1, 3));
+        ggml_tensor * kq = ggml_mul_mat(ctx0, gather_pool_k(), ggml_permute(ctx0, iq, 0, 2, 1, 3));
 
         // the ReLU sits BETWEEN the per-head dot and the head weighting; either side differs
         kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
