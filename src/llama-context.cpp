@@ -28,6 +28,89 @@
 // llama_context
 //
 
+// LLAMA_TIME_DECODE=1 reports where a decode token's HOST time goes, measured with clock_gettime in-process.
+// It exists because a profiler cannot answer this on this machine: nsys inflates CUPTI RUNTIME durations roughly 30-40x
+// (a cudaGraphLaunch the engine times at 5.9-13.6 us reads 246-294 us in a trace), which put 66 % of a decode token's
+// ~430 us device-idle gap on the graph launch when the launch is really about 3 % of it. Three fixes aimed at that
+// phantom -- fusing nodes, launching the two devices' graphs from separate threads, and the scheduler's extra input
+// copies -- each measured null, correctly. So the ~415 us is elsewhere in this function, and these phases say where.
+// Device timestamps from a trace remain trustworthy; host attribution has to come from here.
+// Off (the default) each timer is one test of a static flag.
+enum llama_decode_phase {
+    LLAMA_DECODE_PHASE_BUILD_GRAPH,
+    LLAMA_DECODE_PHASE_ALLOC_GRAPH,
+    LLAMA_DECODE_PHASE_SET_INPUTS,
+    LLAMA_DECODE_PHASE_GRAPH_COMPUTE,
+    LLAMA_DECODE_PHASE_DECODE_TOTAL,
+    LLAMA_DECODE_PHASE_COUNT,
+};
+
+static const char * llama_decode_phase_name(llama_decode_phase p) {
+    switch (p) {
+        case LLAMA_DECODE_PHASE_BUILD_GRAPH:   return "build_graph";
+        case LLAMA_DECODE_PHASE_ALLOC_GRAPH:   return "alloc_graph";
+        case LLAMA_DECODE_PHASE_SET_INPUTS:    return "set_inputs";
+        case LLAMA_DECODE_PHASE_GRAPH_COMPUTE: return "graph_compute";
+        case LLAMA_DECODE_PHASE_DECODE_TOTAL:  return "DECODE TOTAL";
+        default:                               return "?";
+    }
+}
+
+static bool llama_time_decode() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_TIME_DECODE");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return enabled;
+}
+
+// An RAII accumulator. Nested phases are fine: each one charges only its own bracket, and DECODE_TOTAL is the
+// denominator the others are read against, so whatever they do not account for is named rather than assumed.
+struct llama_decode_phase_timer {
+    llama_decode_phase phase;
+    struct timespec    t0;
+    bool               on;
+
+    llama_decode_phase_timer(llama_decode_phase p) : phase(p), on(llama_time_decode()) {
+        if (on) {
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+        }
+    }
+
+    ~llama_decode_phase_timer() {
+        if (!on) {
+            return;
+        }
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double us = (t1.tv_sec - t0.tv_sec)*1e6 + (t1.tv_nsec - t0.tv_nsec)/1e3;
+        static double sum[LLAMA_DECODE_PHASE_COUNT] = {};
+        static int    cnt[LLAMA_DECODE_PHASE_COUNT] = {};
+        sum[phase] += us;
+        cnt[phase] += 1;
+        if (phase == LLAMA_DECODE_PHASE_DECODE_TOTAL && cnt[phase] % 64 == 0) {
+            // straight to stderr: llama-bench installs a log callback that drops INFO and WARN
+            const double tot = sum[LLAMA_DECODE_PHASE_DECODE_TOTAL] / cnt[LLAMA_DECODE_PHASE_DECODE_TOTAL];
+            fprintf(stderr, "decode host phases over %d calls, mean us a call:\n", cnt[phase]);
+            double named = 0;
+            for (int i = 0; i < LLAMA_DECODE_PHASE_COUNT; i++) {
+                if (cnt[i] == 0) {
+                    continue;
+                }
+                const double mean = sum[i] / cnt[i];
+                if (i != LLAMA_DECODE_PHASE_DECODE_TOTAL) {
+                    named += mean * cnt[i] / cnt[LLAMA_DECODE_PHASE_DECODE_TOTAL];
+                }
+                fprintf(stderr, "    %-14s %9.1f us  %5.1f %% of decode   (%d calls)\n",
+                        llama_decode_phase_name((llama_decode_phase) i), mean,
+                        tot > 0 ? 100.0*mean*cnt[i]/cnt[LLAMA_DECODE_PHASE_DECODE_TOTAL]/tot : 0.0, cnt[i]);
+            }
+            fprintf(stderr, "    %-14s %9.1f us  %5.1f %% of decode   <-- in decode but in none of the phases above\n",
+                    "unattributed", tot - named, tot > 0 ? 100.0*(tot - named)/tot : 0.0);
+        }
+    }
+};
+
 // Verify that every Hadamard-folded weight consumed by the graph receives its
 // activation-side transform, and every latent lookup table gets the inverse.
 // An architecture whose matmul path bypasses the transform helpers would
@@ -1634,9 +1717,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        {
+            llama_decode_phase_timer t(LLAMA_DECODE_PHASE_BUILD_GRAPH);
+            gf = model.build_graph(gparams);
+        }
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1644,6 +1728,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        llama_decode_phase_timer t_alloc(LLAMA_DECODE_PHASE_ALLOC_GRAPH);
         if (!ggml_backend_sched_alloc_graph(sched_gf, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1658,15 +1743,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        llama_decode_phase_timer t(LLAMA_DECODE_PHASE_SET_INPUTS);
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, sched_gf);
+    ggml_status status;
+    {
+        llama_decode_phase_timer t(LLAMA_DECODE_PHASE_GRAPH_COMPUTE);
+        status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, sched_gf);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1917,6 +2004,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    llama_decode_phase_timer t_decode(LLAMA_DECODE_PHASE_DECODE_TOTAL);
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
