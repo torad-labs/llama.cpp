@@ -135,6 +135,35 @@ void ggml_cuda_set_device(int device) {
     CUDA_CHECK(cudaSetDevice(physical_device));
 }
 
+// GGML_CUDA_TIME_LAUNCH=1 reports cudaGraphLaunch's own host duration, because a profiler cannot answer the question it
+// raises. nsys inflates this call about 39x: a standalone 400-node graph that its own process times at 1.3 us with
+// clock_gettime reads 50.6 us by that same clock once nsys is attached, and nsys reports 51.1 us. So every host-side
+// attribution taken from a trace is unreliable at this scale -- including the one that put 66 % of a decode token's
+// 444.6 us device-idle gap on this call. Off (the default) this costs one test of a static flag.
+static bool ggml_cuda_time_launch() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_TIME_LAUNCH");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return enabled;
+}
+
+// a running mean a device, reported every 64 launches so the print is never itself the measurement
+static void ggml_cuda_time_launch_record(int device, double us) {
+    static std::mutex mtx;
+    static double     sum[GGML_CUDA_MAX_DEVICES] = {};
+    static int        cnt[GGML_CUDA_MAX_DEVICES] = {};
+    std::lock_guard<std::mutex> lock(mtx);
+    sum[device] += us;
+    cnt[device] += 1;
+    if (cnt[device] % 64 == 0) {
+        // straight to stderr, not GGML_LOG_*: llama-bench installs a log callback that drops INFO and WARN, which cost
+        // two builds to discover
+        fprintf(stderr, "cudaGraphLaunch host cost: device %d, %d launches, mean %.1f us\n",
+                device, cnt[device], sum[device] / cnt[device]);
+    }
+}
+
 int ggml_cuda_get_device() {
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
@@ -6675,7 +6704,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (ggml_cuda_time_launch()) {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            ggml_cuda_time_launch_record(cuda_ctx->device,
+                (t1.tv_sec - t0.tv_sec)*1e6 + (t1.tv_nsec - t0.tv_nsec)/1e3);
+        } else {
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -6866,7 +6904,16 @@ static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
 static void ggml_backend_cuda_capture_launch(ggml_backend_t backend, void * exec) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
-    CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
+    if (ggml_cuda_time_launch()) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ggml_cuda_time_launch_record(cuda_ctx->device,
+            (t1.tv_sec - t0.tv_sec)*1e6 + (t1.tv_nsec - t0.tv_nsec)/1e3);
+    } else {
+        CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
+    }
 }
 
 static void ggml_backend_cuda_capture_free(ggml_backend_t backend, void * exec) {
