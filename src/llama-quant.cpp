@@ -1082,7 +1082,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = tensor->type;
         }
 
-        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+        // A tensor already in its target type is copied verbatim further down (the cur_type != new_type check), so it
+        // needs no imatrix however demanding that type is. Asking the target type alone made requantizing a model that
+        // already holds IQ-family tensors impossible without an imatrix even when those tensors were left untouched --
+        // and because --dry-run only records the requirement instead of raising it, the dry run passed and the real run
+        // failed on the same arguments.
+        metadata[i].requires_imatrix = tensor->type != metadata[i].target_type &&
+                                       tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
 
         if (params->imatrix) {
             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
