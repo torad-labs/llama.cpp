@@ -1750,7 +1750,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
-static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// The type cuBLAS runs a MUL_MAT in, the type its operands are cast to first
+static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * dst) {
     ggml_type compute_type = src0->type;
     if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -1777,8 +1778,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
     }
+    return compute_type;
+}
 
-    switch (compute_type) {
+static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    switch (ggml_cuda_mul_mat_cublas_compute_type(ctx, src0, dst)) {
         case GGML_TYPE_F32:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
             break;
@@ -2801,6 +2805,26 @@ static bool ggml_cuda_mul_mat_runs_mmvf(const ggml_tensor * dst, const int cc, c
     return ggml_cuda_should_use_mmf(src0, src1, cc, warp_size, ne11, /*mul_mat_id =*/ false)
         ? ggml_cuda_should_use_mmvf_underfilled(src0, src1, dst, cc, nsm)
         : ggml_cuda_should_use_mmvf_untiled(src0, src1, ne11);
+}
+
+// Whether ggml_cuda_mul_mat runs the MUL_MAT dst on cuBLAS in BF16, casting its F32 src1 to BF16 first: a BF16 src0
+// that none of its kernels above takes (a BF16 src0 is never quantized, nor the F32 of the transposed vector).
+static bool ggml_cuda_mul_mat_runs_cublas_bf16(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t       ne11 = src1->ne[1];
+    const int           cc   = ggml_cuda_info().devices[ctx.device].cc;
+
+    if (src0->type != GGML_TYPE_BF16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmvf(src0, src1, cc, ne11) ||
+            ggml_cuda_should_use_mmf(src0, src1, cc, ggml_cuda_info().devices[ctx.device].warp_size, ne11, /*mul_mat_id =*/ false) ||
+            ggml_cuda_should_use_mmvf_untiled(src0, src1, ne11)) {
+        return false;
+    }
+    return ggml_cuda_mul_mat_cublas_compute_type(ctx, src0, dst) == GGML_TYPE_BF16;
 }
 
 // AMD runs a float MUL_MAT_ID of up to MMVF_MAX_BATCH_SIZE tokens on the vector kernel, which can read only operands
@@ -6105,6 +6129,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_mm_fusion_args_host fusion_data{};
             fusion_data.rms_norm = node;
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, mm->src[0], x, /*ids =*/ nullptr, mm, &fusion_data);
+            return 1;
+        }
+    }
+
+    // The same pair at a prefill ubatch's columns, where the MUL_MAT runs on cuBLAS in BF16 and casts the norm's F32
+    // output to BF16 before its GEMM: the norm writes that BF16 copy itself, the F32 one is neither written nor read, and
+    // cuBLAS reads the same values it would have cast (GLM-5.3's hc mixes: the norm and the cast were 94 % of norm, cast
+    // and GEMM, around a 21 us GEMM). GGML_CUDA_RMS_NORM_BF16_LEGACY=1 runs the norm and the cast on their own.
+    static const bool rms_norm_bf16_legacy = ggml_env_switch("GGML_CUDA_RMS_NORM_BF16_LEGACY");
+    if (!rms_norm_bf16_legacy && node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
+        ggml_tensor       * mm = cgraph->nodes[i + 1];
+        const ggml_tensor * x  = node->src[0];
+        const ggml_op ops[]    = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT };
+        const int out_nodes[]  = { i + 1 };
+        if (mm->op == GGML_OP_MUL_MAT && mm->src[1] == node && mm->src[0] != node && x->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node) && ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1) &&
+                ggml_cuda_mul_mat_runs_cublas_bf16(*cuda_ctx, mm) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+            ggml_cuda_pool_alloc<nv_bfloat16> y(cuda_ctx->pool(), ggml_nelements(node));
+            ggml_cuda_op_rms_norm_bf16(*cuda_ctx, node, y.get());
+            ggml_tensor y_bf16 = *node;
+            y_bf16.type  = GGML_TYPE_BF16;
+            y_bf16.data  = y.get();
+            y_bf16.nb[0] = ggml_type_size(GGML_TYPE_BF16);
+            for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                y_bf16.nb[d] = y_bf16.nb[d - 1]*y_bf16.ne[d - 1];
+            }
+            ggml_cuda_mul_mat_cublas(*cuda_ctx, mm->src[0], &y_bf16, mm);
             return 1;
         }
     }

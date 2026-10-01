@@ -3761,6 +3761,47 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL with nothing after it, which CUDA fuses on its own; the weight one row broadcast over
+// the rest, as a model's norm weight is, or full size
+struct test_rms_norm_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool broadcast;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, eps, broadcast);
+    }
+
+    test_rms_norm_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, float eps = 1e-6f, bool broadcast = false)
+        : ne(ne), eps(eps), broadcast(broadcast) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = broadcast ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]) : b;
+
+        // the norm's input computed in the graph, as in test_rms_norm_mul_add
+        a = ggml_add(ctx, a, b);
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM without a weight straight into GGML_OP_MUL_MAT (the hyper-connection mixes of DeepSeek V4 and
 // GLM-5.3); CUDA runs both as one matvec at one column
 struct test_rms_norm_mul_mat : public test_case {
@@ -10953,6 +10994,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
 
+    // rows of at most 256 columns over more than one 8-row block of the CUDA warp-per-row kernel, the last one partial
+    // (17 rows), and KDA's per-head output norm: 128 wide, 32 rows a token
+    for (uint32_t n : { 33, 128, 256 }) {
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 17, 3, 2 }, false, 1e-6f));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 17, 3, 2 }, true, 1e-6f));
+        test_cases.emplace_back(new test_rms_norm_mul(            { n, 32, 6, 1 }, 1e-6f, false));
+        test_cases.emplace_back(new test_rms_norm_mul(            { n, 32, 6, 1 }, 1e-6f, true));
+        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 32, 6, 1 }, 1e-6f, false));
+        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 32, 6, 1 }, 1e-6f, true));
+    }
+
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
         for (uint32_t n : { 64, 1025 }) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
@@ -10984,7 +11036,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_w : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int64_t k : {256, 4096, 16384}) {
-            for (int64_t n : {1, 3}) {
+            for (int64_t n : {1, 3, 64}) { // 64: past the vector and mmf kernels, on cuBLAS
                 test_cases.emplace_back(new test_rms_norm_mul_mat(type_w, k, 24, n));
             }
         }
