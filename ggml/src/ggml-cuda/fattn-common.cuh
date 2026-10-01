@@ -841,7 +841,21 @@ static __global__ void flash_attn_mask_to_KV_max(
 // The sparse mode (ggml_flash_attn_ext_set_n_kv_max): each f16 mask row's finite entries as ascending cell indices, n_kv_max
 // a row (sequence, then row, of mask->ne[1] rows), -1 past the row's count. Defined in fattn.cu.
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, int rows_per_list, cudaStream_t stream);
+
+// How many consecutive query rows share one sparse index list. 1 is one list a query, which is what the ncols1 == 1
+// sparse kernel reads and the only width built today. Above 1 a list is the UNION of its rows' cells, so a tile of
+// queries gathers each cell once rather than once per query -- the saving is the overlap between adjacent queries'
+// selections, which is a property of the TRAINED indexer and is not measurable on a random-weight proxy. Default 1 until
+// a real-weight box measures that overlap; GGML_CUDA_FATTN_SPARSE_ROWS=N asks for N (2, 4, 8 or 16).
+static int ggml_cuda_fattn_sparse_rows_per_list() {
+    static const int rows = [] {
+        const char * env = getenv("GGML_CUDA_FATTN_SPARSE_ROWS");
+        const int    n   = env ? atoi(env) : 1;
+        return n == 2 || n == 4 || n == 8 || n == 16 ? n : 1;
+    }();
+    return rows;
+}
 
 // KV_live, the live KV steps of the mma kernel (nbatch_fa cells each) for n = Q tiles x sequences:
 // [0, n) live steps per (sequence, Q tile), at least 1 | [n] blocks done | [n+1, 2n+1) its first live step within its sequence |
@@ -1583,8 +1597,18 @@ void launch_fattn(
         GGML_ASSERT(mask != nullptr && !mask_packed);
         GGML_ASSERT(n_kv_max > 0);
 
-        KV_max.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+        // a union list holds at most rows_per_list times one query's cells, and never more than the cache itself
+        const int rows_per_list = ggml_cuda_fattn_sparse_rows_per_list();
+        // The builder can emit union lists; the kernel below still reads one list a query (ncols1 == 1), so a width above
+        // 1 would silently read the wrong list rather than fail. Abort until the ncols1 > 1 sparse kernel lands.
+        GGML_ASSERT(rows_per_list == 1 ||
+            !"GGML_CUDA_FATTN_SPARSE_ROWS > 1 needs the ncols1 > 1 sparse kernel, which is not built yet");
+        const int32_t n_kv_list = rows_per_list == 1 ? n_kv_max
+            : int32_t(std::min<int64_t>(int64_t(n_kv_max) * rows_per_list, mask->ne[0]));
+        const int64_t n_lists   = (mask->ne[1] + rows_per_list - 1) / rows_per_list;
+
+        KV_max.alloc(size_t(n_kv_list) * n_lists * mask->ne[3]);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_list, rows_per_list, main_stream);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
