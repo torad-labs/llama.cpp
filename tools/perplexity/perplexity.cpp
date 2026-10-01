@@ -269,11 +269,11 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
 
 static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, const std::vector<uint16_t> & base_log_probs, kl_divergence_result & kld,
-        float * kld_values, float * p_diff_values) {
+        float * kld_values, float * p_diff_values, uint8_t * same_top_values) {
     std::mutex mutex;
     const int nv = 2*((n_vocab + 1)/2) + 4;
     int counter = 0;
-    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
+    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values, same_top_values] () {
         kl_divergence_result local_kld;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
@@ -295,9 +295,11 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
+            const size_t same_before = local_kld.n_same_top;
             std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld);
-            kld_values[i]    = (float)v.first;
-            p_diff_values[i] = v.second;
+            kld_values[i]      = (float)v.first;
+            p_diff_values[i]   = v.second;
+            same_top_values[i] = local_kld.n_same_top != same_before;
         }
     };
     for (auto & w : workers) {
@@ -1796,6 +1798,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - first) * nv);
     std::vector<float>    kld_values(size_t(n_ctx - 1 - first)*n_chunk);
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - first)*n_chunk);
+    std::vector<uint8_t> same_top_values(size_t(n_ctx - 1 - first)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
         logits.reserve(size_t(n_ctx) * n_vocab);
@@ -1826,6 +1829,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     kl_divergence_result kld;
     auto    kld_ptr =    kld_values.data();
     auto p_diff_ptr = p_diff_values.data();
+    auto   same_ptr = same_top_values.data();
 
     if (first != n_ctx/2) {
         LOG_INF("%s: scoring from position %d of %d (LLAMA_KLD_FIRST); the base file must have been written with the "
@@ -1910,9 +1914,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
-                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr, same_ptr);
             p_diff_ptr += n_ctx - 1 - first;
             kld_ptr    += n_ctx - 1 - first;
+            same_ptr   += n_ctx - 1 - first;
 
             LOG("%4d", i + seq + 1);
 
@@ -1966,19 +1971,23 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         const char * labels[] = {"0-512", "512-4k", "4k+"};
         std::vector<float> bin[3];
         double p_abs[3] = {0.0, 0.0, 0.0};
+        // same top by position: where the head picks a different token than the base, which a divergence spread over
+        // the tail of the distribution does not show
+        size_t same[3] = {0, 0, 0};
         for (size_t idx = 0; idx < filled; ++idx) {
             const int pos = first + int(idx % per_chunk);
             for (int b = 0; b < 3; ++b) {
                 if (pos >= edges[b] && pos < edges[b+1]) {
                     bin[b].push_back(kld_values[idx]);
                     p_abs[b] += std::fabs(p_diff_values[idx]);
+                    same[b]  += same_top_values[idx];
                     break;
                 }
             }
         }
         LOG("====== dKLD by position in sequence (scored from %d; %zu values over %zu per chunk) ======\n",
             first, filled, per_chunk);
-        LOG("%-8s %9s %12s %12s %12s %12s\n", "bin", "count", "mean", "median", "p99", "mean|dp|");
+        LOG("%-8s %9s %12s %12s %12s %12s %16s\n", "bin", "count", "mean", "median", "p99", "mean|dp|", "same top");
         for (int b = 0; b < 3; ++b) {
             if (bin[b].empty()) {
                 LOG("%-8s %9d %12s   (no scored position lands here at n_ctx %u, first %d)\n",
@@ -1991,8 +2000,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
                 sum += v;
             }
             const size_t n = bin[b].size();
-            LOG("%-8s %9zu %12.6f %12.6f %12.6f %12.6f\n", labels[b], n, sum/n,
-                bin[b][n/2], bin[b][std::min(n - 1, size_t(0.99*double(n)))], p_abs[b]/n);
+            const double top = double(same[b])/n;
+            LOG("%-8s %9zu %12.6f %12.6f %12.6f %12.6f %7.3f ± %5.3f %%\n", labels[b], n, sum/n,
+                bin[b][n/2], bin[b][std::min(n - 1, size_t(0.99*double(n)))], p_abs[b]/n,
+                100.0*top, n > 1 ? 100.0*sqrt(top*(1.0 - top)/(n - 1)) : 0.0);
         }
         LOG("A bin's mean RISING with position is error accumulating through the recurrent state: that class stays at\n"
             "the higher precision. Flat across bins means the error enters the readout only and does not compound.\n\n");
