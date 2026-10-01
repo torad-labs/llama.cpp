@@ -12896,10 +12896,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 32, 8, false, 2048, bs, 4096, 1));
         }
     }
+    // glm5next's real non-expert shapes, at one row and at an MTP verify's width. The candidate 4-bit formats run
+    // beside Q8_0 because the 8.9 GB of non-expert weight is 70 % of what a token reads, and a format that cuts bytes
+    // 47 % while losing 30 % of achieved bandwidth is not a 47 % win. 4096 x 154880 is the output head, read every
+    // token and what an MTP draft pass is bandwidth-dominated by. At bs=1 these take the vector kernel (mmvq), where
+    // NVFP4's and MXFP4's block-scaled MMA cannot apply; bs=3 is where it can, so the ranking may differ between them.
     for (int bs : {1, 3}) {
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192,  bs, 4096,  {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096,  bs, 8192,  {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096,  bs, 16384, {1, 1}, {1, 1}));
+        for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192,  bs, 4096,   {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096,  bs, 8192,   {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096,  bs, 16384,  {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 154880, bs, 4096,  {1, 1}, {1, 1}));
+        }
     }
 
     for (int K : {3, 5}) {
