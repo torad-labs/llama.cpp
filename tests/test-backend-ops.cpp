@@ -5049,6 +5049,29 @@ struct test_rwkv_wkv6 : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET
+// KDA's gate ([head_size, heads, tokens, seqs]): a rate per channel and head and a little jitter per token, so a slow
+// channel stays slow. Activated, the rate is log-uniform over the scalar gate's (-20, -1e-4) a token, and about half
+// the channels (those under 1/16) carry their state across a 16-token chunk; raw, the pre-activation is uniform over
+// (-3, 3), and the channels whose g * a[h] is well above 0 carry it. Drawn independently per token, as the scalar gate
+// is, a channel is fast on some token of every chunk, little state reaches a chunk boundary, and nothing tests what
+// carries it there (with it, a mutant decaying each chunk's state row by its neighbour channel's decay passed a 32-head
+// 512-token case at NMSE 9e-8).
+static void init_kda_gate(ggml_tensor * t, bool raw) {
+    std::mt19937 gen(std::random_device{}());
+    std::uniform_real_distribution<float> rate(raw ? -3.0f : logf(1e-4f), raw ? 3.0f : logf(20.0f));
+    std::uniform_real_distribution<float> jitter(-0.25f, 0.25f);
+    std::vector<float> rates(t->ne[0] * t->ne[1]);
+    for (float & r : rates) {
+        r = rate(gen);
+    }
+    std::vector<float> g(ggml_nelements(t));
+    for (size_t i = 0; i < g.size(); i++) {
+        const float x = rates[i % rates.size()] + jitter(gen);
+        g[i] = raw ? x : -expf(x);
+    }
+    ggml_backend_tensor_set(t, g.data(), 0, ggml_nbytes(t));
+}
+
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
 
@@ -5078,7 +5101,7 @@ struct test_gated_delta_net : public test_case {
     double max_nmse_err() override {
         // the CUDA chunked prefill path (fp16 tensor-core GEMMs, fp32 accumulation) needs a slightly
         // higher threshold than the default; the shapes it cannot take keep the default
-        const bool chunk_shape = head_size == 128 && n_seq_tokens >= 128 && !kda && !rows_mode;
+        const bool chunk_shape = head_size == 128 && n_seq_tokens >= 128 && !rows_mode;
         return chunk_shape ? 2e-7 : 1e-7;
     }
 
@@ -5170,7 +5193,9 @@ struct test_gated_delta_net : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "g") == 0) {
+            if (strcmp(t->name, "g") == 0 && kda) {
+                init_kda_gate(t, raw_gates);
+            } else if (strcmp(t->name, "g") == 0) {
                 // raw: pre-softplus alpha; a[h] * softplus(g + dt_bias) lands in the usual decay range
                 init_tensor_uniform(t, raw_gates ? -3.0f : -20.0f, raw_gates ? 3.0f : -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
@@ -5367,7 +5392,9 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "g") == 0) {
+            if (strcmp(t->name, "g") == 0 && kda) {
+                init_kda_gate(t, raw_gates);
+            } else if (strcmp(t->name, "g") == 0) {
                 // raw: see test_gated_delta_net::initialize_tensors
                 init_tensor_uniform(t, raw_gates ? -3.0f : -20.0f, raw_gates ? 3.0f : -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
@@ -12528,6 +12555,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the served Bonsai 2 27B prefill ubatch: 16 k-heads, 48 v-heads, raw gates, qwen35 views, MTP n_max 2 (K = 3)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3, false, false, 3, false, -1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 300, 2, 3, false, false, 3, false, -1, true, true));
+    // KDA on the chunked path (its gate per channel): activated and raw gates, the partial last chunk over two
+    // sequences, GQA, permuted q/k/v, and the snapshot tail from the chunked state at K 4 and 9
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 128, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 143, 2, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 256, 2, 1, true,  true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1, 1, false, true, 1, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 200, 2, 1, false, true, 4, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 128, 1, 1, false, true, 9, false, -1, true));
     // gated_delta_net -> cpy into the cache (fused), recurrent and chunked shapes
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
@@ -12596,6 +12632,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 1, 1, 1, 1, true, GGML_TYPE_F32, 0, 0, -1, true));
+    // KDA prefill on the chunked path: the f32 cache fused, an f16 one behind its kept cpy, and the gather it keeps
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 256, 1, 3, 1, true, GGML_TYPE_F32, 0, 0, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 200, 2, 3, 1, true, GGML_TYPE_F16, 0, 0, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 256, 1, 3, 1, true, GGML_TYPE_F32, 3, 1, 4, true));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).

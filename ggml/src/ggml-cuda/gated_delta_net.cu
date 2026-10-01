@@ -417,12 +417,18 @@ bool ggml_cuda_gdn_chunked_shape_eligible(const ggml_tensor * dst) {
     const int64_t K        = ggml_get_op_params_i32(dst, 0);
     const bool    kda      = src_g->ne[0] == S_v;
 
-    // - scalar gate (not KDA), not the rows-indexed state read (src[6]), all f32
+    // KDA's per-channel gate takes the chunked path too: on the 44-layer GLM-5.3 proxy its KL against the recurrent
+    // kernel (mean 0.0065 at 2k and at 16k context, no growth along it) is the size of what a -ub 512 -> 256 change
+    // alone costs there (0.0058), on a proxy where a reduction order alone costs 0.0026 (-sm tensor with an f32 wire
+    // against -sm layer). GGML_CUDA_KDA_CHUNKED_LEGACY=1 keeps it on the recurrent kernel at every size.
+    static const bool kda_chunked = !ggml_env_switch("GGML_CUDA_KDA_CHUNKED_LEGACY");
+
+    // - the scalar gate or KDA's per channel, not the rows-indexed state read (src[6]), all f32
     // - 128-wide heads, q and k with one head count that divides the v-head count, no broadcast over sequences
     // - q/k/v rows contiguous with any head/token/seq stride (the views qwen35 takes of the conv output are
     //   read in place; q and k share strides), g/beta/state contiguous
     // - n_tokens >= 128; with K > 1 snapshot slots the last K-1 tokens go to the recurrent kernel
-    return !kda && dst->src[6] == nullptr
+    return (!kda || kda_chunked) && dst->src[6] == nullptr
         && dst->type == GGML_TYPE_F32 && src_q->type == GGML_TYPE_F32 && src_k->type == GGML_TYPE_F32
         && src_v->type == GGML_TYPE_F32 && src_g->type == GGML_TYPE_F32 && src_beta->type == GGML_TYPE_F32
         && src_state->type == GGML_TYPE_F32
@@ -551,8 +557,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
         args.v           = v_d;
         args.g           = g_d;
         args.beta        = b_d;
+        args.kda         = kda;
+        args.raw         = raw;
         args.raw_dt_bias = rb_d;
         args.raw_a       = ra_d;
+        args.raw_lb      = rlb;
         args.state_in    = s_d;
         args.state_out   = chunk_state;
         args.out         = dst_d;
@@ -572,12 +581,17 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
         if (n_tail > 0) {
             const int64_t t0 = n_chunked;
-#define GDN_TAIL_LAUNCH(RAW_)                                                                              \
-            launch_gated_delta_net<false, true, RAW_, false, GGML_TYPE_F32>(q_d + t0 * sq2, k_d + t0 * sq2,         \
-                v_d + t0 * sv2, g_d + t0 * sb2, b_d + t0 * sb2, rb_d, ra_d, rlb, chunk_state, dst_d + t0 * S_v * H, state_d, \
+            const int64_t g0 = t0 * sb2 * (kda ? S_v : 1); // KDA's g at the beta strides times S_v
+#define GDN_TAIL_LAUNCH(KDA_, RAW_)                                                                        \
+            launch_gated_delta_net<KDA_, true, RAW_, false, GGML_TYPE_F32>(q_d + t0 * sq2, k_d + t0 * sq2,          \
+                v_d + t0 * sv2, g_d + g0, b_d + t0 * sb2, rb_d, ra_d, rlb, chunk_state, dst_d + t0 * S_v * H, state_d, \
                 S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                                 \
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, S_v * H * n_tokens, nullptr, stream)
-            if (raw) { GDN_TAIL_LAUNCH(true); } else { GDN_TAIL_LAUNCH(false); }
+            if (kda) {
+                if (raw) { GDN_TAIL_LAUNCH(true, true); } else { GDN_TAIL_LAUNCH(true, false); }
+            } else {
+                if (raw) { GDN_TAIL_LAUNCH(false, true); } else { GDN_TAIL_LAUNCH(false, false); }
+            }
 #undef GDN_TAIL_LAUNCH
         }
         return;

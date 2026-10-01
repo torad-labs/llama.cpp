@@ -10,10 +10,13 @@ struct ggml_cuda_gdn_chunked_args {
     const float * q;
     const float * k;
     const float * v;
-    const float * g;
+    const float * g;           // [1 or k_dim, H, tokens, seqs]: KDA's gate is per channel, at the beta strides times k_dim
     const float * beta;
-    const float * raw_dt_bias; // non-null: beta / g are pre-activation (ggml_gated_delta_net_set_raw_gates)
-    const float * raw_a;
+    bool          kda;
+    bool          raw;         // beta / g pre-activation (ggml_gated_delta_net_set_raw_gates, with KDA _raw_kda_gates)
+    const float * raw_dt_bias; // raw, not KDA
+    const float * raw_a;       // raw
+    float         raw_lb;      // raw KDA: g = raw_lb * sigmoid(-(g * raw_a[h]))
     const float * state_in;    // [S, S, H, n_seqs], per (seq, head) [v][k]
     float *       state_out;   // final state after n_tokens tokens, same layout as state_in
     float *       out;         // attention output of token 0
