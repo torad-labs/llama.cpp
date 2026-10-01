@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <clocale>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -170,6 +171,21 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
         w.join();
     }
     out.write((const char *)log_probs.data(), size_t(n_token)*nv*sizeof(uint16_t));
+}
+
+// The first position in each chunk that gets scored. Both the base-logits writer and the KL-divergence reader must
+// agree on it, because it sets how many values a chunk occupies in the base file; they therefore read it from here.
+//
+// The default of n_ctx/2 discards the first half of every chunk, which for a recurrent architecture discards exactly
+// what matters: a KDA layer carries its state forward, so a quantization error written into that state accumulates
+// with position, and a window starting at n_ctx/2 cannot show the accumulation beginning. Scoring from 0 is what makes
+// a position-binned dKLD possible.
+static int kld_first_position(int n_ctx) {
+    const char * env = getenv("LLAMA_KLD_FIRST");
+    if (env == nullptr) {
+        return n_ctx/2;
+    }
+    return std::min(std::max(atoi(env), 0), n_ctx - 2);
 }
 
 struct kl_divergence_result {
@@ -539,7 +555,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // Example, we have a context window of 512, we will compute perplexity for each of the
     // last 256 tokens.  Then, we split the input up into context window size chunks to
     // process the entire prompt.
-    const int first = n_ctx/2;
+    const int first = kld_first_position(n_ctx);
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -1739,6 +1755,26 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         return;
     }
 
+    // The header carries n_ctx, n_vocab and n_chunk but not the first scored position, and that position sets how many
+    // values each chunk occupies. A base file written at the default and read under LLAMA_KLD_FIRST=0 would misalign
+    // every chunk and report a plausible, meaningless dKLD, so check the payload length against what first implies.
+    {
+        const size_t nv_bytes  = size_t(2*((n_vocab + 1)/2) + 4) * sizeof(uint16_t);
+        const std::streampos here = in.tellg();
+        in.seekg(0, std::ios::end);
+        const size_t payload = size_t(in.tellg() - here);
+        in.seekg(here);
+        const size_t want = size_t(n_ctx - 1 - kld_first_position(n_ctx)) * nv_bytes * size_t(n_chunk);
+        if (payload != want) {
+            LOG_ERR("%s: %s holds %zu payload bytes but this run expects %zu (n_ctx %u, n_chunk %d, first %d).\n"
+                    "%s: the base file was written with a different first scored position -- regenerate it with the "
+                    "same LLAMA_KLD_FIRST.\n",
+                    __func__, params.logits_file.c_str(), payload, want, n_ctx, n_chunk, kld_first_position(n_ctx),
+                    __func__);
+            return;
+        }
+    }
+
     const int n_batch = params.n_batch;
     const int num_batches = (static_cast<int>(n_ctx) + n_batch - 1) / n_batch;
     // Calculate n_seq based on the logits file's n_ctx, but cap it at what the context supports
@@ -1755,9 +1791,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     llama_batch batch = llama_batch_init(std::min(n_batch, static_cast<int>(n_ctx)*n_seq), 0, 1);
 
-    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
-    std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
-    std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+    // sized from the SAME first the writer used, or a lowered LLAMA_KLD_FIRST overruns all three
+    const int first = kld_first_position(n_ctx);
+    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - first) * nv);
+    std::vector<float>    kld_values(size_t(n_ctx - 1 - first)*n_chunk);
+    std::vector<float> p_diff_values(size_t(n_ctx - 1 - first)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
         logits.reserve(size_t(n_ctx) * n_vocab);
@@ -1789,7 +1827,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     auto    kld_ptr =    kld_values.data();
     auto p_diff_ptr = p_diff_values.data();
 
-    const int first = n_ctx/2;
+    if (first != n_ctx/2) {
+        LOG_INF("%s: scoring from position %d of %d (LLAMA_KLD_FIRST); the base file must have been written with the "
+                "same setting, which the size check below enforces\n", __func__, first, n_ctx);
+    }
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -1908,6 +1949,54 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     LOG("\n");
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
+
+    // dKLD BY POSITION, before the sort below discards position for good.
+    //
+    // A single mean over the whole corpus cannot distinguish a format that is uniformly slightly worse from one whose
+    // error compounds: in a recurrent layer the quantized tensors written INTO the state (KDA attn_k, attn_v) carry
+    // their error forward, so their damage grows with distance from the start of the sequence while a tensor feeding
+    // only the readout (attn_q) stays flat. Those two look identical in the aggregate and are not remotely the same
+    // risk. Each chunk restarts from cleared state, so position WITHIN a chunk is the axis, and a chunk shorter than
+    // the bin edges simply leaves the later bins empty -- which is itself the warning that the run cannot see
+    // accumulation at all.
+    {
+        const size_t per_chunk = size_t(n_ctx - 1 - first);
+        const size_t filled    = size_t(kld_ptr - kld_values.data());
+        static const int edges[] = {0, 512, 4096, INT_MAX};
+        const char * labels[] = {"0-512", "512-4k", "4k+"};
+        std::vector<float> bin[3];
+        double p_abs[3] = {0.0, 0.0, 0.0};
+        for (size_t idx = 0; idx < filled; ++idx) {
+            const int pos = first + int(idx % per_chunk);
+            for (int b = 0; b < 3; ++b) {
+                if (pos >= edges[b] && pos < edges[b+1]) {
+                    bin[b].push_back(kld_values[idx]);
+                    p_abs[b] += std::fabs(p_diff_values[idx]);
+                    break;
+                }
+            }
+        }
+        LOG("====== dKLD by position in sequence (scored from %d; %zu values over %zu per chunk) ======\n",
+            first, filled, per_chunk);
+        LOG("%-8s %9s %12s %12s %12s %12s\n", "bin", "count", "mean", "median", "p99", "mean|dp|");
+        for (int b = 0; b < 3; ++b) {
+            if (bin[b].empty()) {
+                LOG("%-8s %9d %12s   (no scored position lands here at n_ctx %u, first %d)\n",
+                    labels[b], 0, "-", n_ctx, first);
+                continue;
+            }
+            std::sort(bin[b].begin(), bin[b].end());
+            double sum = 0.0;
+            for (const float v : bin[b]) {
+                sum += v;
+            }
+            const size_t n = bin[b].size();
+            LOG("%-8s %9zu %12.6f %12.6f %12.6f %12.6f\n", labels[b], n, sum/n,
+                bin[b][n/2], bin[b][std::min(n - 1, size_t(0.99*double(n)))], p_abs[b]/n);
+        }
+        LOG("A bin's mean RISING with position is error accumulating through the recurrent state: that class stays at\n"
+            "the higher precision. Flat across bins means the error enters the readout only and does not compound.\n\n");
+    }
 
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());
