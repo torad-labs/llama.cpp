@@ -40,9 +40,16 @@ void ggml_cuda_gdn_chunked_launch(ggml_backend_cuda_context & ctx, const ggml_te
 //     replay without needing a separate persistent allocation to be pre-sized before capture.
 struct ggml_cuda_gdn_chunked_scratch {
     float *   v_corr;
+    float *   qk;
+    // the scalar gate: stage 1's fp32 k_cumdecay and g_cum, which stages 2 and 3 scale and convert
     float *   k_cumdecay;
     float *   g_cum;
-    float *   qk;
+    // KDA: stage 3's operands as stage 1 leaves them, fp16 [CS][K] a chunk (k_cumdecay, q scale exp(G),
+    // k exp(G_last - G)), and each state row's decay over the chunk, exp(G_last) [K]
+    __half *  kda_kcd;
+    __half *  kda_qg;
+    __half *  kda_kg;
+    float *   kda_decay;
     uintptr_t end;
 };
 
