@@ -1017,11 +1017,16 @@ static bool dsv4_hc_pre_gram_legacy() {
     return legacy;
 }
 
-// GGML_CUDA_HC_FRONT_ONE_LEGACY=1: the Gram path's front in its two kernels, not one launch (dsv4_hc_front_one).
-// GGML_CUDA_HC_FRONT_CHECK=1: both, the two kernels into scratch, and a trap on any bit of the outputs that differs.
-static bool dsv4_hc_front_one_legacy() {
-    static const bool legacy = ggml_env_switch("GGML_CUDA_HC_FRONT_ONE_LEGACY");
-    return legacy;
+// GGML_CUDA_HC_FRONT_ONE=1: the Gram path's front in one launch (dsv4_hc_front_one) instead of its two kernels.
+// Opt-in, because it measured slower than the two on the 44-layer GLM-5.3 proxy at -d 32768 (NVTX, graphs off, the
+// last 31 decode tokens, RTX 5070 Ti): one launch 8.38 us against the two kernels' 2.15 + 3.01, so 759 us a token
+// against 535, and the nodes' issue span 1475 us a token against 1395. The 88 launches a token it saves do not pay
+// for the serialization it adds, one block doing for the whole token what 16 blocks did in parallel.
+// GGML_CUDA_HC_FRONT_CHECK=1: both, the two kernels into scratch, and a trap on any bit of the outputs that differs;
+// it implies the one launch, so the check always has something to compare.
+static bool dsv4_hc_front_one_enabled() {
+    static const bool enabled = ggml_env_switch("GGML_CUDA_HC_FRONT_ONE");
+    return enabled;
 }
 
 static bool dsv4_hc_front_check() {
@@ -1219,7 +1224,7 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
         // the tickets exist from the first graph evaluation on; a front takes at most their tokens
         static_assert(DSV4_HC_PRE_FUSED_MAX_TOKENS <= ggml_cuda_hc_front_tickets::n_tokens, "a token a ticket");
         unsigned int * tickets = ctx.hc_front_ticket();
-        if (dsv4_hc_front_one_legacy() || tickets == nullptr) {
+        if (!(dsv4_hc_front_one_enabled() || dsv4_hc_front_check()) || tickets == nullptr) {
             launch_two(pr);
             return;
         }
