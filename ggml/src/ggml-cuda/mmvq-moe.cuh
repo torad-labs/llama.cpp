@@ -16,6 +16,12 @@ struct ggml_cuda_mmvq_moe_args {
     const void *       vx;
     const void *       vgate;     // nullptr: dst = vx's product (+ x_bias); else the GLU of the two products
     const void *       y;
+    // non-null in place of y: the tokens' vectors in f32, slot s's of token t at y_f32 + s*y_f32_s1 + t*y_f32_s2, each
+    // slot its own (nchannels_y == n_used), which the launch quantizes into its shared copy exactly as
+    // quantize_row_q8_1_cuda writes y (ggml_cuda_mmvq_moe_quantizes_y)
+    const float *      y_f32;
+    int64_t            y_f32_s1;
+    int64_t            y_f32_s2;
     const int32_t *    ids;
     const float *      x_bias;
     const float *      gate_bias;
@@ -60,5 +66,10 @@ int64_t ggml_cuda_mmvq_moe_y_bytes(int64_t ncols_x, int64_t n_used, int64_t ntok
 // memory: its plan's tiles and a slot a team fit beside them. Otherwise, and with GGML_CUDA_MMVQ_MOE_Y_GLOBAL=1, the
 // consumers read them from global memory.
 bool ggml_cuda_mmvq_moe_keeps_y(ggml_type type, int64_t ncols_x, bool gate, int64_t y_bytes);
+
+// Whether a routed launch quantizes its tokens' f32 vectors itself (args.y_f32): each slot's vector its own, 16-byte
+// aligned rows, and a plan that keeps their q8_1 in shared memory. GGML_CUDA_MMVQ_MOE_QUANTIZE_LEGACY=1: never.
+bool ggml_cuda_mmvq_moe_quantizes_y(ggml_type type, int64_t ncols_x, bool gate, int64_t n_used, int64_t ntokens,
+                                    int64_t nchannels_y, const void * y_f32, int64_t y_f32_s1, int64_t y_f32_s2);
 
 void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t stream);

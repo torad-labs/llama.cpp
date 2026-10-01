@@ -101,6 +101,9 @@ struct mmvq_moe_dev_args {
     int                nslots;
     int *              tile_ctr;
     int                y_bytes;     // > 0: the tokens' vectors, [y, y + y_bytes), copied into shared memory past the ring
+    const float *      y_f32;       // non-null: the vectors in f32 (slot s of token t at s*y_f32_s1 + t*y_f32_s2), which
+    int                y_f32_s1;    // the consumers quantize into that copy (mmvq_moe_quantize_y) where the producer
+    int                y_f32_s2;    // would copy y
     int                ids_ready;   // ids whole before the launch (ggml_cuda_mmvq_moe_args): read before the dependency wait
     unsigned int *     l2_issue_stop; // bumped as the reads start (ggml_cuda_l2_issue_stop), or nullptr
     // pair p's (token p / n_used, slot p % n_used) vector, in blocks past y_base (its slot's % nchannels_y), and its
@@ -188,6 +191,62 @@ static __device__ __forceinline__ const block_q8_1 * mmvq_moe_y(const mmvq_moe_d
     return y_base + a.pair_y[p];
 }
 
+#define MMVQ_MOE_QY_CHUNK 8 // float4s a consumer thread loads before it quantizes them: a round trip to L2 for all
+
+// a.y_f32: the consumer threads quantize the pairs' vectors into the copy at y_smem, bit for bit as quantize_q8_1 writes
+// them. A thread takes a float4 of a vector, so 8 lanes take a q8_1 block, and the block's max and sum take
+// warp_reduce_max/sum<QK8_1>'s tree: its xor 16, 8 and 4 are xor 4, 2 and 1 across the 8 lanes (the block's lane
+// 4m + i is lane m's element i), its xor 2 and 1 add the lane's elements 0 + 2 and 1 + 3, then those two.
+static __device__ __forceinline__ void mmvq_moe_quantize_y(const mmvq_moe_dev_args & a, char * y_smem, const int ncols) {
+    constexpr int NT    = MMVQ_MOE_NW*32;
+    const int     nf4   = ncols / 4;
+    const int     total = a.ntokens*a.n_used*nf4; // a whole number of q8_1 blocks: 8 lanes are all in or all out
+    for (int j0 = threadIdx.x; j0 < total; j0 += MMVQ_MOE_QY_CHUNK*NT) {
+        float4 v[MMVQ_MOE_QY_CHUNK];
+#pragma unroll
+        for (int c = 0; c < MMVQ_MOE_QY_CHUNK; ++c) {
+            const int j = j0 + c*NT;
+            v[c] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (j < total) {
+                const int p = j / nf4;
+                v[c] = *(const float4 *) (a.y_f32 + (p % a.n_used)*a.y_f32_s1 + (p / a.n_used)*a.y_f32_s2 + 4*(j - p*nf4));
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < MMVQ_MOE_QY_CHUNK; ++c) {
+            float s[4] = { v[c].x, v[c].y, v[c].z, v[c].w };
+            float m    = fmaxf(fmaxf(fabsf(s[0]), fabsf(s[1])), fmaxf(fabsf(s[2]), fabsf(s[3])));
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) {
+                m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFF, m, o, 8));
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    s[i] += __shfl_xor_sync(0xFFFFFFFF, s[i], o, 8);
+                }
+            }
+            const float sum = (s[0] + s[2]) + (s[1] + s[3]);
+
+            const int j = j0 + c*NT;
+            if (j < total) {
+                const float d  = m / 127.0f;
+                const float xs[4] = { v[c].x, v[c].y, v[c].z, v[c].w };
+                char4 q;
+                q.x = m == 0.0f ? 0 : (int8_t) roundf(xs[0] / d);
+                q.y = m == 0.0f ? 0 : (int8_t) roundf(xs[1] / d);
+                q.z = m == 0.0f ? 0 : (int8_t) roundf(xs[2] / d);
+                q.w = m == 0.0f ? 0 : (int8_t) roundf(xs[3] / d);
+                const int    p  = j / nf4;
+                const int    c4 = j - p*nf4;
+                block_q8_1 * yb = (block_q8_1 *) y_smem + a.pair_y[p] + c4/8;
+                *(char4 *) &yb->qs[4*(c4 % 8)] = q;
+                if (c4 % 8 == 0) {
+                    yb->ds = make_half2(d, sum);
+                }
+            }
+        }
+    }
+}
+
 template <ggml_type type, int nmat, int rpw, bool pairs_once>
 __launch_bounds__((MMVQ_MOE_NW + 1)*32, 1)
 static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
@@ -247,7 +306,7 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
         if (!a.ids_ready) {
             ggml_cuda_pdl_sync();
             ggml_cuda_pdl_lc(); // past the wait: whatever the kernels before this one wrote is whole for the next
-            if (lane == 0 && a.y_bytes > 0) {
+            if (lane == 0 && a.y_bytes > 0 && a.y_f32 == nullptr) {
                 mmvq_moe_mbar_arrive_expect_tx(&y_full, a.y_bytes);
                 mmvq_moe_bulk_load(y_smem, a.y, a.y_bytes, &y_full, unchanged);
             }
@@ -344,7 +403,7 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
                 }
                 ggml_cuda_pdl_sync();
                 ggml_cuda_pdl_lc();
-                if (a.y_bytes > 0) {
+                if (a.y_bytes > 0 && a.y_f32 == nullptr) {
                     mmvq_moe_mbar_arrive_expect_tx(&y_full, a.y_bytes);
                     mmvq_moe_bulk_load(y_smem, a.y, a.y_bytes, &y_full, unchanged);
                 }
@@ -400,7 +459,10 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
     }
     ggml_cuda_pdl_sync(); // the tokens are the previous kernels' results, and dst may still be read
     ggml_cuda_pdl_lc();
-    if (a.y_bytes > 0) {
+    if (a.y_f32 != nullptr) {
+        mmvq_moe_quantize_y(a, y_smem, a.nb*qk);
+        asm volatile("bar.sync 1, %0;" :: "n"(MMVQ_MOE_NW*32) : "memory"); // every consumer's blocks, before any is read
+    } else if (a.y_bytes > 0) {
         mmvq_moe_mbar_wait(&y_full, 0); // the producer's copy of the tokens' vectors
     }
 
@@ -796,16 +858,32 @@ bool ggml_cuda_mmvq_moe_keeps_y(ggml_type type, int64_t ncols_x, bool gate, int6
     return !y_global && y_bytes > 0 && p.rpw > 0 && mmvq_moe_make_plan(type, row_bytes, nmat, y_bytes).rpw == p.rpw;
 }
 
+bool ggml_cuda_mmvq_moe_quantizes_y(ggml_type type, int64_t ncols_x, bool gate, int64_t n_used, int64_t ntokens,
+                                    int64_t nchannels_y, const void * y_f32, int64_t y_f32_s1, int64_t y_f32_s2) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_MMVQ_MOE_QUANTIZE_LEGACY");
+    if (legacy || nchannels_y != n_used || ncols_x % QK8_1 != 0 || (uintptr_t) y_f32 % 16 != 0 || y_f32_s1 % 4 != 0 ||
+            y_f32_s2 % 4 != 0 || (n_used - 1)*y_f32_s1 + (ntokens - 1)*y_f32_s2 + ncols_x > INT_MAX) {
+        return false;
+    }
+    // the q8_1 layout the launch reads (mmvq_src1_q8_1's: each vector's row padded to MATRIX_ROW_PADDING)
+    const int64_t s11 = GGML_PAD(ncols_x, MATRIX_ROW_PADDING) / QK8_1;
+    return ggml_cuda_mmvq_moe_keeps_y(type, ncols_x, gate, ggml_cuda_mmvq_moe_y_bytes(ncols_x, n_used, ntokens, nchannels_y,
+        n_used*s11, s11));
+}
+
 void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t stream) {
     const int     nmat      = args.vgate != nullptr ? 2 : 1;
     const int64_t row_bytes = mmvq_moe_row_bytes(args.type, args.ncols_x);
 
-    // routed experts read the tokens' vectors from the producer's copy past the ring when the plan keeps them there
-    int64_t y_bytes = (uintptr_t) args.y % 16 != 0 ? 0 : ggml_cuda_mmvq_moe_y_bytes(args.ncols_x,
+    // routed experts read the tokens' vectors from the producer's copy past the ring when the plan keeps them there, or
+    // from the copy the consumers quantize there (y_f32, which ggml_cuda_mmvq_moe_quantizes_y admitted)
+    int64_t y_bytes = (uintptr_t) args.y % 16 != 0 && args.y_f32 == nullptr ? 0 : ggml_cuda_mmvq_moe_y_bytes(args.ncols_x,
         args.n_used, args.ntokens, args.nchannels_y, args.stride_col_y, args.stride_channel_y);
     if (!ggml_cuda_mmvq_moe_keeps_y(args.type, args.ncols_x, nmat == 2, y_bytes)) {
+        GGML_ASSERT(args.y_f32 == nullptr && "ggml_cuda_mmvq_moe_quantizes_y keeps the quantized vectors in shared memory");
         y_bytes = 0;
     }
+    GGML_ASSERT(args.y_f32 == nullptr || args.nchannels_y == args.n_used);
     const mmvq_moe_plan p = mmvq_moe_make_plan(args.type, row_bytes, nmat, y_bytes);
     GGML_ASSERT(p.rpw > 0 && "ggml_cuda_mmvq_moe_usable holds a plan");
 
@@ -836,6 +914,9 @@ void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t strea
     a.glu_limit              = args.glu_limit;
     a.nslots                 = p.nslots;
     a.y_bytes                = (int) y_bytes;
+    a.y_f32                  = args.y_f32;
+    a.y_f32_s1               = (int) args.y_f32_s1;
+    a.y_f32_s2               = (int) args.y_f32_s2;
     a.tile_ctr               = args.tile_ctr;
     a.ids_ready              = args.ids_ready ? 1 : 0;
     a.l2_issue_stop          = args.l2_issue_stop;
