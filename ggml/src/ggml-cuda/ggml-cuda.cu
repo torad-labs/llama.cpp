@@ -766,6 +766,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         ssm_conv_ab_slots.release();
     }
+    if (hc_front_tickets.ptr != nullptr) {
+        ggml_cuda_set_device(device);
+        hc_front_tickets.release();
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -6711,6 +6715,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
     cuda_ctx->ssm_conv_ab_slots.ensure();
     cuda_ctx->l2_issue_stop.ensure();
+    cuda_ctx->hc_front_tickets.ensure();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6803,6 +6808,7 @@ static void ggml_backend_cuda_capture_begin(ggml_backend_t backend) {
     cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
     cuda_ctx->ssm_conv_ab_slots.ensure();
     cuda_ctx->l2_issue_stop.ensure();
+    cuda_ctx->hc_front_tickets.ensure();
     {
         std::lock_guard<std::mutex> lock(ggml_cuda_lock);
         ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);

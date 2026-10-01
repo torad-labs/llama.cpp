@@ -1613,6 +1613,30 @@ struct ggml_cuda_pq2_tile_counters {
     }
 };
 
+// The hyper-connection front's tickets in one launch (dsv4_hc_front_one, dsv4-hc.cu), one a stream and token: each
+// block takes its token's after writing its partials, and the block with the last sets it back to 0 and finishes the
+// token. Taken after the launch's dependency wait, like ggml_cuda_pq2_tile_counters, so one serves every launch of a
+// stream, CUDA graph replays included. Made zeroed before a graph evaluation, never inside a capture.
+struct ggml_cuda_hc_front_tickets {
+    static constexpr int n_tokens = 16; // a stream's tickets: the most tokens a front takes in one launch
+
+    unsigned int * ptr = nullptr; // GGML_CUDA_MAX_STREAMS*n_tokens
+
+    void ensure() {
+        if (ptr == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ptr, GGML_CUDA_MAX_STREAMS * n_tokens * sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(ptr, 0, GGML_CUDA_MAX_STREAMS * n_tokens * sizeof(unsigned int)));
+        }
+    }
+
+    void release() {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+            ptr = nullptr;
+        }
+    }
+};
+
 // The word a launch that keeps DRAM busy bumps as its reads start (the routed experts' ring, mmvq-moe.cu), and the paced
 // L2 issuer beside the stream watches: past a change it requests no more (ggml_cuda_l2_issue), where it would take DRAM
 // from that launch for bytes a later kernel reads. Only its changes mean anything. Made before a graph evaluation, never
@@ -2154,6 +2178,7 @@ struct ggml_backend_cuda_context {
     // written once, and ggml-alloc hands its bytes on only past its last reader.
     const ggml_tensor * mmvq_moe_ids[GGML_CUDA_MAX_STREAMS] = {};
     ggml_cuda_ssm_conv_ab_slots ssm_conv_ab_slots;
+    ggml_cuda_hc_front_tickets hc_front_tickets;
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
@@ -2168,6 +2193,11 @@ struct ggml_backend_cuda_context {
 
     // the current stream's PQ2_0 tile counter, or nullptr before the first graph evaluation made them
     int * pq2_tile_counter() { return pq2_tile_counters.ptr != nullptr ? pq2_tile_counters.ptr + curr_stream_no : nullptr; }
+
+    // the current stream's hyper-connection front tickets, or nullptr before the first graph evaluation made them
+    unsigned int * hc_front_ticket() {
+        return hc_front_tickets.ptr != nullptr ? hc_front_tickets.ptr + curr_stream_no*ggml_cuda_hc_front_tickets::n_tokens : nullptr;
+    }
 
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
