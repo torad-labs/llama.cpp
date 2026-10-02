@@ -204,6 +204,57 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// One thread a q8_0 block of one slot of one (query row, sequence): the slot's cell, dequantized with the converter's
+// arithmetic (dequantize_block_q8_0_f16: one half multiply of the exact int8 by the block's scale) into the cell's place in
+// the dense f16 copy. Slots [0, n_kv_max) are the row's indices (-1: none), slot n_kv_max is cell 0, which the K tile load
+// reads for a slot with no cell when it copies asynchronously (flash_attn_ext_f16_load_tile, the single stage's): left
+// unconverted it is whatever the scratch held, and the masked cell's 0 x V turns a non-finite one into NaN.
+static __global__ void flash_attn_gather_k_q8_0(
+        const char * __restrict__ K, const int32_t * __restrict__ indices, half * __restrict__ K_f16,
+        const size_t nb11, const size_t nb13, const int64_t ne1, const int nblocks, const int n_kv_max, const int ne31) {
+    const int64_t item = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t slot = item / nblocks;
+    if (slot > n_kv_max) {
+        return;
+    }
+    const int block    = item % nblocks;
+    const int row      = blockIdx.y;
+    const int sequence = blockIdx.z;
+
+    const int32_t cell = slot < n_kv_max ? indices[(int64_t(sequence)*ne31 + row)*n_kv_max + slot] : 0;
+    if (cell < 0) {
+        return;
+    }
+
+    const block_q8_0 * b = (const block_q8_0 *) (K + sequence*nb13 + cell*nb11) + block;
+    const half d  = b->d;
+    const char2 * qs = (const char2 *) b->qs;
+    half2 * y = (half2 *) (K_f16 + (sequence*ne1 + cell)*(int64_t(nblocks)*QK8_0) + block*QK8_0);
+#pragma unroll
+    for (int i = 0; i < QK8_0/2; ++i) {
+        y[i] = __hmul2(make_half2(qs[i].x, qs[i].y), __half2half2(d));
+    }
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+void ggml_cuda_flash_attn_ext_gather_k_q8_0(
+        const char * K, size_t nb11, size_t nb13, int64_t ne0, int64_t ne1, half * K_f16, const int32_t * indices,
+        int32_t n_kv_max, int64_t ne31, int64_t n_tokens, int64_t n_seq, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(K, nb11, nb13, ne0, ne1, K_f16, indices, n_kv_max, ne31, n_tokens, n_seq, stream);
+    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+#else
+    GGML_ASSERT(ne0 % QK8_0 == 0);
+    const int nblocks = ne0 / QK8_0;
+    const int64_t items = int64_t(n_kv_max + 1)*nblocks;
+    const int threads = 256;
+    const dim3 blocks_num((items + threads - 1)/threads, n_tokens, n_seq);
+    flash_attn_gather_k_q8_0<<<blocks_num, threads, 0, stream>>>(K, indices, K_f16, nb11, nb13, ne1, nblocks, n_kv_max, int(ne31));
+    CUDA_CHECK(cudaGetLastError());
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 // GGML_CUDA_FATTN_SPARSE_LEGACY=1: the hint is ignored, the kernel reads the whole cache under the mask.
 // The gather reads n_kv_max cells a query; the dense kernel reads the cache once for up to 64/ncols2 queries. The gather
 // wins where the cache is at least those queries' cells (GLM-5.3's DSA shape, 32 heads on the latent, RTX 5080 and

@@ -12279,6 +12279,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // under the 8-head tile's switch-over: the masked dense kernel, and the 32-head tile with GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER=1
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},  8192, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
 
+    // q8_0 K on GLM-5.3's sparse launch (the V cache a view of it): a decode and a verify gather only the cells their
+    // indices name (2 x batch x n_kv_max cells under the cache: kv 4352 is the first a decode gathers at a quantized cache's
+    // 256-cell pad, 4096 the last whole conversion), prefill batches and a cache under their cells convert the whole K;
+    // 2 sequences; 576-wide K with 16 heads
+    for (int64_t kv : { 4096, 4352, 8448, 16640, 40960 }) {
+        for (int64_t nb : { 1, 2, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+        }
+    }
+    for (int64_t nb : { 1, 3 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 2}, 16640, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 2}, 16640, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2051));
+    }
+    for (int64_t nb : { 64, 128 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+    }
+
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));

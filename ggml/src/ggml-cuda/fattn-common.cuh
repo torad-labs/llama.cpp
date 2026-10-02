@@ -843,6 +843,14 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
 
+// A q8_0 K read by a sparse launch: only the cells the indices name (ggml_cuda_flash_attn_ext_compact_mask's lists for
+// `n_tokens` rows of `n_seq` sequences, `ne31` mask rows a sequence) and cell 0, which a slot with no cell reads,
+// dequantized into `K_f16` at their own cell positions ([ne0, ne1, 1, n_seq] dense, K's f16 copy but for every cell the
+// launch never reads), the f16 values the whole K's conversion gives. nb11 and nb13 are K's byte strides. Defined in fattn.cu.
+void ggml_cuda_flash_attn_ext_gather_k_q8_0(
+        const char * K, size_t nb11, size_t nb13, int64_t ne0, int64_t ne1, half * K_f16, const int32_t * indices,
+        int32_t n_kv_max, int64_t ne31, int64_t n_tokens, int64_t n_seq, cudaStream_t stream);
+
 // KV_live, the live KV steps of the mma kernel (nbatch_fa cells each) for n = Q tiles x sequences:
 // [0, n) live steps per (sequence, Q tile), at least 1 | [n] blocks done | [n+1, 2n+1) its first live step within its sequence |
 // [ne03] live steps per sequence | [ne03 + 1] a sequence's first unit of work (its steps times its output tiles per Q tile), then the total |
@@ -1515,7 +1523,41 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    // use_sparse: the mask rows compacted to their live cells, which the kernel reads in place of the whole cache, so none
+    // of the scans below
+    const int32_t n_kv_max = use_sparse ? ggml_flash_attn_ext_get_n_kv_max(KQV) : 0;
+    if (use_sparse) {
+        GGML_ASSERT(mask != nullptr && !mask_packed);
+        GGML_ASSERT(n_kv_max > 0);
+
+        if (!sparse_launch.indices) {
+            KV_max.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+        }
+    }
+    GGML_ASSERT(use_sparse || (!sparse_launch.indices && !sparse_launch.whole_tiles && !sparse_launch.grid_kernel));
+
+    // A sparse launch of a q8_0 K whose queries gather fewer cells than the cache holds (a decode, an MTP verify: the whole
+    // K's conversion reads and writes the cache a token, 411 MB a layer at 262,144 cells, for the 2,051 cells it uses)
+    // dequantizes those cells alone. The kernel reads the same f16 values at the same cells, so its output is the whole
+    // conversion's bit for bit. GGML_CUDA_FATTN_KGATHER_LEGACY=1: the whole K.
+    static const bool kgather_legacy = ggml_env_switch("GGML_CUDA_FATTN_KGATHER_LEGACY");
+    const bool gather_K = use_sparse && need_f16_K && !kgather_legacy && K->type == GGML_TYPE_Q8_0 &&
+        (V_is_K_view || !need_f16_V) && K->ne[2] == 1 && K->ne[3] == Q->ne[3] && mask->ne[3] == Q->ne[3] &&
+        K->nb[0] == ggml_type_size(K->type) && K->nb[1] % 2 == 0 && K->ne[0] % ggml_blck_size(K->type) == 0 &&
+        2*Q->ne[1]*Q->ne[3]*n_kv_max <= K->ne[1]*K->ne[3];
+
+    if (gather_K) {
+        GGML_ASSERT(f16_extra.K != 0);
+        half * K_f16 = (half *) f16_extra.K;
+        ggml_cuda_flash_attn_ext_gather_k_q8_0(K_data, nb11, nb13, K->ne[0], K->ne[1], K_f16,
+            sparse_launch.indices ? sparse_launch.indices : KV_max.ptr, n_kv_max, mask->ne[1], Q->ne[1], Q->ne[3], main_stream);
+
+        nb11 = K->ne[0] * sizeof(half);
+        nb12 = K->ne[1] * nb11;
+        nb13 = K->ne[2] * nb12;
+        K_data = (char *) K_f16;
+    } else if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1584,19 +1626,6 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
-    // use_sparse: the mask rows compacted to their live cells, which the kernel reads in place of the whole cache, so none
-    // of the scans below
-    const int32_t n_kv_max = use_sparse ? ggml_flash_attn_ext_get_n_kv_max(KQV) : 0;
-    if (use_sparse) {
-        GGML_ASSERT(mask != nullptr && !mask_packed);
-        GGML_ASSERT(n_kv_max > 0);
-
-        if (!sparse_launch.indices) {
-            KV_max.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
-            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
-        }
-    }
-    GGML_ASSERT(use_sparse || (!sparse_launch.indices && !sparse_launch.whole_tiles && !sparse_launch.grid_kernel));
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
