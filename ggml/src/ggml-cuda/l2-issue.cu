@@ -13,15 +13,34 @@ static __device__ __forceinline__ uint64_t l2_issue_now() {
     return t;
 }
 
-static __global__ void l2_issue_paced(const ggml_cuda_l2_ranges r, const float ns_per_byte) {
+// A block reads stop every L2_ISSUE_STOP_EVERY pieces and compares what it read at the next read: the load's round trip
+// to L2 overlaps the pieces between, and a block stops within 2 * L2_ISSUE_STOP_EVERY pieces of a change (~1.6 us at 40
+// GB/s a block)
+#define L2_ISSUE_STOP_EVERY 4
+
+static __device__ __forceinline__ unsigned int l2_issue_stop_read(const unsigned int * stop) {
+    unsigned int v;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(stop) : "memory");
+    return v;
+}
+
+static __global__ void l2_issue_paced(const ggml_cuda_l2_ranges r, const float ns_per_byte, const unsigned int * stop) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
-    const uint64_t t0   = l2_issue_now();
-    const int64_t  step = (int64_t) gridDim.x * L2_ISSUE_PIECE;
-    int            k    = 0; // the range holding lo
-    int64_t        base = 0; // its first byte's place in the ranges laid end to end
-    for (int64_t off = (int64_t) blockIdx.x * L2_ISSUE_PIECE; off < r.total; off += step) {
+    const uint64_t     t0    = l2_issue_now();
+    const int64_t      step  = (int64_t) gridDim.x * L2_ISSUE_PIECE;
+    const unsigned int start = stop != nullptr ? l2_issue_stop_read(stop) : 0;
+    unsigned int       seen  = start;
+    int                k     = 0; // the range holding lo
+    int64_t            base  = 0; // its first byte's place in the ranges laid end to end
+    for (int64_t off = (int64_t) blockIdx.x * L2_ISSUE_PIECE, n = 0; off < r.total; off += step, ++n) {
         const uint64_t due = (uint64_t) ((float) off * ns_per_byte);
         while (l2_issue_now() - t0 < due) {
+        }
+        if (stop != nullptr && n % L2_ISSUE_STOP_EVERY == 0) {
+            if (seen != start) {
+                return; // a launch that keeps DRAM busy has started, and a request now would take DRAM from it
+            }
+            seen = l2_issue_stop_read(stop);
         }
         const int64_t hi = min(off + (int64_t) L2_ISSUE_PIECE, r.total);
         for (int64_t lo = off; lo < hi;) {
@@ -36,11 +55,12 @@ static __global__ void l2_issue_paced(const ggml_cuda_l2_ranges r, const float n
         }
     }
 #else
-    GGML_UNUSED_VARS(r, ns_per_byte);
+    GGML_UNUSED_VARS(r, ns_per_byte, stop);
 #endif
 }
 
-void ggml_cuda_l2_issue(const ggml_cuda_l2_ranges & r, const double rate_gbs, const int nsm, cudaStream_t stream) {
+void ggml_cuda_l2_issue(const ggml_cuda_l2_ranges & r, const double rate_gbs, const int nsm, const unsigned int * stop,
+                        cudaStream_t stream) {
     if (r.total <= 0 || rate_gbs <= 0.0) {
         return;
     }
@@ -48,6 +68,6 @@ void ggml_cuda_l2_issue(const ggml_cuda_l2_ranges & r, const double rate_gbs, co
     // rate, and no more blocks than pieces
     const int64_t pieces = (r.total + L2_ISSUE_PIECE - 1) / L2_ISSUE_PIECE;
     const int     nb     = (int) std::min<int64_t>({ (int64_t) nsm, pieces, (int64_t) std::ceil(rate_gbs / 40.0) });
-    l2_issue_paced<<<std::max(nb, 1), 1, 0, stream>>>(r, (float) (1.0 / rate_gbs));
+    l2_issue_paced<<<std::max(nb, 1), 1, 0, stream>>>(r, (float) (1.0 / rate_gbs), stop);
     CUDA_CHECK(cudaGetLastError());
 }

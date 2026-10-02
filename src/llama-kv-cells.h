@@ -28,6 +28,66 @@ struct llama_kv_cell_ext {
     }
 };
 
+// the cells whose position or sequences changed, for ONE consumer that keeps a view of the cells
+// (llama_kpool_views): the consumer takes the list, and is told to rebuild the view when it cannot be given one
+class llama_kv_cells_log {
+public:
+    llama_kv_cells_log() = default;
+
+    // a copy starts untracked and empty; an assignment replaces the cells, so any of them may have changed
+    llama_kv_cells_log(const llama_kv_cells_log &) {}
+    llama_kv_cells_log & operator=(const llama_kv_cells_log &) { all(); return *this; }
+
+    // consumer side: const, because the consumer holds the cells const
+    void track(uint32_t max_cells) const {
+        if (!on) {
+            on       = true;
+            everyone = true;
+        }
+        cap = max_cells;
+    }
+
+    // the cells changed since the last take() go to out; false = any cell may have changed (the first take, a reset, a
+    // resize, an assignment, a list that passed its cap): out is empty then
+    bool take(std::vector<uint32_t> & out) const {
+        const bool res = !everyone;
+
+        out.clear();
+        if (res) {
+            out.swap(list);
+        }
+        list.clear();
+        everyone = false;
+
+        return res;
+    }
+
+    void all() {
+        if (on) {
+            everyone = true;
+            list.clear();
+        }
+    }
+
+    void add(uint32_t i) {
+        if (!on || everyone || (!list.empty() && list.back() == i)) {
+            return;
+        }
+        if (list.size() >= cap) {
+            all();
+            return;
+        }
+        list.push_back(i);
+    }
+
+private:
+    mutable bool     on       = false;
+    mutable bool     everyone = false;
+    mutable uint32_t cap      = 0;
+
+    mutable std::vector<uint32_t> list;
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -46,10 +106,13 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_n[s] = 0;
             std::fill(seq_bits[s].begin(), seq_bits[s].end(), 0);
         }
 
         std::fill(pos_max_g.begin(), pos_max_g.end(), -1);
+
+        chg.all();
     }
 
     void reset_shift() {
@@ -180,6 +243,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
 
+            chg.add(idx);
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(i + j);
             }
@@ -216,6 +281,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
 
+            chg.add(idx);
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(idx);
             }
@@ -250,6 +317,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        chg.add(i);
+
         seq_pos_rm(i);
         seq_bits_clr(i);
         seq[i].reset();
@@ -269,6 +338,8 @@ public:
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
         assert(seq_id >= 0);
+
+        chg.add(i);
 
         seq[i].reset(seq_id);
         seq_bit_clr(i, seq_id);
@@ -291,6 +362,8 @@ public:
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
+
+        chg.add(i);
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -346,6 +419,8 @@ public:
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
 
+        chg.add(i);
+
         seq[i].set(seq_id);
         seq_bit_set(i, seq_id);
         seq_pos_inc(seq_id, pos[i]);
@@ -393,6 +468,25 @@ public:
         assert(seq_pos[seq_id].rbegin()->second > 0);
 
         return seq_pos[seq_id].rbegin()->first;
+    }
+
+    // the number of cells that hold sequence seq_id, and the number of different positions among them:
+    // equal when no two of them share a position
+    uint32_t seq_cell_count(llama_seq_id seq_id) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        return seq_n[seq_id];
+    }
+
+    uint32_t seq_pos_distinct(llama_seq_id seq_id) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id].size();
+    }
+
+    // the cells changed since the consumer last took them
+    const llama_kv_cells_log & changes() const {
+        return chg;
     }
 
     // the cells in groups of 64, for a KQ mask row to take a group whole where no position in it can be masked
@@ -464,6 +558,8 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        chg.add(i);
+
         pos[i] = p;
 
         used.insert(i);
@@ -481,6 +577,8 @@ public:
     bool pos_add(uint32_t i, llama_pos d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+
+        chg.add(i);
 
         seq_pos_rm(i);
 
@@ -515,6 +613,8 @@ public:
         assert(pos[i] != -1);
 
         const llama_pos p_old = pos[i];
+
+        chg.add(i);
 
         seq_pos_rm(i);
 
@@ -569,6 +669,11 @@ private:
     //
     std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
 
+    // seq_n[s]: the cells that hold sequence s, the sum of the counts in seq_pos[s]
+    uint32_t seq_n[LLAMA_MAX_SEQ] = {};
+
+    llama_kv_cells_log chg;
+
     // seq_bits[s]: the bits of seq_cells64() for sequence s, sized at its first cell (a sequence never placed has none);
     // pos_max_g: the bounds of pos_max64()
     std::vector<uint64_t> seq_bits[LLAMA_MAX_SEQ];
@@ -622,12 +727,15 @@ private:
         auto it = seq_pos[s].find(p);
         assert(it != seq_pos[s].end());
 
+        seq_n[s]--;
+
         if (--it->second == 0) {
             seq_pos[s].erase(it);
         }
     }
 
     void seq_pos_inc(llama_seq_id s, llama_pos p) {
+        seq_n[s]++;
         seq_pos[s][p]++;
     }
 

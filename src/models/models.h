@@ -1399,7 +1399,8 @@ struct llama_model_glm5next : public llama_model_base {
                 ggml_tensor * cur,
                 int il) const;
 
-        // always stores the key and gate; when `scoring`, returns the selected CELL indices
+        // always stores the key and gate; when `scoring`, returns the selected CELL indices, a dump pool's cells where
+        // fewer than select_k pools are live
         ggml_tensor * build_indexer(
                 const llama_layer & layer,
                 llm_graph_input_kpool * inp_kp,

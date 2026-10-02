@@ -10,10 +10,13 @@ struct ggml_cuda_gdn_chunked_args {
     const float * q;
     const float * k;
     const float * v;
-    const float * g;
+    const float * g;           // [1 or k_dim, H, tokens, seqs]: KDA's gate is per channel, at the beta strides times k_dim
     const float * beta;
-    const float * raw_dt_bias; // non-null: beta / g are pre-activation (ggml_gated_delta_net_set_raw_gates)
-    const float * raw_a;
+    bool          kda;
+    bool          raw;         // beta / g pre-activation (ggml_gated_delta_net_set_raw_gates, with KDA _raw_kda_gates)
+    const float * raw_dt_bias; // raw, not KDA
+    const float * raw_a;       // raw
+    float         raw_lb;      // raw KDA: g = raw_lb * sigmoid(-(g * raw_a[h]))
     const float * state_in;    // [S, S, H, n_seqs], per (seq, head) [v][k]
     float *       state_out;   // final state after n_tokens tokens, same layout as state_in
     float *       out;         // attention output of token 0
@@ -37,9 +40,16 @@ void ggml_cuda_gdn_chunked_launch(ggml_backend_cuda_context & ctx, const ggml_te
 //     replay without needing a separate persistent allocation to be pre-sized before capture.
 struct ggml_cuda_gdn_chunked_scratch {
     float *   v_corr;
+    float *   qk;
+    // the scalar gate: stage 1's fp32 k_cumdecay and g_cum, which stages 2 and 3 scale and convert
     float *   k_cumdecay;
     float *   g_cum;
-    float *   qk;
+    // KDA: stage 3's operands as stage 1 leaves them, fp16 [CS][K] a chunk (k_cumdecay, q scale exp(G),
+    // k exp(G_last - G)), and each state row's decay over the chunk, exp(G_last) [K]
+    __half *  kda_kcd;
+    __half *  kda_qg;
+    __half *  kda_kg;
+    float *   kda_decay;
     uintptr_t end;
 };
 

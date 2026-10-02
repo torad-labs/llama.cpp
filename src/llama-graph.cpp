@@ -606,6 +606,7 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
     dims.n_new_max = dims.rebuild ? dims.n_pools : dims.n_tps/kpool + dims.n_ps;
     // same gate as the builder (glm5next_n_select == indexer_top_k + kpool - 1)
     dims.scoring = cparams.n_ctx > hparams.indexer_top_k + kpool - 1;
+    dims.n_dump  = dims.scoring ? llama_kpool_select_k(dims.n_pools, hparams.indexer_top_k, kpool) : 0;
 
     return dims;
 }
@@ -622,12 +623,16 @@ bool llm_graph_input_kpool::shapes_match(const llm_graph_input_kpool_dims & dims
         return res;
     }
 
-    res &= inp.pool_cells->ne[0] == (int64_t) inp.kpool*dims.n_pools;
+    res &= inp.pool_cells->ne[0] == (int64_t) inp.kpool*(dims.n_pools + dims.n_dump);
     res &= inp.pool_cells->ne[1] == dims.n_stream;
 
     res &= inp.pool_bias->ne[0] == dims.n_pools;
     res &= inp.pool_bias->ne[1] == dims.n_tps;
     res &= inp.pool_bias->ne[2] == dims.n_stream;
+
+    res &= inp.pool_dump->ne[0] == dims.n_dump;
+    res &= inp.pool_dump->ne[1] == dims.n_tps;
+    res &= inp.pool_dump->ne[2] == dims.n_stream;
 
     if (inp.pool_bias_f16) {
         res &= inp.pool_bias_f16->ne[0] == dims.n_pools;
@@ -636,7 +641,7 @@ bool llm_graph_input_kpool::shapes_match(const llm_graph_input_kpool_dims & dims
         res &= inp.pool_bias_f16->ne[3] == dims.n_stream;
     }
 
-    res &= inp.sel_mask->ne[0] == dims.n_kv;
+    res &= inp.sel_mask->ne[0] == dims.n_kv + (int64_t) inp.kpool*dims.n_dump;
     res &= inp.sel_mask->ne[1] == dims.n_tps;
     res &= inp.sel_mask->ne[2] == 1;
     res &= inp.sel_mask->ne[3] == dims.n_stream;
@@ -2883,7 +2888,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il,
-                bool   mask_is_prefix) const {
+                bool   mask_is_prefix,
+             int64_t   n_kv_max) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2927,6 +2933,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         static const bool sparse_prefix_legacy = ggml_env_switch("LLAMA_ATTN_SPARSE_MASK_PREFIX_LEGACY");
         ggml_flash_attn_ext_set_mask_prefix(cur, (mask_is_prefix || sparse_prefix_legacy) && cparams.n_seq_max == 1 &&
                                                  cparams.causal_attn && il >= 0 && !hparams.is_swa(il));
+
+        // n_kv_max: a bound on each mask row's live cells, which a backend may then read alone (the sparse mode)
+        GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
 
         if (v_mla) {
 #if 0
@@ -3355,7 +3365,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false);
+    // a row's live cells are among its top_k: the kernel may read those alone
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false,
+            top_k->ne[0]);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -4000,18 +4012,25 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         GGML_ASSERT(n_ps >= 1 && (int64_t) ubatch.n_seqs_unq == n_ps*n_stream);
 
         const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
+        const int64_t n_dump  = llama_kpool_select_k(n_pools, hparams.indexer_top_k, kpool);
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
 
         GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
 
-        inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_pools, n_stream);
+        inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*(n_pools + n_dump), n_stream);
         ggml_set_input(inp->pool_cells);
         ggml_set_name(inp->pool_cells, "kpool_pool_cells");
+
+        inp->pool_cells_3d = ggml_reshape_3d(ctx0, inp->pool_cells, kpool, n_pools + n_dump, n_stream);
 
         inp->pool_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
         ggml_set_input(inp->pool_bias);
         ggml_set_name(inp->pool_bias, "kpool_pool_bias");
+
+        inp->pool_dump = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_dump, n_tps, n_stream);
+        ggml_set_input(inp->pool_dump);
+        ggml_set_name(inp->pool_dump, "kpool_pool_dump");
 
         // the fused indexer wants f16; built once, shared by every indexer layer
         if (cparams.fused_lid) {
@@ -4022,7 +4041,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         }
 
         // lossless in f16 (only 0.0f and -INFINITY), and f16 + f32 -> f16 adds the KQ mask uncast
-        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv + kpool*n_dump, n_tps, 1, n_stream);
         ggml_set_input(inp->sel_mask);
         ggml_set_name(inp->sel_mask, "kpool_sel_mask");
 
@@ -4087,9 +4106,16 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     GGML_ASSERT(sel_mask->type == GGML_TYPE_F16 || sel_mask->type == GGML_TYPE_F32);
     GGML_ASSERT(sel_mask->type == cand_mask->type);
-    GGML_ASSERT(ggml_are_same_shape(sel_mask, cand_mask));
-    GGML_ASSERT(sel_mask->ne[0] == kq_mask->ne[0] && sel_mask->ne[1] == kq_mask->ne[1] &&
-                sel_mask->ne[3] == kq_mask->ne[3]);
+    GGML_ASSERT(cand_mask->ne[0] == kq_mask->ne[0] && cand_mask->ne[1] == kq_mask->ne[1] &&
+                cand_mask->ne[3] == kq_mask->ne[3]);
+    GGML_ASSERT(sel_mask->ne[1] == cand_mask->ne[1] && sel_mask->ne[2] == cand_mask->ne[2] &&
+                sel_mask->ne[3] == cand_mask->ne[3]);
+
+    // sel_mask's columns past n_kv are the dump pools' (llm_graph_input_kpool::pool_dump): a row the top-k fills with
+    // dump pools scatters into them, never twice into one cell, and they are dropped below
+    const int64_t n_kv = cand_mask->ne[0];
+
+    GGML_ASSERT(sel_mask->ne[0] >= n_kv);
 
     // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy
     ggml_tensor * mask_all = ggml_dup(ctx0, sel_mask);
@@ -4107,7 +4133,8 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     ggml_tensor * mask_top_k = ggml_set_rows(ctx0, mask_all, zeros, top_k_3d);
 
-    mask_top_k = ggml_view_4d(ctx0, mask_top_k, mask_top_k->ne[1], mask_top_k->ne[2], 1, mask_top_k->ne[3],
+    // the first n_kv columns are the mask; the dump columns are dropped here
+    mask_top_k = ggml_view_4d(ctx0, mask_top_k, n_kv, mask_top_k->ne[2], 1, mask_top_k->ne[3],
             mask_top_k->nb[2], mask_top_k->nb[3], mask_top_k->nb[3], 0);
 
     mask_top_k = ggml_add(ctx0, mask_top_k, cand_mask);
@@ -4125,7 +4152,13 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false);
+    // a row's live cells: its top_k pools' cells (top_k->ne[0] = r*select_k) and its tail, positions [(q + 1)/r*r, q]
+    // (kpool_mask_row), at most r - 1 cells unless a sequence holds two cells at one position (an rm + add before the first
+    // cell is gone), whose tail then has more. The kernel may read those alone; the bound rounds up to 32 cells, a CUDA
+    // kernel step, so that case keeps every cell at no cost (2051 and 2080 cells are 65 steps either way)
+    const int64_t n_kv_max = GGML_PAD(top_k->ne[0] + hparams.indexer_kpool - 1, 32);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false,
+            n_kv_max);
     cb(cur, "kqv_out", il);
 
     if (wo) {

@@ -3,6 +3,7 @@
 #include "gguf.h"
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-kv-cache-kpool.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -1294,6 +1295,14 @@ bool llama_kv_cache::get_kpool_dirty() const {
 
 void llama_kv_cache::clear_kpool_dirty() const {
     kpool_dirty = false;
+}
+
+llama_kpool_views & llama_kv_cache::get_kpool_views() const {
+    if (!kpool_views) {
+        kpool_views = std::make_shared<llama_kpool_views>();
+    }
+
+    return *kpool_views;
 }
 
 ggml_type llama_kv_cache::type_k() const {

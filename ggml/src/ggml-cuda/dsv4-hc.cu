@@ -231,6 +231,169 @@ static __global__ void dsv4_hc_post_f32(
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
 }
 
+// DSV4_HC_POST a block a token, where n_embd is NQ blocks' width: thread t makes all four streams at each of its columns
+// t + DSV4_HC_POST_ROW_THREADS*q, reading x and the four residual streams there once. dsv4_hc_post_f32's thread an output
+// read them for each of the four streams it makes and unflattened its index in 64 bits. Each output is that kernel's
+// expression on the same values, so its value.
+//
+// norm: the weightless RMS_NORM of the flat streams fused in, writing the BF16 copy y a cuBLAS BF16 MUL_MAT reads
+// (ggml_cuda_op_rms_norm_bf16's, where the norm read the streams back). The thread's outputs are the flat row's columns
+// t + 1024*j, j = idst*NQ + q, which rms_norm_f32<1024> sums in that order: the thread sums their squares so and the block
+// reduces them as that kernel's does, so the scale and every BF16 value are the norm's bit for bit.
+// No __restrict__ (dsv4_hc_mix_partials' note): with it nvcc loaded x and a stream as LDG.CONSTANT ahead of the PDL wait.
+static constexpr int DSV4_HC_POST_ROW_THREADS = 1024;
+static constexpr int DSV4_HC_POST_ROW_MAX_NQ  = 8;
+
+template <int NQ, bool norm>
+static __global__ void __launch_bounds__(DSV4_HC_POST_ROW_THREADS) dsv4_hc_post_rows_f32(
+        const float * x,
+        const float * residual,
+        const float * post,
+        const float * comb,
+        float * dst,
+        nv_bfloat16 * y,
+        const int64_t sx1,
+        const int64_t sr1,
+        const int64_t sr2,
+        const int64_t sp0,
+        const int64_t sp1,
+        const int64_t sc0,
+        const int64_t sc1,
+        const int64_t sc2,
+        const int64_t sd1,
+        const int64_t sd2,
+        const int     ncols,
+        const float   eps) {
+    ggml_cuda_pdl_lc();
+    constexpr int n_embd = NQ*DSV4_HC_POST_ROW_THREADS;
+    const int64_t it  = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    x        += it*sx1 + tid;
+    residual += it*sr2 + tid;
+    post     += it*sp1;
+    comb     += it*sc2;
+    dst      += it*sd2 + tid;
+
+    ggml_cuda_pdl_sync();
+
+    float p[DSV4_HC];
+    float c[DSV4_HC][DSV4_HC];
+#pragma unroll
+    for (int idst = 0; idst < DSV4_HC; ++idst) {
+        p[idst] = post[idst*sp0];
+#pragma unroll
+        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+            c[idst][isrc] = comb[idst*sc0 + isrc*sc1];
+        }
+    }
+
+    float v[norm ? DSV4_HC : 1][NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        const int   i0 = q*DSV4_HC_POST_ROW_THREADS;
+        const float xv = x[i0];
+        float r[DSV4_HC];
+#pragma unroll
+        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+            r[isrc] = residual[i0 + isrc*sr1];
+        }
+#pragma unroll
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            float sum = __fmul_rn(xv, p[idst]);
+#pragma unroll
+            for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+                sum = __fmaf_rn(r[isrc], c[idst][isrc], sum);
+            }
+            dst[i0 + idst*sd1] = sum;
+            if constexpr (norm) {
+                v[idst][q] = sum;
+            }
+        }
+    }
+
+    if constexpr (norm) {
+        float tmp = 0.0f;
+#pragma unroll
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                tmp += v[idst][q] * v[idst][q];
+            }
+        }
+
+        __shared__ float s_sum[32];
+        tmp = block_reduce<block_reduce_method::SUM, DSV4_HC_POST_ROW_THREADS>(tmp, s_sum);
+
+        // ncols at run time, as rms_norm_f32 divides by it
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+        y += it*ncols + tid;
+#pragma unroll
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                y[idst*n_embd + q*DSV4_HC_POST_ROW_THREADS] = __float2bfloat16(scale * v[idst][q]);
+            }
+        }
+    } else {
+        GGML_UNUSED_VARS(y, ncols, eps);
+    }
+}
+
+// dsv4_hc_post_rows_f32's NQ for the post dst, or 0 where it does not run: x, the residual streams and dst contiguous
+// along n_embd, a multiple of its block up to DSV4_HC_POST_ROW_MAX_NQ of them, not under GGML_CUDA_HC_POST_ROWS_LEGACY
+static int dsv4_hc_post_rows_nq(const ggml_tensor * dst) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_HC_POST_ROWS_LEGACY");
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const int64_t       n_embd   = x->ne[0];
+    if (legacy || residual->ne[1] != DSV4_HC || x->nb[0] != sizeof(float) || residual->nb[0] != sizeof(float) ||
+            dst->nb[0] != sizeof(float) || n_embd % DSV4_HC_POST_ROW_THREADS != 0 ||
+            n_embd > DSV4_HC_POST_ROW_MAX_NQ*DSV4_HC_POST_ROW_THREADS) {
+        return 0;
+    }
+    return n_embd / DSV4_HC_POST_ROW_THREADS;
+}
+
+template <bool norm>
+static void dsv4_hc_post_rows_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, nv_bfloat16 * y, int ncols,
+        float eps) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * comb     = dst->src[3];
+
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3(x->ne[1], 1, 1), dim3(DSV4_HC_POST_ROW_THREADS, 1, 1), 0, ctx.stream());
+
+    auto launch = [&](auto kernel) {
+        ggml_cuda_kernel_launch(kernel, launch_params,
+                (const float *) x->data, (const float *) residual->data,
+                (const float *) post->data, (const float *) comb->data, (float *) dst->data, y,
+                (int64_t) (x->nb[1] / sizeof(float)),
+                (int64_t) (residual->nb[1] / sizeof(float)), (int64_t) (residual->nb[2] / sizeof(float)),
+                (int64_t) (post->nb[0] / sizeof(float)), (int64_t) (post->nb[1] / sizeof(float)),
+                (int64_t) (comb->nb[0] / sizeof(float)), (int64_t) (comb->nb[1] / sizeof(float)),
+                (int64_t) (comb->nb[2] / sizeof(float)),
+                (int64_t) (dst->nb[1] / sizeof(float)), (int64_t) (dst->nb[2] / sizeof(float)),
+                ncols, eps);
+    };
+
+    switch (dsv4_hc_post_rows_nq(dst)) {
+        case 1: launch(dsv4_hc_post_rows_f32<1, norm>); break;
+        case 2: launch(dsv4_hc_post_rows_f32<2, norm>); break;
+        case 3: launch(dsv4_hc_post_rows_f32<3, norm>); break;
+        case 4: launch(dsv4_hc_post_rows_f32<4, norm>); break;
+        case 5: launch(dsv4_hc_post_rows_f32<5, norm>); break;
+        case 6: launch(dsv4_hc_post_rows_f32<6, norm>); break;
+        case 7: launch(dsv4_hc_post_rows_f32<7, norm>); break;
+        case 8: launch(dsv4_hc_post_rows_f32<8, norm>); break;
+        default: GGML_ABORT("dsv4_hc_post_rows_f32 does not run this post");
+    }
+}
+
 // The front of a hyper-connection cycle at a few tokens in two kernels (ggml_cuda_op_dsv4_hc_pre_fused), where it was
 // six nodes: the weightless RMS_NORM of the flat streams, their MUL_MAT by hc_fn, DSV4_HC_WEIGHTS, DSV4_HC_PRE, and the
 // RMS_NORM and MUL of the sublayer's norm. The mat-vec had one block a row, 24 blocks over 16,384 columns, and each of
@@ -579,10 +742,11 @@ struct dsv4_hc_post_args {
     int64_t sx_h;           // x's stream stride (its token stride is the kernel's sx1)
 };
 
+// dsv4_hc_mix_gram's work, a block's: also the first part of dsv4_hc_front_one's
 template <typename T, bool fuse_post>
-static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_mix_gram(
+static __device__ __forceinline__ void dsv4_hc_mix_gram_block(
         float * x, const T * w, float * partials, const int64_t n_embd,
-        const int64_t sx1, const int64_t sw1, const bool w_prewait, const dsv4_hc_post_args pa) {
+        const int64_t sx1, const int64_t sw1, const bool w_prewait, const dsv4_hc_post_args & pa) {
     constexpr int rows = DSV4_HC_MIX/8;
 
     const int slice    = blockIdx.x;
@@ -675,56 +839,45 @@ static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_mix_gram(
     }
 }
 
+template <typename T, bool fuse_post>
+static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_mix_gram(
+        float * x, const T * w, float * partials, const int64_t n_embd,
+        const int64_t sx1, const int64_t sw1, const bool w_prewait, const dsv4_hc_post_args pa) {
+    dsv4_hc_mix_gram_block<T, fuse_post>(x, w, partials, n_embd, sx1, sw1, w_prewait, pa);
+}
+
 // a block for each DSV4_HC_PRE_GRAM_THR elements of a token's mix: every block sums the partials into the mixes and G
 // (from L2, a few KB), makes the pre weights, and the mix's RMS as sqrt(pre' G pre / n_embd + eps); then a thread its
 // element of the mix, normed, times the norm's weight, into dst. Block 0's warp 0 also makes the post and comb weights
 // (the comb in registers, dsv4_hc_comb_regs) into weights_out, while the other blocks write their slices. The streams'
 // RMS is G's trace's. base_prewait, norm_prewait: base or the norm's weight is the model's (dsv4_hc_prewait).
-static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_f32(
-        const float * partials, const int n_slices, const float * x,
-        const float * scale, const float * base, const float * norm_w,
-        float * weights_out, float * dst, const int64_t n_embd, const int64_t k,
-        const int64_t sx1, const int64_t sx2, const int64_t ss0, const int64_t sb0, const int64_t sw0,
-        const int64_t sw1, const int64_t sd1, const float eps_flat, const float eps_hc, const int32_t n_iter,
-        const float eps_norm, const bool base_prewait, const bool norm_prewait) {
-    __shared__ float mix[DSV4_HC_GRAM_ROWS];
-    __shared__ float base_s[DSV4_HC_MIX];
+// q8 non-null: dst's q8_1 copy as quantize_row_q8_1_cuda writes it (token it's row q8_s1 blocks on), a warp a block
+// with quantize_q8_1's arithmetic on the values dst holds, so its bits: n_embd a multiple of MATRIX_ROW_PADDING.
+// Its work is in the device functions below, which dsv4_hc_front_one runs too, so the two make the same bits.
+struct dsv4_hc_pre_args {
+    const float * x;           // the streams [n_embd, DSV4_HC, n_tokens], stream stride sx1, token stride sx2
+    const float * scale;       // stride ss0
+    const float * base;        // stride sb0
+    const float * norm_w;
+    float       * weights_out; // stride sw0, token stride sw1
+    float       * dst;         // token stride sd1
+    block_q8_1  * q8;          // or nullptr; token stride q8_s1 blocks
+    int64_t n_embd, k, sx1, sx2, ss0, sb0, sw0, sw1, sd1, q8_s1;
+    float   eps_flat, eps_hc, eps_norm;
+    int32_t n_iter;
+    bool    base_prewait, norm_prewait;
+};
 
-    const int     it   = blockIdx.y;
-    const int     warp = threadIdx.x / WARP_SIZE;
-    const int     lane = threadIdx.x % WARP_SIZE;
-    const int64_t i    = (int64_t) blockIdx.x*DSV4_HC_PRE_GRAM_THR + threadIdx.x;
+// a token's mixes and G from its partials pt, into mix (shared): warp w sums rows w, w + 8, ..., every row's loads issued
+// before any row's shuffles, one L2 round trip, not one a row. cg: read past L1 (the launch's own blocks wrote them). The
+// caller syncs the block before mix is read.
+template <bool cg>
+static __device__ __forceinline__ void dsv4_hc_gram_mix(const float * pt, const int n_slices, float * mix) {
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
 
-    ggml_cuda_pdl_lc();
-
-    float nw = 0.0f;
-    if (base_prewait && threadIdx.x < DSV4_HC_MIX) {
-        base_s[threadIdx.x] = base[threadIdx.x*sb0];
-    }
-    if (norm_prewait && i < n_embd) {
-        nw = norm_w[i];
-    }
-    ggml_cuda_pdl_sync();
-    if (!base_prewait && threadIdx.x < DSV4_HC_MIX) {
-        base_s[threadIdx.x] = base[threadIdx.x*sb0];
-    }
-    if (!norm_prewait && i < n_embd) {
-        nw = norm_w[i];
-    }
-    // the thread's streams, requested with the partials: one round trip for both
-    float xs[DSV4_HC] = {};
-    if (i < n_embd) {
-        const float * xt = x + it*sx2;
-#pragma unroll
-        for (int h = 0; h < DSV4_HC; ++h) {
-            xs[h] = xt[i + h*sx1];
-        }
-    }
-
-    // warp w sums rows w, w + 8, ...: every row's loads issued before any row's shuffles, one L2 round trip, not one a row
     constexpr int n_warps = DSV4_HC_PRE_GRAM_THR/WARP_SIZE;
     constexpr int rows_w  = (DSV4_HC_GRAM_ROWS + n_warps - 1)/n_warps;
-    const float * pt = partials + (int64_t) it*DSV4_HC_GRAM_ROWS*n_slices;
     float s[rows_w];
 #pragma unroll
     for (int q = 0; q < rows_w; ++q) {
@@ -735,7 +888,7 @@ static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_
         for (int q = 0; q < rows_w; ++q) {
             const int r = warp + q*n_warps;
             if (r < DSV4_HC_GRAM_ROWS) {
-                s[q] += pt[r*n_slices + sl];
+                s[q] += cg ? __ldcg(pt + r*n_slices + sl) : pt[r*n_slices + sl];
             }
         }
     }
@@ -747,19 +900,32 @@ static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_
             mix[r] = s[q];
         }
     }
-    __syncthreads();
+}
 
+// element i's streams of token it (i < n_embd); cg: read past L1 (the launch's own blocks wrote them)
+template <bool cg>
+static __device__ __forceinline__ void dsv4_hc_gram_streams(const dsv4_hc_pre_args & pr, const int it, const int64_t i,
+        float * xs) {
+    const float * xt = pr.x + it*pr.sx2;
+#pragma unroll
+    for (int h = 0; h < DSV4_HC; ++h) {
+        xs[h] = cg ? __ldcg(xt + i + h*pr.sx1) : xt[i + h*pr.sx1];
+    }
+}
+
+// the pre weights and the mix's RMS from mix (dsv4_hc_gram_mix's) and base_s, and the streams' RMS (G's trace's)
+static __device__ __forceinline__ void dsv4_hc_gram_pre(const float * mix, const float * base_s, const dsv4_hc_pre_args & pr,
+        float * pre, float & rms_flat, float & rms) {
     const float * G = mix + DSV4_HC_MIX;
     float trace = 0.0f;
 #pragma unroll
     for (int h = 0; h < DSV4_HC; ++h) {
         trace += G[dsv4_hc_gram_index(h, h)];
     }
-    const float rms_flat = rsqrtf(trace/k + eps_flat);
-    float pre[DSV4_HC];
+    rms_flat = rsqrtf(trace/pr.k + pr.eps_flat);
 #pragma unroll
     for (int h = 0; h < DSV4_HC; ++h) {
-        pre[h] = 1.0f/(1.0f + expf(-(mix[h]*rms_flat*scale[0] + base_s[h]))) + eps_hc;
+        pre[h] = 1.0f/(1.0f + expf(-(mix[h]*rms_flat*pr.scale[0] + base_s[h]))) + pr.eps_hc;
     }
     // pre' G pre: G symmetric, its off-diagonal entries twice
     float sumsq = 0.0f;
@@ -772,46 +938,232 @@ static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_
         }
         sumsq += pre[a]*row;
     }
-    const float rms = rsqrtf(sumsq/n_embd + eps_norm);
+    rms = rsqrtf(sumsq/pr.n_embd + pr.eps_norm);
+}
+
+// token it's pre, post and comb weights into weights_out, by one warp: the comb in registers (dsv4_hc_comb_regs), lane
+// L < 16 writing its element, lanes 16-19 a pre and a post weight
+static __device__ __forceinline__ void dsv4_hc_gram_weights(const float * mix, const float * base_s,
+        const dsv4_hc_pre_args & pr, const int it, const float * pre, const float rms_flat) {
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    float m[DSV4_HC_MIX];
+#pragma unroll
+    for (int r = 0; r < DSV4_HC_MIX; ++r) {
+        m[r] = mix[r]*rms_flat;
+    }
+    float c[DSV4_HC*DSV4_HC];
+    dsv4_hc_comb_regs(c, m, base_s, pr.scale[2*pr.ss0], pr.eps_hc, pr.n_iter);
+    float c_lane = c[0];
+#pragma unroll
+    for (int j = 1; j < DSV4_HC*DSV4_HC; ++j) {
+        c_lane = lane == j ? c[j] : c_lane;
+    }
+    const int h     = lane - DSV4_HC*DSV4_HC;
+    float     pre_h = pre[0];
+    float     m_h   = m[DSV4_HC];
+#pragma unroll
+    for (int j = 1; j < DSV4_HC; ++j) {
+        pre_h = h == j ? pre[j]         : pre_h;
+        m_h   = h == j ? m[DSV4_HC + j] : m_h;
+    }
+    float * d = pr.weights_out + it*pr.sw1;
+    if (lane < DSV4_HC*DSV4_HC) {
+        d[(2*DSV4_HC + lane)*pr.sw0] = c_lane;
+    } else if (lane < DSV4_HC*DSV4_HC + DSV4_HC) {
+        d[h*pr.sw0]             = pre_h;
+        d[(DSV4_HC + h)*pr.sw0] = 2.0f/(1.0f + expf(-(m_h*pr.scale[pr.ss0] + base_s[DSV4_HC + h])));
+    }
+}
+
+// token it's element i of the mix (i < n_embd) from its streams xs, normed, times the norm's weight nw, into dst, and its
+// q8_1 copy when pr.q8: the warp's 32 values are a block (n_embd a multiple of 32: a warp is all in or all out)
+static __device__ __forceinline__ void dsv4_hc_gram_out(const dsv4_hc_pre_args & pr, const int it, const int64_t i,
+        const float * xs, const float * pre, const float rms, const float nw) {
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    float v = xs[0]*pre[0];
+#pragma unroll
+    for (int h = 1; h < DSV4_HC; ++h) {
+        v += xs[h]*pre[h];
+    }
+    const float xi = v*rms*nw;
+    pr.dst[it*pr.sd1 + i] = xi;
+    if (pr.q8 != nullptr) {
+        float amax = fabsf(xi);
+        float sum  = xi;
+        amax = warp_reduce_max<QK8_1>(amax);
+        sum  = warp_reduce_sum<QK8_1>(sum);
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+        block_q8_1 * blk = pr.q8 + it*pr.q8_s1 + i/QK8_1;
+        blk->qs[lane] = q;
+        if (lane == 0) {
+            blk->ds = make_half2(d, sum);
+        }
+    }
+}
+
+static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_f32(
+        const float * partials, const int n_slices, const dsv4_hc_pre_args pr) {
+    __shared__ float mix[DSV4_HC_GRAM_ROWS];
+    __shared__ float base_s[DSV4_HC_MIX];
+
+    const int     it   = blockIdx.y;
+    const int     warp = threadIdx.x / WARP_SIZE;
+    const int64_t i    = (int64_t) blockIdx.x*DSV4_HC_PRE_GRAM_THR + threadIdx.x;
+
+    ggml_cuda_pdl_lc();
+
+    float nw = 0.0f;
+    if (pr.base_prewait && threadIdx.x < DSV4_HC_MIX) {
+        base_s[threadIdx.x] = pr.base[threadIdx.x*pr.sb0];
+    }
+    if (pr.norm_prewait && i < pr.n_embd) {
+        nw = pr.norm_w[i];
+    }
+    ggml_cuda_pdl_sync();
+    if (!pr.base_prewait && threadIdx.x < DSV4_HC_MIX) {
+        base_s[threadIdx.x] = pr.base[threadIdx.x*pr.sb0];
+    }
+    if (!pr.norm_prewait && i < pr.n_embd) {
+        nw = pr.norm_w[i];
+    }
+    // the thread's streams, requested with the partials: one round trip for both
+    float xs[DSV4_HC] = {};
+    if (i < pr.n_embd) {
+        dsv4_hc_gram_streams<false>(pr, it, i, xs);
+    }
+    dsv4_hc_gram_mix<false>(partials + (int64_t) it*DSV4_HC_GRAM_ROWS*n_slices, n_slices, mix);
+    __syncthreads();
+
+    float pre[DSV4_HC];
+    float rms_flat;
+    float rms;
+    dsv4_hc_gram_pre(mix, base_s, pr, pre, rms_flat, rms);
 
     // block 0's warp 0 makes the weights first (the Sinkhorn is the longest chain), then its slice like every warp
     if (blockIdx.x == 0 && warp == 0) {
-        float m[DSV4_HC_MIX];
-#pragma unroll
-        for (int r = 0; r < DSV4_HC_MIX; ++r) {
-            m[r] = mix[r]*rms_flat;
-        }
-        float c[DSV4_HC*DSV4_HC];
-        dsv4_hc_comb_regs(c, m, base_s, scale[2*ss0], eps_hc, n_iter);
-        float c_lane = c[0];
-#pragma unroll
-        for (int j = 1; j < DSV4_HC*DSV4_HC; ++j) {
-            c_lane = lane == j ? c[j] : c_lane;
-        }
-        const int h     = lane - DSV4_HC*DSV4_HC;
-        float     pre_h = pre[0];
-        float     m_h   = m[DSV4_HC];
-#pragma unroll
-        for (int j = 1; j < DSV4_HC; ++j) {
-            pre_h = h == j ? pre[j]         : pre_h;
-            m_h   = h == j ? m[DSV4_HC + j] : m_h;
-        }
-        float * d = weights_out + it*sw1;
-        if (lane < DSV4_HC*DSV4_HC) {
-            d[(2*DSV4_HC + lane)*sw0] = c_lane;
-        } else if (lane < DSV4_HC*DSV4_HC + DSV4_HC) {
-            d[h*sw0]             = pre_h;
-            d[(DSV4_HC + h)*sw0] = 2.0f/(1.0f + expf(-(m_h*scale[ss0] + base_s[DSV4_HC + h])));
+        dsv4_hc_gram_weights(mix, base_s, pr, it, pre, rms_flat);
+    }
+    if (i < pr.n_embd) {
+        dsv4_hc_gram_out(pr, it, i, xs, pre, rms, nw);
+    }
+}
+
+// The front in one launch: dsv4_hc_mix_gram's blocks, after which the block that takes its token's last ticket (one a
+// token at tickets, ggml_cuda_hc_front_tickets) sets it back to 0 and does dsv4_hc_pre_gram_f32's work for the whole
+// token with its device functions, so its bits: the sums from every block's partials, the weights by warp 0, then a
+// thread every DSV4_HC_PRE_GRAM_THR-th element, the streams of DSV4_HC_FRONT_ONE_CH of them requested at once. The
+// partials and, under fuse_post, the streams are the launch's own blocks' writes, so they are read past L1. Every input
+// dsv4_hc_pre_gram_f32 reads is read past the PDL wait mix_gram's part took.
+static constexpr int DSV4_HC_FRONT_ONE_CH = 8;
+
+template <typename T, bool fuse_post>
+static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_front_one(
+        float * x, const T * w, float * partials, const int64_t sx1, const int64_t sw1, const bool w_prewait,
+        const dsv4_hc_post_args pa, const dsv4_hc_pre_args pr, unsigned int * tickets) {
+    static_assert(8*WARP_SIZE == DSV4_HC_PRE_GRAM_THR, "the last block does a dsv4_hc_pre_gram_f32 block's work");
+    __shared__ float mix[DSV4_HC_GRAM_ROWS];
+    __shared__ float base_s[DSV4_HC_MIX];
+    __shared__ bool  last;
+
+    dsv4_hc_mix_gram_block<T, fuse_post>(x, w, partials, pr.n_embd, sx1, sw1, w_prewait, pa);
+
+    // every writer's partials (and slice of the streams) seen device-wide before the block's ticket
+    const int it       = blockIdx.y;
+    const int n_slices = gridDim.x;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int t = atomicAdd(tickets + it, 1u);
+        last = t == (unsigned int) n_slices - 1;
+        if (last) {
+            tickets[it] = 0;
         }
     }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
 
-    if (i < n_embd) {
-        float v = xs[0]*pre[0];
+    const int warp     = threadIdx.x / WARP_SIZE;
+    const int n_chunks = (int) ((pr.n_embd + DSV4_HC_PRE_GRAM_THR - 1) / DSV4_HC_PRE_GRAM_THR);
+    if (threadIdx.x < DSV4_HC_MIX) {
+        base_s[threadIdx.x] = pr.base[threadIdx.x*pr.sb0];
+    }
+    float xs[DSV4_HC_FRONT_ONE_CH][DSV4_HC];
+    float nw[DSV4_HC_FRONT_ONE_CH];
+    auto request = [&](const int c0) {
 #pragma unroll
-        for (int h = 1; h < DSV4_HC; ++h) {
-            v += xs[h]*pre[h];
+        for (int c = 0; c < DSV4_HC_FRONT_ONE_CH; ++c) {
+            const int64_t i = (int64_t) (c0 + c)*DSV4_HC_PRE_GRAM_THR + threadIdx.x;
+            if (c0 + c < n_chunks && i < pr.n_embd) {
+                dsv4_hc_gram_streams<fuse_post>(pr, it, i, xs[c]);
+                nw[c] = pr.norm_w[i];
+            }
         }
-        dst[it*sd1 + i] = v*rms*nw;
+    };
+    // the first chunks' streams requested with the partials
+    request(0);
+    dsv4_hc_gram_mix<true>(partials + (int64_t) it*DSV4_HC_GRAM_ROWS*n_slices, n_slices, mix);
+    __syncthreads();
+
+    float pre[DSV4_HC];
+    float rms_flat;
+    float rms;
+    dsv4_hc_gram_pre(mix, base_s, pr, pre, rms_flat, rms);
+    if (warp == 0) {
+        dsv4_hc_gram_weights(mix, base_s, pr, it, pre, rms_flat);
+    }
+    for (int c0 = 0; c0 < n_chunks; c0 += DSV4_HC_FRONT_ONE_CH) {
+        if (c0 > 0) {
+            request(c0);
+        }
+#pragma unroll
+        for (int c = 0; c < DSV4_HC_FRONT_ONE_CH; ++c) {
+            const int64_t i = (int64_t) (c0 + c)*DSV4_HC_PRE_GRAM_THR + threadIdx.x;
+            if (c0 + c < n_chunks && i < pr.n_embd) {
+                dsv4_hc_gram_out(pr, it, i, xs[c], pre, rms, nw[c]);
+            }
+        }
+    }
+}
+
+// GGML_CUDA_HC_FRONT_CHECK=1: the one launch's normed mix, q8_1 copy and weights (one) against the two kernels' (two),
+// bit for bit; a block a token
+static __global__ void dsv4_hc_front_check_bits(const dsv4_hc_pre_args one, const dsv4_hc_pre_args two) {
+    const int it = blockIdx.y;
+    for (int64_t i = threadIdx.x; i < one.n_embd; i += blockDim.x) {
+        const uint32_t a = __float_as_uint(one.dst[it*one.sd1 + i]);
+        const uint32_t b = __float_as_uint(two.dst[it*two.sd1 + i]);
+        if (a != b) {
+            printf("hc front check: token %d element %lld is %08x from the one launch, %08x from the two\n",
+                    it, (long long) i, a, b);
+            __trap();
+        }
+        if (one.q8 != nullptr && i % QK8_1 == 0) {
+            const block_q8_1 * qa = one.q8 + it*one.q8_s1 + i/QK8_1;
+            const block_q8_1 * qb = two.q8 + it*two.q8_s1 + i/QK8_1;
+            bool same = *(const uint32_t *) &qa->ds == *(const uint32_t *) &qb->ds;
+            for (int j = 0; j < QK8_1; ++j) {
+                same = same && qa->qs[j] == qb->qs[j];
+            }
+            if (!same) {
+                printf("hc front check: token %d q8_1 block %lld differs\n", it, (long long) (i/QK8_1));
+                __trap();
+            }
+        }
+    }
+    if (threadIdx.x < DSV4_HC_MIX) {
+        const uint32_t a = __float_as_uint(one.weights_out[it*one.sw1 + threadIdx.x*one.sw0]);
+        const uint32_t b = __float_as_uint(two.weights_out[it*two.sw1 + threadIdx.x*two.sw0]);
+        if (a != b) {
+            printf("hc front check: token %d weight %d is %08x from the one launch, %08x from the two\n",
+                    it, (int) threadIdx.x, a, b);
+            __trap();
+        }
     }
 }
 
@@ -826,6 +1178,33 @@ static bool dsv4_hc_prewait(const ggml_tensor * t) {
 static bool dsv4_hc_pre_gram_legacy() {
     static const bool legacy = ggml_env_switch("GGML_CUDA_HC_PRE_GRAM_LEGACY");
     return legacy;
+}
+
+// GGML_CUDA_HC_FRONT_ONE=1: the Gram path's front in one launch (dsv4_hc_front_one) instead of its two kernels.
+// Opt-in, because it measured slower than the two on the 44-layer GLM-5.3 proxy at -d 32768 (NVTX, graphs off, the
+// last 31 decode tokens, RTX 5070 Ti): one launch 8.38 us against the two kernels' 2.15 + 3.01, so 759 us a token
+// against 535, and the nodes' issue span 1475 us a token against 1395. The 88 launches a token it saves do not pay
+// for the serialization it adds, one block doing for the whole token what 16 blocks did in parallel.
+// GGML_CUDA_HC_FRONT_CHECK=1: both, the two kernels into scratch, and a trap on any bit of the outputs that differs;
+// it implies the one launch, so the check always has something to compare.
+static bool dsv4_hc_front_one_enabled() {
+    static const bool enabled = ggml_env_switch("GGML_CUDA_HC_FRONT_ONE");
+    return enabled;
+}
+
+static bool dsv4_hc_front_check() {
+    static const bool check = ggml_env_switch("GGML_CUDA_HC_FRONT_CHECK");
+    return check;
+}
+
+bool ggml_cuda_dsv4_hc_writes_q8_1(const ggml_tensor * node) {
+    if (dsv4_hc_pre_gram_legacy() || node->op != GGML_OP_MUL || node->type != GGML_TYPE_F32 ||
+            node->ne[0] % MATRIX_ROW_PADDING != 0) {
+        return false;
+    }
+    const ggml_tensor * rms = node->src[0] != nullptr && node->src[0]->op == GGML_OP_RMS_NORM ? node->src[0] : node->src[1];
+    return rms != nullptr && rms->op == GGML_OP_RMS_NORM && rms->src[0] != nullptr &&
+        rms->src[0]->op == GGML_OP_DSV4_HC_PRE;
 }
 
 bool ggml_cuda_dsv4_hc_pre_fused_supported(const ggml_tensor * rms_flat, const ggml_tensor * mm,
@@ -947,38 +1326,108 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
             pa.sc2  = comb_w->nb[2] / sizeof(float);
             pa.sx_h = x->nb[1] / sizeof(float);
         }
-        auto launch = [&](auto kernel, const auto * w) {
+        // the normed mix's q8_1 copy, when the evaluation holds one for its quantized readers
+        // (ggml_cuda_mmvq_shared_q8_1::produce): written here, not by a q8_1 launch at its first reader
+        ggml_cuda_mmvq_shared_q8_1::entry * q8 = n_embd % MATRIX_ROW_PADDING == 0 ? ctx.mmvq_shared_q8_1.produce(mul) :
+            nullptr;
+
+        dsv4_hc_pre_args pr = {};
+        pr.x            = (const float *) x->data;
+        pr.scale        = (const float *) scale->data;
+        pr.base         = (const float *) base->data;
+        pr.norm_w       = (const float *) norm_w->data;
+        pr.weights_out  = (float *) weights->data;
+        pr.dst          = (float *) mul->data;
+        pr.q8           = q8 != nullptr ? (block_q8_1 *) q8->q8_1 : nullptr;
+        pr.n_embd       = n_embd;
+        pr.k            = k;
+        pr.sx1          = x->nb[1] / sizeof(float);
+        pr.sx2          = x->nb[2] / sizeof(float);
+        pr.ss0          = scale->nb[0] / sizeof(float);
+        pr.sb0          = base->nb[0] / sizeof(float);
+        pr.sw0          = weights->nb[0] / sizeof(float);
+        pr.sw1          = weights->nb[1] / sizeof(float);
+        pr.sd1          = mul->nb[1] / sizeof(float);
+        pr.q8_s1        = n_embd / QK8_1;
+        pr.eps_flat     = ggml_get_op_params_f32(rms_flat, 0);
+        pr.eps_hc       = ggml_get_op_params_f32(weights, 0);
+        pr.eps_norm     = ggml_get_op_params_f32(rms, 0);
+        pr.n_iter       = ggml_get_op_params_i32(weights, 1);
+        pr.base_prewait = dsv4_hc_prewait(base);
+        pr.norm_prewait = dsv4_hc_prewait(norm_w);
+
+        // the two kernels, writing p's outputs
+        auto launch_two = [&](const dsv4_hc_pre_args & p) {
+            auto launch = [&](auto kernel, const auto * w) {
+                ggml_cuda_kernel_launch(kernel, gram_params,
+                    (float *) x->data, w, partials.get(), n_embd, sx1, sw1, w_prewait, pa);
+            };
+            switch (hc_fn->type) {
+                case GGML_TYPE_F32:
+                    post ? launch(dsv4_hc_mix_gram<float, true>, (const float *) hc_fn->data)
+                         : launch(dsv4_hc_mix_gram<float, false>, (const float *) hc_fn->data);
+                    break;
+                case GGML_TYPE_F16:
+                    post ? launch(dsv4_hc_mix_gram<half, true>, (const half *) hc_fn->data)
+                         : launch(dsv4_hc_mix_gram<half, false>, (const half *) hc_fn->data);
+                    break;
+                case GGML_TYPE_BF16:
+                    post ? launch(dsv4_hc_mix_gram<nv_bfloat16, true>, (const nv_bfloat16 *) hc_fn->data)
+                         : launch(dsv4_hc_mix_gram<nv_bfloat16, false>, (const nv_bfloat16 *) hc_fn->data);
+                    break;
+                default:
+                    GGML_ABORT("unsupported hc_fn type %s", ggml_type_name(hc_fn->type));
+            }
+            const int n_blocks = (int) ((n_embd + DSV4_HC_PRE_GRAM_THR - 1) / DSV4_HC_PRE_GRAM_THR);
+            const ggml_cuda_kernel_launch_params pre_params =
+                ggml_cuda_kernel_launch_params(dim3(n_blocks, n_tokens, 1), dim3(DSV4_HC_PRE_GRAM_THR, 1, 1), 0, stream);
+            ggml_cuda_kernel_launch(dsv4_hc_pre_gram_f32, pre_params, (const float *) partials.get(), n_slices, p);
+        };
+
+        // the tickets exist from the first graph evaluation on; a front takes at most their tokens
+        static_assert(DSV4_HC_PRE_FUSED_MAX_TOKENS <= ggml_cuda_hc_front_tickets::n_tokens, "a token a ticket");
+        unsigned int * tickets = ctx.hc_front_ticket();
+        if (!(dsv4_hc_front_one_enabled() || dsv4_hc_front_check()) || tickets == nullptr) {
+            launch_two(pr);
+            return;
+        }
+        GGML_ASSERT(n_tokens <= ggml_cuda_hc_front_tickets::n_tokens);
+
+        ggml_cuda_pool_alloc<float>      check_dst(ctx.pool());
+        ggml_cuda_pool_alloc<float>      check_weights(ctx.pool());
+        ggml_cuda_pool_alloc<block_q8_1> check_q8(ctx.pool());
+        dsv4_hc_pre_args two = pr;
+        if (dsv4_hc_front_check()) {
+            two.dst         = check_dst.alloc(ggml_nbytes(mul) / sizeof(float));
+            two.weights_out = check_weights.alloc(ggml_nbytes(weights) / sizeof(float));
+            two.q8          = pr.q8 != nullptr ? check_q8.alloc(n_tokens*pr.q8_s1) : nullptr;
+            launch_two(two);
+        }
+
+        auto launch_one = [&](auto kernel, const auto * w) {
             ggml_cuda_kernel_launch(kernel, gram_params,
-                (float *) x->data, w, partials.get(), n_embd, sx1, sw1, w_prewait, pa);
+                (float *) x->data, w, partials.get(), sx1, sw1, w_prewait, pa, pr, tickets);
         };
         switch (hc_fn->type) {
             case GGML_TYPE_F32:
-                post ? launch(dsv4_hc_mix_gram<float, true>, (const float *) hc_fn->data)
-                     : launch(dsv4_hc_mix_gram<float, false>, (const float *) hc_fn->data);
+                post ? launch_one(dsv4_hc_front_one<float, true>, (const float *) hc_fn->data)
+                     : launch_one(dsv4_hc_front_one<float, false>, (const float *) hc_fn->data);
                 break;
             case GGML_TYPE_F16:
-                post ? launch(dsv4_hc_mix_gram<half, true>, (const half *) hc_fn->data)
-                     : launch(dsv4_hc_mix_gram<half, false>, (const half *) hc_fn->data);
+                post ? launch_one(dsv4_hc_front_one<half, true>, (const half *) hc_fn->data)
+                     : launch_one(dsv4_hc_front_one<half, false>, (const half *) hc_fn->data);
                 break;
             case GGML_TYPE_BF16:
-                post ? launch(dsv4_hc_mix_gram<nv_bfloat16, true>, (const nv_bfloat16 *) hc_fn->data)
-                     : launch(dsv4_hc_mix_gram<nv_bfloat16, false>, (const nv_bfloat16 *) hc_fn->data);
+                post ? launch_one(dsv4_hc_front_one<nv_bfloat16, true>, (const nv_bfloat16 *) hc_fn->data)
+                     : launch_one(dsv4_hc_front_one<nv_bfloat16, false>, (const nv_bfloat16 *) hc_fn->data);
                 break;
             default:
                 GGML_ABORT("unsupported hc_fn type %s", ggml_type_name(hc_fn->type));
         }
 
-        const int n_blocks = (int) ((n_embd + DSV4_HC_PRE_GRAM_THR - 1) / DSV4_HC_PRE_GRAM_THR);
-        const ggml_cuda_kernel_launch_params pre_params =
-            ggml_cuda_kernel_launch_params(dim3(n_blocks, n_tokens, 1), dim3(DSV4_HC_PRE_GRAM_THR, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(dsv4_hc_pre_gram_f32, pre_params,
-            (const float *) partials.get(), n_slices, (const float *) x->data, (const float *) scale->data,
-            (const float *) base->data, (const float *) norm_w->data, (float *) weights->data, (float *) mul->data,
-            n_embd, k, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), scale->nb[0] / sizeof(float),
-            base->nb[0] / sizeof(float), weights->nb[0] / sizeof(float), weights->nb[1] / sizeof(float),
-            mul->nb[1] / sizeof(float), ggml_get_op_params_f32(rms_flat, 0), ggml_get_op_params_f32(weights, 0),
-            ggml_get_op_params_i32(weights, 1), ggml_get_op_params_f32(rms, 0), dsv4_hc_prewait(base),
-            dsv4_hc_prewait(norm_w));
+        if (dsv4_hc_front_check()) {
+            dsv4_hc_front_check_bits<<<dim3(1, n_tokens, 1), 256, 0, stream>>>(pr, two);
+        }
         return;
     }
     GGML_ASSERT(post == nullptr);
@@ -1125,6 +1574,11 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
 
+    if (dsv4_hc_post_rows_nq(dst) > 0) {
+        dsv4_hc_post_rows_launch<false>(ctx, dst, nullptr, 0, 0.0f);
+        return;
+    }
+
     const int block_size = 256;
     const int64_t nr = n_embd * hc * n_tokens;
     const dim3 block_dims(block_size, 1, 1);
@@ -1140,6 +1594,37 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+}
+
+bool ggml_cuda_dsv4_hc_post_norm_supported(const ggml_tensor * post, const ggml_tensor * rms_flat) {
+    if (post->op != GGML_OP_DSV4_HC_POST || rms_flat->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (post->src[i]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const ggml_tensor * flat   = rms_flat->src[0];
+    const int64_t       n_embd = post->ne[0];
+    return post->type == GGML_TYPE_F32 && rms_flat->type == GGML_TYPE_F32 && dsv4_hc_post_rows_nq(post) > 0 &&
+           ggml_is_contiguous(post) && flat->data == post->data && flat->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(flat) && flat->ne[0] == DSV4_HC*n_embd && flat->ne[1] == post->ne[2] &&
+           flat->ne[2] == 1 && flat->ne[3] == 1;
+}
+
+void ggml_cuda_op_dsv4_hc_post_norm_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * post,
+        const ggml_tensor * rms_flat, nv_bfloat16 * y) {
+    GGML_ASSERT(ggml_cuda_dsv4_hc_post_norm_supported(post, rms_flat));
+
+    float eps;
+    memcpy(&eps, rms_flat->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    // rms_norm_f32<1024>'s rows, as ggml_cuda_op_rms_norm_bf16 launches them from 1024 columns
+    const int ncols = rms_flat->src[0]->ne[0];
+    GGML_ASSERT(ncols >= DSV4_HC_POST_ROW_THREADS);
+    dsv4_hc_post_rows_launch<true>(ctx, post, y, ncols, eps);
 }
 
 void ggml_cuda_op_dsv4_hc_weights(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

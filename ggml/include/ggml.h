@@ -2467,6 +2467,15 @@ extern "C" {
     GGML_API bool ggml_flash_attn_ext_get_mask_prefix(
             const struct ggml_tensor * a);
 
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_n_kv_max(
+            const struct ggml_tensor * a);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2663,6 +2672,19 @@ extern "C" {
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask);
+
+    // the same with key i of stream s at row k_rows[i, s] of k (a view into a cache, no gathered copy), and the
+    // scores in f32 whatever k's type (as over the f32 rows ggml_get_rows would have copied):
+    // k:       [n_embd_idx, 1, n_rows, ne3]
+    // k_rows:  [n_kv, ne3] I32, each in [0, n_rows)
+    // mask, res: n_kv as above
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * k_rows,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 

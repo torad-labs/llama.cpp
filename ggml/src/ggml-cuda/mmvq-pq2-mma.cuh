@@ -15,7 +15,8 @@
 bool ggml_cuda_mmvq_pq2_mma_usable(int cc, const void * vx, const void * vgate, int64_t ncols_x, int64_t nrows_x,
                                    int64_t stride_row_x, int64_t ncols_dst);
 
-// next: the head of the launch after this one, which this one prefetches into L2 (ggml_cuda_pq2_prefetch, common.cuh).
+// next: what this launch prefetches into L2 once its own weights have landed: the weights of the kernels up to the next
+// launch, then that launch's heads (ggml_cuda_pq2_prefetch, common.cuh).
 // tile_ctr: the stream's tile counter (ggml_cuda_pq2_tile_counters, common.cuh), or nullptr: every tile to its own block.
 void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy, const float * x_bias, float * dst,
                             int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x,
@@ -26,8 +27,12 @@ void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy
 
 // n (2 to PQ2_MMA_MAX_GROUP) matrices of ncols_x columns on one activation vy, in one launch: matrix g (vx[g], nrows_x[g]
 // rows of stride_row_x[g] blocks) writes dst[g], column c at dst[g] + c*stride_col_dst[g]. Each matrix must be one
-// ggml_cuda_mmvq_pq2_mma_usable serves unfused, and each gets that launch's result.
+// ggml_cuda_mmvq_pq2_mma_usable serves unfused, and each gets that launch's result. fold_beside: a kernel after it works
+// beside it before its own dependency wait (the conv folding the alpha/beta pair in): the launch takes 152 registers,
+// which leaves that kernel's blocks room on its SMs, and lets the next kernel launch only after its own dependency
+// wait, not at its start.
 void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
                                   const int64_t * stride_row_x, const int64_t * stride_col_dst, const void * vy,
                                   int64_t ncols_x, int64_t ncols_dst, int64_t stride_col_y,
-                                  const ggml_cuda_pq2_prefetch & next, int * tile_ctr, cudaStream_t stream);
+                                  const ggml_cuda_pq2_prefetch & next, int * tile_ctr, bool fold_beside,
+                                  cudaStream_t stream);

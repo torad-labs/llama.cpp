@@ -1324,6 +1324,17 @@ static char * mmvq_src1_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor 
     return q8_1;
 }
 
+// GGML_CUDA_MMVQ_MOE_QUANTIZE_CHECK=1: a routed ring's results from the vectors it quantized beside those from the
+// quantize launch's
+static __global__ void mmvq_moe_quantize_check(const float * own, const float * launch, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n && __float_as_uint(own[i]) != __float_as_uint(launch[i])) {
+        printf("mmvq_moe quantize check: result %lld is %08x from the ring's own q8_1, %08x from the quantize launch's\n",
+                (long long) i, __float_as_uint(own[i]), __float_as_uint(launch[i]));
+        __trap();
+    }
+}
+
 bool ggml_cuda_mul_mat_vec_q_moe_gate_fuses(const ggml_tensor * mm, const ggml_tensor * gate, const int cc) {
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
@@ -1428,8 +1439,26 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    // routed experts at 1-8 tokens, each SM streaming its tiles of expert rows through a ring of bulk copies, and each
+    // distinct expert read once (mmvq-moe.cu)
+    const bool moe_ring = ids && ne03 == 1 && ne13 == 1 &&
+        (fusion == nullptr || (fusion->x_scale == nullptr && fusion->gate_scale == nullptr)) &&
+        ggml_cuda_mmvq_moe_usable(ggml_cuda_info().devices[ctx.device].cc, src0->type, src0->data, fusion_local.gate, ne00,
+            ne01, nb01 / ts_src0, nb02 / ts_src0, ne1, ne2);
+    // a ring whose tokens' vectors are each its own (a down projection: ne11 == ne1) and read by no other MUL_MAT
+    // quantizes them itself from f32, into the shared memory it would copy them to, bit for bit as the quantize launch:
+    // no launch between the gate/up and the down (GLM-5.3's proxy under -sm tensor at 32K cached tokens, RTX 5070 Ti:
+    // 3.1 us of the chain after each gate/up, 43 a token). GGML_CUDA_MMVQ_MOE_QUANTIZE_LEGACY=1: the launch;
+    // GGML_CUDA_MMVQ_MOE_QUANTIZE_CHECK=1: the ring runs from both, and a kernel traps on the first result whose bits differ
+    const bool ring_quantizes = moe_ring && ctx.mmvq_shared_q8_1.find(src1) == nullptr &&
+        ggml_cuda_mmvq_moe_quantizes_y(src0->type, ne00, fusion_local.gate != nullptr, ne1, ne2, ne11, src1->data,
+            nb11 / ts_src1, nb12 / ts_src1);
+    static const bool ring_quantize_check = ggml_env_switch("GGML_CUDA_MMVQ_MOE_QUANTIZE_CHECK");
+
     ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
-    char * src1_q8_1 = mmvq_src1_q8_1(ctx, src1, src0->type, src1_q8_1_own);
+    char * src1_q8_1 = ring_quantizes && !ring_quantize_check ? nullptr :
+        mmvq_src1_q8_1(ctx, src1, src0->type, src1_q8_1_own);
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -1453,11 +1482,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    // routed experts at 1-8 tokens, each SM streaming its tiles of expert rows through a ring of bulk copies, and each
-    // distinct expert read once (mmvq-moe.cu)
-    if (ids && ne03 == 1 && ne13 == 1 && (fusion == nullptr || (fusion->x_scale == nullptr && fusion->gate_scale == nullptr)) &&
-            ggml_cuda_mmvq_moe_usable(ggml_cuda_info().devices[ctx.device].cc, src0->type, src0->data,
-                fusion_local.gate, ne00, ne01, s01, s02, ne1, ne2)) {
+    if (moe_ring) {
         ggml_cuda_mmvq_moe_args args{};
         args.type                   = src0->type;
         args.vx                     = src0->data;
@@ -1473,6 +1498,7 @@ void ggml_cuda_mul_mat_vec_q(
         args.nrows_x                = ne01;
         args.stride_channel_x_bytes = s02 * (int64_t) ts_src0;
         args.n_used                 = ne1;
+        args.n_experts              = ne02;
         args.ntokens                = ne2;
         args.ids_stride             = ids_stride;
         args.nchannels_y            = nchannels_y;
@@ -1482,7 +1508,34 @@ void ggml_cuda_mul_mat_vec_q(
         args.stride_channel_dst     = stride_channel_dst;
         args.stride_bias            = stride_channel_dst; // as mul_mat_vec_q reads an expert's bias
         args.tile_ctr               = ctx.pq2_tile_counter();
+        // the ids an earlier ring launch on this stream read in this evaluation (a down projection's, the gate/up's
+        // before it) are whole before this launch starts, so it lists its experts and issues its first tiles before its
+        // dependency wait (mmvq-moe.cu). GGML_CUDA_MMVQ_MOE_IDS_EARLY_LEGACY=1: past it
+        static const bool ids_early_legacy = ggml_env_switch("GGML_CUDA_MMVQ_MOE_IDS_EARLY_LEGACY");
+        const ggml_tensor *& ids_before = ctx.mmvq_moe_ids[ctx.curr_stream_no];
+        args.ids_ready = !ids_early_legacy && ids_before == ids;
+        ids_before     = ids;
+        args.l2_issue_stop = ctx.l2_issue_stop.ptr;
+        if (!ring_quantizes) {
+            ggml_cuda_mmvq_moe(args, stream);
+            return;
+        }
+        ggml_cuda_pool_alloc<float> check_dst(ctx.pool());
+        if (ring_quantize_check) {
+            GGML_ASSERT(ggml_is_contiguous(dst));
+            args.dst = check_dst.alloc(ggml_nelements(dst));
+            ggml_cuda_mmvq_moe(args, stream); // from the quantize launch's vectors
+            args.dst = dst_d;
+        }
+        args.y        = nullptr;
+        args.y_f32    = (const float *) src1->data;
+        args.y_f32_s1 = nb11 / ts_src1;
+        args.y_f32_s2 = nb12 / ts_src1;
         ggml_cuda_mmvq_moe(args, stream);
+        if (ring_quantize_check) {
+            const int64_t n = ggml_nelements(dst);
+            mmvq_moe_quantize_check<<<(n + 255) / 256, 256, 0, stream>>>(dst_d, check_dst.get(), n);
+        }
         return;
     }
     // past one token only the ring above fuses a routed gate (ggml_cuda_mul_mat_vec_q_moe_gate_fuses)
@@ -1501,7 +1554,8 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
 
-void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, const int n) {
+void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, const int n,
+                                       const bool feeds_fold) {
     GGML_ASSERT(n >= 2 && n <= PQ2_MMA_MAX_GROUP);
     const ggml_tensor * src1 = dsts[0]->src[1];
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float) && src1->ne[2] == 1 && src1->ne[3] == 1);
@@ -1538,7 +1592,7 @@ void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_ten
     }
 
     ggml_cuda_mmvq_pq2_mma_group(n, vx, dst, nrows, stride_row, stride_col_dst, src1_q8_1.get(), ne10, ne11,
-        ne10_padded / QK8_1, ctx.pq2_next, ctx.pq2_tile_counter(), stream);
+        ne10_padded / QK8_1, ctx.pq2_next, ctx.pq2_tile_counter(), feeds_fold, stream);
 }
 
 bool ggml_cuda_mul_mat_vec_q_concat_supported(const ggml_tensor * const * w, const int n, const ggml_tensor * src1,

@@ -314,8 +314,17 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
             nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, 2*d_inner));
 
 
+    // the output gate reads the layer input, not the recurrence's output: its two low-rank products go into the graph
+    // here, after the convolution, g_a beside f_a (two mat-vecs of one input, which ggml-cuda runs as one launch) and
+    // g_b before the recurrence, so that nothing after the recurrence waits on them
+    ggml_build_forward_expand(gf, qk);
+    ggml_tensor * f_a  = ggml_mul_mat(ctx0, layer.ssm_f_a, inp);
+    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_g_b, ggml_mul_mat(ctx0, layer.ssm_g_a, inp));
+    ggml_build_forward_expand(gf, f_a);
+    ggml_build_forward_expand(gf, gate);
+
     // g = lower_bound * sigmoid(exp(A_log)*(f_b(f_a(x)) + dt_bias)); it scales, not clamps
-    ggml_tensor * g_raw = ggml_mul_mat(ctx0, layer.ssm_f_b, ggml_mul_mat(ctx0, layer.ssm_f_a, inp));
+    ggml_tensor * g_raw = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
     g_raw = ggml_add(ctx0, g_raw, layer.ssm_dt_b);
     ggml_tensor * g = ggml_reshape_3d(ctx0, g_raw, head_dim, n_head, n_tokens);
     g = ggml_mul(ctx0, g, ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1));
@@ -348,7 +357,6 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     ggml_tensor * o = ggml_reshape_3d(ctx0, build_cont(out), head_dim, n_head, n_tokens);
     cb(o, "kda_scan_out", il);
 
-    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_g_b, ggml_mul_mat(ctx0, layer.ssm_g_a, inp));
     gate = ggml_reshape_3d(ctx0, gate, head_dim, n_head, n_tokens);
 
     // plain sigmoid gate, not the SiLU that FusedRMSNormGated defaults to
@@ -404,7 +412,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     const int64_t n_kv     = kbuf->ne[2];
     const int64_t n_stream = kbuf->ne[3];
     const int64_t n_tps    = n_tokens/n_stream;
-    const int64_t n_pools  = inp_kp->pool_cells->ne[0]/r;
+    const int64_t n_pools  = inp_kp->pool_bias->ne[0];
 
     GGML_ASSERT(kbuf->ne[0] == d_idx && kbuf->ne[1] == 3 &&
             "the pooled indexer cache needs a key head, a gate head and a pooled head");
@@ -447,12 +455,16 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_build_forward_expand(gf,
             mctx_idx->cpy_k_part(ctx0, pool_new, inp_kp->new_pool_reps, il, d_idx, 2*d_idx));
 
-    ggml_tensor * pooled_rd = ggml_view_3d(ctx0, kbuf, d_idx, n_kv, n_stream,
-            kbuf->nb[2], kbuf->nb[3], 2*d_idx*kbuf->nb[0]);
+    // every pool's key, gathered into f32 rows (the unfused path, and the fused one under LLAMA_INDEXER_GATHER_LEGACY=1)
+    const auto gather_pool_k = [&]() {
+        ggml_tensor * pooled_rd = ggml_view_3d(ctx0, kbuf, d_idx, n_kv, n_stream,
+                kbuf->nb[2], kbuf->nb[3], 2*d_idx*kbuf->nb[0]);
 
-    ggml_tensor * pool_k = ggml_get_rows(ctx0, pooled_rd, inp_kp->pool_reps);
-    pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
-    cb(pool_k, "indexer_pool_k", il);
+        ggml_tensor * pool_k = ggml_get_rows(ctx0, pooled_rd, inp_kp->pool_reps);
+        pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
+        cb(pool_k, "indexer_pool_k", il);
+        return pool_k;
+    };
 
     // no rope: n_rot() is 0 for the whole text tower
     ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
@@ -469,17 +481,28 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * pool_score = nullptr;
 
     if (cparams.fused_lid) {
-        // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
-        ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
+        static const bool gather_legacy = ggml_env_switch("LLAMA_INDEXER_GATHER_LEGACY");
 
-        pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, inp_kp->pool_bias_f16);
+        if (!gather_legacy) {
+            // the pooled keys read where the cache holds them, pool p at cell pool_reps[p], scored in f32 like the
+            // gathered rows (ggml_lightning_indexer_rows): no copy of every pool's key each token
+            ggml_tensor * pooled = ggml_view_4d(ctx0, kbuf, d_idx, 1, n_kv, n_stream,
+                    kbuf->nb[1], kbuf->nb[2], kbuf->nb[3], 2*d_idx*kbuf->nb[0]);
+
+            pool_score = ggml_lightning_indexer_rows(ctx0, iq, pooled, inp_kp->pool_reps, w, inp_kp->pool_bias_f16);
+        } else {
+            // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
+            ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, gather_pool_k(), d_idx, 1, n_pools, n_stream);
+
+            pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, inp_kp->pool_bias_f16);
+        }
         cb(pool_score, "indexer_pool_score", il);
 
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, pool_score, il});
 
         pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, pool_k, ggml_permute(ctx0, iq, 0, 2, 1, 3));
+        ggml_tensor * kq = ggml_mul_mat(ctx0, gather_pool_k(), ggml_permute(ctx0, iq, 0, 2, 1, 3));
 
         // the ReLU sits BETWEEN the per-head dot and the head weighting; either side differs
         kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
@@ -497,14 +520,18 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     // top-k over POOLS then expand: a cell-level top-k is wrong, relu ties span pool bounds
     const int64_t select_k = llama_kpool_select_k(n_pools, hparams.indexer_top_k, r);
     GGML_ASSERT(select_k > 0 && select_k <= n_pools);
+    GGML_ASSERT(inp_kp->pool_dump->ne[0] == select_k && "one dump pool for each slot of the top-k");
+
+    // fewer than select_k live pools (finite scores) fill the top-k with dump pools (-FLT_MAX), never with a dead pool
+    // (-inf), whose cells may be another slot's: each dump pool's cells are its own, past n_kv (llm_graph_input_kpool)
+    pool_score = ggml_concat(ctx0, pool_score, inp_kp->pool_dump, 0);
 
     ggml_tensor * sel = ggml_cont(ctx0, ggml_top_k(ctx0, pool_score, (int) select_k));
     cb(sel, "indexer_top_k_pools", il);
 
-    ggml_tensor * pc3      = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
     ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*n_tps, n_stream);
 
-    ggml_tensor * top_k = ggml_get_rows(ctx0, pc3, sel_flat);
+    ggml_tensor * top_k = ggml_get_rows(ctx0, inp_kp->pool_cells_3d, sel_flat);
     GGML_ASSERT(top_k->type == GGML_TYPE_I32 && "pool_cells is I32, so the gather stays I32");
     top_k = ggml_reshape_3d(ctx0, top_k, r*select_k, n_tps, n_stream);
     cb(top_k, "indexer_top_k", il);

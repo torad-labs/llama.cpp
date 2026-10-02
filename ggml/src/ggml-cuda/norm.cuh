@@ -6,6 +6,10 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// The weightless RMS_NORM dst written to y as BF16 rather than to dst, rounded as convert_unary rounds F32 to BF16: the
+// cast cuBLAS makes of an F32 src1 for a BF16 GEMM, of exactly the values ggml_cuda_op_rms_norm writes
+void ggml_cuda_op_rms_norm_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, nv_bfloat16 * y);
+
 void ggml_cuda_op_add_rms_norm_fused(
         ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul);
 

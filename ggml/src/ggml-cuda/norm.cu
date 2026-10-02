@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "convert.cuh"
 #include "unary.cuh"
 #include <cstdint>
 
@@ -74,9 +75,9 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false>
+template <int block_size, bool do_multiply = false, bool do_add = false, typename dst_t = float>
 static __global__ void rms_norm_f32(const float * x,
-                                    float *       dst,
+                                    dst_t *       dst,
                                     const int     ncols,
                                     const int64_t stride_row,
                                     const int64_t stride_channel,
@@ -108,6 +109,7 @@ static __global__ void rms_norm_f32(const float * x,
     const int tid       = threadIdx.x;
 
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+    static_assert(std::is_same_v<dst_t, float> || !do_multiply, "a non-F32 dst is the plain norm's only");
 
     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
@@ -150,9 +152,140 @@ static __global__ void rms_norm_f32(const float * x,
             const int mul_col = fastmodulo(col, mul_ncols_packed);
             dst[col]          = scale * x[col] * mul[mul_col];
         } else {
-            dst[col] = scale * x[col];
+            dst[col] = ggml_cuda_cast<dst_t>(scale * x[col]);
         }
     }
+}
+
+// rms_norm_f32<256> on rows of at most 256 columns, one warp to a row and eight rows to a block. The block kernel gives
+// each such row 256 threads, half of them idle on a 128-wide row, and two barriers for its 128 values: KDA's per-head
+// output norm is 32,768 of those rows a 1024-token ubatch. Here a lane plays the block's threads lane, lane+32, ...,
+// lane+224: each virtual warp's squares go through the same butterfly, and the eight partials through block_reduce's
+// second stage, so the sum, the scale and every output are the block kernel's bit for bit. Summing a lane's squares
+// first and butterflying once, or loading a float4 to a lane, reorders the sum: test-backend-ops would still pass it.
+static constexpr int rms_norm_warp_rows_per_block = 8;
+
+template <bool do_multiply = false, bool do_add = false>
+static __global__ void rms_norm_f32_warp_rows(const float * x,
+                                              float *       dst,
+                                              const int     ncols,
+                                              const int     nrows,
+                                              const int64_t stride_row,
+                                              const int64_t stride_channel,
+                                              const int64_t stride_sample,
+                                              const float   eps,
+                                              const float * mul,
+                                              const int64_t mul_stride_row,
+                                              const int64_t mul_stride_channel,
+                                              const int64_t mul_stride_sample,
+                                              const uint3   mul_ncols_packed,
+                                              const uint3   mul_nrows_packed,
+                                              const uint3   mul_nchannels_packed,
+                                              const uint3   mul_nsamples_packed,
+                                              const float * add,
+                                              const int64_t add_stride_row,
+                                              const int64_t add_stride_channel,
+                                              const int64_t add_stride_sample,
+                                              const uint3   add_ncols_packed,
+                                              const uint3   add_nrows_packed,
+                                              const uint3   add_nchannels_packed,
+                                              const uint3   add_nsamples_packed) {
+    ggml_cuda_pdl_lc();
+    const int nchannels = gridDim.y;
+
+    const int lane    = threadIdx.x % WARP_SIZE;
+    const int row     = blockIdx.x*rms_norm_warp_rows_per_block + threadIdx.x/WARP_SIZE;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    if (row >= nrows) {
+        return;
+    }
+
+    static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    if constexpr (do_multiply) {
+        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+
+    if constexpr (do_add) {
+        const int add_row     = fastmodulo(row, add_nrows_packed);
+        const int add_channel = fastmodulo(channel, add_nchannels_packed);
+        const int add_sample  = fastmodulo(sample, add_nsamples_packed);
+        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
+    }
+
+    ggml_cuda_pdl_sync();
+    float xv[256/WARP_SIZE];
+    float partial = 0.0f; // block_reduce's second stage: lane w holds virtual warp w's sum, the rest its sentinel
+#pragma unroll
+    for (int w = 0; w < 256/WARP_SIZE; ++w) {
+        if (w*WARP_SIZE >= ncols) {
+            break; // a virtual warp past the row sums to +0.0, block_reduce's sentinel
+        }
+        const int col = w*WARP_SIZE + lane;
+        xv[w] = col < ncols ? x[col] : 0.0f;
+        const float s = warp_reduce_sum(xv[w]*xv[w]);
+        if (lane == w) {
+            partial = s;
+        }
+    }
+    const float tmp = warp_reduce_sum(partial);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+    for (int w = 0; w < 256/WARP_SIZE; ++w) {
+        const int col = w*WARP_SIZE + lane;
+        if (w*WARP_SIZE >= ncols) {
+            break;
+        }
+        if (col >= ncols) {
+            continue;
+        }
+        if constexpr (do_multiply && do_add) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            const int add_col = fastmodulo(col, add_ncols_packed);
+            dst[col]          = scale * xv[w] * mul[mul_col] + add[add_col];
+        } else if constexpr (do_multiply) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            dst[col]          = scale * xv[w] * mul[mul_col];
+        } else {
+            dst[col] = scale * xv[w];
+        }
+    }
+}
+
+// GGML_CUDA_RMS_NORM_WARP_ROWS_LEGACY=1 keeps rows of at most 256 columns on the 256-thread block kernel
+static bool rms_norm_warp_rows_enabled(const int ncols) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_RMS_NORM_WARP_ROWS_LEGACY");
+    return !legacy && ncols <= 256;
+}
+
+template <bool do_multiply, bool do_add>
+static void rms_norm_f32_warp_rows_launch(
+        const float * x, const float * mul, const float * add, float * dst, const int ncols, const int nrows,
+        const int nchannels, const int nsamples, const int64_t stride_row, const int64_t stride_channel,
+        const int64_t stride_sample, const int64_t mul_stride_row, const int64_t mul_stride_channel,
+        const int64_t mul_stride_sample, const uint3 mul_ncols_packed, const uint3 mul_nrows_packed,
+        const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed, const int64_t add_stride_row,
+        const int64_t add_stride_channel, const int64_t add_stride_sample, const uint3 add_ncols_packed,
+        const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed, const float eps,
+        cudaStream_t stream) {
+    const dim3 blocks_num((nrows + rms_norm_warp_rows_per_block - 1) / rms_norm_warp_rows_per_block, nchannels, nsamples);
+    const dim3 block_dims(rms_norm_warp_rows_per_block*WARP_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 0, stream};
+    ggml_cuda_kernel_launch(rms_norm_f32_warp_rows<do_multiply, do_add>, launch_params,
+        x, dst, ncols, nrows, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+        mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+        add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed, add_nchannels_packed,
+        add_nsamples_packed);
 }
 
 // Qwen3.5's gated norm, silu(gate) * (rms_norm(x) * w) with a one-row weight w, in one kernel: rms_norm_f32's sum of
@@ -422,6 +555,10 @@ static void rms_norm_f32_cuda(
         // underlying cudaLaunchKernelEx does not support default params
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+    } else if (rms_norm_warp_rows_enabled(ncols)) {
+        const uint3 z = make_uint3(0, 0, 0);
+        rms_norm_f32_warp_rows_launch<false, false>(x, nullptr, nullptr, dst, ncols, nrows, nchannels, nsamples,
+            stride_row, stride_channel, stride_sample, 0, 0, 0, z, z, z, z, 0, 0, 0, z, z, z, z, eps, stream);
     } else if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
@@ -491,6 +628,12 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
             nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        } else if (rms_norm_warp_rows_enabled(ncols)) {
+            const uint3 z = make_uint3(0, 0, 0);
+            rms_norm_f32_warp_rows_launch<true, false>(x, mul, nullptr, dst, ncols, nrows, nchannels, nsamples,
+                stride_row, stride_channel, stride_sample, mul_stride_row, mul_stride_channel, mul_stride_sample,
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, 0, 0, 0, z, z, z, z,
+                eps, stream);
         } else if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
@@ -518,7 +661,13 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
         const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
         const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
-        if (ncols < 1024) {
+        if (rms_norm_warp_rows_enabled(ncols)) {
+            rms_norm_f32_warp_rows_launch<true, true>(x, mul, add, dst, ncols, nrows, nchannels, nsamples, stride_row,
+                stride_channel, stride_sample, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed,
+                mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add_stride_row, add_stride_channel,
+                add_stride_sample, add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, eps,
+                stream);
+        } else if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims,block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
             ggml_cuda_kernel_launch(rms_norm_f32<256, true, true>, launch_params,
@@ -628,6 +777,37 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, nv_bfloat16 * y) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *) src0->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == ts0);
+    const int64_t s01 = nb01 / ts0;
+    const int64_t s02 = nb02 / ts0;
+    const int64_t s03 = nb03 / ts0;
+
+    // rms_norm_f32_cuda's block sizes: its 128-thread and warp-per-row kernels sum in the 256-thread block's order
+    const dim3 blocks_num(ne01, ne02, ne03);
+    const dim3 block_dims(ne00 < 1024 ? 256 : 1024, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), stream};
+    const uint3 z = make_uint3(0, 0, 0);
+    ggml_cuda_kernel_launch(ne00 < 1024 ? rms_norm_f32<256, false, false, nv_bfloat16> : rms_norm_f32<1024, false, false, nv_bfloat16>,
+        launch_params, src0_d, y, (int) ne00, s01, s02, s03, eps,
+        // underlying cudaLaunchKernelEx does not support default params
+        nullptr, 0, 0, 0, z, z, z, z, nullptr, 0, 0, 0, z, z, z, z);
 }
 
 void ggml_cuda_op_add_rms_norm_fused(

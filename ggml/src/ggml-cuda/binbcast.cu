@@ -542,6 +542,45 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     }
 }
 
+// a thread an element of a token's sum, the slots in their order: each product and each sum rounded on its own, as the
+// MUL and the ADDs round them (never contracted into an FMA)
+static __global__ void k_moe_weighted_sum(const float * experts, const float * weights, float * dst, const int n_embd,
+        const int n_used, const int64_t se1, const int64_t se2, const int64_t sw1, const int64_t sw2, const int64_t sd1) {
+    ggml_cuda_pdl_lc();
+    const int     i = blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t t = blockIdx.y;
+    if (i >= n_embd) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const float * e = experts + t*se2 + i;
+    const float * w = weights + t*sw2;
+    float acc = __fmul_rn(e[0], w[0]);
+    for (int s = 1; s < n_used; ++s) {
+        acc = __fadd_rn(acc, __fmul_rn(e[s*se1], w[s*sw1]));
+    }
+    dst[t*sd1 + i] = acc;
+}
+
+void ggml_cuda_op_moe_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
+        const ggml_tensor * weights, ggml_tensor * dst) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(experts->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+    const int     n_embd   = (int) experts->ne[0];
+    const int     n_used   = (int) experts->ne[1];
+    const int64_t n_tokens = experts->ne[2];
+    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == n_used && weights->ne[2] == n_tokens);
+    GGML_ASSERT(dst->ne[0] == n_embd && dst->ne[1] == n_tokens);
+
+    constexpr int block_size = 128; // k_bin_bcast's
+    const ggml_cuda_kernel_launch_params params = ggml_cuda_kernel_launch_params(
+        dim3((n_embd + block_size - 1) / block_size, (unsigned) n_tokens, 1), dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(k_moe_weighted_sum, params, (const float *) experts->data, (const float *) weights->data,
+        (float *) dst->data, n_embd, n_used, experts->nb[1] / (int64_t) sizeof(float),
+        experts->nb[2] / (int64_t) sizeof(float), weights->nb[1] / (int64_t) sizeof(float),
+        weights->nb[2] / (int64_t) sizeof(float), dst->nb[1] / (int64_t) sizeof(float));
+}
+
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
