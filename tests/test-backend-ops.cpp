@@ -12236,6 +12236,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 2}, 4096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  false, 0, false,  768));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, 0, false, 2304));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, 0, false,  512));
+    // Batches that reach the sparse gather's QUERY TILE, where one index list is the union of its rows' cells: a full tile
+    // of 8, a tile and a 1-row tail (the short last tile), two full tiles, and GLM-5.3's own n_select at the kv its gather
+    // needs. Eval covered only nb 1-3 before, so above one query a tile nothing checked the union against the reference --
+    // the batched sparse cases all sit in make_test_cases_perf, which never compares against a backend.
+    for (int64_t nb : { 8, 9, 16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, 0, false,  512));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
     for (int64_t nb : { 1, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2051));
     }
