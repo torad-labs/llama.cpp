@@ -478,15 +478,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     if constexpr (use_sparse) {
         static_assert(!use_cp_async, "sparse gather incompatible with cp_async");
-        static_assert(ncols1 == 1, "a tile's rows share its indices");
-        if (threadIdx.y == 0) {
-            const int j_vram = fastmodulo(j0, ne01);
+        // A tile's rows share one index list. For ncols1 == 1 that is the row's own cells; above 1 it is the UNION of the
+        // tile's rows' cells, and each row still reads ITS OWN mask value at every gathered cell -- so a cell this row did
+        // not select reads -inf here and contributes nothing, whatever the other rows selected. That is what makes a union
+        // correct independently of how much the rows overlap.
+        for (int j1 = threadIdx.y; j1 < ncols1; j1 += nwarps) {
+            const int j_vram = fastmodulo(j0 + j1, ne01);
 #pragma unroll
             for (int i0 = 0; i0 < nbatch_fa; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
                 const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
-                tile_mask[i] = index >= 0 ? mask_base[int64_t(j_vram)*stride_mask + index] : half(-INFINITY);
+                // ncols1 == 1 lands on tile_mask[i], the layout the one-row kernel wrote before
+                tile_mask[j1*(nbatch_fa + 8) + i] = index >= 0 ? mask_base[int64_t(j_vram)*stride_mask + index] : half(-INFINITY);
             }
         }
         return;
@@ -2159,7 +2163,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 // The instances with a sparse variant (ggml_flash_attn_ext_set_n_kv_max): one token a tile, DeepSeek's and GLM's MLA heads.
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
-    return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
+    // ncols1 == 8 only for GLM-5.3's DSA shape, and only there: a tile of 8 queries sharing one union list is the one
+    // width worth instantiating before the trained indexer's selection overlap is measured, since that overlap decides
+    // whether a union pays at all (a tile of 8 gathers 1.4x one query's cells at 95 % overlap and 8x at none). Each extra
+    // width is another full kernel instantiation, so widths are added when a number justifies them, not in advance.
+    return (DKQ == 512 && DV == 512 && (ncols1 == 1 || ncols1 == 8) && ncols2 == 8) ||
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
 }
 
@@ -2336,7 +2344,10 @@ static __global__ void flash_attn_ext_f16(
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
-        const int32_t * indices = use_sparse_arch ? sparse_indices + (int64_t(sequence % ne33)*ne31 + jt*ncols1)*ne11 : nullptr;
+        // one index list a TILE of ncols1 query rows, so the list count is ceil(ne31/ncols1) and jt selects it directly.
+        // At ncols1 == 1 this is (sequence*ne31 + jt)*ne11, the per-query offset the one-row kernel used.
+        const int n_sparse_lists = (ne31 + ncols1 - 1)/ncols1;
+        const int32_t * indices = use_sparse_arch ? sparse_indices + (int64_t(sequence % ne33)*n_sparse_lists + jt)*ne11 : nullptr;
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 

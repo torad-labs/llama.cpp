@@ -276,7 +276,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // the sparse variant is one token a tile, whatever the batch
+    // A tile of 8 query rows sharing one union list, when asked for and when there are 8 rows to tile: the gather then
+    // reads each cell once a tile instead of once a query. Off by default -- what it saves is the trained indexer's
+    // selection overlap, which a random-weight proxy cannot show (evidence.md).
+    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 8, ncols2)) {
+        if (ggml_cuda_fattn_sparse_tile() && Q->ne[1] >= 8 &&
+                ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst, ncols2)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
+    // otherwise one token a tile, whatever the batch
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
         if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst, ncols2)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);

@@ -843,18 +843,20 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, int rows_per_list, cudaStream_t stream);
 
-// How many consecutive query rows share one sparse index list. 1 is one list a query, which is what the ncols1 == 1
-// sparse kernel reads and the only width built today. Above 1 a list is the UNION of its rows' cells, so a tile of
-// queries gathers each cell once rather than once per query -- the saving is the overlap between adjacent queries'
-// selections, which is a property of the TRAINED indexer and is not measurable on a random-weight proxy. Default 1 until
-// a real-weight box measures that overlap; GGML_CUDA_FATTN_SPARSE_ROWS=N asks for N (2, 4, 8 or 16).
-static int ggml_cuda_fattn_sparse_rows_per_list() {
-    static const int rows = [] {
-        const char * env = getenv("GGML_CUDA_FATTN_SPARSE_ROWS");
-        const int    n   = env ? atoi(env) : 1;
-        return n == 2 || n == 4 || n == 8 || n == 16 ? n : 1;
-    }();
-    return rows;
+// GGML_CUDA_FATTN_SPARSE_TILE=1 lets the dispatch pick the 8-query sparse tile, whose list is the UNION of its rows'
+// cells, so a tile gathers each cell once rather than once per query. Whether that pays is the overlap between adjacent
+// queries' selections -- a property of the TRAINED indexer, which a random-weight proxy reports as no overlap by
+// construction (a tile of 8 gathers 1.4x one query's cells at 95 % overlap and 8x at none). So it is off until a
+// real-weight box measures that overlap, and the tile width the builder uses is always the kernel's own ncols1.
+static bool ggml_cuda_fattn_sparse_tile() {
+    static const bool tile = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_TILE");
+    return tile;
+}
+
+// The cells one sparse list holds. A tile of ncols1 rows unions their selections, so its list is up to ncols1 times one
+// row's, capped by the cache itself -- past that the gather has lost to the dense kernel anyway.
+static int32_t n_kv_sparse_list(int32_t n_kv_max, int64_t n_kv_total, int ncols1) {
+    return ncols1 == 1 ? n_kv_max : int32_t(std::min<int64_t>(int64_t(n_kv_max) * ncols1, n_kv_total));
 }
 
 // KV_live, the live KV steps of the mma kernel (nbatch_fa cells each) for n = Q tiles x sequences:
@@ -1597,18 +1599,13 @@ void launch_fattn(
         GGML_ASSERT(mask != nullptr && !mask_packed);
         GGML_ASSERT(n_kv_max > 0);
 
-        // a union list holds at most rows_per_list times one query's cells, and never more than the cache itself
-        const int rows_per_list = ggml_cuda_fattn_sparse_rows_per_list();
-        // The builder can emit union lists; the kernel below still reads one list a query (ncols1 == 1), so a width above
-        // 1 would silently read the wrong list rather than fail. Abort until the ncols1 > 1 sparse kernel lands.
-        GGML_ASSERT(rows_per_list == 1 ||
-            !"GGML_CUDA_FATTN_SPARSE_ROWS > 1 needs the ncols1 > 1 sparse kernel, which is not built yet");
-        const int32_t n_kv_list = rows_per_list == 1 ? n_kv_max
-            : int32_t(std::min<int64_t>(int64_t(n_kv_max) * rows_per_list, mask->ne[0]));
-        const int64_t n_lists   = (mask->ne[1] + rows_per_list - 1) / rows_per_list;
+        // The list width IS the kernel's tile width: this launch runs ncols1 query rows a tile, and the kernel reads one
+        // list a tile, so deriving the width here rather than configuring it makes a host/kernel mismatch impossible
+        // instead of merely guarded. A union list holds at most ncols1 times one query's cells, never more than the cache.
+        const int64_t n_lists = (mask->ne[1] + ncols1 - 1) / ncols1;
 
-        KV_max.alloc(size_t(n_kv_list) * n_lists * mask->ne[3]);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_list, rows_per_list, main_stream);
+        KV_max.alloc(size_t(n_kv_sparse_list(n_kv_max, mask->ne[0], ncols1)) * n_lists * mask->ne[3]);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_sparse_list(n_kv_max, mask->ne[0], ncols1), ncols1, main_stream);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1726,7 +1723,8 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1]; // the cells the kernel steps over
+    // the cells the kernel steps over, and the stride between sparse lists: a tile's union list, not one row's count
+    const int64_t n_kv = use_sparse ? n_kv_sparse_list(n_kv_max, mask->ne[0], ncols1) : K->ne[1];
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
