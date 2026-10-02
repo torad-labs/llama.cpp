@@ -110,6 +110,10 @@ bool common_sampler_backend_passive(const struct common_sampler * gsmpl);
 // logit), so a backend may take them in the graph for the CPU chain while the sampler is passive; 0 when it reads all
 int32_t common_sampler_backend_top_k(const struct common_sampler * gsmpl);
 
+// the k largest of a row's n_vocab logits as candidates (0 < k <= n_vocab), in llama's order of candidates: by logit,
+// ties by id. A chain whose top-k keeps at most k of them draws from these as from every token's
+void common_sampler_top_k_candidates(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out);
+
 // helpers
 
 // access the internal list of current candidate tokens

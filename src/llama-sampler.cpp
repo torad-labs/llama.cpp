@@ -132,10 +132,24 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// LLAMA_SAMPLING_TIES_LEGACY=1: candidates of equal logit keep whatever order std::sort and std::partial_sort leave them
+// in (the behaviour before ties were broken by id)
+static bool sampling_ties_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLING_TIES_LEGACY");
+    return legacy;
+}
+
+// the order the candidate sorts below give: by logit, ties by id. A total order, so the k a partial sort keeps and their
+// order depend on the candidates alone, not on the order they came in: a top-k taken from a row's largest logits keeps
+// the k, in the order, that a partial sort of every token does (common_sampler_top_k_candidates)
+static bool llama_token_data_before(const llama_token_data & a, const llama_token_data & b) {
+    return a.logit > b.logit || (a.logit == b.logit && a.id < b.id && !sampling_ties_legacy());
+}
+
 // writes result in res, does not mutate cur
 static void llama_token_data_array_partial_sort(const llama_token_data_array & cur, int npartial, std::vector<llama_token_data> & res) {
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return llama_token_data_before(a, b);
     };
 
     constexpr int   nbuckets     = 128;
@@ -193,7 +207,7 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
 // reduces the size of cur_p to npartial, keeping only the top npartial elements
 static void llama_token_data_array_partial_sort_inplace(llama_token_data_array * cur_p, int npartial) {
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return llama_token_data_before(a, b);
     };
 
     if (npartial <= 128) {
