@@ -11542,6 +11542,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 3, 5 }) {
         test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 8, 8, 4096, 2048, n, 7.0f));
     }
+    // and its routed experts at a prefill batch, where MMQ tiles each expert's columns: 64 experts with 8 used, so 64
+    // and 256 tokens give 8 and 32 columns an expert on average, the tile width follows them and only the experts'
+    // non-empty column tiles are launched
+    for (int n : { 64, 256 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 64, 8, true,  2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 64, 8, false, 4096, n, 2048));
+    }
     // and the experts' weighted sum after the down: GLM's (4,096 and 8 slots) at a decode, an MTP verify and a batch, and
     // other widths and slot counts (gpt-oss's 2,880 and 4, a row past a block)
     for (int64_t n_embd : { 4096, 2880 }) {

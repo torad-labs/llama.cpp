@@ -242,8 +242,10 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // A tile reads all J of its columns (the last expert's last one past the data, in the last K chunk up to J - 1 of
+    // them), and the width follows the columns an expert gets, not ne11 (n_expert_used): pad for the widest tile.
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, 128) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -294,6 +296,86 @@ void ggml_cuda_mul_mat_q(
         ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
+bool ggml_cuda_mmq_moe_tiles_legacy() {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_MMQ_MOE_TILES_LEGACY");
+    return legacy;
+}
+
+int64_t ggml_cuda_mmq_moe_ncols() {
+    static const int64_t ncols = [] {
+        const char * s = getenv("GGML_CUDA_MMQ_MOE_NCOLS");
+        return s ? std::max<int64_t>(0, atoll(s)) : int64_t(0);
+    }();
+    return ncols;
+}
+
+// One block: each pass scans the column tiles of blockDim.x experts, ceil(columns/J) each, on top of the earlier
+// passes' total, and every expert writes its own entries at its exclusive prefix.
+static __global__ void mmq_moe_tiles_kernel(const int32_t * __restrict__ expert_bounds, const int n_expert, const int J,
+                                            const int ntiles_max, int32_t * __restrict__ moe_tiles) {
+    __shared__ int warp_incl[WARP_SIZE];
+    __shared__ int done;
+
+    const int lane  = threadIdx.x % WARP_SIZE;
+    const int warp  = threadIdx.x / WARP_SIZE;
+    const int nwarp = blockDim.x / WARP_SIZE;
+
+    if (threadIdx.x == 0) {
+        done = 0;
+    }
+    __syncthreads();
+
+    for (int e0 = 0; e0 < n_expert; e0 += blockDim.x) {
+        const int e = e0 + threadIdx.x;
+        const int n = e < n_expert ? (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J : 0;
+
+        int incl = n;
+#pragma unroll
+        for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+            const int t = __shfl_up_sync(0xFFFFFFFF, incl, offset);
+            if (lane >= offset) {
+                incl += t;
+            }
+        }
+        if (lane == WARP_SIZE - 1) {
+            warp_incl[warp] = incl;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            int s = lane < nwarp ? warp_incl[lane] : 0;
+#pragma unroll
+            for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+                const int t = __shfl_up_sync(0xFFFFFFFF, s, offset);
+                if (lane >= offset) {
+                    s += t;
+                }
+            }
+            warp_incl[lane] = s;
+        }
+        __syncthreads();
+
+        const int first = done + (warp > 0 ? warp_incl[warp - 1] : 0) + incl - n;
+        for (int k = 0; k < n && first + k < ntiles_max; ++k) {
+            moe_tiles[first + k] = (k << 16) | e;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            done += warp_incl[nwarp - 1];
+        }
+        __syncthreads();
+    }
+
+    for (int t = done + threadIdx.x; t < ntiles_max; t += blockDim.x) {
+        moe_tiles[t] = -1;
+    }
+}
+
+void ggml_cuda_mmq_moe_tiles(const int32_t * expert_bounds, const int n_expert, const int J, const int ntiles_max,
+                             int32_t * moe_tiles, cudaStream_t stream) {
+    mmq_moe_tiles_kernel<<<1, 1024, 0, stream>>>(expert_bounds, n_expert, J, ntiles_max, moe_tiles);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static size_t ggml_cuda_mmq_q8_buffer_size(
