@@ -209,12 +209,16 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 // wins where the cache is at least those queries' cells (GLM-5.3's DSA shape, 32 heads on the latent, RTX 5080 and
 // 5070 Ti: at 0.25-0.99x the dense time wherever K >= n_gather, at 1.13-1.27x wherever it is under; upstream's 2x margin
 // gave up a verify's 3 tokens at 8K cells, 0.73x, and a prefill at 16K, 0.63-0.72x).
+// GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER=1: where the 32-head tile takes the launch (sparse_heads_take), the gather reads a
+// query's cells once for 32 heads, so it wins from 2 queries' cells, 4160 for GLM's 2080. Between that and the 8-head
+// tile's switch-over it replaces the masked dense kernel, a different summation: not bit for bit.
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const int ncols2) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(ctx, dst, ncols2);
     return false;
 #else
-    static const bool sparse_legacy = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_LEGACY");
+    static const bool sparse_legacy    = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_LEGACY");
+    static const bool heads_switchover = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER");
 
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -227,12 +231,50 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const int32_t n_kv_max = ggml_flash_attn_ext_get_n_kv_max(dst);
-    const int64_t n_gather = std::min<int64_t>(Q->ne[1], 64/ncols2) * n_kv_max;
+    const int ncols2_gather = heads_switchover && ncols2 == 8 && ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ctx, dst) ? 32 : ncols2;
+    const int64_t n_gather = std::min<int64_t>(Q->ne[1], 64/ncols2_gather) * n_kv_max;
     return !sparse_legacy && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && mask->type == GGML_TYPE_F16 && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, n_gather);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+// The 32-head tile takes a sparse launch of GLM's 512-wide latent with 32 heads or a multiple on it, where the 8-head tiles
+// number at least 4 for each block of the 8-head launch's stream-k grid: the tiles that grid splits, which its kernel redoes
+// after the head tile, are then a few of them. The block count is the bound the shared memory sets on the blocks an SM holds,
+// at least the occupancy launch_fattn finds, so the test only errs toward the 8-head launch.
+// GGML_CUDA_FATTN_SPARSE_HEADS_LEGACY=1: the 8-head launch alone.
+bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, dst);
+    return false;
+#else
+    static const bool heads_legacy = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_HEADS_LEGACY");
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int id = ctx.device;
+    const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[id];
+
+    const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
+    if (heads_legacy || !GGML_CUDA_CC_IS_NVIDIA(info.cc) || !turing_mma_available(info.cc) ||
+            Q->ne[0] != 512 || V->ne[0] != 512 || gqa_ratio % 32 != 0) {
+        return false;
+    }
+
+    static int smem_sm[GGML_CUDA_MAX_DEVICES]    = {0}; // shared memory an SM holds, and what each block reserves of it
+    static int smem_block[GGML_CUDA_MAX_DEVICES] = {0};
+    if (smem_sm[id] == 0) {
+        CUDA_CHECK(cudaDeviceGetAttribute(&smem_block[id], cudaDevAttrReservedSharedMemoryPerBlock, ggml_cuda_get_device()));
+        CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm[id], cudaDevAttrMaxSharedMemoryPerMultiprocessor, ggml_cuda_get_device()));
+    }
+    const fattn_mma_geometry geom = ggml_cuda_fattn_mma_get_geometry<512, 512, 1, 8, GGML_TYPE_F16, GGML_TYPE_F16>(info.cc, info.warp_size);
+    const int64_t blocks = int64_t(smem_sm[id] / (geom.nbytes_shared + smem_block[id])) * info.nsm;
+    const int64_t ntiles = Q->ne[1] * (gqa_ratio/8) * K->ne[2] * Q->ne[3];
+    return ntiles >= 4*blocks;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 template <int DKQ, int DV, int ncols2>

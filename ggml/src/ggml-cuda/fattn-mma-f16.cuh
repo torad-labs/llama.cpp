@@ -343,16 +343,41 @@ static __host__ int get_cols_per_warp(const int cc) {
     }
 }
 
+// The sparse head tile (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads): one query's ncols2 heads on the gather of its cells,
+// run as ncols2/8 groups of the 8-head tile on as many times its warps. Every column takes the 8-head tile's config, MMA tile
+// shapes and warps a column, so its arithmetic is that tile's bit for bit, and the groups share each K/V row the gather reads.
+static constexpr __host__ __device__ int ggml_cuda_fattn_mma_head_groups(const int DKQ, const int DV, const int ncols1, const int ncols2) {
+    return DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 > 8 ? ncols2/8 : 1;
+}
+
+// The config's column count: the tile's columns, or a head group's.
+static constexpr __host__ __device__ int ggml_cuda_fattn_mma_cfg_ncols(const int DKQ, const int DV, const int ncols1, const int ncols2) {
+    return ncols1*ncols2 / ggml_cuda_fattn_mma_head_groups(DKQ, DV, ncols1, ncols2);
+}
+
+static constexpr __device__ int ggml_cuda_fattn_mma_get_nthreads_tile(const int DKQ, const int DV, const int ncols1, const int ncols2) {
+    return ggml_cuda_fattn_mma_head_groups(DKQ, DV, ncols1, ncols2) *
+        ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2));
+}
+
+static constexpr __device__ int ggml_cuda_fattn_mma_get_occupancy_tile(const int DKQ, const int DV, const int ncols1, const int ncols2) {
+    const int occupancy = ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2)) /
+        ggml_cuda_fattn_mma_head_groups(DKQ, DV, ncols1, ncols2);
+    return occupancy > 1 ? occupancy : 1;
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 
 static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
-    return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
+    return cp_async_available(cc) && ncols2 >= 2 ?
+        ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2), cc) : 0;
 }
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse) {
 #ifdef CP_ASYNC_AVAILABLE
-    const int nstages_target = ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
+    const int nstages_target = ncols2 >= 2 ?
+        ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2)) : 0;
     // sparse gather is not implemented for multi-stage loading
     return use_sparse && nstages_target > 1 ? 1 : nstages_target;
 #else
@@ -937,13 +962,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
+    constexpr int  ncols_cfg       = ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2);
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
-    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
-    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols_cfg);
+    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols_cfg);
+    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols_cfg);
+    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols_cfg);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse);
     constexpr bool raw_KV          = type_K != GGML_TYPE_F16;
     static_assert(raw_KV == (type_V != GGML_TYPE_F16), "K and V are both raw or both f16");
@@ -953,7 +979,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // where 2 blocks share an SM: the 4-warp tiles of a verify, whose K then loaded only after V arrived, 1-3 % slower at
     // 65,536 cells. With 3 blocks an SM (a decode token's 2-warp tile) K loads after V arrives: loaded early it ran 1-2 %
     // slower at 16,384 and 245,760 cells (RTX 5080, head 256).
-    constexpr bool raw_K_early     = raw_KV && ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols) <= 2;
+    constexpr bool raw_K_early     = raw_KV && ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols_cfg) <= 2;
 
     constexpr int stride_tile_K = nbatch_K2 + 4;
 
@@ -1578,21 +1604,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols = ncols1 * ncols2;
-    using     T_A_KQ    = typename mma_tile_sizes<DV, ncols>::T_A_KQ;
-    using     T_B_KQ    = typename mma_tile_sizes<DV, ncols>::T_B_KQ;
-    using     T_C_KQ    = typename mma_tile_sizes<DV, ncols>::T_C_KQ;
-    using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols>::T_A_VKQ;
-    using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols>::T_B_VKQ;
-    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
+    constexpr int ncols_cfg = ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2);
+    using     T_A_KQ    = typename mma_tile_sizes<DV, ncols_cfg>::T_A_KQ;
+    using     T_B_KQ    = typename mma_tile_sizes<DV, ncols_cfg>::T_B_KQ;
+    using     T_C_KQ    = typename mma_tile_sizes<DV, ncols_cfg>::T_C_KQ;
+    using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols_cfg>::T_A_VKQ;
+    using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols_cfg>::T_B_VKQ;
+    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols_cfg>::T_C_VKQ;
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
-    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
-    constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
-    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols_cfg);
+    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols_cfg);
+    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols_cfg);
+    constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols_cfg);
+    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols_cfg);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, use_sparse);
 
     if (cols_per_warp > ncols) {
@@ -2156,18 +2183,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
-// The instances with a sparse variant (ggml_flash_attn_ext_set_n_kv_max): one token a tile, DeepSeek's and GLM's MLA heads.
+// The instances with a sparse variant (ggml_flash_attn_ext_set_n_kv_max): one token a tile, DeepSeek's and GLM's MLA heads,
+// and GLM's 32-head tile (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads).
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
+           (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 32) ||
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
 }
 
 // use_sparse: KV_max_ptr holds each mask row's n_kv_max cell indices (ggml_cuda_flash_attn_ext_compact_mask) and ne11 is
 // n_kv_max; the kernel steps over those cells in place of the cache.
+// sparse_seams: only the tiles the stream-k split cuts, each piece as the whole launch does it; the whole tiles are the head
+// tile's (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads).
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, ggml_type type_K, ggml_type type_V,
-    bool use_sparse>
-__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
+    bool use_sparse, bool sparse_seams = false>
+__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads_tile(DKQ, DV, ncols1, ncols2), ggml_cuda_fattn_mma_get_occupancy_tile(DKQ, DV, ncols1, ncols2))
 static __global__ void flash_attn_ext_f16(
         const char * Q_ptr,
         const char * K_ptr,
@@ -2264,10 +2295,11 @@ static __global__ void flash_attn_ext_f16(
     constexpr ggml_type type_V_arch = GGML_TYPE_F16;
 #endif // AMPERE_MMA_AVAILABLE
 
+    static_assert(!sparse_seams || use_sparse, "the seams pass is the sparse launch's");
+
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int ncols     = ncols1 * ncols2;
-    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
-    constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
+    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2));
+    constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads_tile(DKQ, DV, ncols1, ncols2);
     constexpr int nwarps    = nthreads / warp_size;
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
@@ -2325,6 +2357,9 @@ static __global__ void flash_attn_ext_f16(
         int        kb0_stop  = min(tile_steps, kb0_start + kbc_stop - kbc);
         const bool last_tile = kb0_stop < tile_steps; // the block ends inside the tile
         kbc += kb0_stop - kb0_start;
+        if (sparse_seams && kb0_start == 0 && !last_tile) {
+            continue;
+        }
 
         const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
@@ -2375,28 +2410,32 @@ static __global__ void flash_attn_ext_f16(
 // 4096 cells and as many as the gather reads for the queries one dense pass covers. Defined in fattn.cu.
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int ncols2);
 
-template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
-void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * KQV = dst;
-    const int id = ggml_cuda_get_device();
-    const int cc = ggml_cuda_info().devices[id].cc;
+// A launch's warps, KV step and shared memory, the layout flash_attn_ext_f16_process_tile carves.
+struct fattn_mma_geometry {
+    int    nwarps;
+    int    nbatch_fa;
+    int    nstages;
+    size_t nbytes_shared;
+};
 
-    constexpr int ncols = ncols1 * ncols2;
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
+static fattn_mma_geometry ggml_cuda_fattn_mma_get_geometry(const int cc, const int warp_size) {
+    constexpr int ncols     = ncols1 * ncols2;
+    constexpr int ncols_cfg = ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2);
 
-    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
-    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
-    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
+    const int  nthreads       = ggml_cuda_fattn_mma_head_groups(DKQ, DV, ncols1, ncols2) *
+                                ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols_cfg, cc);
+    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols_cfg, cc);
+    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols_cfg, cc);
+    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols_cfg, cc);
+    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols_cfg, cc);
+    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols_cfg, cc);
     const int  nstages        = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, cc);
 
-    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
-    const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
-    const int nwarps         = nthreads / warp_size_host;
+    const int cols_per_warp = std::min(ncols_cfg, get_cols_per_warp(cc));
+    const int nwarps        = nthreads / warp_size;
 
-    constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
-    constexpr bool raw_KV      = type_K != GGML_TYPE_F16;
+    constexpr bool raw_KV = type_K != GGML_TYPE_F16;
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_KV_2stage = (fattn_mma_tile_K_h2(type_K, nbatch_fa, nbatch_K2 + 4) + nbatch_fa*(nbatch_V2 + 4))
@@ -2412,6 +2451,74 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_raw) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_raw);
+
+    return {nwarps, nbatch_fa, nstages, nbytes_shared_total};
+}
+
+// Whether dst's sparse launch is the 32-head tile's (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads). Defined in fattn.cu.
+bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// GLM-5.3's DSA prefill: a query's heads on the latent (64 on one card, 32 a card under -sm tensor) gather the same cells,
+// which the ncols2-head tile reads once a group of ncols2. The head tile reads them once for 32 heads and does every tile
+// whole: the ncols2-head launch's result wherever that launch does the tile in one piece. The tiles its stream-k grid splits
+// are then redone by that launch's kernel on that grid, the whole tiles skipped, and combined by its fixup, so the output is
+// the ncols2-head launch's bit for bit.
+template <int DKQ, int DV, int ncols2>
+static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const fattn_kernel_t kernel_tile, const fattn_mma_geometry & geom_tile, const int warp_size) {
+    constexpr int       ncols2_heads = 32;
+    constexpr ggml_type F16          = GGML_TYPE_F16;
+    static_assert(ggml_cuda_fattn_mma_head_groups(DKQ, DV, 1, ncols2_heads)*ncols2 == ncols2_heads, "a head group is the tile");
+
+    if (!ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ctx, dst)) {
+        return false;
+    }
+
+    const ggml_tensor * mask = dst->src[3];
+
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+
+    const fattn_kernel_t     kernel_heads = flash_attn_ext_f16<DKQ, DV, 1, ncols2_heads, false, false, F16, F16, true>;
+    const fattn_kernel_t     kernel_seams = flash_attn_ext_f16<DKQ, DV, 1, ncols2,       false, false, F16, F16, true, true>;
+    const fattn_mma_geometry geom_heads   = ggml_cuda_fattn_mma_get_geometry<DKQ, DV, 1, ncols2_heads, F16, F16>(cc, warp_size);
+    GGML_ASSERT(geom_heads.nstages <= 1 && geom_heads.nbatch_fa == geom_tile.nbatch_fa);
+
+    static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+    if (!shared_memory_limit_raised[id]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel_heads, cudaFuncAttributeMaxDynamicSharedMemorySize, geom_heads.nbytes_shared));
+        CUDA_CHECK(cudaFuncSetAttribute(kernel_seams, cudaFuncAttributeMaxDynamicSharedMemorySize, geom_tile.nbytes_shared));
+        shared_memory_limit_raised[id] = true;
+    }
+
+    const int32_t n_kv_max = ggml_flash_attn_ext_get_n_kv_max(dst);
+    ggml_cuda_pool_alloc<int32_t> indices(ctx.pool(), size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
+    ggml_cuda_flash_attn_ext_compact_mask(mask, indices.ptr, n_kv_max, ctx.stream());
+
+    launch_fattn<DV, 1, ncols2_heads>(ctx, dst, kernel_heads, geom_heads.nwarps, geom_heads.nbytes_shared, geom_heads.nbatch_fa,
+        true, true, true, warp_size, true, true, {indices.ptr, true, nullptr});
+    launch_fattn<DV, 1, ncols2>(ctx, dst, kernel_seams, geom_tile.nwarps, geom_tile.nbytes_shared, geom_tile.nbatch_fa,
+        true, true, true, warp_size, true, true, {indices.ptr, false, kernel_tile});
+    return true;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
+void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV = dst;
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+
+    const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
+    const fattn_mma_geometry geom = ggml_cuda_fattn_mma_get_geometry<DKQ, DV, ncols1, ncols2, type_K, type_V>(cc, warp_size_host);
+    const int    nwarps              = geom.nwarps;
+    const int    nbatch_fa           = geom.nbatch_fa;
+    const int    nstages             = geom.nstages;
+    const size_t nbytes_shared_total = geom.nbytes_shared;
+
+    constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
+    constexpr bool raw_KV      = type_K != GGML_TYPE_F16;
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
@@ -2436,6 +2543,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 if (!shared_memory_limit_raised[id]) {
                     CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
                     shared_memory_limit_raised[id] = true;
+                }
+
+                if constexpr (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) {
+                    if (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads<DKQ, DV, ncols2>(ctx, dst, fattn_kernel, geom, warp_size_host)) {
+                        return;
+                    }
                 }
             }
         }

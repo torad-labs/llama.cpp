@@ -1453,12 +1453,20 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// A sparse launch that shares its gather with another (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads).
+struct fattn_sparse_launch {
+    const int32_t * indices     = nullptr; // the compacted mask rows (ggml_cuda_flash_attn_ext_compact_mask); null: compacted here
+    bool            whole_tiles = false;   // one block a tile: no tile split, no fixup
+    fattn_kernel_t  grid_kernel = nullptr; // the stream-k grid is the one this kernel's occupancy gives (same block and shared memory)
+};
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
     const bool kv_live_ok = false, // the kernel reads KV_live
-    const bool use_sparse = false  // the kernel reads K, V and the mask by the indices in KV_max, n_kv_max of them
+    const bool use_sparse = false, // the kernel reads K, V and the mask by the indices in KV_max, n_kv_max of them
+    const fattn_sparse_launch & sparse_launch = {}
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1583,9 +1591,12 @@ void launch_fattn(
         GGML_ASSERT(mask != nullptr && !mask_packed);
         GGML_ASSERT(n_kv_max > 0);
 
-        KV_max.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+        if (!sparse_launch.indices) {
+            KV_max.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+        }
     }
+    GGML_ASSERT(use_sparse || (!sparse_launch.indices && !sparse_launch.whole_tiles && !sparse_launch.grid_kernel));
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
@@ -1698,7 +1709,8 @@ void launch_fattn(
 
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm,
+        sparse_launch.grid_kernel ? sparse_launch.grid_kernel : fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
@@ -1718,7 +1730,7 @@ void launch_fattn(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        if(use_stream_k || kv_live) {
+        if((use_stream_k || kv_live) && !sparse_launch.whole_tiles) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
             // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
             // Only do this if the occupancy loss from rounding is acceptable. Live tiles differ in their steps, so never then.
@@ -1814,7 +1826,7 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        sparse_launch.indices ? sparse_launch.indices : KV_max.ptr,
         KV_live_ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

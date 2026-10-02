@@ -11542,6 +11542,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 3, 5 }) {
         test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 8, 8, 4096, 2048, n, 7.0f));
     }
+    // and its routed experts at a prefill batch, where MMQ tiles each expert's columns: 64 experts with 8 used, so 64
+    // and 256 tokens give 8 and 32 columns an expert on average, the tile width follows them and only the experts'
+    // non-empty column tiles are launched
+    for (int n : { 64, 256 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 64, 8, true,  2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 64, 8, false, 4096, n, 2048));
+    }
     // and the experts' weighted sum after the down: GLM's (4,096 and 8 slots) at a decode, an MTP verify and a batch, and
     // other widths and slot counts (gpt-oss's 2,880 and 4, a row past a block)
     for (int64_t n_embd : { 4096, 2880 }) {
@@ -12264,6 +12271,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nb : { 1, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 40960, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
     }
+    // The 32-head tile (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads), a prefill's ubatch of 4 or more 8-head tiles a block:
+    // 64 heads on one card, 2 sequences, and 32 heads a card under -sm tensor
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16640, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 2}, 16640,  96, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, 192, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+    // under the 8-head tile's switch-over: the masked dense kernel, and the 32-head tile with GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER=1
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},  8192, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
 
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
