@@ -12276,6 +12276,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16640, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 2}, 16640,  96, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, 192, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+    // under the 8-head tile's switch-over: the masked dense kernel, and the 32-head tile with GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER=1
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},  8192, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
 
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
