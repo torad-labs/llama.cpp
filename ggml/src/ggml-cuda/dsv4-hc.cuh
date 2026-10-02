@@ -6,6 +6,15 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_dsv4_hc_weights(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// A DSV4_HC_POST (post) and the next front's weightless RMS_NORM of its flat streams (rms_flat) in one kernel, a block a
+// token: it writes post's output and the norm's BF16 copy y, the values ggml_cuda_op_rms_norm_bf16 would write from it,
+// for a MUL_MAT that runs on cuBLAS in BF16. Supported where post's x, residual streams and output are F32 and contiguous
+// along n_embd, n_embd a multiple of 1024 up to 8192, and rms_flat reads post's output whole as one row a token; not under
+// GGML_CUDA_HC_POST_ROWS_LEGACY.
+bool ggml_cuda_dsv4_hc_post_norm_supported(const ggml_tensor * post, const ggml_tensor * rms_flat);
+void ggml_cuda_op_dsv4_hc_post_norm_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * post,
+        const ggml_tensor * rms_flat, nv_bfloat16 * y);
+
 // The front of a hyper-connection cycle, six nodes in two kernels: the weightless RMS_NORM of the flat streams
 // (rms_flat), their MUL_MAT by hc_fn (mm), DSV4_HC_WEIGHTS (weights), DSV4_HC_PRE (pre) on its pre weights' view, and
 // the RMS_NORM (rms) and MUL (mul) of the sublayer's norm; it writes weights and mul. Supported at up to 16 tokens, the

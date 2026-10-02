@@ -4886,6 +4886,20 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// mm, which ggml_cuda_mul_mat_runs_cublas_bf16 runs on cuBLAS in BF16, reading y: the BF16 copy of its F32 src1 (norm)
+// that an earlier kernel wrote where norm's output went unwritten, the values mm would have cast from it
+static void ggml_cuda_mul_mat_cublas_bf16_src1(ggml_backend_cuda_context & ctx, ggml_tensor * mm, const ggml_tensor * norm,
+        nv_bfloat16 * y) {
+    ggml_tensor y_bf16 = *norm;
+    y_bf16.type  = GGML_TYPE_BF16;
+    y_bf16.data  = y;
+    y_bf16.nb[0] = ggml_type_size(GGML_TYPE_BF16);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        y_bf16.nb[d] = y_bf16.nb[d - 1]*y_bf16.ne[d - 1];
+    }
+    ggml_cuda_mul_mat_cublas(ctx, mm->src[0], &y_bf16, mm);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -6067,6 +6081,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // A DSV4_HC_POST and the next front's weightless RMS_NORM of its flat streams where the norm feeds a MUL_MAT on cuBLAS
+    // in BF16, as at a prefill ubatch (the norm-and-cast pair below): the post's kernel, a block a token, holds the
+    // token's streams as it writes them, so it sums their squares in the norm's order and writes the norm's BF16 copy as
+    // well, where the norm was a launch of its own that read the streams back. GGML_CUDA_HC_POST_NORM_LEGACY=1 launches
+    // them on their own.
+    static const bool hc_post_norm_legacy = ggml_env_switch("GGML_CUDA_HC_POST_NORM_LEGACY");
+    if (!hc_post_norm_legacy && node->op == GGML_OP_DSV4_HC_POST) {
+        int i_rms = i + 1;
+        while (i_rms < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[i_rms])) {
+            ++i_rms;
+        }
+        const int i_mm = i_rms + 1;
+        if (i_mm < cgraph->n_nodes) {
+            ggml_tensor * rms     = cgraph->nodes[i_rms];
+            ggml_tensor * mm      = cgraph->nodes[i_mm];
+            const ggml_op ops[]   = { GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL_MAT };
+            const int     idxs[]  = { i, i_rms, i_mm };
+            const int     outs[]  = { i, i_mm };
+            // the norm-and-cast pair's memory check: the post's kernel writes the post's output and the pool's copy, and the
+            // MUL_MAT's launch after it may sit over the post's inputs as it may unfused
+            const int     mm_out[] = { i_mm };
+            if (rms->op == GGML_OP_RMS_NORM && mm->op == GGML_OP_MUL_MAT && mm->src[1] == rms && mm->src[0] != rms &&
+                    ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, ops, outs, 2) &&
+                    ggml_cuda_dsv4_hc_post_norm_supported(node, rms) &&
+                    ggml_cuda_mul_mat_runs_cublas_bf16(*cuda_ctx, mm) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i_rms, 2, mm_out, 1)) {
+                ggml_cuda_pool_alloc<nv_bfloat16> y(cuda_ctx->pool(), ggml_nelements(rms));
+                ggml_cuda_op_dsv4_hc_post_norm_bf16(*cuda_ctx, node, rms, y.get());
+                ggml_cuda_mul_mat_cublas_bf16_src1(*cuda_ctx, mm, rms, y.get());
+                return i_mm - i;
+            }
+        }
+    }
+
     // The front of a hyper-connection cycle (DeepSeek V4, GLM-5.3) at a few tokens: the weightless RMS_NORM of the flat
     // streams, their MUL_MAT by hc_fn, DSV4_HC_WEIGHTS, DSV4_HC_PRE on its pre weights' view, and the RMS_NORM and MUL of
     // the sublayer's norm, in two kernels (ggml_cuda_op_dsv4_hc_pre_fused) where they were four to six launches, the
@@ -6149,14 +6197,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
             ggml_cuda_pool_alloc<nv_bfloat16> y(cuda_ctx->pool(), ggml_nelements(node));
             ggml_cuda_op_rms_norm_bf16(*cuda_ctx, node, y.get());
-            ggml_tensor y_bf16 = *node;
-            y_bf16.type  = GGML_TYPE_BF16;
-            y_bf16.data  = y.get();
-            y_bf16.nb[0] = ggml_type_size(GGML_TYPE_BF16);
-            for (int d = 1; d < GGML_MAX_DIMS; ++d) {
-                y_bf16.nb[d] = y_bf16.nb[d - 1]*y_bf16.ne[d - 1];
-            }
-            ggml_cuda_mul_mat_cublas(*cuda_ctx, mm->src[0], &y_bf16, mm);
+            ggml_cuda_mul_mat_cublas_bf16_src1(*cuda_ctx, mm, node, y.get());
             return 1;
         }
     }

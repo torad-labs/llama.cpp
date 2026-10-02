@@ -231,6 +231,169 @@ static __global__ void dsv4_hc_post_f32(
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
 }
 
+// DSV4_HC_POST a block a token, where n_embd is NQ blocks' width: thread t makes all four streams at each of its columns
+// t + DSV4_HC_POST_ROW_THREADS*q, reading x and the four residual streams there once. dsv4_hc_post_f32's thread an output
+// read them for each of the four streams it makes and unflattened its index in 64 bits. Each output is that kernel's
+// expression on the same values, so its value.
+//
+// norm: the weightless RMS_NORM of the flat streams fused in, writing the BF16 copy y a cuBLAS BF16 MUL_MAT reads
+// (ggml_cuda_op_rms_norm_bf16's, where the norm read the streams back). The thread's outputs are the flat row's columns
+// t + 1024*j, j = idst*NQ + q, which rms_norm_f32<1024> sums in that order: the thread sums their squares so and the block
+// reduces them as that kernel's does, so the scale and every BF16 value are the norm's bit for bit.
+// No __restrict__ (dsv4_hc_mix_partials' note): with it nvcc loaded x and a stream as LDG.CONSTANT ahead of the PDL wait.
+static constexpr int DSV4_HC_POST_ROW_THREADS = 1024;
+static constexpr int DSV4_HC_POST_ROW_MAX_NQ  = 8;
+
+template <int NQ, bool norm>
+static __global__ void __launch_bounds__(DSV4_HC_POST_ROW_THREADS) dsv4_hc_post_rows_f32(
+        const float * x,
+        const float * residual,
+        const float * post,
+        const float * comb,
+        float * dst,
+        nv_bfloat16 * y,
+        const int64_t sx1,
+        const int64_t sr1,
+        const int64_t sr2,
+        const int64_t sp0,
+        const int64_t sp1,
+        const int64_t sc0,
+        const int64_t sc1,
+        const int64_t sc2,
+        const int64_t sd1,
+        const int64_t sd2,
+        const int     ncols,
+        const float   eps) {
+    ggml_cuda_pdl_lc();
+    constexpr int n_embd = NQ*DSV4_HC_POST_ROW_THREADS;
+    const int64_t it  = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    x        += it*sx1 + tid;
+    residual += it*sr2 + tid;
+    post     += it*sp1;
+    comb     += it*sc2;
+    dst      += it*sd2 + tid;
+
+    ggml_cuda_pdl_sync();
+
+    float p[DSV4_HC];
+    float c[DSV4_HC][DSV4_HC];
+#pragma unroll
+    for (int idst = 0; idst < DSV4_HC; ++idst) {
+        p[idst] = post[idst*sp0];
+#pragma unroll
+        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+            c[idst][isrc] = comb[idst*sc0 + isrc*sc1];
+        }
+    }
+
+    float v[norm ? DSV4_HC : 1][NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        const int   i0 = q*DSV4_HC_POST_ROW_THREADS;
+        const float xv = x[i0];
+        float r[DSV4_HC];
+#pragma unroll
+        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+            r[isrc] = residual[i0 + isrc*sr1];
+        }
+#pragma unroll
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            float sum = __fmul_rn(xv, p[idst]);
+#pragma unroll
+            for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+                sum = __fmaf_rn(r[isrc], c[idst][isrc], sum);
+            }
+            dst[i0 + idst*sd1] = sum;
+            if constexpr (norm) {
+                v[idst][q] = sum;
+            }
+        }
+    }
+
+    if constexpr (norm) {
+        float tmp = 0.0f;
+#pragma unroll
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                tmp += v[idst][q] * v[idst][q];
+            }
+        }
+
+        __shared__ float s_sum[32];
+        tmp = block_reduce<block_reduce_method::SUM, DSV4_HC_POST_ROW_THREADS>(tmp, s_sum);
+
+        // ncols at run time, as rms_norm_f32 divides by it
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+        y += it*ncols + tid;
+#pragma unroll
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                y[idst*n_embd + q*DSV4_HC_POST_ROW_THREADS] = __float2bfloat16(scale * v[idst][q]);
+            }
+        }
+    } else {
+        GGML_UNUSED_VARS(y, ncols, eps);
+    }
+}
+
+// dsv4_hc_post_rows_f32's NQ for the post dst, or 0 where it does not run: x, the residual streams and dst contiguous
+// along n_embd, a multiple of its block up to DSV4_HC_POST_ROW_MAX_NQ of them, not under GGML_CUDA_HC_POST_ROWS_LEGACY
+static int dsv4_hc_post_rows_nq(const ggml_tensor * dst) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_HC_POST_ROWS_LEGACY");
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const int64_t       n_embd   = x->ne[0];
+    if (legacy || residual->ne[1] != DSV4_HC || x->nb[0] != sizeof(float) || residual->nb[0] != sizeof(float) ||
+            dst->nb[0] != sizeof(float) || n_embd % DSV4_HC_POST_ROW_THREADS != 0 ||
+            n_embd > DSV4_HC_POST_ROW_MAX_NQ*DSV4_HC_POST_ROW_THREADS) {
+        return 0;
+    }
+    return n_embd / DSV4_HC_POST_ROW_THREADS;
+}
+
+template <bool norm>
+static void dsv4_hc_post_rows_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, nv_bfloat16 * y, int ncols,
+        float eps) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * comb     = dst->src[3];
+
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3(x->ne[1], 1, 1), dim3(DSV4_HC_POST_ROW_THREADS, 1, 1), 0, ctx.stream());
+
+    auto launch = [&](auto kernel) {
+        ggml_cuda_kernel_launch(kernel, launch_params,
+                (const float *) x->data, (const float *) residual->data,
+                (const float *) post->data, (const float *) comb->data, (float *) dst->data, y,
+                (int64_t) (x->nb[1] / sizeof(float)),
+                (int64_t) (residual->nb[1] / sizeof(float)), (int64_t) (residual->nb[2] / sizeof(float)),
+                (int64_t) (post->nb[0] / sizeof(float)), (int64_t) (post->nb[1] / sizeof(float)),
+                (int64_t) (comb->nb[0] / sizeof(float)), (int64_t) (comb->nb[1] / sizeof(float)),
+                (int64_t) (comb->nb[2] / sizeof(float)),
+                (int64_t) (dst->nb[1] / sizeof(float)), (int64_t) (dst->nb[2] / sizeof(float)),
+                ncols, eps);
+    };
+
+    switch (dsv4_hc_post_rows_nq(dst)) {
+        case 1: launch(dsv4_hc_post_rows_f32<1, norm>); break;
+        case 2: launch(dsv4_hc_post_rows_f32<2, norm>); break;
+        case 3: launch(dsv4_hc_post_rows_f32<3, norm>); break;
+        case 4: launch(dsv4_hc_post_rows_f32<4, norm>); break;
+        case 5: launch(dsv4_hc_post_rows_f32<5, norm>); break;
+        case 6: launch(dsv4_hc_post_rows_f32<6, norm>); break;
+        case 7: launch(dsv4_hc_post_rows_f32<7, norm>); break;
+        case 8: launch(dsv4_hc_post_rows_f32<8, norm>); break;
+        default: GGML_ABORT("dsv4_hc_post_rows_f32 does not run this post");
+    }
+}
+
 // The front of a hyper-connection cycle at a few tokens in two kernels (ggml_cuda_op_dsv4_hc_pre_fused), where it was
 // six nodes: the weightless RMS_NORM of the flat streams, their MUL_MAT by hc_fn, DSV4_HC_WEIGHTS, DSV4_HC_PRE, and the
 // RMS_NORM and MUL of the sublayer's norm. The mat-vec had one block a row, 24 blocks over 16,384 columns, and each of
@@ -1411,6 +1574,11 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
 
+    if (dsv4_hc_post_rows_nq(dst) > 0) {
+        dsv4_hc_post_rows_launch<false>(ctx, dst, nullptr, 0, 0.0f);
+        return;
+    }
+
     const int block_size = 256;
     const int64_t nr = n_embd * hc * n_tokens;
     const dim3 block_dims(block_size, 1, 1);
@@ -1426,6 +1594,37 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+}
+
+bool ggml_cuda_dsv4_hc_post_norm_supported(const ggml_tensor * post, const ggml_tensor * rms_flat) {
+    if (post->op != GGML_OP_DSV4_HC_POST || rms_flat->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (post->src[i]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const ggml_tensor * flat   = rms_flat->src[0];
+    const int64_t       n_embd = post->ne[0];
+    return post->type == GGML_TYPE_F32 && rms_flat->type == GGML_TYPE_F32 && dsv4_hc_post_rows_nq(post) > 0 &&
+           ggml_is_contiguous(post) && flat->data == post->data && flat->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(flat) && flat->ne[0] == DSV4_HC*n_embd && flat->ne[1] == post->ne[2] &&
+           flat->ne[2] == 1 && flat->ne[3] == 1;
+}
+
+void ggml_cuda_op_dsv4_hc_post_norm_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * post,
+        const ggml_tensor * rms_flat, nv_bfloat16 * y) {
+    GGML_ASSERT(ggml_cuda_dsv4_hc_post_norm_supported(post, rms_flat));
+
+    float eps;
+    memcpy(&eps, rms_flat->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    // rms_norm_f32<1024>'s rows, as ggml_cuda_op_rms_norm_bf16 launches them from 1024 columns
+    const int ncols = rms_flat->src[0]->ne[0];
+    GGML_ASSERT(ncols >= DSV4_HC_POST_ROW_THREADS);
+    dsv4_hc_post_rows_launch<true>(ctx, post, y, ncols, eps);
 }
 
 void ggml_cuda_op_dsv4_hc_weights(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

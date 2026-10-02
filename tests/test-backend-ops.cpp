@@ -10252,6 +10252,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
+    // CUDA's block a token at n_embd / 1024 columns a thread, up to 8; 9216 on the kernel a thread an output
+    test_cases.emplace_back(new test_dsv4_hc_post(1024, 3));
+    test_cases.emplace_back(new test_dsv4_hc_post(7168, 5));
+    test_cases.emplace_back(new test_dsv4_hc_post(8192, 2));
+    test_cases.emplace_back(new test_dsv4_hc_post(9216, 2));
 
     test_cases.emplace_back(new test_dsv4_hc_weights(31, 1, 1));
     test_cases.emplace_back(new test_dsv4_hc_weights(31, 17, 4));
@@ -10291,6 +10296,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 2, 20, false, false, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 7168, 2, 20, false, true, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4, false, true, true));
+    // at 64 tokens the mixes' MUL_MAT runs on cuBLAS in BF16 and CUDA's post kernel writes the flat norm's BF16 copy for
+    // it (ggml_cuda_dsv4_hc_post_norm_supported); n_embd 64 has the post on its own, and F32 hc_fn runs cuBLAS in F32
+    for (int64_t n_embd : { 1024, 4096, 7168, 64 }) {
+        test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, n_embd, 64, 20, false, true, true));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 257, 20, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 4096, 64, 20, false, true, true));
     // the front's mix read by quantized MUL_MATs: its q8_1 copy written by the front on CUDA and read where the readers
     // run on mul_mat_vec_q (not Q4_K's at 8 tokens on Blackwell, which run on MMQ); at 256 (not a multiple of 512) and at
     // 12 tokens (past mul_mat_vec_q's columns) the readers quantize it
