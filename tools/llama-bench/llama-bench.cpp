@@ -367,6 +367,7 @@ struct cmd_params {
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
     std::vector<ggml_type>           type_s;
+    std::vector<ggml_type>           type_idx;
     std::vector<int>                 n_rs_seq;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
@@ -413,6 +414,7 @@ static const cmd_params cmd_params_defaults = {
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* type_s               */ { GGML_TYPE_F32 },
+    /* type_idx             */ { GGML_TYPE_F16 },
     /* n_rs_seq             */ { 0 },
     /* n_threads            */ { common_cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
@@ -486,6 +488,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -cts, --cache-type-s <t>                          recurrent state (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_s, ggml_type_name), ",").c_str());
+    printf("  -ctki, --cache-type-idx <t>                       sparse-attention indexer (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_idx, ggml_type_name), ",").c_str());
     printf("  -rs, --n-rs-seq <n>                               recurrent-state snapshots a sequence keeps for a draft's rollback,\n"
            "                                                    a drafting server's n_max (default: %s)\n", join(cmd_params_defaults.n_rs_seq, ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -714,6 +717,26 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.type_s.insert(params.type_s.end(), types.begin(), types.end());
+            } else if (arg == "-ctki" || arg == "--cache-type-idx") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+
+                std::vector<ggml_type> types;
+                for (const auto & t : p) {
+                    ggml_type gt = ggml_type_from_name(t);
+                    if (gt == GGML_TYPE_COUNT) {
+                        invalid_param = true;
+                        break;
+                    }
+                    types.push_back(gt);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.type_idx.insert(params.type_idx.end(), types.begin(), types.end());
             } else if (arg == "-rs" || arg == "--n-rs-seq") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1198,6 +1221,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.type_s.empty()) {
         params.type_s = cmd_params_defaults.type_s;
     }
+    if (params.type_idx.empty()) {
+        params.type_idx = cmd_params_defaults.type_idx;
+    }
     if (params.n_rs_seq.empty()) {
         params.n_rs_seq = cmd_params_defaults.n_rs_seq;
     }
@@ -1272,6 +1298,7 @@ struct cmd_params_instance {
     ggml_type          type_k;
     ggml_type          type_v;
     ggml_type          type_s;
+    ggml_type          type_idx;
     int                n_rs_seq;
     int                n_threads;
     std::string        cpu_mask;
@@ -1364,6 +1391,7 @@ struct cmd_params_instance {
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.type_s          = type_s;
+        cparams.type_idx        = type_idx;
         cparams.n_rs_seq        = n_rs_seq;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
@@ -1399,6 +1427,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
     for (const auto & tst : params.type_s)
+    for (const auto & tix : params.type_idx)
     for (const auto & nrs : params.n_rs_seq)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
@@ -1421,6 +1450,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .type_s                = */ tst,
+                /* .type_idx              = */ tix,
                 /* .n_rs_seq              = */ nrs,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
@@ -1459,6 +1489,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .type_s                = */ tst,
+                /* .type_idx              = */ tix,
                 /* .n_rs_seq              = */ nrs,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
@@ -1497,6 +1528,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .type_s                = */ tst,
+                /* .type_idx              = */ tix,
                 /* .n_rs_seq              = */ nrs,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
@@ -1544,6 +1576,7 @@ struct test {
     ggml_type                type_k;
     ggml_type                type_v;
     ggml_type                type_s;
+    ggml_type                type_idx;
     int                      n_rs_seq;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
@@ -1585,6 +1618,7 @@ struct test {
         type_k         = inst.type_k;
         type_v         = inst.type_v;
         type_s         = inst.type_s;
+        type_idx       = inst.type_idx;
         n_rs_seq       = inst.n_rs_seq;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
@@ -1655,8 +1689,8 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "type_s",        "n_rs_seq",       "n_gpu_layers",
-            "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "type_s",        "type_idx",       "n_rs_seq",
+            "n_gpu_layers",   "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
@@ -1744,6 +1778,7 @@ struct test {
                                             ggml_type_name(type_k),
                                             ggml_type_name(type_v),
                                             ggml_type_name(type_s),
+                                            ggml_type_name(type_idx),
                                             std::to_string(n_rs_seq),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
@@ -1927,7 +1962,7 @@ struct markdown_printer : public printer {
         if (field == "n_ubatch") {
             return 8;
         }
-        if (field == "type_k" || field == "type_v" || field == "type_s") {
+        if (field == "type_k" || field == "type_v" || field == "type_s" || field == "type_idx") {
             return 6;
         }
         if (field == "split_mode") {
@@ -2047,6 +2082,9 @@ struct markdown_printer : public printer {
         }
         if (params.type_s.size() > 1 || params.type_s != cmd_params_defaults.type_s) {
             fields.emplace_back("type_s");
+        }
+        if (params.type_idx.size() > 1 || params.type_idx != cmd_params_defaults.type_idx) {
+            fields.emplace_back("type_idx");
         }
         if (params.n_rs_seq.size() > 1 || params.n_rs_seq != cmd_params_defaults.n_rs_seq) {
             fields.emplace_back("n_rs_seq");

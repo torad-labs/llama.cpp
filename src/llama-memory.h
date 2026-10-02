@@ -22,6 +22,9 @@ struct llama_memory_params {
     // recurrent state cache (Gated DeltaNet / SSM S tensor)
     ggml_type type_s;
 
+    // sparse-attention indexer cache (GLM-5.3 DSA)
+    ggml_type type_idx;
+
     // use full-size SWA cache
     bool swa_full;
 

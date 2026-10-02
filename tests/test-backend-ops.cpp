@@ -12749,8 +12749,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // keys read through rows of a pooled cache: a decode, an MTP verify and a prefill ubatch, 1 and 2 streams, a count
-    // off the kernel's blocks
-    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+    // off the kernel's blocks; q8_0 is the cache -ctki q8_0 builds
+    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
         for (int64_t nh : { 32, 64 }) {
             for (int64_t nb : { 1, 3, 64 }) {
                 for (int64_t ns : { 1, 2 }) {

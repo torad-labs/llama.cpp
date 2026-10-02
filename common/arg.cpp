@@ -2477,6 +2477,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_S"));
     add_opt(common_arg(
+        {"-ctki", "--cache-type-idx"}, "TYPE",
+        string_format(
+            "sparse-attention indexer cache data type (GLM-5.3 DSA: the indexer keys and the compressor gates)\n"
+            "allowed values: f16, q8_0\n"
+            "(default: %s)",
+            ggml_type_name(params.cache_type_idx)
+        ),
+        [](common_params & params, const std::string & value) {
+            const ggml_type t = kv_cache_type_from_str(value);
+            if (t != GGML_TYPE_F16 && t != GGML_TYPE_Q8_0) {
+                throw std::runtime_error("Unsupported indexer cache type: " + value + " (f16, q8_0)");
+            }
+            params.cache_type_idx = t;
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_IDX"));
+    add_opt(common_arg(
         {"--kv-mean-center"}, "FNAME",
         "path to a K-cache mean-centering bias file (GGUF), generated with tools/kv-mean-center\n"
         "subtracts a fixed per-(head,channel) bias from K before it is quantized into the cache;\n"

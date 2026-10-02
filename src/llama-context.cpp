@@ -572,6 +572,7 @@ llama_context::llama_context(
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
             /*.type_s    =*/ params.type_s,
+            /*.type_idx  =*/ params.type_idx,
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.n_swa_mtp =*/ cparams.n_swa_mtp,
@@ -3984,6 +3985,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.type_s                      =*/ GGML_TYPE_F32,
+        /*.type_idx                    =*/ GGML_TYPE_F16,
         /*.path_kv_mean_center         =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
@@ -4038,6 +4040,11 @@ llama_context * llama_init_from_model(
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (params.type_idx != GGML_TYPE_F16 && params.type_idx != GGML_TYPE_Q8_0) {
+        LLAMA_LOG_ERROR("%s: unsupported indexer cache type %s (f16 or q8_0)\n", __func__, ggml_type_name(params.type_idx));
         return nullptr;
     }
 

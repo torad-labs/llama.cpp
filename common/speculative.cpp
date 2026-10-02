@@ -2562,6 +2562,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    result.cache_type_idx = GGML_TYPE_F16; // the draft's indexer cache is one layer's: f16
 
     // the K-cache mean-center bias is calibrated for the target model
     // (per-head/channel K layout); the draft model has a different K
