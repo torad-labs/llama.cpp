@@ -519,11 +519,172 @@ static __global__ void lightning_indexer_kernel_quad(
     }
 }
 
-// GGML_CUDA_LIGHTNING_INDEXER_CHECK=1: the vector kernel runs beside the quad kernel and a differing bit traps
+// One level of an octet's cross-lane tree over the N keys each lane holds: the lanes with bit m keep the upper half of
+// the keys and send the lower half, their partners the reverse, and each adds its partner's value of a key it keeps to
+// its own, the sum the butterfly's level makes for that key. One shuffle a kept key where the butterfly takes one a key.
+template <int N>
+static __device__ __forceinline__ void lightning_indexer_oct_level(float * part, const int m, const bool hi) {
+#pragma unroll
+    for (int i = 0; i < N/2; ++i) {
+        const float send = hi ? part[i]       : part[i + N/2];
+        const float keep = hi ? part[i + N/2] : part[i];
+        part[i] = keep + __shfl_xor_sync(0xffffffff, send, m, WARP_SIZE);
+    }
+}
+
+// The vector kernel's scores bit for bit, a key to an octet of lanes: lane t of an octet holds the dims lanes t + 8j
+// (j = 0..3) hold in the vector kernel, 32j + 4t to 32j + 4t + 3, and adds its 4 products in registers in the order
+// warp_reduce_sum's xor 16 and 8 add them (the bits of j), then xor 4, 2 and 1 across the octet, each level handing half
+// of the keys a lane holds to its partner (lightning_indexer_oct_level) until a lane holds one. Every q value a lane
+// reads from shared memory serves the KEYS_PER_OCT keys it holds, twice the quad kernel's 2 at the same registers: that
+// kernel is bound by q's delivery from shared memory (L1 at 90 %, DRAM at 2 %, GLM-5.3's pooled keys at 64K cells).
+template <int WARPS_PER_BLOCK, int KEYS_PER_OCT, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
+static __global__ void lightning_indexer_kernel_oct(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        int64_t n_stream, int64_t n_batch, int64_t n_kv,
+        size_t nb1, size_t nb2, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbk1, size_t nbk2, size_t nbk3,
+        size_t nbw1, size_t nbw2, size_t nbw3,
+        size_t nbm1, size_t nbm2, size_t nbm3,
+        int64_t nem3,
+        const int32_t * rows, int64_t s_rows
+    ) {
+    static_assert(N_EMBD == 4*WARP_SIZE, "a lane of the vector kernel holds 4 dims");
+    static_assert(KEYS_PER_OCT == 1 || KEYS_PER_OCT == 2 || KEYS_PER_OCT == 4 || KEYS_PER_OCT == 8, "halved down to one at 3 levels");
+
+    constexpr int N_J               = N_EMBD / 32; // float4s a lane holds of a key
+    constexpr int OCTS_PER_WARP     = WARP_SIZE / 8;
+    constexpr int KEYS_PER_WARP     = OCTS_PER_WARP * KEYS_PER_OCT;
+    constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+    static_assert(THREADS_PER_BLOCK >= N_HEAD, "a thread loads a head's weight");
+
+    const int i_batch  = blockIdx.y;
+    const int i_stream = blockIdx.z;
+    const int i_warp   = threadIdx.y;
+    const int i_lane   = threadIdx.x;
+    const int tid      = i_warp * WARP_SIZE + i_lane;
+    const int i_oct    = i_lane / 8;
+    const int t        = i_lane % 8;
+
+    // key c of an octet: consecutive octets hold consecutive keys, so a warp writes its scores contiguously
+    const int start_kv = (blockIdx.x * WARPS_PER_BLOCK + i_warp) * KEYS_PER_WARP + i_oct;
+
+    const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
+    const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
+    const int32_t * rows_s = rows ? rows + i_stream*s_rows : nullptr;
+
+    float4 k_reg_f[KEYS_PER_OCT][N_J];
+
+#pragma unroll
+    for (int c = 0; c < KEYS_PER_OCT; ++c) {
+        const int i_kv = start_kv + c*OCTS_PER_WARP;
+        if (i_kv < n_kv) {
+            const int64_t i_row = rows_s ? rows_s[i_kv] : i_kv;
+            const char * k_base = K + i_row*nbk2 + i_stream*nbk3;
+            if constexpr (TYPE_K == GGML_TYPE_F32) {
+#pragma unroll
+                for (int j = 0; j < N_J; ++j) {
+                    k_reg_f[c][j] = ((const float4 *) k_base)[8*j + t];
+                }
+            } else {
+                constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();
+#pragma unroll
+                for (int j = 0; j < N_J; ++j) {
+                    dequantize_k(k_base, &k_reg_f[c][j], 32*j + 4*t);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < N_J; ++j) {
+                k_reg_f[c][j] = make_float4(0, 0, 0, 0);
+            }
+        }
+    }
+
+    __shared__ float  w_shared[N_HEAD];
+    __shared__ float4 q_shared_f[N_HEAD][N_EMBD / 4];
+
+    if (tid < N_HEAD) {
+        w_shared[tid] = w_base[tid];
+    }
+#pragma unroll
+    for (int i_q = tid; i_q < N_HEAD * (N_EMBD / 4); i_q += THREADS_PER_BLOCK) {
+        const int i_head = i_q / (N_EMBD / 4);
+        const int i_embd = i_q % (N_EMBD / 4);
+        q_shared_f[i_head][i_embd] = *(const float4 *) (q_base + i_head*nbq1 + i_embd*sizeof(float4));
+    }
+
+    __syncthreads();
+
+    float score = 0.0f; // of the one key the cross-lane levels leave this lane
+
+#pragma unroll 2
+    for (int i_head = 0; i_head < N_HEAD; ++i_head) {
+        const float w_val = w_shared[i_head];
+        float qk[KEYS_PER_OCT][N_J];
+
+#pragma unroll
+        for (int j = 0; j < N_J; ++j) {
+            const float4 q_vec = q_shared_f[i_head][8*j + t];
+#pragma unroll
+            for (int c = 0; c < KEYS_PER_OCT; ++c) {
+                qk[c][j] = 0.0f;
+                ggml_cuda_mad(qk[c][j], q_vec.x, k_reg_f[c][j].x);
+                ggml_cuda_mad(qk[c][j], q_vec.y, k_reg_f[c][j].y);
+                ggml_cuda_mad(qk[c][j], q_vec.z, k_reg_f[c][j].z);
+                ggml_cuda_mad(qk[c][j], q_vec.w, k_reg_f[c][j].w);
+            }
+        }
+
+        float part[KEYS_PER_OCT];
+#pragma unroll
+        for (int c = 0; c < KEYS_PER_OCT; ++c) {
+            static_assert(N_J == 4, "the in-register levels are xor 16 and 8");
+            const float x16_0 = qk[c][0] + qk[c][2];
+            const float x16_1 = qk[c][1] + qk[c][3];
+            part[c] = x16_0 + x16_1;
+        }
+
+        // xor 4, 2 and 1 across the octet, halving the keys a lane holds at each level while it holds more than one
+        if constexpr (KEYS_PER_OCT >= 2) {
+            lightning_indexer_oct_level<KEYS_PER_OCT>(part, 4, t & 4);
+        } else {
+            part[0] += __shfl_xor_sync(0xffffffff, part[0], 4, WARP_SIZE);
+        }
+        if constexpr (KEYS_PER_OCT >= 4) {
+            lightning_indexer_oct_level<KEYS_PER_OCT/2>(part, 2, t & 2);
+        } else {
+            part[0] += __shfl_xor_sync(0xffffffff, part[0], 2, WARP_SIZE);
+        }
+        if constexpr (KEYS_PER_OCT >= 8) {
+            lightning_indexer_oct_level<KEYS_PER_OCT/4>(part, 1, t & 1);
+        } else {
+            part[0] += __shfl_xor_sync(0xffffffff, part[0], 1, WARP_SIZE);
+        }
+
+        // ReLU, weight
+        const float sum = (part[0] > 0.0f) ? part[0] : 0.0f;
+        score += sum * w_val;
+    }
+
+    // the key the levels left this lane, and one lane of each that holds it
+    const int c = (KEYS_PER_OCT >= 2 && (t & 4) ? KEYS_PER_OCT/2 : 0) + (KEYS_PER_OCT >= 4 && (t & 2) ? KEYS_PER_OCT/4 : 0) +
+        (KEYS_PER_OCT >= 8 && (t & 1) ? KEYS_PER_OCT/8 : 0);
+    constexpr int same_key = 8/KEYS_PER_OCT - 1; // the low bits of t whose lanes hold the same key
+    const int i_kv = start_kv + c*OCTS_PER_WARP;
+    if ((t & same_key) == 0 && i_kv < n_kv) {
+        const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+        float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+        dst_base[i_kv] = score + __half2float(m_base[i_kv]);
+    }
+}
+
+// GGML_CUDA_LIGHTNING_INDEXER_CHECK=1: the vector kernel runs beside the octet (or quad) kernel and a differing bit traps
 static __global__ void lightning_indexer_check(const float * quad, const float * vec, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n && __float_as_uint(quad[i]) != __float_as_uint(vec[i])) {
-        printf("lightning indexer check: score %lld is %08x from the quad kernel, %08x from the vector kernel\n",
+        printf("lightning indexer check: score %lld is %08x from the octet (or quad) kernel, %08x from the vector kernel\n",
                 (long long) i, __float_as_uint(quad[i]), __float_as_uint(vec[i]));
         __trap();
     }
@@ -548,10 +709,29 @@ static __global__ void lightning_indexer_check(const float * quad, const float *
 static constexpr int LIGHTNING_INDEXER_QUAD_WARPS = 4;
 static constexpr int LIGHTNING_INDEXER_QUAD_KEYS  = 2;
 
-// the quad kernel into dst, the vector kernel into vec_d (dst, or the check's buffer), whichever of them run
+// the octet kernel's: 4 warps of 4 octets, LIGHTNING_INDEXER_OCT_KEYS keys an octet
+static constexpr int LIGHTNING_INDEXER_OCT_WARPS = 4;
+static constexpr int LIGHTNING_INDEXER_OCT_KEYS  = 4;
+static constexpr int LIGHTNING_INDEXER_OCT_KEYS_PER_BLOCK = LIGHTNING_INDEXER_OCT_WARPS * (WARP_SIZE/8) * LIGHTNING_INDEXER_OCT_KEYS;
+
+// the octet (or quad) kernel into dst, the vector kernel into vec_d (dst, or the check's buffer), whichever of them run
 #define LIGHTNING_INDEXER_VEC_CASE(n_embd, n_head, K, type_K)                                   \
     if (K->type == (type_K)) {                                                                   \
-        if (!vec_legacy) {                                                                       \
+        if (!vec_legacy && !oct_legacy) {                                                        \
+            lightning_indexer_kernel_oct<LIGHTNING_INDEXER_OCT_WARPS, LIGHTNING_INDEXER_OCT_KEYS,   \
+                n_embd, n_head, type_K>                                                          \
+                <<<grid_oct, block_oct, 0, ctx.stream()>>>(                                      \
+                q_d, k_d, w_d, m_d, dst_d,                                                       \
+                n_stream, n_batch, n_kv,                                                         \
+                nb1, nb2, nb3,                                                                   \
+                nbq1, nbq2, nbq3,                                                                \
+                nbk1, nbk2, nbk3,                                                                \
+                nbw1, nbw2, nbw3,                                                                \
+                nbm1, nbm2, nbm3,                                                                \
+                nem3,                                                                            \
+                rows_d, s_rows                                                                   \
+            );                                                                                   \
+        } else if (!vec_legacy) {                                                                \
             lightning_indexer_kernel_quad<LIGHTNING_INDEXER_QUAD_WARPS, LIGHTNING_INDEXER_QUAD_KEYS, \
                 n_embd, n_head, type_K>                                                          \
                 <<<grid, block_quad, 0, ctx.stream()>>>(                                         \
@@ -636,13 +816,17 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int32_t * rows_d = r ? (const int32_t *) r->data : nullptr;
     const int64_t   s_rows = r ? r->nb[1] / sizeof(int32_t) : 0;
 
-    // the vector kernel's cases run the quad kernel; GGML_CUDA_LIGHTNING_INDEXER_VEC_LEGACY=1 the vector kernel,
-    // GGML_CUDA_LIGHTNING_INDEXER_CHECK=1 both (the vector kernel into a buffer the check compares)
+    // the vector kernel's cases run the octet kernel; GGML_CUDA_LIGHTNING_INDEXER_OCT_LEGACY=1 the quad kernel,
+    // GGML_CUDA_LIGHTNING_INDEXER_VEC_LEGACY=1 the vector kernel, and GGML_CUDA_LIGHTNING_INDEXER_CHECK=1, a debug
+    // instrument, the vector kernel too (into a buffer the check compares)
     static const bool vec_legacy = ggml_env_switch("GGML_CUDA_LIGHTNING_INDEXER_VEC_LEGACY");
+    static const bool oct_legacy = ggml_env_switch("GGML_CUDA_LIGHTNING_INDEXER_OCT_LEGACY");
     static const bool vec_check  = !vec_legacy && ggml_env_switch("GGML_CUDA_LIGHTNING_INDEXER_CHECK");
     ggml_cuda_pool_alloc<float> vec_check_buf(ctx.pool());
     float * vec_d = vec_legacy ? dst_d : nullptr;
     const dim3 block_quad(WARP_SIZE, LIGHTNING_INDEXER_QUAD_WARPS);
+    const dim3 block_oct(WARP_SIZE, LIGHTNING_INDEXER_OCT_WARPS);
+    const dim3 grid_oct((n_kv + LIGHTNING_INDEXER_OCT_KEYS_PER_BLOCK - 1) / LIGHTNING_INDEXER_OCT_KEYS_PER_BLOCK, n_batch, n_stream);
 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;

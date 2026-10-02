@@ -13278,6 +13278,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // GLM-5.3's pooled keys (4 cells a pool) for a 1024-token ubatch at 64K and 256K cells
+    for (int64_t kv : { 16384, 65536 }) {
+        test_cases.emplace_back(new test_lightning_indexer_rows(32, kv, 4*kv, 1024, 1, GGML_TYPE_F16));
+    }
     // GLM-5.3-Flash's pooled indexer at 32K cached tokens: 8258 pools read by rows from the f16 cache, decode and a 3-token verify
     for (int bs : { 1, 3 }) {
         test_cases.emplace_back(new test_lightning_indexer_rows(32, 8258, 33040, bs, 1, GGML_TYPE_F16));
