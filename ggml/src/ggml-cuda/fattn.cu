@@ -235,6 +235,43 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// The 32-head tile takes a sparse launch of GLM's 512-wide latent with 32 heads or a multiple on it, where the 8-head tiles
+// number at least 4 for each block of the 8-head launch's stream-k grid: the tiles that grid splits, which its kernel redoes
+// after the head tile, are then a few of them. The block count is the bound the shared memory sets on the blocks an SM holds,
+// at least the occupancy launch_fattn finds, so the test only errs toward the 8-head launch.
+// GGML_CUDA_FATTN_SPARSE_HEADS_LEGACY=1: the 8-head launch alone.
+bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, dst);
+    return false;
+#else
+    static const bool heads_legacy = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_HEADS_LEGACY");
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int id = ctx.device;
+    const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[id];
+
+    const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
+    if (heads_legacy || !GGML_CUDA_CC_IS_NVIDIA(info.cc) || !turing_mma_available(info.cc) ||
+            Q->ne[0] != 512 || V->ne[0] != 512 || gqa_ratio % 32 != 0) {
+        return false;
+    }
+
+    static int smem_sm[GGML_CUDA_MAX_DEVICES]    = {0}; // shared memory an SM holds, and what each block reserves of it
+    static int smem_block[GGML_CUDA_MAX_DEVICES] = {0};
+    if (smem_sm[id] == 0) {
+        CUDA_CHECK(cudaDeviceGetAttribute(&smem_block[id], cudaDevAttrReservedSharedMemoryPerBlock, ggml_cuda_get_device()));
+        CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm[id], cudaDevAttrMaxSharedMemoryPerMultiprocessor, ggml_cuda_get_device()));
+    }
+    const fattn_mma_geometry geom = ggml_cuda_fattn_mma_get_geometry<512, 512, 1, 8, GGML_TYPE_F16, GGML_TYPE_F16>(info.cc, info.warp_size);
+    const int64_t blocks = int64_t(smem_sm[id] / (geom.nbytes_shared + smem_block[id])) * info.nsm;
+    const int64_t ntiles = Q->ne[1] * (gqa_ratio/8) * K->ne[2] * Q->ne[3];
+    return ntiles >= 4*blocks;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
