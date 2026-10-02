@@ -38,6 +38,14 @@ static bool mtp_pending_h_legacy() {
     return legacy;
 }
 
+// LLAMA_MTP_FOLD_LEGACY=1: a generating sequence's verify rows enter the MTP head in a decode of their own, right after
+// the target's, and draft() decodes the new row in another one (two head decodes before the first draft token). By
+// default the rows wait and enter with draft()'s first decode, cut to the ones the target accepted.
+static bool mtp_fold_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_MTP_FOLD_LEGACY");
+    return legacy;
+}
+
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
@@ -1456,6 +1464,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // The fold (single-head, own-cache MTP; LLAMA_MTP_FOLD_LEGACY=1 turns it off). process() holds a generating
+    // sequence's rows instead of decoding them, accept() cuts them to the accepted prefix, and draft() decodes them
+    // with the new row in one batch, so a round's head decodes go from n_max + 1 to n_max and rejected rows never
+    // enter the head. end() decodes what is still held, so the cache a later prompt reuses is complete.
+    // It needs a draft context that rolls back partially, so the server never restores it around draft(): a
+    // checkpoint taken before draft() would take the folded rows back out. Every single-head own-cache MTP context
+    // here is one -- its memory holds only the NextN attention layer(s) (llama-model.cpp's MTP layer filters).
+    bool fold = false;
+    struct held_rows {
+        std::vector<llama_token> tok;
+        std::vector<llama_pos>   pos;
+        std::vector<float>       h;          // [rows][n_embd]
+        int32_t                  last_beg = 0; // first row of the latest process() call: accept() cuts after it
+    };
+    std::vector<held_rows> held;              // [n_seq]
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1541,6 +1565,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        fold = !mtp_fold_legacy() && !chain_heads && !is_mem_shared;
+        held.assign(n_seq, {});
+        SPC_TRC("- fold the catch-up rows into the first draft decode: %s\n", fold ? "yes" : "no");
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1628,7 +1656,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
-            if (decode_only) {
+            if (fold) {
+                // a generating sequence's rows are held for draft(); any other sequence's rows (a prompt's) enter the
+                // head now, as without the fold. A row's embedding is the target's h of the row before it, a sequence's
+                // first row the h kept from the previous call (rows of a sequence are consecutive in batch_in).
+                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    const int32_t beg = i_batch_beg[seq_id];
+                    if (beg < 0 || (decode_only && !generating[seq_id])) {
+                        continue;
+                    }
+                    const int32_t end = i_batch_end[seq_id];
+                    const auto row_h = [&](int k) {
+                        return k == beg ? h_before(seq_id, batch_in.pos[k]) : h_tgt + (size_t) (k - 1) * n_embd;
+                    };
+                    if (generating[seq_id]) {
+                        auto & hr = held[seq_id];
+                        // rows held through a round that did not draft carry over only if this batch continues them
+                        if (!hr.pos.empty() && hr.pos.back() + 1 != batch_in.pos[beg]) {
+                            hr = {};
+                        }
+                        hr.last_beg = (int32_t) hr.pos.size();
+                        for (int k = beg; k <= end; ++k) {
+                            hr.tok.push_back(batch_in.token[k]);
+                            hr.pos.push_back(batch_in.pos[k]);
+                            hr.h.insert(hr.h.end(), row_h(k), row_h(k) + n_embd);
+                        }
+                        continue;
+                    }
+                    for (int k = beg; k <= end; ++k) {
+                        common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq_id }, 0);
+                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, row_h(k), row_bytes);
+                    }
+                }
+            } else if (decode_only) {
                 // only the rows of generating sequences enter the head, grouped per sequence (rows of a
                 // sequence are consecutive in batch_in); every row's embedding is the target's h of the
                 // row before it, the first row's the pending h from the previous call
@@ -1753,6 +1814,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+
+            if (fold) {
+                // the rows process() held, already cut to the accepted ones, go in ahead of the new row they end at
+                auto & hr = held[seq_id];
+                if (!hr.pos.empty() && hr.pos.back() + 1 == dp.n_past) {
+                    if (decode_only) {
+                        evict_to_window(seq_id, (int32_t) hr.pos.size());
+                    }
+                    for (size_t r = 0; r < hr.pos.size(); ++r) {
+                        common_batch_add(batch, hr.tok[r], hr.pos[r], { seq_id }, false);
+                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, hr.h.data() + r * n_embd, row_bytes);
+                    }
+                } else if (!hr.pos.empty()) {
+                    SPC_DBG("seq_id %d: %zu held rows end at pos %d, the draft starts at %d: dropped\n",
+                            (int) seq_id, hr.pos.size(), (int) hr.pos.back(), (int) dp.n_past);
+                }
+                hr = {};
+            }
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1904,6 +1983,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        if (fold) {
+            // the latest verify rows are the sampled token and the drafts: keep the sampled one and the accepted drafts
+            auto & hr = held[seq_id];
+            const int32_t n_last = (int32_t) hr.pos.size() - hr.last_beg;
+            if (n_last > 0) {
+                const int32_t keep = hr.last_beg + std::min<int32_t>(n_accepted, n_last - 1) + 1;
+                hr.tok.resize(keep);
+                hr.pos.resize(keep);
+                hr.h.resize((size_t) keep * n_embd);
+            }
+        }
+
         const int32_t n_rows = verify_h_rows[seq_id];
         if (n_rows <= 0) {
             return;
@@ -1917,7 +2008,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void end(llama_seq_id seq_id) override {
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            if (fold) {
+                flush_held(seq_id);
+            }
             generating[seq_id] = 0;
+        }
+    }
+
+    // the fold: the rows a sequence still holds at the end of its turn enter the head, so a later prompt that reuses
+    // this sequence's cache finds every position it saw
+    void flush_held(llama_seq_id seq_id) {
+        auto & hr = held[seq_id];
+        if (hr.pos.empty()) {
+            return;
+        }
+        if (decode_only) {
+            evict_to_window(seq_id, (int32_t) hr.pos.size());
+        }
+        common_batch_clear(batch);
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        for (size_t r = 0; r < hr.pos.size(); ++r) {
+            common_batch_add(batch, hr.tok[r], hr.pos[r], { seq_id }, false);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, hr.h.data() + r * n_embd, row_bytes);
+        }
+        hr = {};
+        const int32_t rc = llama_decode(params.ctx_dft, batch);
+        if (rc != 0) {
+            SPC_ERR("llama_decode(ctx_dft) of %d held rows failed rc=%d\n", (int) batch.n_tokens, (int) rc);
         }
     }
 
