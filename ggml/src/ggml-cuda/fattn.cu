@@ -99,17 +99,10 @@ static __global__ void flash_attn_mask_to_sparse_indices_legacy(
 static constexpr int sparse_scan_threads = 1024;
 static constexpr int sparse_scan_cols    = 32;
 
-// NROWS: how many consecutive query rows share one index list. 1 is the per-query list the ncols1 == 1 kernel reads; with
-// NROWS > 1 a block emits the UNION of its rows' cells, so a tile of NROWS queries gathers each cell once instead of once
-// per query. Whether that pays is entirely a question of how much adjacent queries' selections overlap, which is a
-// property of the TRAINED indexer and cannot be measured on a random-weight proxy: see heads/glm-5.3-flash/evidence.md.
-// Correctness does not depend on the overlap -- flash_attn_ext_f16_load_mask reads each row's own mask value at every
-// gathered cell, so a cell a row does not select still reads -inf for that row.
-template <int NROWS>
 __launch_bounds__(sparse_scan_threads, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
         const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
-        const int64_t s31, const int64_t s33, const int ne31) {
+        const int64_t s31, const int64_t s33) {
     ggml_cuda_pdl_sync();
 
     constexpr int nwarps = sparse_scan_threads/WARP_SIZE;
@@ -118,13 +111,10 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     const int warp     = tid / WARP_SIZE;
     const int lane     = tid % WARP_SIZE;
     const int sequence = blockIdx.y;
-    const int tile     = blockIdx.x;
+    const int query    = blockIdx.x;
 
-    const half * mask = mask_ptr + sequence*s33 + int64_t(tile)*NROWS*s31;
-    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + tile)*n_kv_max;
-
-    // the last tile is short when ne31 % NROWS != 0; its missing rows contribute nothing to the union
-    const int nrows = NROWS == 1 ? 1 : min(NROWS, ne31 - tile*NROWS);
+    const half * mask = mask_ptr + sequence*s33 + query*s31;
+    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + query)*n_kv_max;
 
     __shared__ int warp_sums[nwarps];
     int row_count = 0;
@@ -132,25 +122,22 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     for (int i0 = 0; i0 < ne30; i0 += sparse_scan_threads*sparse_scan_cols) {
         const int c0 = i0 + tid*sparse_scan_cols;
 
-        // bit c: column c0 + c is finite in ANY of the tile's rows (a half is inf or nan exactly when its exponent bits
-        // are all set). For NROWS == 1 this is one row's own mask and the loop folds away.
-        uint32_t finite = 0;
-        for (int r = 0; r < nrows; ++r) {
-            // 8 halves a load, -inf past the row (ne30 % 8 == 0: a load is all in or all out)
-            uint4 v[sparse_scan_cols/8];
+        // 8 halves a load, -inf past the row (ne30 % 8 == 0: a load is all in or all out)
+        uint4 v[sparse_scan_cols/8];
 #pragma unroll
-            for (int j = 0; j < sparse_scan_cols/8; ++j) {
-                v[j] = c0 + 8*j < ne30 ? ((const uint4 *) (mask + r*s31 + c0))[j] : make_uint4(0xFC00FC00u, 0xFC00FC00u, 0xFC00FC00u, 0xFC00FC00u);
-            }
+        for (int j = 0; j < sparse_scan_cols/8; ++j) {
+            v[j] = c0 + 8*j < ne30 ? ((const uint4 *) (mask + c0))[j] : make_uint4(0xFC00FC00u, 0xFC00FC00u, 0xFC00FC00u, 0xFC00FC00u);
+        }
 
+        // bit c: column c0 + c is finite (a half is inf or nan exactly when its exponent bits are all set)
+        uint32_t finite = 0;
 #pragma unroll
-            for (int j = 0; j < sparse_scan_cols/8; ++j) {
-                const uint32_t w[4] = {v[j].x, v[j].y, v[j].z, v[j].w};
+        for (int j = 0; j < sparse_scan_cols/8; ++j) {
+            const uint32_t w[4] = {v[j].x, v[j].y, v[j].z, v[j].w};
 #pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    finite |= uint32_t((w[k] & 0x00007C00u) != 0x00007C00u) << (8*j + 2*k + 0);
-                    finite |= uint32_t((w[k] & 0x7C000000u) != 0x7C000000u) << (8*j + 2*k + 1);
-                }
+            for (int k = 0; k < 4; ++k) {
+                finite |= uint32_t((w[k] & 0x00007C00u) != 0x00007C00u) << (8*j + 2*k + 0);
+                finite |= uint32_t((w[k] & 0x7C000000u) != 0x7C000000u) << (8*j + 2*k + 1);
             }
         }
         const int count = __popc(finite);
@@ -197,9 +184,9 @@ static __global__ void flash_attn_mask_to_sparse_indices(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, int rows_per_list, cudaStream_t stream) {
+        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(mask, indices, n_kv_max, rows_per_list, stream);
+    GGML_UNUSED_VARS(mask, indices, n_kv_max, stream);
     GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
 #else
     GGML_ASSERT(mask->type == GGML_TYPE_F16);
@@ -207,34 +194,12 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
     const bool aligned = (uintptr_t) mask->data % 16 == 0 && mask->ne[0] % 8 == 0 && s31 % 8 == 0 && s33 % 8 == 0;
-    // the legacy scan has no union form, so a tiled list needs the wide one
-    const bool wide = (!scan_legacy || rows_per_list > 1) && aligned;
-    GGML_ASSERT(rows_per_list == 1 || wide);
-    const int64_t n_lists = (mask->ne[1] + rows_per_list - 1) / rows_per_list;
-    const dim3 blocks_num(n_lists, mask->ne[3], 1);
+    const bool wide = !scan_legacy && aligned;
+    const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
     const dim3 block_dim(wide ? sparse_scan_threads : 256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
-    if (rows_per_list == 1 && !wide) {
-        // the legacy scan is one row a block and takes no row count
-        ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices_legacy, launch_params,
-            (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
-    } else if (rows_per_list == 1) {
-        ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices<1>, launch_params,
-            (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33, int(mask->ne[1]));
-    } else {
-        // only the widths the sparse kernel is instantiated for; ggml_cuda_fattn_sparse_rows_per_list keeps them in step
-        switch (rows_per_list) {
-            case  2: ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices< 2>, launch_params,
-                         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33, int(mask->ne[1])); break;
-            case  4: ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices< 4>, launch_params,
-                         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33, int(mask->ne[1])); break;
-            case  8: ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices< 8>, launch_params,
-                         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33, int(mask->ne[1])); break;
-            case 16: ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices<16>, launch_params,
-                         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33, int(mask->ne[1])); break;
-            default: GGML_ABORT("unsupported rows_per_list %d", rows_per_list);
-        }
-    }
+    ggml_cuda_kernel_launch(wide ? flash_attn_mask_to_sparse_indices : flash_attn_mask_to_sparse_indices_legacy, launch_params,
+        (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
@@ -276,18 +241,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // A tile of 8 query rows sharing one union list, when asked for and when there are 8 rows to tile: the gather then
-    // reads each cell once a tile instead of once a query. Off by default -- what it saves is the trained indexer's
-    // selection overlap, which a random-weight proxy cannot show (evidence.md).
-    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 8, ncols2)) {
-        if (ggml_cuda_fattn_sparse_tile() && Q->ne[1] >= 8 &&
-                ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst, ncols2)) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, ncols2>(ctx, dst);
-            return;
-        }
-    }
-
-    // otherwise one token a tile, whatever the batch
+    // the sparse variant is one token a tile, whatever the batch
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
         if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst, ncols2)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
