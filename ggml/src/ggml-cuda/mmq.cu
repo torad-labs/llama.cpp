@@ -303,6 +303,14 @@ bool ggml_cuda_mmq_moe_tiles_legacy() {
     return legacy;
 }
 
+int ggml_cuda_mmq_l2_prefetch() {
+    static const int pf = [] {
+        const char * s = getenv("GGML_CUDA_MMQ_L2_PF");
+        return s ? std::max(0, atoi(s)) : 1;
+    }();
+    return pf;
+}
+
 int64_t ggml_cuda_mmq_moe_ncols() {
     static const int64_t ncols = [] {
         const char * s = getenv("GGML_CUDA_MMQ_MOE_NCOLS");
