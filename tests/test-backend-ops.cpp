@@ -11529,6 +11529,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, true,  2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, false, 4096, n, 2048));
     }
+    // past the ring's 8 tokens (8 tokens x 8 used is its 64 pairs): 9 to 16 go to mmvq.cu's mul_mat_vec_q_moe, a warp a
+    // token, and 17 to MMQ. 3 slots at an MTP verify of 3 are 9 tokens, 4 slots 12
+    for (int n : { 9, 12, 16, 17 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, true,  2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, false, 4096, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, true,  2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, false, 4096, n, 2048));
+    }
     // and its routed FFN, gate/up then down on one ids: its FFN on one card (2,048) and on each of two under -sm tensor
     // (1,024), with and without the SwiGLU limit
     for (int64_t n_ff : { 2048, 1024 }) {
