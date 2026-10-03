@@ -8,12 +8,15 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -1942,6 +1945,99 @@ struct ggml_backend_meta_context {
         return capture.graphs.back();
     }
 
+    // Launches a replay on every device at once: device 0 from the calling thread, each other device from a thread of
+    // its own. A launch can block inside the call until its device drains (the graph's work does not fit the device's
+    // launch queue), and the device drains only once its peers reach the graph's first all-reduce, so one thread
+    // launching the devices in turn deadlocks (NCCL docs, "Using NCCL with CUDA Graphs"). launch_all returns once every
+    // launch returned, so what the calling thread queues next follows the replay on every device.
+    struct capture_launcher {
+        ggml_backend_capture_launch_t launch;
+        std::vector<ggml_backend_t>   backends;
+        std::vector<std::thread>      threads; // device j's is threads[j - 1]
+        std::mutex                    mtx;
+        std::condition_variable       cv_start;
+        std::condition_variable       cv_done;
+        const std::vector<void *> *   execs     = nullptr; // the replay's graphs, one a device
+        uint64_t                      n_started = 0;       // replays started, the threads' signal
+        size_t                        n_pending = 0;       // the threads' launches of this replay not returned yet
+        bool                          stop      = false;
+
+        capture_launcher(ggml_backend_capture_launch_t launch_fn, std::vector<ggml_backend_t> device_backends) :
+            launch(launch_fn), backends(std::move(device_backends)) {
+            for (size_t j = 1; j < backends.size(); j++) {
+                threads.emplace_back([this, j] { run(j); });
+            }
+        }
+
+        ~capture_launcher() {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                stop = true;
+            }
+            cv_start.notify_all();
+            for (std::thread & t : threads) {
+                t.join();
+            }
+        }
+
+        void run(size_t j) {
+            uint64_t n_seen = 0;
+            while (true) {
+                void * exec;
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv_start.wait(lock, [&] { return stop || n_started != n_seen; });
+                    if (stop) {
+                        return;
+                    }
+                    n_seen = n_started;
+                    exec   = (*execs)[j];
+                }
+                launch(backends[j], exec);
+                std::lock_guard<std::mutex> lock(mtx);
+                if (--n_pending == 0) {
+                    cv_done.notify_one();
+                }
+            }
+        }
+
+        void launch_all(const std::vector<void *> & e) {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                execs     = &e;
+                n_pending = threads.size();
+                n_started++;
+            }
+            cv_start.notify_all();
+            launch(backends[0], e[0]);
+            std::unique_lock<std::mutex> lock(mtx);
+            cv_done.wait(lock, [&] { return n_pending == 0; });
+        }
+    };
+    std::unique_ptr<capture_launcher> launcher; // made at the first replay
+
+    // launch a captured evaluation on every device; GGML_META_CAPTURE_THREADS=0: the calling thread launches them in turn
+    void capture_launch(const capture_state::graph & g) {
+        static const bool threads_off = [] {
+            const char * s = getenv("GGML_META_CAPTURE_THREADS");
+            return s != nullptr && atoi(s) == 0;
+        }();
+        if (threads_off) {
+            for (size_t j = 0; j < backend_configs.size(); j++) {
+                capture.launch(backend_configs[j].backend, g.execs[j]);
+            }
+            return;
+        }
+        if (!launcher) {
+            std::vector<ggml_backend_t> backends;
+            for (const backend_config & bc : backend_configs) {
+                backends.push_back(bc.backend);
+            }
+            launcher = std::make_unique<capture_launcher>(capture.launch, std::move(backends));
+        }
+        launcher->launch_all(g.execs);
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1987,6 +2083,7 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
+        launcher.reset();
         for (capture_state::graph & g : capture.graphs) {
             capture_free(g);
         }
@@ -2144,9 +2241,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (!capture_legacy && n_backends > 1 && cgraph->uid != 0 && cap.available()) {
         cg = &backend_ctx->capture_graph(cgraph->uid);
         if (!cg->execs.empty()) {
-            for (size_t j = 0; j < n_backends; j++) {
-                cap.launch(backend_ctx->backend_configs[j].backend, cg->execs[j]);
-            }
+            backend_ctx->capture_launch(*cg);
             return GGML_STATUS_SUCCESS;
         }
     }
@@ -2679,9 +2774,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             if (status == GGML_STATUS_SUCCESS && captured) {
                 cg->execs = std::move(execs);
-                for (size_t j = 0; j < n_backends; j++) {
-                    cap.launch(backend_ctx->backend_configs[j].backend, cg->execs[j]);
-                }
+                backend_ctx->capture_launch(*cg);
                 return GGML_STATUS_SUCCESS;
             }
             // what was captured did not run: drop it, and run the steps
