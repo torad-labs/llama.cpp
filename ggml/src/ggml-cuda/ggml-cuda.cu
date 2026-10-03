@@ -83,6 +83,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <cfloat>
 #include <initializer_list>
 #include <limits>
@@ -162,6 +163,55 @@ static void ggml_cuda_time_launch_record(int device, double us) {
         fprintf(stderr, "cudaGraphLaunch host cost: device %d, %d launches, mean %.1f us\n",
                 device, cnt[device], sum[device] / cnt[device]);
     }
+}
+
+// GGML_CUDA_COUNT_INFLIGHT=1 prints, before each replay launch, the device's earlier replays not yet finished, so the last
+// line before a hang tells a host that ran far ahead (many) from one launch that cannot enqueue (0 or 1).
+static bool ggml_cuda_count_inflight() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_COUNT_INFLIGHT");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return enabled;
+}
+
+struct ggml_cuda_inflight_count {
+    std::mutex              mtx;
+    std::deque<cudaEvent_t> events[GGML_CUDA_MAX_DEVICES]; // one a replay not yet seen finished, oldest first
+    int64_t                 launched[GGML_CUDA_MAX_DEVICES] = {};
+};
+
+static ggml_cuda_inflight_count & ggml_cuda_inflight() {
+    static ggml_cuda_inflight_count c;
+    return c;
+}
+
+// drop the replays that finished, and print launched and in flight, straight to stderr like the launch timer
+static void ggml_cuda_count_inflight_before(int device) {
+    ggml_cuda_inflight_count & c = ggml_cuda_inflight();
+    std::lock_guard<std::mutex> lock(c.mtx);
+    std::deque<cudaEvent_t> & q = c.events[device];
+    while (!q.empty()) {
+        const cudaError_t err = cudaEventQuery(q.front());
+        if (err == cudaErrorNotReady) {
+            (void) cudaGetLastError();
+            break;
+        }
+        CUDA_CHECK(err);
+        CUDA_CHECK(cudaEventDestroy(q.front()));
+        q.pop_front();
+    }
+    fprintf(stderr, "capture launch: device %d, launched %lld, in flight %zu\n", device, (long long) c.launched[device], q.size());
+}
+
+static void ggml_cuda_count_inflight_after(int device, cudaStream_t stream) {
+    ggml_cuda_inflight_count & c = ggml_cuda_inflight();
+    std::lock_guard<std::mutex> lock(c.mtx);
+    cudaEvent_t e;
+    CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(e, stream));
+    c.events[device].push_back(e);
+    c.launched[device]++;
 }
 
 int ggml_cuda_get_device() {
@@ -6997,7 +7047,11 @@ static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
 static void ggml_backend_cuda_capture_launch(ggml_backend_t backend, void * exec) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
-    if (ggml_cuda_time_launch()) {
+    if (ggml_cuda_count_inflight()) {
+        ggml_cuda_count_inflight_before(cuda_ctx->device);
+        CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
+        ggml_cuda_count_inflight_after(cuda_ctx->device, cuda_ctx->stream());
+    } else if (ggml_cuda_time_launch()) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
