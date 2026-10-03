@@ -1906,6 +1906,11 @@ struct ggml_backend_meta_context {
         std::vector<graph>      graphs;
         uint64_t                t_now = 0; // the evaluations so far, t_used's clock
 
+        // ring[E % D]: an event a device, recorded after evaluation E (capture_inflight)
+        int                                            inflight = -1; // D, -1 until read
+        std::vector<std::vector<ggml_backend_event_t>> ring;
+        uint64_t                                       n_queued = 0;
+
         bool available() const {
             return allreduce_capturable != nullptr && graph_capturable != nullptr && begin != nullptr && end != nullptr &&
                 launch != nullptr && free != nullptr;
@@ -1940,6 +1945,55 @@ struct ggml_backend_meta_context {
         capture.graphs.back().uid    = uid;
         capture.graphs.back().t_used = capture.t_now;
         return capture.graphs.back();
+    }
+
+    // A replay launch into a full queue blocks, and the device then waits in an all-reduce for a peer replay that is not
+    // launched yet. GGML_META_CAPTURE_INFLIGHT=D (default 2, 0 no bound): replay E waits until evaluation E-D finished on every device.
+    int capture_inflight() {
+        if (capture.inflight >= 0) {
+            return capture.inflight;
+        }
+        const char * s = getenv("GGML_META_CAPTURE_INFLIGHT");
+        capture.inflight = s ? std::max(0, atoi(s)) : 2;
+        capture.ring.resize(capture.inflight);
+        for (std::vector<ggml_backend_event_t> & slot : capture.ring) {
+            for (const backend_config & bc : backend_configs) {
+                slot.push_back(ggml_backend_event_new(ggml_backend_get_device(bc.backend)));
+                if (slot.back() == nullptr) {
+                    GGML_LOG_WARN("%s: %s: a device has no events, so replays are not bounded\n", __func__, name.c_str());
+                    capture.inflight = 0;
+                    return 0;
+                }
+            }
+        }
+        return capture.inflight;
+    }
+
+    // record the end of the evaluation just queued, on every device, in the slot E-D used
+    void capture_mark_queued() {
+        const int d = capture_inflight();
+        if (d == 0) {
+            return;
+        }
+        std::vector<ggml_backend_event_t> & slot = capture.ring[capture.n_queued % d];
+        for (size_t j = 0; j < backend_configs.size(); j++) {
+            ggml_backend_event_record(slot[j], backend_configs[j].backend);
+        }
+        capture.n_queued++;
+    }
+
+    // launch a captured evaluation on every device, once evaluation E-D finished on all of them
+    void capture_launch_bounded(const capture_state::graph & g) {
+        const int d = capture_inflight();
+        if (d > 0 && capture.n_queued >= (uint64_t) d) {
+            for (ggml_backend_event_t e : capture.ring[capture.n_queued % d]) {
+                ggml_backend_event_synchronize(e);
+            }
+        }
+        for (size_t j = 0; j < backend_configs.size(); j++) {
+            capture.launch(backend_configs[j].backend, g.execs[j]);
+        }
+        capture_mark_queued();
     }
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
@@ -1989,6 +2043,11 @@ struct ggml_backend_meta_context {
     ~ggml_backend_meta_context() {
         for (capture_state::graph & g : capture.graphs) {
             capture_free(g);
+        }
+        for (std::vector<ggml_backend_event_t> & slot : capture.ring) {
+            for (ggml_backend_event_t e : slot) {
+                ggml_backend_event_free(e);
+            }
         }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
@@ -2144,9 +2203,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (!capture_legacy && n_backends > 1 && cgraph->uid != 0 && cap.available()) {
         cg = &backend_ctx->capture_graph(cgraph->uid);
         if (!cg->execs.empty()) {
-            for (size_t j = 0; j < n_backends; j++) {
-                cap.launch(backend_ctx->backend_configs[j].backend, cg->execs[j]);
-            }
+            backend_ctx->capture_launch_bounded(*cg);
             return GGML_STATUS_SUCCESS;
         }
     }
@@ -2679,9 +2736,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             if (status == GGML_STATUS_SUCCESS && captured) {
                 cg->execs = std::move(execs);
-                for (size_t j = 0; j < n_backends; j++) {
-                    cap.launch(backend_ctx->backend_configs[j].backend, cg->execs[j]);
-                }
+                backend_ctx->capture_launch_bounded(*cg);
                 return GGML_STATUS_SUCCESS;
             }
             // what was captured did not run: drop it, and run the steps
@@ -2697,7 +2752,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    return compute_steps();
+    const ggml_status status = compute_steps();
+    if (cg != nullptr) {
+        backend_ctx->capture_mark_queued(); // an evaluation by steps is in the bound too
+    }
+    return status;
 }
 
 static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
