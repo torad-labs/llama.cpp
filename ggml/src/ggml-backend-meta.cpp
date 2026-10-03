@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <condition_variable>
@@ -1945,25 +1946,32 @@ struct ggml_backend_meta_context {
         return capture.graphs.back();
     }
 
-    // Launches a replay on every device at once: device 0 from the calling thread, each other device from a thread of
-    // its own. A launch can block inside the call until its device drains (the graph's work does not fit the device's
-    // launch queue), and the device drains only once its peers reach the graph's first all-reduce, so one thread
-    // launching the devices in turn deadlocks (NCCL docs, "Using NCCL with CUDA Graphs"). launch_all returns once every
+    // Launches a replay on every device. The calling thread launches the devices in turn; at the start of each replay it
+    // wakes a thread a device after the first, and that thread launches its device if the calling thread has not taken
+    // it yet. A launch can block inside the call until its device drains (the graph's work does not fit the device's
+    // launch queue), and a device drains only once its peers reach the graph's first all-reduce, so one thread launching
+    // the devices in turn deadlocks (NCCL docs, "Using NCCL with CUDA Graphs"); here a device the blocked calling thread
+    // has not reached is launched by its own thread. When no launch blocks, the calling thread has usually launched every
+    // device before the threads wake, and a replay costs what launching in turn costs. launch_all returns once every
     // launch returned, so what the calling thread queues next follows the replay on every device.
     struct capture_launcher {
-        ggml_backend_capture_launch_t launch;
-        std::vector<ggml_backend_t>   backends;
-        std::vector<std::thread>      threads; // device j's is threads[j - 1]
-        std::mutex                    mtx;
-        std::condition_variable       cv_start;
-        std::condition_variable       cv_done;
-        const std::vector<void *> *   execs     = nullptr; // the replay's graphs, one a device
-        uint64_t                      n_started = 0;       // replays started, the threads' signal
-        size_t                        n_pending = 0;       // the threads' launches of this replay not returned yet
-        bool                          stop      = false;
+        ggml_backend_capture_launch_t              launch;
+        std::vector<ggml_backend_t>                backends;
+        std::vector<std::thread>                   threads;      // device j's is threads[j - 1]
+        std::unique_ptr<std::atomic<uint64_t>[]>   claimed;      // the last replay device j was taken for
+        std::atomic<int>                           n_taking{0};  // threads taking a device or launching it
+        std::mutex                                 mtx;
+        std::condition_variable                    cv_start;
+        std::condition_variable                    cv_done;
+        const std::vector<void *> *                execs     = nullptr; // the replay's graphs, one a device
+        uint64_t                                   n_started = 0;       // replays started; replay g is numbered g
+        bool                                       stop      = false;
 
         capture_launcher(ggml_backend_capture_launch_t launch_fn, std::vector<ggml_backend_t> device_backends) :
-            launch(launch_fn), backends(std::move(device_backends)) {
+            launch(launch_fn), backends(std::move(device_backends)), claimed(new std::atomic<uint64_t>[backends.size()]) {
+            for (size_t j = 0; j < backends.size(); j++) {
+                claimed[j] = 0;
+            }
             for (size_t j = 1; j < backends.size(); j++) {
                 threads.emplace_back([this, j] { run(j); });
             }
@@ -1980,38 +1988,61 @@ struct ggml_backend_meta_context {
             }
         }
 
+        // device j for replay g, unless another thread took it
+        bool take(size_t j, uint64_t g) {
+            uint64_t prev = g - 1;
+            return claimed[j].compare_exchange_strong(prev, g);
+        }
+
         void run(size_t j) {
             uint64_t n_seen = 0;
             while (true) {
-                void * exec;
+                uint64_t                    g;
+                const std::vector<void *> * ex;
                 {
                     std::unique_lock<std::mutex> lock(mtx);
                     cv_start.wait(lock, [&] { return stop || n_started != n_seen; });
                     if (stop) {
                         return;
                     }
-                    n_seen = n_started;
-                    exec   = (*execs)[j];
+                    n_seen = g = n_started;
+                    ex         = execs;
                 }
-                launch(backends[j], exec);
-                std::lock_guard<std::mutex> lock(mtx);
-                if (--n_pending == 0) {
+                // A thread can wake after launch_all(g) returned and the replayed graphs were freed, so it reads them only
+                // once it took device j: then launch_all(g) has not returned, as it fails its own take of j or waits for
+                // n_taking, raised before the take.
+                n_taking++;
+                if (take(j, g)) {
+                    launch(backends[j], (*ex)[j]);
+                }
+                if (--n_taking == 0) {
+                    std::lock_guard<std::mutex> lock(mtx);
                     cv_done.notify_one();
                 }
             }
         }
 
         void launch_all(const std::vector<void *> & e) {
+            uint64_t g;
             {
                 std::lock_guard<std::mutex> lock(mtx);
-                execs     = &e;
-                n_pending = threads.size();
-                n_started++;
+                execs = &e;
+                g     = ++n_started;
             }
             cv_start.notify_all();
-            launch(backends[0], e[0]);
-            std::unique_lock<std::mutex> lock(mtx);
-            cv_done.wait(lock, [&] { return n_pending == 0; });
+            for (size_t j = 0; j < backends.size(); j++) {
+                if (take(j, g)) {
+                    launch(backends[j], e[j]);
+                }
+            }
+            // a thread still taking or launching: a launch takes microseconds, so yield a while before sleeping
+            for (int i = 0; i < 1000 && n_taking.load() != 0; i++) {
+                std::this_thread::yield();
+            }
+            if (n_taking.load() != 0) {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv_done.wait(lock, [&] { return n_taking.load() == 0; });
+            }
         }
     };
     std::unique_ptr<capture_launcher> launcher; // made at the first replay
