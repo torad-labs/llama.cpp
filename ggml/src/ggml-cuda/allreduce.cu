@@ -576,6 +576,15 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // One host thread launches the kernel on device 0, then on device 1 (ggml_cuda_ar_allreduce). Under
+    // CUDA_LAUNCH_BLOCKING the first launch waits for the kernel to end, which waits for device 1's, so it never returns.
+    const char * launch_blocking = getenv("CUDA_LAUNCH_BLOCKING");
+    if (launch_blocking != nullptr && atoi(launch_blocking) != 0) {
+        GGML_LOG_WARN("%s: CUDA_LAUNCH_BLOCKING=%s would deadlock the internal AllReduce; "
+                      "falling back to the meta backend's butterfly\n", __func__, launch_blocking);
+        return nullptr;
+    }
+
     auto * p = new ggml_cuda_ar_pipeline{};
     p->n_devices        = n_devices;
     p->copy_bytes       = GGML_CUDA_AR_COPY_MAX_BYTES;
