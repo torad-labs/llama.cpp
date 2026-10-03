@@ -1997,8 +1997,8 @@ struct ggml_backend_meta_context {
         void run(size_t j) {
             uint64_t n_seen = 0;
             while (true) {
-                uint64_t g;
-                void *   exec;
+                uint64_t                    g;
+                const std::vector<void *> * ex;
                 {
                     std::unique_lock<std::mutex> lock(mtx);
                     cv_start.wait(lock, [&] { return stop || n_started != n_seen; });
@@ -2006,11 +2006,14 @@ struct ggml_backend_meta_context {
                         return;
                     }
                     n_seen = g = n_started;
-                    exec       = (*execs)[j];
+                    ex         = execs;
                 }
-                n_taking++; // before the take: once launch_all finds device j taken, it waits for this to drop
+                // A thread can wake after launch_all(g) returned and the replayed graphs were freed, so it reads them only
+                // once it took device j: then launch_all(g) has not returned, as it fails its own take of j or waits for
+                // n_taking, raised before the take.
+                n_taking++;
                 if (take(j, g)) {
-                    launch(backends[j], exec);
+                    launch(backends[j], (*ex)[j]);
                 }
                 if (--n_taking == 0) {
                     std::lock_guard<std::mutex> lock(mtx);
