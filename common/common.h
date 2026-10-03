@@ -617,6 +617,7 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
     ggml_type cache_type_s = GGML_TYPE_F32; // recurrent state cache data type (Gated DeltaNet / SSM S): f32, f16, bf16, q8_0
+    ggml_type cache_type_idx = GGML_TYPE_F16; // sparse-attention indexer cache data type (GLM-5.3 DSA keys and gates): f16, q8_0
 
     // path to a K-cache mean-centering bias file (GGUF), or empty to disable.
     // only takes effect when cache_type_k == GGML_TYPE_Q4_0; see docs/kv-mean-center.md

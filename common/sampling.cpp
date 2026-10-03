@@ -117,11 +117,19 @@ static bool top_k_prefilter_legacy() {
     return legacy;
 }
 
-// the k largest logits as candidates, sorted by logit (ties by id): the set top-k's partial sort of every token keeps,
-// without the n_vocab-long array; a block of logits is skipped with one compare pass when none beats the k-th so far
-static void top_k_candidates(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
-    // a min-heap on the logit, as in std::partial_sort: a later token replaces the smallest only when strictly larger
-    const auto heap_cmp = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+// LLAMA_SAMPLING_TIES_LEGACY=1, read as src/llama-sampler.cpp reads it: candidates of equal logit are not ordered by id,
+// so the heap below may keep any of those tied at its k-th (the behaviour before ties were broken by id)
+static bool sampling_ties_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLING_TIES_LEGACY");
+    return legacy;
+}
+
+void common_sampler_top_k_candidates(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
+    // a heap whose front is the worst kept, by logit and then id as llama's candidate sorts order them: a later token,
+    // its id larger than every kept one's, replaces the worst only when its logit is strictly larger
+    const auto heap_cmp = [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id && !sampling_ties_legacy());
+    };
 
     out.resize(k);
     for (int32_t i = 0; i < k; ++i) {
@@ -174,8 +182,13 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
-    // the chain's top-k when no sampler before it changes a logit for these params, else 0 (sampler_top_k_first)
+    // the chain's top-k when no sampler before it changes a logit for these params, else 0: the k a backend may take for
+    // it (common_sampler_backend_top_k)
     int32_t top_k_first = 0;
+
+    // how many of a row's largest logits the chain reads on the CPU, 0 for every token's: its top-k, and behind penalties
+    // that only lower logits, their window too (sampler_top_k_first)
+    int32_t n_candidates = 0;
 
     void reset() {
         prev.clear();
@@ -207,8 +220,8 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
             // a backend's top-k gives its candidates in no fixed order among equal logits: sorted by logit, ties by id,
-            // as top_k_candidates sorts them, the chain draws from them as from the k the CPU takes (a row the backend
-            // did not cut, its device lacking an op, stays as every token's)
+            // as common_sampler_top_k_candidates sorts them, the chain draws from them as from the k the CPU takes (a
+            // row the backend did not cut, its device lacking an op, stays as every token's)
             if (!top_k_prefilter_legacy() && sampled_logits_count < (uint32_t) n_vocab) {
                 std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
                     return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
@@ -221,7 +234,7 @@ struct common_sampler {
             GGML_ASSERT(logits != nullptr);
             // a token the backend sampled is looked up among the candidates, so they stay every token's
             if (top_k > 0 && top_k < n_vocab && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
-                top_k_candidates(logits, n_vocab, top_k, cur);
+                common_sampler_top_k_candidates(logits, n_vocab, top_k, cur);
                 cur_p = { cur.data(), cur.size(), -1, true };
                 return;
             }
@@ -271,9 +284,25 @@ static bool top_k_first_legacy() {
     return legacy;
 }
 
+// LLAMA_SAMPLING_TOP_K_PENALTIES_LEGACY=1: penalties before the chain's top-k have it read every token's logit (the
+// behaviour before the candidates took in the penalty window)
+static bool top_k_penalties_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLING_TOP_K_PENALTIES_LEGACY");
+    return legacy;
+}
+
+// the most candidates a chain behind penalties is cut to; a longer window (repeat_last_n -1 is the context) reads every
+// token's logit
+static constexpr int32_t top_k_first_max_candidates = 1024;
+
 // the chain's top-k when it is the first sampler of the chain to change a logit or drop a token (the penalties, DRY and
-// top-n-sigma before it off for these params), else 0; up to 128, the k llama_sampler_top_k partial-sorts for
-static int32_t sampler_top_k_first(const common_params_sampling & params, bool has_logit_bias) {
+// top-n-sigma before it off for these params), else 0; up to 128, the k llama_sampler_top_k partial-sorts for.
+// Penalties before it that only lower logits (repeat at least 1, frequency and presence at least 0) leave it first in
+// effect, and window is then their last_n: they change the logits of the at most last_n tokens in their window and no
+// other, so a token outside the k + last_n largest logits (llama's order: by logit, ties by id) has k unpenalized
+// tokens above it still, and the k the top-k keeps are among those k + last_n
+static int32_t sampler_top_k_first(const common_params_sampling & params, bool has_logit_bias, int32_t & window) {
+    window = 0;
     if (top_k_first_legacy() || has_logit_bias || params.mirostat != 0 || params.top_k <= 0 || params.top_k > 128) {
         return 0;
     }
@@ -284,7 +313,13 @@ static int32_t sampler_top_k_first(const common_params_sampling & params, bool h
             case COMMON_SAMPLER_TYPE_PENALTIES:
                 if (params.penalty_last_n != 0 &&
                         (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
-                    return 0;
+                    const bool lowers_only = params.penalty_repeat >= 1.0f && params.penalty_freq >= 0.0f &&
+                        params.penalty_present >= 0.0f;
+                    if (top_k_penalties_legacy() || sampling_ties_legacy() || !lowers_only || params.penalty_last_n < 0 ||
+                            params.penalty_last_n > top_k_first_max_candidates - params.top_k) {
+                        return 0;
+                    }
+                    window = params.penalty_last_n;
                 }
                 break;
             case COMMON_SAMPLER_TYPE_DRY:
@@ -544,7 +579,12 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
     };
 
-    result->top_k_first = sampler_top_k_first(params, has_logit_bias);
+    int32_t window = 0;
+    const int32_t top_k = sampler_top_k_first(params, has_logit_bias, window);
+    // a backend's top-k stands in for the chain's own, which a penalty window before it would change: behind one, only
+    // the CPU cuts a row, to the top-k and the window
+    result->top_k_first  = window == 0 ? top_k : 0;
+    result->n_candidates = top_k > 0 ? top_k + window : 0;
 
     // a lazy grammar waiting for its trigger and a reasoning budget that is not forcing leave every logit as it is,
     // so while both stay so a backend-sampled token is the one the CPU chain would draw (common_sampler_backend_passive);
@@ -660,7 +700,7 @@ int32_t common_sampler_n_history(const struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -669,6 +709,10 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
     };
+    // derived from params at init: a clone reads the rows its original does
+    result->top_k_first  = gsmpl->top_k_first;
+    result->n_candidates = gsmpl->n_candidates;
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -683,12 +727,14 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     llama_sampler_copy(src->rbudget, dst->rbudget);
     llama_sampler_copy(src->chain,   dst->chain);
 
-    dst->params     = src->params;
-    dst->prev       = src->prev;
-    dst->cur        = src->cur;
-    dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
-    dst->t_total_us = src->t_total_us;
+    dst->params       = src->params;
+    dst->top_k_first  = src->top_k_first;
+    dst->n_candidates = src->n_candidates;
+    dst->prev         = src->prev;
+    dst->cur          = src->cur;
+    dst->cur_p        = src->cur_p;
+    dst->cur_p.data   = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->t_total_us   = src->t_total_us;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -762,7 +808,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     const bool every_token = (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) ||
         (grammar_first && grammar_should_apply(gsmpl));
 
-    gsmpl->set_logits(ctx, idx, every_token ? 0 : gsmpl->top_k_first);
+    gsmpl->set_logits(ctx, idx, every_token ? 0 : gsmpl->n_candidates);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.

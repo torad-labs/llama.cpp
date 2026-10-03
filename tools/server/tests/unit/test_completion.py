@@ -737,6 +737,43 @@ def test_top_k_prefilter_pre_sampling_probs(monkeypatch, temperature, n_probs):
         for a, b in zip(on["top_logprobs"], legacy["top_logprobs"]):
             assert a["logprob"] == pytest.approx(b["logprob"], abs=2e-5)
 
+@pytest.mark.parametrize("penalties", [
+    # a GGUF's defaults: repeat 1.1 over 256, and with frequency and presence, which lower logits as repeat does
+    {"repeat_penalty": 1.1, "repeat_last_n": 256},
+    {"repeat_penalty": 1.3, "repeat_last_n": 64, "frequency_penalty": 0.2, "presence_penalty": 0.3},
+    # one that raises logits, read from every token's on both sides
+    {"repeat_penalty": 1.1, "repeat_last_n": 64, "frequency_penalty": -0.5},
+])
+def test_top_k_penalties_prefilter(monkeypatch, penalties):
+    """Penalties before the top-k: the chain reads the k + last_n largest logits of a row and draws the tokens and gives
+    the probabilities it does from every token's (LLAMA_SAMPLING_TOP_K_PENALTIES_LEGACY=1)."""
+    global server
+    bodies = []
+    for legacy in ("0", "1"):
+        monkeypatch.setenv("LLAMA_SAMPLING_TOP_K_PENALTIES_LEGACY", legacy)
+        server = ServerPreset.tinyllama2()
+        server.start()
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "Once upon a time",
+            "n_predict": 64,
+            "temperature": 1.0,
+            "top_k": 40,
+            "top_p": 1.0,
+            "min_p": 0.0,
+            "seed": 42,
+            "n_probs": 5,
+            "post_sampling_probs": True,
+            "return_tokens": True,
+            **penalties,
+        })
+        server.stop()
+        assert res.status_code == 200
+        bodies.append(res.body)
+
+    assert len(bodies[0]["tokens"]) >= 8
+    assert bodies[0]["tokens"] == bodies[1]["tokens"]
+    assert bodies[0]["completion_probabilities"] == bodies[1]["completion_probabilities"]
+
 @pytest.mark.parametrize("tokenize,openai_style", [(False, False), (False, True), (True, False), (True, True)])
 def test_logit_bias(tokenize, openai_style):
     global server

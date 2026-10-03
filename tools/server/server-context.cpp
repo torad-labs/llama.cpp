@@ -1994,6 +1994,11 @@ private:
         }
         slot.has_next_token = true;
 
+        // a byte the model sampled that cannot continue the character before it, or a continuation byte with no lead,
+        // reads U+FFFD: the final parse of the text (common_chat_peg_parse) refuses malformed UTF-8 and the request
+        // would answer 500 after the whole generation. The text already sent is well-formed, so the scan starts there.
+        utf8_replace_malformed(slot.generated_text, slot.n_sent_text);
+
         // check if there is incomplete UTF-8 character at the end
         bool incomplete = validate_utf8(slot.generated_text) < slot.generated_text.size();
 

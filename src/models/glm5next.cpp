@@ -416,7 +416,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
 
     GGML_ASSERT(kbuf->ne[0] == d_idx && kbuf->ne[1] == 3 &&
             "the pooled indexer cache needs a key head, a gate head and a pooled head");
-    GGML_ASSERT(kbuf->nb[1] == (size_t) d_idx*kbuf->nb[0] && "key, gate and pooled must be adjacent in a cell");
+    GGML_ASSERT(kbuf->nb[1] == ggml_row_size(kbuf->type, d_idx) && "key, gate and pooled must be adjacent in a cell");
     GGML_ASSERT(n_tokens == n_tps*n_stream);
 
     ggml_tensor * kg_rows = ggml_view_3d(ctx0, kbuf, 2*d_idx, n_kv, n_stream,
@@ -458,7 +458,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     // every pool's key, gathered into f32 rows (the unfused path, and the fused one under LLAMA_INDEXER_GATHER_LEGACY=1)
     const auto gather_pool_k = [&]() {
         ggml_tensor * pooled_rd = ggml_view_3d(ctx0, kbuf, d_idx, n_kv, n_stream,
-                kbuf->nb[2], kbuf->nb[3], 2*d_idx*kbuf->nb[0]);
+                kbuf->nb[2], kbuf->nb[3], 2*kbuf->nb[1]);
 
         ggml_tensor * pool_k = ggml_get_rows(ctx0, pooled_rd, inp_kp->pool_reps);
         pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
@@ -487,7 +487,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
             // the pooled keys read where the cache holds them, pool p at cell pool_reps[p], scored in f32 like the
             // gathered rows (ggml_lightning_indexer_rows): no copy of every pool's key each token
             ggml_tensor * pooled = ggml_view_4d(ctx0, kbuf, d_idx, 1, n_kv, n_stream,
-                    kbuf->nb[1], kbuf->nb[2], kbuf->nb[3], 2*d_idx*kbuf->nb[0]);
+                    kbuf->nb[1], kbuf->nb[2], kbuf->nb[3], 2*kbuf->nb[1]);
 
             pool_score = ggml_lightning_indexer_rows(ctx0, iq, pooled, inp_kp->pool_reps, w, inp_kp->pool_bias_f16);
         } else {

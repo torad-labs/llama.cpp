@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -7,6 +8,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -334,6 +337,118 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+// a chain whose top-k comes behind penalties, as a GGUF's sampling defaults build one
+struct penalized_chain {
+    int32_t k;
+    int32_t last_n;
+    float   repeat;
+    float   freq;
+    float   present;
+    float   top_p;
+    float   min_p;
+};
+
+// the token the chain draws from a row, then the candidates it kept in its order: from every token's logit
+// (n_candidates 0), or from the n_candidates largest as common_sampler reads them
+static std::vector<llama_token_data> penalized_draw(const penalized_chain & c, const std::vector<float> & logits,
+        const std::vector<llama_token> & history, int32_t n_candidates, uint32_t seed) {
+    const int32_t n_vocab = (int32_t) logits.size();
+
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_penalties(n_vocab, c.last_n, c.repeat, c.freq, c.present));
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(c.k));
+    llama_sampler_chain_add(chain, llama_sampler_init_top_p(c.top_p, 1));
+    llama_sampler_chain_add(chain, llama_sampler_init_min_p(c.min_p, 1));
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(1.0f));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+    for (const llama_token token : history) {
+        llama_sampler_accept(chain, token);
+    }
+
+    std::vector<llama_token_data> cur;
+    if (n_candidates > 0) {
+        common_sampler_top_k_candidates(logits.data(), n_vocab, n_candidates, cur);
+    } else {
+        for (llama_token id = 0; id < n_vocab; ++id) {
+            cur.push_back(llama_token_data{id, logits[id], 0.0f});
+        }
+    }
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, n_candidates > 0 };
+    llama_sampler_apply(chain, &cur_p);
+    llama_sampler_free(chain);
+
+    std::vector<llama_token_data> out = { cur_p.data[cur_p.selected] };
+    out.insert(out.end(), cur_p.data, cur_p.data + cur_p.size);
+    return out;
+}
+
+// the same tokens in the same order with bit-equal logits and probabilities
+static bool same_draw(const std::vector<llama_token_data> & a, const std::vector<llama_token_data> & b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].id != b[i].id || a[i].logit != b[i].logit || a[i].p != b[i].p) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The k + last_n largest logits hold the k a top-k behind penalties keeps, a tie cut at rank k + last_n included, and
+// one fewer does not: token 9 leads and is the window's one token, the penalty drops it below the three tied at 4, and
+// of those the candidates keep ids 2 and 5 (by id), which are the k every token's top-k keeps
+static void test_top_k_penalties_candidates_boundary() {
+    std::vector<float> logits(12, 1.0f);
+    logits[9] = 10.0f;
+    logits[2] = logits[5] = logits[8] = 4.0f;
+    const penalized_chain c = { 2, 1, 100.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+    const std::vector<llama_token> history = { 9 };
+
+    const auto every = penalized_draw(c, logits, history, 0, 7);
+    GGML_ASSERT(every.size() == 3 && every[1].id == 2 && every[2].id == 5);
+    GGML_ASSERT(same_draw(penalized_draw(c, logits, history, c.k + c.last_n, 7), every));
+    GGML_ASSERT(!same_draw(penalized_draw(c, logits, history, c.k + c.last_n - 1, 7), every));
+}
+
+// rows on a grid of logits, so equal logits sit at every rank and at every cut, behind windows drawn mostly from the
+// largest logits as a model's own recent tokens are, longer than last_n so the window slides: the same draw from the
+// k + last_n largest as from every token, for each chain
+static void test_top_k_penalties_candidates_random() {
+    const penalized_chain chains[] = {
+        {  40, 256, 1.1f, 0.0f, 0.0f, 0.95f, 0.05f }, // GLM-5.3-Flash's GGUF sampling, the server's min_p
+        {  40,  64, 1.5f, 0.2f, 0.3f, 1.0f,  0.0f  },
+        {   5,  16, 1.0f, 0.5f, 0.0f, 0.9f,  0.0f  },
+        {   1,   8, 3.0f, 0.0f, 1.0f, 1.0f,  0.0f  },
+        { 128, 896, 1.1f, 0.0f, 0.0f, 1.0f,  0.0f  }, // the most candidates common_sampler cuts a row to
+    };
+    const int32_t n_vocab = 4096;
+
+    std::mt19937 rng(20261001);
+    std::normal_distribution<float> normal(0.0f, 3.0f);
+    for (const auto & c : chains) {
+        for (int trial = 0; trial < 200; ++trial) {
+            std::vector<float> logits(n_vocab);
+            for (float & logit : logits) {
+                logit = std::round(normal(rng) * 2.0f) / 2.0f;
+            }
+            std::vector<llama_token> by_logit(n_vocab);
+            std::iota(by_logit.begin(), by_logit.end(), 0);
+            std::stable_sort(by_logit.begin(), by_logit.end(), [&](llama_token a, llama_token b) {
+                return logits[a] > logits[b];
+            });
+            std::uniform_int_distribution<int32_t> rank(0, 2*c.k + c.last_n);
+            std::vector<llama_token> history;
+            for (int32_t i = 0; i < c.last_n + 7; ++i) {
+                history.push_back(by_logit[rank(rng)]);
+            }
+            const uint32_t seed = rng();
+            GGML_ASSERT(same_draw(penalized_draw(c, logits, history, c.k + c.last_n, seed),
+                                  penalized_draw(c, logits, history, 0, seed)));
+        }
+    }
+}
+
 int main(void) {
     ggml_time_init();
 
@@ -422,6 +537,9 @@ int main(void) {
     test_sampler_queue(10000, "pmk", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mkp", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mpk", 100, 0.8f, 0.1f);
+
+    test_top_k_penalties_candidates_boundary();
+    test_top_k_penalties_candidates_random();
 
     printf("OK\n");
 

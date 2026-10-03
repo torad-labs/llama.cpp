@@ -196,12 +196,23 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
     }
 }
 
+// Ada and newer: past the routed-expert ring's 8 tokens (mmvq-moe.cu), mul_mat_vec_q_moe is a warp a token and, for IQ3_XXS,
+// 25 % faster than MMQ at 9-12 tokens and 19 % at 16 (RTX PRO 4500, E288; TORAD.md). Other types are not measured: 8.
+// GGML_CUDA_MMVQ_MMID_MAX=N (8-16, read once) sets every type's ceiling to N; 8 is the ceiling before this was added.
+static int get_mmvq_mmid_max_batch_ada_plus(ggml_type type) {
+    static const int forced = [] {
+        const char * s = getenv("GGML_CUDA_MMVQ_MMID_MAX");
+        return s ? std::min(MMVQ_MMID_CEILING, std::max(MMVQ_MAX_BATCH_SIZE, atoi(s))) : 0;
+    }();
+    return forced != 0 ? forced : type == GGML_TYPE_IQ3_XXS ? MMVQ_MMID_CEILING : MMVQ_MAX_BATCH_SIZE;
+}
+
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-            return MMVQ_MAX_BATCH_SIZE;
+            return get_mmvq_mmid_max_batch_ada_plus(type);
         }
         if (cc >= GGML_CUDA_CC_TURING) {
             return get_mmvq_mmid_max_batch_turing_plus(type);
@@ -335,7 +346,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #elif defined(GCN)
     return get_mmvq_mmid_max_batch_gcn(type);
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
-    return MMVQ_MAX_BATCH_SIZE;
+    return MMVQ_MMID_CEILING;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
     return get_mmvq_mmid_max_batch_turing_plus(type);
 #else
@@ -950,7 +961,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(ncols_dst <= (ids ? MMVQ_MMID_CEILING : MMVQ_MAX_BATCH_SIZE));
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
@@ -1371,7 +1382,7 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(!ids || ne12 <= MMVQ_MMID_CEILING);
 
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;

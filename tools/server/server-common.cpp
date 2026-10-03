@@ -918,6 +918,44 @@ size_t validate_utf8(const std::string& text) {
     return len;
 }
 
+size_t utf8_replace_malformed(std::string & text, size_t from) {
+    const auto byte = [&text](size_t k) { return static_cast<unsigned char>(text[k]); };
+
+    std::string fixed; // the text from its first malformed byte on, rebuilt
+    size_t first = std::string::npos;
+    size_t i = std::min(from, text.size());
+    while (i < text.size()) {
+        const unsigned char c = byte(i);
+        const size_t len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+        size_t n = 1;
+        while (n < len && i + n < text.size() && (byte(i + n) & 0xC0) == 0x80) {
+            n++;
+        }
+        const bool whole = len > 0 && n == len;
+        if (!whole && len > 0 && i + n == text.size()) {
+            break; // an incomplete tail
+        }
+        if (!whole && first == std::string::npos) {
+            first = i;
+        }
+        if (first != std::string::npos) {
+            if (whole) {
+                fixed.append(text, i, len);
+            } else {
+                fixed.append("\xEF\xBF\xBD");
+            }
+        }
+        i += whole ? len : 1; // a malformed lead stands alone: the byte after it is read afresh
+    }
+    if (first == std::string::npos) {
+        return i;
+    }
+    const size_t n_tail = text.size() - i;
+    fixed.append(text, i, std::string::npos);
+    text.replace(first, std::string::npos, fixed);
+    return text.size() - n_tail;
+}
+
 server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files, bool is_placeholder) {
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;

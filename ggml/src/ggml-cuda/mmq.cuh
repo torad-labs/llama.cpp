@@ -909,13 +909,40 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+// GGML_CUDA_MMQ_L2_PF=N (host, mmq.cu; default 1, 0 off): while a chunk is computed, each thread asks L2 for the weight
+// bytes of the chunk N ahead, so the next load_tiles reads L2 and not DRAM. Only the issue time of loads moves; the
+// arithmetic is untouched.
+// A row's chunk is span_bytes contiguous bytes: one hint for every 128-byte line it starts in, and one for its last byte.
+template <ggml_type type, int J, bool fallback, int span_bytes>
+static __device__ __forceinline__ void mmq_prefetch_x_l2(
+        const char * __restrict__ x, const int kbx0, const int i_max, const int stride_row_x) {
+    constexpr int nthreads = ggml_cuda_mmq_get_nthreads(type, J, fallback);
+    constexpr int I        = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int bytes    = type == GGML_TYPE_IQ3_XXS ? int(sizeof(block_iq3_xxs)) : int(sizeof(block_q8_0));
+    constexpr int nh       = (span_bytes + 127)/128 + 1;
+    const int tid = threadIdx.y*ggml_cuda_get_physical_warp_size() + threadIdx.x;
+#pragma unroll
+    for (int w = tid; w < I*nh; w += nthreads) {
+        const int row = min(w / nh, i_max);
+        const int h   = w % nh;
+        if (h > 0 && (h - 1)*128 >= span_bytes) {
+            continue;
+        }
+        const int off = h*128 < span_bytes ? h*128 : span_bytes - 1;
+        const char * p = x + (int64_t(kbx0) + int64_t(row)*stride_row_x)*bytes + off;
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(p)));
+#endif
+    }
+}
+
 template <ggml_type type, int J, bool fallback, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const int l2_pf) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
@@ -952,6 +979,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        if constexpr (!async_buffer_y && (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q8_0)) {
+            const int kb_pf = kb0 + l2_pf*blocks_per_iter;
+            if (l2_pf > 0 && kb_pf < kb0_stop) {
+                constexpr int span = blocks_per_iter*int(type == GGML_TYPE_IQ3_XXS ? sizeof(block_iq3_xxs) : sizeof(block_q8_0));
+                mmq_prefetch_x_l2<type, J, fallback, span>(x, offset_x + kb_pf, tile_x_max_i, stride_row_x);
+            }
+        }
         if constexpr (async_buffer_y) {
             const char * by0 = reinterpret_cast<const char *>(
                 y + ncols_y * (kb0 * qk / ne_block) * sz);
@@ -1076,7 +1110,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int l2_pf) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1174,7 +1208,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, l2_pf);
         return;
     }
 
@@ -1269,7 +1303,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, l2_pf);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1354,7 +1388,7 @@ static __global__ void mul_mat_q(
     mul_mat_q_process_tile<type, J, fallback, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, l2_pf);
 }
 
 template <ggml_type type, int J, bool fallback>
@@ -1523,6 +1557,10 @@ void ggml_cuda_mmq_moe_tiles(const int32_t * expert_bounds, int n_expert, int J,
 // the knob that measures the width against a routing's spread
 int64_t ggml_cuda_mmq_moe_ncols();
 
+// GGML_CUDA_MMQ_L2_PF=N: the weight rows of the chunk N ahead are prefetched into L2 while a chunk is computed
+// (unset: 1, 0: off)
+int ggml_cuda_mmq_l2_prefetch();
+
 // The columns the tile width is picked for. MUL_MAT_ID: an expert's columns spread about their mean m like a count's,
 // by about sqrt(m), so the width is the narrowest that holds m + 3 sqrt(m) in one tile (the widest past that): on the
 // E288 proxy (288 experts, 8 used) the measured best at 1024 and 512 tokens a ubatch, J 48 and 32. Else all of them.
@@ -1602,7 +1640,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, ggml_cuda_mmq_l2_prefetch());
         return;
     }
 
@@ -1631,7 +1669,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, ggml_cuda_mmq_l2_prefetch());
 
     if (!fixup_needed) {
         return;

@@ -2892,11 +2892,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 }
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };
-                            type_idx = params.type_k;
-                            if (ggml_is_quantized(type_idx)) {
-                                LLAMA_LOG_WARN("%s: indexer key cache stays %s rather than %s: it also holds the compressor gates\n",
-                                        __func__, ggml_type_name(GGML_TYPE_F16), ggml_type_name(type_idx));
-                                type_idx = GGML_TYPE_F16;
+                            // q8_0 only on request (-ctki): the indexer keys, the compressor gates and the pooled keys
+                            // then share it. At the f16 default the cache follows K, and stays f16 under a quantized
+                            // K, as before this flag
+                            type_idx = params.type_idx;
+                            if (type_idx != GGML_TYPE_Q8_0) {
+                                type_idx = ggml_is_quantized(params.type_k) ? GGML_TYPE_F16 : params.type_k;
                             }
                         }
                     }

@@ -2,6 +2,11 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
+// Compile-time bound of mul_mat_vec_q_moe's block (a warp a token): the most tokens a quantized MUL_MAT_ID can send to MMVQ
+// on Ada and newer. Which types use it is get_mmvq_mmid_max_batch's table; GGML_CUDA_MMVQ_MMID_MAX=8..16 sets every type's
+// ceiling to that value (8 is the ring's, the batch size MMQ takes over at).
+#define MMVQ_MMID_CEILING 16
+
 // Max. columns for which a MUL_MAT (not MUL_MAT_ID) fuses a bias or residual add into MMVQ, reading one per column at the
 // output's column stride: an MTP verify's width at two drafts. A gate and GLU fuse at one column only. Measured on
 // sm_120 (5070 Ti), net of the launches the fusion removes, per step: the add -302 / -92 / +768 us at 2 / 3 / 4 columns,

@@ -11529,6 +11529,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, true,  2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, false, 4096, n, 2048));
     }
+    // past the ring's 8 tokens (8 tokens x 8 used is its 64 pairs): 9 to 16 go to mmvq.cu's mul_mat_vec_q_moe, a warp a
+    // token, and 17 to MMQ. 3 slots at an MTP verify of 3 are 9 tokens, 4 slots 12
+    for (int n : { 9, 12, 16, 17 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, true,  2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 8, false, 4096, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, true,  2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, false, 4096, n, 2048));
+    }
     // and its routed FFN, gate/up then down on one ids: its FFN on one card (2,048) and on each of two under -sm tensor
     // (1,024), with and without the SwiGLU limit
     for (int64_t n_ff : { 2048, 1024 }) {
@@ -12279,6 +12287,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // under the 8-head tile's switch-over: the masked dense kernel, and the 32-head tile with GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER=1
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},  8192, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
 
+    // q8_0 K on GLM-5.3's sparse launch (the V cache a view of it): a decode and a verify gather only the cells their
+    // indices name (2 x batch x n_kv_max cells under the cache: kv 4352 is the first a decode gathers at a quantized cache's
+    // 256-cell pad, 4096 the last whole conversion), prefill batches and a cache under their cells convert the whole K;
+    // 2 sequences; 576-wide K with 16 heads
+    for (int64_t kv : { 4096, 4352, 8448, 16640, 40960 }) {
+        for (int64_t nb : { 1, 2, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+        }
+    }
+    for (int64_t nb : { 1, 3 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 2}, 16640, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 2}, 16640, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2051));
+    }
+    for (int64_t nb : { 64, 128 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+    }
+
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -12732,8 +12757,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // keys read through rows of a pooled cache: a decode, an MTP verify and a prefill ubatch, 1 and 2 streams, a count
-    // off the kernel's blocks
-    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+    // off the kernel's blocks; q8_0 is the cache -ctki q8_0 builds
+    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
         for (int64_t nh : { 32, 64 }) {
             for (int64_t nb : { 1, 3, 64 }) {
                 for (int64_t ns : { 1, 2 }) {
@@ -13277,6 +13302,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
+    }
+    // GLM-5.3's pooled keys (4 cells a pool) for a 1024-token ubatch at 64K and 256K cells
+    for (int64_t kv : { 16384, 65536 }) {
+        test_cases.emplace_back(new test_lightning_indexer_rows(32, kv, 4*kv, 1024, 1, GGML_TYPE_F16));
     }
     // GLM-5.3-Flash's pooled indexer at 32K cached tokens: 8258 pools read by rows from the f16 cache, decode and a 3-token verify
     for (int bs : { 1, 3 }) {
