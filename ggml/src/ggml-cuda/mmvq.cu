@@ -1554,7 +1554,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (pq2_mma) {
         ggml_cuda_mmvq_pq2_mma(src0->data, fusion_local.gate, src1_q8_1, (const float *) fusion_local.x_bias,
-            dst_d, ne00, ne01, ne1, s01, s11, s1, ctx.pq2_next, ctx.pq2_tile_counter(), stream);
+            dst_d, ne00, ne01, ne1, s01, s11, s1, ctx.pq2_next, stream);
         return;
     }
 
@@ -1603,7 +1603,7 @@ void ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_ten
     }
 
     ggml_cuda_mmvq_pq2_mma_group(n, vx, dst, nrows, stride_row, stride_col_dst, src1_q8_1.get(), ne10, ne11,
-        ne10_padded / QK8_1, ctx.pq2_next, ctx.pq2_tile_counter(), feeds_fold, stream);
+        ne10_padded / QK8_1, ctx.pq2_next, feeds_fold, stream);
 }
 
 bool ggml_cuda_mul_mat_vec_q_concat_supported(const ggml_tensor * const * w, const int n, const ggml_tensor * src1,
