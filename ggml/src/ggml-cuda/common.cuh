@@ -1590,9 +1590,8 @@ struct ggml_cuda_pq2_prefetch {
     }
 };
 
-// One tile counter a stream for the ring launches (the PQ2_0 tensor-core ones, mmvq-pq2-mma.cu, and the routed experts',
-// mmvq-moe.cu): past its own first tiles a block takes the next by an atomic add on it, and the block that takes the
-// launch's last ticket sets it back to 0. A launch takes tickets only after its dependency wait, when every launch before
+// One tile counter a stream for the routed experts' ring launches (mmvq-moe.cu): past its own first tiles a block takes
+// the next by an atomic add on it, and the block that takes the launch's last ticket sets it back to 0. A launch takes tickets only after its dependency wait, when every launch before
 // it on the stream has ended, so one counter serves every launch of a stream, CUDA graph replays included. Made zeroed
 // before a graph evaluation, never inside a capture.
 struct ggml_cuda_pq2_tile_counters {

@@ -18,7 +18,7 @@
 // first appear, each with the token/slot pairs that route to it, and a tile is 8*RPW rows of one of them. Tile t is
 // expert t / ntr's row tile t % ntr. A block's first tiles, as many as its ring holds, are its own (blockIdx.x, then
 // every gridDim.x-th); the rest go to whichever block asks next, by a ticket on the stream's counter
-// (ggml_cuda_pq2_tile_counters, as mmvq-pq2-mma.cu takes them), so the blocks end within a tile of each other where
+// (ggml_cuda_pq2_tile_counters), so the blocks end within a tile of each other where
 // owned tiles left the launch's end to the slowest (2,048 tiles on 84 SMs: 25 against 24, a tile's 1.3 us). Two teams of
 // eight consumer warps take the block's tiles in turn (team 0 the even ones). In a team, warp g takes the tile's rows
 // [g*RPW, (g+1)*RPW), its 32 lanes along k as mul_mat_vec_q's (vec_dot_q_cuda at the type's vdr), for each of the
