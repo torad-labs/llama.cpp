@@ -268,7 +268,9 @@ void ggml_cuda_flash_attn_ext_gather_k_q8_0(
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// GGML_CUDA_FATTN_SPARSE_LEGACY=1: the hint is ignored, the kernel reads the whole cache under the mask.
+// GGML_CUDA_FATTN_SPARSE_LEGACY=1: the hint is ignored, and the dense kernel runs as it did before the gather: over the
+// KV steps a row of its Q tile sees (launch_fattn's kv_live, 2f0ca785a), the whole cache under the mask only with
+// GGML_CUDA_FATTN_LIVE_TILES_LEGACY=1 as well.
 // The gather reads n_kv_max cells a query; the dense kernel reads the cache once for up to 64/ncols2 queries. The gather
 // wins where the cache is at least those queries' cells (GLM-5.3's DSA shape, 32 heads on the latent, RTX 5080 and
 // 5070 Ti: at 0.25-0.99x the dense time wherever K >= n_gather, at 1.13-1.27x wherever it is under; upstream's 2x margin
