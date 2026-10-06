@@ -201,7 +201,12 @@ static __device__ __forceinline__ void mmvq_moe_quantize_y(const mmvq_moe_dev_ar
     constexpr int NT    = MMVQ_MOE_NW*32;
     const int     nf4   = ncols / 4;
     const int     total = a.ntokens*a.n_used*nf4; // a whole number of q8_1 blocks: 8 lanes are all in or all out
-    for (int j0 = threadIdx.x; j0 < total; j0 += MMVQ_MOE_QY_CHUNK*NT) {
+    // the bound is rounded up to a whole warp, so a warp's lanes are all in or all out: the shuffles below name all 32
+    // lanes, and a warp the bound split would wait on lanes that never reach them. Today total is a multiple of 32
+    // only because ggml_cuda_mmvq_moe_y_bytes admits a copy of a whole number of 16-byte units, which holds the rows to
+    // 128 columns; the j < total guards cover the load and the store
+    const int bound = (total + 31)/32*32;
+    for (int j0 = threadIdx.x; j0 < bound; j0 += MMVQ_MOE_QY_CHUNK*NT) {
         float4 v[MMVQ_MOE_QY_CHUNK];
 #pragma unroll
         for (int c = 0; c < MMVQ_MOE_QY_CHUNK; ++c) {
