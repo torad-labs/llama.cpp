@@ -241,7 +241,7 @@ struct server_slot {
     mtmd::batch_ptr mbatch = nullptr;
 
     // speculative decoding
-    common_speculative * spec;
+    common_speculative * spec = nullptr; // the context's, once init ran
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -323,12 +323,14 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        // the drafter's kept row travels with the prompt, as the two states above do
+        common_speculative_get_state(spec, id, cur->data.spec);
 
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -340,6 +342,7 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_set_state(spec, id, {}); // the cells a kept row belongs to are gone
 
         if (!prompt.checkpoints.empty()) {
             checkpoint_spare(prompt.checkpoints.back());
