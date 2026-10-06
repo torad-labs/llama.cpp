@@ -926,14 +926,36 @@ size_t utf8_replace_malformed(std::string & text, size_t from) {
     size_t i = std::min(from, text.size());
     while (i < text.size()) {
         const unsigned char c = byte(i);
-        const size_t len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+        // a lead's length and the range its second byte must fall in (Unicode Table 3-7): E0, ED, F0 and F4 narrow it,
+        // which is what keeps out an overlong form, a surrogate and a code point past U+10FFFF; 80-C1 and F5-FF lead
+        // nothing. A pattern-only check kept those, and the chat parser's strict JSON dump then threw on them.
+        size_t len = 0;
+        unsigned char lo = 0x80;
+        unsigned char hi = 0xBF;
+        if (c < 0x80) {
+            len = 1;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            len = 2;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            len = 3;
+            lo  = c == 0xE0 ? 0xA0 : 0x80;
+            hi  = c == 0xED ? 0x9F : 0xBF;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            len = 4;
+            lo  = c == 0xF0 ? 0x90 : 0x80;
+            hi  = c == 0xF4 ? 0x8F : 0xBF;
+        }
         size_t n = 1;
-        while (n < len && i + n < text.size() && (byte(i + n) & 0xC0) == 0x80) {
+        while (n < len && i + n < text.size()) {
+            const unsigned char b = byte(i + n);
+            if (b < (n == 1 ? lo : 0x80) || b > (n == 1 ? hi : 0xBF)) {
+                break;
+            }
             n++;
         }
         const bool whole = len > 0 && n == len;
         if (!whole && len > 0 && i + n == text.size()) {
-            break; // an incomplete tail
+            break; // an incomplete tail: every byte so far is right, and the next token may complete it
         }
         if (!whole && first == std::string::npos) {
             first = i;
@@ -945,7 +967,9 @@ size_t utf8_replace_malformed(std::string & text, size_t from) {
                 fixed.append("\xEF\xBF\xBD");
             }
         }
-        i += whole ? len : 1; // a malformed lead stands alone: the byte after it is read afresh
+        // a malformed sequence is replaced by one U+FFFD for its maximal subpart (the lead and the continuation bytes it
+        // took before the one that cannot continue it), as the JSON writer does; that byte is then read afresh
+        i += whole ? len : (len > 0 ? n : 1);
     }
     if (first == std::string::npos) {
         return i;
