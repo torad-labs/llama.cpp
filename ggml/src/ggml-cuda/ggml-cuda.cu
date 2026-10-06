@@ -4593,16 +4593,19 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
         return true;
     }
     // at the rows that fit one block, its warps meet at a barrier once the logits (the first node's src) are read, so the
-    // outputs may overlap a src inside the logits' bytes (the logits, or gpt-oss's reshape of them); the bias is read past
-    // the barrier, so it is checked (ggml_cuda_topk_moe_reads_before_writes). GGML_CUDA_TOPK_MOE_ALIAS_LEGACY=1: at one
-    // row only
+    // outputs may overlap the logits themselves, or gpt-oss's reshape of them; the bias is read past the barrier, so it
+    // is checked (ggml_cuda_topk_moe_reads_before_writes). GGML_CUDA_TOPK_MOE_ALIAS_LEGACY=1: at one row only
     static const bool   topk_moe_alias_legacy = ggml_env_switch("GGML_CUDA_TOPK_MOE_ALIAS_LEGACY");
     const ggml_tensor * read_first            = is_topk_moe && !topk_moe_alias_legacy &&
         ggml_cuda_topk_moe_reads_before_writes(topk_moe_rows) ? cgraph->nodes[node_idx]->src[0] : nullptr;
-    auto within_read_first = [&](const ggml_tensor * src) {
-        return read_first != nullptr && src->buffer == read_first->buffer &&
-            (const char *) src->data >= (const char *) read_first->data &&
-            (const char *) src->data + ggml_nbytes(src) <= (const char *) read_first->data + ggml_nbytes(read_first);
+    // the logits and a reshape of them, which share both, and nothing else: a src merely CONTAINED in the logits is a
+    // strict sub-view, and the two that can be one are both read past the barrier, not before it. The bias is one (its
+    // every instance here is a model weight, so GGML_OP_NONE above already skips it, and a weight shares no buffer with
+    // the logits); the other is the tail of a logits tensor with ne[2] > 1, which ggml_nrows counts and the launch's
+    // logits->ne[1] does not read.
+    auto reads_first_whole = [&](const ggml_tensor * src) {
+        return read_first != nullptr && src->buffer == read_first->buffer && src->data == read_first->data &&
+            ggml_nbytes(src) == ggml_nbytes(read_first);
     };
 
     for (int i = 0; i < out_count; ++i) {
@@ -4616,7 +4619,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == staged_src || within_read_first(src)) {
+                if (!src || src->op == GGML_OP_NONE || src == staged_src || reads_first_whole(src)) {
                     continue;
                 }
 
