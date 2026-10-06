@@ -320,7 +320,9 @@ int64_t ggml_cuda_mmq_moe_ncols() {
 }
 
 // One block: each pass scans the column tiles of blockDim.x experts, ceil(columns/J) each, on top of the earlier
-// passes' total, and every expert writes its own entries at its exclusive prefix.
+// passes' total, and every expert writes its own entries at its exclusive prefix. A list longer than the launch's
+// column tiles (ntiles_max, whose first term counts an expert at most once a token) would leave an expert's last
+// columns unlaunched and their rows of dst unwritten, with no sign: the launch traps instead, and the next sync fails.
 static __global__ void mmq_moe_tiles_kernel(const int32_t * __restrict__ expert_bounds, const int n_expert, const int J,
                                             const int ntiles_max, int32_t * __restrict__ moe_tiles) {
     __shared__ int warp_incl[WARP_SIZE];
@@ -365,7 +367,12 @@ static __global__ void mmq_moe_tiles_kernel(const int32_t * __restrict__ expert_
         __syncthreads();
 
         const int first = done + (warp > 0 ? warp_incl[warp - 1] : 0) + incl - n;
-        for (int k = 0; k < n && first + k < ntiles_max; ++k) {
+        if (first + n > ntiles_max) {
+            printf("ERROR: MUL_MAT_ID: expert %d takes column tiles %d to %d, over the launch's %d (an expert named "
+                   "twice for one token?)\n", e, first, first + n - 1, ntiles_max);
+            __trap();
+        }
+        for (int k = 0; k < n; ++k) {
             moe_tiles[first + k] = (k << 16) | e;
         }
         __syncthreads();

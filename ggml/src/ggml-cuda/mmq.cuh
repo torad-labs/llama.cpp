@@ -1607,7 +1607,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     // MUL_MAT_ID: the grid's column tiles are the experts' non-empty ones back to back, one channel. An expert of c
     // columns fills ceil(c/J) <= ntx of them and an empty one none, so with n columns over n_expert experts there are
-    // at most (n + min(n_expert, n)*(J - 1))/J.
+    // at most (n + min(n_expert, n)*(J - 1))/J. The first term holds while ids names an expert at most once for a
+    // token, which every graph here builds (a top-k of distinct experts); mmq_moe_tiles_kernel traps on a list past
+    // this bound rather than drop an expert's last tiles.
     int64_t nchannels_grid = args.nchannels_y;
     ggml_cuda_pool_alloc<int32_t> moe_tiles(ctx.pool(id));
     if (args.ids_dst && !ggml_cuda_mmq_moe_tiles_legacy()) {
