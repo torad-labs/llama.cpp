@@ -118,9 +118,19 @@ void llama_kpool_compress(
         const llama_kpool_write_fn & write,
         const llama_kpool_name_fn  & name);
 
+// A row of the sparse attention's mask is live at its top-k pools' cells and at its tail, the cells of its sequence at
+// positions [(q + 1)/r*r, q] (sel_mask's finite columns): at most r - 1 unless the sequence holds two cells at one position.
+// The most cells a tail of this ubatch holds, at least r - 1, from the cells as the ubatch left them
+int64_t llama_kpool_tail_max(const llama_kpool_cells_fn & cells_of, const llama_ubatch & ubatch, uint32_t kpool);
+
+// the live cells a mask row may hold (ggml_flash_attn_ext_set_n_kv_max): n_top_k top-k cells and an n_tail tail, padded to 32
+// cells, a step of the CUDA kernel
+int64_t llama_kpool_n_kv_max(int64_t n_top_k, int64_t n_tail);
+
 // the maps of llama_kv_cache_set_input_kpool from a cells accessor. views == nullptr builds them from the cells
-// every call; else a sequence alone in its stream is served from its view, byte for byte the same maps
-void llama_kpool_set_input(
+// every call; else a sequence alone in its stream is served from its view, byte for byte the same maps.
+// Returns the most cells a row's tail was granted (sel_mask's finite columns in a row)
+int64_t llama_kpool_set_input(
         const llama_kpool_cells_fn & cells_of,
               llama_kpool_views    * views,
               ggml_tensor    * cell_pool,
@@ -146,8 +156,9 @@ void llama_kpool_set_input(
 //   sel_mask    n_kv columns, then kpool*n_dump dump columns of -inf (n_kv is cand_mask's)
 //   cand_mask   bounds top-k spills a partial seq_rm would let escape
 // pool_reps / new_pool_cells / new_pool_reps are nullptr when the cache is off, and an entry
-// is emitted only for filled == kpool: cell 0 is real, so writing its 0 slot would clobber
-void llama_kv_cache_set_input_kpool(
+// is emitted only for filled == kpool: cell 0 is real, so writing its 0 slot would clobber.
+// Returns llama_kpool_set_input's
+int64_t llama_kv_cache_set_input_kpool(
         const llama_kv_cache * kv,
               ggml_tensor    * cell_pool,
               ggml_tensor    * pool_cells,
@@ -177,6 +188,7 @@ struct llm_graph_input_kpool_dims {
     int64_t n_pools   = 0;
     int64_t n_dump    = 0;
     int64_t n_new_max = 0;
+    int64_t n_tail    = 0;
     bool    rebuild   = false;
     bool    scoring   = false;
 };
@@ -229,6 +241,10 @@ public:
 
     // set at build time: re-emit every pool after a position mutation
     bool rebuild = false;
+
+    // set at build time: the most cells a row's tail holds (llama_kpool_tail_max), which sizes the sparse attention's
+    // n_kv_max; set_input asserts no row is granted more
+    int64_t n_tail = 0;
 
     // exact, since pool_bias only holds 0.0f or -INFINITY. nullptr if the fused path is off
     ggml_tensor * pool_bias_f16 = nullptr; // F16 [n_pools, n_tps, 1, n_stream]

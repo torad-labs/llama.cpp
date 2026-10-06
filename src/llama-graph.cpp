@@ -604,6 +604,9 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
     dims.n_pools = llama_kpool_n_pools(dims.n_kv, kpool, dims.n_ps);
     dims.rebuild = mctx_attn->get_kv()->get_kpool_dirty(ubatch);
     dims.n_new_max = dims.rebuild ? dims.n_pools : dims.n_tps/kpool + dims.n_ps;
+    dims.n_tail    = llama_kpool_tail_max([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
+        return kv->get_cells(s);
+    }, ubatch, kpool);
     // same gate as the builder (glm5next_n_select == indexer_top_k + kpool - 1)
     dims.scoring = cparams.n_ctx > hparams.indexer_top_k + kpool - 1;
     dims.n_dump  = dims.scoring ? llama_kpool_select_k(dims.n_pools, hparams.indexer_top_k, kpool) : 0;
@@ -656,6 +659,9 @@ bool llm_graph_input_kpool::shapes_match(const llm_graph_input_kpool_dims & dims
 
     res &= inp.rebuild == dims.rebuild;
     res &= (int64_t) inp.n_new_max == dims.n_new_max;
+
+    // the sparse attention's n_kv_max is sized on it
+    res &= inp.n_tail == dims.n_tail;
 
     res &= inp.new_pool_cells->ne[0] == (int64_t) inp.kpool*dims.n_new_max;
     res &= inp.new_pool_cells->ne[1] == dims.n_stream;
@@ -4058,6 +4064,9 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         inp->n_new_max = (uint32_t) n_new_max;
         inp->rebuild   = rebuild;
+        inp->n_tail    = llama_kpool_tail_max([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
+            return kv->get_cells(s);
+        }, ubatch, kpool);
 
         inp->pool_reps = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
         ggml_set_input(inp->pool_reps);
@@ -4089,6 +4098,7 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         ggml_tensor * top_k,
         ggml_tensor * sel_mask,
         ggml_tensor * cand_mask,
+            int64_t   n_tail,
             float     kq_scale,
             int       il) const {
     ggml_build_forward_expand(gf, q_cur);
@@ -4155,9 +4165,10 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     // a row's live cells: its top_k pools' cells (top_k->ne[0] = r*select_k) and its tail, positions [(q + 1)/r*r, q]
     // (kpool_mask_row), at most r - 1 cells unless a sequence holds two cells at one position (an rm + add before the first
-    // cell is gone), whose tail then has more. The kernel may read those alone; the bound rounds up to 32 cells, a CUDA
-    // kernel step, so that case keeps every cell at no cost (2051 and 2080 cells are 65 steps either way)
-    const int64_t n_kv_max = GGML_PAD(top_k->ne[0] + hparams.indexer_kpool - 1, 32);
+    // cell is gone), whose tail then has more. n_tail counts the longest tail of this ubatch in the cells, and set_input
+    // asserts no row is granted more, so the bound holds every row's live cells; the compaction traps on one it does not
+    GGML_ASSERT(n_tail >= (int64_t) hparams.indexer_kpool - 1);
+    const int64_t n_kv_max = llama_kpool_n_kv_max(top_k->ne[0], n_tail);
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false,
             n_kv_max);
     cb(cur, "kqv_out", il);

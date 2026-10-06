@@ -6,8 +6,19 @@
 #include "fattn.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// A row with more finite cells than n_kv_max breaks ggml_flash_attn_ext_set_n_kv_max's contract, and its first n_kv_max
+// would attend to part of the row without a sign: the launch traps instead, and the next sync fails
+static __device__ __forceinline__ void flash_attn_sparse_check_count(
+        const int count, const int n_kv_max, const int query, const int sequence) {
+    if (count > n_kv_max && threadIdx.x == 0) {
+        printf("ERROR: sparse flash attention: mask row %d of sequence %d has %d finite cells, over n_kv_max %d\n",
+               query, sequence, count, n_kv_max);
+        __trap();
+    }
+}
+
 // A block a mask row: its finite entries' cells, ascending, into the row's n_kv_max indices, -1 past its count (a count
-// over n_kv_max keeps the first n_kv_max: the bound is the graph's to keep).
+// over n_kv_max writes the first n_kv_max and traps: the bound is the graph's to keep).
 // Upstream's scan (8e93a9773): 256 threads, 2048 columns a round of scalar loads. A decode's one row is one block, so
 // a round is a memory round trip: 11 us at 32K columns. GGML_CUDA_FATTN_SPARSE_SCAN_LEGACY=1, or a mask row not
 // 16-byte aligned.
@@ -84,6 +95,7 @@ static __global__ void flash_attn_mask_to_sparse_indices_legacy(
     }
 
     const int count = row_count;
+    flash_attn_sparse_check_count(count, n_kv_max, query, sequence);
     for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
         indices[i] = -1;
     }
@@ -173,6 +185,7 @@ static __global__ void flash_attn_mask_to_sparse_indices(
         __syncthreads(); // the next chunk rewrites warp_sums
     }
 
+    flash_attn_sparse_check_count(row_count, n_kv_max, query, sequence);
     for (int i = row_count + tid; i < n_kv_max; i += sparse_scan_threads) {
         indices[i] = -1;
     }

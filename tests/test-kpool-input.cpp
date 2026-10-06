@@ -516,6 +516,30 @@ static bool dump_safe(const maps & m, int64_t n_kv, uint32_t r, char * what, siz
     return true;
 }
 
+// the most finite columns a row of sel_mask holds among its first n_kv: the cells its tail grants
+static int64_t sel_tail_max(const maps & m, int64_t n_kv) {
+    const int64_t n_sel  = m.sel_mask->ne[0];
+    const int64_t n_rows = m.sel_mask->ne[1]*m.sel_mask->ne[3];
+
+    int64_t n_max = 0;
+
+    for (int64_t row = 0; row < n_rows; ++row) {
+        int64_t n = 0;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int64_t k = row*n_sel + j;
+            const float   x = m.sel_mask->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) m.sel_mask->data)[k]) :
+                                                                   ((const float *) m.sel_mask->data)[k];
+            n += std::isfinite(x);
+        }
+        n_max = std::max(n_max, n);
+    }
+
+    return n_max;
+}
+
+// builds whose longest tail held more than r - 1 cells (two cells at one position)
+static int64_t n_tail_long = 0;
+
 // the inputs of one ubatch built from the views and from the cells. The ubatch is placed in the cells first, as the cache
 // does (apply_ubatch before the inputs are set). rebuild: re-emit every pool, as after a position mutation
 static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, bool rebuild, std::mt19937 & rng, control ctl, char * what, size_t n_what) {
@@ -608,10 +632,22 @@ static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, 
     maps inc(n_kv, n_ns, n_tokens/n_ns, n_ps, cfg.r, cfg.kcache, cfg.f16, rebuild, n_dump, 0x5A);
 
     // the views go first: the reference never takes the log
-    llama_kpool_set_input(cells_of, &views, nullptr, inc.pool_cells, nullptr, inc.pool_bias, inc.sel_mask, inc.cand_mask,
+    const int64_t tail_inc = llama_kpool_set_input(cells_of, &views, nullptr, inc.pool_cells, nullptr, inc.pool_bias, inc.sel_mask, inc.cand_mask,
             inc.pool_reps, inc.new_pool_cells, inc.new_pool_reps, strm_of.data(), w.v_cells[0].size(), rebuild, ub, cfg.r);
-    llama_kpool_set_input(cells_of, nullptr, nullptr, ref.pool_cells, nullptr, ref.pool_bias, ref.sel_mask, ref.cand_mask,
+    const int64_t tail_ref = llama_kpool_set_input(cells_of, nullptr, nullptr, ref.pool_cells, nullptr, ref.pool_bias, ref.sel_mask, ref.cand_mask,
             ref.pool_reps, ref.new_pool_cells, ref.new_pool_reps, strm_of.data(), w.v_cells[0].size(), rebuild, ub, cfg.r);
+
+    // the tail a row is granted, as set_input reports it and as sel_mask holds it, within the bound the graph sizes on
+    const int64_t tail_sel = sel_tail_max(ref, n_kv);
+    const int64_t tail_max = llama_kpool_tail_max(cells_of, *ub, cfg.r);
+
+    n_tail_long += tail_ref > (int64_t) cfg.r - 1;
+
+    if (tail_inc != tail_ref || tail_ref != tail_sel || tail_ref > tail_max) {
+        snprintf(what, n_what, "tail: views report %lld cells, the cells %lld, sel_mask holds %lld, the bound is %lld",
+                (long long) tail_inc, (long long) tail_ref, (long long) tail_sel, (long long) tail_max);
+        return false;
+    }
 
     if (ctl == CONTROL_CORRUPT) {
         ((uint8_t *) inc.sel_mask->data)[0] ^= 0x80;
@@ -980,11 +1016,53 @@ static void run_shift_regroups() {
     CHECK( llama_kpool_stale::shift_regroups(4, 8, 10, -4), "a range that ends inside a pool");
 }
 
+// a sequence holding 11 more cells at each of its last three positions: the row at the last has a tail of 36 cells, and with
+// GLM-5-Next's 2,048 top-k cells (512 pools of 4) its live cells pass the n_kv_max an r - 1 tail sizes
+static void run_tail_bound(std::mt19937 & rng) {
+    const uint32_t r = 4;
+
+    pool w(256, 1, true, rng);
+    w.append(0, 63);
+
+    auto & cells = w.cells_of(0);
+    for (llama_pos p = 60; p <= 62; ++p) {
+        for (int k = 0; k < 11; ++k) {
+            const int64_t i = w.find_empty(0);
+            cells.pos_set(i, p);
+            cells.seq_add(i, 0);
+        }
+    }
+
+    ubatch_data ud;
+    ud.add(0, 62);
+    const llama_ubatch * ub = ud.get();
+
+    const llama_kpool_cells_fn cells_of = [&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); };
+
+    maps m(256, 1, 1, 1, r, false, true, false, 0, 0);
+    const int64_t n_tail = llama_kpool_set_input(cells_of, nullptr, nullptr, m.pool_cells, nullptr, m.pool_bias, m.sel_mask, m.cand_mask,
+            nullptr, nullptr, nullptr, nullptr, 0, false, ub, r);
+    const int64_t n_bound = llama_kpool_tail_max(cells_of, *ub, r);
+
+    const int64_t n_top_k  = 2048;
+    const int64_t n_live   = n_top_k + n_tail;
+    const int64_t n_kv_old = llama_kpool_n_kv_max(n_top_k, r - 1);
+    const int64_t n_kv_new = llama_kpool_n_kv_max(n_top_k, n_bound);
+
+    printf("a tail of %lld cells: %lld live cells a row, n_kv_max %lld for an r - 1 tail, %lld for the longest tail\n",
+            (long long) n_tail, (long long) n_live, (long long) n_kv_old, (long long) n_kv_new);
+
+    CHECK(n_tail == 36 && n_bound == 36, "the tail: %lld cells granted, %lld counted, 36 placed", (long long) n_tail, (long long) n_bound);
+    CHECK(n_kv_old < n_live, "an r - 1 tail bound holds %lld live cells: the case cannot fail", (long long) n_live);
+    CHECK(n_kv_new >= n_live, "n_kv_max %lld under %lld live cells", (long long) n_kv_new, (long long) n_live);
+}
+
 int main() {
     std::mt19937 rng(20260930);
 
     run_shift_regroups();
     run_compress_chunks();
+    run_tail_bound(rng);
 
     const int64_t n_stale_per_seq = stale_after_shift(rng, true);
     const int64_t n_stale_flag    = stale_after_shift(rng, false);
@@ -1027,6 +1105,9 @@ int main() {
     // the rounds must reach the view path, not only the fallback
     CHECK(total.n_served > 2000, "only %llu streams were served from views", (unsigned long long) total.n_served);
     CHECK(total.n_direct > 100,  "only %llu streams took the maps from the cells: the fallbacks are not reached", (unsigned long long) total.n_direct);
+
+    printf("random rounds: %lld builds with a tail over r - 1 cells, each within llama_kpool_tail_max\n", (long long) n_tail_long);
+    CHECK(n_tail_long > 0, "no build held a tail over r - 1 cells: the bound is not tested");
 
     if (n_fail == 0) {
         printf("ok\n");
