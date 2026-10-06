@@ -4514,6 +4514,53 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     }
 };
 
+// 16 tokens whose last 12 have streams that cancel in pairs to within 1e-7, at a scale of 100, under equal pre weights
+// (scale[0] 0, base[0..3] equal): the mix is ~0. CUDA's Gram front sums pre' G pre from G's entries, not the mix's
+// squares, and that rounds under 0 for about a third of such tokens; unclamped, rsqrtf makes their rows NaN. The
+// cancelling tokens' outputs are ~1e-3, so the first 4 tokens carry the NMSE and the Gram's rounding of the tiny RMS
+// does not count.
+struct test_dsv4_hc_pre_cancel : public test_dsv4_hc_pre_fused {
+    static constexpr int64_t n_plain = 4;
+
+    test_dsv4_hc_pre_cancel() : test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 16) {}
+
+    std::string vars() override {
+        return test_dsv4_hc_pre_fused::vars() + ",cancel";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc_pre_fused::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "scale") {
+                const float zero = 0.0f;
+                ggml_backend_tensor_set(t, &zero, 0, sizeof(float));
+            } else if (name == "base") {
+                const float base_pre[hc] = { 0.08f, 0.08f, 0.08f, 0.08f };
+                ggml_backend_tensor_set(t, base_pre, 0, sizeof(base_pre));
+            } else if (name == "x") {
+                GGML_ASSERT(ggml_is_contiguous(t));
+                std::vector<float> x(ggml_nelements(t));
+                ggml_backend_tensor_get(t, x.data(), 0, ggml_nbytes(t));
+                std::mt19937 rng(tensor_seed(t));
+                std::uniform_real_distribution<float> dist(-100.0f, 100.0f);
+                for (int64_t it = n_plain; it < n_tokens; ++it) {
+                    float * xt = x.data() + it*hc*n_embd;
+                    for (int64_t i = 0; i < n_embd; ++i) {
+                        const float a = dist(rng);
+                        const float b = dist(rng);
+                        xt[i + 0*n_embd] =  a;
+                        xt[i + 1*n_embd] = -a*(1.0f + 1e-7f*(i % 7 - 3));
+                        xt[i + 2*n_embd] =  b;
+                        xt[i + 3*n_embd] = -b*(1.0f + 1e-7f*(i % 5 - 2));
+                    }
+                }
+                ggml_backend_tensor_set(t, x.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 // The front's normed mix read by n_readers quantized MUL_MATs of 256 rows (the sublayer's projections), their outputs
 // summed. CUDA's front writes the mix's q8_1 copy beside it where n_embd is a multiple of 512 and a reader runs on
 // mul_mat_vec_q (ggml_cuda_dsv4_hc_writes_q8_1), for one reader or more, and the readers read the copy.
@@ -10281,6 +10328,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 1, 20, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 3, 20, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 7168, 2, 20));
+    // streams whose mix cancels: the Gram front's pre' G pre rounds under 0 and must not make a token NaN (433d88eae)
+    test_cases.emplace_back(new test_dsv4_hc_pre_cancel());
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 64, 2, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 31, 3, 4));
