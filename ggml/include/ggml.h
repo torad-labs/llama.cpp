@@ -2468,7 +2468,7 @@ extern "C" {
             const struct ggml_tensor * a);
 
     // Use finite mask entries as a sparse K/V set. Set 0 to disable.
-    // n_kv_max must bound the number of finite entries in every mask row.
+    // n_kv_max must bound the number of finite entries in every mask row: CUDA traps on a row over it rather than drop cells.
     GGML_API void ggml_flash_attn_ext_set_n_kv_max(
             struct ggml_tensor * a,
             int32_t              n_kv_max);
@@ -2606,7 +2606,9 @@ extern "C" {
     // tensor shapes (S_k == S_v, H_v % H_k == 0):
     //   q, k  : [S_k, H_k, n_tokens, n_seqs]
     //   v     : [S_v, H_v, n_tokens, n_seqs]
-    //   g     : [1, H_v, n_tokens, n_seqs] (scalar gate) or [S_v, H_v, n_tokens, n_seqs] (KDA)
+    //   g     : [1, H_v, n_tokens, n_seqs] (scalar gate) or [S_v, H_v, n_tokens, n_seqs] (KDA), a log-decay: KDA's must be
+    //           <= 0 (a decay exp(g) of at most 1), since CUDA's chunked path stages exp of its sums in fp16 and traps on
+    //           one above 0; a raw KDA gate (ggml_gated_delta_net_set_raw_kda_gates) with lower_bound > 0 runs recurrent
     //   beta  : [1, H_v, n_tokens, n_seqs]
     //   state : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0
     //

@@ -311,6 +311,7 @@ __launch_bounds__(128, 4) __global__ void cgdr_kda_fwdsub_intra_kernel(
 
     // Step 0: q (scaled), k, the activated log-decay and beta into SMEM; tokens past seq_len are zeros, which neither
     // decay the state nor update it
+    bool g_above_0 = false;
     for (int i = tid; i < CS * BK; i += 128) {
         const int t = i / BK, c = i % BK;
         float     qv = 0.f, kv = 0.f, gv = 0.f;
@@ -320,6 +321,8 @@ __launch_bounds__(128, 4) __global__ void cgdr_kda_fwdsub_intra_kernel(
             gv = g_chunk[t * sb2 * BK + c];
             if constexpr (RAW) {
                 gv = raw_lb * (1.0f / (1.0f + expf(gv * raw_a[h])));
+            } else {
+                g_above_0 |= gv > 0.0f;
             }
         }
         s_q[t * sk + c] = qv;
@@ -336,7 +339,15 @@ __launch_bounds__(128, 4) __global__ void cgdr_kda_fwdsub_intra_kernel(
         }
         s_beta[i] = beta_val;
     }
-    __syncthreads();
+    // stage 3's fp16 operands hold exp of the gate's sums, at most 1 for a log-decay at or under 0 (ggml_gated_delta_net);
+    // a gate above it saturates them to inf, so the launch traps. A raw gate is under 0 by eligibility (raw_lb <= 0)
+    if constexpr (RAW) {
+        __syncthreads();
+    } else if (__syncthreads_or(g_above_0) && tid == 0) {
+        printf("ERROR: chunked KDA: a log-decay above 0 in chunk %d of head %d; ggml_gated_delta_net's g must be <= 0 "
+               "(GGML_CUDA_KDA_CHUNKED_LEGACY=1 takes the recurrent kernel)\n", pid_chunk, h);
+        __trap();
+    }
 
     // Step 1: G, each channel's prefix sum along the chunk
     {

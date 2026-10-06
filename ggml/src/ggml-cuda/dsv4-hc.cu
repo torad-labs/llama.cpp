@@ -938,7 +938,9 @@ static __device__ __forceinline__ void dsv4_hc_gram_pre(const float * mix, const
         }
         sumsq += pre[a]*row;
     }
-    rms = rsqrtf(sumsq/pr.n_embd + pr.eps_norm);
+    // pre' G pre is a sum of squares, but rounded it can fall under 0 when the streams cancel, and rsqrtf of a negative
+    // makes the whole token NaN
+    rms = rsqrtf(fmaxf(sumsq, 0.0f)/pr.n_embd + pr.eps_norm);
 }
 
 // token it's pre, post and comb weights into weights_out, by one warp: the comb in registers (dsv4_hc_comb_regs), lane

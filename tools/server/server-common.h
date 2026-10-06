@@ -270,10 +270,12 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8
 size_t validate_utf8(const std::string& text);
 
-// replaces each malformed byte of text from `from` on (a continuation byte with no lead, a lead byte not followed by
-// its continuation bytes, a byte that leads nothing) with U+FFFD, as the JSON writer shows it, and stops before an
-// incomplete tail: a lead whose continuation bytes are right so far but too few, which the next token may complete.
-// Returns where that tail starts (text.size() if there is none); text[from, return) is then well-formed UTF-8.
+// replaces each malformed sequence of text from `from` on with one U+FFFD for its maximal subpart, as the JSON writer
+// shows it: a continuation byte with no lead, a byte that leads nothing (80-C1, F5-FF), and a lead whose next byte
+// cannot continue it, judged by Unicode's Table 3-7, so an overlong form, a surrogate and a code point past U+10FFFF
+// are malformed too. It stops before an incomplete tail: a lead whose continuation bytes are right so far but too
+// few, which the next token may complete. Returns where that tail starts (text.size() if there is none);
+// text[from, return) is then well-formed UTF-8.
 size_t utf8_replace_malformed(std::string & text, size_t from);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks

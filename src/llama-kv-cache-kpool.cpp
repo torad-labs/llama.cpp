@@ -27,6 +27,39 @@ uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t
     return std::min(n_pools, indexer_top_k/kpool);
 }
 
+int64_t llama_kpool_tail_max(const llama_kpool_cells_fn & cells_of, const llama_ubatch & ubatch, uint32_t kpool) {
+    const llama_pos r = (llama_pos) kpool;
+
+    int64_t n_tail = r - 1;
+
+    for (uint32_t k = 0; k < ubatch.n_seqs_unq; ++k) {
+        const llama_seq_id     s     = ubatch.seq_id_unq[k];
+        const llama_kv_cells & cells = cells_of(s);
+
+        // one cell a position: a tail spans at most r - 1 positions
+        if (cells.seq_cell_count(s) == cells.seq_pos_distinct(s)) {
+            continue;
+        }
+
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            // a reserve ubatch (ubatch_reserve) names no sequence for its tokens and places none
+            if (ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != s) {
+                continue;
+            }
+
+            const llama_pos q = ubatch.pos[i];
+
+            n_tail = std::max<int64_t>(n_tail, cells.seq_pos_count(s, (q + 1)/r*r, q + 1, UINT32_MAX));
+        }
+    }
+
+    return n_tail;
+}
+
+int64_t llama_kpool_n_kv_max(int64_t n_top_k, int64_t n_tail) {
+    return GGML_PAD(n_top_k + n_tail, 32);
+}
+
 // sel_mask and cand_mask hold only 0.0f and -INFINITY, so f16 is exact here
 template <typename T> struct kpool_mask_of;
 
@@ -51,9 +84,10 @@ static void kpool_mask_fill(char * dst, int64_t n, bool f16) {
     }
 }
 
-// pool_of[j] - b_base is the pool of cell j among the run, or negative when its pool is not complete
+// pool_of[j] - b_base is the pool of cell j among the run, or negative when its pool is not complete. Returns the cells the
+// tail grants
 template <typename T>
-static void kpool_mask_row(
+static int64_t kpool_mask_row(
                 T * cur_sel,
                 T * cur_cand,
         const llama_pos * pos_at,
@@ -66,6 +100,8 @@ static void kpool_mask_row(
     const T v_sel  = kpool_mask_of<T>::from(0.0f);
     const T v_mask = kpool_mask_of<T>::from(-INFINITY);
 
+    int64_t n_tail = 0;
+
     for (int64_t j = 0; j < n_kv; ++j) {
         const bool vis    = (uint32_t) pos_at [j] <= (uint32_t) q;
         const bool pooled = (uint32_t) (pool_of[j] - b_base) < (uint32_t) bo_vis;
@@ -73,7 +109,11 @@ static void kpool_mask_row(
 
         cur_sel [j] = vis && tail   ? v_sel : v_mask;
         cur_cand[j] = vis && (pooled || tail) ? v_sel : v_mask;
+
+        n_tail += vis && tail;
     }
+
+    return n_tail;
 }
 
 // the cell an unused write slot names: empty, or not the last of its block, and not a cell the real slots write, since a pooled key
@@ -131,8 +171,8 @@ struct kpool_stream_out {
 
 // one sequence alone in its stream, from its view: the bytes the loop over the cells of llama_kpool_set_input writes.
 // That loop's caller has zeroed pool_cells, pool_reps, new_cells and the padded mask rows, set pool_bias to -INFINITY, and written
-// the dump pools and sel_mask's dump columns
-static void kpool_stream_from_view(
+// the dump pools and sel_mask's dump columns. Returns the most cells a row's tail was granted
+static int64_t kpool_stream_from_view(
         const kpool_stream_out         & o,
         const llama_kpool_views::view  & v,
         const llama_kv_cells           & cells,
@@ -223,7 +263,8 @@ static void kpool_stream_from_view(
         }
     }
 
-    int64_t n_done = 0;
+    int64_t n_done     = 0;
+    int64_t n_tail_max = 0;
 
     for (int64_t ii = 0; ii < o.n_tps; ++ii) {
         const int64_t i = s*o.n_tps + ii;
@@ -246,13 +287,13 @@ static void kpool_stream_from_view(
         char * cur_sel  = o.sel_mask  + ii*o.n_sel*o.mask_ts;
         char * cur_cand = o.cand_mask + ii*o.n_kv *o.mask_ts;
 
-        if (o.mask_f16) {
+        const int64_t n_tail = o.mask_f16 ?
             kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
-                    v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv, q, tail_start, bo_vis);
-        } else {
+                    v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv, q, tail_start, bo_vis) :
             kpool_mask_row((float *) cur_sel, (float *) cur_cand,
                     v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv, q, tail_start, bo_vis);
-        }
+
+        n_tail_max = std::max(n_tail_max, n_tail);
 
         float * q_pool_bias = o.pool_bias + ii*o.n_pools;
 
@@ -279,9 +320,11 @@ static void kpool_stream_from_view(
             }
         }
     }
+
+    return n_tail_max;
 }
 
-void llama_kpool_set_input(
+int64_t llama_kpool_set_input(
         const llama_kpool_cells_fn & cells_of,
               llama_kpool_views    * views,
               ggml_tensor    * cell_pool,
@@ -413,6 +456,8 @@ void llama_kpool_set_input(
     std::vector<llama_pos> pos_at;
 
     std::vector<int64_t> run_off(n_ps);
+
+    int64_t n_tail_max = 0;
     std::vector<int64_t> run_len(n_ps);
 
     auto seq_of = [&](int64_t s, int64_t ps) {
@@ -445,9 +490,6 @@ void llama_kpool_set_input(
 
         // the fallback of an unused slot when no spare cell is left: recomputing a complete pool is idempotent
         const int32_t * any_rep_src = nullptr;
-
-        // the cells named as a rep by the new slots
-        std::vector<uint8_t> emitted(kcache ? kv_size : 0, 0);
 
         if (kcache) {
             // a pool with no rep gathers row 0; such a pool is -INFINITY in pool_bias, so discarded
@@ -487,13 +529,16 @@ void llama_kpool_set_input(
                 o.mask_f16   = mask_f16;
                 o.mask_ts    = mask_ts;
 
-                kpool_stream_from_view(o, *v, cells_of(seq), seq, ubatch, s, rebuild);
+                n_tail_max = std::max(n_tail_max, kpool_stream_from_view(o, *v, cells_of(seq), seq, ubatch, s, rebuild));
 
                 continue;
             }
 
             views->get_stats().n_direct++;
         }
+
+        // the cells named as a rep by the new slots: a byte per cell of the cache, so only on this path, which reads it
+        std::vector<uint8_t> emitted(kcache ? kv_size : 0, 0);
 
         // [TAG_KPOOL_PACK] one packed run per sequence, NOT one full-width table: the indexer
         // scores every slot against every query, which would multiply the score tensor by n_seq_max
@@ -687,13 +732,13 @@ void llama_kpool_set_input(
                 char  * cur_sel  = cur_sel_mask  + ii*n_sel*mask_ts;
                 char  * cur_cand = cur_cand_mask + ii*n_kv *mask_ts;
 
-                if (mask_f16) {
+                const int64_t n_tail = mask_f16 ?
                     kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
-                            pos_at.data(), pool_of.data(), 0, n_kv, q, tail_start, bo_vis);
-                } else {
+                            pos_at.data(), pool_of.data(), 0, n_kv, q, tail_start, bo_vis) :
                     kpool_mask_row((float *) cur_sel, (float *) cur_cand,
                             pos_at.data(), pool_of.data(), 0, n_kv, q, tail_start, bo_vis);
-                }
+
+                n_tail_max = std::max(n_tail_max, n_tail);
 
                 if (cur_bias) {
                     for (int64_t j = 0; j < n_kv; ++j) {
@@ -733,6 +778,80 @@ void llama_kpool_set_input(
                 }
             }
         }
+    }
+
+    return n_tail_max;
+}
+
+void llama_kpool_compress(
+        ggml_context               * ctx,
+        ggml_cgraph                * gf,
+        ggml_tensor                * kg_rows,
+        ggml_tensor                * new_pool_cells,
+        ggml_tensor                * new_pool_reps,
+        ggml_tensor                * ape,
+        int64_t                      r,
+        int64_t                      chunk,
+        const llama_kpool_write_fn & write,
+        const llama_kpool_name_fn  & name) {
+    GGML_ASSERT(r > 0 && chunk > 0);
+    GGML_ASSERT(kg_rows->ne[0] % 2 == 0);
+    GGML_ASSERT(new_pool_cells->ne[0] % r == 0);
+
+    const int64_t d_idx     = kg_rows->ne[0]/2;
+    const int64_t n_stream  = new_pool_cells->ne[1];
+    const int64_t n_new_max = new_pool_cells->ne[0]/r;
+
+    GGML_ASSERT(kg_rows->ne[2] == n_stream);
+    GGML_ASSERT(new_pool_reps->ne[0] == n_new_max*n_stream);
+    GGML_ASSERT(ape->ne[0] == r && ape->ne[1] == d_idx);
+
+    for (int64_t p0 = 0; p0 < n_new_max; p0 += chunk) {
+        const int64_t n = std::min(chunk, n_new_max - p0);
+
+        // the chunk's members and rep rows, stream by stream; the whole tensors when it is every pool
+        ggml_tensor * cells = new_pool_cells;
+        ggml_tensor * reps  = new_pool_reps;
+
+        if (n != n_new_max) {
+            cells = ggml_view_2d(ctx, new_pool_cells, r*n, n_stream, new_pool_cells->nb[1],
+                    ggml_row_size(new_pool_cells->type, r*p0));
+            reps  = ggml_view_2d(ctx, new_pool_reps, n, n_stream, ggml_row_size(new_pool_reps->type, n_new_max),
+                    ggml_row_size(new_pool_reps->type, p0));
+
+            if (n_stream > 1) {
+                cells = ggml_cont(ctx, cells);
+                reps  = ggml_cont(ctx, reps);
+            }
+            reps = ggml_reshape_1d(ctx, reps, n*n_stream);
+        }
+
+        ggml_tensor * members = ggml_get_rows(ctx, kg_rows, cells);
+        name(members, "indexer_pool_members");
+
+        const size_t nb_mem = members->nb[1];
+
+        ggml_tensor * mem_k = ggml_view_4d(ctx, members, d_idx, r, n, n_stream,
+                nb_mem, nb_mem*r, members->nb[2], 0);
+        ggml_tensor * mem_g = ggml_view_4d(ctx, members, d_idx, r, n, n_stream,
+                nb_mem, nb_mem*r, members->nb[2], d_idx*members->nb[0]);
+
+        // r-way softmaxes over the SLOT axis, so it must be dim 0; ape is added PRE-softmax
+        ggml_tensor * keys_t = ggml_cont(ctx, ggml_permute(ctx, mem_k, 1, 0, 2, 3));
+        ggml_tensor * gate_t = ggml_cont(ctx, ggml_permute(ctx, mem_g, 1, 0, 2, 3));
+
+        gate_t = ggml_add(ctx, gate_t, ggml_reshape_4d(ctx, ape, r, d_idx, 1, 1));
+
+        // soft_max maps ne2/ne3 to gridDim.y/z (65535 cap); fold into ne1
+        ggml_tensor * probs = ggml_soft_max(ctx, ggml_reshape_2d(ctx, gate_t, r, d_idx*n*n_stream));
+        probs = ggml_reshape_4d(ctx, probs, r, d_idx, n, n_stream);
+        name(probs, "indexer_pool_probs");
+
+        ggml_tensor * pool_new = ggml_sum_rows(ctx, ggml_mul(ctx, keys_t, probs));
+        pool_new = ggml_reshape_2d(ctx, pool_new, d_idx, n*n_stream);
+        name(pool_new, "indexer_pool_new");
+
+        ggml_build_forward_expand(gf, write(pool_new, reps));
     }
 }
 
@@ -956,7 +1075,7 @@ const llama_kpool_views::view * llama_kpool_views::serve(
     return &v;
 }
 
-void llama_kv_cache_set_input_kpool(
+int64_t llama_kv_cache_set_input_kpool(
         const llama_kv_cache * kv,
               ggml_tensor    * cell_pool,
               ggml_tensor    * pool_cells,
@@ -983,12 +1102,12 @@ void llama_kv_cache_set_input_kpool(
 
     llama_kpool_views * views = legacy ? nullptr : &kv->get_kpool_views();
 
-    llama_kpool_set_input(cells_of, views,
+    const int64_t n_tail = llama_kpool_set_input(cells_of, views,
             cell_pool, pool_cells, bias, pool_bias, sel_mask, cand_mask,
             pool_reps, new_pool_cells, new_pool_reps, strm_of, kv_size, rebuild, ubatch, kpool);
 
     if (!check || !views) {
-        return;
+        return n_tail;
     }
 
     // the same maps from the cells; the views must have written the same bytes
@@ -1033,6 +1152,8 @@ void llama_kv_cache_set_input_kpool(
         LLAMA_LOG_WARN("%s: k-pool input checked %" PRIu64 " calls: %" PRIu64 " streams from views, %" PRIu64 " views rebuilt, %" PRIu64 " from the cells\n",
                 __func__, n_checked, st.n_served, st.n_rebuilt, st.n_direct);
     }
+
+    return n_tail;
 }
 
 void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
@@ -1057,7 +1178,7 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_dump->buffer) && pool_dump->type == GGML_TYPE_F32 && ggml_is_contiguous(pool_dump));
     std::fill_n((float *) pool_dump->data, ggml_nelements(pool_dump), -FLT_MAX);
 
-    llama_kv_cache_set_input_kpool(
+    const int64_t n_tail_set = llama_kv_cache_set_input_kpool(
             mctx_attn->get_kv(),
             /* cell_pool */ nullptr, pool_cells, /* bias */ nullptr, pool_bias,
             sel_mask, cand_mask,
@@ -1067,8 +1188,12 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             rebuild,
             ubatch, kpool);
 
-    // cleared here, not in build_inp_kpool: a graph built but not evaluated must not clear it
+    // the sparse attention's n_kv_max counts n_tail tail cells a row: a row granted more would lose cells to its compaction
+    GGML_ASSERT(n_tail_set <= n_tail && "k-pool: a row's tail holds more cells than the graph's sparse bound");
+
+    // cleared here, not in build_inp_kpool: a graph built but not evaluated must not clear it. Only this ubatch's
+    // sequences were re-emitted, so only theirs
     if (rebuild) {
-        mctx_attn->get_kv()->clear_kpool_dirty();
+        mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);
     }
 }

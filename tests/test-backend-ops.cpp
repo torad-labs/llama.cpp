@@ -4514,6 +4514,53 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     }
 };
 
+// 16 tokens whose last 12 have streams that cancel in pairs to within 1e-7, at a scale of 100, under equal pre weights
+// (scale[0] 0, base[0..3] equal): the mix is ~0. CUDA's Gram front sums pre' G pre from G's entries, not the mix's
+// squares, and that rounds under 0 for about a third of such tokens; unclamped, rsqrtf makes their rows NaN. The
+// cancelling tokens' outputs are ~1e-3, so the first 4 tokens carry the NMSE and the Gram's rounding of the tiny RMS
+// does not count.
+struct test_dsv4_hc_pre_cancel : public test_dsv4_hc_pre_fused {
+    static constexpr int64_t n_plain = 4;
+
+    test_dsv4_hc_pre_cancel() : test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 16) {}
+
+    std::string vars() override {
+        return test_dsv4_hc_pre_fused::vars() + ",cancel";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc_pre_fused::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "scale") {
+                const float zero = 0.0f;
+                ggml_backend_tensor_set(t, &zero, 0, sizeof(float));
+            } else if (name == "base") {
+                const float base_pre[hc] = { 0.08f, 0.08f, 0.08f, 0.08f };
+                ggml_backend_tensor_set(t, base_pre, 0, sizeof(base_pre));
+            } else if (name == "x") {
+                GGML_ASSERT(ggml_is_contiguous(t));
+                std::vector<float> x(ggml_nelements(t));
+                ggml_backend_tensor_get(t, x.data(), 0, ggml_nbytes(t));
+                std::mt19937 rng(tensor_seed(t));
+                std::uniform_real_distribution<float> dist(-100.0f, 100.0f);
+                for (int64_t it = n_plain; it < n_tokens; ++it) {
+                    float * xt = x.data() + it*hc*n_embd;
+                    for (int64_t i = 0; i < n_embd; ++i) {
+                        const float a = dist(rng);
+                        const float b = dist(rng);
+                        xt[i + 0*n_embd] =  a;
+                        xt[i + 1*n_embd] = -a*(1.0f + 1e-7f*(i % 7 - 3));
+                        xt[i + 2*n_embd] =  b;
+                        xt[i + 3*n_embd] = -b*(1.0f + 1e-7f*(i % 5 - 2));
+                    }
+                }
+                ggml_backend_tensor_set(t, x.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 // The front's normed mix read by n_readers quantized MUL_MATs of 256 rows (the sublayer's projections), their outputs
 // summed. CUDA's front writes the mix's q8_1 copy beside it where n_embd is a multiple of 512 and a reader runs on
 // mul_mat_vec_q (ggml_cuda_dsv4_hc_writes_q8_1), for one reader or more, and the readers read the copy.
@@ -10281,6 +10328,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 1, 20, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 3, 20, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 7168, 2, 20));
+    // streams whose mix cancels: the Gram front's pre' G pre rounds under 0 and must not make a token NaN (433d88eae)
+    test_cases.emplace_back(new test_dsv4_hc_pre_cancel());
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 64, 5, 4));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 64, 2, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 31, 3, 4));
@@ -11550,6 +11599,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 3, 5 }) {
         test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 8, 8, 4096, 2048, n, 7.0f));
     }
+    // and the same FFN in Q8_0, which the ring takes past one token (an MTP verify), the down quantizing its vectors
+    for (int n : { 2, 3 }) {
+        test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_Q8_0, 16, 8, 4096, 2048, n, 7.0f));
+    }
+    // and 8 tokens on each of 8 experts, where the ring's pair tables are exactly full (64 = MMVQ_MOE_MAX_PAIRS, bit 63
+    // of an expert's pair mask). These reach the ring, not its own quantize of y: 64 vectors of 4,096 columns leave the
+    // shared-memory plan no room for them, so ggml_cuda_mmvq_moe_keeps_y is false and y comes from the shared path. The
+    // 2- and 3-token cases above are the ones that quantize in the ring, and a doubled block scale there fails those two
+    // and leaves these passing (RTX 5090, 2026-10-06)
+    test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 8, 8, 4096, 2048, 8, 7.0f));
+    test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_Q8_0, 8, 8, 4096, 2048, 8, 0.0f));
     // and its routed experts at a prefill batch, where MMQ tiles each expert's columns: 64 experts with 8 used, so 64
     // and 256 tokens give 8 and 32 columns an expert on average, the tile width follows them and only the experts'
     // non-empty column tiles are launched
@@ -12529,6 +12589,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({129, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
+                    // the rows that fit one block of topk_moe_cuda, at an expert count the fusion takes: every other
+                    // shape here has 1 row or 22, so the fused path's own aliasing rule was never reached (160 is no
+                    // power of two, so ggml_cuda_should_use_topk_moe refuses the shape above)
+                    test_cases.emplace_back(new test_topk_moe({128, 4, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
                 }
@@ -12626,6 +12690,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1, 1, false, true, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 200, 2, 1, false, true, 4, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 128, 1, 1, false, true, 9, false, -1, true));
+    // KDA with strided q/k/v (the qwen35 views, no cont anywhere), and one chunk of 16 tokens alone: 128 tokens with
+    // K = 113 snapshot slots leaves the chunked pass a single chunk and the last 112 tokens to the recurrent kernel
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2, false, true, 1, false, -1, false, /*qkv_view=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2, false, true, 1, false, -1, true,  /*qkv_view=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 128, 1, 1, false, true, /*K=*/113));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 128, 2, 1, false, true, 113, false, -1, true));
     // gated_delta_net -> cpy into the cache (fused), recurrent and chunked shapes
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));

@@ -16,6 +16,25 @@ struct llama_context;
 
 class llama_kpool_views;
 
+// GLM-5-Next pooled-key cache: the sequences whose cached pooled keys a position mutation left stale. Pools group cells by
+// absolute position, so seq_add or seq_div regroups them while every cached key still looks complete. A ubatch holding a
+// marked sequence re-emits every pool of its sequences and clears only their marks; a marked sequence the ubatch does not
+// hold stays marked until a ubatch of its own (one flag for the cache, cleared by another sequence's ubatch, left it stale).
+// Sticky by design: a mark that clears too early is silently wrong
+struct llama_kpool_stale {
+    // whether seq_add's shift of [p0, p1) by `shift` regroups pools of `kpool` cells: a cached key survives only if WHOLE pools
+    // move, a shift by a multiple of kpool over a range that starts and ends on a pool boundary (p0 < 0: from the start,
+    // p1 < 0: to the end, neither can be straddled)
+    static bool shift_regroups(uint32_t kpool, llama_pos p0, llama_pos p1, llama_pos shift);
+
+    void mark(llama_seq_id seq_id); // seq_id < 0: every sequence
+    bool any  (const llama_ubatch & ubatch) const;
+    void clear(const llama_ubatch & ubatch);
+
+private:
+    std::bitset<LLAMA_MAX_SEQ> seqs;
+};
+
 //
 // llama_kv_cache
 //
@@ -161,11 +180,11 @@ public:
 
     bool get_has_shift() const;
 
-    // GLM-5-Next pooled-key cache: seq_add/seq_div regroup pools while every cached key still
-    // looks complete. sticky by design, a flag that clears too early is silently wrong
-    void set_kpool_dirty();
-    bool get_kpool_dirty() const;
-    void clear_kpool_dirty() const;
+    // GLM-5-Next pooled-key cache, per sequence (llama_kpool_stale): seq_add/seq_div mark a sequence, a ubatch holding a
+    // marked one rebuilds, and its set_input clears the ubatch's sequences
+    void set_kpool_dirty(llama_seq_id seq_id);
+    bool get_kpool_dirty(const llama_ubatch & ubatch) const;
+    void clear_kpool_dirty(const llama_ubatch & ubatch) const;
 
     // the pooled-key input state kept from one ubatch to the next (llama-kv-cache-kpool.h); made at the first call
     llama_kpool_views & get_kpool_views() const;
@@ -272,7 +291,7 @@ private:
     bool v_trans = true;  // the value tensor is transposed
 
     // see set_kpool_dirty. mutable: its only consumer runs from set_input, holding a const cache
-    mutable bool kpool_dirty = false;
+    mutable llama_kpool_stale kpool_stale;
 
     mutable std::shared_ptr<llama_kpool_views> kpool_views;
 

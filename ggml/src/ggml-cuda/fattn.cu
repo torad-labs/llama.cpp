@@ -6,8 +6,19 @@
 #include "fattn.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// A row with more finite cells than n_kv_max breaks ggml_flash_attn_ext_set_n_kv_max's contract, and its first n_kv_max
+// would attend to part of the row without a sign: the launch traps instead, and the next sync fails
+static __device__ __forceinline__ void flash_attn_sparse_check_count(
+        const int count, const int n_kv_max, const int query, const int sequence) {
+    if (count > n_kv_max && threadIdx.x == 0) {
+        printf("ERROR: sparse flash attention: mask row %d of sequence %d has %d finite cells, over n_kv_max %d\n",
+               query, sequence, count, n_kv_max);
+        __trap();
+    }
+}
+
 // A block a mask row: its finite entries' cells, ascending, into the row's n_kv_max indices, -1 past its count (a count
-// over n_kv_max keeps the first n_kv_max: the bound is the graph's to keep).
+// over n_kv_max writes the first n_kv_max and traps: the bound is the graph's to keep).
 // Upstream's scan (8e93a9773): 256 threads, 2048 columns a round of scalar loads. A decode's one row is one block, so
 // a round is a memory round trip: 11 us at 32K columns. GGML_CUDA_FATTN_SPARSE_SCAN_LEGACY=1, or a mask row not
 // 16-byte aligned.
@@ -84,6 +95,7 @@ static __global__ void flash_attn_mask_to_sparse_indices_legacy(
     }
 
     const int count = row_count;
+    flash_attn_sparse_check_count(count, n_kv_max, query, sequence);
     for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
         indices[i] = -1;
     }
@@ -173,6 +185,7 @@ static __global__ void flash_attn_mask_to_sparse_indices(
         __syncthreads(); // the next chunk rewrites warp_sums
     }
 
+    flash_attn_sparse_check_count(row_count, n_kv_max, query, sequence);
     for (int i = row_count + tid; i < n_kv_max; i += sparse_scan_threads) {
         indices[i] = -1;
     }
@@ -255,7 +268,9 @@ void ggml_cuda_flash_attn_ext_gather_k_q8_0(
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// GGML_CUDA_FATTN_SPARSE_LEGACY=1: the hint is ignored, the kernel reads the whole cache under the mask.
+// GGML_CUDA_FATTN_SPARSE_LEGACY=1: the hint is ignored, and the dense kernel runs as it did before the gather: over the
+// KV steps a row of its Q tile sees (launch_fattn's kv_live, 2f0ca785a), the whole cache under the mask only with
+// GGML_CUDA_FATTN_LIVE_TILES_LEGACY=1 as well.
 // The gather reads n_kv_max cells a query; the dense kernel reads the cache once for up to 64/ncols2 queries. The gather
 // wins where the cache is at least those queries' cells (GLM-5.3's DSA shape, 32 heads on the latent, RTX 5080 and
 // 5070 Ti: at 0.25-0.99x the dense time wherever K >= n_gather, at 1.13-1.27x wherever it is under; upstream's 2x margin

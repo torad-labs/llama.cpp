@@ -1915,6 +1915,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_pos[seq_id] = verify_pos[seq_id] + i_h;
     }
 
+    // the kept row and the position it is for, so a restored checkpoint pairs the token after it with the row the
+    // generation it belongs to produced. A sequence with no kept row has no state, and an empty one clears it: a slot
+    // whose cells are removed or replaced by another conversation's keeps a row that is no longer the one before
+    // anything (position alone does not tell the two apart, h_before)
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos[seq_id] < 0) {
+            return false;
+        }
+
+        const llama_pos pos = pending_pos[seq_id];
+
+        data.resize(sizeof(llama_pos) + (size_t) n_embd * sizeof(float));
+        std::memcpy(data.data(),                     &pos,                       sizeof(llama_pos));
+        std::memcpy(data.data() + sizeof(llama_pos), pending_h[seq_id].data(), (size_t) n_embd * sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        if (data.empty()) {
+            pending_pos[seq_id] = -1;
+            return;
+        }
+        if (data.size() != sizeof(llama_pos) + (size_t) n_embd * sizeof(float)) {
+            return;
+        }
+
+        llama_pos pos = -1;
+        std::memcpy(&pos, data.data(), sizeof(llama_pos));
+
+        pending_pos[seq_id] = pos;
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd * sizeof(float));
+    }
+
     void end(llama_seq_id seq_id) override {
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             generating[seq_id] = 0;

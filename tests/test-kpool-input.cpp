@@ -15,16 +15,20 @@
 // is checked against a snapshot of the cells on its own.
 
 #include "../src/llama-batch.h"
+#include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cache-kpool.h"
 #include "../src/llama-kv-cells.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <random>
 #include <set>
 #include <vector>
@@ -512,6 +516,30 @@ static bool dump_safe(const maps & m, int64_t n_kv, uint32_t r, char * what, siz
     return true;
 }
 
+// the most finite columns a row of sel_mask holds among its first n_kv: the cells its tail grants
+static int64_t sel_tail_max(const maps & m, int64_t n_kv) {
+    const int64_t n_sel  = m.sel_mask->ne[0];
+    const int64_t n_rows = m.sel_mask->ne[1]*m.sel_mask->ne[3];
+
+    int64_t n_max = 0;
+
+    for (int64_t row = 0; row < n_rows; ++row) {
+        int64_t n = 0;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int64_t k = row*n_sel + j;
+            const float   x = m.sel_mask->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) m.sel_mask->data)[k]) :
+                                                                   ((const float *) m.sel_mask->data)[k];
+            n += std::isfinite(x);
+        }
+        n_max = std::max(n_max, n);
+    }
+
+    return n_max;
+}
+
+// builds whose longest tail held more than r - 1 cells (two cells at one position)
+static int64_t n_tail_long = 0;
+
 // the inputs of one ubatch built from the views and from the cells. The ubatch is placed in the cells first, as the cache
 // does (apply_ubatch before the inputs are set). rebuild: re-emit every pool, as after a position mutation
 static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, bool rebuild, std::mt19937 & rng, control ctl, char * what, size_t n_what) {
@@ -604,10 +632,22 @@ static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, 
     maps inc(n_kv, n_ns, n_tokens/n_ns, n_ps, cfg.r, cfg.kcache, cfg.f16, rebuild, n_dump, 0x5A);
 
     // the views go first: the reference never takes the log
-    llama_kpool_set_input(cells_of, &views, nullptr, inc.pool_cells, nullptr, inc.pool_bias, inc.sel_mask, inc.cand_mask,
+    const int64_t tail_inc = llama_kpool_set_input(cells_of, &views, nullptr, inc.pool_cells, nullptr, inc.pool_bias, inc.sel_mask, inc.cand_mask,
             inc.pool_reps, inc.new_pool_cells, inc.new_pool_reps, strm_of.data(), w.v_cells[0].size(), rebuild, ub, cfg.r);
-    llama_kpool_set_input(cells_of, nullptr, nullptr, ref.pool_cells, nullptr, ref.pool_bias, ref.sel_mask, ref.cand_mask,
+    const int64_t tail_ref = llama_kpool_set_input(cells_of, nullptr, nullptr, ref.pool_cells, nullptr, ref.pool_bias, ref.sel_mask, ref.cand_mask,
             ref.pool_reps, ref.new_pool_cells, ref.new_pool_reps, strm_of.data(), w.v_cells[0].size(), rebuild, ub, cfg.r);
+
+    // the tail a row is granted, as set_input reports it and as sel_mask holds it, within the bound the graph sizes on
+    const int64_t tail_sel = sel_tail_max(ref, n_kv);
+    const int64_t tail_max = llama_kpool_tail_max(cells_of, *ub, cfg.r);
+
+    n_tail_long += tail_ref > (int64_t) cfg.r - 1;
+
+    if (tail_inc != tail_ref || tail_ref != tail_sel || tail_ref > tail_max) {
+        snprintf(what, n_what, "tail: views report %lld cells, the cells %lld, sel_mask holds %lld, the bound is %lld",
+                (long long) tail_inc, (long long) tail_ref, (long long) tail_sel, (long long) tail_max);
+        return false;
+    }
 
     if (ctl == CONTROL_CORRUPT) {
         ((uint8_t *) inc.sel_mask->data)[0] ^= 0x80;
@@ -749,8 +789,288 @@ static void run_controls(std::mt19937 & rng) {
     CHECK(views.get_stats().n_rebuilt > n_rebuilt, "a view whose changes were taken was not rebuilt");
 }
 
+// The stale marks of the pooled keys across two sequences, as a server makes them: sequence 0 shifted by a context shift
+// (seq_rm of [4, 9), then seq_add of [9, end) by -5), a decode of sequence 1, a decode of sequence 0. The pooled keys are
+// kept as the indexer cache keeps them, one row per complete pool written by the new-pool slots; after the last decode
+// every complete pool of both sequences must hold the key of its members. `per_seq` false is the cache's former scheme, one
+// flag for the cache, which the decode of sequence 1 clears: the count of stale pools it leaves shows the check can fail.
+// Returns the count of complete pools whose key is not their members' after the last decode
+static int64_t stale_after_shift(std::mt19937 & rng, bool per_seq) {
+    const uint32_t r    = 4;
+    const uint32_t size = 256;
+
+    pool w(size, 2, true, rng);
+
+    llama_kpool_stale stale;  // the per-sequence marks
+    bool              flag = false; // the former flag
+
+    // the indexer cache: rep row -> the members the key in it was made from
+    std::map<int64_t, std::vector<int32_t>> key;
+
+    const llama_kpool_cells_fn cells_of = [&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); };
+    const uint32_t strm_of[1] = { 0 };
+
+    auto decode = [&](llama_seq_id s, uint32_t n) {
+        ubatch_data ud;
+        for (const llama_pos p : w.append(s, n)) {
+            ud.add(s, p);
+        }
+        const llama_ubatch * ub = ud.get();
+
+        const bool rebuild = per_seq ? stale.any(*ub) : flag;
+
+        const int64_t n_kv  = std::max<int64_t>(32, (w.v_cells[0].used_max_p1() + 31)/32*32);
+        const int64_t n_tps = ub->n_tokens;
+
+        maps m(n_kv, 1, n_tps, 1, r, true, true, rebuild, 0, 0);
+
+        llama_kpool_set_input(cells_of, nullptr, nullptr, m.pool_cells, nullptr, m.pool_bias, m.sel_mask, m.cand_mask,
+                m.pool_reps, m.new_pool_cells, m.new_pool_reps, strm_of, size, rebuild, ub, r);
+
+        // set_rows: every slot writes its row, a real one the key of its members
+        const int64_t   n_new_max = m.new_pool_cells->ne[0]/r;
+        const int32_t * cells_in  = (const int32_t *) m.new_pool_cells->data;
+        const int64_t * rows      = (const int64_t *) m.new_pool_reps->data;
+
+        for (int64_t k = 0; k < n_new_max; ++k) {
+            key[rows[k]] = std::vector<int32_t>(cells_in + k*r, cells_in + (k + 1)*r);
+        }
+
+        if (per_seq) {
+            if (rebuild) {
+                stale.clear(*ub);
+            }
+        } else {
+            flag = false;
+        }
+
+        return rebuild;
+    };
+
+    // the complete pools of a sequence whose row does not hold the key of their members
+    auto n_stale = [&](llama_seq_id s) {
+        const auto & cells = w.cells_of(s);
+
+        std::map<llama_pos, std::vector<int32_t>> pools;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.seq_has(i, s)) {
+                auto & m = pools[cells.pos_get(i)/r];
+                m.resize(r, -1);
+                m[cells.pos_get(i) % r] = (int32_t) i;
+            }
+        }
+
+        int64_t n = 0;
+        for (const auto & [b, members] : pools) {
+            if (std::find(members.begin(), members.end(), -1) != members.end()) {
+                continue;
+            }
+            const auto it = key.find(members[r - 1]);
+            n += it == key.end() || it->second != members;
+        }
+        return n;
+    };
+
+    decode(0, 16);
+    decode(1, 16);
+    CHECK(n_stale(0) == 0 && n_stale(1) == 0, "the prefills left %lld and %lld stale pools", (long long) n_stale(0), (long long) n_stale(1));
+
+    // the context shift of sequence 0, as llama_memory_hybrid::seq_rm and seq_add apply it
+    w.rollback(0, 4, 9);
+    auto & cells = w.cells_of(0);
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.pos_in(i, 9, INT32_MAX) && cells.seq_has(i, 0)) {
+            cells.pos_add(i, -5);
+        }
+    }
+    cells.reset_shift();
+
+    CHECK(llama_kpool_stale::shift_regroups(r, 9, -1, -5), "a shift by -5 over pools of 4 must regroup them");
+    stale.mark(0);
+    flag = true;
+
+    const bool rebuilt_1 = decode(1, 1);
+    const bool rebuilt_0 = decode(0, 1);
+
+    if (per_seq) {
+        CHECK(!rebuilt_1, "a decode of sequence 1 rebuilt for sequence 0's shift");
+        CHECK(rebuilt_0, "the decode of the shifted sequence 0 did not rebuild");
+
+        // and the marks are spent: the next decode of sequence 0 is a plain one
+        ubatch_data ud;
+        ud.add(0, w.p_next(0));
+        CHECK(!stale.any(*ud.get()), "sequence 0 is still marked after the decode that rebuilt it");
+    }
+
+    return n_stale(0) + n_stale(1);
+}
+
+// The new pools' keys compressed `chunk` at a time (llama_kpool_compress) against all at once, as a rebuild re-emits every
+// pool: the same bytes in every pooled row, from a compute buffer of a chunk's size. Returns the buffer's bytes
+static size_t compress_pools(int64_t chunk, std::vector<float> & pooled) {
+    const int64_t d_idx   = 32;
+    const int64_t r       = 4;
+    const int64_t n_kv    = 16384;
+    const int64_t n_pools = n_kv/r;
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+
+    ggml_init_params dp = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * cd = ggml_init(dp);
+
+    ggml_tensor * kbuf  = ggml_new_tensor_4d(cd, GGML_TYPE_F32, d_idx, 3, n_kv, 1); // a cell: key, gate, pooled key
+    ggml_tensor * cells = ggml_new_tensor_2d(cd, GGML_TYPE_I32, r*n_pools, 1);
+    ggml_tensor * reps  = ggml_new_tensor_1d(cd, GGML_TYPE_I64, n_pools);
+    ggml_tensor * ape   = ggml_new_tensor_2d(cd, GGML_TYPE_F32, r, d_idx);
+
+    ggml_backend_buffer_t data = ggml_backend_alloc_ctx_tensors(cd, cpu);
+
+    std::mt19937 rng(20261006);
+    std::uniform_real_distribution<float> u(-2.0f, 2.0f);
+
+    std::vector<float> kv(ggml_nelements(kbuf));
+    for (int64_t j = 0; j < n_kv; ++j) {
+        for (int64_t h = 0; h < 3*d_idx; ++h) {
+            kv[j*3*d_idx + h] = h < 2*d_idx ? u(rng) : 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(kbuf, kv.data(), 0, ggml_nbytes(kbuf));
+
+    // a pool's members are r cells anywhere in the cache, its key in the row of the last
+    std::vector<int32_t> perm(n_kv);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        perm[j] = (int32_t) j;
+    }
+    std::shuffle(perm.begin(), perm.end(), rng);
+    std::vector<int64_t> rows(n_pools);
+    for (int64_t p = 0; p < n_pools; ++p) {
+        rows[p] = perm[p*r + r - 1];
+    }
+    ggml_backend_tensor_set(cells, perm.data(), 0, ggml_nbytes(cells));
+    ggml_backend_tensor_set(reps,  rows.data(), 0, ggml_nbytes(reps));
+
+    std::vector<float> a(r*d_idx);
+    for (auto & x : a) {
+        x = u(rng);
+    }
+    ggml_backend_tensor_set(ape, a.data(), 0, ggml_nbytes(ape));
+
+    ggml_init_params gp = { 4096*ggml_tensor_overhead() + ggml_graph_overhead_custom(4096, false), nullptr, true };
+    ggml_context * cg = ggml_init(gp);
+    ggml_cgraph  * gf = ggml_new_graph_custom(cg, 4096, false);
+
+    ggml_tensor * kg_rows = ggml_view_3d(cg, kbuf, 2*d_idx, n_kv, 1, kbuf->nb[2], kbuf->nb[3], 0);
+
+    llama_kpool_compress(cg, gf, kg_rows, cells, reps, ape, r, chunk,
+            [&](ggml_tensor * src, ggml_tensor * idx) {
+                ggml_tensor * k2  = ggml_reshape_2d(cg, kbuf, 3*d_idx, n_kv);
+                ggml_tensor * dst = ggml_view_2d(cg, k2, d_idx, n_kv, k2->nb[1], ggml_row_size(k2->type, 2*d_idx));
+                return ggml_set_rows(cg, dst, src, idx);
+            },
+            [](ggml_tensor * t, const char * name) {
+                ggml_set_name(t, name);
+            });
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    CHECK(ggml_gallocr_alloc_graph(galloc, gf), "the compression graph did not allocate");
+    const size_t size = ggml_gallocr_get_buffer_size(galloc, 0);
+
+    ggml_backend_graph_compute(cpu, gf);
+
+    ggml_backend_tensor_get(kbuf, kv.data(), 0, ggml_nbytes(kbuf));
+    pooled.assign(n_pools*d_idx, 0.0f);
+    for (int64_t p = 0; p < n_pools; ++p) {
+        std::copy_n(kv.data() + rows[p]*3*d_idx + 2*d_idx, d_idx, pooled.data() + p*d_idx);
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(cg);
+    ggml_backend_buffer_free(data);
+    ggml_free(cd);
+    ggml_backend_free(cpu);
+
+    return size;
+}
+
+static void run_compress_chunks() {
+    std::vector<float> whole;
+    std::vector<float> chunked;
+
+    const size_t size_whole   = compress_pools(4096, whole); // every pool at once: the graph before chunks
+    const size_t size_chunked = compress_pools(512,  chunked);
+
+    printf("compressing 4,096 pools: %zu bytes of compute buffer at once, %zu in chunks of 512\n", size_whole, size_chunked);
+
+    CHECK(whole.size() == chunked.size() && memcmp(whole.data(), chunked.data(), whole.size()*sizeof(float)) == 0,
+            "the pooled keys compressed in chunks differ from all at once");
+    CHECK(std::any_of(whole.begin(), whole.end(), [](float x) { return x != 0.0f; }), "no pooled key was written");
+    CHECK(size_chunked*4 < size_whole, "chunks of 512 of 4,096 pools took %zu bytes against %zu at once", size_chunked, size_whole);
+}
+
+// which shifts regroup pools, as llama_memory_hybrid::seq_add asks
+static void run_shift_regroups() {
+    CHECK(!llama_kpool_stale::shift_regroups(4, 8, -1, -4), "whole pools moved by a whole pool");
+    CHECK(!llama_kpool_stale::shift_regroups(4, -1, -1, 8), "the whole sequence moved by two pools");
+    CHECK( llama_kpool_stale::shift_regroups(4, 9, -1, -5), "a shift by -5");
+    CHECK( llama_kpool_stale::shift_regroups(4, 9, -1, -4), "a range that starts inside a pool");
+    CHECK( llama_kpool_stale::shift_regroups(4, 8, 10, -4), "a range that ends inside a pool");
+}
+
+// a sequence holding 11 more cells at each of its last three positions: the row at the last has a tail of 36 cells, and with
+// GLM-5-Next's 2,048 top-k cells (512 pools of 4) its live cells pass the n_kv_max an r - 1 tail sizes
+static void run_tail_bound(std::mt19937 & rng) {
+    const uint32_t r = 4;
+
+    pool w(256, 1, true, rng);
+    w.append(0, 63);
+
+    auto & cells = w.cells_of(0);
+    for (llama_pos p = 60; p <= 62; ++p) {
+        for (int k = 0; k < 11; ++k) {
+            const int64_t i = w.find_empty(0);
+            cells.pos_set(i, p);
+            cells.seq_add(i, 0);
+        }
+    }
+
+    ubatch_data ud;
+    ud.add(0, 62);
+    const llama_ubatch * ub = ud.get();
+
+    const llama_kpool_cells_fn cells_of = [&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); };
+
+    maps m(256, 1, 1, 1, r, false, true, false, 0, 0);
+    const int64_t n_tail = llama_kpool_set_input(cells_of, nullptr, nullptr, m.pool_cells, nullptr, m.pool_bias, m.sel_mask, m.cand_mask,
+            nullptr, nullptr, nullptr, nullptr, 0, false, ub, r);
+    const int64_t n_bound = llama_kpool_tail_max(cells_of, *ub, r);
+
+    const int64_t n_top_k  = 2048;
+    const int64_t n_live   = n_top_k + n_tail;
+    const int64_t n_kv_old = llama_kpool_n_kv_max(n_top_k, r - 1);
+    const int64_t n_kv_new = llama_kpool_n_kv_max(n_top_k, n_bound);
+
+    printf("a tail of %lld cells: %lld live cells a row, n_kv_max %lld for an r - 1 tail, %lld for the longest tail\n",
+            (long long) n_tail, (long long) n_live, (long long) n_kv_old, (long long) n_kv_new);
+
+    CHECK(n_tail == 36 && n_bound == 36, "the tail: %lld cells granted, %lld counted, 36 placed", (long long) n_tail, (long long) n_bound);
+    CHECK(n_kv_old < n_live, "an r - 1 tail bound holds %lld live cells: the case cannot fail", (long long) n_live);
+    CHECK(n_kv_new >= n_live, "n_kv_max %lld under %lld live cells", (long long) n_kv_new, (long long) n_live);
+}
+
 int main() {
     std::mt19937 rng(20260930);
+
+    run_shift_regroups();
+    run_compress_chunks();
+    run_tail_bound(rng);
+
+    const int64_t n_stale_per_seq = stale_after_shift(rng, true);
+    const int64_t n_stale_flag    = stale_after_shift(rng, false);
+
+    printf("a context shift of one sequence: %lld stale pools with per-sequence marks, %lld with one flag for the cache\n",
+            (long long) n_stale_per_seq, (long long) n_stale_flag);
+    CHECK(n_stale_per_seq == 0, "%lld pools kept a stale key after the shifted sequence's own decode", (long long) n_stale_per_seq);
+    CHECK(n_stale_flag > 0, "one flag for the cache left no pool stale: the check cannot fail");
 
     llama_kpool_views::stats total;
 
@@ -785,6 +1105,9 @@ int main() {
     // the rounds must reach the view path, not only the fallback
     CHECK(total.n_served > 2000, "only %llu streams were served from views", (unsigned long long) total.n_served);
     CHECK(total.n_direct > 100,  "only %llu streams took the maps from the cells: the fallbacks are not reached", (unsigned long long) total.n_direct);
+
+    printf("random rounds: %lld builds with a tail over r - 1 cells, each within llama_kpool_tail_max\n", (long long) n_tail_long);
+    CHECK(n_tail_long > 0, "no build held a tail over r - 1 cells: the bound is not tested");
 
     if (n_fail == 0) {
         printf("ok\n");

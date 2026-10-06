@@ -196,20 +196,9 @@ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    // pools group cells by absolute position, so a cached pooled key survives a shift only if
-    // WHOLE pools move: the shift must be a multiple of kpool AND the range must start and
-    // end on a pool boundary. both callers pass an arbitrary bound.
-    if (mem_idx && hparams.indexer_kpool > 0) {
-        const llama_pos r = (llama_pos) hparams.indexer_kpool;
-
-        // p0 < 0 means "from the start", p1 < 0 "to the end": neither can be straddled
-        const bool whole_pools = shift % r == 0 &&
-                                 (p0 <= 0 || p0 % r == 0) &&
-                                 (p1 <  0 || p1 % r == 0);
-
-        if (!whole_pools) {
-            mem_attn->set_kpool_dirty();
-        }
+    // both callers pass an arbitrary bound: a shift that regroups pools marks the sequence's pooled keys stale
+    if (mem_idx && hparams.indexer_kpool > 0 && llama_kpool_stale::shift_regroups(hparams.indexer_kpool, p0, p1, shift)) {
+        mem_attn->set_kpool_dirty(seq_id);
     }
     mem_attn->seq_add(seq_id, p0, p1, shift);
     if (mem_idx) mem_idx->seq_add(seq_id, p0, p1, shift);
@@ -218,7 +207,7 @@ void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     if (mem_idx && hparams.indexer_kpool > 0 && d != 1) {
-        mem_attn->set_kpool_dirty();
+        mem_attn->set_kpool_dirty(seq_id);
     }
     mem_attn->seq_div(seq_id, p0, p1, d);
     if (mem_idx) mem_idx->seq_div(seq_id, p0, p1, d);

@@ -142,10 +142,7 @@ void ggml_cuda_set_device(int device) {
 // attribution taken from a trace is unreliable at this scale -- including the one that put 66 % of a decode token's
 // 444.6 us device-idle gap on this call. Off (the default) this costs one test of a static flag.
 static bool ggml_cuda_time_launch() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_CUDA_TIME_LAUNCH");
-        return env != nullptr && atoi(env) == 1;
-    }();
+    static const bool enabled = ggml_env_switch("GGML_CUDA_TIME_LAUNCH");
     return enabled;
 }
 
@@ -168,10 +165,7 @@ static void ggml_cuda_time_launch_record(int device, double us) {
 // GGML_CUDA_COUNT_INFLIGHT=1 prints, before each replay launch, the device's earlier replays not yet finished, so the last
 // line before a hang tells a host that ran far ahead (many) from one launch that cannot enqueue (0 or 1).
 static bool ggml_cuda_count_inflight() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_CUDA_COUNT_INFLIGHT");
-        return env != nullptr && atoi(env) == 1;
-    }();
+    static const bool enabled = ggml_env_switch("GGML_CUDA_COUNT_INFLIGHT");
     return enabled;
 }
 
@@ -2073,7 +2067,10 @@ static bool ggml_cuda_pq2_mma_group_enabled() {
 
 // A MUL_MAT that ggml_cuda_mul_mat sends to ggml_cuda_mul_mat_vec_q and that sends it, unfused, to the tensor-core kernel
 static bool ggml_cuda_pq2_mma_group_member(ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
-    return mm->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+    // a node the graph does not compute (GGML_TENSOR_FLAG_COMPUTE unset, ggml_build_forward_select) is no member: the node
+    // loop skips it, and a group would compute it
+    return mm->op == GGML_OP_MUL_MAT && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) && !ggml_is_empty(mm) &&
+        ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
         mm->src[1]->nb[0] == sizeof(float) && mm->nb[0] == sizeof(float) &&
         ggml_cuda_should_use_mmvq(GGML_TYPE_PQ2_0, ggml_cuda_info().devices[ctx.device].cc, mm->src[1]->ne[1]) &&
         ggml_cuda_pq2_mma_fuses(ctx, mm, nullptr, nullptr);
@@ -3600,7 +3597,7 @@ static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     static const bool legacy = ggml_env_switch("GGML_CUDA_GRAPH_KEY_LEGACY");
 
     ggml_cuda_graph_key key;
-    key.first_node = cgraph->nodes[0];
+    key.first_node = cgraph->n_nodes > 0 ? cgraph->nodes[0] : nullptr; // an empty graph's slot 0 is no node of it
     if (legacy) {
         return key;
     }
@@ -4590,13 +4587,26 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     };
 
     bool is_ok = true;
-    // exception for topk-moe, which reads all its rows before it writes when they fit one block
-    // (ggml_cuda_topk_moe_reads_before_writes). GGML_CUDA_TOPK_MOE_ALIAS_LEGACY=1: at one row only
-    static const bool topk_moe_alias_legacy = ggml_env_switch("GGML_CUDA_TOPK_MOE_ALIAS_LEGACY");
-    const int64_t     topk_moe_rows         = ggml_nrows(cgraph->nodes[node_idx]);
-    if (is_topk_moe && (topk_moe_alias_legacy ? topk_moe_rows == 1 : ggml_cuda_topk_moe_reads_before_writes(topk_moe_rows))) {
+    // exception for topk-moe at one row: its one warp reads every src before it writes
+    const int64_t topk_moe_rows = ggml_nrows(cgraph->nodes[node_idx]);
+    if (is_topk_moe && topk_moe_rows == 1) {
         return true;
     }
+    // at the rows that fit one block, its warps meet at a barrier once the logits (the first node's src) are read, so the
+    // outputs may overlap the logits themselves, or gpt-oss's reshape of them; the bias is read past the barrier, so it
+    // is checked (ggml_cuda_topk_moe_reads_before_writes). GGML_CUDA_TOPK_MOE_ALIAS_LEGACY=1: at one row only
+    static const bool   topk_moe_alias_legacy = ggml_env_switch("GGML_CUDA_TOPK_MOE_ALIAS_LEGACY");
+    const ggml_tensor * read_first            = is_topk_moe && !topk_moe_alias_legacy &&
+        ggml_cuda_topk_moe_reads_before_writes(topk_moe_rows) ? cgraph->nodes[node_idx]->src[0] : nullptr;
+    // the logits and a reshape of them, which share both, and nothing else: a src merely CONTAINED in the logits is a
+    // strict sub-view, and the two that can be one are both read past the barrier, not before it. The bias is one (its
+    // every instance here is a model weight, so GGML_OP_NONE above already skips it, and a weight shares no buffer with
+    // the logits); the other is the tail of a logits tensor with ne[2] > 1, which ggml_nrows counts and the launch's
+    // logits->ne[1] does not read.
+    auto reads_first_whole = [&](const ggml_tensor * src) {
+        return read_first != nullptr && src->buffer == read_first->buffer && src->data == read_first->data &&
+            ggml_nbytes(src) == ggml_nbytes(read_first);
+    };
 
     for (int i = 0; i < out_count; ++i) {
         const ggml_tensor * dst = cgraph->nodes[out_nodes[i]];
@@ -4609,7 +4619,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == staged_src) {
+                if (!src || src->op == GGML_OP_NONE || src == staged_src || reads_first_whole(src)) {
                     continue;
                 }
 

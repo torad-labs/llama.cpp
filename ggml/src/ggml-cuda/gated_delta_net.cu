@@ -428,7 +428,10 @@ bool ggml_cuda_gdn_chunked_shape_eligible(const ggml_tensor * dst) {
     // - q/k/v rows contiguous with any head/token/seq stride (the views qwen35 takes of the conv output are
     //   read in place; q and k share strides), g/beta/state contiguous
     // - n_tokens >= 128; with K > 1 snapshot slots the last K-1 tokens go to the recurrent kernel
-    return (!kda || kda_chunked) && dst->src[6] == nullptr
+    // - KDA's raw gate, lower_bound * sigmoid, at or under 0: the chunked kernels stage exp of its sums in fp16, which a
+    //   gate above 0 saturates (an activated gate above 0 traps there instead, cgdr_kda_fwdsub_intra_kernel)
+    const bool kda_raw_ok = !kda || ggml_get_op_params_i32(dst, 1) != 2 || ggml_get_op_params_f32(dst, 2) <= 0.0f;
+    return (!kda || kda_chunked) && kda_raw_ok && dst->src[6] == nullptr
         && dst->type == GGML_TYPE_F32 && src_q->type == GGML_TYPE_F32 && src_k->type == GGML_TYPE_F32
         && src_v->type == GGML_TYPE_F32 && src_g->type == GGML_TYPE_F32 && src_beta->type == GGML_TYPE_F32
         && src_state->type == GGML_TYPE_F32

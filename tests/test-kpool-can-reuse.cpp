@@ -82,6 +82,7 @@ static llm_graph_input_kpool make_inp(const case_tensors & t, bool scoring, int6
     inp.new_pool_reps  = t.new_pool_reps;
     inp.n_new_max      = (uint32_t) n_new_max;
     inp.rebuild        = rebuild;
+    inp.n_tail         = KPOOL - 1;
     (void) scoring;
     return inp;
 }
@@ -96,6 +97,7 @@ static llm_graph_input_kpool_dims base_dims() {
     d.n_pools   = N_POOLS;
     d.n_dump    = N_DUMP;
     d.n_new_max = N_NEW_MAX;
+    d.n_tail    = KPOOL - 1;
     d.rebuild   = false;
     d.scoring   = true;
     return d;
@@ -169,6 +171,11 @@ int main() {
         d = base_dims();
         d.n_dump = N_DUMP - 1;
         CHECK(!llm_graph_input_kpool::shapes_match(d, inp), "a dump pool count change must refuse");
+
+        // the sparse attention's n_kv_max is sized on the longest tail
+        d = base_dims();
+        d.n_tail = KPOOL + 8;
+        CHECK(!llm_graph_input_kpool::shapes_match(d, inp), "a longer tail must refuse");
 
         // non-scoring stored graph asked against a scoring step must refuse
         case_tensors ts = make_tensors(ctx, false, 0);
