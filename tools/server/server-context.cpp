@@ -1041,6 +1041,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        for (server_slot & slot : slots) {
+            slot.spec = nullptr; // the slots outlive it: sleeping destroys and load_model builds both again
+        }
         spec.reset();
         spec_init.reset();
 
