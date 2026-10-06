@@ -11604,7 +11604,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_Q8_0, 16, 8, 4096, 2048, n, 7.0f));
     }
     // and 8 tokens on each of 8 experts, where the ring's pair tables are exactly full (64 = MMVQ_MOE_MAX_PAIRS, bit 63
-    // of an expert's pair mask)
+    // of an expert's pair mask). These reach the ring, not its own quantize of y: 64 vectors of 4,096 columns leave the
+    // shared-memory plan no room for them, so ggml_cuda_mmvq_moe_keeps_y is false and y comes from the shared path. The
+    // 2- and 3-token cases above are the ones that quantize in the ring, and a doubled block scale there fails those two
+    // and leaves these passing (RTX 5090, 2026-10-06)
     test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 8, 8, 4096, 2048, 8, 7.0f));
     test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_Q8_0, 8, 8, 4096, 2048, 8, 0.0f));
     // and its routed experts at a prefill batch, where MMQ tiles each expert's columns: 64 experts with 8 used, so 64
