@@ -230,7 +230,7 @@ int main() {
         run(0);
     }
 
-    const bool legacy      = getenv("GGML_META_CAPTURE_LEGACY") != nullptr;
+    const bool legacy      = ggml_env_switch("GGML_META_CAPTURE_LEGACY"); // as the backend reads it
     const int  executables = legacy ? 0 : (n_graphs + 1)*2;
     const bool ok_captures = counts.executables == executables && counts.not_captured == 0;
     printf("%s %d executables made (%d expected), %d graphs not captured\n", ok_captures ? "ok  " : "FAIL",
