@@ -12630,6 +12630,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1, 1, false, true, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 200, 2, 1, false, true, 4, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 128, 1, 1, false, true, 9, false, -1, true));
+    // KDA with strided q/k/v (the qwen35 views, no cont anywhere), and one chunk of 16 tokens alone: 128 tokens with
+    // K = 113 snapshot slots leaves the chunked pass a single chunk and the last 112 tokens to the recurrent kernel
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2, false, true, 1, false, -1, false, /*qkv_view=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2, false, true, 1, false, -1, true,  /*qkv_view=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 128, 1, 1, false, true, /*K=*/113));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 128, 2, 1, false, true, 113, false, -1, true));
     // gated_delta_net -> cpy into the cache (fused), recurrent and chunked shapes
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
