@@ -20,7 +20,9 @@
 #include "../src/llama-kv-cells.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -867,6 +869,108 @@ static int64_t stale_after_shift(std::mt19937 & rng, bool per_seq) {
     return n_stale(0) + n_stale(1);
 }
 
+// The new pools' keys compressed `chunk` at a time (llama_kpool_compress) against all at once, as a rebuild re-emits every
+// pool: the same bytes in every pooled row, from a compute buffer of a chunk's size. Returns the buffer's bytes
+static size_t compress_pools(int64_t chunk, std::vector<float> & pooled) {
+    const int64_t d_idx   = 32;
+    const int64_t r       = 4;
+    const int64_t n_kv    = 16384;
+    const int64_t n_pools = n_kv/r;
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+
+    ggml_init_params dp = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * cd = ggml_init(dp);
+
+    ggml_tensor * kbuf  = ggml_new_tensor_4d(cd, GGML_TYPE_F32, d_idx, 3, n_kv, 1); // a cell: key, gate, pooled key
+    ggml_tensor * cells = ggml_new_tensor_2d(cd, GGML_TYPE_I32, r*n_pools, 1);
+    ggml_tensor * reps  = ggml_new_tensor_1d(cd, GGML_TYPE_I64, n_pools);
+    ggml_tensor * ape   = ggml_new_tensor_2d(cd, GGML_TYPE_F32, r, d_idx);
+
+    ggml_backend_buffer_t data = ggml_backend_alloc_ctx_tensors(cd, cpu);
+
+    std::mt19937 rng(20261006);
+    std::uniform_real_distribution<float> u(-2.0f, 2.0f);
+
+    std::vector<float> kv(ggml_nelements(kbuf));
+    for (int64_t j = 0; j < n_kv; ++j) {
+        for (int64_t h = 0; h < 3*d_idx; ++h) {
+            kv[j*3*d_idx + h] = h < 2*d_idx ? u(rng) : 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(kbuf, kv.data(), 0, ggml_nbytes(kbuf));
+
+    // a pool's members are r cells anywhere in the cache, its key in the row of the last
+    std::vector<int32_t> perm(n_kv);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        perm[j] = (int32_t) j;
+    }
+    std::shuffle(perm.begin(), perm.end(), rng);
+    std::vector<int64_t> rows(n_pools);
+    for (int64_t p = 0; p < n_pools; ++p) {
+        rows[p] = perm[p*r + r - 1];
+    }
+    ggml_backend_tensor_set(cells, perm.data(), 0, ggml_nbytes(cells));
+    ggml_backend_tensor_set(reps,  rows.data(), 0, ggml_nbytes(reps));
+
+    std::vector<float> a(r*d_idx);
+    for (auto & x : a) {
+        x = u(rng);
+    }
+    ggml_backend_tensor_set(ape, a.data(), 0, ggml_nbytes(ape));
+
+    ggml_init_params gp = { 4096*ggml_tensor_overhead() + ggml_graph_overhead_custom(4096, false), nullptr, true };
+    ggml_context * cg = ggml_init(gp);
+    ggml_cgraph  * gf = ggml_new_graph_custom(cg, 4096, false);
+
+    ggml_tensor * kg_rows = ggml_view_3d(cg, kbuf, 2*d_idx, n_kv, 1, kbuf->nb[2], kbuf->nb[3], 0);
+
+    llama_kpool_compress(cg, gf, kg_rows, cells, reps, ape, r, chunk,
+            [&](ggml_tensor * src, ggml_tensor * idx) {
+                ggml_tensor * k2  = ggml_reshape_2d(cg, kbuf, 3*d_idx, n_kv);
+                ggml_tensor * dst = ggml_view_2d(cg, k2, d_idx, n_kv, k2->nb[1], ggml_row_size(k2->type, 2*d_idx));
+                return ggml_set_rows(cg, dst, src, idx);
+            },
+            [](ggml_tensor * t, const char * name) {
+                ggml_set_name(t, name);
+            });
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    CHECK(ggml_gallocr_alloc_graph(galloc, gf), "the compression graph did not allocate");
+    const size_t size = ggml_gallocr_get_buffer_size(galloc, 0);
+
+    ggml_backend_graph_compute(cpu, gf);
+
+    ggml_backend_tensor_get(kbuf, kv.data(), 0, ggml_nbytes(kbuf));
+    pooled.assign(n_pools*d_idx, 0.0f);
+    for (int64_t p = 0; p < n_pools; ++p) {
+        std::copy_n(kv.data() + rows[p]*3*d_idx + 2*d_idx, d_idx, pooled.data() + p*d_idx);
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(cg);
+    ggml_backend_buffer_free(data);
+    ggml_free(cd);
+    ggml_backend_free(cpu);
+
+    return size;
+}
+
+static void run_compress_chunks() {
+    std::vector<float> whole;
+    std::vector<float> chunked;
+
+    const size_t size_whole   = compress_pools(4096, whole); // every pool at once: the graph before chunks
+    const size_t size_chunked = compress_pools(512,  chunked);
+
+    printf("compressing 4,096 pools: %zu bytes of compute buffer at once, %zu in chunks of 512\n", size_whole, size_chunked);
+
+    CHECK(whole.size() == chunked.size() && memcmp(whole.data(), chunked.data(), whole.size()*sizeof(float)) == 0,
+            "the pooled keys compressed in chunks differ from all at once");
+    CHECK(std::any_of(whole.begin(), whole.end(), [](float x) { return x != 0.0f; }), "no pooled key was written");
+    CHECK(size_chunked*4 < size_whole, "chunks of 512 of 4,096 pools took %zu bytes against %zu at once", size_chunked, size_whole);
+}
+
 // which shifts regroup pools, as llama_memory_hybrid::seq_add asks
 static void run_shift_regroups() {
     CHECK(!llama_kpool_stale::shift_regroups(4, 8, -1, -4), "whole pools moved by a whole pool");
@@ -880,6 +984,7 @@ int main() {
     std::mt19937 rng(20260930);
 
     run_shift_regroups();
+    run_compress_chunks();
 
     const int64_t n_stale_per_seq = stale_after_shift(rng, true);
     const int64_t n_stale_flag    = stale_after_shift(rng, false);

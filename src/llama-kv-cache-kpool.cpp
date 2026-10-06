@@ -736,6 +736,78 @@ void llama_kpool_set_input(
     }
 }
 
+void llama_kpool_compress(
+        ggml_context               * ctx,
+        ggml_cgraph                * gf,
+        ggml_tensor                * kg_rows,
+        ggml_tensor                * new_pool_cells,
+        ggml_tensor                * new_pool_reps,
+        ggml_tensor                * ape,
+        int64_t                      r,
+        int64_t                      chunk,
+        const llama_kpool_write_fn & write,
+        const llama_kpool_name_fn  & name) {
+    GGML_ASSERT(r > 0 && chunk > 0);
+    GGML_ASSERT(kg_rows->ne[0] % 2 == 0);
+    GGML_ASSERT(new_pool_cells->ne[0] % r == 0);
+
+    const int64_t d_idx     = kg_rows->ne[0]/2;
+    const int64_t n_stream  = new_pool_cells->ne[1];
+    const int64_t n_new_max = new_pool_cells->ne[0]/r;
+
+    GGML_ASSERT(kg_rows->ne[2] == n_stream);
+    GGML_ASSERT(new_pool_reps->ne[0] == n_new_max*n_stream);
+    GGML_ASSERT(ape->ne[0] == r && ape->ne[1] == d_idx);
+
+    for (int64_t p0 = 0; p0 < n_new_max; p0 += chunk) {
+        const int64_t n = std::min(chunk, n_new_max - p0);
+
+        // the chunk's members and rep rows, stream by stream; the whole tensors when it is every pool
+        ggml_tensor * cells = new_pool_cells;
+        ggml_tensor * reps  = new_pool_reps;
+
+        if (n != n_new_max) {
+            cells = ggml_view_2d(ctx, new_pool_cells, r*n, n_stream, new_pool_cells->nb[1],
+                    ggml_row_size(new_pool_cells->type, r*p0));
+            reps  = ggml_view_2d(ctx, new_pool_reps, n, n_stream, ggml_row_size(new_pool_reps->type, n_new_max),
+                    ggml_row_size(new_pool_reps->type, p0));
+
+            if (n_stream > 1) {
+                cells = ggml_cont(ctx, cells);
+                reps  = ggml_cont(ctx, reps);
+            }
+            reps = ggml_reshape_1d(ctx, reps, n*n_stream);
+        }
+
+        ggml_tensor * members = ggml_get_rows(ctx, kg_rows, cells);
+        name(members, "indexer_pool_members");
+
+        const size_t nb_mem = members->nb[1];
+
+        ggml_tensor * mem_k = ggml_view_4d(ctx, members, d_idx, r, n, n_stream,
+                nb_mem, nb_mem*r, members->nb[2], 0);
+        ggml_tensor * mem_g = ggml_view_4d(ctx, members, d_idx, r, n, n_stream,
+                nb_mem, nb_mem*r, members->nb[2], d_idx*members->nb[0]);
+
+        // r-way softmaxes over the SLOT axis, so it must be dim 0; ape is added PRE-softmax
+        ggml_tensor * keys_t = ggml_cont(ctx, ggml_permute(ctx, mem_k, 1, 0, 2, 3));
+        ggml_tensor * gate_t = ggml_cont(ctx, ggml_permute(ctx, mem_g, 1, 0, 2, 3));
+
+        gate_t = ggml_add(ctx, gate_t, ggml_reshape_4d(ctx, ape, r, d_idx, 1, 1));
+
+        // soft_max maps ne2/ne3 to gridDim.y/z (65535 cap); fold into ne1
+        ggml_tensor * probs = ggml_soft_max(ctx, ggml_reshape_2d(ctx, gate_t, r, d_idx*n*n_stream));
+        probs = ggml_reshape_4d(ctx, probs, r, d_idx, n, n_stream);
+        name(probs, "indexer_pool_probs");
+
+        ggml_tensor * pool_new = ggml_sum_rows(ctx, ggml_mul(ctx, keys_t, probs));
+        pool_new = ggml_reshape_2d(ctx, pool_new, d_idx, n*n_stream);
+        name(pool_new, "indexer_pool_new");
+
+        ggml_build_forward_expand(gf, write(pool_new, reps));
+    }
+}
+
 void llama_kpool_views::view::rebuild(const llama_kv_cells & c, llama_seq_id seq) {
     built = true;
     ok    = false;

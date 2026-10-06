@@ -92,6 +92,32 @@ private:
 
 using llama_kpool_cells_fn = std::function<const llama_kv_cells &(llama_seq_id)>;
 
+// the pools a compression makes at once: a rebuild re-emits every pool (n_new_max = n_pools, 131,074 at 524,288 cells), and
+// their members and softmax at once took about 1.07 GB of compute buffer at d_idx 128 that no reserve sized; a chunk takes
+// about 34 MB (test-kpool-input: 8,388,608 bytes for 4,096 pools at d_idx 32), and a decode's few pools are one chunk
+constexpr int64_t LLAMA_KPOOL_COMPRESS_CHUNK = 4096;
+
+// the write of a chunk's pooled keys (src: [d_idx, rows]) at its rep rows (I64 [rows]); and the name of a tensor
+using llama_kpool_write_fn = std::function<ggml_tensor *(ggml_tensor * src, ggml_tensor * rows)>;
+using llama_kpool_name_fn  = std::function<void(ggml_tensor * t, const char * name)>;
+
+// The pooled keys of the new pools: each pool's r member keys mixed by a softmax over their gates (ape added before it, over
+// the slot axis), written at the pool's rep row. kg_rows: [2*d_idx, n_kv, n_stream], each cell's key then gate; new_pool_cells
+// (I32 [r*n_new_max, n_stream]) and new_pool_reps (I64 [n_new_max*n_stream]) as llm_graph_input_kpool holds them; ape: [r, d_idx].
+// The pools go `chunk` at a time, each chunk's write expanded into gf before the next chunk is made, so the allocator gives the
+// next chunk the memory of the last. One chunk is the graph this compression always was
+void llama_kpool_compress(
+        ggml_context               * ctx,
+        ggml_cgraph                * gf,
+        ggml_tensor                * kg_rows,
+        ggml_tensor                * new_pool_cells,
+        ggml_tensor                * new_pool_reps,
+        ggml_tensor                * ape,
+        int64_t                      r,
+        int64_t                      chunk,
+        const llama_kpool_write_fn & write,
+        const llama_kpool_name_fn  & name);
+
 // the maps of llama_kv_cache_set_input_kpool from a cells accessor. views == nullptr builds them from the cells
 // every call; else a sequence alone in its stream is served from its view, byte for byte the same maps
 void llama_kpool_set_input(

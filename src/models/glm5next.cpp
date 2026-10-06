@@ -422,38 +422,18 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * kg_rows = ggml_view_3d(ctx0, kbuf, 2*d_idx, n_kv, n_stream,
             kbuf->nb[2], kbuf->nb[3], 0);
 
-    const int64_t n_new_max = inp_kp->new_pool_cells->ne[0]/r;
-
-    ggml_tensor * members = ggml_get_rows(ctx0, kg_rows, inp_kp->new_pool_cells);
-    cb(members, "indexer_pool_members", il);
-
-    const size_t nb_mem = members->nb[1];
-
-    ggml_tensor * mem_k = ggml_view_4d(ctx0, members, d_idx, r, n_new_max, n_stream,
-            nb_mem, nb_mem*r, members->nb[2], 0);
-    ggml_tensor * mem_g = ggml_view_4d(ctx0, members, d_idx, r, n_new_max, n_stream,
-            nb_mem, nb_mem*r, members->nb[2], d_idx*members->nb[0]);
-
-    // r-way softmaxes over the SLOT axis, so it must be dim 0; ape is added PRE-softmax
-    ggml_tensor * keys_t = ggml_cont(ctx0, ggml_permute(ctx0, mem_k, 1, 0, 2, 3));
-    ggml_tensor * gate_t = ggml_cont(ctx0, ggml_permute(ctx0, mem_g, 1, 0, 2, 3));
-
     ggml_tensor * ape = ggml_cont(ctx0, ggml_transpose(ctx0, layer.indexer_comp_ape));
-    gate_t = ggml_add(ctx0, gate_t, ggml_reshape_4d(ctx0, ape, r, d_idx, 1, 1));
-
-    // soft_max maps ne2/ne3 to gridDim.y/z (65535 cap); fold into ne1
-    ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, gate_t, r, d_idx*n_new_max*n_stream));
-    probs = ggml_reshape_4d(ctx0, probs, r, d_idx, n_new_max, n_stream);
-    cb(probs, "indexer_pool_probs", il);
-
-    ggml_tensor * pool_new = ggml_sum_rows(ctx0, ggml_mul(ctx0, keys_t, probs));
-    pool_new = ggml_reshape_2d(ctx0, pool_new, d_idx, n_new_max*n_stream);
-    cb(pool_new, "indexer_pool_new", il);
 
     // the write is by GLOBAL row while pool_reps is stream-local, so the read must not chain
-    // off the write tensor; expand first and let build order sequence them
-    ggml_build_forward_expand(gf,
-            mctx_idx->cpy_k_part(ctx0, pool_new, inp_kp->new_pool_reps, il, d_idx, 2*d_idx));
+    // off the write tensor; every chunk's write is expanded first and build order sequences them
+    llama_kpool_compress(ctx0, gf, kg_rows, inp_kp->new_pool_cells, inp_kp->new_pool_reps, ape, r,
+            LLAMA_KPOOL_COMPRESS_CHUNK,
+            [&](ggml_tensor * src, ggml_tensor * rows) {
+                return mctx_idx->cpy_k_part(ctx0, src, rows, il, d_idx, 2*d_idx);
+            },
+            [&](ggml_tensor * t, const char * name) {
+                cb(t, name, il);
+            });
 
     // every pool's key, gathered into f32 rows (the unfused path, and the fused one under LLAMA_INDEXER_GATHER_LEGACY=1)
     const auto gather_pool_k = [&]() {
