@@ -446,9 +446,6 @@ void llama_kpool_set_input(
         // the fallback of an unused slot when no spare cell is left: recomputing a complete pool is idempotent
         const int32_t * any_rep_src = nullptr;
 
-        // the cells named as a rep by the new slots
-        std::vector<uint8_t> emitted(kcache ? kv_size : 0, 0);
-
         if (kcache) {
             // a pool with no rep gathers row 0; such a pool is -INFINITY in pool_bias, so discarded
             std::fill(cur_pool_reps, cur_pool_reps + n_pools, 0);
@@ -494,6 +491,9 @@ void llama_kpool_set_input(
 
             views->get_stats().n_direct++;
         }
+
+        // the cells named as a rep by the new slots: a byte per cell of the cache, so only on this path, which reads it
+        std::vector<uint8_t> emitted(kcache ? kv_size : 0, 0);
 
         // [TAG_KPOOL_PACK] one packed run per sequence, NOT one full-width table: the indexer
         // scores every slot against every query, which would multiply the score tensor by n_seq_max
