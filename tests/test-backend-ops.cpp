@@ -11554,6 +11554,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 2, 3 }) {
         test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_Q8_0, 16, 8, 4096, 2048, n, 7.0f));
     }
+    // and 8 tokens on each of 8 experts, where the ring's pair tables are exactly full (64 = MMVQ_MOE_MAX_PAIRS, bit 63
+    // of an expert's pair mask)
+    test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 8, 8, 4096, 2048, 8, 7.0f));
+    test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_Q8_0, 8, 8, 4096, 2048, 8, 0.0f));
     // and its routed experts at a prefill batch, where MMQ tiles each expert's columns: 64 experts with 8 used, so 64
     // and 256 tokens give 8 and 32 columns an expert on average, the tile width follows them and only the experts'
     // non-empty column tiles are launched
