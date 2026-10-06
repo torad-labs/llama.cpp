@@ -368,8 +368,10 @@ static __global__ void mmq_moe_tiles_kernel(const int32_t * __restrict__ expert_
 
         const int first = done + (warp > 0 ? warp_incl[warp - 1] : 0) + incl - n;
         if (first + n > ntiles_max) {
-            printf("ERROR: MUL_MAT_ID: expert %d takes column tiles %d to %d, over the launch's %d (an expert named "
-                   "twice for one token?)\n", e, first, first + n - 1, ntiles_max);
+            // first and n, not a range: an expert that takes none still trips this once the running offset is past the
+            // bound, and "tiles 64 to 63" names no tile
+            printf("ERROR: MUL_MAT_ID: expert %d takes %d column tiles from %d, over the launch's %d (an expert named "
+                   "twice for one token?)\n", e, n, first, ntiles_max);
             __trap();
         }
         for (int k = 0; k < n; ++k) {
