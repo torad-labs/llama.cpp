@@ -1285,16 +1285,54 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
-void llama_kv_cache::set_kpool_dirty() {
-    kpool_dirty = true;
+bool llama_kpool_stale::shift_regroups(uint32_t kpool, llama_pos p0, llama_pos p1, llama_pos shift) {
+    GGML_ASSERT(kpool > 0);
+
+    const llama_pos r = (llama_pos) kpool;
+
+    const bool whole_pools = shift % r == 0 &&
+                             (p0 <= 0 || p0 % r == 0) &&
+                             (p1 <  0 || p1 % r == 0);
+
+    return !whole_pools;
 }
 
-bool llama_kv_cache::get_kpool_dirty() const {
-    return kpool_dirty;
+void llama_kpool_stale::mark(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        seqs.set();
+        return;
+    }
+
+    GGML_ASSERT(seq_id < LLAMA_MAX_SEQ);
+    seqs.set(seq_id);
 }
 
-void llama_kv_cache::clear_kpool_dirty() const {
-    kpool_dirty = false;
+bool llama_kpool_stale::any(const llama_ubatch & ubatch) const {
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        if (seqs.test(ubatch.seq_id_unq[s])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void llama_kpool_stale::clear(const llama_ubatch & ubatch) {
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        seqs.reset(ubatch.seq_id_unq[s]);
+    }
+}
+
+void llama_kv_cache::set_kpool_dirty(llama_seq_id seq_id) {
+    kpool_stale.mark(seq_id);
+}
+
+bool llama_kv_cache::get_kpool_dirty(const llama_ubatch & ubatch) const {
+    return kpool_stale.any(ubatch);
+}
+
+void llama_kv_cache::clear_kpool_dirty(const llama_ubatch & ubatch) const {
+    kpool_stale.clear(ubatch);
 }
 
 llama_kpool_views & llama_kv_cache::get_kpool_views() const {

@@ -15,6 +15,7 @@
 // is checked against a snapshot of the cells on its own.
 
 #include "../src/llama-batch.h"
+#include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cache-kpool.h"
 #include "../src/llama-kv-cells.h"
 
@@ -25,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <random>
 #include <set>
 #include <vector>
@@ -749,8 +751,143 @@ static void run_controls(std::mt19937 & rng) {
     CHECK(views.get_stats().n_rebuilt > n_rebuilt, "a view whose changes were taken was not rebuilt");
 }
 
+// The stale marks of the pooled keys across two sequences, as a server makes them: sequence 0 shifted by a context shift
+// (seq_rm of [4, 9), then seq_add of [9, end) by -5), a decode of sequence 1, a decode of sequence 0. The pooled keys are
+// kept as the indexer cache keeps them, one row per complete pool written by the new-pool slots; after the last decode
+// every complete pool of both sequences must hold the key of its members. `per_seq` false is the cache's former scheme, one
+// flag for the cache, which the decode of sequence 1 clears: the count of stale pools it leaves shows the check can fail.
+// Returns the count of complete pools whose key is not their members' after the last decode
+static int64_t stale_after_shift(std::mt19937 & rng, bool per_seq) {
+    const uint32_t r    = 4;
+    const uint32_t size = 256;
+
+    pool w(size, 2, true, rng);
+
+    llama_kpool_stale stale;  // the per-sequence marks
+    bool              flag = false; // the former flag
+
+    // the indexer cache: rep row -> the members the key in it was made from
+    std::map<int64_t, std::vector<int32_t>> key;
+
+    const llama_kpool_cells_fn cells_of = [&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); };
+    const uint32_t strm_of[1] = { 0 };
+
+    auto decode = [&](llama_seq_id s, uint32_t n) {
+        ubatch_data ud;
+        for (const llama_pos p : w.append(s, n)) {
+            ud.add(s, p);
+        }
+        const llama_ubatch * ub = ud.get();
+
+        const bool rebuild = per_seq ? stale.any(*ub) : flag;
+
+        const int64_t n_kv  = std::max<int64_t>(32, (w.v_cells[0].used_max_p1() + 31)/32*32);
+        const int64_t n_tps = ub->n_tokens;
+
+        maps m(n_kv, 1, n_tps, 1, r, true, true, rebuild, 0, 0);
+
+        llama_kpool_set_input(cells_of, nullptr, nullptr, m.pool_cells, nullptr, m.pool_bias, m.sel_mask, m.cand_mask,
+                m.pool_reps, m.new_pool_cells, m.new_pool_reps, strm_of, size, rebuild, ub, r);
+
+        // set_rows: every slot writes its row, a real one the key of its members
+        const int64_t   n_new_max = m.new_pool_cells->ne[0]/r;
+        const int32_t * cells_in  = (const int32_t *) m.new_pool_cells->data;
+        const int64_t * rows      = (const int64_t *) m.new_pool_reps->data;
+
+        for (int64_t k = 0; k < n_new_max; ++k) {
+            key[rows[k]] = std::vector<int32_t>(cells_in + k*r, cells_in + (k + 1)*r);
+        }
+
+        if (per_seq) {
+            if (rebuild) {
+                stale.clear(*ub);
+            }
+        } else {
+            flag = false;
+        }
+
+        return rebuild;
+    };
+
+    // the complete pools of a sequence whose row does not hold the key of their members
+    auto n_stale = [&](llama_seq_id s) {
+        const auto & cells = w.cells_of(s);
+
+        std::map<llama_pos, std::vector<int32_t>> pools;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.seq_has(i, s)) {
+                auto & m = pools[cells.pos_get(i)/r];
+                m.resize(r, -1);
+                m[cells.pos_get(i) % r] = (int32_t) i;
+            }
+        }
+
+        int64_t n = 0;
+        for (const auto & [b, members] : pools) {
+            if (std::find(members.begin(), members.end(), -1) != members.end()) {
+                continue;
+            }
+            const auto it = key.find(members[r - 1]);
+            n += it == key.end() || it->second != members;
+        }
+        return n;
+    };
+
+    decode(0, 16);
+    decode(1, 16);
+    CHECK(n_stale(0) == 0 && n_stale(1) == 0, "the prefills left %lld and %lld stale pools", (long long) n_stale(0), (long long) n_stale(1));
+
+    // the context shift of sequence 0, as llama_memory_hybrid::seq_rm and seq_add apply it
+    w.rollback(0, 4, 9);
+    auto & cells = w.cells_of(0);
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.pos_in(i, 9, INT32_MAX) && cells.seq_has(i, 0)) {
+            cells.pos_add(i, -5);
+        }
+    }
+    cells.reset_shift();
+
+    CHECK(llama_kpool_stale::shift_regroups(r, 9, -1, -5), "a shift by -5 over pools of 4 must regroup them");
+    stale.mark(0);
+    flag = true;
+
+    const bool rebuilt_1 = decode(1, 1);
+    const bool rebuilt_0 = decode(0, 1);
+
+    if (per_seq) {
+        CHECK(!rebuilt_1, "a decode of sequence 1 rebuilt for sequence 0's shift");
+        CHECK(rebuilt_0, "the decode of the shifted sequence 0 did not rebuild");
+
+        // and the marks are spent: the next decode of sequence 0 is a plain one
+        ubatch_data ud;
+        ud.add(0, w.p_next(0));
+        CHECK(!stale.any(*ud.get()), "sequence 0 is still marked after the decode that rebuilt it");
+    }
+
+    return n_stale(0) + n_stale(1);
+}
+
+// which shifts regroup pools, as llama_memory_hybrid::seq_add asks
+static void run_shift_regroups() {
+    CHECK(!llama_kpool_stale::shift_regroups(4, 8, -1, -4), "whole pools moved by a whole pool");
+    CHECK(!llama_kpool_stale::shift_regroups(4, -1, -1, 8), "the whole sequence moved by two pools");
+    CHECK( llama_kpool_stale::shift_regroups(4, 9, -1, -5), "a shift by -5");
+    CHECK( llama_kpool_stale::shift_regroups(4, 9, -1, -4), "a range that starts inside a pool");
+    CHECK( llama_kpool_stale::shift_regroups(4, 8, 10, -4), "a range that ends inside a pool");
+}
+
 int main() {
     std::mt19937 rng(20260930);
+
+    run_shift_regroups();
+
+    const int64_t n_stale_per_seq = stale_after_shift(rng, true);
+    const int64_t n_stale_flag    = stale_after_shift(rng, false);
+
+    printf("a context shift of one sequence: %lld stale pools with per-sequence marks, %lld with one flag for the cache\n",
+            (long long) n_stale_per_seq, (long long) n_stale_flag);
+    CHECK(n_stale_per_seq == 0, "%lld pools kept a stale key after the shifted sequence's own decode", (long long) n_stale_per_seq);
+    CHECK(n_stale_flag > 0, "one flag for the cache left no pool stale: the check cannot fail");
 
     llama_kpool_views::stats total;
 

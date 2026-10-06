@@ -602,7 +602,7 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
     dims.n_tps   = ubatch.n_tokens/dims.n_stream;
     dims.n_ps    = ubatch.n_seqs_unq/dims.n_stream;
     dims.n_pools = llama_kpool_n_pools(dims.n_kv, kpool, dims.n_ps);
-    dims.rebuild = mctx_attn->get_kv()->get_kpool_dirty();
+    dims.rebuild = mctx_attn->get_kv()->get_kpool_dirty(ubatch);
     dims.n_new_max = dims.rebuild ? dims.n_pools : dims.n_tps/kpool + dims.n_ps;
     // same gate as the builder (glm5next_n_select == indexer_top_k + kpool - 1)
     dims.scoring = cparams.n_ctx > hparams.indexer_top_k + kpool - 1;
@@ -4051,8 +4051,9 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         // n_new_max is an exact bound (a contiguous run of L tokens closes at most L/kpool + 1
         // pools), FIXED for the decode phase so the graph shape does not track pools-closed-this-
-        // step; after a position mutation every cached key is stale, so it must re-emit all
-        const bool     rebuild   = mctx_attn->get_kv()->get_kpool_dirty();
+        // step; after a position mutation of a sequence of this ubatch every cached key of its sequences is stale, so it
+        // must re-emit all of theirs
+        const bool     rebuild   = mctx_attn->get_kv()->get_kpool_dirty(ubatch);
         const int64_t  n_new_max = rebuild ? n_pools : n_tps/kpool + n_ps;
 
         inp->n_new_max = (uint32_t) n_new_max;

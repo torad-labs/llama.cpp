@@ -1067,8 +1067,9 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             rebuild,
             ubatch, kpool);
 
-    // cleared here, not in build_inp_kpool: a graph built but not evaluated must not clear it
+    // cleared here, not in build_inp_kpool: a graph built but not evaluated must not clear it. Only this ubatch's
+    // sequences were re-emitted, so only theirs
     if (rebuild) {
-        mctx_attn->get_kv()->clear_kpool_dirty();
+        mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);
     }
 }
