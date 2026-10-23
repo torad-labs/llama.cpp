@@ -1783,6 +1783,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            static const bool index_share_legacy = ggml_env_switch("LLAMA_MTP_INDEX_SHARE_LEGACY");
+            if (!index_share_legacy) llama_mtp_draft_step(ctx_dft, i);
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
@@ -1883,6 +1885,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             ++i;
         }
 
+        llama_mtp_draft_step(ctx_dft, -1);
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
         }

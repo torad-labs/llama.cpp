@@ -9,13 +9,17 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -79,7 +83,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 128;
@@ -126,6 +130,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 128;
         n_head = 4; // split two ways, each device gets 2 KDA and 2 DSA heads (2 DSA heads are the fewest with 128-row q_b blocks)
         n_ff   = 192;
+        n_layer = mtp ? 3 : 2;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
@@ -148,6 +153,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    if (mtp) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -366,10 +374,11 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, const std::vector<float> & tensor_split = {}) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, const std::vector<float> & tensor_split = {}, bool mtp = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = mtp;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -430,6 +439,166 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+static std::vector<float> get_mtp_logits(
+        llama_model * model, llama_context * ctx, const std::vector<llama_token> & tokens, const std::vector<float> & hidden,
+        llama_pos start = 0) {
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        common_batch_add(batch, tokens[i], start + i, {0}, true);
+    }
+    batch.embd = const_cast<float *>(hidden.data());
+    const int32_t result = llama_decode(ctx, batch);
+    batch.embd = nullptr;
+    llama_batch_free(batch);
+    if (result) {
+        throw std::runtime_error("failed to decode MTP batch");
+    }
+    std::vector<float> logits;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const float * row = llama_get_logits_ith(ctx, i);
+        logits.insert(logits.end(), row, row + n_vocab);
+    }
+    return logits;
+}
+
+static bool test_glm_draft_vocab(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    std::mt19937 rng(seed);
+    for (const int n_hot : {1, 2, 7, 32, 63, 127}) {
+        auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+        auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+        auto * model = pair.first.get();
+        auto * target = pair.second.get();
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        const auto tokens = get_tokens(5, n_vocab, rng());
+        const auto target_before = get_logits(model, target, tokens);
+        llama_context_params params = llama_context_default_params();
+        params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx = 128;
+        params.n_batch = params.n_ubatch = 32;
+        params.n_threads = params.n_threads_batch = 4;
+        std::normal_distribution<float> normal(0.0f, 0.1f);
+        std::vector<float> hidden(tokens.size() * llama_model_n_embd(model));
+        for (auto & value : hidden) {
+            value = normal(rng);
+        }
+        llama_context_ptr full(llama_init_from_model(model, params));
+        if (!full) {
+            throw std::runtime_error("failed to create full MTP context");
+        }
+        const auto expected = get_mtp_logits(model, full.get(), tokens, hidden);
+        full.reset();
+
+        for (const std::vector<llama_token> & invalid : {std::vector<llama_token>{}, {-1}, {128}, {3, 3}, {9, 2}}) {
+            if (llama_model_set_draft_vocab(model, invalid.data(), invalid.size())) {
+                LOG_ERR("GLM draft vocabulary accepted invalid IDs\n");
+                return false;
+            }
+        }
+        std::vector<llama_token> ids(n_vocab);
+        std::iota(ids.begin(), ids.end(), 0);
+        std::shuffle(ids.begin(), ids.end(), rng);
+        ids.resize(n_hot);
+        std::sort(ids.begin(), ids.end());
+        if (!llama_model_set_draft_vocab(model, ids.data(), ids.size())) {
+            LOG_ERR("GLM draft vocabulary rejected %d valid IDs\n", n_hot);
+            return false;
+        }
+        llama_context_ptr trimmed(llama_init_from_model(model, params));
+        if (!trimmed) {
+            throw std::runtime_error("failed to create trimmed MTP context");
+        }
+        const auto actual = get_mtp_logits(model, trimmed.get(), tokens, hidden);
+        std::vector<float> selected_expected, selected_actual;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            if (std::binary_search(ids.begin(), ids.end(), i % n_vocab)) {
+                if (!std::isfinite(actual[i])) {
+                    return false;
+                }
+                selected_expected.push_back(expected[i]);
+                selected_actual.push_back(actual[i]);
+            } else if (actual[i] != -INFINITY) {
+                LOG_ERR("GLM draft vocabulary scored an excluded ID\n");
+                return false;
+            }
+        }
+        if (nmse(selected_expected, selected_actual) > 1e-4) {
+            LOG_ERR("GLM draft vocabulary changed selected logits\n");
+            return false;
+        }
+        llama_memory_clear(llama_get_memory(target), true);
+        if (get_logits(model, target, tokens) != target_before) {
+            LOG_ERR("GLM draft vocabulary changed target logits\n");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool test_glm_mtp_index(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    int scores = 0;
+    llama_context_params params = llama_context_default_params();
+    params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    params.n_ctx = 128;
+    params.n_batch = params.n_ubatch = 64;
+    params.n_threads = params.n_threads_batch = 4;
+    params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+        if (ask && std::string(t->name).find("indexer_top_k_pools") == 0) {
+            ++*static_cast<int *>(data);
+        }
+        return false;
+    };
+    params.cb_eval_user_data = &scores;
+    llama_context_ptr ctx(llama_init_from_model(model, params));
+    params.cb_eval = nullptr;
+    params.cb_eval_user_data = nullptr;
+    llama_context_ptr reference(llama_init_from_model(model, params));
+    if (!ctx || !reference || llama_mtp_draft_step(pair.second.get(), 0)) {
+        return false;
+    }
+    const auto tokens = get_tokens(40, 128, seed);
+    const int n_embd = llama_model_n_embd(model);
+    std::vector<float> hidden(40*n_embd, 0.1f);
+    get_mtp_logits(model, ctx.get(), tokens, hidden);
+    get_mtp_logits(model, reference.get(), tokens, hidden);
+    const auto step = [&](int i, int pos, bool fresh) {
+        scores = 0;
+        if (!llama_mtp_draft_step(ctx.get(), i)) {
+            return false;
+        }
+        const auto logits = get_mtp_logits(model, ctx.get(), {7}, hidden, pos);
+        const auto expected = get_mtp_logits(model, reference.get(), {7}, hidden, pos);
+        if ((scores > 0) != fresh || !std::all_of(logits.begin(), logits.end(), [](float x) { return std::isfinite(x); })) {
+            LOG_ERR("MTP step %d at %d: expected fresh=%d, indexer ran %d times\n", i, pos, fresh, scores);
+            return false;
+        }
+        // Reuse must keep writing raw and compressed keys. When scoring resumes,
+        // the result must agree with a context that scored at every earlier step.
+        if (fresh && nmse(expected, logits) > 1e-4) return false;
+        return true;
+    };
+    if (!step(0, 40, true) || !step(1, 41, false) || !step(2, 42, false) ||
+        !step(3, 43, true) || !step(4, 44, false) || !step(0, 45, true)) {
+        return false;
+    }
+    if (!llama_memory_seq_rm(llama_get_memory(reference.get()), 0, 45, -1) ||
+        !llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 45, -1) || !step(1, 45, true)) {
+        return false;
+    }
+    const size_t size = llama_state_seq_get_size(ctx.get(), 0);
+    std::vector<uint8_t> saved(size);
+    if (llama_state_seq_get_data(ctx.get(), saved.data(), saved.size(), 0) != size ||
+        llama_state_seq_set_data(ctx.get(), saved.data(), saved.size(), 0) != size || !step(2, 46, true)) {
+        return false;
+    }
+    return step(-1, 47, true);
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -748,6 +917,14 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         if (nmse_val > 1e-4) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_draft_vocab(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL MTP vocab\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_mtp_index(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL MTP index\033[0m";
                         }
                     }
 

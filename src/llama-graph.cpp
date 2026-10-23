@@ -681,7 +681,12 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
         return false;
     }
 
-    return shapes_match(current_dims(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool), *this);
+    draft = params.cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? mctx_hyb->get_mtp_index() : nullptr;
+    const auto dims = current_dims(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool);
+    const bool reuse_selection = draft && draft->can_reuse(params.ubatch, dims.n_kv, kpool*dims.n_dump, kpool);
+    if ((draft_top_k != nullptr) != reuse_selection) return false;
+
+    return shapes_match(dims, *this);
 }
 
 llm_graph_input_attn_kv_msa::llm_graph_input_attn_kv_msa(
@@ -1456,6 +1461,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_mtp_index   = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1507,6 +1513,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    if (t_mtp_index != nullptr) {
+        ggml_set_output(t_mtp_index);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -4015,6 +4024,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
     GGML_ASSERT(kpool > 0);
 
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_attn, mctx_idx, kpool);
+    inp->draft = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? mctx_cur->get_mtp_index() : nullptr;
 
     inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     ggml_set_input(inp->k_idxs);
@@ -4094,6 +4104,17 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         inp->new_pool_reps = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_new_max*n_stream);
         ggml_set_input(inp->new_pool_reps);
         ggml_set_name(inp->new_pool_reps, "kpool_new_pool_reps");
+
+        if (inp->draft && inp->draft->can_reuse(ubatch, n_kv, kpool*n_dump, kpool)) {
+            inp->draft_top_k = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool*n_dump, n_tps, n_stream);
+            ggml_set_input(inp->draft_top_k);
+            ggml_set_name(inp->draft_top_k, "kpool_mtp_top_k");
+            // The map builder still refreshes masks, the live tail, and new pooled
+            // keys. Keep its host scratch inputs allocated even when scoring is omitted.
+            for (auto * t : {inp->pool_cells, inp->pool_bias, inp->pool_dump, inp->pool_reps}) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
     }
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));

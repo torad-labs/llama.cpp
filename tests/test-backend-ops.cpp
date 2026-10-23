@@ -10220,8 +10220,22 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    // Decode, draft and one/two/three-slot n_max=2 verification. Include the
+    // M=9 MMQ boundary and full/trimmed vocabulary shards, not just M=1.
+    for (int64_t n : {1, 2, 3, 6, 9}) {
+        for (int64_t m : {512, 1536, 2048, 4096, 8192, 16384, 32768, 77440}) {
+            cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 4096, {1, 1}, {1, 1}));
+        }
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, n, 1536, {1, 1}, {1, 1}));
+        // Odd rows and non-power-of-two K exercise the vector kernel's padded tail.
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 63, n, 1056, {1, 1}, {1, 1}));
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_glm_q8_cases(test_cases);
     std::default_random_engine rng(0);
 
     // unary ops
@@ -12848,6 +12862,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_glm_q8_cases(test_cases);
 
     // Ternary Bonsai 2 27B at decode and an MTP verify's width (1-5 columns): the FFN's gate/up + GLU and the residual adds
     // after the FFN down and a Gated DeltaNet layer's output projection, each one fused graph where the backend fuses it

@@ -21,6 +21,11 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // Returns false (and logs why) for a model whose MTP graph cannot score a trimmed head.
 LLAMA_API bool llama_model_set_draft_vocab(struct llama_model * model, const llama_token * ids, size_t n_ids);
 
+// GLM MTP index reuse: 0 starts a draft round, successive positive steps may reuse its
+// pooled selection, and -1 ends it. Unsupported contexts return false. Prompt/catch-up
+// decodes must happen outside a round. KV mutations invalidate every retained selection.
+LLAMA_API bool llama_mtp_draft_step(struct llama_context * ctx, int32_t step);
+
 // True while a lazy grammar sampler waits for its trigger: its apply leaves every logit as it is until then.
 // False for any other sampler, and for a grammar that constrains (triggered, or not lazy).
 LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);

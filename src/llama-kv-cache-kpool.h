@@ -14,6 +14,24 @@ class llama_kv_cache;
 class llama_kv_cache_context;
 class llama_kv_cells;
 
+// Transient, per-round MTP selections. A mutation of the owning memory invalidates
+// them; these are never serialized with a prompt cache.
+class llama_kpool_draft {
+public:
+    void clear() { ++epoch; rows.clear(); }
+    void advance(int32_t next) { if (next <= 0 || next != step + 1) clear(); step = next; }
+    bool active() const { return step >= 0; }
+    uint64_t generation() const { return epoch; }
+    void capture(llama_seq_id seq, llama_pos pos, int64_t n_kv, const std::vector<int32_t> & cells);
+    bool can_reuse(const llama_ubatch & ubatch, int64_t n_kv, int64_t width, uint32_t kpool) const;
+    void copy(const llama_ubatch & ubatch, int32_t * dst) const;
+private:
+    struct row { llama_pos pos; int32_t step; int64_t n_kv; std::vector<int32_t> cells; };
+    int32_t step = -1;
+    uint64_t epoch = 0;
+    std::map<llama_seq_id, row> rows;
+};
+
 // GLM-5-Next indexer pooling. no input may hold a negative index (ggml_set_rows asserts
 // i1 >= 0, ggml_get_rows has no sentinel), so unusable entries are clamped and masked.
 
@@ -248,6 +266,9 @@ public:
 
     // exact, since pool_bias only holds 0.0f or -INFINITY. nullptr if the fused path is off
     ggml_tensor * pool_bias_f16 = nullptr; // F16 [n_pools, n_tps, 1, n_stream]
+
+    llama_kpool_draft * draft = nullptr;
+    ggml_tensor * draft_top_k = nullptr; // retained selection in the current batch's sequence order
 
     ggml_tensor * sel_mask   = nullptr;   // F16 [n_kv + kpool*n_dump, n_batch, 1, n_stream]; the dump columns -inf
     ggml_tensor * cand_mask  = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
