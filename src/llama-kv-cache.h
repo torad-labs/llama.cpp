@@ -182,7 +182,7 @@ public:
 
     // GLM-5-Next pooled-key cache, per sequence (llama_kpool_stale): seq_add/seq_div mark a sequence, a ubatch holding a
     // marked one rebuilds, and its set_input clears the ubatch's sequences
-    void set_kpool_dirty(llama_seq_id seq_id);
+    void set_kpool_dirty(llama_seq_id seq_id) const;
     bool get_kpool_dirty(const llama_ubatch & ubatch) const;
     void clear_kpool_dirty(const llama_ubatch & ubatch) const;
 

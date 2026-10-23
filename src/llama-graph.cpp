@@ -607,8 +607,7 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
     dims.n_tail    = llama_kpool_tail_max([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
         return kv->get_cells(s);
     }, ubatch, kpool);
-    // same gate as the builder (glm5next_n_select == indexer_top_k + kpool - 1)
-    dims.scoring = cparams.n_ctx > hparams.indexer_top_k + kpool - 1;
+    dims.scoring = llama_kpool_needs_scoring(dims.n_kv, cparams.n_ctx, hparams.indexer_top_k, kpool);
     dims.n_dump  = dims.scoring ? llama_kpool_select_k(dims.n_pools, hparams.indexer_top_k, kpool) : 0;
 
     return dims;
@@ -620,7 +619,7 @@ bool llm_graph_input_kpool::shapes_match(const llm_graph_input_kpool_dims & dims
     res &= dims.n_stream >= 1;
     res &= inp.k_idxs && inp.k_idxs->ne[0] == dims.n_tokens;
 
-    // the scoring structure is fixed per context; a flip means a different graph
+    // Crossing the dense span needs a different graph.
     res &= (inp.pool_cells != nullptr) == dims.scoring;
     if (inp.pool_cells == nullptr) {
         return res;
@@ -683,7 +682,7 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
 
     draft = params.cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? mctx_hyb->get_mtp_index() : nullptr;
     const auto dims = current_dims(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool);
-    const bool reuse_selection = draft && draft->can_reuse(params.ubatch, dims.n_kv, kpool*dims.n_dump, kpool);
+    const bool reuse_selection = dims.scoring && draft && draft->can_reuse(params.ubatch, dims.n_kv, kpool*dims.n_dump, kpool);
     if ((draft_top_k != nullptr) != reuse_selection) return false;
 
     return shapes_match(dims, *this);

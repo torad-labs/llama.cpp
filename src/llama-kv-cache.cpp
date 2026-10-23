@@ -1323,7 +1323,7 @@ void llama_kpool_stale::clear(const llama_ubatch & ubatch) {
     }
 }
 
-void llama_kv_cache::set_kpool_dirty(llama_seq_id seq_id) {
+void llama_kv_cache::set_kpool_dirty(llama_seq_id seq_id) const {
     kpool_stale.mark(seq_id);
 }
 

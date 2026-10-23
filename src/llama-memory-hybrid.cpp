@@ -256,7 +256,11 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mtp_index.clear();
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_read(io, seq_id, flags);
-        if (mem_idx) mem_idx->state_read(io, seq_id, flags);
+        if (mem_idx) {
+            mem_idx->state_read(io, seq_id, flags);
+            // A saved dense prefix may have raw keys but no compressed pools.
+            mem_attn->set_kpool_dirty(seq_id);
+        }
     }
     mem_recr->state_read(io, seq_id, flags);
 }

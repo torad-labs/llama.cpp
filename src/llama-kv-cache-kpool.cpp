@@ -12,6 +12,12 @@
 #include <cstring>
 #include <vector>
 
+bool llama_kpool_needs_scoring(int64_t n_kv, uint32_t n_ctx, uint32_t indexer_top_k, uint32_t kpool) {
+    GGML_ASSERT(kpool > 0);
+    static const bool legacy = ggml_env_switch("LLAMA_GLM_SHORT_DENSE_LEGACY");
+    return (legacy ? int64_t(n_ctx) : n_kv) > int64_t(indexer_top_k) + kpool - 1;
+}
+
 uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs) {
     GGML_ASSERT(kpool > 0);
     GGML_ASSERT(n_seqs > 0);
@@ -1193,6 +1199,10 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
     }
 
     if (pool_cells == nullptr) {
+        // Raw keys still change. Build every deferred pool when scoring starts.
+        for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
+            mctx_attn->get_kv()->set_kpool_dirty(ubatch->seq_id_unq[s]);
+        }
         return;
     }
 

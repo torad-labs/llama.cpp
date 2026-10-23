@@ -41,6 +41,8 @@ uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs = 1)
 // select_k of Glm5NextTextIndexer.forward: must run over POOLS, a cell cut takes partial pools
 uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t kpool);
 
+bool llama_kpool_needs_scoring(int64_t n_kv, uint32_t n_ctx, uint32_t indexer_top_k, uint32_t kpool);
+
 // The pool maps of a decode step are a function of the cells alone, and between two steps a few cells change. A view
 // is one sequence's cells in pool terms (per-cell positions, pool table, completeness), kept up to date from the cells
 // llama_kv_cells_log names, so a step reads only the cells that changed. A view that cannot follow (the log no longer

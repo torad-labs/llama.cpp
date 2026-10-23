@@ -641,14 +641,15 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
 
     llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k();
 
-    // gated on n_ctx, not n_kv, which grows and would flip the graph topology mid-run
+    // The kpool input rejects graph reuse when the dense span is crossed.
     llm_graph_input_kpool * inp_kp = nullptr;
     bool indexer_scoring = false;
     {
         const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
 
         if (mctx_hyb->get_idx() != nullptr) {
-            indexer_scoring = cparams.n_ctx > glm5next_n_select(hparams);
+            indexer_scoring = llama_kpool_needs_scoring(mctx_hyb->get_attn()->get_n_kv(),
+                    cparams.n_ctx, hparams.indexer_top_k, hparams.indexer_kpool);
 
             inp_kp = build_inp_kpool(mctx_hyb,
                     inp_mem->get_attn()->get_kq_mask(), indexer_scoring);
@@ -813,7 +814,8 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
         const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
 
         if (mctx_hyb->get_idx() != nullptr) {
-            indexer_scoring = cparams.n_ctx > glm5next_n_select(hparams);
+            indexer_scoring = llama_kpool_needs_scoring(mctx_hyb->get_attn()->get_n_kv(),
+                    cparams.n_ctx, hparams.indexer_top_k, hparams.indexer_kpool);
 
             inp_kp = build_inp_kpool(mctx_hyb,
                     inp_mem->get_attn()->get_kq_mask(), indexer_scoring);

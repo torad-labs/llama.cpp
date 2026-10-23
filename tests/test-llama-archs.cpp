@@ -614,7 +614,8 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
     llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(64));
+    // Every live pool fits, but the padded KV span still needs the sparse path.
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(60));
     auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
     auto * model = pair.first.get();
     const int n_embd = llama_model_n_embd(model);
@@ -685,6 +686,85 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
             }
         }
       }
+    }
+    return true;
+}
+
+static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(256));
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int n_embd = llama_model_n_embd(model);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto tokens = get_tokens(384, n_vocab, seed);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 0.1f);
+    std::vector<float> hidden(tokens.size()*n_embd);
+    for (auto & value : hidden) value = normal(rng);
+
+    for (const bool mtp : {false, true}) {
+        int scores = 0;
+        llama_context_params params = llama_context_default_params();
+        if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx = params.n_batch = params.n_ubatch = 512;
+        params.n_threads = params.n_threads_batch = 4;
+        llama_context_ptr reference(llama_init_from_model(model, params));
+        params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            if (ask && std::string(t->name).find("indexer_top_k_pools") == 0) {
+                ++*static_cast<int *>(data);
+            }
+            return false;
+        };
+        params.cb_eval_user_data = &scores;
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        llama_context_ptr restored(llama_init_from_model(model, params));
+        if (!ctx || !reference || !restored) return false;
+        const auto decode = [&](llama_context * context, int begin, int end) {
+            llama_batch batch = llama_batch_init(end - begin, 0, 1);
+            for (int pos = begin; pos < end; ++pos) {
+                common_batch_add(batch, tokens[pos], pos, {0}, true);
+            }
+            if (mtp) batch.embd = hidden.data() + begin*n_embd;
+            const int result = llama_decode(context, batch);
+            batch.embd = nullptr;
+            llama_batch_free(batch);
+            if (result) throw std::runtime_error("short dense decode failed");
+            std::vector<float> logits;
+            for (int pos = begin; pos < end; ++pos) {
+                const float * row = llama_get_logits_ith(context, pos - begin);
+                logits.insert(logits.end(), row, row + n_vocab);
+            }
+            return logits;
+        };
+        const auto expected = decode(reference.get(), 0, tokens.size());
+        const auto check = [&](llama_context * context, int begin, int end) {
+            scores = 0;
+            const auto actual = decode(context, begin, end);
+            const std::vector<float> wanted(expected.begin() + begin*n_vocab, expected.begin() + end*n_vocab);
+            const double error = nmse(wanted, actual);
+            if ((scores > 0) != (end > 256) || !(error <= 1e-4)) {
+                LOG_ERR("GLM short dense: mtp=%d span=%d:%d scores=%d nmse=%g\n", mtp, begin, end, scores, error);
+                return false;
+            }
+            return true;
+        };
+        if (!check(ctx.get(), 0, 128)) return false;
+        const size_t size = llama_state_seq_get_size(ctx.get(), 0);
+        std::vector<uint8_t> saved(size);
+        if (llama_state_seq_get_data(ctx.get(), saved.data(), size, 0) != size) return false;
+        for (const auto & span : {std::pair<int, int>{128, 255}, {255, 256}, {256, 257},
+                {257, 258}, {258, 259}, {259, 260}, {260, 384}}) {
+            if (!check(ctx.get(), span.first, span.second)) return false;
+        }
+        // Restore the short prefix after its pooled keys were deferred, into both
+        // a fresh context and one whose later sparse decode cleared the dirty bit.
+        for (auto * context : {restored.get(), ctx.get()}) {
+            if (llama_state_seq_set_data(context, saved.data(), size, 0) != size ||
+                !check(context, 128, 384)) return false;
+        }
     }
     return true;
 }
@@ -1010,6 +1090,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                                 !test_draft_vocab(arch, seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL MTP vocab\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_short_dense(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL short dense\033[0m";
                         }
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_mtp_index(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
