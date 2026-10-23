@@ -64,7 +64,8 @@ static bool exercise(ggml_backend_dev_t meta, ggml_backend_t cpu, bool nodes_fir
         }
         GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
         float input[24], actual[24];
-        for (int i = 0; i < 24; ++i) input[i] = float(32*step + i) / 4.0f;
+        // Exact on the CUDA reduction's BF16 wire as well as the CPU's F32 wire.
+        for (int i = 0; i < 24; ++i) input[i] = float((7*step + i)%64);
         ggml_backend_tensor_set(x, input, 0, sizeof(input));
         printf("capacity: order=%d step=%d reductions=%d tail=%d nodes=%d\n", nodes_first, step, shape.first, shape.second, ggml_graph_n_nodes(graph));
         fflush(stdout);
