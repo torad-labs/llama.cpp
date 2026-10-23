@@ -623,7 +623,7 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
         llama_context_params params = llama_context_default_params();
         params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         params.n_ctx = 256;
-        params.n_seq_max = 2;
+        params.n_seq_max = 3;
         params.n_batch = params.n_ubatch = 128;
         params.kv_unified = unified;
         params.n_threads = params.n_threads_batch = 4;
@@ -644,27 +644,40 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
         std::normal_distribution<float> normal(0.0f, 0.1f);
         std::vector<float> hidden(tokens.size()*n_embd);
         for (auto & value : hidden) value = normal(rng);
-        for (llama_seq_id seq : {0, 1}) {
-            const auto begin = tokens.begin() + (seq == 0 ? 0 : 40);
-            const std::vector<llama_token> history(begin, begin + 40 + seq);
+        // Slot zero is idle: neither captured row index is its sequence ID.
+        for (llama_seq_id seq : {1, 2}) {
+            const auto begin = tokens.begin() + (seq == 1 ? 0 : 40);
+            const std::vector<llama_token> history(begin, begin + 39 + seq);
             get_mtp_logits(model, ctx.get(), history, hidden, 0, {seq});
             get_mtp_logits(model, reference.get(), history, hidden, 0, {seq});
         }
-        // Unequal histories: sequence 1 closes its pool at step 2, sequence 0 at
+        // Unequal histories: sequence 2 closes its pool at step 2, sequence 1 at
         // step 3. Stream-local selections also differ, exposing stream mix-ups.
+        int fresh_scores = 0;
         for (int step = 0; step < 4; ++step) {
             scores = 0;
             if (!llama_mtp_draft_step(ctx.get(), step)) return false;
-            const std::vector<llama_seq_id> seqs = step % 2 ? std::vector<llama_seq_id>{1, 0} : std::vector<llama_seq_id>{0, 1};
-            const std::vector<llama_pos> offsets = {seqs[0], seqs[1]};
+            const std::vector<llama_seq_id> seqs = step % 2 ? std::vector<llama_seq_id>{2, 1} : std::vector<llama_seq_id>{1, 2};
+            const std::vector<llama_pos> offsets = {seqs[0] - 1, seqs[1] - 1};
             const auto actual = get_mtp_logits(model, ctx.get(), {7, 19}, hidden, 40 + step, seqs, offsets);
             const auto expected = get_mtp_logits(model, reference.get(), {7, 19}, hidden, 40 + step, seqs, offsets);
             const bool fresh = step == 0 || step == 2 || step == 3;
-            if ((scores > 0) != fresh || !std::all_of(actual.begin(), actual.end(), [](float x) { return std::isfinite(x); }) ||
-                    nmse(expected, actual) > 1e-4) {
+            if (step == 0) fresh_scores = scores;
+            if (fresh_scores == 0 || scores != (fresh ? fresh_scores : 0) ||
+                    !std::all_of(actual.begin(), actual.end(), [](float x) { return std::isfinite(x); })) {
                 LOG_ERR("MTP two-sequence logits differ: unified=%d step=%d fresh=%d scores=%d nmse=%g\n",
                     unified, step, fresh, scores, nmse(expected, actual));
                 return false;
+            }
+            const size_t row_size = actual.size()/seqs.size();
+            for (size_t row = 0; row < seqs.size(); ++row) {
+                const std::vector<float> actual_row(actual.begin() + row*row_size, actual.begin() + (row + 1)*row_size);
+                const std::vector<float> expected_row(expected.begin() + row*row_size, expected.begin() + (row + 1)*row_size);
+                if (nmse(expected_row, actual_row) > 1e-4) {
+                    LOG_ERR("MTP sequence %d logits differ: unified=%d step=%d nmse=%g\n",
+                            seqs[row], unified, step, nmse(expected_row, actual_row));
+                    return false;
+                }
             }
         }
     }
