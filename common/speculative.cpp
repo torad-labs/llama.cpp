@@ -1408,10 +1408,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
-// --spec-draft-mtp-adaptive: one sequence's MTP draft depth, low or n_max, from the acceptance of its own drafts in the
-// current request. low is max(1, n_min) up to n_max, so no round drafts fewer tokens than n_min. The depth is decided
-// once every `window` observed rounds and holds in between; a low-depth window ends in one full-depth probe, so the
-// tokens past low stay measured.
+// --spec-draft-mtp-adaptive selects low or n_max from the acceptance of the sequence's own drafts in the current request.
+// low is max(1, n_min) up to n_max; the request's remaining output limit can shorten a draft below n_min.
+// The depth holds for `window` observed rounds; a low-depth window ends in one full-depth probe to measure tokens past low.
 struct common_mtp_depth {
     static constexpr int32_t window = 8;
     static constexpr float   keep   = 15.0f / 16.0f; // weight left to an observation after each later round
@@ -1619,7 +1618,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             d.reset(this->params.n_max, this->params.n_min);
         }
         n_draft_max.assign(n_seq, this->params.n_max);
-        if (this->params.mtp_adaptive > 0.0f) {
+        if (this->params.n_min > this->params.n_max) {
+            SPC_WRN("MTP drafting is disabled: --spec-draft-n-min = %d exceeds the effective maximum draft depth = %d\n", this->params.n_min, this->params.n_max);
+        } else if (this->params.mtp_adaptive > 0.0f) {
             const int32_t low = depth.empty() ? 1 : depth[0].low;
             SPC_TRC("- adaptive depth: %d or %d tokens per sequence, cost %.3f\n", low, this->params.n_max, this->params.mtp_adaptive);
             if (low >= this->params.n_max) {

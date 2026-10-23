@@ -7,9 +7,9 @@
 // stable: a sequence's depth holds for windows of 8 of its rounds, the first window of a request is full depth, and a
 // one-token window ends in one full-depth probe. Another sequence's rounds, an earlier request on the same slot, and a
 // round verified twice (a checkpoint replay) never move it. Without the flag every round drafts n_max, as before.
-// With --spec-draft-n-min m the low depth is max(1, m): no round drafts fewer than m tokens, so every round's draft
-// reaches verification and the windows and probes go on. Full depth is kept while the tokens past the low depth expected
-// to land pay for the time they add to a low-depth round; at m >= n_max the depth stays n_max.
+// With --spec-draft-n-min m the low depth is max(1, m), capped at n_max, before the request's output limit shortens a draft.
+// Full depth is kept while the tokens past the low depth pay for their added time; at m == n_max the depth stays n_max, and m > n_max disables drafting.
+// When all drafts start landing after two windows capped at m, full depth returns within three windows and stays there.
 // The head's kept hidden row stays the target row that a verification accepted, however the batch is laid out.
 
 #include "common.h"
@@ -577,6 +577,30 @@ static bool test_n_min(llama_model * model) {
     }
     for (const config c : { config{2, 2}, config{3, 2}, config{4, 2}, config{4, 3} }) {
         if (!histories(model, c.n_max, c.n_min, 2)) return false;
+    }
+    for (const config c : { config{3, 2}, config{4, 2}, config{4, 3} }) {
+        server_rig rig(model, 0.18f, c.n_max, c.n_min);
+        std::mt19937 rng(50 + 8*c.n_max + c.n_min);
+        rig.request(0, rng, 11);
+        std::vector<int> len;
+        for (int round = 0; round < 8*WINDOW; ++round) {
+            const int n = rig.draft({0}).at(0);
+            len.push_back(n);
+            rig.verify({0});
+            rig.accept(0, round < 2*WINDOW ? std::min(n, c.n_min) : n, rng);
+        }
+        const std::string full(WINDOW, '0' + c.n_max);
+        const std::string low = std::string(WINDOW - 1, '0' + c.n_min) + std::string(1, '0' + c.n_max);
+        if (str(len).substr(0, 2*WINDOW) != full + low) {
+            return fail("a sequence capped at n_min did not reach low depth before acceptance improved");
+        }
+        if (!stable_shape(len, true, c.n_max, c.n_min)) {
+            return fail("a sequence recovering from n_min changed depth inside a window");
+        }
+        if (str(len).substr(5*WINDOW) != full + full + full) {
+            fprintf(stderr, "n_max %d n_min %d recovery: %s\n", c.n_max, c.n_min, str(len).c_str());
+            return fail("a sequence whose drafts all land did not recover from n_min to full depth within three windows");
+        }
     }
     return true;
 }
