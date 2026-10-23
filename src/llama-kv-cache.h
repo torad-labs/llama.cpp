@@ -28,6 +28,7 @@ struct llama_kpool_stale {
     static bool shift_regroups(uint32_t kpool, llama_pos p0, llama_pos p1, llama_pos shift);
 
     void mark(llama_seq_id seq_id); // seq_id < 0: every sequence
+    void inherit(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
     bool any  (const llama_ubatch & ubatch) const;
     void clear(const llama_ubatch & ubatch);
 

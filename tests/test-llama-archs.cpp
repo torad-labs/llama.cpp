@@ -722,10 +722,10 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
         llama_context_ptr ctx(llama_init_from_model(model, params));
         llama_context_ptr restored(llama_init_from_model(model, params));
         if (!ctx || !reference || !restored) return false;
-        const auto decode = [&](llama_context * context, int begin, int end) {
+        const auto decode = [&](llama_context * context, int begin, int end, llama_seq_id seq_id = 0) {
             llama_batch batch = llama_batch_init(end - begin, 0, 1);
             for (int pos = begin; pos < end; ++pos) {
-                common_batch_add(batch, tokens[pos], pos, {0}, true);
+                common_batch_add(batch, tokens[pos], pos, {seq_id}, true);
             }
             if (mtp) batch.embd = hidden.data() + begin*n_embd;
             const int result = llama_decode(context, batch);
@@ -740,13 +740,14 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
             return logits;
         };
         const auto expected = decode(reference.get(), 0, tokens.size());
-        const auto check = [&](llama_context * context, int begin, int end) {
+        const auto check = [&](llama_context * context, int begin, int end, llama_seq_id seq_id = 0) {
             scores = 0;
-            const auto actual = decode(context, begin, end);
+            const auto actual = decode(context, begin, end, seq_id);
             const std::vector<float> wanted(expected.begin() + begin*n_vocab, expected.begin() + end*n_vocab);
             const double error = nmse(wanted, actual);
             if ((scores > 0) != (end > 256) || !(error <= 1e-4)) {
-                LOG_ERR("GLM short dense: mtp=%d span=%d:%d scores=%d nmse=%g\n", mtp, begin, end, scores, error);
+                LOG_ERR("GLM short dense: mtp=%d seq=%d span=%d:%d scores=%d nmse=%g\n",
+                        mtp, seq_id, begin, end, scores, error);
                 return false;
             }
             return true;
@@ -764,6 +765,31 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
         for (auto * context : {restored.get(), ctx.get()}) {
             if (llama_state_seq_set_data(context, saved.data(), size, 0) != size ||
                 !check(context, 128, 384)) return false;
+        }
+        // A caller may fork a short prefix without ever building its pooled keys.
+        // The child alone crosses into sparse attention; the parent's stale flag
+        // cannot make this correct by happening to share the next microbatch.
+        for (const bool unified : {false, true}) {
+            auto copy_params = params;
+            copy_params.n_seq_max = 2;
+            copy_params.kv_unified = unified;
+            copy_params.n_ctx = unified ? 512 : 1024;
+            for (const int prefix : {128, 255}) {
+                llama_context_ptr copied(llama_init_from_model(model, copy_params));
+                llama_context_ptr original(llama_init_from_model(model, copy_params));
+                if (!copied || !original || !check(copied.get(), 0, prefix) ||
+                        !check(original.get(), 0, prefix)) return false;
+                llama_memory_seq_cp(llama_get_memory(copied.get()), 0, 1, -1, -1);
+                const auto before_copy = decode(original.get(), prefix, tokens.size());
+                const auto after_copy = decode(copied.get(), prefix, tokens.size(), 1);
+                // Same inputs and batch geometry: changing the sequence ID through
+                // a prefix copy must preserve the continuation, including selection.
+                if (before_copy != after_copy) {
+                    LOG_ERR("GLM dense prefix copy: mtp=%d unified=%d prefix=%d nmse=%g\n",
+                            mtp, unified, prefix, nmse(before_copy, after_copy));
+                    return false;
+                }
+            }
         }
     }
     return true;
