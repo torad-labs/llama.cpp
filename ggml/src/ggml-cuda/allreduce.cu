@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // CUDA AllReduce for tensor-parallel inference across two GPUs.
@@ -259,6 +260,11 @@ static __global__ void ggml_cuda_ar_kernel(
 // the peer finished the call that read it (it arrived at the call between). One block, so the token is published by a plain
 // store once every thread has read it. The sum is the chunked kernel's: both sides round through T_wire, so the two devices and
 // the two kernels give the same bits.
+//
+// Where the cards can map each other's memory, reductions up to GGML_CUDA_AR_P2P_MAX_BYTES on the wire run the same kernel on
+// an inbox in each card's own memory: a device stores its packets straight into the peer's inbox and polls its own, so the
+// call is one PCIe write and no PCIe read (NCCL's P2P transport writes to the receiver the same way). The slot and token
+// rules above hold for the inboxes unchanged.
 // ---------------------------------------------------------------------------
 
 static constexpr int GGML_CUDA_AR_LL_THREADS = 1024;
@@ -278,8 +284,8 @@ template <typename T_dst, typename T_wire>
 static __global__ void ggml_cuda_ar_ll_kernel(
         const T_dst * sendbuf,
         T_dst       * recvbuf,
-        uint2       * ll_mine,       // slot 0; slot 1 follows at slot_packets
-        const uint2 * ll_other,      // slot 0 of the peer's staging
+        uint2       * ll_mine,       // where this device's packets go, slot 0; slot 1 follows at slot_packets
+        const uint2 * ll_other,      // where the peer's packets arrive, slot 0
         int           slot_packets,
         int           count,
         int         * counter) {
@@ -381,6 +387,9 @@ static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
 // Largest wire size the LL kernel reduces by default; GGML_CUDA_AR_LL_MAX_BYTES overrides (0 disables).
 static constexpr size_t GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT = 16 * 1024; // 16 KB
 
+// Largest wire size the LL kernel reduces card to card by default; GGML_CUDA_AR_P2P_MAX_BYTES overrides (0 disables).
+static constexpr size_t GGML_CUDA_AR_P2P_MAX_BYTES_DEFAULT = 128 * 1024; // 128 KB
+
 // Copy-engine path: largest tensor accepted on this path; sets host_large /
 // dev_tmp allocation size.
 static constexpr size_t GGML_CUDA_AR_COPY_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
@@ -444,6 +453,14 @@ struct ggml_cuda_ar_host_mapping {
     }
 };
 
+// A device's P2P inbox: device memory on that card that the peer stores its LL packets into, 2 slots. cudaMalloc when
+// both ranks are one GPU, else a VMM mapping both GPUs may access (ggml_cuda_ar_p2p_alloc).
+struct ggml_cuda_ar_p2p_inbox {
+    uint2 * dev  = nullptr;
+    size_t  size = 0;     // bytes allocated or mapped
+    bool    vmm  = false; // mapped with cuMemMap
+};
+
 struct ggml_cuda_ar_pipeline {
     int      n_devices;
     int      devices[GGML_CUDA_MAX_DEVICES];
@@ -453,11 +470,13 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
     size_t   ll_max_bytes;   // wire bytes up to which the LL kernel reduces; 0 disables
+    size_t   p2p_max_bytes;  // wire bytes up to which the LL kernel reduces card to card; 0 when off or unavailable
     uint64_t call_count;
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
     ggml_cuda_ar_host_mapping ll_buf[GGML_CUDA_MAX_DEVICES];     // pinned packets (LL kernel), 2 slots
+    ggml_cuda_ar_p2p_inbox    p2p[GGML_CUDA_MAX_DEVICES];        // device packets (LL kernel card to card), 2 slots
     ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
     char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copy-engine path
     cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking
@@ -553,6 +572,11 @@ static size_t ggml_cuda_ar_ll_slot_packets(const ggml_cuda_ar_pipeline * p) {
     return (p->ll_max_bytes + 3) / 4;
 }
 
+// Packets one slot of a P2P inbox holds.
+static size_t ggml_cuda_ar_p2p_slot_packets(const ggml_cuda_ar_pipeline * p) {
+    return (p->p2p_max_bytes + 3) / 4;
+}
+
 // Per-AR copy-engine chunk size: env-var override if set, else heuristic
 // (clamp(nbytes/4, HEURISTIC_MIN, HEURISTIC_MAX)).
 static size_t ggml_cuda_ar_chunk_bytes(const ggml_cuda_ar_pipeline * p, size_t nbytes) {
@@ -573,6 +597,155 @@ static void ggml_cuda_ar_wait_for_compute(
 // ---------------------------------------------------------------------------
 // Init / free
 // ---------------------------------------------------------------------------
+
+// Stores a known pattern over all of the peer's inbox, which ggml_cuda_ar_p2p_init reads back.
+static __global__ void ggml_cuda_ar_p2p_probe_kernel(uint2 * inbox, int n_packets, uint32_t flag) {
+    for (int i = threadIdx.x; i < n_packets; i += blockDim.x) {
+        ggml_cuda_ar_ll_store(inbox + i, (uint32_t) i, flag);
+    }
+}
+
+static void ggml_cuda_ar_p2p_free(ggml_cuda_ar_pipeline * p, int i) {
+    ggml_cuda_ar_p2p_inbox & inbox = p->p2p[i];
+    if (inbox.dev == nullptr) {
+        return;
+    }
+    ggml_cuda_set_device(p->devices[i]);
+    if (inbox.vmm) {
+#if defined(GGML_USE_VMM)
+        cuMemUnmap(reinterpret_cast<CUdeviceptr>(inbox.dev), inbox.size);
+        cuMemAddressFree(reinterpret_cast<CUdeviceptr>(inbox.dev), inbox.size);
+#endif // defined(GGML_USE_VMM)
+    } else {
+        cudaFree(inbox.dev);
+    }
+    inbox = {};
+}
+
+// Allocates device i's inbox, bytes on its card that both devices can store to. Two ranks on one GPU take cudaMalloc;
+// two GPUs take a VMM mapping that grants both of them access, which leaves cudaDeviceEnablePeerAccess (every cudaMalloc
+// of either card mapped to the other) alone.
+static bool ggml_cuda_ar_p2p_alloc(ggml_cuda_ar_pipeline * p, int i, size_t bytes) {
+    const int phys      = ggml_cuda_info().devices[p->devices[i]].physical_device;
+    const int phys_peer = ggml_cuda_info().devices[p->devices[1 - i]].physical_device;
+    ggml_cuda_ar_p2p_inbox & inbox = p->p2p[i];
+    ggml_cuda_set_device(p->devices[i]);
+    if (phys == phys_peer) {
+        void * ptr = nullptr;
+        if (cudaMalloc(&ptr, bytes) != cudaSuccess) {
+            return false;
+        }
+        inbox.dev  = static_cast<uint2 *>(ptr);
+        inbox.size = bytes;
+        return true;
+    }
+#if defined(GGML_USE_VMM)
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = phys;
+    size_t granularity = 0;
+    if (cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS ||
+            granularity == 0) {
+        return false;
+    }
+    const size_t size = granularity * ((bytes + granularity - 1) / granularity);
+    CUmemGenericAllocationHandle handle;
+    if (cuMemCreate(&handle, size, &prop, 0) != CUDA_SUCCESS) {
+        return false;
+    }
+    CUdeviceptr ptr = 0;
+    if (cuMemAddressReserve(&ptr, size, 0, 0, 0) != CUDA_SUCCESS) {
+        cuMemRelease(handle);
+        return false;
+    }
+    const bool mapped = cuMemMap(ptr, size, 0, handle, 0) == CUDA_SUCCESS;
+    cuMemRelease(handle); // the mapping keeps the memory
+    if (!mapped) {
+        cuMemAddressFree(ptr, size);
+        return false;
+    }
+    inbox.dev  = reinterpret_cast<uint2 *>(ptr);
+    inbox.size = size;
+    inbox.vmm  = true;
+    CUmemAccessDesc access[2] = {};
+    for (int k = 0; k < 2; ++k) {
+        access[k].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access[k].location.id   = k == 0 ? phys : phys_peer;
+        access[k].flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    }
+    return cuMemSetAccess(ptr, size, access, 2) == CUDA_SUCCESS;
+#else
+    return false;
+#endif // defined(GGML_USE_VMM)
+}
+
+// Sets up both inboxes and checks the link before a reduction relies on it: each device stores a pattern into the
+// peer's inbox, the host reads it back, and the inboxes are zeroed so no slot holds a call's token. False when the
+// cards cannot map each other's memory or the pattern does not arrive; the host paths then reduce everything.
+static bool ggml_cuda_ar_p2p_init(ggml_cuda_ar_pipeline * p) {
+    const int phys[2] = {
+        ggml_cuda_info().devices[p->devices[0]].physical_device,
+        ggml_cuda_info().devices[p->devices[1]].physical_device,
+    };
+    if (phys[0] != phys[1]) {
+        const bool vmm = ggml_cuda_info().devices[p->devices[0]].vmm && ggml_cuda_info().devices[p->devices[1]].vmm;
+        int access_01 = 0;
+        int access_10 = 0;
+        if (!vmm || cudaDeviceCanAccessPeer(&access_01, phys[0], phys[1]) != cudaSuccess ||
+                cudaDeviceCanAccessPeer(&access_10, phys[1], phys[0]) != cudaSuccess || !access_01 || !access_10) {
+            GGML_LOG_INFO("%s: GPUs %d and %d cannot map each other's memory%s: no card to card reduction\n",
+                          __func__, phys[0], phys[1], vmm ? "" : " (no VMM)");
+            return false;
+        }
+    }
+
+    const int    n_packets = (int) (GGML_CUDA_AR_POOL_SIZE * ggml_cuda_ar_p2p_slot_packets(p));
+    const size_t bytes     = (size_t) n_packets * sizeof(uint2);
+    for (int i = 0; i < 2; ++i) {
+        if (!ggml_cuda_ar_p2p_alloc(p, i, bytes)) {
+            GGML_LOG_WARN("%s: P2P inbox of %zu bytes failed on device %d: no card to card reduction\n",
+                          __func__, bytes, p->devices[i]);
+            return false;
+        }
+    }
+
+    const uint32_t flag[2] = {0xA5A50000u, 0xA5A50001u}; // what device 0 and device 1 store
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        ggml_cuda_ar_p2p_probe_kernel<<<1, GGML_CUDA_AR_LL_THREADS, 0, p->streams[i]>>>(p->p2p[1 - i].dev, n_packets, flag[i]);
+        if (cudaGetLastError() != cudaSuccess) {
+            GGML_LOG_WARN("%s: P2P probe launch failed on device %d: no card to card reduction\n", __func__, p->devices[i]);
+            return false;
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        if (cudaStreamSynchronize(p->streams[i]) != cudaSuccess) {
+            GGML_LOG_WARN("%s: P2P probe failed on device %d: no card to card reduction\n", __func__, p->devices[i]);
+            return false;
+        }
+    }
+    std::vector<uint2> seen(n_packets);
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        if (cudaMemcpy(seen.data(), p->p2p[i].dev, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return false;
+        }
+        for (int k = 0; k < n_packets; ++k) {
+            if (seen[k].x != (uint32_t) k || seen[k].y != flag[1 - i]) {
+                GGML_LOG_WARN("%s: device %d's stores did not reach device %d's memory (packet %d): "
+                              "no card to card reduction\n", __func__, p->devices[1 - i], p->devices[i], k);
+                return false;
+            }
+        }
+        if (cudaMemsetAsync(p->p2p[i].dev, 0, bytes, p->streams[i]) != cudaSuccess ||
+                cudaStreamSynchronize(p->streams[i]) != cudaSuccess) {
+            return false;
+        }
+    }
+    return true;
+}
 
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices) {
 
@@ -621,6 +794,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // Wire bytes up to which the LL kernel reduces (0 = chunked kernel only), capped at
     // what one chunk of the chunked kernel takes.
     p->ll_max_bytes     = std::min(ggml_cuda_ar_env_u64("GGML_CUDA_AR_LL_MAX_BYTES", GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT),
+                                   (uint64_t) GGML_CUDA_AR_MAX_BYTES);
+    // The same for the LL kernel card to card (ggml_cuda_ar_p2p_init), which takes over from the limit above where it is
+    // larger.
+    p->p2p_max_bytes    = std::min(ggml_cuda_ar_env_u64("GGML_CUDA_AR_P2P_MAX_BYTES", GGML_CUDA_AR_P2P_MAX_BYTES_DEFAULT),
                                    (uint64_t) GGML_CUDA_AR_MAX_BYTES);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
@@ -723,6 +900,13 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    if (p->p2p_max_bytes > 0 && !ggml_cuda_ar_p2p_init(p)) {
+        for (size_t i = 0; i < n_devices; ++i) {
+            ggml_cuda_ar_p2p_free(p, i);
+        }
+        p->p2p_max_bytes = 0;
+    }
+
     // Copy-engine path: pinned host staging + device scratch, sized for the
     // largest tensor we accept on this path (GGML_CUDA_AR_COPY_MAX_BYTES).
     // dev_tmp is single-buffered; cross-AR safety is enforced by an explicit
@@ -744,8 +928,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     }
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
-                  "%zu KB chunked kernel staging + %zu KB LL staging (up to %zu KB on the wire) + %zu MB copy-engine staging per GPU\n",
-                  __func__, n_devices, p->buf_bytes >> 10, ll_total >> 10, p->ll_max_bytes >> 10, p->copy_bytes >> 20);
+                  "%zu KB chunked kernel staging + %zu KB LL staging (up to %zu KB on the wire) + %zu MB copy-engine staging per GPU, "
+                  "LL card to card up to %zu KB on the wire\n",
+                  __func__, n_devices, p->buf_bytes >> 10, ll_total >> 10, p->ll_max_bytes >> 10, p->copy_bytes >> 20,
+                  p->p2p_max_bytes >> 10);
 
     return p;
 }
@@ -766,6 +952,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < p->n_devices; ++i) {
         p->host_buf[i].free();
         p->ll_buf[i].free();
+        ggml_cuda_ar_p2p_free(p, i);
         p->host_large[i].free();
         if (p->dev_tmp[i]) {
             ggml_cuda_set_device(p->devices[i]);
@@ -977,8 +1164,10 @@ static void ggml_cuda_ar_launch_kernels(
         int64_t                 ne) {
     // host_buf carries T_wire data: max_chunk_elems is what one slot holds
     const size_t max_chunk_elems = p->buf_bytes / sizeof(T_wire);
-    // nbytes on the wire is the same on both devices
-    const bool   use_ll          = (size_t) ne * sizeof(T_wire) <= p->ll_max_bytes;
+    // nbytes on the wire is the same on both devices, so both take the same kernel and buffers
+    const size_t wire_bytes      = (size_t) ne * sizeof(T_wire);
+    const bool   use_p2p         = wire_bytes <= p->p2p_max_bytes;
+    const bool   use_ll          = use_p2p || wire_bytes <= p->ll_max_bytes;
 
     for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
         const size_t remaining_elems = (size_t) (ne - chunk_start);
@@ -996,7 +1185,17 @@ static void ggml_cuda_ar_launch_kernels(
                 CUDA_CHECK(cudaMemsetAsync(chunk, 0, chunk_elems * sizeof(T_dst), stream));
             }
 
-            if (use_ll) {
+            if (use_p2p) {
+                // into the peer's inbox, from this device's own
+                ggml_cuda_ar_ll_kernel<T_dst, T_wire><<<dim3(1), dim3(GGML_CUDA_AR_LL_THREADS), 0, stream>>>(
+                    chunk,
+                    chunk,
+                    p->p2p[peer].dev,
+                    p->p2p[i].dev,
+                    static_cast<int>(ggml_cuda_ar_p2p_slot_packets(p)),
+                    static_cast<int>(chunk_elems),
+                    p->counter[i]);
+            } else if (use_ll) {
                 ggml_cuda_ar_ll_kernel<T_dst, T_wire><<<dim3(1), dim3(GGML_CUDA_AR_LL_THREADS), 0, stream>>>(
                     chunk,
                     chunk,

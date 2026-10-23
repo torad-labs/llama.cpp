@@ -6,11 +6,13 @@
 // A stack of feed-forward layers, x = x + down(up(x)), is split over two devices with the up rows and the down columns
 // cut unevenly (n_lo on the first device, the rest on the second), so the second device reaches each all-reduce long
 // after the first: a reduction that took a stale token or slot sums the second device's share of an earlier step.
-// Five graphs, A to E, take x of 1 to 5 columns: A and B are evaluated in turn 6 times each, then C, D and E 3 times
-// each (E's capture evicts A's), then A 3 times (captured again), each time with a new x; every output is compared
-// with the CPU's. The CUDA backend logs each executable it makes; the test counts them, one a device for each capture
-// (A, B, C, D, E, A again), or none under GGML_META_CAPTURE_LEGACY=1. On the first two GPUs, or on the first GPU
-// twice; with no GPU the test is skipped.
+// Five graphs, A to E, take x of 1, 2, 3, 4 and 40 columns: A and B are evaluated in turn 6 times each, then C, D and
+// E 3 times each (E's capture evicts A's), then A 3 times (captured again), each time with a new x; every output is
+// compared with the CPU's. A to D reduce 4 to 16 KB on the BF16 wire, which the LL kernel takes (card to card where the
+// cards can map each other's memory), and E 160 KB, which the chunked kernel takes, so the replays mix the kernels that
+// share the device's token. The CUDA backend logs each executable it makes; the test counts them, one a device for
+// each capture (A, B, C, D, E, A again), or none under GGML_META_CAPTURE_LEGACY=1. On the first two GPUs, or on the
+// first GPU twice; with no GPU the test is skipped.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -187,15 +189,16 @@ int main() {
     ffn_weights w_cpu(ggml_backend_get_default_buffer_type(cpu), w_data);
 
     // each graph is allocated once by a scheduler of its own, as llama.cpp's graph slots are
-    constexpr int n_graphs = 5;
+    constexpr int     n_graphs        = 5;
+    constexpr int64_t n_tok[n_graphs] = {1, 2, 3, 4, 40};
     std::vector<std::unique_ptr<ffn_graph>> graphs;
     std::vector<std::unique_ptr<ffn_graph>> graphs_cpu;
     std::vector<ggml_backend_sched_t>       scheds;
     std::vector<ggml_backend_sched_t>       scheds_cpu;
     ggml_backend_t backends[2] = {backend, cpu};
     for (int k = 0; k < n_graphs; k++) {
-        graphs.push_back(std::make_unique<ffn_graph>(w_meta.up, w_meta.down, k + 1));
-        graphs_cpu.push_back(std::make_unique<ffn_graph>(w_cpu.up, w_cpu.down, k + 1));
+        graphs.push_back(std::make_unique<ffn_graph>(w_meta.up, w_meta.down, n_tok[k]));
+        graphs_cpu.push_back(std::make_unique<ffn_graph>(w_cpu.up, w_cpu.down, n_tok[k]));
         scheds.push_back(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
         GGML_ASSERT(ggml_backend_sched_alloc_graph(scheds.back(), graphs.back()->gf));
         scheds_cpu.push_back(ggml_backend_sched_new(&cpu, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true));
