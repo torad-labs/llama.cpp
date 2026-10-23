@@ -384,7 +384,7 @@ static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 // Larger tensors are reduced by issuing multiple chunked launches.
 static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
 
-// Largest wire size the LL kernel reduces by default; GGML_CUDA_AR_LL_MAX_BYTES overrides (0 disables).
+// Largest wire size the host LL path reduces by default; GGML_CUDA_AR_LL_MAX_BYTES overrides (0 disables this path).
 static constexpr size_t GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT = 16 * 1024; // 16 KB
 
 // Largest wire size the LL kernel reduces card to card by default; GGML_CUDA_AR_P2P_MAX_BYTES overrides (0 disables).
@@ -469,7 +469,7 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
-    size_t   ll_max_bytes;   // wire bytes up to which the LL kernel reduces; 0 disables
+    size_t   ll_max_bytes;   // wire bytes up to which the host LL path reduces; 0 disables this path
     size_t   p2p_max_bytes;  // wire bytes up to which the LL kernel reduces card to card; 0 when off or unavailable
     uint64_t call_count;
 
@@ -730,6 +730,7 @@ static bool ggml_cuda_ar_p2p_init(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < 2; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         if (cudaMemcpy(seen.data(), p->p2p[i].dev, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            GGML_LOG_WARN("%s: P2P probe readback failed on device %d: no card to card reduction\n", __func__, p->devices[i]);
             return false;
         }
         for (int k = 0; k < n_packets; ++k) {
@@ -741,6 +742,7 @@ static bool ggml_cuda_ar_p2p_init(ggml_cuda_ar_pipeline * p) {
         }
         if (cudaMemsetAsync(p->p2p[i].dev, 0, bytes, p->streams[i]) != cudaSuccess ||
                 cudaStreamSynchronize(p->streams[i]) != cudaSuccess) {
+            GGML_LOG_WARN("%s: P2P inbox reset failed on device %d: no card to card reduction\n", __func__, p->devices[i]);
             return false;
         }
     }
@@ -791,8 +793,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
-    // Wire bytes up to which the LL kernel reduces (0 = chunked kernel only), capped at
-    // what one chunk of the chunked kernel takes.
+    // Wire bytes up to which the host LL path reduces (0 disables this path), capped at one chunk's size.
     p->ll_max_bytes     = std::min(ggml_cuda_ar_env_u64("GGML_CUDA_AR_LL_MAX_BYTES", GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT),
                                    (uint64_t) GGML_CUDA_AR_MAX_BYTES);
     // The same for the LL kernel card to card (ggml_cuda_ar_p2p_init), which takes over from the limit above where it is
@@ -929,9 +930,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu KB LL staging (up to %zu KB on the wire) + %zu MB copy-engine staging per GPU, "
-                  "LL card to card up to %zu KB on the wire\n",
+                  "LL card to card up to %zu bytes on the wire\n",
                   __func__, n_devices, p->buf_bytes >> 10, ll_total >> 10, p->ll_max_bytes >> 10, p->copy_bytes >> 20,
-                  p->p2p_max_bytes >> 10);
+                  p->p2p_max_bytes);
 
     return p;
 }

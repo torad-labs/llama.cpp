@@ -46,6 +46,10 @@ static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, v
 struct log_counts {
     int executables  = 0; // ggml_backend_cuda_capture_end made one
     int not_captured = 0; // the meta backend refused a capture
+    size_t p2p_bytes = 0;
+    bool p2p_reported = false;
+    bool p2p_unsupported = false;
+    bool p2p_failed = false;
 };
 
 static void log_cb(ggml_log_level level, const char * text, void * user_data) {
@@ -56,7 +60,15 @@ static void log_cb(ggml_log_level level, const char * text, void * user_data) {
     if (strstr(text, "not captured") != nullptr) {
         counts->not_captured++;
     }
-    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+    const char * p2p = strstr(text, "LL card to card up to ");
+    if (p2p != nullptr) {
+        counts->p2p_reported = sscanf(p2p, "LL card to card up to %zu bytes", &counts->p2p_bytes) == 1;
+    }
+    const bool unsupported = strstr(text, "cannot map each other's memory") != nullptr;
+    counts->p2p_unsupported |= unsupported;
+    const bool error = level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR;
+    counts->p2p_failed |= error && strstr(text, "ggml_cuda_ar_p2p_init") != nullptr;
+    if (error || p2p != nullptr || unsupported) {
         fputs(text, stderr);
     }
 }
@@ -239,6 +251,23 @@ int main() {
     printf("%s %d executables made (%d expected), %d graphs not captured\n", ok_captures ? "ok  " : "FAIL",
         counts.executables, executables, counts.not_captured);
     ok = ok && ok_captures;
+
+    const char * ar = getenv("GGML_CUDA_ALLREDUCE");
+    if (ar != nullptr && strcmp(ar, "internal") == 0 && strncmp(ggml_backend_dev_name(gpus[0]), "CUDA", 4) == 0) {
+        const char * value = getenv("GGML_CUDA_AR_P2P_MAX_BYTES");
+        char * end = nullptr;
+        const uint64_t parsed = value == nullptr ? 0 : strtoull(value, &end, 10);
+        const uint64_t requested = value != nullptr && end != value ? parsed : 128*1024;
+        const size_t expected = requested > 1024*1024 ? 1024*1024 : requested;
+        const bool unsupported = counts.p2p_unsupported && gpus[0] != gpus[1];
+        const bool ok_p2p = counts.p2p_reported && !counts.p2p_failed &&
+                           counts.p2p_bytes == (unsupported ? 0 : expected);
+        printf("%s card-to-card limit %zu bytes: %s\n", ok_p2p ? "ok  " : "FAIL", counts.p2p_bytes,
+               unsupported ? "peer unsupported; peer coverage skipped" :
+               counts.p2p_bytes >= 4096 ? "device inboxes exercised" :
+               counts.p2p_bytes > 0 ? "below this test's smallest reduction; peer coverage skipped" : "disabled");
+        ok = ok && ok_p2p;
+    }
 
     for (int k = 0; k < n_graphs; k++) {
         ggml_backend_sched_free(scheds_cpu[k]);
