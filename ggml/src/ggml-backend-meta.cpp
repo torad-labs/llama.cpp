@@ -824,9 +824,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     };
 
     auto handle_pad = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
-            GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 0] == 0);
-            GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 1] == 0);
+        if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
+                (tensor->op_params[2*src_ss[0].axis + 0] != 0 || tensor->op_params[2*src_ss[0].axis + 1] != 0)) {
+            // along the split axis: a gather, every device ends up with the whole (ggml_backend_meta_is_gather)
+            GGML_ASSERT(src_ss[0].n_segments == 1 && src_ss[0].nr[0] == 1);
+            GGML_ASSERT(tensor->op_params[2*GGML_MAX_DIMS] == 0); // not circular
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
         return src_ss[0];
     };
@@ -1259,6 +1262,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     return ret;
 }
 
+// A pad along the axis its source is split by gathers the source. Each device pads its own slice out to the whole
+// tensor, with zeros where the other devices' slices go (ggml_backend_meta_buffer_make_simple_tensors); the gather after
+// it (the backends' allgather, or ggml_backend_meta_graph_compute's own) puts every slice on every device, bit for bit,
+// so the result is mirrored: what one device's pad of the whole source makes. Sampling uses it for split logits.
+static bool ggml_backend_meta_is_gather(const ggml_tensor * tensor) {
+    if (tensor->op != GGML_OP_PAD || tensor->src[0] == nullptr || tensor->src[0]->buffer == nullptr ||
+            !ggml_backend_buffer_is_meta(tensor->src[0]->buffer)) {
+        return false;
+    }
+    const int axis = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true).axis;
+    return axis >= 0 && axis < GGML_MAX_DIMS &&
+        (ggml_get_op_params_i32(tensor, 2*axis + 0) != 0 || ggml_get_op_params_i32(tensor, 2*axis + 1) != 0);
+}
+
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
     return (void *) 0x1000000000000000; // FIXME
@@ -1283,6 +1300,14 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
         ne[k] = tensor->ne[k];
         nb[k] = tensor->nb[k];
     }
+
+    // a gather: device j pads before its slice by the slices before it, and after it by the ones after it
+    const bool gather = ggml_backend_meta_is_gather(tensor);
+    ggml_backend_meta_split_state split_state_gather = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+    if (gather) {
+        split_state_gather = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+    }
+    int64_t gather_offset = 0;
 
     simple_tensors.clear();
     simple_tensors.reserve(n_simple_bufs);
@@ -1318,6 +1343,14 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+        if (gather) {
+            const int     axis  = split_state_gather.axis;
+            const int64_t ne_j  = split_state_gather.ne[j];
+            const int64_t after = tensor->src[0]->ne[axis] - gather_offset - ne_j;
+            ggml_set_op_params_i32(t_ij, 2*axis + 0, ggml_get_op_params_i32(tensor, 2*axis + 0) + (int32_t) gather_offset);
+            ggml_set_op_params_i32(t_ij, 2*axis + 1, ggml_get_op_params_i32(tensor, 2*axis + 1) + (int32_t) after);
+            gather_offset += ne_j;
+        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
@@ -1363,8 +1396,8 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
         simple_tensors.push_back(t_ij);
     }
 
-    // If one of the sources has a zero-sized slice, disable the computation:
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
+    // If one of the sources has a zero-sized slice, disable the computation (a gather pads it to zeros):
+    for (int i = 0; i < GGML_MAX_SRC && !gather; i++) {
         if (tensor->src[i] == nullptr || !ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
             continue;
         }
@@ -1866,6 +1899,7 @@ struct ggml_backend_meta_context {
         std::vector<cgraph_config>           cgraphs;
         std::vector<ggml_tensor *>           nodes;
         std::vector<ggml_backend_buffer_ptr> bufs;
+        std::vector<ggml_backend_buffer_ptr> gather_bufs; // the other devices' tensors, for the generic gather
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
@@ -1885,6 +1919,8 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_allgather_tensor_t comm_allgather = nullptr; // null: the generic gather
+    std::vector<bool>                    gathers; // a subgraph ends with a gather (ggml_backend_meta_is_gather)
     ggml_backend_graph_next_t            graph_next     = nullptr; // the simple backends' look ahead, or null
 
     // A whole evaluation of a cgraph, every step's subgraph and all-reduce on every device, captured into one graph a
@@ -1893,6 +1929,7 @@ struct ggml_backend_meta_context {
     // evaluated last. A llama.cpp context computes its last graph and up to 3 graph slots in turn, each keeping its uid.
     struct capture_state {
         ggml_backend_comm_allreduce_capturable_t allreduce_capturable = nullptr;
+        ggml_backend_comm_allgather_capturable_t allgather_capturable = nullptr; // null: no gather is captured
         ggml_backend_graph_capturable_t          graph_capturable     = nullptr;
         ggml_backend_capture_begin_t             begin                = nullptr;
         ggml_backend_capture_end_t               end                  = nullptr;
@@ -2101,8 +2138,12 @@ struct ggml_backend_meta_context {
             GGML_ASSERT(comm_allreduce != nullptr);
 
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            comm_allgather = (ggml_backend_comm_allgather_tensor_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allgather_tensor");
             capture.allreduce_capturable = (ggml_backend_comm_allreduce_capturable_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_capturable");
+            capture.allgather_capturable = (ggml_backend_comm_allgather_capturable_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allgather_capturable");
             capture.graph_capturable = (ggml_backend_graph_capturable_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_capturable");
             capture.begin  = (ggml_backend_capture_begin_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_begin");
@@ -2479,21 +2520,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return i_delayed;
             };
 
+            backend_ctx->gathers.clear();
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 // a host view ends no step, but the graph's last node ends the last one whatever it is
-                const bool partial = !ggml_backend_meta_is_host_view(node) &&
+                const bool host_view = ggml_backend_meta_is_host_view(node);
+                const bool partial = !host_view &&
                     ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
-                if (partial) {
+                // a gather ends its step too, and a gather follows it even after the last step
+                const bool gather = !host_view && ggml_backend_meta_is_gather(node);
+                if (partial || gather) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || partial;
+                const bool new_subgraph = i + 1 == cgraph->n_nodes || partial || gather;
                 if (!new_subgraph) {
                     continue;
                 }
 
-                const int i_delayed = get_i_delayed(i);
+                const int i_delayed = gather ? i : get_i_delayed(i);
+                backend_ctx->gathers.push_back(gather);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -2537,8 +2583,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         if (max_nnodes_raised || n_subgraphs > backend_ctx->max_subgraphs) {
             backend_ctx->max_subgraphs = std::max(backend_ctx->max_subgraphs, n_subgraphs);
-            const size_t n_nodes_per_device = 3 * backend_ctx->n_reduce_steps; // tmp + ADD (+zeroing) graph per step and device
-            const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
+            // tmp + ADD (+zeroing) graph per step and device; the generic gather: tmp, two views and a CPY graph per peer
+            const size_t n_nodes_per_device = std::max(3 * backend_ctx->n_reduce_steps, 4 * (n_backends - 1));
+            const size_t n_cgraphs_per_device = std::max(2 * backend_ctx->n_reduce_steps, n_backends - 1); // ADD ( + zeroing) graph per step and device
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
@@ -2729,6 +2776,76 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+    // The gather after step i without the backends' allgather: each device copies every other device's tensor whole
+    // into a buffer of its own, then that device's slice of it into its own tensor (a CPY of strided views), bit for bit.
+    // The slice a device reads is one its owner never writes, so the copies can run while the owners take theirs.
+    auto gather_fallback = [&](size_t i) -> ggml_status {
+        const size_t i_node = (i + 1 < backend_ctx->n_subgraphs ?
+            (size_t) backend_ctx->backend_configs[0].cgraphs[i + 1].offset : (size_t) cgraph->n_nodes) - 1;
+        const ggml_tensor * gather = cgraph->nodes[i_node];
+        const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(gather->src[0], /*assume_sync =*/ true);
+        const int axis = split_state.axis;
+        GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
+
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_tensor * node_dst = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            GGML_ASSERT(ggml_is_contiguous(node_dst));
+            if (bcj.gather_bufs.size() < n_backends) {
+                bcj.gather_bufs.resize(n_backends);
+            }
+
+            int64_t offset = ggml_get_op_params_i32(gather, 2*axis); // where the slices start in the whole
+            for (size_t k = 0; k < n_backends; offset += split_state.ne[k], k++) {
+                if (k == j || split_state.ne[k] == 0) {
+                    continue;
+                }
+                auto & bck = backend_ctx->backend_configs[k];
+                ggml_tensor * node_src = bck.cgraphs[i].cgraph_main->nodes[bck.cgraphs[i].cgraph_main->n_nodes - 1];
+
+                ggml_tensor * node_tmp = get_node_aux(node_dst);
+                ggml_backend_buffer_ptr & buf_ptr = bcj.gather_bufs[k];
+                if (!buf_ptr || ggml_backend_buffer_get_size(buf_ptr.get()) < ggml_nbytes(node_dst)) {
+                    buf_ptr.reset(ggml_backend_alloc_buffer(bcj.backend, backend_ctx->max_tmp_size));
+                }
+                node_tmp->buffer = buf_ptr.get();
+                node_tmp->data   = ggml_backend_buffer_get_base(buf_ptr.get());
+                ggml_backend_tensor_copy_async(bck.backend, bcj.backend, node_src, node_tmp);
+
+                // device k's slice, in the copy and in this device's tensor
+                ggml_tensor * slice_src = get_node_aux(node_dst);
+                ggml_tensor * slice_dst = get_node_aux(node_dst);
+                const size_t offs = (size_t) offset * node_dst->nb[axis];
+                for (ggml_tensor * slice : {slice_src, slice_dst}) {
+                    slice->ne[axis]  = split_state.ne[k];
+                    slice->view_src  = slice == slice_src ? node_tmp : node_dst;
+                    slice->view_offs = offs;
+                    slice->buffer    = slice->view_src->buffer;
+                    slice->data      = (char *) slice->view_src->data + offs;
+                }
+
+                ggml_tensor * node_cpy = get_node_aux(slice_dst);
+                node_cpy->op        = GGML_OP_CPY;
+                node_cpy->src[0]    = slice_src;
+                node_cpy->src[1]    = slice_dst;
+                node_cpy->view_src  = node_dst;
+                node_cpy->view_offs = offs;
+                node_cpy->buffer    = node_dst->buffer;
+                node_cpy->data      = slice_dst->data;
+                node_cpy->flags    |= GGML_TENSOR_FLAG_COMPUTE;
+
+                ggml_cgraph * cgraph_aux = get_cgraph_aux();
+                cgraph_aux->nodes[0] = node_cpy;
+                cgraph_aux->n_nodes  = 1;
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, cgraph_aux);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    };
+
     auto compute_steps = [&]() -> ggml_status {
         for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
             for (size_t j = 0; j < n_backends; j++) {
@@ -2743,7 +2860,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
-            if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            if (n_backends > 1 && backend_ctx->gathers[i]) {
+                bool backend_allgather_success = false;
+                if (backend_ctx->comm_ctx && backend_ctx->comm_allgather) {
+                    std::vector<ggml_tensor *> nodes;
+                    nodes.reserve(n_backends);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        ggml_cgraph * cgraph_ij = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+                        nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+                    }
+                    backend_allgather_success = backend_ctx->comm_allgather(backend_ctx->comm_ctx, nodes.data());
+                }
+                if (!backend_allgather_success) {
+                    const ggml_status status = gather_fallback(i);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+            } else if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
                 bool backend_allreduce_success = false;
                 if (backend_ctx->comm_ctx) {
                     std::vector<ggml_tensor *> nodes;
@@ -2779,7 +2913,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 nodes[j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
             }
-            if (i < backend_ctx->n_subgraphs - 1 && !cap.allreduce_capturable(backend_ctx->comm_ctx, nodes.data())) {
+            if (backend_ctx->gathers[i]) {
+                if (cap.allgather_capturable == nullptr || backend_ctx->comm_allgather == nullptr ||
+                        !cap.allgather_capturable(backend_ctx->comm_ctx, nodes.data())) {
+                    return (int) i;
+                }
+            } else if (i < backend_ctx->n_subgraphs - 1 && !cap.allreduce_capturable(backend_ctx->comm_ctx, nodes.data())) {
                 return (int) i;
             }
         }

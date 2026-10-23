@@ -60,6 +60,7 @@ struct llama_cparams {
     bool kv_unified;
     bool attn_mask_bits;     // the KV attention mask is bit-packed (GGML_TYPE_I16) instead of f16; only with flash_attn
     bool pipeline_parallel;
+    bool logits_gather = false; // -sm tensor: the logits are split by vocab, and backend sampling gathers them first
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

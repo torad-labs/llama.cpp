@@ -28,14 +28,39 @@ struct test_args {
 
 struct test_params {
     llama_model_ptr model;
+    std::string     model_path;
 };
+
+// -sm tensor: the model split by tensor parallelism over the first two GPUs, or over the first GPU twice
+static void set_tensor_split(llama_model_params & mparams, ggml_backend_dev_t devs[3]) {
+    std::vector<ggml_backend_dev_t> gpus;
+    for (size_t i = 0; i < ggml_backend_dev_count() && gpus.size() < 2; i++) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpus.push_back(ggml_backend_dev_get(i));
+        }
+    }
+    GGML_ASSERT(!gpus.empty());
+    devs[0] = gpus[0];
+    devs[1] = gpus.size() > 1 ? gpus[1] : gpus[0];
+    devs[2] = nullptr;
+    mparams.devices      = devs;
+    mparams.n_gpu_layers = 999;
+    mparams.split_mode   = LLAMA_SPLIT_MODE_TENSOR;
+}
 
 static llama_model_ptr load_model(const test_args & args) {
     auto mparams = llama_model_default_params();
 
-    ggml_backend_dev_t devs[2] = { nullptr, nullptr };
+    ggml_backend_dev_t devs[3] = { nullptr, nullptr, nullptr };
 
-    if (args.device != "auto") {
+    if (args.device == "tensor") {
+        if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr) {
+            fprintf(stderr, "Error: -sm tensor requested but no GPU is available\n");
+            return nullptr;
+        }
+        set_tensor_split(mparams, devs);
+        fprintf(stderr, "Using -sm tensor over: %s, %s\n", ggml_backend_dev_name(devs[0]), ggml_backend_dev_name(devs[1]));
+    } else if (args.device != "auto") {
         if (args.device == "gpu") {
             devs[0] = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
 
@@ -2172,6 +2197,91 @@ static void test_backend_multi_output_cpu_suffix(const test_params & params) {
     printf("backend multi-output CPU suffix test PASSED\n");
 }
 
+// GOAL: Marcos serves GLM-5.3 Flash on two GPUs with -sm tensor and MTP drafts, sampled at temp 1.0, top-p 0.95 and
+// repeat penalty 1.1 over the last 256 tokens. Under -sm tensor the engine refused backend sampling and sampled every
+// sequence on the CPU, the MTP drafter's top-k 10 chain too. With the model split by -sm tensor:
+//   - the served chain and a greedy chain run in the graph: each output has its sampled token, step after step,
+//   - the greedy token is the argmax of the logits the same model gives a context with no backend sampler,
+//   - the drafter's chain (top-k 10, dist) attached with llama_set_sampler is taken (it returns true) and draws a token
+//     among those 10.
+// That the chains draw exactly the tokens one device draws for the same logits is test-backend-meta-sampler's.
+static void test_backend_tensor_split(const test_params & params) {
+    if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr) {
+        printf("no GPU for -sm tensor, skipped\n");
+        return;
+    }
+
+    auto mparams = llama_model_default_params();
+    ggml_backend_dev_t devs[3];
+    set_tensor_split(mparams, devs);
+    test_params tp = {
+        /*.model      =*/ llama_model_ptr(llama_model_load_from_file(params.model_path.c_str(), mparams)),
+        /*.model_path =*/ params.model_path,
+    };
+    GGML_ASSERT(tp.model && "failed to load the model with -sm tensor");
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(tp.model.get()));
+
+    llama_sampler_ptr served(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(served.get(), llama_sampler_init_penalties(n_vocab, 256, 1.1f, 0.0f, 0.0f));
+    llama_sampler_chain_add(served.get(), llama_sampler_init_top_p(0.95f, 0));
+    llama_sampler_chain_add(served.get(), llama_sampler_init_temp(1.0f));
+    llama_sampler_chain_add(served.get(), llama_sampler_init_dist(88));
+    llama_sampler_ptr greedy(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(greedy.get(), llama_sampler_init_greedy());
+    std::vector<llama_sampler_seq_config> configs = {{ 0, served.get() }, { 1, greedy.get() }};
+    std::vector<llama_sampler_seq_config> no_configs;
+
+    test_context test_ctx(tp, configs);
+    test_context ref_ctx(tp, no_configs, 2);
+
+    const std::map<llama_seq_id, std::string> prompts = {{0, "Hello"}, {1, "Some"}};
+    GGML_ASSERT(test_ctx.decode(prompts));
+    GGML_ASSERT(ref_ctx.decode(prompts));
+
+    auto argmax = [&](int32_t idx) {
+        const float * logits = llama_get_logits_ith(ref_ctx.ctx.get(), idx);
+        GGML_ASSERT(logits != nullptr);
+        return (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+    };
+
+    for (int step = 0; step < 4; step++) {
+        const llama_token tok_served = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(0));
+        const llama_token tok_greedy = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(1));
+        const llama_token tok_ref    = argmax(ref_ctx.idx_for_seq(1));
+        printf("step %d: served chain drew %d, greedy drew %d, argmax of the logits %d\n", step, tok_served, tok_greedy,
+            tok_ref);
+        GGML_ASSERT(tok_served >= 0 && tok_served < n_vocab);
+        GGML_ASSERT(tok_greedy == tok_ref);
+
+        const std::map<llama_seq_id, llama_token> next = {{0, tok_served}, {1, tok_greedy}};
+        GGML_ASSERT(test_ctx.decode_tokens(next));
+        GGML_ASSERT(ref_ctx.decode_tokens(next));
+    }
+
+    // the MTP drafter's chain, attached as common_speculative attaches it
+    llama_sampler_ptr draft(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(draft.get(), llama_sampler_init_top_k(10));
+    llama_sampler_chain_add(draft.get(), llama_sampler_init_dist(7));
+    GGML_ASSERT(llama_set_sampler(test_ctx.ctx.get(), 1, draft.get()));
+
+    const llama_token tok_prev = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(1));
+    const std::map<llama_seq_id, llama_token> next = {{1, tok_prev}};
+    GGML_ASSERT(test_ctx.decode_tokens(next));
+    GGML_ASSERT(ref_ctx.decode_tokens(next));
+    const llama_token tok_draft = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(1));
+    const float * logits = llama_get_logits_ith(ref_ctx.ctx.get(), ref_ctx.idx_for_seq(1));
+    GGML_ASSERT(logits != nullptr);
+    GGML_ASSERT(tok_draft >= 0 && tok_draft < n_vocab);
+    int n_above = 0;
+    for (int32_t i = 0; i < n_vocab; i++) {
+        n_above += logits[i] > logits[tok_draft];
+    }
+    printf("draft chain drew %d, %d logits above it\n", tok_draft, n_above);
+    GGML_ASSERT(n_above < 10);
+
+    printf("backend -sm tensor sampling test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2202,6 +2312,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "min_p",           test_backend_min_p_sampling,          true  },
     { "cpu_mixed",       test_backend_cpu_mixed_batch,         true  },
     { "top_p",           test_backend_top_p_sampling,          true  },
+    { "tensor_split",    test_backend_tensor_split,            true  },
 };
 
 static test_args parse_cli(int argc, char ** argv) {
@@ -2255,8 +2366,8 @@ static test_args parse_cli(int argc, char ** argv) {
         exit(EXIT_FAILURE);
     }
 
-    if (out.device != "cpu" && out.device != "gpu" && out.device != "auto") {
-        fprintf(stderr, "Invalid device '%s'. Must be 'cpu', 'gpu' or 'auto'\n", out.device.c_str());
+    if (out.device != "cpu" && out.device != "gpu" && out.device != "tensor" && out.device != "auto") {
+        fprintf(stderr, "Invalid device '%s'. Must be 'cpu', 'gpu', 'tensor' or 'auto'\n", out.device.c_str());
         exit(EXIT_FAILURE);
     }
 
@@ -2339,7 +2450,8 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     test_params params = {
-        /*.model =*/ load_model(args),
+        /*.model      =*/ load_model(args),
+        /*.model_path =*/ args.model,
     };
 
     const std::vector<const backend_test_case *> tests = collect_tests_to_run(args.test);

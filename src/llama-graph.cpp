@@ -4369,7 +4369,13 @@ void llm_graph_context::build_sampling() const {
 
     // add a dummy row to keep the single-output graph static regardless of active samplers
     // multi-output graphs can still vary with the number of output rows
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    // -sm tensor: each device holds its share of the vocab. A pad along the vocab gathers the rows on every device, bit
+    // for bit (ggml-backend-meta.cpp, ggml_backend_meta_is_gather), and the samplers run on them as on one device; the
+    // padding keeps each row 128-byte aligned
+    const int64_t n_vocab = res->t_logits->ne[0];
+    ggml_tensor * logits_t = cparams.logits_gather ?
+        ggml_pad_ext(ctx0, res->t_logits, 0, (int) (32 - n_vocab % 32), 0, 1, 0, 0, 0, 0) :
+        ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
@@ -4388,7 +4394,7 @@ void llm_graph_context::build_sampling() const {
         const int i_out   = active ? 1          : 0;
 
         for (uint32_t i = 0; i < rows.size(); ++i) {
-            ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], rows[i] * logits_t->nb[1]);
+            ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, n_vocab, rows[i] * logits_t->nb[1]);
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
             struct llama_sampler_data data = {

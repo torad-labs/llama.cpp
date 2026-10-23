@@ -27,6 +27,14 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// In-place exact gather across tensors[0..1]: each holds its device's part and zero bits elsewhere, and both end up
+// with the bitwise OR of the two, 32-bit word by word, on the chunked or LL kernel (capturable). tensors[i] must be
+// contiguous, 16-byte aligned and a whole number of words.
+bool ggml_cuda_ar_allgather(
+    ggml_cuda_ar_pipeline * pipeline,
+    ggml_backend_t        * backends,
+    ggml_tensor           ** tensors);
+
 // Whether the AllReduce of a tensor like t (same preconditions) can be captured
 // into a CUDA graph and replayed: it runs on the chunked kernel, which takes its
 // tokens and slots from the device, and not over the copy engines, whose
