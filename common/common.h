@@ -349,6 +349,10 @@ struct common_params_speculative_draft {
     // their rows of the LM head only and every other token's draft logit is -inf (empty = the full vocabulary)
     std::string mtp_vocab;
 
+    // > 0: each sequence drafts 1 or n_max MTP tokens a round, from the acceptance of its own drafts. The value is the
+    // cost of a draft token past the first, as a share of a one-token round's time (0 = off: always n_max)
+    float mtp_adaptive = 0.0f;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
