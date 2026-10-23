@@ -93,6 +93,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
+    if (mtp && arch == LLM_ARCH_QWEN35) {
+        n_layer = 3; // keep both recurrent and attention target blocks before NextN
+    }
     if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_GEMMA4) {
@@ -443,11 +446,12 @@ static std::vector<float> get_logits(
 
 static std::vector<float> get_mtp_logits(
         llama_model * model, llama_context * ctx, const std::vector<llama_token> & tokens, const std::vector<float> & hidden,
-        llama_pos start = 0) {
+        llama_pos start = 0, const std::vector<llama_seq_id> & seqs = {}) {
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
     for (size_t i = 0; i < tokens.size(); ++i) {
-        common_batch_add(batch, tokens[i], start + i, {0}, true);
+        const size_t n_seq = std::max(size_t(1), seqs.size());
+        common_batch_add(batch, tokens[i], start + i/n_seq, {seqs.empty() ? 0 : seqs[i%n_seq]}, true);
     }
     batch.embd = const_cast<float *>(hidden.data());
     const int32_t result = llama_decode(ctx, batch);
@@ -464,11 +468,11 @@ static std::vector<float> get_mtp_logits(
     return logits;
 }
 
-static bool test_glm_draft_vocab(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+static bool test_draft_vocab(const llm_arch arch, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     std::mt19937 rng(seed);
     for (const int n_hot : {1, 2, 7, 32, 63, 127}) {
-        auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+        auto gguf = get_gguf_ctx(arch, arch != LLM_ARCH_QWEN35, true);
         auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
         auto * model = pair.first.get();
         auto * target = pair.second.get();
@@ -494,7 +498,7 @@ static bool test_glm_draft_vocab(const size_t seed, const std::vector<ggml_backe
 
         for (const std::vector<llama_token> & invalid : {std::vector<llama_token>{}, {-1}, {128}, {3, 3}, {9, 2}}) {
             if (llama_model_set_draft_vocab(model, invalid.data(), invalid.size())) {
-                LOG_ERR("GLM draft vocabulary accepted invalid IDs\n");
+                LOG_ERR("%s draft vocabulary accepted invalid IDs\n", llm_arch_name(arch));
                 return false;
             }
         }
@@ -504,7 +508,7 @@ static bool test_glm_draft_vocab(const size_t seed, const std::vector<ggml_backe
         ids.resize(n_hot);
         std::sort(ids.begin(), ids.end());
         if (!llama_model_set_draft_vocab(model, ids.data(), ids.size())) {
-            LOG_ERR("GLM draft vocabulary rejected %d valid IDs\n", n_hot);
+            LOG_ERR("%s draft vocabulary rejected %d valid IDs\n", llm_arch_name(arch), n_hot);
             return false;
         }
         llama_context_ptr trimmed(llama_init_from_model(model, params));
@@ -521,17 +525,17 @@ static bool test_glm_draft_vocab(const size_t seed, const std::vector<ggml_backe
                 selected_expected.push_back(expected[i]);
                 selected_actual.push_back(actual[i]);
             } else if (actual[i] != -INFINITY) {
-                LOG_ERR("GLM draft vocabulary scored an excluded ID\n");
+                LOG_ERR("%s draft vocabulary scored an excluded ID\n", llm_arch_name(arch));
                 return false;
             }
         }
         if (nmse(selected_expected, selected_actual) > 1e-4) {
-            LOG_ERR("GLM draft vocabulary changed selected logits\n");
+            LOG_ERR("%s draft vocabulary changed selected logits\n", llm_arch_name(arch));
             return false;
         }
         llama_memory_clear(llama_get_memory(target), true);
         if (get_logits(model, target, tokens) != target_before) {
-            LOG_ERR("GLM draft vocabulary changed target logits\n");
+            LOG_ERR("%s draft vocabulary changed target logits\n", llm_arch_name(arch));
             return false;
         }
     }
@@ -599,6 +603,65 @@ static bool test_glm_mtp_index(const size_t seed, const std::vector<ggml_backend
         return false;
     }
     return step(-1, 47, true);
+}
+
+// With a budget covering every live pool, reusing the selection must compute the
+// same logits as scoring it afresh. Distinct histories and reordered batch rows
+// exercise the graph-to-sequence mapping, in both KV layouts.
+static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(64));
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int n_embd = llama_model_n_embd(model);
+    for (const bool unified : {false, true}) {
+        int scores = 0;
+        llama_context_params params = llama_context_default_params();
+        params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx = 256;
+        params.n_seq_max = 2;
+        params.n_batch = params.n_ubatch = 128;
+        params.kv_unified = unified;
+        params.n_threads = params.n_threads_batch = 4;
+        params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            if (ask && std::string(t->name).find("indexer_top_k_pools") == 0) {
+                ++*static_cast<int *>(data);
+            }
+            return false;
+        };
+        params.cb_eval_user_data = &scores;
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        params.cb_eval = nullptr;
+        params.cb_eval_user_data = nullptr;
+        llama_context_ptr reference(llama_init_from_model(model, params));
+        if (!ctx || !reference) return false;
+        const auto tokens = get_tokens(80, 128, seed);
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> normal(0.0f, 0.1f);
+        std::vector<float> hidden(tokens.size()*n_embd);
+        for (auto & value : hidden) value = normal(rng);
+        get_mtp_logits(model, ctx.get(), tokens, hidden, 0, {0, 1});
+        get_mtp_logits(model, reference.get(), tokens, hidden, 0, {0, 1});
+        // One pool interval: two reuse steps followed by the completion boundary.
+        // The next interval can grow the physical pool width and must re-score.
+        for (int step = 0; step < 4; ++step) {
+            scores = 0;
+            if (!llama_mtp_draft_step(ctx.get(), step)) return false;
+            const std::vector<llama_seq_id> seqs = step % 2 ? std::vector<llama_seq_id>{1, 0} : std::vector<llama_seq_id>{0, 1};
+            const auto actual = get_mtp_logits(model, ctx.get(), {7, 19}, hidden, 40 + step, seqs);
+            const auto expected = get_mtp_logits(model, reference.get(), {7, 19}, hidden, 40 + step, seqs);
+            const bool fresh = step == 0 || step == 3;
+            if ((scores > 0) != fresh || !std::all_of(actual.begin(), actual.end(), [](float x) { return std::isfinite(x); }) ||
+                    nmse(expected, actual) > 1e-4) {
+                LOG_ERR("MTP two-sequence logits differ: unified=%d step=%d fresh=%d scores=%d nmse=%g\n",
+                    unified, step, fresh, scores, nmse(expected, actual));
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -918,13 +981,18 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
-                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_draft_vocab(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                        if ((arch == LLM_ARCH_GLM5NEXT || arch == LLM_ARCH_QWEN35) &&
+                                !test_draft_vocab(arch, seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL MTP vocab\033[0m";
                         }
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_mtp_index(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL MTP index\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_mtp_index_sequences(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL MTP sequences\033[0m";
                         }
                     }
 
