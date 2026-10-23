@@ -10231,6 +10231,25 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
         // Odd rows and non-power-of-two K exercise the vector kernel's padded tail.
         cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 63, n, 1056, {1, 1}, {1, 1}));
     }
+    // One rank's share of each Q8_0 projection under a two-way tensor split, at the widths the SM120 tuning covers:
+    // shared expert gate/up and down, dense FFN gate/up and down, MLA output and q_b, MLA k_b and v_b per head.
+    for (int64_t n : {1, 2, 3, 6}) {
+        for (auto [m, k] : std::initializer_list<std::pair<int64_t, int64_t>>{
+                 {1024, 4096}, {4096, 1024}, {6144, 4096}, {4096, 6144}, {4096, 8192}, {8192, 1536}}) {
+            cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, n, 256, {32, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, n, 512, {32, 1}, {1, 1}));
+        // K under one warp's span with odd rows: the last block of rows is partial.
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 63, n, 256, {1, 1}, {1, 1}));
+        // KDA q/k/v as one launch, and the shared expert down with the residual added in its epilogue.
+        cases.emplace_back(new test_mul_mat_concat(GGML_TYPE_Q8_0, 4096, 4096, n));
+        cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n, 4096, 1024,
+            false, 1, 1, false, /*with_bias =*/ true, /*with_gate =*/ false, false, {1, 1}, false, /*full_bias =*/ true));
+    }
+    // The draft's shared expert gate and up with the GLU in one launch.
+    cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, 1, 1024, 4096,
+        false, 1, 1, false, false, /*with_gate =*/ true, false, {1, 1}));
 }
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
