@@ -700,6 +700,7 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
     const int n_embd = llama_model_n_embd(model);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const auto tokens = get_tokens(384, n_vocab, seed);
+    const auto previous_tokens = get_tokens(384, n_vocab, seed + 1);
     std::mt19937 rng(seed);
     std::normal_distribution<float> normal(0.0f, 0.1f);
     std::vector<float> hidden(tokens.size()*n_embd);
@@ -722,10 +723,12 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
         llama_context_ptr ctx(llama_init_from_model(model, params));
         llama_context_ptr restored(llama_init_from_model(model, params));
         if (!ctx || !reference || !restored) return false;
-        const auto decode = [&](llama_context * context, int begin, int end, llama_seq_id seq_id = 0) {
+        const auto decode = [&](llama_context * context, int begin, int end, llama_seq_id seq_id = 0,
+                const std::vector<llama_token> * history = nullptr) {
+            const auto & input = history ? *history : tokens;
             llama_batch batch = llama_batch_init(end - begin, 0, 1);
             for (int pos = begin; pos < end; ++pos) {
-                common_batch_add(batch, tokens[pos], pos, {seq_id}, true);
+                common_batch_add(batch, input[pos], pos, {seq_id}, true);
             }
             if (mtp) batch.embd = hidden.data() + begin*n_embd;
             const int result = llama_decode(context, batch);
@@ -766,29 +769,38 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
             if (llama_state_seq_set_data(context, saved.data(), size, 0) != size ||
                 !check(context, 128, 384)) return false;
         }
-        // A caller may fork a short prefix without ever building its pooled keys.
-        // The child alone crosses into sparse attention; the parent's stale flag
-        // cannot make this correct by happening to share the next microbatch.
+        // Copy deferred and built pooled keys, into fresh and reused slots.
+        // The child alone continues into sparse attention.
         for (const bool unified : {false, true}) {
             auto copy_params = params;
             copy_params.n_seq_max = 2;
             copy_params.kv_unified = unified;
             copy_params.n_ctx = unified ? 512 : 1024;
-            for (const int prefix : {128, 255}) {
+            for (const int prefix : {128, 255, 300}) {
+              for (const bool reused : {false, true}) {
                 llama_context_ptr copied(llama_init_from_model(model, copy_params));
                 llama_context_ptr original(llama_init_from_model(model, copy_params));
-                if (!copied || !original || !check(copied.get(), 0, prefix) ||
+                if (!copied || !original) return false;
+                if (reused) {
+                    scores = 0;
+                    decode(copied.get(), 0, previous_tokens.size(), 1, &previous_tokens);
+                    if (scores == 0 || !llama_memory_seq_rm(llama_get_memory(copied.get()), 1, -1, -1)) return false;
+                }
+                if (!check(copied.get(), 0, prefix) ||
                         !check(original.get(), 0, prefix)) return false;
                 llama_memory_seq_cp(llama_get_memory(copied.get()), 0, 1, -1, -1);
+                scores = 0;
                 const auto before_copy = decode(original.get(), prefix, tokens.size());
+                if (scores == 0) return false;
+                scores = 0;
                 const auto after_copy = decode(copied.get(), prefix, tokens.size(), 1);
-                // Same inputs and batch geometry: changing the sequence ID through
-                // a prefix copy must preserve the continuation, including selection.
-                if (before_copy != after_copy) {
-                    LOG_ERR("GLM dense prefix copy: mtp=%d unified=%d prefix=%d nmse=%g\n",
-                            mtp, unified, prefix, nmse(before_copy, after_copy));
+                // Same inputs and batch geometry must preserve the continuation, including selection.
+                if (scores == 0 || before_copy != after_copy) {
+                    LOG_ERR("GLM prefix copy: mtp=%d unified=%d prefix=%d reused=%d scores=%d nmse=%g\n",
+                            mtp, unified, prefix, reused, scores, nmse(before_copy, after_copy));
                     return false;
                 }
+              }
             }
         }
     }
