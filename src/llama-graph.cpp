@@ -1399,6 +1399,21 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
 
         auto & sampler = samplers[seq_id];
 
+        // the sequence's tokens in this ubatch and its output rows: the penalties of each row of an MTP verify batch
+        // count the drafts before it (llama_sampler_backend_set_batch)
+        std::vector<llama_token> tokens;
+        std::vector<int8_t>      output;
+        for (uint32_t i = 0; i < ubatch->n_tokens; i++) {
+            if (ubatch->seq_id[i][0] != seq_id) {
+                continue;
+            }
+            if (ubatch->token) {
+                tokens.push_back(ubatch->token[i]);
+            }
+            output.push_back(ubatch->output[i] ? 1 : 0);
+        }
+        llama_sampler_backend_set_batch(sampler, ubatch->token ? tokens.data() : nullptr, output.data(), (int32_t) output.size());
+
         if (sampler->iface->backend_set_input) {
             sampler->iface->backend_set_input(sampler);
         }
@@ -4357,6 +4372,12 @@ void llm_graph_context::build_sampling() const {
         if (ubatch.output[i]) {
             sampling_rows[ubatch.seq_id[i][0]].push_back(n_rows++);
         }
+    }
+
+    // -sm tensor: a ubatch with no output rows (the ubatches of a prompt before its last) has empty logits, and a pad of
+    // them has no split the meta backend can name. There is nothing to sample
+    if (n_rows == 0 && cparams.logits_gather) {
+        return;
     }
 
     res->t_sampled.resize(n_rows, nullptr);

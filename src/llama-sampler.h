@@ -43,6 +43,13 @@ void llama_sampler_backend_begin(llama_sampler * sampler);
 // the context no longer runs the sampler: the chain applies every sampler on the CPU again and the dist sampler draws
 // from its own RNG outside any backend transaction (a sequence goes back to the backend with a fresh sampler)
 void llama_sampler_backend_release(llama_sampler * sampler);
+// the sequence's tokens in the ubatch the sampler's graph is about to run, in batch order, with output[i] set for the
+// output rows (tokens may be null: a batch of embeddings). The penalties sampler penalizes each output row for the
+// accepted history followed by the sequence's tokens after its first output row of the decode, up to and including the
+// row's own: the rows of an MTP verify batch see the drafts before them, as the CPU chain does when it accepts each
+// draft before sampling the next row
+void llama_sampler_backend_set_batch(
+        llama_sampler * sampler, const llama_token * tokens, const int8_t * output, int32_t n_tokens);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
