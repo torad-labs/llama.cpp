@@ -619,6 +619,7 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
     auto * model = pair.first.get();
     const int n_embd = llama_model_n_embd(model);
     for (const bool unified : {false, true}) {
+      for (const bool split_capture : {false, true}) {
         int scores = 0;
         llama_context_params params = llama_context_default_params();
         params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -653,20 +654,23 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
         }
         // Unequal histories: sequence 2 closes its pool at step 2, sequence 1 at
         // step 3. Stream-local selections also differ, exposing stream mix-ups.
-        int fresh_scores = 0;
-        for (int step = 0; step < 4; ++step) {
+        int scores_per_ubatch = 0;
+        for (int step = 0; step < 5; ++step) {
             scores = 0;
             if (!llama_mtp_draft_step(ctx.get(), step)) return false;
-            const std::vector<llama_seq_id> seqs = step % 2 ? std::vector<llama_seq_id>{2, 1} : std::vector<llama_seq_id>{1, 2};
+            const std::vector<llama_seq_id> seqs = (bool(step % 2) != split_capture) ?
+                std::vector<llama_seq_id>{2, 1} : std::vector<llama_seq_id>{1, 2};
             const std::vector<llama_pos> offsets = {seqs[0] - 1, seqs[1] - 1};
             const auto actual = get_mtp_logits(model, ctx.get(), {7, 19}, hidden, 40 + step, seqs, offsets);
             const auto expected = get_mtp_logits(model, reference.get(), {7, 19}, hidden, 40 + step, seqs, offsets);
-            const bool fresh = step == 0 || step == 2 || step == 3;
-            if (step == 0) fresh_scores = scores;
-            if (fresh_scores == 0 || scores != (fresh ? fresh_scores : 0) ||
+            const int scoring_ubatches = step == 0 ? (!unified && split_capture ? 2 : 1) :
+                step == 2 || step == 3 ? 1 : 0;
+            if (step == 0) scores_per_ubatch = scores/scoring_ubatches;
+            const int expected_scores = scores_per_ubatch*scoring_ubatches;
+            if (scores_per_ubatch == 0 || scores != expected_scores ||
                     !std::all_of(actual.begin(), actual.end(), [](float x) { return std::isfinite(x); })) {
-                LOG_ERR("MTP two-sequence logits differ: unified=%d step=%d fresh=%d scores=%d nmse=%g\n",
-                    unified, step, fresh, scores, nmse(expected, actual));
+                LOG_ERR("MTP sequence reuse failed: unified=%d split_capture=%d step=%d scores=%d expected=%d nmse=%g\n",
+                    unified, split_capture, step, scores, expected_scores, nmse(expected, actual));
                 return false;
             }
             const size_t row_size = actual.size()/seqs.size();
@@ -680,6 +684,7 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
                 }
             }
         }
+      }
     }
     return true;
 }

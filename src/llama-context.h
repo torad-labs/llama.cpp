@@ -277,6 +277,8 @@ private:
     // the graphs process_ubatch keeps (gf_res_prev and the slots') are rebuilt before their next use
     void graph_results_reset();
 
+    void mtp_index_capture();
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);

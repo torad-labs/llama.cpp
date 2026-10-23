@@ -1630,9 +1630,8 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    // Only the immediately preceding decode can supply a selection. Never keep
-    // a pointer through graph reuse/reallocation or a prompt/catch-up decode.
-    mtp_index.tensor = nullptr;
+    // Keep each ubatch's rows before its graph storage can be reused.
+    mtp_index_capture();
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1774,6 +1773,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    mtp_index.tensor = nullptr;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2013,6 +2013,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch & batch_inp) {
     llama_decode_phase_timer t_decode(LLAMA_DECODE_PHASE_DECODE_TOTAL);
+
+    // An unconsumed selection from an earlier decode is not a draft step.
+    mtp_index.tensor = nullptr;
 
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -4293,13 +4296,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
 
-bool llama_context::mtp_draft_step(int32_t step) {
-    if (model.arch != LLM_ARCH_GLM5NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
-        model.hparams.n_layer_nextn != 1 || !memory) return false;
+void llama_context::mtp_index_capture() {
+    if (!mtp_index.tensor) return;
     auto * draft = static_cast<llama_memory_hybrid *>(memory.get())->get_mtp_index();
-    if (step > 0 && mtp_index.tensor && mtp_index.generation == draft->generation()) {
-        // The driver has already read the sampled token and h_nextn. Synchronize
-        // for API callers too, before reading the small I32 selection.
+    if (mtp_index.generation == draft->generation()) {
         synchronize();
         const int64_t width = mtp_index.tensor->ne[0];
         std::vector<int32_t> row(width);
@@ -4308,6 +4308,14 @@ bool llama_context::mtp_draft_step(int32_t step) {
             draft->capture(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv, row);
         }
     }
+    mtp_index.tensor = nullptr;
+}
+
+bool llama_context::mtp_draft_step(int32_t step) {
+    if (model.arch != LLM_ARCH_GLM5NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+        model.hparams.n_layer_nextn != 1 || !memory) return false;
+    auto * draft = static_cast<llama_memory_hybrid *>(memory.get())->get_mtp_index();
+    if (step > 0) mtp_index_capture();
     mtp_index.tensor = nullptr;
     draft->advance(step);
     return true;
