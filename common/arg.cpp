@@ -4262,7 +4262,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_VOCAB"));
     add_opt(common_arg(
         {"--spec-draft-mtp-adaptive"}, "COST",
-        "each sequence drafts 1 or --spec-draft-n-max MTP tokens a round, from the acceptance of its own drafts in the request.\n"
+        "each sequence drafts max(1, --spec-draft-n-min) or --spec-draft-n-max MTP tokens a round, from the acceptance of its\n"
+        "own drafts in the request.\n"
         "COST is the time a draft token past the first adds to a round, as a share of a one-token round: (T2 - T1) / T1,\n"
         "in [0, 1] (default: 0 = off, always --spec-draft-n-max)",
         [](common_params & params, const std::string & value) {

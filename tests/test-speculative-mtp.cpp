@@ -7,6 +7,9 @@
 // stable: a sequence's depth holds for windows of 8 of its rounds, the first window of a request is full depth, and a
 // one-token window ends in one full-depth probe. Another sequence's rounds, an earlier request on the same slot, and a
 // round verified twice (a checkpoint replay) never move it. Without the flag every round drafts n_max, as before.
+// With --spec-draft-n-min m the low depth is max(1, m): no round drafts fewer than m tokens, so every round's draft
+// reaches verification and the windows and probes go on. Full depth is kept while the tokens past the low depth expected
+// to land pay for the time they add to a low-depth round; at m >= n_max the depth stays n_max.
 // The head's kept hidden row stays the target row that a verification accepted, however the batch is laid out.
 
 #include "common.h"
@@ -145,6 +148,7 @@ struct server_rig {
     common_speculative_init_result_ptr init;
     common_speculative_ptr spec;
     int32_t n_vocab = 0;
+    int32_t n_max   = N_MAX;
 
     struct seq {
         llama_pos    n_past  = 0;
@@ -154,7 +158,7 @@ struct server_rig {
     };
     std::vector<seq> seqs = std::vector<seq>(N_SEQ);
 
-    server_rig(llama_model * model, float adaptive) {
+    server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0) : n_max(n_max) {
         params.n_ctx      = 8192;
         params.n_parallel = N_SEQ;
         params.n_batch    = 512;
@@ -163,7 +167,8 @@ struct server_rig {
         params.cpuparams.n_threads       = 4;
         params.cpuparams_batch.n_threads = 4;
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-        params.speculative.draft.n_max = N_MAX;
+        params.speculative.draft.n_max = n_max;
+        params.speculative.draft.n_min = n_min;
         params.speculative.draft.mtp_adaptive = adaptive;
         const auto limits = common_speculative_get_output_limits(params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
         params.n_outputs_max         = limits.total;
@@ -196,7 +201,7 @@ struct server_rig {
         std::map<llama_seq_id, int> first;
         for (const auto & r : rows) {
             // as the server asks: every row of a verification, the last row of a prompt
-            const size_t n_out = r.second.size() <= 1 + N_MAX ? r.second.size() : 1;
+            const size_t n_out = r.second.size() <= (size_t) (1 + n_max) ? r.second.size() : 1;
             first[r.first] = batch.n_tokens;
             for (size_t i = 0; i < r.second.size(); ++i) {
                 common_batch_add(batch, r.second[i], seqs[r.first].n_past++, { r.first }, i + n_out >= r.second.size());
@@ -271,14 +276,16 @@ struct server_rig {
     }
 };
 
-// which draft positions land: the first with probability p1, the next ones (given the first) with probability p2
+// which draft positions land: the first with probability p1, the next ones (given the first) with probability p2; none
+// at or past position cap
 struct acceptance {
-    float p1 = 1.0f;
-    float p2 = 1.0f;
+    float p1  = 1.0f;
+    float p2  = 1.0f;
+    int   cap = 1 << 30;
     int operator()(int len, std::mt19937 & rng) const {
         std::uniform_real_distribution<float> u(0.0f, 1.0f);
         int n = 0;
-        while (n < len && u(rng) < (n == 0 ? p1 : p2)) {
+        while (n < std::min(len, cap) && u(rng) < (n == 0 ? p1 : p2)) {
             ++n;
         }
         return n;
@@ -296,14 +303,14 @@ static std::string str(const std::vector<int> & v) {
     return s;
 }
 
-// draft lengths from a window boundary, replayed rounds left out: every window full depth or 7 one-token rounds and a
+// draft lengths from a window boundary, replayed rounds left out: every window full depth or 7 low-depth rounds and a
 // full-depth probe, the last window a prefix of either; a request's first window is full depth
-static bool stable_shape(const std::vector<int> & len, bool request_start = true) {
+static bool stable_shape(const std::vector<int> & len, bool request_start = true, int n_max = N_MAX, int n_low = 1) {
     for (size_t w = 0; w*WINDOW < len.size(); ++w) {
         bool full = true, low = w > 0 || !request_start;
         for (size_t i = w*WINDOW; i < std::min(len.size(), (w + 1)*WINDOW); ++i) {
-            full = full && len[i] == N_MAX;
-            low  = low  && len[i] == (i % WINDOW == WINDOW - 1 ? N_MAX : 1);
+            full = full && len[i] == n_max;
+            low  = low  && len[i] == (i % WINDOW == WINDOW - 1 ? n_max : n_low);
         }
         if (!full && !low) {
             return false;
@@ -468,24 +475,32 @@ static std::vector<std::vector<int>> play(server_rig & rig, const std::vector<hi
     return len;
 }
 
-// over generated histories: shapes stay stable, a sequence's depths follow from its own rounds alone (the same rounds
-// alone, or among other sequences' rounds, give the same lengths), and a slot's earlier request never reaches the next
-static bool test_histories(llama_model * model) {
-    int n_low = 0;
-    for (uint32_t seed = 0; seed < 6; ++seed) {
+// over generated histories: shapes stay stable, no round drafts fewer than n_min tokens, a sequence's depths follow from
+// its own rounds alone (the same rounds alone, or among other sequences' rounds, give the same lengths), and a slot's
+// earlier request never reaches the next
+static bool histories(llama_model * model, int n_max, int n_min, uint32_t n_seeds) {
+    const int n_low = std::min(std::max(1, n_min), n_max);
+    int n_low_rounds = 0;
+    for (uint32_t seed = 0; seed < n_seeds; ++seed) {
         std::mt19937 rng(100 + seed);
         const auto rounds = generate(rng, 5*WINDOW, {0, 1, 2});
 
         // all three sequences together
-        server_rig together(model, 0.18f);
+        server_rig together(model, 0.18f, n_max, n_min);
         std::vector<std::mt19937> draws = { std::mt19937(seed*3 + 0), std::mt19937(seed*3 + 1), std::mt19937(seed*3 + 2) };
         for (llama_seq_id s = 0; s < N_SEQ; ++s) together.request(s, rng, 6 + s);
         const auto len = play(together, rounds, draws);
 
         for (llama_seq_id s = 0; s < N_SEQ; ++s) {
-            n_low += (int) std::count(len[s].begin(), len[s].end(), 1);
-            if (!stable_shape(len[s])) {
-                fprintf(stderr, "seed %u seq %d: %s\n", seed, s, str(len[s]).c_str());
+            if (n_low < n_max) {
+                n_low_rounds += (int) std::count(len[s].begin(), len[s].end(), n_low);
+            }
+            if (std::any_of(len[s].begin(), len[s].end(), [&](int l) { return l < std::max(1, n_min); })) {
+                fprintf(stderr, "n_max %d n_min %d seed %u seq %d: %s\n", n_max, n_min, seed, s, str(len[s]).c_str());
+                return fail("a generated history drafted fewer than n_min tokens");
+            }
+            if (!stable_shape(len[s], true, n_max, n_low)) {
+                fprintf(stderr, "n_max %d n_min %d seed %u seq %d: %s\n", n_max, n_min, seed, s, str(len[s]).c_str());
                 return fail("a generated history changed a depth inside a window");
             }
             // the same sequence's rounds alone, after an earlier request of its own on the slot
@@ -501,7 +516,7 @@ static bool test_histories(llama_model * model) {
                 }
                 own.push_back(o);
             }
-            server_rig alone(model, 0.18f);
+            server_rig alone(model, 0.18f, n_max, n_min);
             std::vector<std::mt19937> earlier = { std::mt19937(99), std::mt19937(98), std::mt19937(97) };
             alone.request(s, rng, 5);
             std::vector<history_round> before = generate(rng, 3*WINDOW, {s});
@@ -513,13 +528,56 @@ static bool test_histories(llama_model * model) {
             std::vector<std::mt19937> draws_alone = { std::mt19937(seed*3 + 0), std::mt19937(seed*3 + 1), std::mt19937(seed*3 + 2) };
             const auto len_alone = play(alone, own, draws_alone);
             if (len_alone[s] != len[s]) {
-                fprintf(stderr, "seed %u seq %d: together %s, alone %s\n", seed, s, str(len[s]).c_str(), str(len_alone[s]).c_str());
+                fprintf(stderr, "n_max %d n_min %d seed %u seq %d: together %s, alone %s\n", n_max, n_min, seed, s, str(len[s]).c_str(), str(len_alone[s]).c_str());
                 return fail("a sequence's depths depend on other sequences or on the slot's earlier request");
             }
         }
     }
-    // the histories hold phases where nothing lands: some rounds must have drafted one token
-    if (n_low == 0) return fail("no generated history ever drafted one token");
+    // the histories hold phases where nothing lands: where a low depth exists, some rounds must have drafted it
+    if (n_low < n_max && n_low_rounds == 0) return fail("no generated history ever drafted the low depth");
+    return true;
+}
+
+static bool test_histories(llama_model * model) {
+    return histories(model, N_MAX, 0, 6);
+}
+
+// --spec-draft-n-min: three sequences in one batch, whose drafts all land, never land, or land up to n_min tokens and
+// none past. The full-depth one keeps n_max. The other two drop to n_min after the first window, with one full-depth
+// probe a window: the tokens past n_min never land, so they do not pay for their cost. No round drafts fewer than n_min
+// tokens or skips verification. At n_min = n_max every round drafts n_max. Then the same over generated histories, for
+// n_max up to 4
+static bool test_n_min(llama_model * model) {
+    struct config { int n_max, n_min; };
+    for (const config c : { config{2, 2}, config{3, 2}, config{4, 2}, config{4, 3}, config{4, 4}, config{3, 5} }) {
+        server_rig rig(model, 0.18f, c.n_max, c.n_min);
+        std::mt19937 rng(20 + 8*c.n_max + c.n_min);
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) rig.request(s, rng, 7 + 2*s);
+        const acceptance acc[N_SEQ] = { {1.0f, 1.0f}, {0.0f, 0.0f}, {1.0f, 1.0f, c.n_min} };
+        std::vector<int> len[N_SEQ];
+        for (int round = 0; round < 3*WINDOW; ++round) {
+            const auto l = rig.draft({0, 1, 2});
+            rig.verify(round % 2 ? std::vector<llama_seq_id>{2, 0, 1} : std::vector<llama_seq_id>{0, 1, 2});
+            for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+                len[s].push_back(l.at(s));
+                rig.accept(s, acc[s](l.at(s), rng), rng);
+            }
+        }
+        // n_min past n_max: no draft is ever long enough, with the flag or without it
+        const bool none = c.n_min > c.n_max;
+        const std::string full = none ? std::string(WINDOW, '0') : std::string(WINDOW, '0' + c.n_max);
+        const std::string low  = c.n_min >= c.n_max ? full : std::string(WINDOW - 1, '0' + c.n_min) + std::string(1, '0' + c.n_max);
+        bool ok = str(len[0]) == full + full + full;
+        ok = ok && str(len[1]) == full + low + low;
+        ok = ok && str(len[2]) == full + low + low;
+        if (!ok) {
+            fprintf(stderr, "n_max %d n_min %d: %s %s %s\n", c.n_max, c.n_min, str(len[0]).c_str(), str(len[1]).c_str(), str(len[2]).c_str());
+            return fail("with n_min, a sequence did not keep drafting at least n_min tokens at the depth its acceptance calls for");
+        }
+    }
+    for (const config c : { config{2, 2}, config{3, 2}, config{4, 2}, config{4, 3} }) {
+        if (!histories(model, c.n_max, c.n_min, 2)) return false;
+    }
     return true;
 }
 
@@ -596,6 +654,7 @@ int main(void) {
             { "adaptive",  test_adaptive  },
             { "replay",    test_replay    },
             { "histories", test_histories },
+            { "n-min",     test_n_min     },
             { "kept-row",  test_kept_row  },
         };
         for (const auto & t : tests) {

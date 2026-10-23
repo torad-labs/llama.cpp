@@ -1408,14 +1408,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
-// --spec-draft-mtp-adaptive: one sequence's MTP draft depth, 1 or n_max, from the acceptance of its own drafts in the
-// current request. It is decided once every `window` observed rounds and holds in between; a one-token window ends in
-// one full-depth probe, so the tokens past the first stay measured.
+// --spec-draft-mtp-adaptive: one sequence's MTP draft depth, low or n_max, from the acceptance of its own drafts in the
+// current request. low is max(1, n_min) up to n_max, so no round drafts fewer tokens than n_min. The depth is decided
+// once every `window` observed rounds and holds in between; a low-depth window ends in one full-depth probe, so the
+// tokens past low stay measured.
 struct common_mtp_depth {
     static constexpr int32_t window = 8;
     static constexpr float   keep   = 15.0f / 16.0f; // weight left to an observation after each later round
     static constexpr float   band   = 0.125f;        // hysteresis around the cost
 
+    int32_t low    = 1;
     int32_t depth  = 0;
     int32_t rounds = 0; // observed rounds in this request
 
@@ -1423,40 +1425,49 @@ struct common_mtp_depth {
     int32_t n_verified = 0; // target batches of the sequence since that draft (2: a checkpoint replay)
 
     // decayed sums and weights: the first draft token landed; the tokens past the first that landed in full-depth
-    // rounds whose first did. Both start as one round where every draft token landed
+    // rounds whose first did, all of them and those a low-depth draft holds. All start as one round where every draft
+    // token landed
     float first_sum = 0.0f, first_w = 0.0f;
     float extra_sum = 0.0f, extra_w = 0.0f;
+    float low_sum   = 0.0f;
 
-    void reset(int32_t n_max) {
+    void reset(int32_t n_max, int32_t n_min) {
         *this = {};
+        low       = std::max(1, std::min(n_min, n_max));
         depth     = n_max;
         first_sum = first_w = extra_w = 1.0f;
         extra_sum = (float) (n_max - 1);
+        low_sum   = (float) (low - 1);
     }
 
     int32_t n_draft(int32_t n_max) const {
-        return depth == 1 && rounds % window == window - 1 ? n_max : depth;
+        return depth == low && rounds % window == window - 1 ? n_max : depth;
     }
 
     void observe(int32_t n_max, float cost, int32_t n_accepted) {
         first_sum = keep*first_sum + (n_accepted > 0 ? 1.0f : 0.0f);
         first_w   = keep*first_w   + 1.0f;
         extra_sum *= keep;
+        low_sum   *= keep;
         extra_w   *= keep;
         if (n_drafted == n_max && n_accepted > 0) {
             extra_sum += (float) (n_accepted - 1);
+            low_sum   += (float) (std::min(n_accepted, low) - 1);
             extra_w   += 1.0f;
         }
         if (++rounds % window != 0) {
             return;
         }
-        // the tokens a round gains past the first, against a one-token round's, and what they cost
+        // the tokens a full-depth round gains past a low-depth round's, against that round's, and the time they add
+        // to it. At low = 1 this is p1*e/(1+p1) against (n_max-1)*cost
         const float p1   = first_sum / first_w;
-        const float gain = p1 * (extra_sum / extra_w) / (1.0f + p1);
-        const float cut  = (float) (n_max - 1) * cost;
+        const float e    = extra_sum / extra_w;
+        const float e_lo = low_sum / extra_w;
+        const float gain = p1 * (e - e_lo) / (1.0f + p1 * (1.0f + e_lo));
+        const float cut  = (float) (n_max - low) * cost / (1.0f + (float) (low - 1) * cost);
         if (depth == n_max && gain < cut * (1.0f - band)) {
-            depth = 1;
-        } else if (depth == 1 && gain > cut * (1.0f + band)) {
+            depth = low;
+        } else if (depth == low && gain > cut * (1.0f + band)) {
             depth = n_max;
         }
     }
@@ -1605,13 +1616,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         depth.assign(n_seq, {});
         for (auto & d : depth) {
-            d.reset(this->params.n_max);
+            d.reset(this->params.n_max, this->params.n_min);
         }
         n_draft_max.assign(n_seq, this->params.n_max);
         if (this->params.mtp_adaptive > 0.0f) {
-            SPC_TRC("- adaptive depth: 1 or %d tokens per sequence, cost %.3f\n", this->params.n_max, this->params.mtp_adaptive);
-            if (this->params.n_max < 2) {
-                SPC_WRN("--spec-draft-mtp-adaptive has no effect at n_max = %d\n", this->params.n_max);
+            const int32_t low = depth.empty() ? 1 : depth[0].low;
+            SPC_TRC("- adaptive depth: %d or %d tokens per sequence, cost %.3f\n", low, this->params.n_max, this->params.mtp_adaptive);
+            if (low >= this->params.n_max) {
+                SPC_WRN("--spec-draft-mtp-adaptive has no effect at n_max = %d, n_min = %d\n", this->params.n_max, this->params.n_min);
             }
         }
     }
@@ -1644,7 +1656,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             generating[seq_id] = 1;
-            depth[seq_id].reset(params.n_max);
+            depth[seq_id].reset(params.n_max, params.n_min);
         }
 
         auto * ctx_dft = this->params.ctx_dft;
@@ -2055,7 +2067,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void end(llama_seq_id seq_id) override {
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             generating[seq_id] = 0;
-            depth[seq_id].reset(params.n_max);
+            depth[seq_id].reset(params.n_max, params.n_min);
         }
     }
 
