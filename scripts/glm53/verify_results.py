@@ -68,9 +68,25 @@ def validate_routes(record):
         if len(rows) != 8 or len(hist) != 64 or any(type(v) is not int or v < 0 for v in counts + rows + hist):
             return False
         calls, pairs, unique, reused = counts
-        return (calls > 0 and sum(rows) == calls and sum(hist) == unique
+        has_work = calls > 0 and pairs > 0 and unique > 0
+        idle = calls == pairs == unique == reused == 0
+        return ((has_work or idle) and sum(rows) == calls and sum(hist) == unique
                 and sum((i+1)*v for i, v in enumerate(hist)) == pairs
                 and sum(hist[2:]) == reused)
+    except (KeyError, TypeError):
+        return False
+
+def validate_route_observations(records):
+    """Keep idle contexts, but require conserved work on both physical GPUs."""
+    active = set()
+    try:
+        for record in records:
+            device = record["device"]
+            if type(device) is not int or device not in (0, 1) or not validate_routes(record):
+                return False
+            if record["calls"] > 0:
+                active.add(device)
+        return active == {0, 1}
     except (KeyError, TypeError):
         return False
 

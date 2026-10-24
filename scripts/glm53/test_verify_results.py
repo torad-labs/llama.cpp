@@ -3,6 +3,7 @@ import copy
 import math
 import random
 import unittest
+import verify_results
 from verify_results import evaluate, validate_routes
 
 HASHES = {name: name + "-pinned" for name in ("english", "chinese", "code", "tools")}
@@ -66,6 +67,31 @@ class Goal(unittest.TestCase):
             for key in ("calls","pairs","unique","reused"):
                 wrong=copy.deepcopy(record); wrong[key]+=1
                 self.assertFalse(validate_routes(wrong))
+
+    def test_idle_contexts_preserve_required_device_observations(self):
+        idle = dict(calls=0, pairs=0, unique=0, reused=0, rows=[0]*8, multiplicity=[0]*64)
+        self.assertTrue(validate_routes(idle))
+        rng = random.Random(531)
+        for _ in range(128):
+            records = []
+            for device in (0, 1):
+                calls = rng.randint(1, 5)
+                records.append(dict(device=device, calls=calls, pairs=2*calls, unique=2*calls, reused=0,
+                                    rows=[calls] + [0]*7, multiplicity=[2*calls] + [0]*63))
+                records += [dict(copy.deepcopy(idle), device=device) for _ in range(rng.randint(1, 5))]
+            rng.shuffle(records)
+            original = copy.deepcopy(records)
+            self.assertTrue(verify_results.validate_route_observations(records))
+            self.assertEqual(records, original)
+            for missing in (0, 1):
+                no_work = [r for r in records if r['device'] != missing or r['calls'] == 0]
+                self.assertFalse(verify_results.validate_route_observations(no_work))
+            wrong = copy.deepcopy(records)
+            next(r for r in wrong if r['calls'] == 0)['pairs'] = 1
+            self.assertFalse(verify_results.validate_route_observations(wrong))
+            self.assertFalse(verify_results.validate_route_observations(records + [dict(idle, device=2)]))
+        self.assertFalse(verify_results.validate_route_observations([]))
+        self.assertFalse(verify_results.validate_route_observations([dict(idle, device=0), dict(idle, device=1)]))
 
 if __name__ == "__main__":
     unittest.main()

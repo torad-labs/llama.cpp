@@ -19,7 +19,7 @@ import time
 
 from qualification import (BASELINE_ARCHIVE, BASELINE_COMMIT, check_quality,
                            check_run_identity, device_cases, verify_files, validate_device_csv)
-from verify_results import evaluate, load_rows, validate_routes
+from verify_results import evaluate, load_rows, validate_route_observations
 
 
 def clean_env():
@@ -226,7 +226,7 @@ class Window:
         routes = [json.loads(line.split("GLM_ROUTE_STATS ", 1)[1])
                   for line in (self.out / "route-diagnostics/server.log").read_text().splitlines()
                   if "GLM_ROUTE_STATS " in line]
-        if not routes or not all(validate_routes(row) for row in routes) or {r["device"] for r in routes} != {0, 1}:
+        if not validate_route_observations(routes):
             raise ValueError("missing or inconsistent per-device route observations")
         write_json(self.out / "qualification.json", dict(passed=primary["passed"] and companion["passed"],
                                                          primary=primary, companion=companion, routes=routes))
