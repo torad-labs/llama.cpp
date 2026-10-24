@@ -6,7 +6,8 @@
 
 // Metadata belongs to the CUDA buffer, not tensor::extra (used by row split).
 // A view's data pointer remains a logical byte address into the same allocation.
-ggml_cuda_q8_layout ggml_cuda_q8_layout_of(const ggml_tensor * tensor);
+struct ggml_cuda_q8_tma_descriptor;
+ggml_cuda_q8_layout ggml_cuda_q8_layout_of(const ggml_tensor * tensor, const ggml_cuda_q8_tma_descriptor ** maps = nullptr);
 void ggml_cuda_q8_prepare_write(const ggml_tensor * tensor);
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -18,7 +19,6 @@ struct ggml_cuda_q8_tma_descriptor {
     uint32_t columns;
 };
 std::shared_ptr<ggml_cuda_q8_tma_descriptor> ggml_cuda_q8_tma_create(void * base, uint32_t columns, uint32_t rows);
-const ggml_cuda_q8_tma_descriptor * ggml_cuda_q8_tma_of(const ggml_tensor * tensor);
 #endif
 
 bool ggml_cuda_q8_tma(ggml_backend_cuda_context & ctx, const ggml_tensor * weight, const ggml_tensor * dst,
@@ -49,6 +49,7 @@ static __device__ __forceinline__ half ggml_cuda_q8_scale(
 // Endpoints without a layout are ordinary device pointers. No global scratch.
 void ggml_cuda_q8_copy_bytes(const void * src, ggml_cuda_q8_layout src_layout,
                            void * dst, ggml_cuda_q8_layout dst_layout, size_t size, cudaStream_t stream);
+void ggml_cuda_q8_memset_bytes(ggml_cuda_q8_layout layout, uint8_t value, size_t size, cudaStream_t stream);
 
 // True when the complete supported copy/conversion was submitted.
 bool ggml_cuda_q8_copy_tensor(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst);

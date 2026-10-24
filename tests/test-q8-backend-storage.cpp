@@ -2,6 +2,7 @@
 // Run once per physical GPU as well as on CPU; a missing requested device fails.
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -14,6 +15,74 @@ static void check(ggml_tensor * t, const std::vector<uint8_t> & expected) {
     std::vector<uint8_t> actual(expected.size());
     ggml_backend_tensor_get(t, actual.data(), 0, actual.size());
     GGML_ASSERT(actual == expected);
+}
+
+static ggml_backend_meta_split_state mirrored(const ggml_tensor *, void *) {
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+static void check_meta_fallback(ggml_backend_dev_t device) {
+    auto * cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_dev_t devices[] = {device, device};
+    auto * meta = ggml_backend_meta_device(devices, 2, mirrored, nullptr);
+    auto * backend = ggml_backend_dev_init(meta, nullptr);
+    for (const bool crossing : {false, true}) {
+        auto * wc = ggml_init({2*ggml_tensor_overhead(), nullptr, true});
+        auto * weight = ggml_new_tensor_2d(wc, GGML_TYPE_Q8_0, 256, 8);
+        auto * wb = ggml_backend_alloc_ctx_tensors(wc, backend);
+        GGML_ASSERT(wb);
+        ggml_backend_buffer_set_usage(wb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<uint8_t> codes(ggml_nbytes(weight));
+        for (int row = 0; row < 8; ++row) {
+            for (int block = 0; block < 8; ++block) {
+                const size_t offset = row*weight->nb[1] + block*34;
+                const ggml_fp16_t scale = ggml_fp32_to_fp16(1.0f);
+                memcpy(codes.data() + offset, &scale, 2);
+                std::fill_n(codes.data() + offset + 2, 32, uint8_t(row + 1));
+            }
+        }
+        ggml_backend_tensor_set(weight, codes.data(), 0, codes.size());
+        auto * ctx = ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        auto * x = crossing ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 3) :
+                              ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 3);
+        auto * ids = crossing ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 3);
+        auto * view = crossing ? ggml_view_2d(ctx, weight, 512, 4, 2*weight->nb[1], 0) : weight;
+        auto * out = crossing ? ggml_mul_mat(ctx, view, x) : ggml_mul_mat_id(ctx, view, x, ids);
+        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            GGML_ASSERT(!ggml_backend_supports_op(backend, out));
+        }
+        ggml_set_input(x);
+        if (ids) { ggml_set_input(ids); }
+        ggml_set_output(out);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        ggml_backend_t backends[] = {backend, cpu};
+        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+        std::vector<float> input(ggml_nelements(x));
+        for (int token = 0; token < 3; ++token) {
+            std::fill_n(input.data() + token*x->ne[0], x->ne[0], float(token + 1));
+        }
+        ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+        const int32_t zeros[3] = {};
+        if (ids) { ggml_backend_tensor_set(ids, zeros, 0, sizeof(zeros)); }
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+        std::vector<float> actual(ggml_nelements(out));
+        ggml_backend_tensor_get(out, actual.data(), 0, ggml_nbytes(out));
+        for (int token = 0; token < 3; ++token) {
+            for (int row = 0; row < out->ne[0]; ++row) {
+                const float expected = 256.0f*(token + 1)*(crossing ? 4*row + 3 : row + 1);
+                GGML_ASSERT(actual[token*out->ne[0] + row] == expected);
+            }
+        }
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(wb);
+        ggml_free(wc);
+    }
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    puts("2/2 meta packed reader fallbacks passed");
 }
 
 // BF16 activations select cuBLAS on CUDA but are not supported by the CPU
@@ -88,6 +157,10 @@ int main(int argc, char ** argv) {
     const char * name = argc > 1 ? argv[1] : "CPU";
     auto * device = ggml_backend_dev_by_name(name);
     if (!device) { fprintf(stderr, "required device %s missing\n", name); return 1; }
+    if (argc > 2 && strcmp(argv[2], "--meta") == 0) {
+        check_meta_fallback(device);
+        return 0;
+    }
     auto * backend = ggml_backend_dev_init(device, nullptr);
     GGML_ASSERT(backend);
     if (argc > 2 && strcmp(argv[2], "--cublas") == 0) {
@@ -99,8 +172,9 @@ int main(int argc, char ** argv) {
     for (int life = 0; life < 3; ++life) {
         for (const int k : {256, 1536, 4096, 8192, 16384}) {
             auto * ctx = ggml_init({4*ggml_tensor_overhead(), nullptr, true});
-            auto * src = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, 35);
-            auto * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, 35);
+            const int n_rows = k == 16384 ? 257 : 35;
+            auto * src = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, n_rows);
+            auto * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, n_rows);
             auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
             GGML_ASSERT(buffer);
             ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);

@@ -162,11 +162,12 @@ bool ggml_cuda_q8_tma(ggml_backend_cuda_context & ctx, const ggml_tensor * weigh
 #ifdef GGML_CUDA_Q8_TMA
     static const bool enabled = ggml_env_switch("GGML_CUDA_Q8_TMA");
     if (!enabled || ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_BLACKWELL ||
+            ggml_cuda_highest_compiled_arch(ggml_cuda_info().devices[ctx.device].cc) != GGML_CUDA_CC_BLACKWELL ||
         fusion.gate || fusion.gate_bias || fusion.x_scale || fusion.gate_scale ||
         weight->type != GGML_TYPE_Q8_0 || weight->ne[2] != 1 || weight->ne[3] != 1 ||
         dst->ne[1] < 1 || dst->ne[1] > 8 || dst->ne[2] != 1 || dst->ne[3] != 1 || dst->type != GGML_TYPE_F32) { return false; }
-    const auto layout = ggml_cuda_q8_layout_of(weight);
-    const auto * maps = ggml_cuda_q8_tma_of(weight);
+    const ggml_cuda_q8_tma_descriptor * maps = nullptr;
+    const auto layout = ggml_cuda_q8_layout_of(weight, &maps);
     const size_t row_bytes = layout.blocks_per_row.z * sizeof(block_q8_0);
     if (!maps || weight->ne[0] != maps->columns || weight->nb[1] != row_bytes || layout.offset % row_bytes) { return false; }
     static const int slots = [] {

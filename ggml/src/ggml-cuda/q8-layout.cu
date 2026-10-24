@@ -20,6 +20,21 @@ void ggml_cuda_q8_copy_bytes(const void * src, ggml_cuda_q8_layout sl,
     CUDA_CHECK(cudaGetLastError());
 }
 
+static __global__ void q8_memset_bytes(ggml_cuda_q8_layout layout, uint8_t value, size_t size) {
+    ggml_cuda_pdl_sync();
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < size; i += (size_t) gridDim.x*blockDim.x) {
+        layout.base[ggml_cuda_q8_physical_byte(layout, i)] = value;
+    }
+}
+
+void ggml_cuda_q8_memset_bytes(ggml_cuda_q8_layout layout, uint8_t value, size_t size, cudaStream_t stream) {
+    GGML_ASSERT(layout.base && layout.offset <= layout.bytes && size <= layout.bytes - layout.offset);
+    if (!size) { return; }
+    const unsigned blocks = (unsigned) std::min<size_t>((size + 255)/256, 65535);
+    q8_memset_bytes<<<blocks, 256, 0, stream>>>(layout, value, size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 struct q8_copy_shape {
     int64_t ne[4];
     size_t nb[4];

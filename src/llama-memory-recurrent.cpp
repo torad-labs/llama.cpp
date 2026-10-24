@@ -120,9 +120,14 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 
     if (state_arena) {
-        const uint32_t layers = (uint32_t) std::count_if(s_l.begin(), s_l.end(), [](const ggml_tensor * t) { return t != nullptr; });
-        for (ggml_tensor * s : s_l) {
-            if (s) { ggml_recurrent_arena_mark(s, mem_size, layers); }
+        std::map<ggml_backend_buffer_type_t, uint32_t> layers;
+        for (const auto & item : ctx_map) {
+            if (item.first.second >= 0) { ++layers[item.first.first]; }
+        }
+        for (const auto & item : ctx_map) {
+            if (item.first.second >= 0) {
+                ggml_recurrent_arena_mark(s_l[item.first.second], mem_size, layers.at(item.first.first));
+            }
         }
     }
 

@@ -824,7 +824,7 @@ static mmvq_moe_plan mmvq_moe_make_plan(ggml_type type, int64_t row_bytes, int n
             GGML_ABORT("GGML_CUDA_IQ3_SLOTS must be 2, 4, 6 or 8");
         }();
         for (int rpw : {2, 1}) {
-            if (!mmvq_moe_pairs_fits(type, nmat, rpw) ||
+            if ((4*rpw*row_bytes) % 16 || !mmvq_moe_pairs_fits(type, nmat, rpw) ||
                 (row_bytes/(int64_t)sizeof(block_iq3_xxs) + 3)/4 > mmvq_moe_iq3_nit(rpw)) { continue; }
             const int box = GGML_PAD(4 * rpw * row_bytes, 128);
             const int fit = (int) std::min<int64_t>((mmvq_moe_compact_dyn_max(nmat, rpw) - y_bytes)/(nmat*box), slots)/2*2;
@@ -868,10 +868,9 @@ bool ggml_cuda_mmvq_moe_usable(int cc, ggml_type type, const void * vx, const vo
     const int64_t       ts        = ggml_type_size(type);
     const int64_t       row_bytes = mmvq_moe_row_bytes(type, ncols_x);
     const mmvq_moe_plan p         = mmvq_moe_make_plan(type, row_bytes, vgate != nullptr ? 2 : 1);
-    // a tile is 8*rpw dense rows: 16-byte aligned wherever it starts when the rows are an even number of bytes, and the
-    // last tile of an expert when the expert is a whole number of 16-byte units. IQ3_XXS: a lane's k iterations (4
-    // blocks of a row each) fit its fragments
+    // Every full tile and the last tile of an expert must be 16-byte aligned for bulk copies.
     return ncols_x % ggml_blck_size(type) == 0 && stride_row_x*ts == row_bytes && row_bytes % 2 == 0 &&
+        (p.groups*p.rpw*row_bytes) % 16 == 0 &&
         (nrows_x*row_bytes) % 16 == 0 && (stride_channel_x*ts) % 16 == 0 &&
         (uintptr_t) vx % 16 == 0 && (uintptr_t) vgate % 16 == 0 &&
         ntokens >= 1 && ntokens <= MMVQ_MAX_BATCH_SIZE && n_used >= 1 && ntokens*n_used <= MMVQ_MOE_MAX_PAIRS &&

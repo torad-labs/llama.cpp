@@ -155,12 +155,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
 
-static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
-    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
-    return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
-        [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
-}
+static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op);
 
 static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
@@ -540,6 +535,35 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
     const std::vector<ggml_tensor *> * simple_tensors = buf_ctx->find_simple_tensors(tensor);
     return simple_tensors != nullptr ? (*simple_tensors)[index] : nullptr;
+}
+
+static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const auto * ctx = (const ggml_backend_meta_device_context *) dev->context;
+    for (size_t rank = 0; rank < ctx->simple_devs.size(); ++rank) {
+        const auto simple = [&](const ggml_tensor * tensor) -> const ggml_tensor * {
+            if (!tensor) { return nullptr; }
+            const ggml_tensor * root = tensor;
+            while (root->view_src) { root = root->view_src; }
+            auto * buffer = tensor->buffer ? tensor->buffer : root->buffer;
+            if (!buffer || !ggml_backend_buffer_is_meta(buffer)) { return tensor; }
+            const auto * storage = (const ggml_backend_meta_buffer_context *) buffer->context;
+            const auto * parts = storage->find_simple_tensors(tensor);
+            if (parts && rank < parts->size()) { return (*parts)[rank]; }
+            // Unallocated Q8 views have no per-rank byte geometry yet. Use canonical fallback until it is known.
+            if (root->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q8_0) { return nullptr; }
+            return tensor;
+        };
+        const auto * physical = simple(op);
+        if (!physical) { return false; }
+        ggml_tensor probe = *physical;
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            probe.src[i] = const_cast<ggml_tensor *>(simple(op->src[i]));
+            if (op->src[i] && !probe.src[i]) { return false; }
+        }
+        if (!ggml_backend_dev_supports_op(ctx->simple_devs[rank], &probe)) { return false; }
+    }
+    return true;
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {

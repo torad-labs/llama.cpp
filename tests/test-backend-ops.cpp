@@ -11770,6 +11770,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int overlap : {0, 1, 2}) {
             test_cases.emplace_back(new test_glm53_moe_routes(n, overlap, 4096, 1024));
             test_cases.emplace_back(new test_glm53_moe_routes(n, overlap, 512, 256));
+            test_cases.emplace_back(new test_glm53_moe_routes(n, overlap, 3840, 768));
         }
     }
     // and its routed experts at a prefill batch, where MMQ tiles each expert's columns: 64 experts with 8 used, so 64

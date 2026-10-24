@@ -887,6 +887,10 @@ struct ggml_backend_cuda_buffer_context {
     std::map<uintptr_t, q8_entry> q8_rows;
     std::unordered_set<uintptr_t> q8_written;
     std::mutex q8_mutex;
+    const uint64_t q8_id = [] { static std::atomic<uint64_t> next{1}; return next.fetch_add(1); }();
+    std::atomic<uint64_t> q8_revision{0};
+    std::atomic<bool> q8_present{false};
+    std::atomic<bool> q8_compute{false};
     int device;
     void * dev_ptr = nullptr;
     std::string name;
@@ -910,20 +914,45 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
-ggml_cuda_q8_layout ggml_cuda_q8_layout_of(const ggml_tensor * tensor) {
+ggml_cuda_q8_layout ggml_cuda_q8_layout_of(const ggml_tensor * tensor, const ggml_cuda_q8_tma_descriptor ** maps) {
+    if (maps) { *maps = nullptr; }
     if (tensor == nullptr || tensor->data == nullptr) { return {}; }
     const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     if (!buffer || !ggml_backend_buffer_is_cuda(buffer)) { return {}; }
     auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
-    std::lock_guard<std::mutex> lock(ctx->q8_mutex);
+    if (!ctx->q8_present.load(std::memory_order_acquire)) { return {}; }
+    struct cached_layout {
+        uint64_t owner = 0, revision = 0;
+        ggml_cuda_q8_layout layout = {};
+        const ggml_cuda_q8_tma_descriptor * maps = nullptr;
+    };
+    static thread_local cached_layout cache;
     const uintptr_t address = (uintptr_t) tensor->data;
+    const uint64_t revision = ctx->q8_revision.load(std::memory_order_acquire);
+    if (cache.owner == ctx->q8_id && cache.revision == revision && address >= (uintptr_t) cache.layout.base &&
+        address - (uintptr_t) cache.layout.base < cache.layout.bytes) {
+        auto layout = cache.layout;
+        layout.offset = address - (uintptr_t) layout.base;
+        GGML_ASSERT(ggml_nbytes(tensor) <= layout.bytes - layout.offset);
+        if (maps) { *maps = cache.maps; }
+        return layout;
+    }
+    std::lock_guard<std::mutex> lock(ctx->q8_mutex);
     auto it = ctx->q8_rows.upper_bound(address);
     if (it == ctx->q8_rows.begin()) { return {}; }
     --it;
     const size_t offset = address - it->first;
     if (offset >= it->second.bytes) { return {}; }
     GGML_ASSERT(ggml_nbytes(tensor) <= it->second.bytes - offset);
-    return {(char *) it->first, offset, it->second.bytes, init_fastdiv_values(it->second.blocks_per_row)};
+    cache.owner = ctx->q8_id;
+    cache.revision = ctx->q8_revision.load(std::memory_order_relaxed);
+    cache.layout = {(char *) it->first, offset, it->second.bytes, init_fastdiv_values(it->second.blocks_per_row)};
+    cache.maps = nullptr;
+#ifdef GGML_CUDA_Q8_TMA
+    cache.maps = it->second.tma.get();
+#endif
+    if (maps) { *maps = cache.maps; }
+    return cache.layout;
 }
 
 static void ggml_cuda_q8_register(ggml_backend_buffer_t buffer, const ggml_tensor * tensor) {
@@ -932,7 +961,13 @@ static void ggml_cuda_q8_register(ggml_backend_buffer_t buffer, const ggml_tenso
     // A write through a view chooses the root's representation, exactly once.
     // A tensor first written as canonical can never be reinterpreted in place.
     while (tensor->view_src) { tensor = tensor->view_src; }
+    if (tensor->type != GGML_TYPE_Q8_0) { return; }
     auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        ctx->q8_compute.store(true, std::memory_order_relaxed);
+        return;
+    }
+    if (ctx->q8_compute.load(std::memory_order_relaxed)) { return; }
     std::lock_guard<std::mutex> lock(ctx->q8_mutex);
     if (!ctx->q8_written.emplace((uintptr_t) tensor->data).second) { return; }
     if (tensor->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(tensor) ||
@@ -947,18 +982,9 @@ static void ggml_cuda_q8_register(ggml_backend_buffer_t buffer, const ggml_tenso
     }
 #endif
     ctx->q8_rows.emplace((uintptr_t) tensor->data, std::move(entry));
+    ctx->q8_revision.fetch_add(1, std::memory_order_release);
+    ctx->q8_present.store(true, std::memory_order_release);
 }
-
-#ifdef GGML_CUDA_Q8_TMA
-const ggml_cuda_q8_tma_descriptor * ggml_cuda_q8_tma_of(const ggml_tensor * tensor) {
-    const auto layout = ggml_cuda_q8_layout_of(tensor);
-    if (!layout.base) { return nullptr; }
-    const auto buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
-    std::lock_guard<std::mutex> lock(ctx->q8_mutex);
-    return ctx->q8_rows.at((uintptr_t) layout.base).tma.get();
-}
-#endif
 
 void ggml_cuda_q8_prepare_write(const ggml_tensor * tensor) {
     auto * root = tensor;
@@ -973,11 +999,13 @@ void ggml_cuda_q8_prepare_write(const ggml_tensor * tensor) {
 // A driver allocation failure uses one host row and no additional device memory.
 template<bool write>
 static void ggml_cuda_q8_transfer(ggml_backend_cuda_buffer_context & ctx, const ggml_tensor * tensor,
-                                  std::conditional_t<write, const void *, void *> host, size_t offset, size_t size, cudaStream_t stream) {
+                                  std::conditional_t<write, const void *, void *> host, size_t offset, size_t size, cudaStream_t stream,
+                                  size_t copies = 1, size_t tensor_stride = 0, size_t host_stride = 0) {
     auto layout = ggml_cuda_q8_layout_of(tensor);
     GGML_ASSERT(layout.base != nullptr && offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
+    if (size == 0 || copies == 0) { return; }
+    GGML_ASSERT(!tensor_stride || copies - 1 <= (ggml_nbytes(tensor) - offset - size)/tensor_stride);
     layout.offset += offset;
-    if (size == 0) { return; }
     static std::mutex transfer_mutex[GGML_CUDA_MAX_DEVICES];
     std::lock_guard<std::mutex> lock(transfer_mutex[ggml_cuda_get_physical_device(ctx.device)]);
     const size_t capacity = std::min<size_t>(size, 4*1024*1024);
@@ -988,37 +1016,41 @@ static void ggml_cuda_q8_transfer(ggml_backend_cuda_buffer_context & ctx, const 
         const size_t row_bytes = layout.blocks_per_row.z * sizeof(block_q8_0);
         const ggml_q8_0_split_layout row_layout{layout.blocks_per_row.z};
         std::vector<char> row(row_bytes);
-        for (size_t done = 0; done < size;) {
-            const size_t logical = layout.offset + done;
-            const size_t in_row = logical % row_bytes;
-            const size_t count = std::min(size - done, row_bytes - in_row);
-            char * device_row = layout.base + logical - in_row;
-            CUDA_CHECK(cudaMemcpyAsync(row.data(), device_row, row_bytes, cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            for (size_t i = 0; i < count; ++i) {
-                if constexpr (write) { row[row_layout.offset(in_row + i)] = ((const char *) host)[done + i]; }
-                else       { ((char *) host)[done + i] = row[row_layout.offset(in_row + i)]; }
-            }
-            if constexpr (write) {
-                CUDA_CHECK(cudaMemcpyAsync(device_row, row.data(), row_bytes, cudaMemcpyHostToDevice, stream));
+        for (size_t copy = 0; copy < copies; ++copy) {
+            for (size_t done = 0; done < size;) {
+                const size_t logical = layout.offset + copy*tensor_stride + done;
+                const size_t in_row = logical % row_bytes;
+                const size_t count = std::min(size - done, row_bytes - in_row);
+                char * device_row = layout.base + logical - in_row;
+                CUDA_CHECK(cudaMemcpyAsync(row.data(), device_row, row_bytes, cudaMemcpyDeviceToHost, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
+                for (size_t i = 0; i < count; ++i) {
+                    if constexpr (write) { row[row_layout.offset(in_row + i)] = ((const char *) host)[copy*host_stride + done + i]; }
+                    else       { ((char *) host)[copy*host_stride + done + i] = row[row_layout.offset(in_row + i)]; }
+                }
+                if constexpr (write) {
+                    CUDA_CHECK(cudaMemcpyAsync(device_row, row.data(), row_bytes, cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+                done += count;
             }
-            done += count;
         }
         return;
     }
-    for (size_t done = 0; done < size;) {
-        const size_t count = std::min(capacity, size - done);
-        auto chunk = layout;
-        chunk.offset += done;
-        if constexpr (write) {
-            CUDA_CHECK(cudaMemcpyAsync(scratch, (const char *) host + done, count, cudaMemcpyHostToDevice, stream));
-            ggml_cuda_q8_copy_bytes(scratch, {}, nullptr, chunk, count, stream);
-        } else {
-            ggml_cuda_q8_copy_bytes(nullptr, chunk, scratch, {}, count, stream);
-            CUDA_CHECK(cudaMemcpyAsync((char *) host + done, scratch, count, cudaMemcpyDeviceToHost, stream));
+    for (size_t copy = 0; copy < copies; ++copy) {
+        for (size_t done = 0; done < size;) {
+            const size_t count = std::min(capacity, size - done);
+            auto chunk = layout;
+            chunk.offset += copy*tensor_stride + done;
+            if constexpr (write) {
+                CUDA_CHECK(cudaMemcpyAsync(scratch, (const char *) host + copy*host_stride + done, count, cudaMemcpyHostToDevice, stream));
+                ggml_cuda_q8_copy_bytes(scratch, {}, nullptr, chunk, count, stream);
+            } else {
+                ggml_cuda_q8_copy_bytes(nullptr, chunk, scratch, {}, count, stream);
+                CUDA_CHECK(cudaMemcpyAsync((char *) host + copy*host_stride + done, scratch, count, cudaMemcpyDeviceToHost, stream));
+            }
+            done += count;
         }
-        done += count;
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(scratch));
@@ -1041,7 +1073,10 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     // never survive tensor initialization from an earlier graph/allocation.
     {
         std::lock_guard<std::mutex> lock(ctx->q8_mutex);
-        ctx->q8_rows.erase((uintptr_t) tensor->data);
+        if (ctx->q8_rows.erase((uintptr_t) tensor->data)) {
+            ctx->q8_revision.fetch_add(1, std::memory_order_release);
+            ctx->q8_present.store(!ctx->q8_rows.empty(), std::memory_order_release);
+        }
         ctx->q8_written.erase((uintptr_t) tensor->data);
     }
 
@@ -1063,13 +1098,11 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 
     ggml_cuda_set_device(ctx->device);
     ggml_cuda_q8_register(buffer, tensor);
-    if (ggml_cuda_q8_layout_of(tensor).base) {
-        std::vector<uint8_t> bytes(std::min<size_t>(size, 4*1024*1024), value);
-        for (size_t done = 0; done < size;) {
-            const size_t count = std::min(bytes.size(), size - done);
-            ggml_cuda_q8_transfer<true>(*ctx, tensor, bytes.data(), offset + done, count, cudaStreamPerThread);
-            done += count;
-        }
+    auto layout = ggml_cuda_q8_layout_of(tensor);
+    if (layout.base) {
+        layout.offset += offset;
+        ggml_cuda_q8_memset_bytes(layout, value, size, cudaStreamPerThread);
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return;
     }
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
@@ -1108,9 +1141,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_cuda_set_device(ctx->device);
     ggml_cuda_q8_register(buffer, tensor);
     if (ggml_cuda_q8_layout_of(tensor).base) {
-        for (size_t i = 0; i < n_copies; ++i) {
-            ggml_cuda_q8_transfer<true>(*ctx, tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size, cudaStreamPerThread);
-        }
+        ggml_cuda_q8_transfer<true>(*ctx, tensor, data, offset, size, cudaStreamPerThread, n_copies, stride_tensor, stride_data);
         return;
     }
     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -1124,9 +1155,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 
     ggml_cuda_set_device(ctx->device);
     if (ggml_cuda_q8_layout_of(tensor).base) {
-        for (size_t i = 0; i < n_copies; ++i) {
-            ggml_cuda_q8_transfer<false>(*ctx, tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size, cudaStreamPerThread);
-        }
+        ggml_cuda_q8_transfer<false>(*ctx, tensor, data, offset, size, cudaStreamPerThread, n_copies, stride_tensor, stride_data);
         return;
     }
     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -3754,9 +3783,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     if (ggml_cuda_q8_layout_of(tensor).base) {
         auto * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
         ggml_cuda_set_device(ctx->device);
-        for (size_t i = 0; i < n_copies; ++i) {
-            ggml_cuda_q8_transfer<true>(*ctx, tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size, cuda_ctx->stream());
-        }
+        ggml_cuda_q8_transfer<true>(*ctx, tensor, data, offset, size, cuda_ctx->stream(), n_copies, stride_tensor, stride_data);
         return;
     }
 
@@ -3773,9 +3800,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     if (ggml_cuda_q8_layout_of(tensor).base) {
         auto * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
         ggml_cuda_set_device(ctx->device);
-        for (size_t i = 0; i < n_copies; ++i) {
-            ggml_cuda_q8_transfer<false>(*ctx, tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size, cuda_ctx->stream());
-        }
+        ggml_cuda_q8_transfer<false>(*ctx, tensor, data, offset, size, cuda_ctx->stream(), n_copies, stride_tensor, stride_data);
         return;
     }
 
@@ -6893,10 +6918,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node == cuda_ctx->ar_hc_completed) {
-                    cuda_ctx->ar_hc_completed = nullptr;
-                    continue; // the preceding collective captured this consumer
-                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -6943,6 +6964,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 mmvq_shared_q8_1_seen          = i;
                 cuda_ctx->mmvq_shared_q8_1.head = nullptr;
+
+                if (node == cuda_ctx->ar_hc_completed) {
+                    cuda_ctx->ar_hc_completed = nullptr;
+                    continue; // the collective ran the consumer; host bookkeeping still applies
+                }
 
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;

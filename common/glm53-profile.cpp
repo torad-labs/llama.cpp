@@ -97,5 +97,5 @@ void common_glm53_profile_apply(common_params & params) {
         applied = resolved;
         applied_name = params.glm53_profile;
     }
-    params.sampling.backend_sampling = resolved.at("LLAMA_GLM53_TARGET_SAMPLING") == "1";
+    params.sampling.backend_sampling = params.sampling.backend_sampling || resolved.at("LLAMA_GLM53_TARGET_SAMPLING") == "1";
 }
