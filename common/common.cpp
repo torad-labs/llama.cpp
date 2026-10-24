@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "glm53-profile.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1549,6 +1550,7 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_glm53_profile_apply(params);
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();

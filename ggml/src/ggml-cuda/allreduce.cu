@@ -280,7 +280,16 @@ static __device__ __forceinline__ uint2 ggml_cuda_ar_ll_load(const uint2 * p) {
     return v;
 }
 
-template <typename T_dst, typename T_wire>
+struct ggml_cuda_ar_hc_post {
+    const float * residual = nullptr;
+    const float * post = nullptr;
+    const float * comb = nullptr;
+    float * dst = nullptr;
+    int width = 0;
+    int sr1 = 0, sr2 = 0, sp1 = 0, sc1 = 0, sc2 = 0, sd1 = 0, sd2 = 0;
+};
+
+template <typename T_dst, typename T_wire, bool HC_POST = false>
 static __global__ void ggml_cuda_ar_ll_kernel(
         const T_dst * sendbuf,
         T_dst       * recvbuf,
@@ -288,7 +297,8 @@ static __global__ void ggml_cuda_ar_ll_kernel(
         const uint2 * ll_other,      // where the peer's packets arrive, slot 0
         int           slot_packets,
         int           count,
-        int         * counter) {
+        int         * counter,
+        ggml_cuda_ar_hc_post hc = {}) {
     constexpr int W = 4 / sizeof(T_wire);
 
     const int tid = threadIdx.x;
@@ -333,7 +343,27 @@ static __global__ void ggml_cuda_ar_ll_kernel(
                 for (int k = 0; k < W; ++k) {
                     const int j = i * W + k;
                     if (j < count) {
-                        recvbuf[j] = ggml_cuda_ar_combine<T_dst, T_wire>(sendbuf[j], wire[k]);
+                        const T_dst reduced = ggml_cuda_ar_combine<T_dst, T_wire>(sendbuf[j], wire[k]);
+                        recvbuf[j] = reduced;
+                        if constexpr (HC_POST) {
+                            static_assert(std::is_same_v<T_dst, float>, "mHC consumes F32");
+                            const int row = j / hc.width;
+                            const int col = j % hc.width;
+                            float residual[4];
+#pragma unroll
+                            for (int s = 0; s < 4; ++s) {
+                                residual[s] = hc.residual[col + s*hc.sr1 + row*hc.sr2];
+                            }
+#pragma unroll
+                            for (int d = 0; d < 4; ++d) {
+                                float sum = __fmul_rn(reduced, hc.post[d + row*hc.sp1]);
+#pragma unroll
+                                for (int s = 0; s < 4; ++s) {
+                                    sum = __fmaf_rn(residual[s], hc.comb[d + s*hc.sc1 + row*hc.sc2], sum);
+                                }
+                                hc.dst[col + d*hc.sd1 + row*hc.sd2] = sum;
+                            }
+                        }
                     }
                 }
             }
@@ -1222,6 +1252,81 @@ static void ggml_cuda_ar_launch_kernels(
     }
 }
 
+// Fuse only inside a joined meta capture. A standalone subgraph executable
+// must never remember that a consumer was skipped by a preceding evaluation.
+// The LL packet format, polling, parity slots and final counter stay identical.
+static bool ggml_cuda_ar_try_hc_post(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends,
+                                    ggml_tensor ** tensors, bool bf16, bool copy_engine) {
+    static const bool enabled = ggml_env_switch("GGML_CUDA_AR_HC_POST");
+    if (!enabled || copy_engine || tensors[0]->type != GGML_TYPE_F32 || tensors[0]->ne[1] > 8 ||
+        tensors[0]->ne[2] != 1 || tensors[0]->ne[3] != 1) { return false; }
+    const int64_t count = ggml_nelements(tensors[0]);
+    const size_t wire_bytes = (size_t) count * (bf16 ? sizeof(nv_bfloat16) : sizeof(float));
+    const bool p2p = wire_bytes <= p->p2p_max_bytes;
+    if (wire_bytes > p->buf_bytes || (!p2p && wire_bytes > p->ll_max_bytes)) { return false; }
+    ggml_cuda_ar_hc_post args[2];
+    ggml_tensor * consumer[2] = {};
+    for (int rank = 0; rank < 2; ++rank) {
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[rank]->context);
+        const auto * graph = ctx->ar_graph_next;
+        if (!ctx->outer_capture || !graph || ctx->curr_stream_no != 0 ||
+            ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_BLACKWELL ||
+            !(tensors[rank]->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_is_contiguous(tensors[rank])) { return false; }
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            auto * n = graph->nodes[i];
+            if (n->op == GGML_OP_NONE || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE ||
+                n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) { continue; }
+            consumer[rank] = n;
+            break;
+        }
+        auto * node = consumer[rank];
+        if (!node || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            node->op != GGML_OP_DSV4_HC_POST || node->src[0] != tensors[rank] ||
+            node->ne[0] != tensors[rank]->ne[0] || node->ne[1] != 4 ||
+            node->ne[2] != tensors[rank]->ne[1] || node->ne[3] != 1) { return false; }
+        const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const uintptr_t ap = (uintptr_t) a->data, bp = (uintptr_t) b->data;
+            return ap < bp + ggml_nbytes(b) && bp < ap + ggml_nbytes(a);
+        };
+        for (auto * t : {node, node->src[1], node->src[2], node->src[3]}) {
+            if (!t || t->type != GGML_TYPE_F32 || !t->data || t->nb[0] != sizeof(float) ||
+                t->ne[3] != 1 || ggml_nbytes(t) > INT_MAX) { return false; }
+            for (int d = 1; d < 4; ++d) { if (t->nb[d] % sizeof(float)) { return false; } }
+        }
+        for (int s = 0; s < 4; ++s) {
+            if (overlaps(node, node->src[s])) { return false; }
+        }
+        const auto * r = node->src[1];
+        const auto * post = node->src[2];
+        const auto * comb = node->src[3];
+        args[rank] = {(const float *) r->data, (const float *) post->data, (const float *) comb->data,
+                      (float *) node->data, (int) node->ne[0],
+                      (int) (r->nb[1]/4), (int) (r->nb[2]/4), (int) (post->nb[1]/4),
+                      (int) (comb->nb[1]/4), (int) (comb->nb[2]/4), (int) (node->nb[1]/4), (int) (node->nb[2]/4)};
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[rank]->context);
+        ggml_cuda_set_device(ctx->device);
+        auto * mine = p2p ? p->p2p[1-rank].dev : reinterpret_cast<uint2 *>(p->ll_buf[rank].dev);
+        const auto * other = p2p ? p->p2p[rank].dev : reinterpret_cast<const uint2 *>(p->ll_buf[1-rank].dev);
+        const int slots = (int) (p2p ? ggml_cuda_ar_p2p_slot_packets(p) : ggml_cuda_ar_ll_slot_packets(p));
+        auto * data = (float *) tensors[rank]->data;
+        if (bf16) {
+            ggml_cuda_ar_ll_kernel<float, nv_bfloat16, true><<<1, GGML_CUDA_AR_LL_THREADS, 0, ctx->stream()>>>(
+                data, data, mine, other, slots, (int) count, p->counter[rank], args[rank]);
+        } else {
+            ggml_cuda_ar_ll_kernel<float, float, true><<<1, GGML_CUDA_AR_LL_THREADS, 0, ctx->stream()>>>(
+                data, data, mine, other, slots, (int) count, p->counter[rank], args[rank]);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        ctx->ar_hc_completed = consumer[rank];
+        ctx->ar_hc_graph = ctx->ar_graph_next;
+    }
+    GGML_LOG_DEBUG("%s: captured LL collective + HC_POST, %lld values, %s wire, %s inbox\n", __func__,
+                   (long long) count, bf16 ? "bf16" : "f32", p2p ? "peer" : "host");
+    return true;
+}
+
 bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -1247,6 +1352,8 @@ bool ggml_cuda_ar_allreduce(
     GGML_ASSERT(p->buf_bytes >= type_size);
     const size_t    nbytes          = route.nbytes;
     const bool      use_copy_engine = route.use_copy_engine;
+
+    if (ggml_cuda_ar_try_hc_post(p, backends, tensors, use_bf16, use_copy_engine)) { return true; }
 
     // The copy-engine path syncs the host on its events, which no CUDA graph
     // can hold (ggml_cuda_ar_capturable).

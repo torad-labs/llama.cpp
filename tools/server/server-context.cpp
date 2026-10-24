@@ -4485,6 +4485,7 @@ private:
                 common_sampler_ptr smpl_save(may_restore ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                slot.stats.record_draft_verification(slot.spec_i_batch.size(), slot.spec_is_replay);
                 for (const auto idx : slot.spec_i_batch) {
                     pull_eval(slot, (int) idx);
                 }
@@ -4602,6 +4603,7 @@ private:
                 }
 
                 slot.stats.n_gen += 1;
+                slot.stats.n_draft_delivered += 1;
 
                 if (i < lens_rows.size()) {
                     lens_write(slot, ids[i], lens_rows[i], pos_first + (int) i);

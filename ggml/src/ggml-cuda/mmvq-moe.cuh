@@ -47,6 +47,7 @@ struct ggml_cuda_mmvq_moe_args {
                                   // triggers the next only past its dependency wait): the experts listed and the block's
                                   // first tiles issued before this one's
     unsigned int *     l2_issue_stop; // bumped as the launch's reads start (ggml_cuda_l2_issue_stop), or nullptr
+    unsigned long long * route_stats; // optional diagnostic counters, owned by the CUDA context
 };
 
 // Whether ggml_cuda_mmvq_moe takes these weights: an NVIDIA GPU from Hopper on (cp.async.bulk), a type and token count

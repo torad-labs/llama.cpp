@@ -9,6 +9,7 @@
 #include "json.h"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cinttypes>
@@ -363,6 +364,19 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
+    uint64_t n_draft_delivered = 0; // only outputs actually processed by the speculative loop
+    uint64_t n_draft_verif_attempts = 0; // includes work discarded by checkpoint restore
+    uint64_t n_draft_verif_rows = 0;
+    uint64_t n_draft_replay_attempts = 0;
+    std::array<uint64_t, 9> draft_verify_rows = {}; // widths 1..8, then >8
+
+    void record_draft_verification(size_t rows, bool replay) {
+        GGML_ASSERT(rows > 0);
+        n_draft_verif_attempts++;
+        n_draft_verif_rows += rows;
+        n_draft_replay_attempts += replay;
+        draft_verify_rows[std::min<size_t>(rows, draft_verify_rows.size()) - 1]++;
+    }
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set

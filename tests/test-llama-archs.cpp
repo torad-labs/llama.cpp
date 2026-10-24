@@ -807,6 +807,105 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
     return true;
 }
 
+// A speculative prefix must have the same recurrent state and continuation as
+// a context that never evaluated the rejected suffix. Exercise generated rounds
+// at every verification width, including zero/all draft acceptance, IndexPool
+// boundaries, cancellation with a pending restore, and reuse of three slots.
+static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(4));
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::mt19937 rng(seed);
+    for (const bool unified : {false, true}) {
+        auto params = llama_context_default_params();
+        params.n_ctx = 2048;
+        params.n_seq_max = 3;
+        params.n_rs_seq = 8;
+        params.n_batch = 512;
+        params.n_ubatch = 64;
+        params.n_threads = params.n_threads_batch = 4;
+        params.kv_unified = unified;
+        llama_context_ptr actual(llama_init_from_model(model, params));
+        llama_context_ptr reference(llama_init_from_model(model, params));
+        if (!actual || !reference) return false;
+        std::vector<llama_pos> positions(3, 0);
+        const auto decode = [&](llama_context * ctx, int seq, int pos, const std::vector<llama_token> & input, int n) {
+            llama_batch batch = llama_batch_init(n, 0, 1);
+            for (int i = 0; i < n; ++i) common_batch_add(batch, input[i], pos + i, {seq}, i == n-1);
+            const int status = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+            return status == 0;
+        };
+        const auto state = [](llama_context * ctx, int seq) {
+            constexpr auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            std::vector<uint8_t> bytes(llama_state_seq_get_size_ext(ctx, seq, flags));
+            const size_t n = llama_state_seq_get_data_ext(ctx, bytes.data(), bytes.size(), seq, flags);
+            bytes.resize(n);
+            return bytes;
+        };
+        const auto states_match = [&](int seq) {
+            const auto a = state(actual.get(), seq), b = state(reference.get(), seq);
+            if (a.empty() || a.size() != b.size() || a.size()%sizeof(float)) return false;
+            for (size_t i = 0; i < a.size(); i += sizeof(float)) {
+                if (!memcmp(a.data()+i, b.data()+i, sizeof(float))) continue;
+                float x, y;
+                memcpy(&x, a.data()+i, sizeof(float)); memcpy(&y, b.data()+i, sizeof(float));
+                if (!(std::fabs(x-y) <= 1e-6f)) return false;
+            }
+            return true;
+        };
+        const auto random_tokens = [&](int n) {
+            std::vector<llama_token> out(n);
+            for (auto & t : out) t = (llama_token)(rng()%vocab);
+            return out;
+        };
+        for (int seq = 0; seq < 3; ++seq) {
+            const auto input = random_tokens(253 + seq);
+            if (!decode(actual.get(), seq, 0, input, input.size()) ||
+                !decode(reference.get(), seq, 0, input, input.size())) return false;
+            positions[seq] = input.size();
+        }
+        for (int width = 1; width <= 8; ++width) {
+            for (int keep = 1; keep <= width; ++keep) {
+                const int seq = (width + keep)%3;
+                const int pos = positions[seq];
+                const auto input = random_tokens(width);
+                if (!decode(actual.get(), seq, pos, input, width) ||
+                    !decode(reference.get(), seq, pos, input, keep)) return false;
+                if (keep < width && !llama_memory_seq_rm(llama_get_memory(actual.get()), seq, pos+keep, -1)) return false;
+                if (!states_match(seq)) {
+                    LOG_ERR("GLM generated prefix: unified=%d seq=%d width=%d keep=%d state mismatch\n", unified, seq, width, keep);
+                    return false;
+                }
+                positions[seq] += keep;
+                if (keep < width && width%3 == 0 && keep == 1) {
+                    // Cancel before consuming the selected snapshot, then reuse
+                    // the sequence ID with a different history.
+                    if (!llama_memory_seq_rm(llama_get_memory(actual.get()), seq, -1, -1) ||
+                        !llama_memory_seq_rm(llama_get_memory(reference.get()), seq, -1, -1)) return false;
+                    positions[seq] = 0;
+                }
+                const auto correction = random_tokens(3);
+                if (!decode(actual.get(), seq, positions[seq], correction, correction.size()) ||
+                    !decode(reference.get(), seq, positions[seq], correction, correction.size())) return false;
+                positions[seq] += correction.size();
+                const float * a = llama_get_logits_ith(actual.get(), correction.size()-1);
+                const float * b = llama_get_logits_ith(reference.get(), correction.size()-1);
+                if (!a || !b) return false;
+                for (int token = 0; token < vocab; ++token) {
+                    if (!(std::fabs(a[token]-b[token]) <= 1e-4f)) return false;
+                }
+                for (int s = 0; s < 3; ++s) if (!states_match(s)) return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1128,6 +1227,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                                 !test_draft_vocab(arch, seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL MTP vocab\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_generated_prefixes(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            throw std::runtime_error("GLM generated speculative prefixes failed");
                         }
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_short_dense(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;

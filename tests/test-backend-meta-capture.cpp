@@ -45,6 +45,7 @@ static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, v
 
 struct log_counts {
     int executables  = 0; // ggml_backend_cuda_capture_end made one
+    int hc_fused = 0;
     int not_captured = 0; // the meta backend refused a capture
     size_t p2p_bytes = 0;
     bool p2p_reported = false;
@@ -54,6 +55,7 @@ struct log_counts {
 
 static void log_cb(ggml_log_level level, const char * text, void * user_data) {
     log_counts * counts = (log_counts *) user_data;
+    if (strstr(text, "captured LL collective + HC_POST") != nullptr) { counts->hc_fused++; }
     if (strstr(text, "ggml_backend_cuda_capture_end") != nullptr && strstr(text, " nodes, ") != nullptr) {
         counts->executables++;
     }
@@ -79,10 +81,13 @@ struct ffn_graph {
     ggml_cgraph  * gf  = nullptr;
     ggml_tensor  * x   = nullptr;
     ggml_tensor  * out = nullptr;
+    ggml_tensor  * residual = nullptr;
+    ggml_tensor  * post = nullptr;
+    ggml_tensor  * comb = nullptr;
 
     ffn_graph(const std::vector<ggml_tensor *> & up, const std::vector<ggml_tensor *> & down, int64_t n_tok) {
         const ggml_init_params params = {
-            /*.mem_size   =*/ (4*n_layer + 2)*ggml_tensor_overhead() + ggml_graph_overhead(),
+            /*.mem_size   =*/ (4*n_layer + 8)*ggml_tensor_overhead() + ggml_graph_overhead(),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -93,7 +98,15 @@ struct ffn_graph {
         for (int il = 0; il < n_layer; il++) {
             ggml_tensor * h = ggml_mul_mat(ctx, up[il], cur);
             ggml_tensor * y = ggml_mul_mat(ctx, down[il], h);
-            cur = ggml_add(ctx, y, cur);
+            if (il == n_layer - 1 && ggml_env_switch("TEST_GLM_HC")) {
+                residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tok);
+                post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_tok);
+                comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, n_tok);
+                for (auto * input : {residual, post, comb}) { ggml_set_input(input); }
+                cur = ggml_dsv4_hc_post(ctx, y, residual, post, comb);
+            } else {
+                cur = ggml_add(ctx, y, cur);
+            }
         }
         out = cur;
         ggml_set_output(out);
@@ -143,6 +156,12 @@ struct ffn_weights {
 
 static std::vector<float> compute(ggml_backend_sched_t sched, ffn_graph & g, const std::vector<float> & x) {
     ggml_backend_tensor_set(g.x, x.data(), 0, ggml_nbytes(g.x));
+    for (auto * input : {g.residual, g.post, g.comb}) {
+        if (!input) { continue; }
+        std::vector<float> data(ggml_nelements(input));
+        for (size_t i = 0; i < data.size(); ++i) { data[i] = 0.1f + 0.25f*x[(17*i + 5)%x.size()]; }
+        ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+    }
     GGML_ASSERT(ggml_backend_sched_graph_compute(sched, g.gf) == GGML_STATUS_SUCCESS);
     std::vector<float> out(ggml_nelements(g.out));
     ggml_backend_tensor_get(g.out, out.data(), 0, ggml_nbytes(g.out));
@@ -201,8 +220,8 @@ int main() {
     ffn_weights w_cpu(ggml_backend_get_default_buffer_type(cpu), w_data);
 
     // each graph is allocated once by a scheduler of its own, as llama.cpp's graph slots are
-    constexpr int     n_graphs        = 5;
-    constexpr int64_t n_tok[n_graphs] = {1, 2, 3, 4, 40};
+    constexpr int     n_graphs        = 6;
+    constexpr int64_t n_tok[n_graphs] = {1, 2, 3, 4, 8, 40};
     std::vector<std::unique_ptr<ffn_graph>> graphs;
     std::vector<std::unique_ptr<ffn_graph>> graphs_cpu;
     std::vector<ggml_backend_sched_t>       scheds;
@@ -251,6 +270,10 @@ int main() {
     printf("%s %d executables made (%d expected), %d graphs not captured\n", ok_captures ? "ok  " : "FAIL",
         counts.executables, executables, counts.not_captured);
     ok = ok && ok_captures;
+    if (ggml_env_switch("TEST_GLM_HC") && ggml_env_switch("GGML_CUDA_AR_HC_POST") && !legacy) {
+        printf("%s %d collective HC consumers captured\n", counts.hc_fused > 0 ? "ok" : "FAIL", counts.hc_fused);
+        ok = ok && counts.hc_fused > 0;
+    }
 
     const char * ar = getenv("GGML_CUDA_ALLREDUCE");
     if (ar != nullptr && strcmp(ar, "internal") == 0 && strncmp(ggml_backend_dev_name(gpus[0]), "CUDA", 4) == 0) {

@@ -1,6 +1,37 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include "q8-layout.cuh"
+
+template<typename T>
+static __global__ void k_get_rows_q8_split(ggml_cuda_q8_layout layout, const int32_t * ids, T * dst,
+        int64_t cols, int64_t rows, int64_t batches, int64_t outer,
+        size_t wb1, size_t wb2, size_t wb3, size_t is0, size_t is1, size_t is2,
+        size_t os1, size_t os2, size_t os3) {
+    ggml_cuda_pdl_sync();
+    const int64_t count = cols * rows * batches * outer;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t c = i % cols, r = i / cols % rows;
+        const int64_t b = i / (cols * rows) % batches, o = i / (cols * rows * batches);
+        const int32_t row = ids[r*is0 + b*is1 + o*is2];
+        const uint32_t block = (row*wb1 + b*wb2 + o*wb3) / sizeof(block_q8_0) + c/QK8_0;
+        const float value = float(ggml_cuda_q8_scale(layout, block)) * ggml_cuda_q8_codes(layout, block)[c % QK8_0];
+        dst[c + r*os1 + b*os2 + o*os3] = ggml_cuda_cast<T>(value);
+    }
+}
+
+template<typename T>
+static void get_rows_q8_split(const ggml_tensor * w, const ggml_tensor * ids, ggml_tensor * dst, cudaStream_t stream) {
+    const int64_t n = ggml_nelements(dst);
+    if (n == 0) { return; }
+    const auto layout = ggml_cuda_q8_layout_of(w);
+    GGML_ASSERT(layout.offset % sizeof(block_q8_0) == 0);
+    k_get_rows_q8_split<<<(unsigned) std::min<int64_t>((n + 255)/256, 65535), 256, 0, stream>>>(
+        layout, (const int32_t *) ids->data, (T *) dst->data, w->ne[0], ids->ne[0], ids->ne[1], ids->ne[2],
+        w->nb[1], w->nb[2], w->nb[3], ids->nb[0]/4, ids->nb[1]/4, ids->nb[2]/4,
+        dst->nb[1]/sizeof(T), dst->nb[2]/sizeof(T), dst->nb[3]/sizeof(T));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -452,6 +483,16 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src1 = dst->src[1];
 
     cudaStream_t stream = ctx.stream();
+
+    if (ggml_cuda_q8_layout_of(src0).base) {
+        switch (dst->type) {
+            case GGML_TYPE_F32:  get_rows_q8_split<float>(src0, src1, dst, stream); break;
+            case GGML_TYPE_F16:  get_rows_q8_split<half>(src0, src1, dst, stream); break;
+            case GGML_TYPE_BF16: get_rows_q8_split<nv_bfloat16>(src0, src1, dst, stream); break;
+            default: GGML_ABORT("unsupported Q8 split gather output");
+        }
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

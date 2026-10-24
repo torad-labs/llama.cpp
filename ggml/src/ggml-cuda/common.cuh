@@ -1636,6 +1636,20 @@ struct ggml_cuda_hc_front_tickets {
     }
 };
 
+// Optional diagnostic counters, stable across captures. Disabled in throughput
+// runs: one producer CTA records actual route multiplicity per expert operation.
+struct ggml_cuda_route_stats {
+    static constexpr int size = 76; // calls, pairs, unique, reused; rows[8]; multiplicity[64]
+    unsigned long long * ptr = nullptr;
+    void ensure() {
+        static const bool enabled = ggml_env_switch("GGML_CUDA_ROUTE_STATS");
+        if (enabled && ptr == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ptr, size*sizeof(*ptr)));
+            CUDA_CHECK(cudaMemset(ptr, 0, size*sizeof(*ptr)));
+        }
+    }
+};
+
 // The word a launch that keeps DRAM busy bumps as its reads start (the routed experts' ring, mmvq-moe.cu), and the paced
 // L2 issuer beside the stream watches: past a change it requests no more (ggml_cuda_l2_issue), where it would take DRAM
 // from that launch for bytes a later kernel reads. Only its changes mean anything. Made before a graph evaluation, never
@@ -2178,12 +2192,16 @@ struct ggml_backend_cuda_context {
     const ggml_tensor * mmvq_moe_ids[GGML_CUDA_MAX_STREAMS] = {};
     ggml_cuda_ssm_conv_ab_slots ssm_conv_ab_slots;
     ggml_cuda_hc_front_tickets hc_front_tickets;
+    ggml_cuda_route_stats route_stats;
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
     ggml_cuda_l2_issue_stop l2_issue_stop;
     bool        l2_persisting = false;   // a launch was given a persisting L2 window (ggml_cuda_l2_persist_window)
     const ggml_cgraph * l2_graph_next = nullptr; // the graph after the next computed, while it computes (ggml_backend_graph_next)
+    const ggml_cgraph * ar_graph_next = nullptr; // retained through the intervening collective
+    const ggml_cgraph * ar_hc_graph = nullptr;
+    const ggml_tensor * ar_hc_completed = nullptr; // consumed once, only during an outer capture
     // the stream is being captured with the rest of an evaluation across backends (ggml_backend_cuda_capture_begin):
     // the graphs computed meanwhile are evaluated into it, with no CUDA graph of their own
     bool outer_capture = false;
@@ -2251,6 +2269,13 @@ struct ggml_backend_cuda_context {
     }
 };
 
+struct ggml_cuda_q8_layout {
+    char * base = nullptr;
+    size_t offset = 0;
+    size_t bytes = 0;
+    uint3 blocks_per_row = {};
+};
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -2271,6 +2296,8 @@ struct ggml_cuda_mm_fusion_args_device {
     float glu_limit = 0.0f;
     bool  rms_norm = false;
     float rms_norm_eps = 0.0f;
+    ggml_cuda_q8_layout q8_layout;
+    ggml_cuda_q8_layout gate_q8_layout;
 };
 
 struct ggml_cuda_kernel_launch_params {

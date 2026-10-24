@@ -79,9 +79,19 @@ json server_slot_stats::to_json() const {
         {"predicted_per_second",   n_gen_tps()},
     };
 
-    if (n_draft_tokens > 0) {
+    if (n_draft_tokens > 0 || n_draft_verif_attempts > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
+        base["draft_rounds"] = n_draft_verif_steps;
+        base["draft_delivered_n"] = n_draft_delivered;
+        base["draft_delivered_per_round"] = n_draft_verif_attempts ?
+            double(n_draft_delivered)/n_draft_verif_attempts : 0.0;
+        base["draft_verify_attempts"] = n_draft_verif_attempts;
+        base["draft_verify_rows_total"] = n_draft_verif_rows;
+        base["draft_replay_attempts"] = n_draft_replay_attempts;
+        for (size_t i = 0; i < draft_verify_rows.size(); ++i) {
+            base["draft_verify_rows"][i < 8 ? std::to_string(i+1) : ">8"] = draft_verify_rows[i];
+        }
     }
 
     return base;

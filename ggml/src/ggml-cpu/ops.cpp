@@ -509,7 +509,9 @@ static void ggml_compute_forward_dup_from_q(
               ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
+    // DUP/CONT (including ggml_cast) have no second operand. CPY's second
+    // operand describes the same destination layout; use dst for every route.
+    const ggml_tensor * src1 = dst;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
