@@ -56,7 +56,6 @@ std::map<std::string, std::string> common_glm53_profile_resolve(
     }
     // Turning a prerequisite off also turns its implicit dependants off. An explicitly contradictory request fails before changing the environment.
     for (const auto & pair : {std::pair<const char *, const char *>{"GGML_CUDA_Q8_TMA", "GGML_CUDA_Q8_SPLIT"},
-                             {"GGML_CUDA_GDN_STATE_PERSIST", "GGML_CUDA_GDN_STATE_ARENA"},
                              {"GGML_CUDA_HC_CTA_PUBLISH", "GGML_CUDA_HC_FRONT_ONE"}}) {
         if (out.at(pair.second) == "0") {
             if (overrides.count(pair.first) && out.at(pair.first) == "1") {
@@ -90,7 +89,7 @@ void common_glm53_profile_apply(common_params & params) {
     }
     resolved = common_glm53_profile_resolve(params.glm53_profile, overrides);
     if (const char * warps = getenv("GGML_CUDA_MMVQ_Q8_SM120_WARPS")) {
-        if (*warps) { throw std::invalid_argument("GLM lossless profiles preserve the logical Q8 reduction; remove the WARPS override"); }
+        if (*warps && std::string(warps) != "0") { throw std::invalid_argument("GLM lossless profiles preserve the logical Q8 reduction; remove the WARPS override"); }
     }
     if (params.cache_type_s != GGML_TYPE_F32) {
         throw std::invalid_argument("GLM same-pack profiles require F32 recurrent state");

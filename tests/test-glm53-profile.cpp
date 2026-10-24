@@ -71,14 +71,55 @@ static int check_spellings() {
     return 0;
 }
 
+static int check_persistence() {
+    for (const std::string profile : {"canonical", "sm120-balanced", "sm120-wide", "sm120-direct"}) {
+        for (const char * arena : {"0", "1"}) {
+            for (const char * persist : {"0", "1"}) {
+                const auto resolved = common_glm53_profile_resolve(profile, {
+                    {"GGML_CUDA_GDN_STATE_ARENA", arena}, {"GGML_CUDA_GDN_STATE_PERSIST", persist}});
+                if (resolved.at("GGML_CUDA_GDN_STATE_ARENA") != arena ||
+                    resolved.at("GGML_CUDA_GDN_STATE_PERSIST") != persist) { return 19; }
+            }
+        }
+    }
+    set_env("GGML_CUDA_GDN_STATE_ARENA", "0");
+    set_env("GGML_CUDA_GDN_STATE_PERSIST", "1");
+    common_params params;
+    if (!parse_server({"test", "--model", "profile-test.gguf", "--glm53-profile", "canonical"}, params)) { return 20; }
+    common_glm53_profile_apply(params);
+    if (std::string(getenv("GGML_CUDA_GDN_STATE_ARENA")) != "0" ||
+        std::string(getenv("GGML_CUDA_GDN_STATE_PERSIST")) != "1") { return 21; }
+    puts("existing non-arena persistence remains available with every profile");
+    return 0;
+}
+
+static int check_warps() {
+    for (const char * value : {"1", "2", "4", "8", "0", ""}) {
+        set_env("GGML_CUDA_MMVQ_Q8_SM120_WARPS", value);
+        common_params params;
+        if (!parse_server({"test", "--model", "profile-test.gguf", "--glm53-profile", "canonical"}, params)) { return 22; }
+        bool rejected = false;
+        try { common_glm53_profile_apply(params); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        const bool changes_reduction = value[0] != '\0' && value[0] != '0';
+        if (rejected != changes_reduction) {
+            fprintf(stderr, "WARPS=%s: rejected=%d, expected=%d\n", value, rejected, changes_reduction);
+            return 23;
+        }
+    }
+    puts("default warp scheduling is accepted; reduction overrides are rejected");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc > 1 && strcmp(argv[1], "--router") == 0) { return check_router(); }
     if (argc > 1 && strcmp(argv[1], "--spellings") == 0) { return check_spellings(); }
+    if (argc > 1 && strcmp(argv[1], "--persistence") == 0) { return check_persistence(); }
+    if (argc > 1 && strcmp(argv[1], "--warps") == 0) { return check_warps(); }
     // Every combination must either resolve to a compatible bundle or reject
     // an explicit contradiction. No partial environment application is needed.
     for (const std::string profile : {"canonical", "sm120-balanced", "sm120-wide", "sm120-direct"}) {
         for (const auto & pair : {std::pair<const char *, const char *>{"GGML_CUDA_Q8_TMA", "GGML_CUDA_Q8_SPLIT"},
-                                 {"GGML_CUDA_GDN_STATE_PERSIST", "GGML_CUDA_GDN_STATE_ARENA"},
                                  {"GGML_CUDA_HC_CTA_PUBLISH", "GGML_CUDA_HC_FRONT_ONE"}}) {
             const auto off = common_glm53_profile_resolve(profile, {{pair.second, "0"}});
             if (off.at(pair.first) != "0") { return 4; }
