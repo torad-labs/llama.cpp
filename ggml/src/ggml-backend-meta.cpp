@@ -1952,6 +1952,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_allreduce_next_t   comm_allreduce_next = nullptr;
     ggml_backend_comm_allgather_tensor_t comm_allgather = nullptr; // null: the generic gather
     std::vector<bool>                    gathers; // a subgraph ends with a gather (ggml_backend_meta_is_gather)
     ggml_backend_graph_next_t            graph_next     = nullptr; // the simple backends' look ahead, or null
@@ -2171,6 +2172,8 @@ struct ggml_backend_meta_context {
             GGML_ASSERT(comm_allreduce != nullptr);
 
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            comm_allreduce_next = (ggml_backend_comm_allreduce_next_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_next");
             comm_allgather = (ggml_backend_comm_allgather_tensor_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allgather_tensor");
             capture.allreduce_capturable = (ggml_backend_comm_allreduce_capturable_t)
@@ -2915,13 +2918,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 bool backend_allreduce_success = false;
                 if (backend_ctx->comm_ctx) {
                     std::vector<ggml_tensor *> nodes;
+                    std::vector<const ggml_cgraph *> next;
                     nodes.reserve(n_backends);
+                    next.reserve(n_backends);
                     for (size_t j = 0; j < n_backends; j++) {
                         auto & bcj = backend_ctx->backend_configs[j];
                         ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                         nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+                        next.push_back(bcj.cgraphs[i + 1].cgraph_main);
                     }
-                    backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                    backend_allreduce_success = backend_ctx->comm_allreduce_next
+                        ? backend_ctx->comm_allreduce_next(backend_ctx->comm_ctx, nodes.data(), next.data())
+                        : backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
                 }
 
                 if (!backend_allreduce_success) {

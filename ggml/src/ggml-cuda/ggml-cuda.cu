@@ -1538,7 +1538,7 @@ static bool ggml_backend_cuda_comm_internal_supports(
 // Run the internal AR pipeline.  Returns false on unsupported / failed input
 // -- the caller decides whether to abort (env-forced) or fall back silently.
 static bool ggml_backend_cuda_comm_allreduce_internal(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, const ggml_cgraph * const * next = nullptr) {
     GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
 
     if (!ggml_backend_cuda_comm_internal_supports(comm_ctx, tensors)) {
@@ -1548,7 +1548,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
         return true;
     }
 
-    return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
+    return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, next);
 }
 
 // ---------------------------------------------------------------------------
@@ -1685,6 +1685,15 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    return comm_ctx->try_allreduce(comm_ctx, tensors);
+}
+
+static bool ggml_backend_cuda_comm_allreduce_next(void * comm_ctx_v, ggml_tensor ** tensors, const ggml_cgraph * const * next) {
+    if (comm_ctx_v == nullptr) { return false; }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal) {
+        return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors, next);
+    }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
@@ -7319,6 +7328,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const ggml_cuda_nvtx_range nvtx_graph("graph");
         ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
         cuda_ctx->l2_graph_next = nullptr;
+        cuda_ctx->ar_hc_completed = nullptr;
+        cuda_ctx->ar_hc_graph = nullptr;
         return GGML_STATUS_SUCCESS;
     }
 
@@ -7368,6 +7379,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const ggml_cuda_nvtx_range nvtx_graph("graph");
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
     cuda_ctx->l2_graph_next = nullptr;
+    cuda_ctx->ar_hc_completed = nullptr;
+    cuda_ctx->ar_hc_graph = nullptr;
 
     return GGML_STATUS_SUCCESS;
 }
@@ -7375,7 +7388,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 // ggml_backend_graph_next_t: the graph the backend computes after the next one (ggml_cuda_l2_issue_plan_of)
 static void ggml_backend_cuda_graph_next(ggml_backend_t backend, const ggml_cgraph * next) {
     ((ggml_backend_cuda_context *) backend->context)->l2_graph_next = next;
-    ((ggml_backend_cuda_context *) backend->context)->ar_graph_next = next;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -8733,6 +8745,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_next") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_next;
     }
     if (strcmp(name, "ggml_backend_comm_allgather_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allgather_tensor;

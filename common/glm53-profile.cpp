@@ -1,6 +1,7 @@
 #include "glm53-profile.h"
 #include "common.h"
 #include "log.h"
+#include <cctype>
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
@@ -30,29 +31,42 @@ std::map<std::string, std::string> common_glm53_profile_resolve(
     };
     for (const auto & [key, value] : overrides) {
         if (!out.count(key)) { throw std::invalid_argument("unsupported GLM profile override: " + key); }
-        const bool valid = key == "GGML_CUDA_Q8_TMA_SLOTS" ? value == "2" || value == "4" :
-                           key == "GGML_CUDA_IQ3_SLOTS" ? value == "2" || value == "4" || value == "6" || value == "8" :
-                           key == "GGML_CUDA_KDA_COLUMNS" ? value == "1" || value == "2" || value == "4" :
-                           value == "0" || value == "1";
+        const auto first = value.find_first_not_of(" \t\r\n\v\f");
+        const auto last = value.find_last_not_of(" \t\r\n\v\f");
+        std::string normalized = first == std::string::npos ? "" : value.substr(first, last - first + 1);
+        const bool discrete = key == "GGML_CUDA_Q8_TMA_SLOTS" || key == "GGML_CUDA_IQ3_SLOTS" || key == "GGML_CUDA_KDA_COLUMNS";
+        if (!discrete) {
+            for (char & c : normalized) { c = (char) std::tolower((unsigned char) c); }
+            if (normalized.empty() || normalized == "false" || normalized == "no" || normalized == "off") {
+                normalized = "0";
+            } else if (normalized == "true" || normalized == "yes" || normalized == "on") {
+                normalized = "1";
+            } else {
+                char * end = nullptr;
+                const long number = std::strtol(normalized.c_str(), &end, 10);
+                if (end != normalized.c_str() && end == normalized.c_str() + normalized.size()) { normalized = number == 0 ? "0" : "1"; }
+            }
+        }
+        const bool valid = key == "GGML_CUDA_Q8_TMA_SLOTS" ? normalized == "2" || normalized == "4" :
+                           key == "GGML_CUDA_IQ3_SLOTS" ? normalized == "2" || normalized == "4" || normalized == "6" || normalized == "8" :
+                           key == "GGML_CUDA_KDA_COLUMNS" ? normalized == "1" || normalized == "2" || normalized == "4" :
+                           normalized == "0" || normalized == "1";
         if (!valid) { throw std::invalid_argument("invalid GLM profile value: " + key + "=" + value); }
-        out[key] = value;
+        out[key] = normalized;
     }
-    // Turning a prerequisite off also turns its implicit dependants off. An
-    // explicitly contradictory request fails before changing the environment.
+    // Turning a prerequisite off also turns its implicit dependants off. An explicitly contradictory request fails before changing the environment.
     for (const auto & pair : {std::pair<const char *, const char *>{"GGML_CUDA_Q8_TMA", "GGML_CUDA_Q8_SPLIT"},
                              {"GGML_CUDA_GDN_STATE_PERSIST", "GGML_CUDA_GDN_STATE_ARENA"},
                              {"GGML_CUDA_HC_CTA_PUBLISH", "GGML_CUDA_HC_FRONT_ONE"}}) {
         if (out.at(pair.second) == "0") {
-            const auto explicit_value = overrides.find(pair.first);
-            if (explicit_value != overrides.end() && explicit_value->second == "1") {
+            if (overrides.count(pair.first) && out.at(pair.first) == "1") {
                 throw std::invalid_argument(std::string(pair.first) + " requires " + pair.second);
             }
             out[pair.first] = "0";
         }
     }
     if (out.at("GGML_CUDA_KDA_COLUMNS") == "1") {
-        const auto explicit_front = overrides.find("GGML_CUDA_KDA_FRONT_SHARED");
-        if (explicit_front != overrides.end() && explicit_front->second == "1") {
+        if (overrides.count("GGML_CUDA_KDA_FRONT_SHARED") && out.at("GGML_CUDA_KDA_FRONT_SHARED") == "1") {
             throw std::invalid_argument("GGML_CUDA_KDA_FRONT_SHARED requires 2 or 4 KDA columns");
         }
         out["GGML_CUDA_KDA_FRONT_SHARED"] = "0";

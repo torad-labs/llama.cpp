@@ -1256,9 +1256,9 @@ static void ggml_cuda_ar_launch_kernels(
 // must never remember that a consumer was skipped by a preceding evaluation.
 // The LL packet format, polling, parity slots and final counter stay identical.
 static bool ggml_cuda_ar_try_hc_post(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends,
-                                    ggml_tensor ** tensors, bool bf16, bool copy_engine) {
+                                    ggml_tensor ** tensors, const ggml_cgraph * const * next, bool bf16, bool copy_engine) {
     static const bool enabled = ggml_env_switch("GGML_CUDA_AR_HC_POST");
-    if (!enabled || copy_engine || tensors[0]->type != GGML_TYPE_F32 || tensors[0]->ne[1] > 8 ||
+    if (!enabled || !next || copy_engine || tensors[0]->type != GGML_TYPE_F32 || tensors[0]->ne[1] > 8 ||
         tensors[0]->ne[2] != 1 || tensors[0]->ne[3] != 1) { return false; }
     const int64_t count = ggml_nelements(tensors[0]);
     const size_t wire_bytes = (size_t) count * (bf16 ? sizeof(nv_bfloat16) : sizeof(float));
@@ -1268,7 +1268,7 @@ static bool ggml_cuda_ar_try_hc_post(ggml_cuda_ar_pipeline * p, ggml_backend_t *
     ggml_tensor * consumer[2] = {};
     for (int rank = 0; rank < 2; ++rank) {
         auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[rank]->context);
-        const auto * graph = ctx->ar_graph_next;
+        const auto * graph = next[rank];
         if (!ctx->outer_capture || !graph || ctx->curr_stream_no != 0 ||
             ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_BLACKWELL ||
             !(tensors[rank]->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_is_contiguous(tensors[rank])) { return false; }
@@ -1320,7 +1320,7 @@ static bool ggml_cuda_ar_try_hc_post(ggml_cuda_ar_pipeline * p, ggml_backend_t *
         }
         CUDA_CHECK(cudaGetLastError());
         ctx->ar_hc_completed = consumer[rank];
-        ctx->ar_hc_graph = ctx->ar_graph_next;
+        ctx->ar_hc_graph = next[rank];
     }
     GGML_LOG_DEBUG("%s: captured LL collective + HC_POST, %lld values, %s wire, %s inbox\n", __func__,
                    (long long) count, bf16 ? "bf16" : "f32", p2p ? "peer" : "host");
@@ -1330,7 +1330,8 @@ static bool ggml_cuda_ar_try_hc_post(ggml_cuda_ar_pipeline * p, ggml_backend_t *
 bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
-        ggml_tensor           ** tensors) {
+        ggml_tensor           ** tensors,
+        const ggml_cgraph * const * next) {
     GGML_ASSERT(p != nullptr);
 
     const int n = p->n_devices;
@@ -1353,7 +1354,7 @@ bool ggml_cuda_ar_allreduce(
     const size_t    nbytes          = route.nbytes;
     const bool      use_copy_engine = route.use_copy_engine;
 
-    if (ggml_cuda_ar_try_hc_post(p, backends, tensors, use_bf16, use_copy_engine)) { return true; }
+    if (ggml_cuda_ar_try_hc_post(p, backends, tensors, next, use_bf16, use_copy_engine)) { return true; }
 
     // The copy-engine path syncs the host on its events, which no CUDA graph
     // can hold (ggml_cuda_ar_capturable).
@@ -1527,7 +1528,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
 }
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
-bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **, const ggml_cgraph * const *) {
     return false;
 }
 bool ggml_cuda_ar_allgather(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {

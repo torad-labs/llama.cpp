@@ -2199,7 +2199,6 @@ struct ggml_backend_cuda_context {
     ggml_cuda_l2_issue_stop l2_issue_stop;
     bool        l2_persisting = false;   // a launch was given a persisting L2 window (ggml_cuda_l2_persist_window)
     const ggml_cgraph * l2_graph_next = nullptr; // the graph after the next computed, while it computes (ggml_backend_graph_next)
-    const ggml_cgraph * ar_graph_next = nullptr; // retained through the intervening collective
     const ggml_cgraph * ar_hc_graph = nullptr;
     const ggml_tensor * ar_hc_completed = nullptr; // consumed once, only during an outer capture
     // the stream is being captured with the rest of an evaluation across backends (ggml_backend_cuda_capture_begin):

@@ -208,6 +208,9 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Optional AllReduce with explicit following graphs, one per rank. It may also execute a consumer prefix and skip that prefix when the graph is computed.
+    // The caller keeps these graphs and their nodes valid through the following graph_compute on each rank. False has the same fallback meaning as the plain AllReduce.
+    typedef bool   (*ggml_backend_comm_allreduce_next_t)(void * comm_ctx, struct ggml_tensor ** tensors, const struct ggml_cgraph * const * next);
     // Whether that AllReduce of these tensors can be captured with the rest of an evaluation (below)
     typedef bool   (*ggml_backend_comm_allreduce_capturable_t)(void * comm_ctx, struct ggml_tensor ** tensors);
     // Exact gather (meta backend, a pad along the split axis): each tensor holds its backend's part and zero bits

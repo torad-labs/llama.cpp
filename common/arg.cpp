@@ -1305,7 +1305,12 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
-        common_glm53_profile_apply(params);
+        if (ex == LLAMA_EXAMPLE_SERVER) {
+            // A remote preset may still turn this process into a router. Only model processes apply kernel defaults.
+            if (!params.glm53_profile.empty()) { common_glm53_profile_resolve(params.glm53_profile); }
+        } else {
+            common_glm53_profile_apply(params);
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;

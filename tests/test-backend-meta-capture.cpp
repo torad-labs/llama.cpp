@@ -178,6 +178,82 @@ static double nmse(const std::vector<float> & ref, const std::vector<float> & v)
     return err/sum;
 }
 
+// A weight-prefetch hint does not authorize the following collective to execute its consumer.
+static bool check_collective_hint_scope(const std::vector<ggml_backend_dev_t> & gpus) {
+    auto reg = ggml_backend_dev_backend_reg(gpus[0]);
+    const auto init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init");
+    const auto free_comm = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free");
+    const auto reduce = (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
+    const auto hint = (ggml_backend_graph_next_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_next");
+    const auto begin = (ggml_backend_capture_begin_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_begin");
+    const auto end = (ggml_backend_capture_end_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_end");
+    const auto launch = (ggml_backend_capture_launch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_launch");
+    const auto free_exec = (ggml_backend_capture_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_free");
+    GGML_ASSERT(init && free_comm && reduce && hint && begin && end && launch && free_exec);
+    ggml_backend_t backends[2];
+    ggml_context * contexts[2];
+    ggml_backend_buffer_t buffers[2];
+    ggml_tensor * sums[2];
+    ggml_tensor * consumers[2];
+    ggml_cgraph * prefixes[2];
+    ggml_cgraph * hints[2];
+    void * execs[2];
+    for (int rank = 0; rank < 2; ++rank) {
+        backends[rank] = ggml_backend_dev_init(gpus[rank], nullptr);
+        contexts[rank] = ggml_init({16*ggml_tensor_overhead() + 2*ggml_graph_overhead(), nullptr, true});
+        auto * ctx = contexts[rank];
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+        sums[rank] = ggml_scale(ctx, x, 1.0f);
+        auto * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, 1);
+        auto * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
+        auto * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 1);
+        consumers[rank] = ggml_dsv4_hc_post(ctx, sums[rank], residual, post, comb);
+        sums[rank]->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        consumers[rank]->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        prefixes[rank] = ggml_new_graph(ctx);
+        ggml_build_forward_expand(prefixes[rank], sums[rank]);
+        hints[rank] = ggml_new_graph(ctx);
+        ggml_graph_add_node(hints[rank], consumers[rank]);
+        buffers[rank] = ggml_backend_alloc_ctx_tensors(ctx, backends[rank]);
+        GGML_ASSERT(buffers[rank]);
+        for (auto * t : {x, residual, post, comb, consumers[rank]}) {
+            std::vector<float> values(ggml_nelements(t), t == x ? float(rank + 1) : t == consumers[rank] ? -7.0f : 1.0f);
+            ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+        }
+    }
+    void * comm = init(backends, 2);
+    GGML_ASSERT(comm);
+    for (int rank = 0; rank < 2; ++rank) { begin(backends[rank]); }
+    for (int rank = 0; rank < 2; ++rank) {
+        hint(backends[rank], hints[rank]);
+        GGML_ASSERT(ggml_backend_graph_compute_async(backends[rank], prefixes[rank]) == GGML_STATUS_SUCCESS);
+    }
+    GGML_ASSERT(reduce(comm, sums));
+    for (int rank = 0; rank < 2; ++rank) {
+        execs[rank] = end(backends[rank]);
+        GGML_ASSERT(execs[rank]);
+    }
+    for (int rank = 0; rank < 2; ++rank) { launch(backends[rank], execs[rank]); }
+    bool ok = true;
+    for (int rank = 0; rank < 2; ++rank) {
+        ggml_backend_synchronize(backends[rank]);
+        for (auto * t : {sums[rank], consumers[rank]}) {
+            std::vector<float> values(ggml_nelements(t));
+            ggml_backend_tensor_get(t, values.data(), 0, ggml_nbytes(t));
+            for (float value : values) { ok = ok && value == (t == sums[rank] ? 3.0f : -7.0f); }
+        }
+        free_exec(backends[rank], execs[rank]);
+    }
+    free_comm(comm);
+    for (int rank = 0; rank < 2; ++rank) {
+        ggml_backend_buffer_free(buffers[rank]);
+        ggml_free(contexts[rank]);
+        ggml_backend_free(backends[rank]);
+    }
+    printf("%s plain collective leaves an advisory consumer untouched\n", ok ? "ok" : "FAIL");
+    return ok;
+}
+
 int main() {
     std::vector<ggml_backend_dev_t> gpus;
     for (size_t i = 0; i < ggml_backend_dev_count() && gpus.size() < 2; i++) {
@@ -193,6 +269,11 @@ int main() {
         gpus.push_back(gpus[0]);
     }
     printf("meta backend over %s and %s\n", ggml_backend_dev_name(gpus[0]), ggml_backend_dev_name(gpus[1]));
+
+    const char * ar = getenv("GGML_CUDA_ALLREDUCE");
+    if (ggml_env_switch("TEST_GLM_HC") && ggml_env_switch("GGML_CUDA_AR_HC_POST") &&
+        ar && strcmp(ar, "internal") == 0 &&
+        strncmp(ggml_backend_dev_name(gpus[0]), "CUDA", 4) == 0 && !check_collective_hint_scope(gpus)) { return 1; }
 
     log_counts counts;
     ggml_log_set(log_cb, &counts);
@@ -275,7 +356,6 @@ int main() {
         ok = ok && counts.hc_fused > 0;
     }
 
-    const char * ar = getenv("GGML_CUDA_ALLREDUCE");
     if (ar != nullptr && strcmp(ar, "internal") == 0 && strncmp(ggml_backend_dev_name(gpus[0]), "CUDA", 4) == 0) {
         const char * value = getenv("GGML_CUDA_AR_P2P_MAX_BYTES");
         char * end = nullptr;
