@@ -88,10 +88,12 @@
 #include <deque>
 #include <cfloat>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -876,6 +878,33 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+struct ggml_cuda_q8_transfer_workspace {
+    static constexpr size_t capacity = 4*1024*1024;
+    int device;
+    void * data = nullptr;
+    cudaEvent_t ready = nullptr;
+    bool recorded = false;
+
+    explicit ggml_cuda_q8_transfer_workspace(int device) : device(device) {}
+    ~ggml_cuda_q8_transfer_workspace() {
+        if (!data) { return; }
+        ggml_cuda_set_device(device);
+        if (recorded) { CUDA_CHECK(cudaEventSynchronize(ready)); }
+        CUDA_CHECK(cudaEventDestroy(ready));
+        CUDA_CHECK(cudaFree(data));
+    }
+};
+
+struct ggml_cuda_q8_transfer_slot {
+    std::mutex mutex;
+    std::weak_ptr<ggml_cuda_q8_transfer_workspace> workspace;
+};
+
+static ggml_cuda_q8_transfer_slot & ggml_cuda_q8_transfer_slot_for(int device) {
+    static ggml_cuda_q8_transfer_slot slots[GGML_CUDA_MAX_DEVICES];
+    return slots[ggml_cuda_get_physical_device(device)];
+}
+
 struct ggml_backend_cuda_buffer_context {
     struct q8_entry {
         size_t bytes;
@@ -885,12 +914,14 @@ struct ggml_backend_cuda_buffer_context {
 #endif
     };
     std::map<uintptr_t, q8_entry> q8_rows;
-    std::unordered_set<uintptr_t> q8_written;
+    std::set<uintptr_t> q8_written;
     std::mutex q8_mutex;
     const uint64_t q8_id = [] { static std::atomic<uint64_t> next{1}; return next.fetch_add(1); }();
     std::atomic<uint64_t> q8_revision{0};
     std::atomic<bool> q8_present{false};
+    std::atomic<bool> q8_tracked{false};
     std::atomic<bool> q8_compute{false};
+    std::shared_ptr<ggml_cuda_q8_transfer_workspace> q8_transfer;
     int device;
     void * dev_ptr = nullptr;
     std::string name;
@@ -901,6 +932,11 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        ggml_cuda_set_device(device);
+        if (q8_transfer) {
+            std::lock_guard<std::mutex> lock(ggml_cuda_q8_transfer_slot_for(device).mutex);
+            q8_transfer.reset();
+        }
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -970,6 +1006,7 @@ static void ggml_cuda_q8_register(ggml_backend_buffer_t buffer, const ggml_tenso
     if (ctx->q8_compute.load(std::memory_order_relaxed)) { return; }
     std::lock_guard<std::mutex> lock(ctx->q8_mutex);
     if (!ctx->q8_written.emplace((uintptr_t) tensor->data).second) { return; }
+    ctx->q8_tracked.store(true, std::memory_order_release);
     if (tensor->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(tensor) ||
             tensor->ne[0] % 256 != 0 || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
             ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
@@ -994,24 +1031,35 @@ void ggml_cuda_q8_prepare_write(const ggml_tensor * tensor) {
     }
 }
 
-// Loader/readback scratch is transient, at most 4 MiB per physical device. It is
-// never part of captured inference and never retains a second set of weights.
-// A driver allocation failure uses one host row and no additional device memory.
+// One 4 MiB scratch per physical device, shared by its packed buffers until their last release. Events order different streams.
+// Allocation failure uses one host row and no extra device memory.
 template<bool write>
 static void ggml_cuda_q8_transfer(ggml_backend_cuda_buffer_context & ctx, const ggml_tensor * tensor,
                                   std::conditional_t<write, const void *, void *> host, size_t offset, size_t size, cudaStream_t stream,
-                                  size_t copies = 1, size_t tensor_stride = 0, size_t host_stride = 0) {
+                                  size_t copies = 1, size_t tensor_stride = 0, size_t host_stride = 0, bool async = false) {
     auto layout = ggml_cuda_q8_layout_of(tensor);
     GGML_ASSERT(layout.base != nullptr && offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
     if (size == 0 || copies == 0) { return; }
     GGML_ASSERT(!tensor_stride || copies - 1 <= (ggml_nbytes(tensor) - offset - size)/tensor_stride);
     layout.offset += offset;
-    static std::mutex transfer_mutex[GGML_CUDA_MAX_DEVICES];
-    std::lock_guard<std::mutex> lock(transfer_mutex[ggml_cuda_get_physical_device(ctx.device)]);
-    const size_t capacity = std::min<size_t>(size, 4*1024*1024);
-    void * scratch = nullptr;
-    const cudaError_t err = cudaMalloc(&scratch, capacity);
+    auto & slot = ggml_cuda_q8_transfer_slot_for(ctx.device);
+    std::lock_guard<std::mutex> lock(slot.mutex);
+    if (!ctx.q8_transfer) {
+        ctx.q8_transfer = slot.workspace.lock();
+        if (!ctx.q8_transfer) {
+            ctx.q8_transfer = std::make_shared<ggml_cuda_q8_transfer_workspace>(ctx.device);
+            slot.workspace = ctx.q8_transfer;
+        }
+    }
+    auto & workspace = *ctx.q8_transfer;
+    const size_t capacity = ggml_cuda_q8_transfer_workspace::capacity;
+    cudaError_t err = cudaSuccess;
+    if (!workspace.data) {
+        err = cudaMalloc(&workspace.data, capacity);
+        if (err == cudaSuccess) { CUDA_CHECK(cudaEventCreateWithFlags(&workspace.ready, cudaEventDisableTiming)); }
+    }
     if (err != cudaSuccess) {
+        workspace.data = nullptr;
         (void) cudaGetLastError();
         const size_t row_bytes = layout.blocks_per_row.z * sizeof(block_q8_0);
         const ggml_q8_0_split_layout row_layout{layout.blocks_per_row.z};
@@ -1037,6 +1085,8 @@ static void ggml_cuda_q8_transfer(ggml_backend_cuda_buffer_context & ctx, const 
         }
         return;
     }
+    void * scratch = workspace.data;
+    if (workspace.recorded) { CUDA_CHECK(cudaStreamWaitEvent(stream, workspace.ready, 0)); }
     for (size_t copy = 0; copy < copies; ++copy) {
         for (size_t done = 0; done < size;) {
             const size_t count = std::min(capacity, size - done);
@@ -1052,8 +1102,9 @@ static void ggml_cuda_q8_transfer(ggml_backend_cuda_buffer_context & ctx, const 
             done += count;
         }
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(scratch));
+    CUDA_CHECK(cudaEventRecord(workspace.ready, stream));
+    workspace.recorded = true;
+    if (!async) { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 }
 
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -1069,15 +1120,28 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
-    // Reallocation/reuse starts a new lifetime at this address. Weight layouts
-    // never survive tensor initialization from an earlier graph/allocation.
-    {
+    // A replacement ends every overlapping packed lifetime, including a new tensor starting inside an old one.
+    if (ctx->q8_tracked.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(ctx->q8_mutex);
-        if (ctx->q8_rows.erase((uintptr_t) tensor->data)) {
+        const uintptr_t begin = (uintptr_t) tensor->data;
+        const uintptr_t end = begin + ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+        auto it = ctx->q8_rows.lower_bound(begin);
+        if (it != ctx->q8_rows.begin()) {
+            auto previous = std::prev(it);
+            if (previous->first + previous->second.bytes > begin) { it = previous; }
+        }
+        bool changed = false;
+        while (it != ctx->q8_rows.end() && it->first < end) {
+            ctx->q8_written.erase(it->first);
+            it = ctx->q8_rows.erase(it);
+            changed = true;
+        }
+        ctx->q8_written.erase(ctx->q8_written.lower_bound(begin), ctx->q8_written.lower_bound(end));
+        if (changed) {
             ctx->q8_revision.fetch_add(1, std::memory_order_release);
             ctx->q8_present.store(!ctx->q8_rows.empty(), std::memory_order_release);
         }
-        ctx->q8_written.erase((uintptr_t) tensor->data);
+        ctx->q8_tracked.store(!ctx->q8_written.empty(), std::memory_order_release);
     }
 
     if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -3751,7 +3815,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     if (ggml_cuda_q8_layout_of(tensor).base) {
         auto * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
         ggml_cuda_set_device(ctx->device);
-        ggml_cuda_q8_transfer<true>(*ctx, tensor, data, offset, size, cuda_ctx->stream());
+        ggml_cuda_q8_transfer<true>(*ctx, tensor, data, offset, size, cuda_ctx->stream(), 1, 0, 0, true);
         return;
     }
 
@@ -3766,7 +3830,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     if (ggml_cuda_q8_layout_of(tensor).base) {
         auto * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
         ggml_cuda_set_device(ctx->device);
-        ggml_cuda_q8_transfer<false>(*ctx, tensor, data, offset, size, cuda_ctx->stream());
+        ggml_cuda_q8_transfer<false>(*ctx, tensor, data, offset, size, cuda_ctx->stream(), 1, 0, 0, true);
         return;
     }
 
@@ -3783,7 +3847,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     if (ggml_cuda_q8_layout_of(tensor).base) {
         auto * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
         ggml_cuda_set_device(ctx->device);
-        ggml_cuda_q8_transfer<true>(*ctx, tensor, data, offset, size, cuda_ctx->stream(), n_copies, stride_tensor, stride_data);
+        ggml_cuda_q8_transfer<true>(*ctx, tensor, data, offset, size, cuda_ctx->stream(), n_copies, stride_tensor, stride_data, true);
         return;
     }
 
@@ -3800,7 +3864,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     if (ggml_cuda_q8_layout_of(tensor).base) {
         auto * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
         ggml_cuda_set_device(ctx->device);
-        ggml_cuda_q8_transfer<false>(*ctx, tensor, data, offset, size, cuda_ctx->stream(), n_copies, stride_tensor, stride_data);
+        ggml_cuda_q8_transfer<false>(*ctx, tensor, data, offset, size, cuda_ctx->stream(), n_copies, stride_tensor, stride_data, true);
         return;
     }
 
@@ -7985,19 +8049,15 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
     return ggml_backend_cuda_host_buffer_type();
 }
 
-// TODO: move these functions here
-static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
-
-    // Repacked storage is a backend detail, never a new GGML type. Only readers
-    // that interpret it may execute here. All other operations transfer canonical
-    // bytes through get/set to their ordinary backend fallback.
+static bool ggml_backend_cuda_supports_op_storage(const ggml_tensor * op,
+        const ggml_tensor * const tensors[GGML_MAX_SRC + 1], const bool unresolved[GGML_MAX_SRC + 1]) {
     for (int i = -1; i < GGML_MAX_SRC; ++i) {
-        const ggml_tensor * t = i < 0 ? op : op->src[i];
+        const ggml_tensor * t = tensors[i+1];
         const auto layout = ggml_cuda_q8_layout_of(t);
         if (!layout.base) { continue; }
         if (op->op == GGML_OP_NONE || op->op == GGML_OP_VIEW || op->op == GGML_OP_RESHAPE ||
             op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) { continue; }
+        if (unresolved[i+1]) { return false; }
         if (t->type != GGML_TYPE_Q8_0 || t->nb[0] != sizeof(block_q8_0) || layout.offset % sizeof(block_q8_0)) {
             return false;
         }
@@ -8006,8 +8066,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (i != 0 || t->ne[0] % 256) { return false; }
                 // A packed row can be sliced, but cannot straddle two physical
                 // row planes. Such reshapes use the canonical backend fallback.
-                if (layout.offset/sizeof(block_q8_0) % layout.blocks_per_row.z + t->ne[0]/QK8_0 > layout.blocks_per_row.z ||
-                    t->nb[1] % (layout.blocks_per_row.z*sizeof(block_q8_0))) { return false; }
+                if (layout.offset/sizeof(block_q8_0) % layout.blocks_per_row.z + t->ne[0]/QK8_0 > layout.blocks_per_row.z) { return false; }
+                for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+                    if (t->ne[dim] > 1 && t->nb[dim] % (layout.blocks_per_row.z*sizeof(block_q8_0))) { return false; }
+                }
                 break;
             case GGML_OP_GET_ROWS:
                 if (i != 0 || (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_BF16)) {
@@ -8022,11 +8084,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 // Concurrent in-place reordering is not a copy. Let the host
                 // fallback materialize its source before writing overlapping views.
-                if (ggml_q8_copy_needs_staging(op->src[0], op)) { return false; }
+                if (ggml_q8_copy_needs_staging(tensors[1], tensors[0])) { return false; }
                 break;
             default: return false;
         }
     }
+    return true;
+}
+
+// TODO: move these functions here
+static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const ggml_tensor * tensors[GGML_MAX_SRC + 1] = {op};
+    const bool unresolved[GGML_MAX_SRC + 1] = {};
+    for (int i = 0; i < GGML_MAX_SRC; ++i) { tensors[i+1] = op->src[i]; }
+    if (!ggml_backend_cuda_supports_op_storage(op, tensors, unresolved)) { return false; }
 
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -8650,6 +8722,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_supports_op_storage") == 0) {
+        return (void *)ggml_backend_cuda_supports_op_storage;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

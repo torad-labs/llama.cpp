@@ -11,10 +11,13 @@ int main() {
     stats.n_draft_verif_steps = 3;
     stats.n_draft_delivered = 9;
     for (const size_t rows : {3, 4, 7}) stats.record_draft_verification(rows, false);
+    stats.record_draft_verification(3, true);
+    stats.record_draft_verification(4, true);
     const auto result = stats.to_json();
     if (result.value("draft_rounds", 0) != 3 ||
         result.value("draft_delivered_n", 0) != 9 ||
-        result.value("draft_delivered_per_round", 0.0) != 3.0) {
+        result.value("draft_delivered_per_round", 0.0) != 3.0 ||
+        result.value("draft_verify_attempts", 0) != 5 || result.value("draft_replay_attempts", 0) != 2) {
         fprintf(stderr, "FAIL: sampled response omits delivered-token/round accounting\n");
         return 1;
     }

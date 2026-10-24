@@ -107,6 +107,12 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         for gpu in (0, 1):
             subset = [c for c in cases if c["env"].get("CUDA_VISIBLE_DEVICES") == str(gpu)]
+            for packing in (0, 1):
+                case = next(c for c in subset if c["name"] == f"q8-meta-cache-p{packing}-gpu{gpu}")
+                self.assertEqual(case["env"]["GGML_CUDA_Q8_SPLIT"], str(packing))
+                self.assertIn("--meta-cache", case["argv"])
+                self.assertEqual(case["require"], "16/16 meta Q8 cache rebuilds passed")
+            self.assertIn(f"q8-channel-views-gpu{gpu}", names)
             for mode in ("direct", "tma2", "tma4"):
                 self.assertTrue(any(c["name"] == f"q8-readers-{mode}-gpu{gpu}" for c in subset))
             for compute in ("f16", "bf16", "f32"):
@@ -119,7 +125,9 @@ class QualificationTest(unittest.TestCase):
                 for front in (0, 1) if columns > 1 else (0,):
                     self.assertIn(f"kda-c{columns}-f{front}-gpu{gpu}", names)
             for slots in (2, 4, 6, 8):
-                self.assertIn(f"iq3-s{slots}-gpu{gpu}", names)
+                case = next(c for c in subset if c["name"] == f"iq3-s{slots}-gpu{gpu}")
+                self.assertEqual(case["cases"], 72)
+                self.assertNotIn("-p", case["argv"])
         for route in ("peer", "host", "mixed", "duplicate"):
             self.assertIn(f"capture-{route}", names)
         self.assertEqual(next(c for c in cases if c["name"] == "capture-peer")["require"],

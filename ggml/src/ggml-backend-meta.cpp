@@ -57,6 +57,7 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
 
 struct ggml_backend_meta_device_context {
     std::vector<ggml_backend_dev_t>     simple_devs;
+    std::vector<ggml_backend_supports_op_storage_t> storage_support;
     ggml_backend_meta_get_split_state_t get_split_state;
     void *                              get_split_state_ud;
 
@@ -68,13 +69,17 @@ struct ggml_backend_meta_device_context {
             simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
         name        = std::string("Meta(");
         description = std::string("Meta(");
-        for (size_t i = 0; i < simple_devs.size(); i++) {
+        for (size_t i = 0; i < this->simple_devs.size(); i++) {
+            const auto dev = this->simple_devs[i];
+            const auto reg = ggml_backend_dev_backend_reg(dev);
+            storage_support.push_back(reg ? reinterpret_cast<ggml_backend_supports_op_storage_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_supports_op_storage")) : nullptr);
             if (i > 0) {
                 name        += ",";
                 description += ",";
             }
-            name        += ggml_backend_dev_name       (simple_devs[i]);
-            description += ggml_backend_dev_description(simple_devs[i]);
+            name        += ggml_backend_dev_name       (dev);
+            description += ggml_backend_dev_description(dev);
         }
         name        += ")";
         description += ")";
@@ -371,13 +376,9 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
 }
 
 static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
-    for (size_t i = 0; i < n_simple_bufts; i++) {
-        if (!ggml_backend_buft_is_host(ggml_backend_meta_buft_simple_buft(buft, i))) {
-            return false;
-        }
-    }
-    return true;
+    // Meta addresses are virtual even when every underlying buffer is on the host.
+    GGML_UNUSED(buft);
+    return false;
 }
 
 static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_iface = {
@@ -541,27 +542,35 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const auto * ctx = (const ggml_backend_meta_device_context *) dev->context;
     for (size_t rank = 0; rank < ctx->simple_devs.size(); ++rank) {
-        const auto simple = [&](const ggml_tensor * tensor) -> const ggml_tensor * {
+        // Shape checks use one consistent logical graph. Storage checks use the allocated rank tensors separately.
+        if (!ggml_backend_dev_supports_op(ctx->simple_devs[rank], op)) { return false; }
+        if (!ctx->storage_support[rank]) { continue; }
+        const auto simple = [&](const ggml_tensor * tensor, bool & unresolved) -> const ggml_tensor * {
             if (!tensor) { return nullptr; }
+            if (tensor->buffer && tensor->data && ggml_backend_buffer_is_meta(tensor->buffer)) {
+                const auto * storage = (const ggml_backend_meta_buffer_context *) tensor->buffer->context;
+                const auto * parts = storage->find_simple_tensors(tensor);
+                if (parts && rank < parts->size()) { return (*parts)[rank]; }
+            }
             const ggml_tensor * root = tensor;
             while (root->view_src) { root = root->view_src; }
-            auto * buffer = tensor->buffer ? tensor->buffer : root->buffer;
-            if (!buffer || !ggml_backend_buffer_is_meta(buffer)) { return tensor; }
-            const auto * storage = (const ggml_backend_meta_buffer_context *) buffer->context;
-            const auto * parts = storage->find_simple_tensors(tensor);
-            if (parts && rank < parts->size()) { return (*parts)[rank]; }
-            // Unallocated Q8 views have no per-rank byte geometry yet. Use canonical fallback until it is known.
-            if (root->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q8_0) { return nullptr; }
+            if (root->buffer && root->data && ggml_backend_buffer_is_meta(root->buffer)) {
+                const auto * storage = (const ggml_backend_meta_buffer_context *) root->buffer->context;
+                const auto * parts = storage->find_simple_tensors(root);
+                if (parts && rank < parts->size()) {
+                    unresolved = tensor != root;
+                    return (*parts)[rank];
+                }
+            }
             return tensor;
         };
-        const auto * physical = simple(op);
-        if (!physical) { return false; }
-        ggml_tensor probe = *physical;
+        bool unresolved[GGML_MAX_SRC + 1] = {};
+        const ggml_tensor * tensors[GGML_MAX_SRC + 1] = {};
+        tensors[0] = simple(op, unresolved[0]);
         for (int i = 0; i < GGML_MAX_SRC; ++i) {
-            probe.src[i] = const_cast<ggml_tensor *>(simple(op->src[i]));
-            if (op->src[i] && !probe.src[i]) { return false; }
+            tensors[i+1] = simple(op->src[i], unresolved[i+1]);
         }
-        if (!ggml_backend_dev_supports_op(ctx->simple_devs[rank], &probe)) { return false; }
+        if (!ctx->storage_support[rank](op, tensors, unresolved)) { return false; }
     }
     return true;
 }

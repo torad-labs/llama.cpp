@@ -80,6 +80,11 @@ def device_cases():
         add(f"q8-storage-gpu{gpu}", ["test-q8-backend-storage", "CUDA0"], card)
         add(f"q8-meta-fallback-gpu{gpu}", ["test-q8-backend-storage", "CUDA0", "--meta"],
             card | {"GGML_CUDA_Q8_SPLIT": "1"}, require="2/2 meta packed reader fallbacks passed")
+        for packing in (0, 1):
+            add(f"q8-meta-cache-p{packing}-gpu{gpu}", ["test-q8-backend-storage", "CUDA0", "--meta-cache"],
+                card | {"GGML_CUDA_Q8_SPLIT": str(packing)}, require="16/16 meta Q8 cache rebuilds passed")
+        add(f"q8-channel-views-gpu{gpu}", ["test-q8-backend-storage", "CUDA0", "--views"],
+            card | {"GGML_CUDA_Q8_SPLIT": "1"}, require="4/4 packed channel views passed")
         for mode in ("direct", "tma2", "tma4"):
             env = card | {"GGML_CUDA_Q8_SPLIT": "1", "GGML_CUDA_Q8_TMA": "1" if mode.startswith("tma") else "0",
                           "GGML_CUDA_Q8_TMA_SLOTS": "4" if mode == "tma4" else "2",
@@ -106,7 +111,7 @@ def device_cases():
         for slots in (2, 4, 6, 8):
             ops(f"iq3-s{slots}-gpu{gpu}", "GLM53_MOE_ROUTES",
                 card | {"GGML_CUDA_IQ3_COMPACT": "1", "GGML_CUDA_IQ3_SLOTS": str(slots)},
-                72 if slots == 8 else 24, None if slots == 8 else "n_embd=512,n_ff=256")
+                72)
         for publication in (0, 1):
             ops(f"hc-publication-{publication}-gpu{gpu}", "DSV4_HC_PRE_FUSED,DSV4_HC_PRE_Q8_1,DSV4_HC_PRE_POST",
                 card | {"GGML_CUDA_HC_FRONT_ONE": "1", "GGML_CUDA_HC_CTA_PUBLISH": str(publication)})

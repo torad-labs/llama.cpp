@@ -92,6 +92,11 @@ extern "C" {
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 
+    // Optional registry procedure "ggml_backend_supports_op_storage": inspect backend-owned storage separately from logical op geometry.
+    // Entry 0 is the output, then its sources. An unresolved entry supplies the allocated view root instead of the not-yet-initialized tensor.
+    typedef bool (*ggml_backend_supports_op_storage_t)(const struct ggml_tensor * op,
+            const struct ggml_tensor * const tensors[GGML_MAX_SRC + 1], const bool unresolved[GGML_MAX_SRC + 1]);
+
     // the usage of a meta buffer's simple buffers, each device's: its tensors' shards are in them, and a backend computing a
     // device's graph asks them (weights no kernel writes, which a kernel may read before its dependency wait)
     GGML_API void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buf, enum ggml_backend_buffer_usage usage);
