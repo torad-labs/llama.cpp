@@ -28,6 +28,7 @@ struct llama_kpool_stale {
     static bool shift_regroups(uint32_t kpool, llama_pos p0, llama_pos p1, llama_pos shift);
 
     void mark(llama_seq_id seq_id); // seq_id < 0: every sequence
+    void inherit(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
     bool any  (const llama_ubatch & ubatch) const;
     void clear(const llama_ubatch & ubatch);
 
@@ -182,7 +183,7 @@ public:
 
     // GLM-5-Next pooled-key cache, per sequence (llama_kpool_stale): seq_add/seq_div mark a sequence, a ubatch holding a
     // marked one rebuilds, and its set_input clears the ubatch's sequences
-    void set_kpool_dirty(llama_seq_id seq_id);
+    void set_kpool_dirty(llama_seq_id seq_id) const;
     bool get_kpool_dirty(const llama_ubatch & ubatch) const;
     void clear_kpool_dirty(const llama_ubatch & ubatch) const;
 

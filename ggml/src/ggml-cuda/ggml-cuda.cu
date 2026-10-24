@@ -1411,6 +1411,58 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+// The exact gather (ggml_backend_comm_allgather_tensor_t): the tensors are taken as 32-bit words, each word nonzero on
+// one device at most, so the internal pipeline's OR and NCCL's integer sum both give every word bit for bit (-0.0,
+// denormals and NaN payloads included), where an F32 sum would not. Contiguous tensors of one size, a whole number of
+// words, 16-byte aligned for the pipeline's vector loads.
+static bool ggml_backend_cuda_comm_allgather_takes(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    const size_t nbytes = ggml_nbytes(tensors[0]);
+    for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+        if (tensors[i] == nullptr || ggml_nbytes(tensors[i]) != nbytes || !ggml_is_contiguous(tensors[i]) ||
+                ((uintptr_t) tensors[i]->data & 0xF) != 0) {
+            return false;
+        }
+    }
+    return nbytes % sizeof(uint32_t) == 0;
+}
+
+static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (!ggml_backend_cuda_comm_allgather_takes(comm_ctx, tensors)) {
+        return false;
+    }
+    const size_t n_words = ggml_nbytes(tensors[0]) / sizeof(uint32_t);
+    if (n_words == 0) {
+        return true;
+    }
+#ifdef GGML_USE_NCCL
+    if (comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_nccl) {
+        for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+            if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+                ggml_cuda_set_device(cuda_ctx->device);
+                CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+            }
+        }
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+            NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, n_words, ncclUint32, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
+        }
+        NCCL_CHECK(ncclGroupEnd());
+        return true;
+    }
+#endif // GGML_USE_NCCL
+    if (comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal) {
+        return ggml_cuda_ar_allgather(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
+    }
+    return false;
+}
+
 // Whether the AllReduce of these tensors can be captured with the rest of an
 // evaluation (ggml_backend_cuda_capture_begin) and replayed: only on the
 // internal pipeline's chunked kernel (ggml_cuda_ar_capturable), since NCCL's is
@@ -1429,6 +1481,16 @@ static bool ggml_backend_cuda_comm_allreduce_capturable(void * comm_ctx_v, struc
     return comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal &&
         ggml_backend_cuda_comm_internal_supports(comm_ctx, tensors) && ggml_nelements(tensors[0]) > 0 &&
         ggml_cuda_ar_capturable(comm_ctx->ar_pipeline, tensors[0]);
+}
+
+// The gather is captured on the internal pipeline, whose kernels it always takes; not an empty one (above).
+static bool ggml_backend_cuda_comm_allgather_capturable(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    return comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal &&
+        ggml_backend_cuda_comm_allgather_takes(comm_ctx, tensors) && ggml_nbytes(tensors[0]) > 0;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -8278,12 +8340,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
+    if (strcmp(name, "ggml_backend_comm_allgather_tensor") == 0) {
+        return (void *)ggml_backend_cuda_comm_allgather_tensor;
+    }
     if (strcmp(name, "ggml_backend_graph_next") == 0) {
         return (void *)ggml_backend_cuda_graph_next;
     }
 #ifdef USE_CUDA_GRAPH
     if (strcmp(name, "ggml_backend_comm_allreduce_capturable") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_capturable;
+    }
+    if (strcmp(name, "ggml_backend_comm_allgather_capturable") == 0) {
+        return (void *)ggml_backend_cuda_comm_allgather_capturable;
     }
     if (strcmp(name, "ggml_backend_graph_capturable") == 0) {
         return (void *)ggml_backend_cuda_graph_capturable;

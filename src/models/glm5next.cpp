@@ -435,6 +435,10 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
                 cb(t, name, il);
             });
 
+    if (inp_kp->draft_top_k) {
+        return inp_kp->draft_top_k;
+    }
+
     // every pool's key, gathered into f32 rows (the unfused path, and the fused one under LLAMA_INDEXER_GATHER_LEGACY=1)
     const auto gather_pool_k = [&]() {
         ggml_tensor * pooled_rd = ggml_view_3d(ctx0, kbuf, d_idx, n_kv, n_stream,
@@ -515,6 +519,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     GGML_ASSERT(top_k->type == GGML_TYPE_I32 && "pool_cells is I32, so the gather stays I32");
     top_k = ggml_reshape_3d(ctx0, top_k, r*select_k, n_tps, n_stream);
     cb(top_k, "indexer_top_k", il);
+    if (inp_kp->draft) res->t_mtp_index = top_k;
 
     return top_k;
 }
@@ -636,14 +641,15 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
 
     llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k();
 
-    // gated on n_ctx, not n_kv, which grows and would flip the graph topology mid-run
+    // The kpool input rejects graph reuse when the dense span is crossed.
     llm_graph_input_kpool * inp_kp = nullptr;
     bool indexer_scoring = false;
     {
         const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
 
         if (mctx_hyb->get_idx() != nullptr) {
-            indexer_scoring = cparams.n_ctx > glm5next_n_select(hparams);
+            indexer_scoring = llama_kpool_needs_scoring(mctx_hyb->get_attn()->get_n_kv(),
+                    cparams.n_ctx, hparams.indexer_top_k, hparams.indexer_kpool);
 
             inp_kp = build_inp_kpool(mctx_hyb,
                     inp_mem->get_attn()->get_kq_mask(), indexer_scoring);
@@ -808,7 +814,8 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
         const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
 
         if (mctx_hyb->get_idx() != nullptr) {
-            indexer_scoring = cparams.n_ctx > glm5next_n_select(hparams);
+            indexer_scoring = llama_kpool_needs_scoring(mctx_hyb->get_attn()->get_n_kv(),
+                    cparams.n_ctx, hparams.indexer_top_k, hparams.indexer_kpool);
 
             inp_kp = build_inp_kpool(mctx_hyb,
                     inp_mem->get_attn()->get_kq_mask(), indexer_scoring);
@@ -859,7 +866,23 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "glm5next MTP: no nextn.shared_head_head and no output");
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (model.output_draft) {
+        const int64_t n_vocab = head_w->ne[1];
+        const int64_t n_hot   = model.output_draft->ne[1];
+        const int64_t n_out   = cur->ne[1];
+        ggml_tensor * hot = build_lora_mm(model.output_draft, cur, model.output_draft_s);
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+            // A pad along the split axis gathers the small head before the global-ID scatter.
+            hot = ggml_pad(ctx0, hot, 32 - n_hot % 32, 0, 0, 0);
+            hot = ggml_cont(ctx0, ggml_view_2d(ctx0, hot, n_hot, n_out, hot->nb[1], 0));
+        }
+        cb(hot, "mtp_draft_logits", -1);
+        ggml_tensor * full = ggml_fill_inplace(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
+        cur = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, hot, 1, n_hot, n_out), model.output_draft_ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_out);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

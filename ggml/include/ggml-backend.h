@@ -210,6 +210,10 @@ extern "C" {
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
     // Whether that AllReduce of these tensors can be captured with the rest of an evaluation (below)
     typedef bool   (*ggml_backend_comm_allreduce_capturable_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Exact gather (meta backend, a pad along the split axis): each tensor holds its backend's part and zero bits
+    // everywhere else, and every tensor ends up with every part, bit for bit. False: not done, the caller gathers
+    typedef bool   (*ggml_backend_comm_allgather_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    typedef bool   (*ggml_backend_comm_allgather_capturable_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
     // Capture of a whole evaluation across backends, into one graph a backend replayed with one launch (meta backend):
     // begin starts capturing what is queued on the backend, the graphs computed on it meanwhile included, and end returns

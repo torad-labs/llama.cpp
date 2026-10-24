@@ -217,6 +217,22 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    // the adaptive MTP depth takes the cost of a draft token past the first, as a share of a one-token round; off by default
+    {
+        common_params adaptive;
+        assert(adaptive.speculative.draft.mtp_adaptive == 0.0f);
+        argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-mtp-adaptive", "0.18"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive, LLAMA_EXAMPLE_SERVER));
+        assert(adaptive.speculative.draft.mtp_adaptive == 0.18f);
+        argv = {"binary_name", "--spec-draft-mtp-adaptive", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive, LLAMA_EXAMPLE_SERVER));
+        assert(adaptive.speculative.draft.mtp_adaptive == 0.0f);
+        for (const char * bad : {"-0.1", "1.5", "nan", "inf", "cheap"}) {
+            argv = {"binary_name", "--spec-draft-mtp-adaptive", bad};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive, LLAMA_EXAMPLE_SERVER));
+        }
+    }
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -286,6 +302,15 @@ static void test(void) {
     argv = {"binary_name"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    setenv("LLAMA_ARG_SPEC_DRAFT_MTP_ADAPTIVE", "0.25", true);
+    {
+        common_params adaptive;
+        argv = {"binary_name"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive, LLAMA_EXAMPLE_SERVER));
+        assert(adaptive.speculative.draft.mtp_adaptive == 0.25f);
+    }
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_MTP_ADAPTIVE");
 
     printf("test-arg-parser: test negated environment variables\n\n");
 

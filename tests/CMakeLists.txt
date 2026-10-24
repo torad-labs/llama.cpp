@@ -203,6 +203,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    llama_test(test-llama-archs NAME test-glm5next ARGS -a glm5next -s 1234)
+    llama_test(test-llama-archs NAME test-qwen35 ARGS -a qwen35 -s 1234)
+    llama_build_and_test(test-speculative-mtp.cpp)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -343,6 +346,8 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-backend-meta-split.cpp)
     llama_build_and_test(test-backend-meta-capture.cpp)
     llama_build_and_test(test-backend-meta-sourceless.cpp)
+    llama_build_and_test(test-backend-meta-sampler.cpp)
+    llama_build_and_test(test-backend-meta-capacity.cpp)
     llama_build_and_test(test-pq2-mma-device-memory.cpp)
 llama_build_and_test(test-ptq1_0-element-map.cpp)
 llama_build_and_test(test-ptq1_0-cuda-dot.cpp)

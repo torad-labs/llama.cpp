@@ -1057,8 +1057,75 @@ static void run_tail_bound(std::mt19937 & rng) {
     CHECK(n_kv_new >= n_live, "n_kv_max %lld under %lld live cells", (long long) n_kv_new, (long long) n_live);
 }
 
+static void run_draft_rounds(std::mt19937 & rng) {
+    // Selections follow sequence identity when the live batch shrinks/reorders. A
+    // new completed pool or any memory mutation must force fresh scoring.
+    int first_refuses = 0, last_refuses = 0;
+    for (int round = 0; round < 1000; ++round) {
+        llama_kpool_draft draft;
+        const int r = 2 + rng()%7;
+        const int base = (1 + rng()%30)*r + rng()%r;
+        const int other = (1 + rng()%30)*r + rng()%r;
+        const int width = r*(1 + rng()%8);
+        const int n_kv = 512;
+        std::vector<int32_t> a(width), b(width);
+        for (int j = 0; j < width; ++j) { a[j] = rng()%128; b[j] = 128 + rng()%128; }
+        draft.advance(0);
+        draft.capture(2, base, n_kv, a);
+        draft.capture(7, other, n_kv, b);
+        for (int step = 1; step < r + 2; ++step) {
+            draft.advance(step);
+            ubatch_data ud;
+            std::vector<int> order = {2, 7};
+            std::shuffle(order.begin(), order.end(), rng);
+            if (rng()%2) order.resize(1);
+            std::vector<bool> row_reuses;
+            for (const int seq : order) {
+                const int captured = seq == 2 ? base : other;
+                ud.add(seq, captured + step);
+                // The next pool finishes at this token position. No row may
+                // replay a selection made before one of its pools completed.
+                const int next_completion = ((captured + 1)/r + 1)*r - 1;
+                row_reuses.push_back(captured + step < next_completion);
+            }
+            const auto & ub = *ud.get();
+            const bool expected = std::all_of(row_reuses.begin(), row_reuses.end(), [](bool reuse) { return reuse; });
+            if (row_reuses.size() == 2) {
+                first_refuses += !row_reuses[0] && row_reuses[1];
+                last_refuses  += row_reuses[0] && !row_reuses[1];
+            }
+            CHECK(draft.can_reuse(ub, n_kv, width, r) == expected, "draft pool completion at step %d, r %d", step, r);
+            CHECK(!draft.can_reuse(ub, n_kv + 256, width, r), "draft accepted different KV geometry");
+            CHECK(!draft.can_reuse(ub, n_kv, width + r, r), "draft accepted different selection width");
+            if (expected && draft.can_reuse(ub, n_kv, width, r)) {
+                std::vector<int32_t> got(width*order.size());
+                draft.copy(ub, got.data());
+                for (size_t i = 0; i < order.size(); ++i) {
+                    const auto & selected = order[i] == 2 ? a : b;
+                    CHECK(std::equal(selected.begin(), selected.end(), got.begin() + i*width),
+                            "sequence %d lost its selection", order[i]);
+                }
+            }
+        }
+        draft.advance(0);
+        ubatch_data ud;
+        ud.add(2, base + 1);
+        CHECK(!draft.can_reuse(*ud.get(), n_kv, width, r), "selection escaped its round");
+        draft.capture(2, base, n_kv, a);
+        draft.advance(1);
+        draft.clear();
+        CHECK(!draft.can_reuse(*ud.get(), n_kv, width, r), "selection survived a memory mutation");
+        draft.capture(2, base, n_kv, a);
+        draft.advance(-1);
+        CHECK(!draft.can_reuse(*ud.get(), n_kv, width, r), "selection reused outside drafting");
+    }
+    CHECK(first_refuses > 0 && last_refuses > 0, "generated no mixed pool boundaries in both row orders");
+}
+
 int main() {
     std::mt19937 rng(20260930);
+
+    run_draft_rounds(rng);
 
     run_shift_regroups();
     run_compress_chunks();

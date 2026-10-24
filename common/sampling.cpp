@@ -830,6 +830,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
             return id;
         }
+
+        LOG_DBG("%s: no backend-sampled token at idx %d: the CPU samplers run\n", __func__, idx);
     }
 
     // a row a backend cut to its top k holds no other token: as for a sampled token, a grammar or reasoning budget that

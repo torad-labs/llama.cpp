@@ -168,12 +168,14 @@ bool llama_memory_hybrid::get_can_shift() const {
 }
 
 void llama_memory_hybrid::clear(bool data) {
+    mtp_index.clear();
     mem_attn->clear(data);
     if (mem_idx) mem_idx->clear(data);
     mem_recr->clear(data);
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    mtp_index.clear();
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
@@ -184,18 +186,21 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    mtp_index.clear();
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     if (mem_idx) mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
+    mtp_index.clear();
     mem_attn->seq_keep(seq_id);
     if (mem_idx) mem_idx->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    mtp_index.clear();
     // both callers pass an arbitrary bound: a shift that regroups pools marks the sequence's pooled keys stale
     if (mem_idx && hparams.indexer_kpool > 0 && llama_kpool_stale::shift_regroups(hparams.indexer_kpool, p0, p1, shift)) {
         mem_attn->set_kpool_dirty(seq_id);
@@ -206,6 +211,7 @@ void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    mtp_index.clear();
     if (mem_idx && hparams.indexer_kpool > 0 && d != 1) {
         mem_attn->set_kpool_dirty(seq_id);
     }
@@ -247,9 +253,14 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    mtp_index.clear();
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_read(io, seq_id, flags);
-        if (mem_idx) mem_idx->state_read(io, seq_id, flags);
+        if (mem_idx) {
+            mem_idx->state_read(io, seq_id, flags);
+            // A saved dense prefix may have raw keys but no compressed pools.
+            mem_attn->set_kpool_dirty(seq_id);
+        }
     }
     mem_recr->state_read(io, seq_id, flags);
 }
@@ -272,7 +283,8 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * m
     ctx_attn(mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr : mem->get_mem_idx()->init_full()),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())),
+    mtp_index(mem->get_mtp_index()) {
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(
@@ -283,7 +295,8 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
     // the pending per-cell delta must still be cleared or the caches disagree about a shift
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr : mem->get_mem_idx()->init_update(lctx, optimize)),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())),
+    mtp_index(mem->get_mtp_index()) {
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(
@@ -297,7 +310,8 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), this->ubatches)),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())),
+    mtp_index(mem->get_mtp_index()) {
 }
 
 bool llama_memory_hybrid_context::next() {

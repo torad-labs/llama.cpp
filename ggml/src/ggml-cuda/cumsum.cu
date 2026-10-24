@@ -186,27 +186,73 @@ static __global__ void cumsum_kernel(
 }
 
 #ifdef GGML_CUDA_USE_CUB
+// A row too long for one block is scanned in tiles of BLOCK_SIZE*UNROLL_FACTOR elements: each block sums its tile, one
+// block scans those sums, and each block then scans its tile on top of the sum of the tiles before it.  Every sum is
+// taken in one fixed order, so a row comes out the same bits every time; cub::DeviceScan, used here before, adds a
+// tile's predecessors in whatever order they finish, and dist's sampled token moved with it (test-backend-meta-sampler).
+template<typename T, int BLOCK_SIZE, int UNROLL_FACTOR>
+static __global__ void cumsum_tile_sums_kernel(const T * __restrict__ src, T * __restrict__ tile_sums, const int64_t ne) {
+    using BlockReduceT = cub::BlockReduce<T, BLOCK_SIZE>;
+    __shared__ typename BlockReduceT::TempStorage temp_storage;
+
+    const int64_t start = (int64_t) blockIdx.x * BLOCK_SIZE * UNROLL_FACTOR;
+    T thread_sum = T(0);
+#pragma unroll
+    for (int i = 0; i < UNROLL_FACTOR; i++) {
+        const int64_t idx = start + threadIdx.x * UNROLL_FACTOR + i;
+        thread_sum += idx < ne ? src[idx] : T(0);
+    }
+    const T tile_sum = BlockReduceT(temp_storage).Sum(thread_sum);
+    if (threadIdx.x == 0) {
+        tile_sums[blockIdx.x] = tile_sum;
+    }
+}
+
+// tile_prefix[b]: the inclusive scan of the tile sums, so the tiles before tile b sum to tile_prefix[b - 1]
+template<typename T, int BLOCK_SIZE, int UNROLL_FACTOR>
+static __global__ void cumsum_tiles_kernel(const T * __restrict__ src, T * __restrict__ dst,
+        const T * __restrict__ tile_prefix, const int64_t ne) {
+    using BlockScanT = cub::BlockScan<T, BLOCK_SIZE>;
+    __shared__ typename BlockScanT::TempStorage temp_storage;
+
+    const int64_t start = (int64_t) blockIdx.x * BLOCK_SIZE * UNROLL_FACTOR;
+    T items[UNROLL_FACTOR];
+    T thread_sum = T(0);
+#pragma unroll
+    for (int i = 0; i < UNROLL_FACTOR; i++) {
+        const int64_t idx = start + threadIdx.x * UNROLL_FACTOR + i;
+        thread_sum += idx < ne ? src[idx] : T(0);
+        items[i] = thread_sum;
+    }
+    T thread_prefix;
+    BlockScanT(temp_storage).InclusiveSum(thread_sum, thread_prefix);
+
+    const T carry = blockIdx.x == 0 ? T(0) : tile_prefix[blockIdx.x - 1];
+    const T thread_offset = thread_prefix - thread_sum + carry;
+#pragma unroll
+    for (int i = 0; i < UNROLL_FACTOR; i++) {
+        const int64_t idx = start + threadIdx.x * UNROLL_FACTOR + i;
+        if (idx < ne) {
+            dst[idx] = items[i] + thread_offset;
+        }
+    }
+}
+
 template <typename T>
-static void cumsum_cub(ggml_cuda_pool & pool,
-                       const T *        src,
-                       T *              dst,
-                       int64_t          ne,
-                       cudaStream_t     stream) {
-    size_t tmp_size = 0;
+static void cumsum_tiled(ggml_cuda_pool & pool, const T * src, T * dst, const int64_t ne, cudaStream_t stream) {
+    constexpr int UNROLL_FACTOR = 4;
+    constexpr int TILE_SIZE     = CUDA_CUMSUM_BLOCK_SIZE * UNROLL_FACTOR;
+    const int64_t n_tiles = (ne + TILE_SIZE - 1) / TILE_SIZE;
 
-    // Query how much temp storage CUDA UnBound (CUB) needs
-    cub::DeviceScan::InclusiveSum(nullptr,   // d_temp_storage (null = just query size)
-                                  tmp_size,  // reference to size (will be set by CUB)
-                                  src,       // input pointer
-                                  dst,       // output pointer
-                                  ne,        // number of elements
-                                  stream     // CUDA stream to use
-    );
+    ggml_cuda_pool_alloc<T> tile_sums(pool, n_tiles);
+    ggml_cuda_pool_alloc<T> tile_prefix(pool, n_tiles);
 
-    ggml_cuda_pool_alloc<uint8_t> tmp_alloc(pool, tmp_size);
-
-    // Perform the inclusive scan
-    cub::DeviceScan::InclusiveSum((void *) tmp_alloc.get(), tmp_size, src, dst, ne, stream);
+    cumsum_tile_sums_kernel<T, CUDA_CUMSUM_BLOCK_SIZE, UNROLL_FACTOR><<<n_tiles, CUDA_CUMSUM_BLOCK_SIZE, 0, stream>>>(
+        src, tile_sums.get(), ne);
+    cumsum_cub_kernel<T, CUDA_CUMSUM_BLOCK_SIZE><<<dim3(1, 1, 1), CUDA_CUMSUM_BLOCK_SIZE, 0, stream>>>(
+        tile_sums.get(), tile_prefix.get(), n_tiles, 1, 1, 1, n_tiles, n_tiles, n_tiles, n_tiles, n_tiles, n_tiles);
+    cumsum_tiles_kernel<T, CUDA_CUMSUM_BLOCK_SIZE, UNROLL_FACTOR><<<n_tiles, CUDA_CUMSUM_BLOCK_SIZE, 0, stream>>>(
+        src, dst, tile_prefix.get(), ne);
 }
 #endif // GGML_CUDA_USE_CUB
 
@@ -231,7 +277,7 @@ static void cumsum_cuda(
         // Heuristics were determined as part of https://github.com/ggml-org/llama.cpp/pull/17004
         if (((nrows == 1) && (ne00 > 1024)) || (ne00 / nrows > 4096)) {
             for (int i=0; i<nrows; i++) {
-                cumsum_cub(ctx.pool(), src + i * ne00, dst + i * ne00, ne00, stream);
+                cumsum_tiled(ctx.pool(), src + i * ne00, dst + i * ne00, ne00, stream);
             }
             return;
         }

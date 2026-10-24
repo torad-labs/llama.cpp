@@ -1067,6 +1067,30 @@ static __device__ __forceinline__ float vec_dot_q5_1_q8_1(
     return vec_dot_q5_1_q8_1_impl<VDR_Q5_1_Q8_1_MMVQ>(vl, vh, u, bq5_1->dm, bq8_1->ds);
 }
 
+// The loads of vec_dot_q8_0_q8_1 below, apart from its math: mul_mat_vec_q issues several K steps' loads before their dot
+// products (vec_dot_q8_0_q8_1_impl), with the same values. vec_dot_q8_0_q8_1 keeps its own, so its kernels' code is as it was.
+static __device__ __forceinline__ void load_q8_0_mmvq(
+    const void * __restrict__ vbq, const int kbx, const int iqs, int * v, half & d8_0) {
+
+    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
+
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b2(bq8_0->qs, iqs + i);
+    }
+    d8_0 = bq8_0->d;
+}
+
+static __device__ __forceinline__ void load_q8_1_mmvq_q8_0(
+    const block_q8_1 * __restrict__ bq8_1, const int iqs, int * u, half & d8_1) {
+
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        u[i] = get_int_b4(bq8_1->qs, iqs + i);
+    }
+    d8_1 = __low2half(bq8_1->ds);
+}
+
 static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

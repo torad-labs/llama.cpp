@@ -621,6 +621,7 @@ struct llama_model {
     // the MTP draft head's vocabulary (set_draft_vocab): the LM head's rows for these token ids only, so a draft
     // step reads n_ids rows of the head instead of n_vocab; the graph scores those and every other logit is -inf
     struct ggml_tensor * output_draft     = nullptr;
+    struct ggml_tensor * output_draft_s   = nullptr;
     struct ggml_tensor * output_draft_ids = nullptr;
 
     // NextN/MTP model-level projections

@@ -533,6 +533,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
 
+    // A dense prefix can have raw keys but no pooled keys yet. Whether cells
+    // are shared or copied, its child must rebuild those keys before scoring.
+    kpool_stale.inherit(seq_id_src, seq_id_dst);
+
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
 
@@ -1307,6 +1311,12 @@ void llama_kpool_stale::mark(llama_seq_id seq_id) {
     seqs.set(seq_id);
 }
 
+void llama_kpool_stale::inherit(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    if (seqs.test(seq_id_src)) {
+        seqs.set(seq_id_dst);
+    }
+}
+
 bool llama_kpool_stale::any(const llama_ubatch & ubatch) const {
     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
         if (seqs.test(ubatch.seq_id_unq[s])) {
@@ -1323,7 +1333,7 @@ void llama_kpool_stale::clear(const llama_ubatch & ubatch) {
     }
 }
 
-void llama_kv_cache::set_kpool_dirty(llama_seq_id seq_id) {
+void llama_kv_cache::set_kpool_dirty(llama_seq_id seq_id) const {
     kpool_stale.mark(seq_id);
 }
 

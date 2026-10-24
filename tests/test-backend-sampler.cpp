@@ -28,14 +28,39 @@ struct test_args {
 
 struct test_params {
     llama_model_ptr model;
+    std::string     model_path;
 };
+
+// -sm tensor: the model split by tensor parallelism over the first two GPUs, or over the first GPU twice
+static void set_tensor_split(llama_model_params & mparams, ggml_backend_dev_t devs[3]) {
+    std::vector<ggml_backend_dev_t> gpus;
+    for (size_t i = 0; i < ggml_backend_dev_count() && gpus.size() < 2; i++) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpus.push_back(ggml_backend_dev_get(i));
+        }
+    }
+    GGML_ASSERT(!gpus.empty());
+    devs[0] = gpus[0];
+    devs[1] = gpus.size() > 1 ? gpus[1] : gpus[0];
+    devs[2] = nullptr;
+    mparams.devices      = devs;
+    mparams.n_gpu_layers = 999;
+    mparams.split_mode   = LLAMA_SPLIT_MODE_TENSOR;
+}
 
 static llama_model_ptr load_model(const test_args & args) {
     auto mparams = llama_model_default_params();
 
-    ggml_backend_dev_t devs[2] = { nullptr, nullptr };
+    ggml_backend_dev_t devs[3] = { nullptr, nullptr, nullptr };
 
-    if (args.device != "auto") {
+    if (args.device == "tensor") {
+        if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr) {
+            fprintf(stderr, "Error: -sm tensor requested but no GPU is available\n");
+            return nullptr;
+        }
+        set_tensor_split(mparams, devs);
+        fprintf(stderr, "Using -sm tensor over: %s, %s\n", ggml_backend_dev_name(devs[0]), ggml_backend_dev_name(devs[1]));
+    } else if (args.device != "auto") {
         if (args.device == "gpu") {
             devs[0] = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
 
@@ -2172,6 +2197,427 @@ static void test_backend_multi_output_cpu_suffix(const test_params & params) {
     printf("backend multi-output CPU suffix test PASSED\n");
 }
 
+// GOAL: Marcos serves GLM-5.3 Flash on two GPUs with -sm tensor and MTP drafts, sampled at temp 1.0, top-p 0.95 and
+// repeat penalty 1.1 over the last 256 tokens. Under -sm tensor the engine refused backend sampling and sampled every
+// sequence on the CPU, the MTP drafter's top-k 10 chain too. With the model split by -sm tensor:
+//   - the served chain and a greedy chain run in the graph: each output has its sampled token, step after step,
+//   - the greedy token is the argmax of the logits the same model gives a context with no backend sampler,
+//   - the drafter's chain (top-k 10, dist) attached with llama_set_sampler is taken (it returns true) and draws a token
+//     among those 10.
+// That the chains draw exactly the tokens one device draws for the same logits is test-backend-meta-sampler's.
+static void test_backend_tensor_split(const test_params & params) {
+    if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr) {
+        printf("no GPU for -sm tensor, skipped\n");
+        return;
+    }
+
+    auto mparams = llama_model_default_params();
+    ggml_backend_dev_t devs[3];
+    set_tensor_split(mparams, devs);
+    test_params tp = {
+        /*.model      =*/ llama_model_ptr(llama_model_load_from_file(params.model_path.c_str(), mparams)),
+        /*.model_path =*/ params.model_path,
+    };
+    GGML_ASSERT(tp.model && "failed to load the model with -sm tensor");
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(tp.model.get()));
+
+    llama_sampler_ptr served(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(served.get(), llama_sampler_init_penalties(n_vocab, 256, 1.1f, 0.0f, 0.0f));
+    llama_sampler_chain_add(served.get(), llama_sampler_init_top_p(0.95f, 0));
+    llama_sampler_chain_add(served.get(), llama_sampler_init_temp(1.0f));
+    llama_sampler_chain_add(served.get(), llama_sampler_init_dist(88));
+    llama_sampler_ptr greedy(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(greedy.get(), llama_sampler_init_greedy());
+    std::vector<llama_sampler_seq_config> configs = {{ 0, served.get() }, { 1, greedy.get() }};
+    std::vector<llama_sampler_seq_config> no_configs;
+
+    test_context test_ctx(tp, configs);
+    test_context ref_ctx(tp, no_configs, 2);
+
+    const std::map<llama_seq_id, std::string> prompts = {{0, "Hello"}, {1, "Some"}};
+    GGML_ASSERT(test_ctx.decode(prompts));
+    GGML_ASSERT(ref_ctx.decode(prompts));
+
+    auto argmax = [&](int32_t idx) {
+        const float * logits = llama_get_logits_ith(ref_ctx.ctx.get(), idx);
+        GGML_ASSERT(logits != nullptr);
+        return (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+    };
+
+    for (int step = 0; step < 4; step++) {
+        const llama_token tok_served = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(0));
+        const llama_token tok_greedy = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(1));
+        const llama_token tok_ref    = argmax(ref_ctx.idx_for_seq(1));
+        printf("step %d: served chain drew %d, greedy drew %d, argmax of the logits %d\n", step, tok_served, tok_greedy,
+            tok_ref);
+        GGML_ASSERT(tok_served >= 0 && tok_served < n_vocab);
+        GGML_ASSERT(tok_greedy == tok_ref);
+
+        const std::map<llama_seq_id, llama_token> next = {{0, tok_served}, {1, tok_greedy}};
+        GGML_ASSERT(test_ctx.decode_tokens(next));
+        GGML_ASSERT(ref_ctx.decode_tokens(next));
+    }
+
+    // the MTP drafter's chain, attached as common_speculative attaches it
+    llama_sampler_ptr draft(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(draft.get(), llama_sampler_init_top_k(10));
+    llama_sampler_chain_add(draft.get(), llama_sampler_init_dist(7));
+    GGML_ASSERT(llama_set_sampler(test_ctx.ctx.get(), 1, draft.get()));
+
+    const llama_token tok_prev = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(1));
+    const std::map<llama_seq_id, llama_token> next = {{1, tok_prev}};
+    GGML_ASSERT(test_ctx.decode_tokens(next));
+    GGML_ASSERT(ref_ctx.decode_tokens(next));
+    const llama_token tok_draft = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(1));
+    const float * logits = llama_get_logits_ith(ref_ctx.ctx.get(), ref_ctx.idx_for_seq(1));
+    GGML_ASSERT(logits != nullptr);
+    GGML_ASSERT(tok_draft >= 0 && tok_draft < n_vocab);
+    int n_above = 0;
+    for (int32_t i = 0; i < n_vocab; i++) {
+        n_above += logits[i] > logits[tok_draft];
+    }
+    printf("draft chain drew %d, %d logits above it\n", tok_draft, n_above);
+    GGML_ASSERT(n_above < 10);
+
+    printf("backend -sm tensor sampling test PASSED\n");
+}
+
+// GOAL: Marcos serves with MTP drafts (n_max 2): each step decodes a verify batch, the last accepted token and the
+// drafts, with one output a draft, and samples every output with his chain (repeat penalty 1.1 over the last 256 tokens,
+// top-p 0.95, temp 1.0, dist). The penalties sampler refused the backend for more than one output a sequence, so every
+// verify round fell back to the CPU sampler. Done means: the chain runs on the backend for a verify batch, and for each
+// output row the penalty uses the history as it stands at that row (the accepted prefix plus the batch's earlier drafts),
+// so each row draws the token the CPU chain draws for the same seed and logits; on one GPU and on a model split by
+// -sm tensor.
+//
+// The CPU reference: a fresh chain with the same seed takes the same prefix, then for each row is applied to the
+// reference context's logits of that row (the same batch, decoded without samplers) and takes the row's draft before
+// the next row, as common_sampler_sample_and_accept_n does while drafts are accepted.
+
+static llama_sampler * make_verify_chain(int32_t n_vocab, uint32_t seed, bool with_dist) {
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_penalties(n_vocab, 256, 1.1f, 0.0f, 0.0f));
+    llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.95f, 0));
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(1.0f));
+    if (with_dist) {
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+    }
+    return chain;
+}
+
+// the candidates left after penalties (with history), top-p and temp on the CPU, by token id, and how far the top-p
+// cut is from p (the GPU sums the probabilities in another order: a candidate at a cut closer than 1e-4 may differ)
+struct cpu_kept_result {
+    std::unordered_map<llama_token, float> logits;
+    float cut_distance = 0.0f;
+    std::vector<double> p_all; // every token's probability after the penalties, before top-p
+};
+
+static cpu_kept_result cpu_kept(
+        int32_t n_vocab, const std::vector<llama_token> & history, const float * logits) {
+    llama_sampler_ptr chain(make_verify_chain(n_vocab, 0, false));
+    for (llama_token t : history) {
+        llama_sampler_accept(chain.get(), t);
+    }
+    std::vector<llama_token_data> data(n_vocab);
+    for (llama_token t = 0; t < n_vocab; ++t) {
+        data[t] = { t, logits[t], 0.0f };
+    }
+    llama_token_data_array arr = { data.data(), data.size(), -1, false };
+    llama_sampler_apply(chain.get(), &arr);
+    cpu_kept_result kept;
+    float cdf = 0.0f;
+    for (size_t i = 0; i < arr.size; ++i) {
+        kept.logits[arr.data[i].id] = arr.data[i].logit;
+        cdf += arr.data[i].p;
+    }
+    const float cdf_before = cdf - arr.data[arr.size - 1].p;
+    kept.cut_distance = std::min(std::fabs(cdf_before - 0.95f), std::fabs(cdf - 0.95f));
+
+    // the distribution top-p cuts: the penalties alone, softmax in double
+    llama_sampler_ptr pen(llama_sampler_init_penalties(n_vocab, 256, 1.1f, 0.0f, 0.0f));
+    for (llama_token t : history) {
+        llama_sampler_accept(pen.get(), t);
+    }
+    for (llama_token t = 0; t < n_vocab; ++t) {
+        data[t] = { t, logits[t], 0.0f };
+    }
+    llama_token_data_array all = { data.data(), data.size(), -1, false };
+    llama_sampler_apply(pen.get(), &all);
+    double max_l = -INFINITY;
+    for (size_t i = 0; i < all.size; ++i) {
+        max_l = std::max(max_l, (double) all.data[i].logit);
+    }
+    kept.p_all.assign(n_vocab, 0.0);
+    double sum = 0.0;
+    for (size_t i = 0; i < all.size; ++i) {
+        const double e = std::exp((double) all.data[i].logit - max_l);
+        kept.p_all[all.data[i].id] = e;
+        sum += e;
+    }
+    for (auto & v : kept.p_all) {
+        v /= sum;
+    }
+    return kept;
+}
+
+static void run_verify_penalties(llama_model * model, const char * where) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const uint32_t seed = 1234;
+    const int n_rows = 3; // the last accepted token and two drafts
+
+    std::vector<llama_token> prompt(64);
+    const std::string text = "The quick brown fox jumps over the lazy dog. A stitch in time saves nine. Once upon a time";
+    const int n_prompt = llama_tokenize(vocab, text.c_str(), text.size(), prompt.data(), prompt.size(), true, false);
+    GGML_ASSERT(n_prompt > 1);
+    prompt.resize(n_prompt);
+    const int32_t n_past = n_prompt - 1; // positions of the prompt before its last token
+
+    auto make_ctx = [&](llama_sampler * smpl) {
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx                 = 512;
+        cparams.n_batch               = 512;
+        cparams.n_seq_max             = 1;
+        cparams.n_outputs_max         = n_rows;
+        cparams.n_outputs_max_per_seq = n_rows;
+        llama_sampler_seq_config config = { 0, smpl };
+        cparams.samplers   = smpl ? &config : nullptr;
+        cparams.n_samplers = smpl ? 1 : 0;
+        llama_context_ptr ctx(llama_init_from_model(model, cparams));
+        GGML_ASSERT(ctx);
+        return ctx;
+    };
+    auto decode = [](llama_context * ctx, const std::vector<llama_token> & tokens, int32_t pos0, bool all_out, bool last_out) {
+        llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            common_batch_add(batch, tokens[i], pos0 + i, { 0 }, all_out || (last_out && i + 1 == tokens.size()));
+        }
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        llama_batch_free(batch);
+    };
+    auto argmax_excluding = [&](const float * logits, const std::unordered_set<llama_token> & excluded, int nth) {
+        std::vector<llama_token> order(n_vocab);
+        for (llama_token t = 0; t < n_vocab; ++t) {
+            order[t] = t;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](llama_token a, llama_token b) { return logits[a] > logits[b]; });
+        for (llama_token t : order) {
+            if (excluded.count(t) == 0 && nth-- == 0) {
+                return t;
+            }
+        }
+        GGML_ABORT("no token left");
+    };
+
+    // drafts the penalty can be seen on: neither is in the prefix, and at a later row one of them survives top-p, so a
+    // row that missed its earlier drafts would keep a different logit for it
+    const std::unordered_set<llama_token> in_prefix(prompt.begin(), prompt.end());
+    llama_token d1 = -1;
+    llama_token d2 = -1;
+    {
+        llama_context_ptr scratch = make_ctx(nullptr);
+        decode(scratch.get(), prompt, 0, false, true);
+        const std::vector<float> l0(llama_get_logits_ith(scratch.get(), -1), llama_get_logits_ith(scratch.get(), -1) + n_vocab);
+        for (int nth = 0; nth < 20 && d2 < 0; ++nth) {
+            const llama_token c1 = argmax_excluding(l0.data(), in_prefix, nth);
+            llama_memory_seq_rm(llama_get_memory(scratch.get()), 0, n_prompt, -1);
+            decode(scratch.get(), { c1 }, n_prompt, false, true);
+            const std::vector<float> l1(llama_get_logits_ith(scratch.get(), -1), llama_get_logits_ith(scratch.get(), -1) + n_vocab);
+            std::unordered_set<llama_token> excluded = in_prefix;
+            excluded.insert(c1);
+            const llama_token c2 = argmax_excluding(l1.data(), excluded, 0);
+            decode(scratch.get(), { c2 }, n_prompt + 1, false, true);
+            const float * l2 = llama_get_logits_ith(scratch.get(), -1);
+
+            std::vector<llama_token> h1(prompt);
+            h1.push_back(c1);
+            std::vector<llama_token> h2(h1);
+            h2.push_back(c2);
+            const auto k1 = cpu_kept(n_vocab, h1, l1.data());
+            const auto k2 = cpu_kept(n_vocab, h2, l2);
+            if (k1.logits.count(c1) || k2.logits.count(c1) || k2.logits.count(c2)) {
+                d1 = c1;
+                d2 = c2;
+            }
+        }
+    }
+    GGML_ASSERT(d2 >= 0 && "no drafts whose penalty shows at a later row; pick another prompt");
+    const std::vector<llama_token> verify = { prompt.back(), d1, d2 };
+    printf("[%s] verify batch: last accepted %d, drafts %d %d\n", where, verify[0], d1, d2);
+
+    llama_sampler_ptr chain(make_verify_chain(n_vocab, seed, true));
+    llama_context_ptr ctx     = make_ctx(chain.get());
+    llama_context_ptr ref_ctx = make_ctx(nullptr);
+
+    // the prefix: the prompt, decoded without outputs, and taken into the chain as the server takes it
+    const std::vector<llama_token> head(prompt.begin(), prompt.begin() + n_past);
+    decode(ctx.get(),     head, 0, false, false);
+    decode(ref_ctx.get(), head, 0, false, false);
+    llama_sampler_ptr cpu(make_verify_chain(n_vocab, seed, true));
+    for (llama_token t : prompt) {
+        llama_sampler_accept(chain.get(), t);
+        llama_sampler_accept(cpu.get(), t);
+    }
+
+    decode(ctx.get(),     verify, n_past, true, false);
+    decode(ref_ctx.get(), verify, n_past, true, false);
+
+    // every token's penalized logit, row by row: with the penalties alone before dist, the backend hands back the
+    // whole row, so a token the history at that row penalizes shows whether or not it would survive top-p
+    {
+        llama_sampler_ptr pen_chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(pen_chain.get(), llama_sampler_init_penalties(n_vocab, 256, 1.1f, 0.0f, 0.0f));
+        llama_sampler_chain_add(pen_chain.get(), llama_sampler_init_dist(seed));
+        llama_context_ptr pctx = make_ctx(pen_chain.get());
+        decode(pctx.get(), head, 0, false, false);
+        for (llama_token t : prompt) {
+            llama_sampler_accept(pen_chain.get(), t);
+        }
+        decode(pctx.get(), verify, n_past, true, false);
+
+        std::vector<llama_token> h(prompt);
+        for (int row = 0; row < n_rows; ++row) {
+            llama_sampler_ptr pen(llama_sampler_init_penalties(n_vocab, 256, 1.1f, 0.0f, 0.0f));
+            for (llama_token t : h) {
+                llama_sampler_accept(pen.get(), t);
+            }
+            const float * logits = llama_get_logits_ith(ref_ctx.get(), row);
+            std::vector<llama_token_data> data(n_vocab);
+            for (llama_token t = 0; t < n_vocab; ++t) {
+                data[t] = { t, logits[t], 0.0f };
+            }
+            llama_token_data_array arr = { data.data(), data.size(), -1, false };
+            llama_sampler_apply(pen.get(), &arr);
+
+            const float *       b   = llama_get_sampled_logits_ith(pctx.get(), row);
+            const llama_token * bc  = llama_get_sampled_candidates_ith(pctx.get(), row);
+            const uint32_t      n_b = llama_get_sampled_logits_count_ith(pctx.get(), row);
+            GGML_ASSERT(b != nullptr && n_b == (uint32_t) n_vocab && "the penalized row did not come back whole");
+            size_t      n_bad   = 0;
+            llama_token worst_t = -1;
+            float       worst   = 0.0f;
+            for (uint32_t i = 0; i < n_b; ++i) {
+                const llama_token t = bc ? bc[i] : (llama_token) i;
+                const float diff = std::fabs(b[i] - data[t].logit);
+                if (diff > 1e-5f * std::max(1.0f, std::fabs(data[t].logit))) {
+                    n_bad++;
+                    if (diff > worst) {
+                        worst   = diff;
+                        worst_t = t;
+                    }
+                }
+            }
+            printf("[%s] row %d: %zu penalized logits differ from the CPU's (worst token %d by %g)\n", where, row, n_bad,
+                worst_t, worst);
+            GGML_ASSERT(n_bad == 0 && "a token's penalized logit differs from the CPU chain's at the history of its row");
+            if (row + 1 < n_rows) {
+                h.push_back(verify[row + 1]);
+            }
+        }
+    }
+
+    std::vector<llama_token> history(prompt);
+    for (int row = 0; row < n_rows; ++row) {
+        const float * logits = llama_get_logits_ith(ref_ctx.get(), row);
+        GGML_ASSERT(logits != nullptr);
+
+        std::vector<llama_token_data> data(n_vocab);
+        for (llama_token t = 0; t < n_vocab; ++t) {
+            data[t] = { t, logits[t], 0.0f };
+        }
+        llama_token_data_array arr = { data.data(), data.size(), -1, false };
+        llama_sampler_apply(cpu.get(), &arr);
+        GGML_ASSERT(arr.selected >= 0);
+        const llama_token tok_cpu = arr.data[arr.selected].id;
+        const auto kept = cpu_kept(n_vocab, history, logits);
+
+        const llama_token tok_backend = llama_get_sampled_token_ith(ctx.get(), row);
+        printf("[%s] row %d: backend drew %d, CPU chain drew %d, %zu candidates kept\n", where, row, tok_backend, tok_cpu,
+            kept.logits.size());
+        GGML_ASSERT(tok_backend >= 0 && tok_backend < n_vocab && "the row was not sampled on the backend");
+
+        // the backend's candidates after the chain: the CPU's penalized logits, and the top-p set of the row's distribution
+        const float *       b_logits = llama_get_sampled_logits_ith(ctx.get(), row);
+        const llama_token * b_cands  = llama_get_sampled_candidates_ith(ctx.get(), row);
+        const uint32_t      n_b      = llama_get_sampled_logits_count_ith(ctx.get(), row);
+        GGML_ASSERT(b_logits != nullptr && b_cands != nullptr);
+        size_t n_matched      = 0;
+        size_t n_backend_only = 0;
+        double m_b            = 0.0; // the backend's kept mass, in double precision
+        double p_b_min        = 1.0;
+        std::vector<bool> b_kept(n_vocab, false);
+        for (uint32_t i = 0; i < n_b; ++i) {
+            if (!std::isfinite(b_logits[i])) {
+                continue;
+            }
+            const llama_token t = b_cands[i];
+            b_kept[t] = true;
+            m_b    += kept.p_all[t];
+            p_b_min = std::min(p_b_min, kept.p_all[t]);
+            const auto it = kept.logits.find(t);
+            if (it == kept.logits.end()) {
+                n_backend_only++;
+                continue;
+            }
+            n_matched++;
+            GGML_ASSERT(std::fabs(b_logits[i] - it->second) <= 1e-5f * std::max(1.0f, std::fabs(it->second)) &&
+                "a kept candidate's penalized logit differs from the CPU chain's");
+        }
+        double p_out_max = 0.0;
+        for (llama_token t = 0; t < n_vocab; ++t) {
+            if (!b_kept[t]) {
+                p_out_max = std::max(p_out_max, kept.p_all[t]);
+            }
+        }
+        printf("[%s] row %d: the backend keeps %zu candidates holding %.7f of the row\n", where, row,
+            n_matched + n_backend_only, m_b);
+        // top-p judged in double precision: the likeliest tokens, and the fewest of them whose mass reaches p, within
+        // the float error of a cumulative sum
+        GGML_ASSERT(p_out_max <= p_b_min * (1.0 + 1e-6) && "the backend left out a token likelier than one it kept");
+        GGML_ASSERT(m_b >= 0.95 - 1e-5 && m_b - p_b_min < 0.95 + 1e-5 &&
+            "the backend's top-p set is not the smallest one reaching p");
+
+        const size_t n_cpu_only = kept.logits.size() - n_matched;
+        if (n_backend_only != 0 || n_cpu_only != 0) {
+            // the CPU chain sums a row's probabilities in float32, one token after another over the whole vocabulary:
+            // on a flat row that sum drifts, its top-p cut moves off the row's own, and the draws over the two sets
+            // cannot be compared
+            double m_c = 0.0;
+            for (const auto & [t, l] : kept.logits) {
+                m_c += kept.p_all[t];
+            }
+            printf("[%s] row %d: the CPU chain keeps %zu holding %.7f (%zu only on the backend, %zu only on the CPU): "
+                "its float32 softmax moved the cut, the draws are not compared\n", where, row, kept.logits.size(), m_c,
+                n_backend_only, n_cpu_only);
+        } else {
+            GGML_ASSERT(tok_backend == tok_cpu && "the backend drew another token than the CPU chain from the same set");
+        }
+
+        if (row + 1 < n_rows) {
+            llama_sampler_accept(cpu.get(), verify[row + 1]);
+            history.push_back(verify[row + 1]);
+        }
+    }
+
+    printf("[%s] backend penalties verify batch test PASSED\n", where);
+}
+
+static void test_backend_verify_penalties(const test_params & params) {
+    run_verify_penalties(params.model.get(), "model as loaded");
+
+    if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr) {
+        printf("no GPU for -sm tensor, skipped that half\n");
+        return;
+    }
+    auto mparams = llama_model_default_params();
+    ggml_backend_dev_t devs[3];
+    set_tensor_split(mparams, devs);
+    llama_model_ptr split(llama_model_load_from_file(params.model_path.c_str(), mparams));
+    GGML_ASSERT(split && "failed to load the model with -sm tensor");
+    run_verify_penalties(split.get(), "-sm tensor");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2202,6 +2648,8 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "min_p",           test_backend_min_p_sampling,          true  },
     { "cpu_mixed",       test_backend_cpu_mixed_batch,         true  },
     { "top_p",           test_backend_top_p_sampling,          true  },
+    { "tensor_split",    test_backend_tensor_split,            true  },
+    { "verify_penalties", test_backend_verify_penalties,       true  },
 };
 
 static test_args parse_cli(int argc, char ** argv) {
@@ -2255,8 +2703,8 @@ static test_args parse_cli(int argc, char ** argv) {
         exit(EXIT_FAILURE);
     }
 
-    if (out.device != "cpu" && out.device != "gpu" && out.device != "auto") {
-        fprintf(stderr, "Invalid device '%s'. Must be 'cpu', 'gpu' or 'auto'\n", out.device.c_str());
+    if (out.device != "cpu" && out.device != "gpu" && out.device != "tensor" && out.device != "auto") {
+        fprintf(stderr, "Invalid device '%s'. Must be 'cpu', 'gpu', 'tensor' or 'auto'\n", out.device.c_str());
         exit(EXIT_FAILURE);
     }
 
@@ -2339,7 +2787,8 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     test_params params = {
-        /*.model =*/ load_model(args),
+        /*.model      =*/ load_model(args),
+        /*.model_path =*/ args.model,
     };
 
     const std::vector<const backend_test_case *> tests = collect_tests_to_run(args.test);

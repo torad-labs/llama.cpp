@@ -772,7 +772,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         const int64_t n_vocab = head_w->ne[1];
         const int64_t n_hot   = model.output_draft->ne[1];
         const int64_t n_out   = cur->ne[1];
-        ggml_tensor * hot = build_lora_mm(model.output_draft, cur, nullptr);
+        ggml_tensor * hot = build_lora_mm(model.output_draft, cur, model.output_draft_s);
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+            hot = ggml_pad(ctx0, hot, 32 - n_hot % 32, 0, 0, 0);
+            hot = ggml_cont(ctx0, ggml_view_2d(ctx0, hot, n_hot, n_out, hot->nb[1], 0));
+        }
         cb(hot, "mtp_draft_logits", -1);
         ggml_tensor * full = ggml_fill_inplace(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
         cur = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, hot, 1, n_hot, n_out), model.output_draft_ids);

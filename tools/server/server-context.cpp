@@ -1134,9 +1134,9 @@ private:
         // server would serve as if they had been taken (a vocabulary file never opened, a window never applied)
         const auto & draft_opts = params_base.speculative.draft;
         if (!spec_mtp && (!draft_opts.mtp_vocab.empty() || draft_opts.mtp_swa > 0 || draft_opts.mtp_decode_only ||
-                          draft_opts.mtp_window != common_params_speculative_draft{}.mtp_window)) {
-            SRV_ERR("%s", "--spec-draft-mtp-vocab, --spec-draft-mtp-swa, --spec-draft-mtp-decode-only and "
-                          "--spec-draft-mtp-window need the MTP head drafting (--spec-type draft-mtp)\n");
+                          draft_opts.mtp_window != common_params_speculative_draft{}.mtp_window || draft_opts.mtp_adaptive > 0.0f)) {
+            SRV_ERR("%s", "--spec-draft-mtp-vocab, --spec-draft-mtp-swa, --spec-draft-mtp-decode-only, --spec-draft-mtp-window and "
+                          "--spec-draft-mtp-adaptive need the MTP head drafting (--spec-type draft-mtp)\n");
             return false;
         }
 

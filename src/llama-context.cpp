@@ -287,6 +287,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
+    cparams.logits_gather           = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
@@ -1524,19 +1525,6 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        static bool warned = false;
-        if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-            warned = true;
-        }
-        if (sampling.samplers.count(seq_id) > 0 && reserve_on_detach) {
-            sched_need_reserve = true;
-        }
-        sampling.samplers.erase(seq_id);
-        return false;
-    }
-
     const bool can_offload =
         sampler &&
         sampler->iface->backend_init &&
@@ -1642,6 +1630,8 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // Keep each ubatch's rows before its graph storage can be reused.
+    mtp_index_capture();
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1761,12 +1751,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (gtype == LLM_GRAPH_TYPE_DECODER_MTP && model.arch == LLM_ARCH_GLM5NEXT &&
+        res->t_mtp_index && ubatch.n_tokens == ubatch.n_seqs_unq) {
+        auto * hybrid = static_cast<llama_memory_hybrid *>(memory.get());
+        auto * draft = hybrid->get_mtp_index();
+        bool eligible = draft->active();
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) eligible &= ubatch.n_seq_id[i] == 1;
+        if (eligible) {
+            mtp_index.tensor = res->t_mtp_index;
+            mtp_index.generation = draft->generation();
+            mtp_index.n_kv = static_cast<llama_memory_hybrid_context *>(mctx)->get_attn()->get_n_kv();
+            mtp_index.seqs.resize(ubatch.n_tokens);
+            mtp_index.positions.assign(ubatch.pos, ubatch.pos + ubatch.n_tokens);
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) mtp_index.seqs[i] = ubatch.seq_id[i][0];
+        }
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    mtp_index.tensor = nullptr;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2006,6 +2013,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch & batch_inp) {
     llama_decode_phase_timer t_decode(LLAMA_DECODE_PHASE_DECODE_TOTAL);
+
+    // An unconsumed selection from an earlier decode is not a draft step.
+    mtp_index.tensor = nullptr;
 
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -2765,6 +2775,7 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 void llama_context::graph_results_reset() {
+    mtp_index.tensor = nullptr;
     gf_res_prev->reset();
     for (auto & slot : graph_slots) {
         slot.res->reset();
@@ -4283,6 +4294,35 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_context::mtp_index_capture() {
+    if (!mtp_index.tensor) return;
+    auto * draft = static_cast<llama_memory_hybrid *>(memory.get())->get_mtp_index();
+    if (mtp_index.generation == draft->generation()) {
+        synchronize();
+        const int64_t width = mtp_index.tensor->ne[0];
+        std::vector<int32_t> row(width);
+        for (size_t i = 0; i < mtp_index.seqs.size(); ++i) {
+            ggml_backend_tensor_get(mtp_index.tensor, row.data(), i*width*sizeof(int32_t), width*sizeof(int32_t));
+            draft->capture(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv, row);
+        }
+    }
+    mtp_index.tensor = nullptr;
+}
+
+bool llama_context::mtp_draft_step(int32_t step) {
+    if (model.arch != LLM_ARCH_GLM5NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+        model.hparams.n_layer_nextn != 1 || !memory) return false;
+    auto * draft = static_cast<llama_memory_hybrid *>(memory.get())->get_mtp_index();
+    if (step > 0) mtp_index_capture();
+    mtp_index.tensor = nullptr;
+    draft->advance(step);
+    return true;
+}
+
+bool llama_mtp_draft_step(llama_context * ctx, int32_t step) {
+    return ctx && ctx->mtp_draft_step(step);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

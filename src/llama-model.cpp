@@ -618,7 +618,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // output
-        if (std::regex_match(tensor_name, pattern_output_weight)) {
+        if (std::regex_match(tensor_name, pattern_output_weight) || tensor_name == "output_draft.weight") {
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
@@ -3096,7 +3096,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 void llama_model::set_draft_vocab(const llama_token * ids, size_t n_ids) {
     // only an MTP graph that scores output_draft may be handed one: any other would keep drafting over the full
     // vocabulary while its caller believes the head trimmed
-    if (arch != LLM_ARCH_QWEN35 || hparams.n_layer_nextn == 0) {
+    if ((arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_GLM5NEXT) || hparams.n_layer_nextn == 0) {
         throw std::runtime_error(format("draft vocab: the %s graph has no MTP head that scores a trimmed vocabulary", llm_arch_name(arch)));
     }
     if (output_draft) {
@@ -3108,7 +3108,7 @@ void llama_model::set_draft_vocab(const llama_token * ids, size_t n_ids) {
     if (head == nullptr || head->buffer == nullptr) {
         throw std::runtime_error("draft vocab: the MTP graph's LM head is not loaded");
     }
-    if (head_s) {
+    if (head_s && ggml_nelements(head_s) != 1) {
         throw std::runtime_error(format("draft vocab: %s carries a scale tensor, which a row subset would not", head->name));
     }
     const int64_t n_vocab = head->ne[1];
@@ -3168,6 +3168,7 @@ void llama_model::set_draft_vocab(const llama_token * ids, size_t n_ids) {
         hadamard_rotations[w] = t;
     }
     output_draft     = w;
+    output_draft_s   = head_s;
     output_draft_ids = w_ids;
 
     LLAMA_LOG_INFO("%s: MTP draft vocabulary: %zu of %lld tokens, %.2f of %.2f MiB of %s (%s)\n", __func__,

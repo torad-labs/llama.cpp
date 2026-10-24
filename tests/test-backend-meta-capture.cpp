@@ -6,11 +6,13 @@
 // A stack of feed-forward layers, x = x + down(up(x)), is split over two devices with the up rows and the down columns
 // cut unevenly (n_lo on the first device, the rest on the second), so the second device reaches each all-reduce long
 // after the first: a reduction that took a stale token or slot sums the second device's share of an earlier step.
-// Five graphs, A to E, take x of 1 to 5 columns: A and B are evaluated in turn 6 times each, then C, D and E 3 times
-// each (E's capture evicts A's), then A 3 times (captured again), each time with a new x; every output is compared
-// with the CPU's. The CUDA backend logs each executable it makes; the test counts them, one a device for each capture
-// (A, B, C, D, E, A again), or none under GGML_META_CAPTURE_LEGACY=1. On the first two GPUs, or on the first GPU
-// twice; with no GPU the test is skipped.
+// Five graphs, A to E, take x of 1, 2, 3, 4 and 40 columns: A and B are evaluated in turn 6 times each, then C, D and
+// E 3 times each (E's capture evicts A's), then A 3 times (captured again), each time with a new x; every output is
+// compared with the CPU's. A to D reduce 4 to 16 KB on the BF16 wire, which the LL kernel takes (card to card where the
+// cards can map each other's memory), and E 160 KB, which the chunked kernel takes, so the replays mix the kernels that
+// share the device's token. The CUDA backend logs each executable it makes; the test counts them, one a device for
+// each capture (A, B, C, D, E, A again), or none under GGML_META_CAPTURE_LEGACY=1. On the first two GPUs, or on the
+// first GPU twice; with no GPU the test is skipped.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -44,6 +46,10 @@ static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, v
 struct log_counts {
     int executables  = 0; // ggml_backend_cuda_capture_end made one
     int not_captured = 0; // the meta backend refused a capture
+    size_t p2p_bytes = 0;
+    bool p2p_reported = false;
+    bool p2p_unsupported = false;
+    bool p2p_failed = false;
 };
 
 static void log_cb(ggml_log_level level, const char * text, void * user_data) {
@@ -54,7 +60,15 @@ static void log_cb(ggml_log_level level, const char * text, void * user_data) {
     if (strstr(text, "not captured") != nullptr) {
         counts->not_captured++;
     }
-    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+    const char * p2p = strstr(text, "LL card to card up to ");
+    if (p2p != nullptr) {
+        counts->p2p_reported = sscanf(p2p, "LL card to card up to %zu bytes", &counts->p2p_bytes) == 1;
+    }
+    const bool unsupported = strstr(text, "cannot map each other's memory") != nullptr;
+    counts->p2p_unsupported |= unsupported;
+    const bool error = level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR;
+    counts->p2p_failed |= error && strstr(text, "ggml_cuda_ar_p2p_init") != nullptr;
+    if (error || p2p != nullptr || unsupported) {
         fputs(text, stderr);
     }
 }
@@ -187,15 +201,16 @@ int main() {
     ffn_weights w_cpu(ggml_backend_get_default_buffer_type(cpu), w_data);
 
     // each graph is allocated once by a scheduler of its own, as llama.cpp's graph slots are
-    constexpr int n_graphs = 5;
+    constexpr int     n_graphs        = 5;
+    constexpr int64_t n_tok[n_graphs] = {1, 2, 3, 4, 40};
     std::vector<std::unique_ptr<ffn_graph>> graphs;
     std::vector<std::unique_ptr<ffn_graph>> graphs_cpu;
     std::vector<ggml_backend_sched_t>       scheds;
     std::vector<ggml_backend_sched_t>       scheds_cpu;
     ggml_backend_t backends[2] = {backend, cpu};
     for (int k = 0; k < n_graphs; k++) {
-        graphs.push_back(std::make_unique<ffn_graph>(w_meta.up, w_meta.down, k + 1));
-        graphs_cpu.push_back(std::make_unique<ffn_graph>(w_cpu.up, w_cpu.down, k + 1));
+        graphs.push_back(std::make_unique<ffn_graph>(w_meta.up, w_meta.down, n_tok[k]));
+        graphs_cpu.push_back(std::make_unique<ffn_graph>(w_cpu.up, w_cpu.down, n_tok[k]));
         scheds.push_back(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
         GGML_ASSERT(ggml_backend_sched_alloc_graph(scheds.back(), graphs.back()->gf));
         scheds_cpu.push_back(ggml_backend_sched_new(&cpu, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true));
@@ -236,6 +251,23 @@ int main() {
     printf("%s %d executables made (%d expected), %d graphs not captured\n", ok_captures ? "ok  " : "FAIL",
         counts.executables, executables, counts.not_captured);
     ok = ok && ok_captures;
+
+    const char * ar = getenv("GGML_CUDA_ALLREDUCE");
+    if (ar != nullptr && strcmp(ar, "internal") == 0 && strncmp(ggml_backend_dev_name(gpus[0]), "CUDA", 4) == 0) {
+        const char * value = getenv("GGML_CUDA_AR_P2P_MAX_BYTES");
+        char * end = nullptr;
+        const uint64_t parsed = value == nullptr ? 0 : strtoull(value, &end, 10);
+        const uint64_t requested = value != nullptr && end != value ? parsed : 128*1024;
+        const size_t expected = requested > 1024*1024 ? 1024*1024 : requested;
+        const bool unsupported = counts.p2p_unsupported && gpus[0] != gpus[1];
+        const bool ok_p2p = counts.p2p_reported && !counts.p2p_failed &&
+                           counts.p2p_bytes == (unsupported ? 0 : expected);
+        printf("%s card-to-card limit %zu bytes: %s\n", ok_p2p ? "ok  " : "FAIL", counts.p2p_bytes,
+               unsupported ? "peer unsupported; peer coverage skipped" :
+               counts.p2p_bytes >= 4096 ? "device inboxes exercised" :
+               counts.p2p_bytes > 0 ? "below this test's smallest reduction; peer coverage skipped" : "disabled");
+        ok = ok && ok_p2p;
+    }
 
     for (int k = 0; k < n_graphs; k++) {
         ggml_backend_sched_free(scheds_cpu[k]);

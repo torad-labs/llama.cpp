@@ -12,6 +12,12 @@
 #include <cstring>
 #include <vector>
 
+bool llama_kpool_needs_scoring(int64_t n_kv, uint32_t n_ctx, uint32_t indexer_top_k, uint32_t kpool) {
+    GGML_ASSERT(kpool > 0);
+    static const bool legacy = ggml_env_switch("LLAMA_GLM_SHORT_DENSE_LEGACY");
+    return (legacy ? int64_t(n_ctx) : n_kv) > int64_t(indexer_top_k) + kpool - 1;
+}
+
 uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs) {
     GGML_ASSERT(kpool > 0);
     GGML_ASSERT(n_seqs > 0);
@@ -1156,12 +1162,47 @@ int64_t llama_kv_cache_set_input_kpool(
     return n_tail;
 }
 
+void llama_kpool_draft::capture(llama_seq_id seq, llama_pos pos, int64_t n_kv, const std::vector<int32_t> & cells) {
+    if (active()) rows[seq] = {pos, step, n_kv, cells};
+}
+
+bool llama_kpool_draft::can_reuse(const llama_ubatch & ubatch, int64_t n_kv, int64_t width, uint32_t kpool) const {
+    if (!active() || !kpool || !ubatch.n_tokens || ubatch.n_tokens != ubatch.n_seqs_unq) return false;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id && ubatch.n_seq_id[i] != 1) return false;
+        const auto found = rows.find(ubatch.seq_id[i][0]);
+        if (found == rows.end()) return false;
+        const auto & row = found->second;
+        if (row.n_kv != n_kv || (int64_t) row.cells.size() != width || step <= row.step ||
+            (int64_t) ubatch.pos[i] != (int64_t) row.pos + step - row.step ||
+            (ubatch.pos[i] + 1)/kpool != (row.pos + 1)/kpool) return false;
+    }
+    return true;
+}
+
+void llama_kpool_draft::copy(const llama_ubatch & ubatch, int32_t * dst) const {
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const auto & cells = rows.at(ubatch.seq_id[i][0]).cells;
+        dst = std::copy(cells.begin(), cells.end(), dst);
+    }
+}
+
 void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
     // unconditional: the key/gate STORE runs on the dense path too, or cells below n_select
     // would have no indexer state when the first ubatch crosses it
     mctx_idx->set_input_k_idxs(k_idxs, ubatch);
 
+    if (draft_top_k) {
+        GGML_ASSERT(draft && draft->can_reuse(*ubatch, mctx_attn->get_n_kv(), draft_top_k->ne[0], kpool));
+        GGML_ASSERT(ggml_backend_buffer_is_host(draft_top_k->buffer));
+        draft->copy(*ubatch, (int32_t *) draft_top_k->data);
+    }
+
     if (pool_cells == nullptr) {
+        // Raw keys still change. Build every deferred pool when scoring starts.
+        for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
+            mctx_attn->get_kv()->set_kpool_dirty(ubatch->seq_id_unq[s]);
+        }
         return;
     }
 
