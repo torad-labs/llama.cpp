@@ -66,14 +66,17 @@ def check_quality(records):
 def device_cases():
     cases = []
 
-    def add(name, argv, env=None, count=None, require=None):
-        cases.append(dict(name=name, argv=argv, env=env or {}, cases=count, require=require))
+    def add(name, argv, env=None, count=None, require=None, expected_failure=None):
+        case = dict(name=name, argv=argv, env=env or {}, cases=count, require=require)
+        if expected_failure is not None:
+            case["expected_failure"] = expected_failure
+        cases.append(case)
 
-    def ops(name, op, env, count=None, pattern=None):
+    def ops(name, op, env, count=None, pattern=None, expected_failure=None):
         argv = ["test-backend-ops", "test", "-b", "CUDA0", "-o", op, "--output", "csv", "-j", "1"]
         if pattern:
             argv += ["-p", pattern]
-        add(name, argv, env, count)
+        add(name, argv, env, count, expected_failure=expected_failure)
 
     for gpu in (0, 1):
         card = {"CUDA_VISIBLE_DEVICES": str(gpu)}
@@ -90,6 +93,15 @@ def device_cases():
                           "GGML_CUDA_Q8_TMA_SLOTS": "4" if mode == "tma4" else "2",
                           "GGML_CUDA_MMVQ_Q8_SM120_CHECK": "1"}
             ops(f"q8-readers-{mode}-gpu{gpu}", "Q8_WEIGHT_READERS", env, 203)
+        # With TMA eligible, an invalid slot count must fail. Global legacy must
+        # bypass TMA entirely, so the same unused setting must then be harmless.
+        for legacy in (0, 1):
+            ops(f"q8-legacy-priority-{legacy}-gpu{gpu}", "Q8_WEIGHT_READERS",
+                card | {"GGML_CUDA_Q8_SPLIT": "1", "GGML_CUDA_Q8_TMA": "1",
+                        "GGML_CUDA_Q8_TMA_SLOTS": "invalid", "GGML_CUDA_MMVQ_Q8_SM120_LEGACY": str(legacy),
+                        "GGML_CUDA_MMVQ_Q8_SM120_CHECK": "0"}, 203 if legacy else None,
+                expected_failure=None if legacy else
+                    dict(exit=-6, message="GGML_CUDA_Q8_TMA_SLOTS must be 2 or 4"))
         for compute in ("f16", "bf16", "f32"):
             add(f"q8-cublas-{compute}-gpu{gpu}", ["test-q8-backend-storage", "CUDA0", "--cublas"],
                 card | {"GGML_CUDA_Q8_SPLIT": "1", "GGML_CUDA_CUBLAS_COMPUTE_TYPE": compute},

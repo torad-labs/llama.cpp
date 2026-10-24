@@ -14,6 +14,37 @@ from run_window import Window
 
 
 class WindowProcessTest(unittest.TestCase):
+    def test_negative_device_probe_accepts_only_its_declared_error(self):
+        # A configuration probe may intentionally fail, but a different failure
+        # (or an unexpected success) must close the window like any other error.
+        for exit_code, message, accepted in ((3, "expected-config-error", True),
+                                              (4, "expected-config-error", False),
+                                              (3, "different-error", False),
+                                              (0, "expected-config-error", False)):
+            with self.subTest(exit=exit_code, message=message), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                binaries = root / "candidate-tests"
+                binaries.mkdir()
+                (binaries / "probe").symlink_to(sys.executable)
+                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630))
+                window.profile_env = {}
+                window.out.mkdir()
+                case = dict(name="negative", argv=["probe", "-c",
+                    "import sys; print(sys.argv[1], file=sys.stderr); raise SystemExit(int(sys.argv[2]))",
+                    message, str(exit_code)], env={}, cases=None, require=None,
+                    expected_failure=dict(exit=3, message="expected-config-error"))
+                if accepted:
+                    window.device_case(case)
+                    self.assertFalse(window.failed.is_set())
+                    self.assertEqual(window.command("next", [sys.executable, "-c", "print('continued')"]).strip(),
+                                     "continued")
+                else:
+                    with self.assertRaises(RuntimeError):
+                        window.device_case(case)
+                    self.assertTrue(window.failed.is_set())
+                receipts = json.loads((window.out / "commands.json").read_text())
+                self.assertEqual(receipts[0]["exit"], exit_code)
+
     def test_real_command_keeps_arguments_and_receipt(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

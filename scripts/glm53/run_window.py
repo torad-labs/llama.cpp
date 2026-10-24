@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import signal
 import subprocess
 import sys
@@ -42,7 +43,7 @@ class Window:
         self.env = clean_env() | {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1",
                                   "GGML_CUDA_ALLREDUCE": "internal", "GGML_CUDA_GRAPH_MAX": "0"}
 
-    def command(self, name, argv, env=None, limit=300):
+    def command(self, name, argv, env=None, limit=300, expected_failure=None):
         remaining = min(limit, self.until - time.time())
         if self.failed.is_set() or remaining <= 0:
             raise TimeoutError("mandatory window ended; collect and stop the retained rental")
@@ -63,7 +64,11 @@ class Window:
                     except subprocess.TimeoutExpired:
                         pass
                 rc = child.returncode
-                if rc:
+                if expected_failure is not None:
+                    diagnostic = (self.out / (name + ".log")).read_text()
+                    if not rc or rc != expected_failure["exit"] or expected_failure["message"] not in diagnostic:
+                        raise RuntimeError(f"{name}: expected failure was not observed (exit {rc})")
+                elif rc:
                     raise RuntimeError(f"{name}: exit {rc}")
             except BaseException:
                 self.failed.set()
@@ -80,7 +85,8 @@ class Window:
                     self.records.append(dict(name=name, argv=[str(x) for x in argv],
                                              env={k: v for k, v in (env or self.env).items()
                                                   if k.startswith(("GGML_", "LLAMA_", "CUDA_", "TEST_"))},
-                                             started_epoch=started, ended_epoch=time.time(), exit=child.returncode))
+                                             started_epoch=started, ended_epoch=time.time(), exit=child.returncode,
+                                             expected_failure=expected_failure))
                     write_json(self.out / "commands.json", self.records)
         return (self.out / (name + ".out")).read_text()
 
@@ -88,11 +94,12 @@ class Window:
         env = self.env | self.profile_env | case["env"]
         env["LD_LIBRARY_PATH"] = str(self.root / "candidate-tests") + ":" + str(self.root / "cuda-runtime")
         binary, *argv = case["argv"]
-        output = self.command(case["name"], [self.root / "candidate-tests" / binary, *argv], env, 420)
+        output = self.command(case["name"], [self.root / "candidate-tests" / binary, *argv], env, 420,
+                              expected_failure=case.get("expected_failure"))
         combined = output + (self.out / (case["name"] + ".log")).read_text()
         if case["require"] and case["require"] not in combined:
             raise ValueError(f"{case['name']}: required route was not exercised")
-        if binary == "test-backend-ops":
+        if binary == "test-backend-ops" and case.get("expected_failure") is None:
             validate_device_csv(output, case["cases"])
 
     def preflight(self):
@@ -250,6 +257,9 @@ def main():
         print(json.dumps(dict(profile=args.profile, cases=device_cases(), primary=[1048576, 512],
                               companion=[524288, 1024], stop_at=args.stop_at), indent=2))
         return 0
+    # Configuration probes deliberately abort. Disable their core files in this
+    # process and its children before starting worker threads, without preexec_fn.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
     window = Window(args)
     def interrupted(signum, frame):
         window.failed.set()

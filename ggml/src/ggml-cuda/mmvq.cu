@@ -1856,7 +1856,8 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const auto run = [&](float * out, const bool q8_sm120_legacy) {
-        if (!q8_sm120_legacy && !ids && ggml_cuda_q8_tma(ctx, src0, dst, src1_q8_1, stride_col_y, fusion_local, out)) {
+        if (!q8_sm120_legacy && !mmvq_q8_sm120_env_get().legacy && !ids &&
+            ggml_cuda_q8_tma(ctx, src0, dst, src1_q8_1, stride_col_y, fusion_local, out)) {
             return;
         }
         mul_mat_vec_q_switch_type(

@@ -107,6 +107,20 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         for gpu in (0, 1):
             subset = [c for c in cases if c["env"].get("CUDA_VISIBLE_DEVICES") == str(gpu)]
+            for legacy in (0, 1):
+                name = f"q8-legacy-priority-{legacy}-gpu{gpu}"
+                self.assertIn(name, names)
+                probe = next(c for c in subset if c["name"] == name)
+                self.assertEqual(probe["env"]["GGML_CUDA_Q8_SPLIT"], "1")
+                self.assertEqual(probe["env"]["GGML_CUDA_Q8_TMA"], "1")
+                self.assertEqual(probe["env"]["GGML_CUDA_MMVQ_Q8_SM120_LEGACY"], str(legacy))
+                self.assertEqual(probe["env"]["GGML_CUDA_Q8_TMA_SLOTS"], "invalid")
+                if legacy:
+                    self.assertNotIn("expected_failure", probe)
+                    self.assertEqual(probe["cases"], 203)
+                else:
+                    self.assertEqual(probe["expected_failure"],
+                                     dict(exit=-6, message="GGML_CUDA_Q8_TMA_SLOTS must be 2 or 4"))
             for packing in (0, 1):
                 case = next(c for c in subset if c["name"] == f"q8-meta-cache-p{packing}-gpu{gpu}")
                 self.assertEqual(case["env"]["GGML_CUDA_Q8_SPLIT"], str(packing))
