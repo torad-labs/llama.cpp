@@ -10,7 +10,7 @@ import time
 from types import SimpleNamespace
 import unittest
 
-from run_window import Window
+from run_window import SiblingStopped, Window
 
 
 class WindowProcessTest(unittest.TestCase):
@@ -70,7 +70,7 @@ class WindowProcessTest(unittest.TestCase):
                 os.kill(pid, 0)
             receipt, = json.loads((window.out / "commands.json").read_text())
             self.assertNotEqual(receipt["exit"], 0)
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(SiblingStopped):
                 window.command("later", [sys.executable, "-c", "print('must not run')"])
             self.assertFalse((window.out / "later.out").exists())
 
@@ -95,6 +95,40 @@ class WindowProcessTest(unittest.TestCase):
             receipts = json.loads((window.out / "commands.json").read_text())
             self.assertEqual({r["name"] for r in receipts}, {"other-card", "failed-card"})
             self.assertTrue(all(r["exit"] != 0 for r in receipts))
+
+    def test_a_failure_on_either_card_is_reported_as_itself(self):
+        # Whichever card fails first, the controller must name that case and its
+        # reason, not the other card's stop, and the receipts must say which case
+        # failed validation and which was stopped because of it.
+        header = '"backend_name","op_name","op_params","test_mode","supported","passed","error_message"'
+        for failing in (0, 1):
+            with self.subTest(card=failing), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                binaries = root / "candidate-tests"
+                binaries.mkdir()
+                for name in ("probe", "test-backend-ops"):
+                    (binaries / name).symlink_to(sys.executable)
+                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630))
+                window.profile_env = {}
+                window.out.mkdir()
+                rejected = f'"CUDA0, CUDA0","GATED_DELTA_NET","kda=1,K=3,rows_mode=1","test","0","0","not supported"'
+                cases = [dict(name=f"passing-gpu{failing}", argv=["test-backend-ops", "-c",
+                              f"print({header!r}); print({header.replace('backend_name', 'CUDA0')!r}.replace('supported', '1')"
+                              ".replace('passed', '1').replace('error_message', ''))"],
+                              env={"CUDA_VISIBLE_DEVICES": str(failing)}, cases=1, require=None),
+                         dict(name=f"rejected-gpu{failing}", argv=["test-backend-ops", "-c",
+                              f"print({header!r}); print({rejected!r})"],
+                              env={"CUDA_VISIBLE_DEVICES": str(failing)}, cases=1, require=None),
+                         dict(name=f"waiting-gpu{1 - failing}", argv=["probe", "-c", "import time; time.sleep(60)"],
+                              env={"CUDA_VISIBLE_DEVICES": str(1 - failing)}, cases=None, require=None)]
+                with self.assertRaisesRegex(ValueError, f"rejected-gpu{failing}: .*not supported"):
+                    window.card_matrix(cases)
+                receipts = {r["name"]: r for r in json.loads((window.out / "commands.json").read_text())}
+                self.assertEqual(set(receipts), {f"passing-gpu{failing}", f"rejected-gpu{failing}", f"waiting-gpu{1 - failing}"})
+                self.assertIsNone(receipts[f"passing-gpu{failing}"]["error"])
+                self.assertEqual(receipts[f"rejected-gpu{failing}"]["exit"], 0)
+                self.assertIn("not supported", receipts[f"rejected-gpu{failing}"]["error"])
+                self.assertIn("another command failed", receipts[f"waiting-gpu{1 - failing}"]["error"])
 
 
 if __name__ == "__main__":

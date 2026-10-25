@@ -18,8 +18,8 @@ import sys
 import threading
 import time
 
-from qualification import (BASELINE_ARCHIVE, BASELINE_COMMIT, check_quality,
-                           check_run_identity, device_cases, verify_files, validate_device_csv)
+from qualification import (BASELINE_ARCHIVE, BASELINE_COMMIT, check_quality, check_run_identity,
+                           device_cases, verify_files, validate_arch_table, validate_device_csv)
 from verify_results import evaluate, load_rows, validate_route_observations
 
 
@@ -29,6 +29,10 @@ def clean_env():
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+class SiblingStopped(RuntimeError):
+    """A command stopped because another one failed; never the cause itself."""
 
 
 class Window:
@@ -43,11 +47,16 @@ class Window:
         self.env = clean_env() | {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1",
                                   "GGML_CUDA_ALLREDUCE": "internal", "GGML_CUDA_GRAPH_MAX": "0"}
 
-    def command(self, name, argv, env=None, limit=300, expected_failure=None):
+    def command(self, name, argv, env=None, limit=300, expected_failure=None, check=None):
+        # check(stdout, stderr) runs before the receipt is written, so a failed
+        # validation closes the window and is recorded against its own command.
+        if self.failed.is_set():
+            raise SiblingStopped("another command failed; not starting " + name)
         remaining = min(limit, self.until - time.time())
-        if self.failed.is_set() or remaining <= 0:
+        if remaining <= 0:
             raise TimeoutError("mandatory window ended; collect and stop the retained rental")
         started = time.time()
+        error = None
         with (self.out / (name + ".out")).open("w") as stdout, (self.out / (name + ".log")).open("w") as stderr:
             child = subprocess.Popen([str(x) for x in argv], env=env or self.env, cwd=self.root,
                                      stdout=stdout, stderr=stderr, start_new_session=True)
@@ -55,7 +64,7 @@ class Window:
                 end = time.monotonic() + remaining
                 while child.poll() is None:
                     if self.failed.is_set():
-                        raise RuntimeError("another command failed; stopping the current check")
+                        raise SiblingStopped("another command failed; stopping the current check")
                     left = end - time.monotonic()
                     if left <= 0:
                         raise subprocess.TimeoutExpired(argv, remaining)
@@ -70,7 +79,10 @@ class Window:
                         raise RuntimeError(f"{name}: expected failure was not observed (exit {rc})")
                 elif rc:
                     raise RuntimeError(f"{name}: exit {rc}")
-            except BaseException:
+                if check:
+                    check((self.out / (name + ".out")).read_text(), (self.out / (name + ".log")).read_text())
+            except BaseException as exc:
+                error = f"{type(exc).__name__}: {exc}"
                 self.failed.set()
                 if child.poll() is None:
                     os.killpg(child.pid, signal.SIGTERM)
@@ -86,7 +98,7 @@ class Window:
                                              env={k: v for k, v in (env or self.env).items()
                                                   if k.startswith(("GGML_", "LLAMA_", "CUDA_", "TEST_"))},
                                              started_epoch=started, ended_epoch=time.time(), exit=child.returncode,
-                                             expected_failure=expected_failure))
+                                             expected_failure=expected_failure, error=error))
                     write_json(self.out / "commands.json", self.records)
         return (self.out / (name + ".out")).read_text()
 
@@ -94,13 +106,19 @@ class Window:
         env = self.env | self.profile_env | case["env"]
         env["LD_LIBRARY_PATH"] = str(self.root / "candidate-tests") + ":" + str(self.root / "cuda-runtime")
         binary, *argv = case["argv"]
-        output = self.command(case["name"], [self.root / "candidate-tests" / binary, *argv], env, 420,
-                              expected_failure=case.get("expected_failure"))
-        combined = output + (self.out / (case["name"] + ".log")).read_text()
-        if case["require"] and case["require"] not in combined:
-            raise ValueError(f"{case['name']}: required route was not exercised")
-        if binary == "test-backend-ops" and case.get("expected_failure") is None:
-            validate_device_csv(output, case["cases"])
+
+        def check(output, log):
+            try:
+                if case["require"] and case["require"] not in output + log:
+                    raise ValueError(f"required route was not exercised: {case['require']}")
+                if binary == "test-backend-ops" and case.get("expected_failure") is None:
+                    validate_device_csv(output, case["cases"])
+                if case.get("table"):
+                    validate_arch_table(output, **case["table"])
+            except ValueError as exc:
+                raise ValueError(f"{case['name']}: {exc}") from None
+        self.command(case["name"], [self.root / "candidate-tests" / binary, *argv], env, 420,
+                     expected_failure=case.get("expected_failure"), check=check)
 
     def preflight(self):
         self.out.mkdir(parents=True, exist_ok=False)
@@ -203,11 +221,7 @@ class Window:
         check_quality(quality)
         write_json(self.out / "quality.json", quality)
 
-    def run(self):
-        self.preflight()
-        cases = device_cases()
-        # Verify genuine peer support before doing the longer per-card matrix.
-        self.device_case(next(c for c in cases if c["name"] == "capture-peer"))
+    def card_matrix(self, cases):
         def on_card(card):
             try:
                 for case in cases:
@@ -217,7 +231,18 @@ class Window:
                 self.failed.set()
                 raise
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(on_card, (0, 1)))
+            futures = [pool.submit(on_card, card) for card in (0, 1)]
+        # Both cards have finished; the cause is the failure that was not a stop.
+        errors = [future.exception() for future in futures if future.exception()]
+        if errors:
+            raise next((e for e in errors if not isinstance(e, SiblingStopped)), errors[0])
+
+    def run(self):
+        self.preflight()
+        cases = device_cases()
+        # Verify genuine peer support before doing the longer per-card matrix.
+        self.device_case(next(c for c in cases if c["name"] == "capture-peer"))
+        self.card_matrix(cases)
         for case in cases:
             if case["name"] == "capture-peer":
                 continue

@@ -7,8 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from qualification import (BASELINE_COMMIT, device_cases, check_run_identity,
-                           check_quality, verify_files, validate_device_csv)
+from qualification import (BASELINE_COMMIT, device_cases, check_run_identity, check_quality,
+                           verify_files, validate_arch_table, validate_device_csv)
 
 
 class QualificationTest(unittest.TestCase):
@@ -84,9 +84,72 @@ class QualificationTest(unittest.TestCase):
                        header+'"CUDA0",1,0,""\n',
                        header+'"CUDA0",0,1,""\n',
                        header+'"CUDA0",1,1,"mismatch"\n',
-                       header+'"CPU",1,1,""\n'):
+                       header+'"CPU",1,1,""\n',
+                       header+good*2+'"CUDA0"\n'):
             with self.assertRaises(ValueError):
                 validate_device_csv(output, 3)
+        # test-backend-ops labels an unsupported case with every backend that rejects
+        # one of its tensors, so a rejected case can carry any label but plain CUDA0.
+        # Every CSV row is a case the matrix asked for, whatever its label.
+        for extra in ('"CUDA0, CUDA0",0,0,"not supported"\n', '"CPU",0,0,"not supported"\n'):
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "not supported"):
+                validate_device_csv(header + good*3 + extra, 3)
+        # A mismatch prints its diagnostic on the row's own line, before the quote.
+        with self.assertRaisesRegex(ValueError, "test failed"):
+            validate_device_csv(header + good*2 + '[GATED_DELTA_NET] ERR = 0.1 > 0.0005 "CUDA0",1,0,"test failed"\n', 3)
+        # Every case the matrix runs states how many cases it must see.
+        with self.assertRaises(ValueError):
+            validate_device_csv(header + good*3, None)
+
+    def test_every_backend_ops_case_pins_its_case_count(self):
+        # A filter that silently matches fewer cases, or a backend that drops one,
+        # must fail; only a probe that is meant to abort carries no count.
+        for case in device_cases():
+            if case["argv"][0] == "test-backend-ops" and "expected_failure" not in case:
+                with self.subTest(case=case["name"]):
+                    self.assertIsInstance(case["cases"], int)
+                    self.assertGreater(case["cases"], 0)
+        counts = {c["name"]: c["cases"] for c in device_cases()}
+        for gpu in (0, 1):
+            # 104 gated-delta-net and 70 cache-fusion KDA shapes; 44+16+5 HC shapes.
+            for name in [f"kda-c1-f0-gpu{gpu}"] + [f"kda-c{c}-f{f}-gpu{gpu}" for c in (2, 4) for f in (0, 1)]:
+                self.assertEqual(counts[name], 174, name)
+            for publication in (0, 1):
+                self.assertEqual(counts[f"hc-publication-{publication}-gpu{gpu}"], 65)
+
+    def test_architecture_cases_require_every_device_to_match_the_cpu(self):
+        # test-llama-archs exits 0 when every row is SKIP. On the two-card box each
+        # card and the CPU must match the CPU logits and survive a save/load, and
+        # both tensor splits must match; a tensor split has no roundtrip by design.
+        ok, skip, fail = "\033[1;32mOK\033[0m", "\033[1;33mSKIP\033[0m", "\033[1;31mFAIL\033[0m"
+
+        def table(arch, rows):
+            head = "main: using seed 1234\n|     Model arch.|  Device|Config|   NMSE vs. CPU|Roundtrip|\n|---|---|---|---|---|\n"
+            return head + "".join(f"|{arch:>16}|{device:>24}|{'MoE':>6}|{nmse:>15}|{trip:>20}|\n"
+                                  for device, nmse, trip in rows)
+        good = [("NVIDIA RTX PRO 6000 Blackwell Server Edition", ok + " (1.20e-07)", ok)] * 2 + [
+            ("AMD EPYC 9354 32-Core Processor", ok + " (0.00e+00)", ok),
+            ("Meta", ok + " (2.10e-07)", skip), ("Meta 3:7", ok + " (2.30e-07)", skip)]
+        self.assertTrue(validate_arch_table(table("glm5next", good), "glm5next", 3))
+        cpu_only = [good[2], ("Meta", skip + "           ", skip), ("Meta 3:7", skip + "           ", skip)]
+        broken = {"all skipped": [(d, skip + "           ", skip) for d, _, _ in good],
+                  "no GPU": cpu_only,
+                  "one card missing": good[1:],
+                  "NMSE failed": [good[0], (good[1][0], fail + " (3.00e-02)", ok)] + good[2:],
+                  "MTP vocab": [(good[0][0], "\033[1;31mFAIL MTP vocab\033[0m (1.20e-07)", ok)] + good[1:],
+                  "roundtrip failed": [(good[0][0], good[0][1], fail)] + good[1:],
+                  "card roundtrip skipped": [(good[0][0], good[0][1], skip)] + good[1:],
+                  "split skipped": good[:3] + [("Meta", skip + "           ", skip), good[4]],
+                  "unfinished row": good[:4] + [("Meta 3:7", "", "")]}
+        for label, rows in broken.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                validate_arch_table(table("glm5next", rows), "glm5next", 3)
+        with self.assertRaises(ValueError):
+            validate_arch_table(table("qwen35", good), "glm5next", 3)
+        cases = {c["name"]: c for c in device_cases()}
+        for name, arch in (("glm-architecture", "glm5next"), ("glm-ordinary-cache", "glm5next"),
+                           ("qwen-architecture", "qwen35")):
+            self.assertEqual(cases[name].get("table"), dict(arch=arch, devices=3), name)
 
     def test_all_contexts_must_meet_distribution_contract(self):
         quality = {str(n): {"meanKld": 0, "sameTopP": 100} for n in (2048, 4096, 16384)}

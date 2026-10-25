@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import math
+import re
 
 BASELINE_COMMIT = "776b8f577dec45f2fba79b6a41ae8b782f5fc3b3"
 BASELINE_ARCHIVE = "48358002368846e49d93da500a852f8b6fb51a53655d563fdbdacddb6c8aa4ef"
@@ -20,12 +21,39 @@ def digest(path):
     return sha.hexdigest()
 
 def validate_device_csv(output, count):
-    records = csv.DictReader(io.StringIO("\n".join(line for line in output.splitlines() if line.startswith('"'))))
-    rows = [row for row in records if row.get("backend_name") == "CUDA0"]
-    if (not rows or count is not None and len(rows) != count
-            or any(row.get("supported") not in ("true", "1") or row.get("passed") not in ("true", "1")
-                   or row.get("error_message") for row in rows)):
-        raise ValueError(f"missing, unsupported or failed CUDA cases ({len(rows)})")
+    # An unsupported case is labelled with every backend that rejected one of its
+    # tensors, and a mismatch prints its diagnostic ahead of the row on its line.
+    lines = []
+    for line in output.splitlines():
+        if not line.startswith('"') and '"CUDA0",' in line:
+            line = line[line.index('"CUDA0",'):]
+        if line.startswith('"'):
+            lines.append(line)
+    rows = list(csv.DictReader(io.StringIO("\n".join(lines))))
+    bad = [row for row in rows if row.get("backend_name") != "CUDA0" or row.get("supported") not in ("true", "1")
+           or row.get("passed") not in ("true", "1") or row.get("error_message")]
+    if not isinstance(count, int) or len(rows) != count or bad:
+        named = "; ".join(f"{row.get('backend_name')} {row.get('op_name')} {row.get('op_params')}: "
+                          f"{row.get('error_message') or 'incomplete row'}" for row in bad[:5])
+        raise ValueError(f"{len(rows)} cases reported for {count} required, {len(bad)} not passed on CUDA0"
+                         + (f": {named}" if named else ""))
+    return True
+
+def validate_arch_table(output, arch, devices):
+    # test-llama-archs exits 0 when every row is SKIP. Each single device must match
+    # the CPU logits and its save/load roundtrip; both tensor splits must match too,
+    # and a tensor split has no roundtrip by design.
+    single, splits = [], []
+    for line in re.sub(r"\x1b\[[0-9;]*m", "", output).splitlines():
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) == 7 and cells[1] == arch:
+            (splits if cells[2] in ("Meta", "Meta 3:7") else single).append(cells[2:6])
+    bad = [row for row in single + splits if not row[2].startswith("OK (")]
+    bad += [row for row in single if row[3] != "OK"] + [row for row in splits if row[3] not in ("OK", "SKIP")]
+    if len(single) != devices or sorted(row[0] for row in splits) != ["Meta", "Meta 3:7"] or bad:
+        raise ValueError(f"{arch}: {len(single)} of {devices} devices and {len(splits)} of 2 tensor splits reported"
+                         + "".join(f"; {device} {config}: {nmse or 'no result'}, roundtrip {trip or 'none'}"
+                                   for device, config, nmse, trip in bad))
     return True
 
 def verify_files(root, files):
@@ -117,32 +145,34 @@ def device_cases():
                     count, pattern)
         # GLM never builds rows mode (src[6]), which CUDA rejects by design; the
         # fusion's vars end in kda=1, the op's carry rows_mode right after K.
+        # That leaves 104 gated-delta-net and 70 cache-fusion cases registered.
         for columns in (1, 2, 4):
             for front in (0, 1) if columns > 1 else (0,):
                 ops(f"kda-c{columns}-f{front}-gpu{gpu}", "GATED_DELTA_NET,GATED_DELTA_NET_CACHE_FUSION",
                     card | {"GGML_CUDA_KDA_COLUMNS": str(columns), "GGML_CUDA_KDA_FRONT_SHARED": str(front)},
-                    pattern="kda=1(,K=[0-9]+,rows_mode=0,|$)")
+                    174, "kda=1(,K=[0-9]+,rows_mode=0,|$)")
         for slots in (2, 4, 6, 8):
             ops(f"iq3-s{slots}-gpu{gpu}", "GLM53_MOE_ROUTES",
                 card | {"GGML_CUDA_IQ3_COMPACT": "1", "GGML_CUDA_IQ3_SLOTS": str(slots)},
                 72)
         for publication in (0, 1):
             ops(f"hc-publication-{publication}-gpu{gpu}", "DSV4_HC_PRE_FUSED,DSV4_HC_PRE_Q8_1,DSV4_HC_PRE_POST",
-                card | {"GGML_CUDA_HC_FRONT_ONE": "1", "GGML_CUDA_HC_CTA_PUBLISH": str(publication)})
+                card | {"GGML_CUDA_HC_FRONT_ONE": "1", "GGML_CUDA_HC_CTA_PUBLISH": str(publication)}, 65)
     for route, settings in (("peer", {}), ("host", {"GGML_CUDA_AR_P2P_MAX_BYTES": "0"}),
                             ("mixed", {"GGML_CUDA_AR_P2P_MAX_BYTES": "8192"}),
                             ("duplicate", {"CUDA_VISIBLE_DEVICES": "0"})):
         add(f"capture-{route}", ["test-backend-meta-capture"], settings | {"TEST_GLM_HC": "1"},
             require="device inboxes exercised" if route == "peer" else "OK")
     for name, argv in (
-        ("glm-architecture", ["test-llama-archs", "-a", "glm5next", "-s", "1234"]),
-        ("qwen-architecture", ["test-llama-archs", "-a", "qwen35", "-s", "1234"]),
         ("speculative", ["test-speculative-mtp"]), ("sampling", ["test-sampling"]),
         ("meta-sampler", ["test-backend-meta-sampler"]), ("meta-sourceless", ["test-backend-meta-sourceless"]),
         ("meta-capacity", ["test-backend-meta-capacity", "--gpu"]),
         ("recurrent-arena", ["test-recurrent-arena"]), ("server-counters", ["test-server-speculation-stats"])):
         add(name, argv)
-    # Device ownership fallback and ordinary-cache fallback use a fresh process.
-    add("glm-ordinary-cache", ["test-llama-archs", "-a", "glm5next", "-s", "1234"],
-        {"GGML_CUDA_GDN_STATE_PERSIST": "0"})
+    # Both cards and the CPU, each alone, then both tensor splits. Device ownership
+    # fallback and ordinary-cache fallback use a fresh process.
+    for name, arch, env in (("glm-architecture", "glm5next", None), ("qwen-architecture", "qwen35", None),
+                            ("glm-ordinary-cache", "glm5next", {"GGML_CUDA_GDN_STATE_PERSIST": "0"})):
+        add(name, ["test-llama-archs", "-a", arch, "-s", "1234"], env)
+        cases[-1]["table"] = dict(arch=arch, devices=3)
     return cases
