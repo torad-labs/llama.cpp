@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from qualification import (BASELINE_COMMIT, device_cases, check_run_identity, check_quality,
+from qualification import (BASELINE_COMMIT, device_cases, check_run_identity, check_quality, check_stop_at,
                            verify_files, validate_arch_table, validate_device_csv)
 
 
@@ -157,6 +157,18 @@ class QualificationTest(unittest.TestCase):
         for name, arch in (("glm-architecture", "glm5next"), ("glm-ordinary-cache", "glm5next"),
                            ("qwen-architecture", "qwen35")):
             self.assertEqual(cases[name].get("table"), dict(arch=arch, devices=3), name)
+
+    def test_the_armed_stop_must_fall_inside_the_approved_cap(self):
+        # The cap is the number of hours Marcos approved for the window; one by default.
+        now = 1_000_000.0
+        for stop_in, hours, accepted in ((3500, 1, True), (3700, 1, False), (5000, 1.5, True), (5500, 1.5, False),
+                                         (0, 1, False), (-10, 1.5, False)):
+            with self.subTest(stop_in=stop_in, hours=hours):
+                if accepted:
+                    self.assertTrue(check_stop_at(now + stop_in, now, hours))
+                else:
+                    with self.assertRaisesRegex(ValueError, f"at most {hours:g} hours? away"):
+                        check_stop_at(now + stop_in, now, hours)
 
     def test_all_contexts_must_meet_distribution_contract(self):
         quality = {str(n): {"meanKld": 0, "sameTopP": 100} for n in (2048, 4096, 16384)}

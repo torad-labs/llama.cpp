@@ -88,6 +88,13 @@ def check_run_identity(meta, expected, context, ubatch, profile):
         raise ValueError("serving configuration or artifact identity changed")
     return True
 
+def check_stop_at(stop_at, now, max_hours):
+    # The provider stop is armed before the controller starts, inside the hours approved for the window.
+    if not 0 < stop_at - now <= max_hours * 3600:
+        raise ValueError(f"stop-at must be the armed deadline, at most {max_hours:g} hour{'' if max_hours == 1 else 's'} away")
+    return True
+
+
 def check_quality(records):
     if set(records) != {"2048", "4096", "16384"}:
         raise ValueError("all three distribution contexts are required")

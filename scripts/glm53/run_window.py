@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 
-from qualification import (BASELINE_ARCHIVE, BASELINE_COMMIT, check_quality, check_run_identity,
+from qualification import (BASELINE_ARCHIVE, BASELINE_COMMIT, check_quality, check_run_identity, check_stop_at,
                            device_cases, verify_files, validate_arch_table, validate_device_csv)
 from verify_results import evaluate, load_rows, validate_route_observations
 
@@ -130,8 +130,7 @@ class Window:
 
     def preflight(self):
         self.out.mkdir(parents=True, exist_ok=False)
-        if not 0 < self.args.stop_at - time.time() <= 3600:
-            raise ValueError("stop-at must be the armed deadline, at most one hour away")
+        check_stop_at(self.args.stop_at, time.time(), self.args.max_hours)
         processes = self.command("initial-processes", ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"])
         if processes.strip():
             raise ValueError("the dedicated GPU allocation is occupied")
@@ -311,6 +310,7 @@ def main():
     parser.add_argument("--run-id", required=True, help="unique Rig KLD output prefix")
     parser.add_argument("--profile", choices=("sm120-balanced", "sm120-wide", "sm120-direct"), default="sm120-balanced")
     parser.add_argument("--stop-at", type=float, required=True, help="already armed provider-stop epoch; includes setup")
+    parser.add_argument("--max-hours", type=float, default=1.0, help="the hours approved for the window, setup included")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     if not args.execute:

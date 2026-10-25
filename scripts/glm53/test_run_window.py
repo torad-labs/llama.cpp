@@ -177,12 +177,12 @@ class WindowProcessTest(unittest.TestCase):
     def test_outcome_names_the_stage_and_cause_of_a_failure(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            window = Window(SimpleNamespace(root=root, stop_at=time.time()+7200))
+            window = Window(SimpleNamespace(root=root, stop_at=time.time()+7200, max_hours=1.5))
             with self.assertRaisesRegex(ValueError, "stop-at"):
                 execute(window)
             outcome = json.loads((window.out / "outcome.json").read_text())
             self.assertEqual((outcome["passed"], outcome["stage"]), (False, "preflight"))
-            self.assertRegex(outcome["error"], "^ValueError: stop-at must be the armed deadline")
+            self.assertRegex(outcome["error"], "^ValueError: stop-at must be the armed deadline, at most 1.5 hours away")
 
     def test_the_speed_comparison_comes_before_the_long_serving_checks(self):
         # One hour may not hold every leg; the distribution check and both
