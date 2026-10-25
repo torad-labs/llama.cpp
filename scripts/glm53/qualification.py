@@ -115,11 +115,13 @@ def device_cases():
                     card | {"GGML_CUDA_Q8_SPLIT": "0", "GGML_CUDA_Q8_TMA": "0",
                             "GGML_CUDA_MMVQ_Q8_SM120_CHECK": "1", "GGML_CUDA_MMVQ_Q8_SM120_UNROLL": str(unroll)},
                     count, pattern)
+        # GLM never builds rows mode (src[6]), which CUDA rejects by design; the
+        # fusion's vars end in kda=1, the op's carry rows_mode right after K.
         for columns in (1, 2, 4):
             for front in (0, 1) if columns > 1 else (0,):
                 ops(f"kda-c{columns}-f{front}-gpu{gpu}", "GATED_DELTA_NET,GATED_DELTA_NET_CACHE_FUSION",
                     card | {"GGML_CUDA_KDA_COLUMNS": str(columns), "GGML_CUDA_KDA_FRONT_SHARED": str(front)},
-                    pattern="kda=1")
+                    pattern="kda=1(,K=[0-9]+,rows_mode=0,|$)")
         for slots in (2, 4, 6, 8):
             ops(f"iq3-s{slots}-gpu{gpu}", "GLM53_MOE_ROUTES",
                 card | {"GGML_CUDA_IQ3_COMPACT": "1", "GGML_CUDA_IQ3_SLOTS": str(slots)},

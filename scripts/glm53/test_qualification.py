@@ -1,6 +1,8 @@
 """The paid window must use pinned bytes, matched serving and real device coverage."""
 import copy
 import hashlib
+import itertools
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -146,6 +148,33 @@ class QualificationTest(unittest.TestCase):
             self.assertIn(f"capture-{route}", names)
         self.assertEqual(next(c for c in cases if c["name"] == "capture-peer")["require"],
                          "device inboxes exercised")
+
+    def test_kda_cases_select_every_shape_glm_builds_and_no_rows_mode(self):
+        # glm5next's build_kda_layer never passes state_rows, so the rows-indexed
+        # state read (src[6]) is not on GLM's path and CUDA rejects it by design.
+        # Every other KDA gated-delta-net and KDA cache-fusion shape stays required.
+        # The strings follow test-backend-ops' vars(), which -p searches as a regex.
+        gdn = ("type={ty},head_count=4,head_size={s},n_seq_tokens={t},n_seqs={b},v_repeat={r},permuted={p},"
+               "kda={kda},K={K},rows_mode={rows},cache_rows={c},raw_gates={g},qkv_view={q}")
+        fusion = "type={ty},head_count=4,head_size={s},n_seq_tokens={t},n_seqs={b},K={K},v_repeat={r},raw_gates={g},cache_type={ty}"
+        kda_cases = [c for c in device_cases() if c["name"].startswith("kda-")]
+        self.assertEqual(len(kda_cases), 10)
+        wrong = []
+        for case in kda_cases:
+            pattern = case["argv"][case["argv"].index("-p") + 1]
+            for ty, s, t, b, r, p, kda, K, rows, c, g, q in itertools.product(
+                    ("f32", "f16"), (16, 64, 128), (1, 4, 32, 128), (1, 3), (1, 2), (0, 1), (0, 1),
+                    (1, 2, 9, 17), (0, 1), (-1, 4, 6), (0, 1), (0, 1)):
+                values = dict(ty=ty, s=s, t=t, b=b, r=r, p=p, kda=kda, K=K, rows=rows, c=c, g=g, q=q)
+                text = gdn.format(**values)
+                if bool(re.search(pattern, text)) != (kda == 1 and rows == 0):
+                    wrong.append((case["name"], text))
+                for tail in ("", f",mem_size={c},kv_head=1"):
+                    for row in ("", f",state_row={rows}"):
+                        text = fusion.format(**values) + tail + row + (",kda=1" if kda else "")
+                        if bool(re.search(pattern, text)) != (kda == 1):
+                            wrong.append((case["name"], text))
+        self.assertEqual(wrong[:3], [])
 
 
 if __name__ == "__main__":
