@@ -12814,6 +12814,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, ns,
                     1, false, true, 3, false, -1, true, true));
         }
+        // GLM's own head count on each card (64 KDA heads split over two) at the widths it decodes: 1-3 tokens over
+        // 1-3 slots with q/k/v as conv-output views, and the 3-token verify of two and three slots fused into the cache
+        if (nt <= 3) {
+            for (int64_t ns : { 1, 2, 3 }) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, nt, ns,
+                        1, false, true, 3, false, -1, true, true));
+            }
+        }
+        if (nt == 3) {
+            for (int64_t ns : { 2, 3 }) {
+                test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 32, 128, 3, ns,
+                        3, 1, true, GGML_TYPE_F32, 3, 0, -1, true));
+            }
+        }
         // two and three slots fused into an f32 cache laid out as delta-net-base.cpp lays it out for three slots,
         // starting at each row a batch of that many slots can start at
         for (int64_t ns : { 2, 3 }) {

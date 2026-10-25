@@ -42,13 +42,20 @@ def validate_device_csv(output, count):
 def validate_arch_table(output, arch, devices):
     # test-llama-archs exits 0 when every row is SKIP. Each single device must match
     # the CPU logits and its save/load roundtrip; both tensor splits must match too,
-    # and a tensor split has no roundtrip by design.
+    # and a tensor split has no roundtrip by design. The binary prints OK unless the
+    # NMSE exceeds 1e-4, which a NaN never does, so the value is read here.
+    def nmse_ok(cell):
+        match = re.fullmatch(r"OK \(([^)]*)\)", cell)
+        try:
+            return bool(match) and math.isfinite(float(match[1])) and float(match[1]) <= 1e-4
+        except ValueError:
+            return False
     single, splits = [], []
     for line in re.sub(r"\x1b\[[0-9;]*m", "", output).splitlines():
         cells = [cell.strip() for cell in line.split("|")]
         if len(cells) == 7 and cells[1] == arch:
             (splits if cells[2] in ("Meta", "Meta 3:7") else single).append(cells[2:6])
-    bad = [row for row in single + splits if not row[2].startswith("OK (")]
+    bad = [row for row in single + splits if not nmse_ok(row[2])]
     bad += [row for row in single if row[3] != "OK"] + [row for row in splits if row[3] not in ("OK", "SKIP")]
     if len(single) != devices or sorted(row[0] for row in splits) != ["Meta", "Meta 3:7"] or bad:
         raise ValueError(f"{arch}: {len(single)} of {devices} devices and {len(splits)} of 2 tensor splits reported"
@@ -145,12 +152,12 @@ def device_cases():
                     count, pattern)
         # GLM never builds rows mode (src[6]), which CUDA rejects by design; the
         # fusion's vars end in kda=1, the op's carry rows_mode right after K.
-        # That leaves 104 gated-delta-net and 70 cache-fusion cases registered.
+        # That leaves 113 gated-delta-net and 72 cache-fusion cases registered.
         for columns in (1, 2, 4):
             for front in (0, 1) if columns > 1 else (0,):
                 ops(f"kda-c{columns}-f{front}-gpu{gpu}", "GATED_DELTA_NET,GATED_DELTA_NET_CACHE_FUSION",
                     card | {"GGML_CUDA_KDA_COLUMNS": str(columns), "GGML_CUDA_KDA_FRONT_SHARED": str(front)},
-                    174, "kda=1(,K=[0-9]+,rows_mode=0,|$)")
+                    185, "kda=1(,K=[0-9]+,rows_mode=0,|$)")
         for slots in (2, 4, 6, 8):
             ops(f"iq3-s{slots}-gpu{gpu}", "GLM53_MOE_ROUTES",
                 card | {"GGML_CUDA_IQ3_COMPACT": "1", "GGML_CUDA_IQ3_SLOTS": str(slots)},
@@ -163,12 +170,14 @@ def device_cases():
                             ("duplicate", {"CUDA_VISIBLE_DEVICES": "0"})):
         add(f"capture-{route}", ["test-backend-meta-capture"], settings | {"TEST_GLM_HC": "1"},
             require="device inboxes exercised" if route == "peer" else "OK")
-    for name, argv in (
-        ("speculative", ["test-speculative-mtp"]), ("sampling", ["test-sampling"]),
-        ("meta-sampler", ["test-backend-meta-sampler"]), ("meta-sourceless", ["test-backend-meta-sourceless"]),
-        ("meta-capacity", ["test-backend-meta-capacity", "--gpu"]),
-        ("recurrent-arena", ["test-recurrent-arena"]), ("server-counters", ["test-server-speculation-stats"])):
-        add(name, argv)
+    # Both meta tests exit 0 when they find no GPU; the sampler names the two cards it ran over.
+    for name, argv, require in (
+        ("speculative", ["test-speculative-mtp"], None), ("sampling", ["test-sampling"], None),
+        ("meta-sampler", ["test-backend-meta-sampler"], "meta backend over CUDA0 and CUDA1"),
+        ("meta-sourceless", ["test-backend-meta-sourceless"], "OK"),
+        ("meta-capacity", ["test-backend-meta-capacity", "--gpu"], None),
+        ("recurrent-arena", ["test-recurrent-arena"], None), ("server-counters", ["test-server-speculation-stats"], None)):
+        add(name, argv, require=require)
     # Both cards and the CPU, each alone, then both tensor splits. Device ownership
     # fallback and ordinary-cache fallback use a fresh process.
     for name, arch, env in (("glm-architecture", "glm5next", None), ("qwen-architecture", "qwen35", None),

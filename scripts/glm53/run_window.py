@@ -42,6 +42,7 @@ class Window:
         self.out = self.root / "results"
         self.until = args.stop_at - 600  # 50 minutes mandatory, then collection/stop reserve.
         self.failed = threading.Event()
+        self.stage = "preflight"
         self.records = []
         self.lock = threading.Lock()
         self.env = clean_env() | {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1",
@@ -50,6 +51,7 @@ class Window:
     def command(self, name, argv, env=None, limit=300, expected_failure=None, check=None):
         # check(stdout, stderr) runs before the receipt is written, so a failed
         # validation closes the window and is recorded against its own command.
+        # On a failed exit it still runs, to name what failed.
         if self.failed.is_set():
             raise SiblingStopped("another command failed; not starting " + name)
         remaining = min(limit, self.until - time.time())
@@ -78,7 +80,13 @@ class Window:
                     if not rc or rc != expected_failure["exit"] or expected_failure["message"] not in diagnostic:
                         raise RuntimeError(f"{name}: expected failure was not observed (exit {rc})")
                 elif rc:
-                    raise RuntimeError(f"{name}: exit {rc}")
+                    detail = ""
+                    if check:
+                        try:
+                            check((self.out / (name + ".out")).read_text(), (self.out / (name + ".log")).read_text())
+                        except Exception as exc:
+                            detail = f"; {exc}"
+                    raise RuntimeError(f"{name}: exit {rc}{detail}")
                 if check:
                     check((self.out / (name + ".out")).read_text(), (self.out / (name + ".log")).read_text())
             except BaseException as exc:
@@ -238,23 +246,34 @@ class Window:
             raise next((e for e in errors if not isinstance(e, SiblingStopped)), errors[0])
 
     def run(self):
+        self.stage = "preflight"
         self.preflight()
         cases = device_cases()
         # Verify genuine peer support before doing the longer per-card matrix.
+        self.stage = "capture-peer"
         self.device_case(next(c for c in cases if c["name"] == "capture-peer"))
+        self.stage = "card-matrix"
         self.card_matrix(cases)
         for case in cases:
             if case["name"] == "capture-peer":
                 continue
             if case["env"].get("CUDA_VISIBLE_DEVICES") not in ("0", "1") or case["name"] == "capture-duplicate":
+                self.stage = case["name"]
                 self.device_case(case)
-        self.serve("serving-semantics", "candidate", 1048576, 512, "semantics")
-        self.serve("capacity-32k", "candidate", 524288, 1024, "concurrency")
-        self.serve("capacity-128k", "candidate", 1048576, 512, "capacity")
+        # The distribution check and both comparisons come first, so a window that
+        # runs out of time has already answered whether the candidate is faster.
+        self.stage = "quality"
         self.quality()
+        self.stage = "primary"
         primary = self.compare("primary", 1048576, 512)
+        self.stage = "companion"
         companion = self.compare("companion", 524288, 1024)
-        self.serve("route-diagnostics", "candidate", 1048576, 512, "diagnostic")
+        for name, context, ubatch, mode in (("serving-semantics", 1048576, 512, "semantics"),
+                                            ("capacity-32k", 524288, 1024, "concurrency"),
+                                            ("capacity-128k", 1048576, 512, "capacity"),
+                                            ("route-diagnostics", 1048576, 512, "diagnostic")):
+            self.stage = name
+            self.serve(name, "candidate", context, ubatch, mode)
         routes = [json.loads(line.split("GLM_ROUTE_STATS ", 1)[1])
                   for line in (self.out / "route-diagnostics/server.log").read_text().splitlines()
                   if "GLM_ROUTE_STATS " in line]
@@ -262,7 +281,23 @@ class Window:
             raise ValueError("missing or inconsistent per-device route observations")
         write_json(self.out / "qualification.json", dict(passed=primary["passed"] and companion["passed"],
                                                          primary=primary, companion=companion, routes=routes))
+        self.stage = "done"
         return primary["passed"] and companion["passed"]
+
+
+def execute(window):
+    # results/outcome.json says how the controller ended, whatever ended it.
+    outcome = dict(passed=False, stage=None, error=None)
+    try:
+        outcome["passed"] = bool(window.run())
+        return outcome["passed"]
+    except BaseException as exc:
+        outcome["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        outcome["stage"] = window.stage
+        if window.out.is_dir():
+            write_json(window.out / "outcome.json", outcome)
 
 
 def main():
@@ -290,7 +325,7 @@ def main():
         window.failed.set()
         raise InterruptedError(f"qualification interrupted by signal {signum}")
     signal.signal(signal.SIGTERM, interrupted)
-    return 0 if window.run() else 1
+    return 0 if execute(window) else 1
 
 
 if __name__ == "__main__":

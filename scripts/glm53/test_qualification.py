@@ -111,9 +111,10 @@ class QualificationTest(unittest.TestCase):
                     self.assertGreater(case["cases"], 0)
         counts = {c["name"]: c["cases"] for c in device_cases()}
         for gpu in (0, 1):
-            # 104 gated-delta-net and 70 cache-fusion KDA shapes; 44+16+5 HC shapes.
+            # 113 gated-delta-net and 72 cache-fusion KDA shapes, 11 of them at GLM's 32 heads a card;
+            # 44+16+5 HC shapes.
             for name in [f"kda-c1-f0-gpu{gpu}"] + [f"kda-c{c}-f{f}-gpu{gpu}" for c in (2, 4) for f in (0, 1)]:
-                self.assertEqual(counts[name], 174, name)
+                self.assertEqual(counts[name], 185, name)
             for publication in (0, 1):
                 self.assertEqual(counts[f"hc-publication-{publication}-gpu{gpu}"], 65)
 
@@ -140,6 +141,12 @@ class QualificationTest(unittest.TestCase):
                   "roundtrip failed": [(good[0][0], good[0][1], fail)] + good[1:],
                   "card roundtrip skipped": [(good[0][0], good[0][1], skip)] + good[1:],
                   "split skipped": good[:3] + [("Meta", skip + "           ", skip), good[4]],
+                  # test-llama-archs marks a row OK unless its NMSE exceeds 1e-4, which NaN never does.
+                  "NMSE nan": [(good[0][0], ok + " (nan)", ok)] + good[1:],
+                  "NMSE -nan": good[:3] + [("Meta", ok + " (-nan)", skip), good[4]],
+                  "NMSE inf": [good[0], (good[1][0], ok + " (inf)", ok)] + good[2:],
+                  "NMSE above 1e-4": [(good[0][0], ok + " (2.00e-04)", ok)] + good[1:],
+                  "NMSE unreadable": [(good[0][0], ok + " (fast)", ok)] + good[1:],
                   "unfinished row": good[:4] + [("Meta 3:7", "", "")]}
         for label, rows in broken.items():
             with self.subTest(label), self.assertRaises(ValueError):

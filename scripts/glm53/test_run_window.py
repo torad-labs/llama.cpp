@@ -10,7 +10,8 @@ import time
 from types import SimpleNamespace
 import unittest
 
-from run_window import SiblingStopped, Window
+from qualification import device_cases
+from run_window import SiblingStopped, Window, execute
 
 
 class WindowProcessTest(unittest.TestCase):
@@ -129,6 +130,86 @@ class WindowProcessTest(unittest.TestCase):
                 self.assertEqual(receipts[f"rejected-gpu{failing}"]["exit"], 0)
                 self.assertIn("not supported", receipts[f"rejected-gpu{failing}"]["error"])
                 self.assertIn("another command failed", receipts[f"waiting-gpu{1 - failing}"]["error"])
+
+    def test_a_failing_backend_ops_run_names_its_failing_rows(self):
+        # test-backend-ops exits 1 when any case fails; the receipt and the
+        # controller's error must still name which cases failed and why.
+        header = '"backend_name","op_name","op_params","test_mode","supported","passed","error_message"'
+        failing = '[GATED_DELTA_NET] ERR = 0.1 > 0.0005 "CUDA0","GATED_DELTA_NET","kda=1,K=3","test","1","0","test failed"'
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "candidate-tests").mkdir()
+            (root / "candidate-tests" / "test-backend-ops").symlink_to(sys.executable)
+            window = Window(SimpleNamespace(root=root, stop_at=time.time()+630))
+            window.profile_env = {}
+            window.out.mkdir()
+            case = dict(name="kda-failing", argv=["test-backend-ops", "-c",
+                        f"print({header!r}); print({failing!r}); raise SystemExit(1)"], env={}, cases=1, require=None)
+            with self.assertRaisesRegex(RuntimeError, "kda-failing: exit 1; .*kda=1,K=3: test failed"):
+                window.device_case(case)
+            receipt, = json.loads((window.out / "commands.json").read_text())
+            self.assertIn("kda=1,K=3: test failed", receipt["error"])
+
+    def test_meta_backend_tests_fail_when_they_skip(self):
+        # Both meta tests exit 0 when they find no GPU; the sampler must also run over
+        # two different cards.
+        cases = {c["name"]: c for c in device_cases()}
+        outputs = {"meta-sampler": ("meta backend over CUDA0 and CUDA1\nok   case\nOK\n",
+                                    ["no GPU for the meta backend, skipped\n", "meta backend over CUDA0 and CUDA0\nOK\n"]),
+                   "meta-sourceless": ("OK\n", ["no GPU for the meta backend, skipped\n"])}
+        for name, (passing, skipping) in outputs.items():
+            for output in [passing] + skipping:
+                with self.subTest(name=name, output=output), tempfile.TemporaryDirectory() as folder:
+                    root = Path(folder)
+                    (root / "candidate-tests").mkdir()
+                    binary = root / "candidate-tests" / cases[name]["argv"][0]
+                    binary.write_text(f"#!/bin/sh\nprintf '%s' '{output}'\n")
+                    binary.chmod(0o755)
+                    window = Window(SimpleNamespace(root=root, stop_at=time.time()+630))
+                    window.profile_env = {}
+                    window.out.mkdir()
+                    if output == passing:
+                        window.device_case(cases[name])
+                    else:
+                        with self.assertRaisesRegex(ValueError, f"{name}: required route was not exercised"):
+                            window.device_case(cases[name])
+
+    def test_outcome_names_the_stage_and_cause_of_a_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            window = Window(SimpleNamespace(root=root, stop_at=time.time()+7200))
+            with self.assertRaisesRegex(ValueError, "stop-at"):
+                execute(window)
+            outcome = json.loads((window.out / "outcome.json").read_text())
+            self.assertEqual((outcome["passed"], outcome["stage"]), (False, "preflight"))
+            self.assertRegex(outcome["error"], "^ValueError: stop-at must be the armed deadline")
+
+    def test_the_speed_comparison_comes_before_the_long_serving_checks(self):
+        # One hour may not hold every leg; the distribution check and both
+        # comparisons must land before the semantics, capacity and route legs.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            window = Window(SimpleNamespace(root=root, stop_at=time.time()+630))
+            window.out.mkdir()
+            calls = []
+            window.preflight = lambda: calls.append("preflight")
+            window.device_case = lambda case: calls.append(case["name"])
+            window.card_matrix = lambda cases: calls.append("card-matrix")
+            window.quality = lambda: calls.append("quality")
+            window.compare = lambda label, context, ubatch: calls.append(label) or dict(passed=True)
+
+            def serve(name, arm, context, ubatch, mode="timing"):
+                calls.append(name)
+                raise TimeoutError("serving deadline reached")
+            window.serve = serve
+            with self.assertRaises(TimeoutError):
+                execute(window)
+            served = calls[calls.index("card-matrix") + 1:]
+            self.assertEqual(served[-4:], ["quality", "primary", "companion", "serving-semantics"])
+            self.assertEqual(calls[:3], ["preflight", "capture-peer", "card-matrix"])
+            outcome = json.loads((window.out / "outcome.json").read_text())
+            self.assertEqual((outcome["passed"], outcome["stage"]), (False, "serving-semantics"))
+            self.assertEqual(outcome["error"], "TimeoutError: serving deadline reached")
 
 
 if __name__ == "__main__":
