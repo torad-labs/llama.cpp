@@ -228,8 +228,10 @@ class QualificationTest(unittest.TestCase):
                 self.assertNotIn("-p", case["argv"])
         for route in ("peer", "host", "mixed", "duplicate"):
             self.assertIn(f"capture-{route}", names)
-        self.assertEqual(next(c for c in cases if c["name"] == "capture-peer")["require"],
-                         "device inboxes exercised")
+        # The peer route's line, as the box printed it on October 24 (capture-peer.out); host staging is not it.
+        peer = next(c for c in cases if c["name"] == "capture-peer")["require"]
+        self.assertRegex("ok   card-to-card limit 131072 bytes: device inboxes exercised", f"^{peer}$")
+        self.assertNotRegex("FAIL card-to-card limit 0 bytes: host staging only", f"^{peer}$")
 
     def test_kda_cases_select_every_shape_glm_builds_and_no_rows_mode(self):
         # glm5next's build_kda_layer never passes state_rows, so the rows-indexed

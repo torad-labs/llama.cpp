@@ -43,6 +43,7 @@ class Window:
         self.until = args.stop_at - 600  # 50 minutes mandatory, then collection/stop reserve.
         self.failed = threading.Event()
         self.stage = "preflight"
+        self.verdicts = {}
         self.records = []
         self.lock = threading.Lock()
         self.env = clean_env() | {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1",
@@ -117,7 +118,8 @@ class Window:
 
         def check(output, log):
             try:
-                if case["require"] and case["require"] not in output + log:
+                # The required line is a pattern for one whole line of the program's own output.
+                if case["require"] and not any(re.fullmatch(case["require"], line) for line in output.splitlines()):
                     raise ValueError(f"required route was not exercised: {case['require']}")
                 if binary == "test-backend-ops" and case.get("expected_failure") is None:
                     validate_device_csv(output, case["cases"])
@@ -261,12 +263,18 @@ class Window:
                 self.device_case(case)
         # The distribution check and both comparisons come first, so a window that
         # runs out of time has already answered whether the candidate is faster.
+        # A failed comparison is the window's answer and ends it.
         self.stage = "quality"
         self.quality()
-        self.stage = "primary"
-        primary = self.compare("primary", 1048576, 512)
-        self.stage = "companion"
-        companion = self.compare("companion", 524288, 1024)
+        comparisons = {}
+        for label, context, ubatch in (("primary", 1048576, 512), ("companion", 524288, 1024)):
+            self.stage = label
+            result = comparisons[label] = self.compare(label, context, ubatch)
+            self.verdicts[label] = dict(passed=result["passed"], failures=result["failures"],
+                                        baseline_tok_s=result["baseline"]["tok_s"],
+                                        candidate_tok_s=result["candidate"]["tok_s"])
+            if not result["passed"]:
+                raise ValueError(f"{label} comparison failed: {', '.join(result['failures'])}")
         for name, context, ubatch, mode in (("serving-semantics", 1048576, 512, "semantics"),
                                             ("capacity-32k", 524288, 1024, "concurrency"),
                                             ("capacity-128k", 1048576, 512, "capacity"),
@@ -278,15 +286,14 @@ class Window:
                   if "GLM_ROUTE_STATS " in line]
         if not validate_route_observations(routes):
             raise ValueError("missing or inconsistent per-device route observations")
-        write_json(self.out / "qualification.json", dict(passed=primary["passed"] and companion["passed"],
-                                                         primary=primary, companion=companion, routes=routes))
+        write_json(self.out / "qualification.json", dict(passed=True, **comparisons, routes=routes))
         self.stage = "done"
-        return primary["passed"] and companion["passed"]
+        return True
 
 
 def execute(window):
-    # results/outcome.json says how the controller ended, whatever ended it.
-    outcome = dict(passed=False, stage=None, error=None)
+    # results/outcome.json says how the controller ended, whatever ended it, with each comparison's verdict.
+    outcome = dict(passed=False, stage=None, error=None, verdicts=None)
     try:
         outcome["passed"] = bool(window.run())
         return outcome["passed"]
@@ -294,7 +301,7 @@ def execute(window):
         outcome["error"] = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        outcome["stage"] = window.stage
+        outcome["stage"], outcome["verdicts"] = window.stage, window.verdicts
         if window.out.is_dir():
             write_json(window.out / "outcome.json", outcome)
 

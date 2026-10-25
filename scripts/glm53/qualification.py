@@ -176,7 +176,7 @@ def device_cases():
                             ("mixed", {"GGML_CUDA_AR_P2P_MAX_BYTES": "8192"}),
                             ("duplicate", {"CUDA_VISIBLE_DEVICES": "0"})):
         add(f"capture-{route}", ["test-backend-meta-capture"], settings | {"TEST_GLM_HC": "1"},
-            require="device inboxes exercised" if route == "peer" else "OK")
+            require=r"ok +card-to-card limit \d+ bytes: device inboxes exercised" if route == "peer" else "OK")
     # Both meta tests exit 0 when they find no GPU; the sampler names the two cards it ran over.
     for name, argv, require in (
         ("speculative", ["test-speculative-mtp"], None), ("sampling", ["test-sampling"], None),

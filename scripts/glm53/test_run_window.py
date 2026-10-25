@@ -14,6 +14,20 @@ from qualification import device_cases
 from run_window import SiblingStopped, Window, execute
 
 
+def comparison(passed, failures, baseline_tok_s, candidate_tok_s):
+    # The shape verify_results.evaluate returns, as far as the window reads it.
+    return dict(passed=passed, failures=failures, baseline=dict(tok_s=baseline_tok_s),
+                candidate=dict(tok_s=candidate_tok_s))
+
+
+def staged(window, calls, compare):
+    window.preflight = lambda: calls.append("preflight")
+    window.device_case = lambda case: calls.append(case["name"])
+    window.card_matrix = lambda cases: calls.append("card-matrix")
+    window.quality = lambda: calls.append("quality")
+    window.compare = lambda label, context, ubatch: calls.append(label) or compare(label)
+
+
 class WindowProcessTest(unittest.TestCase):
     def test_negative_device_probe_accepts_only_its_declared_error(self):
         # A configuration probe may intentionally fail, but a different failure
@@ -192,11 +206,7 @@ class WindowProcessTest(unittest.TestCase):
             window = Window(SimpleNamespace(root=root, stop_at=time.time()+630))
             window.out.mkdir()
             calls = []
-            window.preflight = lambda: calls.append("preflight")
-            window.device_case = lambda case: calls.append(case["name"])
-            window.card_matrix = lambda cases: calls.append("card-matrix")
-            window.quality = lambda: calls.append("quality")
-            window.compare = lambda label, context, ubatch: calls.append(label) or dict(passed=True)
+            staged(window, calls, lambda label: comparison(True, [], 141.2, 230.0))
 
             def serve(name, arm, context, ubatch, mode="timing"):
                 calls.append(name)
@@ -210,6 +220,58 @@ class WindowProcessTest(unittest.TestCase):
             outcome = json.loads((window.out / "outcome.json").read_text())
             self.assertEqual((outcome["passed"], outcome["stage"]), (False, "serving-semantics"))
             self.assertEqual(outcome["error"], "TimeoutError: serving deadline reached")
+            # The 200 tok/s answer is in outcome.json even when a later leg ends the window.
+            for label in ("primary", "companion"):
+                self.assertEqual(outcome["verdicts"][label],
+                                 dict(passed=True, failures=[], baseline_tok_s=141.2, candidate_tok_s=230.0))
+
+    def test_a_failed_comparison_stops_the_window_and_names_its_verdict(self):
+        # A miss is the window's answer: nothing after it runs, and outcome.json says why, with both rates.
+        misses = {"primary": "combined rate below 200 tok/s", "companion": "pair 0 did not improve"}
+        for failing, failure in misses.items():
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as folder:
+                window = Window(SimpleNamespace(root=Path(folder), stop_at=time.time()+630))
+                window.out.mkdir()
+                calls = []
+                staged(window, calls, lambda label: comparison(True, [], 141.2, 230.0) if label != failing
+                       else comparison(False, [failure], 141.2, 190.5))
+                window.serve = lambda name, *rest, **kwargs: calls.append(name)
+                with self.assertRaisesRegex(ValueError, f"^{failing} comparison failed: {failure}$"):
+                    execute(window)
+                self.assertEqual(calls[-1], failing)
+                outcome = json.loads((window.out / "outcome.json").read_text())
+                self.assertEqual((outcome["passed"], outcome["stage"]), (False, failing))
+                self.assertEqual(outcome["error"], f"ValueError: {failing} comparison failed: {failure}")
+                self.assertEqual(outcome["verdicts"][failing],
+                                 dict(passed=False, failures=[failure], baseline_tok_s=141.2, candidate_tok_s=190.5))
+                self.assertFalse((window.out / "qualification.json").exists())
+
+    def test_a_required_line_must_be_a_whole_line_of_the_programs_output(self):
+        # "OK" inside another word or line, or only among the diagnostics, is not the program saying OK.
+        cases = {c["name"]: c for c in device_cases()}
+        inboxes = "ok   card-to-card limit 131072 bytes: device inboxes exercised\n"
+        outputs = (("meta-sourceless", "FAIL y[3]\nOK\n", "", True),
+                   ("meta-sourceless", "TOKEN\n", "", False),
+                   ("meta-sourceless", "not OK\n", "", False),
+                   ("meta-sourceless", "", "OK\n", False),
+                   ("capture-peer", "ok   eval 1, graph A: NMSE vs CPU 6.1e-07\n" + inboxes + "OK\n", "", True),
+                   ("capture-peer", "FAIL card-to-card limit 0 bytes: host staging only\nOK\n",
+                    inboxes, False))
+        for name, stdout, stderr, accepted in outputs:
+            with self.subTest(name=name, stdout=stdout, stderr=stderr), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                (root / "candidate-tests").mkdir()
+                binary = root / "candidate-tests" / cases[name]["argv"][0]
+                binary.write_text(f"#!/bin/sh\nprintf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\n")
+                binary.chmod(0o755)
+                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630))
+                window.profile_env = {}
+                window.out.mkdir()
+                if accepted:
+                    window.device_case(cases[name])
+                else:
+                    with self.assertRaisesRegex(ValueError, f"{name}: required route was not exercised"):
+                        window.device_case(cases[name])
 
 
 if __name__ == "__main__":
