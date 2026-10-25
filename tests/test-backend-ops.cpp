@@ -12802,7 +12802,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     3, 1, true, GGML_TYPE_F32, 3, 1, row, true));
         }
         // the same widths with the state passed directly, as glm5next builds them (no rows mode), for one to three
-        // slots decoding together: GLM's K = 3 (two MTP drafts) and the prefix-overlapping K = nt + 1
+        // slots decoding together: GLM's K = 3 (two MTP drafts) and the prefix-overlapping K = nt + 1, and at K = 3
+        // with q/k/v as glm5next passes them, views into one conv-output row per token (q's and v's strides differ)
         for (int64_t ns : { 1, 2, 3 }) {
             test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, ns,
                     1, false, true, 3, false, -1, true));
@@ -12810,6 +12811,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, ns,
                         1, false, true, nt + 1, false, -1, true));
             }
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, ns,
+                    1, false, true, 3, false, -1, true, true));
         }
         // two and three slots fused into an f32 cache laid out as delta-net-base.cpp lays it out for three slots,
         // starting at each row a batch of that many slots can start at
