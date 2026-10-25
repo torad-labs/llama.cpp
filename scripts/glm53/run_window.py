@@ -8,6 +8,7 @@ import argparse
 import concurrent.futures
 import csv
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ import sys
 import threading
 import time
 
-from qualification import (BASELINE_ARCHIVE, BASELINE_COMMIT, check_quality, check_run_identity, check_stop_at,
+from qualification import (BASELINE_ARCHIVE, BASELINE_COMMIT, check_quality, check_quality_context, check_run_identity, check_stop_at,
                            device_cases, verify_files, validate_arch_table, validate_device_csv)
 from verify_results import evaluate, load_rows, validate_route_observations
 
@@ -226,9 +227,13 @@ class Window:
                     "RIG_ROOT": str(self.args.rig_root),
                     "LD_LIBRARY_PATH": f"{self.root}/{arm}:{self.root}/cuda-runtime"}, 600)
                 if arm == "candidate":
-                    quality[str(ctx)] = json.loads(output)["summary"]
+                    # Keep invalid numeric literals as text so the failed result still has a valid JSON record.
+                    report = json.loads(output, parse_constant=str,
+                                        parse_float=lambda value: float(value) if math.isfinite(float(value)) else value)
+                    quality[str(ctx)] = report.get("summary") if isinstance(report, dict) else None
+                    write_json(self.out / "quality.json", quality)
+                    check_quality_context(ctx, quality[str(ctx)])
         check_quality(quality)
-        write_json(self.out / "quality.json", quality)
 
     def card_matrix(self, cases):
         def on_card(card):

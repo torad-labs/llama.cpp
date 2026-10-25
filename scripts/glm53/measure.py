@@ -5,7 +5,11 @@ operator's deadline, and cleanup terminates only children launched by this run.
 """
 import argparse
 import concurrent.futures
+import contextlib
+import csv
+from datetime import datetime
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -13,7 +17,9 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import threading
 import time
+import urllib.error
 import urllib.request
 
 
@@ -34,16 +40,31 @@ def server_command(args):
     return argv + (["--glm53-profile", args.profile] if args.profile else [])
 
 def validate_response(response, tokens, prompt_tokens=None):
-    timings = response.get("timings", {})
+    response = response if isinstance(response, dict) else {}
+    timings = response.get("timings")
+    timings = timings if isinstance(timings, dict) else {}
     if (not isinstance(response.get("content"), str) or not response["content"].strip()
             or "error" in response or timings.get("predicted_n") != tokens
             or prompt_tokens is not None and timings.get("prompt_n") != prompt_tokens):
-        raise ValueError("missing delivered output or incomplete prompt/generation")
+        raise ValueError(f"missing delivered output or incomplete prompt/generation: predicted_n="
+                         f"{timings.get('predicted_n')!r}, expected {tokens}; prompt_n={timings.get('prompt_n')!r}, "
+                         f"expected {prompt_tokens!r}; error={response.get('error')!r}")
     return True
 
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False, default=str) + "\n")
+
+
+def retain_body(response, saved):
+    try:
+        raw = response.read()
+    except http.client.IncompleteRead as exc:
+        saved.write(exc.partial)
+        raise
+    saved.write(raw)
+    return raw
+
 
 def terminate(child):
     if child is not None and child.poll() is None:
@@ -60,6 +81,8 @@ class ServingLeg:
         self.args = args
         self.out = args.root / "results" / args.run
         self.url = f"http://127.0.0.1:{args.port}"
+        self.request_lock = threading.Lock()
+        self.request_number = 0
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("GGML_", "LLAMA_", "TEST_"))}
         self.env.update(CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES="0,1",
                         GGML_CUDA_ALLREDUCE="internal", GGML_CUDA_GRAPH_MAX="0",
@@ -75,21 +98,65 @@ class ServingLeg:
             raise TimeoutError("serving deadline reached")
         return min(maximum, left)
 
-    def request(self, path, data=None, maximum=300):
-        body = None if data is None else json.dumps(data, ensure_ascii=False).encode()
-        req = urllib.request.Request(self.url + path, data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout(maximum)) as response:
-            return json.load(response)
+    def response_record(self):
+        with self.request_lock:
+            self.request_number += 1
+            folder = self.out / "http"
+            folder.mkdir(exist_ok=True)
+            return folder / f"{self.request_number:06d}.json"
 
-    def complete(self, prompt, tokens=384, slot=0, prompt_tokens=None):
+    @contextlib.contextmanager
+    def capture_response(self, path, data=None, maximum=300, record=None, context=None):
+        record = record or self.response_record()
+        raw = record.with_suffix(".body")
+        meta = dict(path=path, request=data, context=context, status=None,
+                    body_file=str(raw.relative_to(self.out)), started_epoch=time.time())
+        write_json(record, meta)
+        try:
+            body = None if data is None else json.dumps(data, ensure_ascii=False).encode()
+            req = urllib.request.Request(self.url + path, data=body, headers={"Content-Type": "application/json"})
+            try:
+                response = urllib.request.urlopen(req, timeout=self.timeout(maximum))
+            except urllib.error.HTTPError as exc:
+                meta["status"] = exc.code
+                with exc, raw.open("wb") as saved:
+                    retain_body(exc, saved)
+                raise
+            meta["status"] = response.status
+            with response, raw.open("wb") as saved:
+                yield response, saved
+        except Exception as exc:
+            meta["error"] = f"{type(exc).__name__}: {exc}"
+            message = f"request {path} failed: {meta['error']}; record {record.relative_to(self.out)}"
+            if isinstance(exc, ValueError):
+                raise ValueError(message) from exc
+            if isinstance(exc, OSError):
+                raise OSError(message) from exc
+            raise RuntimeError(message) from exc
+        finally:
+            meta["ended_epoch"] = time.time()
+            write_json(record, meta)
+
+    def request(self, path, data=None, maximum=300, record=None, context=None):
+        with self.capture_response(path, data, maximum, record, context) as (response, saved):
+            return json.loads(retain_body(response, saved))
+
+    def complete(self, prompt, tokens=384, slot=0, prompt_tokens=None, repeat=None):
         before = time.monotonic()
         payload = completion_payload(prompt["prompt"], tokens, slot)
-        result = self.request("/completion", payload)
-        validate_response(result, tokens, prompt_tokens)
+        record = self.response_record()
+        result = self.request("/completion", payload, record=record,
+                              context=dict(category=prompt["category"], repeat=repeat, slot=slot,
+                                           expected_tokens=tokens, expected_prompt_tokens=prompt_tokens))
+        try:
+            validate_response(result, tokens, prompt_tokens)
+        except ValueError as exc:
+            raise ValueError(f"{prompt['category']} slot {slot}: {exc}; record {record.relative_to(self.out)}") from exc
         elapsed = time.monotonic() - before
         raw = prompt["prompt"].encode() if isinstance(prompt["prompt"], str) else json.dumps(prompt["prompt"]).encode()
         return dict(category=prompt["category"], elapsed=elapsed,
-                    prompt_sha256=hashlib.sha256(raw).hexdigest(), request=payload, response=result)
+                    prompt_sha256=hashlib.sha256(raw).hexdigest(), request=payload, response=result,
+                    response_record=str(record.relative_to(self.out)))
 
     def long_prompt(self, prompts, count):
         prompt = next(p for p in prompts if p["category"] == "long")
@@ -127,11 +194,10 @@ class ServingLeg:
             raise ValueError("forced tool call did not preserve the requested schema")
 
         payload = completion_payload("Explain merge sort and give several examples.", 4096, 0) | {"stream": True}
-        req = urllib.request.Request(self.url + "/completion", data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json"})
         first = None
-        with urllib.request.urlopen(req, timeout=self.timeout(60)) as stream:
+        with self.capture_response("/completion", payload, maximum=60) as (stream, saved):
             for line in stream:
+                saved.write(line)
                 self.timeout()
                 if line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                     item = json.loads(line[6:])
@@ -164,13 +230,60 @@ class ServingLeg:
                 raise ValueError("the four public categories are required")
             for repeat in range(self.args.repeats if mode == "timing" else 1):
                 for prompt in chosen:
-                    row = self.complete(prompt, self.args.tokens) | dict(repeat=repeat)
+                    row = self.complete(prompt, self.args.tokens, repeat=repeat) | dict(repeat=repeat)
                     timing = row["response"]["timings"]
                     if not math.isfinite(timing.get("predicted_ms", math.nan)) or timing["predicted_ms"] <= 0:
                         raise ValueError("invalid prediction timing")
                     with (self.out / "responses.jsonl").open("a") as output:
                         output.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
                     print(json.dumps(dict(category=row["category"], repeat=repeat, timings=timing)), flush=True)
+
+    def memory_samples(self):
+        text = (self.out / "gpu.csv").read_text()
+        # The monitor can be in the middle of a line when the file is read.
+        lines = text[:text.rfind("\n")+1].splitlines()
+        samples = {0: [], 1: []}
+        for row in csv.reader(lines):
+            try:
+                stamp, device, memory, _power = row
+                stamp = datetime.strptime(stamp.strip(), "%Y/%m/%d %H:%M:%S.%f").timestamp()
+                device, memory = int(device), float(memory)
+                if device not in samples or not math.isfinite(memory) or memory < 0:
+                    raise ValueError("invalid device or memory value")
+                if samples[device] and stamp < samples[device][-1][0]:
+                    raise ValueError("sample time moved backwards")
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(f"invalid GPU memory sample {row!r}: {exc}") from exc
+            samples[device].append((stamp, memory))
+        return samples
+
+    def memory_evidence(self, monitor, started=None, ended=None):
+        until = time.monotonic() + self.timeout(3)
+        while True:
+            status = monitor.poll()
+            if status is not None:
+                raise RuntimeError(f"GPU memory monitor exited before cleanup ({status}); see gpu.csv and gpu-monitor.log")
+            samples = self.memory_samples()
+            if all(samples.values()):
+                if started is None:
+                    return None
+                covered = {}
+                for device, rows in samples.items():
+                    before = [i for i, row in enumerate(rows) if row[0] <= started]
+                    after = [i for i, row in enumerate(rows) if row[0] >= ended]
+                    if before and after:
+                        covered[device] = rows[before[-1]:after[0]+1]
+                if len(covered) == 2:
+                    for device, rows in covered.items():
+                        if any(b[0]-a[0] > 2 for a, b in zip(rows, rows[1:])):
+                            raise ValueError(f"GPU {device} memory samples have a gap over 2 seconds during the workload")
+                    return dict(workload_start_epoch=started, workload_end_epoch=ended,
+                                peak_mib={str(device): max(memory for _, memory in rows) for device, rows in samples.items()},
+                                sample_counts={str(device): len(rows) for device, rows in samples.items()})
+            if time.monotonic() >= until:
+                raise ValueError(f"incomplete GPU memory evidence for both cards over the workload; "
+                                 f"sample counts: { {device: len(rows) for device, rows in samples.items()} }")
+            time.sleep(min(0.05, max(0, until-time.monotonic())))
 
     def run(self):
         self.out.mkdir(parents=True, exist_ok=False)
@@ -182,15 +295,18 @@ class ServingLeg:
                     engine_env={k: v for k, v in self.env.items() if k.startswith(("GGML_", "LLAMA_", "CUDA_"))})
         write_json(self.out / "run.json", meta)
         child, monitor = None, None
-        with (self.out / "server.log").open("w") as log, (self.out / "gpu.csv").open("w") as gpu:
+        with ((self.out / "server.log").open("w") as log, (self.out / "gpu.csv").open("w") as gpu,
+              (self.out / "gpu-monitor.log").open("w") as monitor_log):
             try:
                 if self.args.mode in ("capacity", "concurrency", "diagnostic"):
-                    monitor = subprocess.Popen(["nvidia-smi", "--query-gpu=index,memory.used,power.draw",
+                    monitor = subprocess.Popen(["stdbuf", "-oL", "nvidia-smi", "--query-gpu=timestamp,index,memory.used,power.draw",
                                                 "--format=csv,noheader,nounits", "--loop-ms=500"],
-                                               stdout=gpu, stderr=gpu, start_new_session=True)
+                                               stdout=gpu, stderr=monitor_log, start_new_session=True)
                 child = subprocess.Popen(meta["argv"], env=self.env, stdout=log, stderr=log, start_new_session=True)
                 ready_until = min(self.args.deadline, time.time()+300)
                 while True:
+                    if monitor is not None and monitor.poll() is not None:
+                        raise RuntimeError(f"GPU memory monitor exited during readiness ({monitor.returncode}); see gpu-monitor.log")
                     if child.poll() is not None:
                         raise RuntimeError(f"server exited during readiness ({child.returncode})")
                     if time.time() >= ready_until:
@@ -211,16 +327,27 @@ class ServingLeg:
                     write_json(self.out / "run.json", meta)
                 # Untimed warmup is identical for both arms.
                 self.request("/completion", completion_payload("Hello", 32, 0) | dict(temperature=0, top_k=1))
+                if monitor is not None:
+                    self.memory_evidence(monitor)
+                started = time.time()
                 self.workload(prompts)
+                ended = time.time()
+                if monitor is not None:
+                    write_json(self.out / "memory.json", self.memory_evidence(monitor, started, ended))
                 if child.poll() is not None or self.request("/health", maximum=5).get("status") != "ok":
                     raise RuntimeError("server did not remain healthy after the workload")
+                if monitor is not None and monitor.poll() is not None:
+                    raise RuntimeError(f"GPU memory monitor exited before cleanup ({monitor.returncode}); see gpu-monitor.log")
                 write_json(self.out / "workload.json", dict(passed=True, mode=self.args.mode))
             finally:
                 before = None if child is None else child.poll()
+                monitor_before = None if monitor is None else monitor.poll()
                 terminate(child)
                 terminate(monitor)
                 write_json(self.out / "process-exit.json", dict(before_cleanup=before,
-                           pid=None if child is None else child.pid, exit=None if child is None else child.returncode))
+                           pid=None if child is None else child.pid, exit=None if child is None else child.returncode,
+                           monitor=dict(before_cleanup=monitor_before, pid=None if monitor is None else monitor.pid,
+                                        exit=None if monitor is None else monitor.returncode)))
 
 
 def main():

@@ -95,14 +95,20 @@ def check_stop_at(stop_at, now, max_hours):
     return True
 
 
+def check_quality_context(ctx, summary):
+    kld = summary.get("meanKld") if isinstance(summary, dict) else None
+    top = summary.get("sameTopP") if isinstance(summary, dict) else None
+    if (not isinstance(kld, (float, int)) or not math.isfinite(kld) or abs(kld) > 1e-6
+            or not isinstance(top, (float, int)) or not math.isfinite(top) or not 99.99 <= top <= 100):
+        raise ValueError(f"distribution contract failed at context {ctx}: meanKld={kld!r}, sameTopP={top!r}")
+    return True
+
+
 def check_quality(records):
     if set(records) != {"2048", "4096", "16384"}:
         raise ValueError("all three distribution contexts are required")
     for ctx, summary in records.items():
-        kld, top = summary.get("meanKld"), summary.get("sameTopP")
-        if (not isinstance(kld, (float, int)) or not math.isfinite(kld) or abs(kld) > 1e-6
-                or not isinstance(top, (float, int)) or not math.isfinite(top) or not 99.99 <= top <= 100):
-            raise ValueError(f"distribution contract failed at context {ctx}")
+        check_quality_context(ctx, summary)
     return True
 
 def device_cases():

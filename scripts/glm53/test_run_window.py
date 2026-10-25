@@ -246,6 +246,45 @@ class WindowProcessTest(unittest.TestCase):
                                  dict(passed=False, failures=[failure], baseline_tok_s=141.2, candidate_tok_s=190.5))
                 self.assertFalse((window.out / "qualification.json").exists())
 
+    def test_each_distribution_result_is_retained_and_checked_before_the_next_context(self):
+        # A numerical miss is the cause of failure even if a later context would fail differently.
+        for failed_ctx in (2048, 4096, None):
+            with self.subTest(context=failed_ctx), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                rig = root / "rig.py"
+                rig.write_text(f"#!{sys.executable}\n" +
+                               "import json, sys\n"
+                               "ctx = int(sys.argv[sys.argv.index('--ctx')+1])\n"
+                               f"failed = {failed_ctx!r}\n"
+                               "if failed is not None and ctx > failed: raise SystemExit(99)\n"
+                               "print(json.dumps({'summary': {'meanKld': 0.001 if ctx == failed else 0.0, "
+                               "'sameTopP': 100.0}}))\n")
+                rig.chmod(0o755)
+                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630, rig=rig,
+                                run_id="quality-test", rig_root=root, fixtures=root))
+                window.out.mkdir()
+                window.model, window.profile_env = root / "model.gguf", {}
+                window.stage = "quality"
+                window.run = window.quality
+                if failed_ctx is not None:
+                    with self.assertRaisesRegex(ValueError, f"distribution contract failed at context {failed_ctx}"):
+                        execute(window)
+                    outcome = json.loads((window.out / "outcome.json").read_text())
+                    self.assertFalse(outcome["passed"])
+                    self.assertIn(f"context {failed_ctx}", outcome["error"])
+                    self.assertIn("0.001", outcome["error"])
+                else:
+                    window.quality()
+                expected_contexts = [ctx for ctx in (2048, 4096, 16384)
+                                     if failed_ctx is None or ctx <= failed_ctx]
+                retained = json.loads((window.out / "quality.json").read_text())
+                self.assertEqual(set(retained), {str(ctx) for ctx in expected_contexts})
+                if failed_ctx:
+                    self.assertEqual(retained[str(failed_ctx)], dict(meanKld=0.001, sameTopP=100.0))
+                receipts = json.loads((window.out / "commands.json").read_text())
+                self.assertEqual([row["name"] for row in receipts],
+                                 [f"kld-{arm}-{ctx}" for ctx in expected_contexts for arm in ("baseline", "candidate")])
+
     def test_a_required_line_must_be_a_whole_line_of_the_programs_output(self):
         # "OK" inside another word or line, or only among the diagnostics, is not the program saying OK.
         cases = {c["name"]: c for c in device_cases()}
