@@ -82,12 +82,19 @@ class Window:
                     if not rc or rc != expected_failure["exit"] or expected_failure["message"] not in diagnostic:
                         raise RuntimeError(f"{name}: expected failure was not observed (exit {rc})")
                 elif rc:
-                    detail = ""
+                    try:
+                        with (self.out / (name + ".log")).open("rb") as log:
+                            size = log.seek(0, os.SEEK_END)
+                            log.seek(max(0, size-4096))
+                            diagnostic = log.read(4096).decode("utf-8", errors="replace").strip()
+                        detail = f"; stderr: {diagnostic}" if diagnostic else ""
+                    except OSError as exc:
+                        detail = f"; stderr unavailable: {type(exc).__name__}: {exc}"
                     if check:
                         try:
                             check((self.out / (name + ".out")).read_text(), (self.out / (name + ".log")).read_text())
                         except Exception as exc:
-                            detail = f"; {exc}"
+                            detail += f"; {exc}"
                     raise RuntimeError(f"{name}: exit {rc}{detail}")
                 if check:
                     check((self.out / (name + ".out")).read_text(), (self.out / (name + ".log")).read_text())

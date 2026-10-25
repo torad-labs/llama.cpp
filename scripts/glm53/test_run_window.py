@@ -29,6 +29,30 @@ def staged(window, calls, compare):
 
 
 class WindowProcessTest(unittest.TestCase):
+    def test_failed_child_identity_survives_unreadable_stderr(self):
+        for unavailable in (False, True):
+            with self.subTest(unavailable=unavailable), tempfile.TemporaryDirectory(dir="/tmp") as folder:
+                window = Window(SimpleNamespace(root=Path(folder), stop_at=time.time()+630))
+                window.out.mkdir()
+                log = window.out / "failed-child.log"
+                raw = b"primary child failure\xff\n"
+                child = f"import sys; from pathlib import Path; sys.stderr.buffer.write({raw!r}); sys.stderr.flush(); "
+                if unavailable:
+                    child += f"Path({str(log)!r}).unlink(); "
+                child += "raise SystemExit(7)"
+                window.run = lambda: window.command("failed-child", [sys.executable, "-c", child])
+                with self.assertRaises(RuntimeError):
+                    execute(window)
+                record, = json.loads((window.out / "commands.json").read_text())
+                outcome = json.loads((window.out / "outcome.json").read_text())
+                for receipt in (record, outcome):
+                    self.assertIn("failed-child: exit 7", receipt["error"])
+                    self.assertIn("stderr unavailable" if unavailable else "primary child failure", receipt["error"])
+                self.assertEqual(record["exit"], 7)
+                self.assertFalse(outcome["passed"])
+                if not unavailable:
+                    self.assertEqual(log.read_bytes(), raw)
+
     def test_negative_device_probe_accepts_only_its_declared_error(self):
         # A configuration probe may intentionally fail, but a different failure
         # (or an unexpected success) must close the window like any other error.
@@ -163,6 +187,35 @@ class WindowProcessTest(unittest.TestCase):
                 window.device_case(case)
             receipt, = json.loads((window.out / "commands.json").read_text())
             self.assertIn("kda=1,K=3: test failed", receipt["error"])
+
+    def test_architecture_failure_keeps_stderr_cause_and_missing_coverage(self):
+        primary = "GLM generated prefix: unified=0 seq=2 width=4 keep=1 state mismatch"
+        table = "|        glm5next|CUDA0|   MoE|"
+        for preamble in ("", "earlier diagnostic\n" * 1000):
+            with self.subTest(long_preamble=bool(preamble)), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                (root / "candidate-tests").mkdir()
+                (root / "candidate-tests" / "test-llama-archs").symlink_to(sys.executable)
+                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630))
+                window.profile_env = {}
+                window.stage = "glm-architecture"
+                window.out.mkdir()
+                diagnostic = preamble + primary + "\nencountered runtime error: GLM generated speculative prefixes failed"
+                case = dict(name="glm-architecture", argv=["test-llama-archs", "-c",
+                            f"import sys; print({table!r}); print({diagnostic!r}, file=sys.stderr); raise SystemExit(255)"],
+                            env={}, cases=None, require=None, table=dict(arch="glm5next", devices=3))
+                window.run = lambda: window.device_case(case)
+                with self.assertRaises(RuntimeError):
+                    execute(window)
+                receipt, = json.loads((window.out / "commands.json").read_text())
+                outcome = json.loads((window.out / "outcome.json").read_text())
+                for record in (receipt, outcome):
+                    self.assertIn(primary, record["error"])
+                    self.assertIn("0 of 3 devices and 0 of 2 tensor splits", record["error"])
+                    self.assertLess(len(record["error"]), 5000)
+                self.assertEqual(receipt["exit"], 255)
+                self.assertFalse(outcome["passed"])
+                self.assertEqual(outcome["stage"], "glm-architecture")
 
     def test_meta_backend_tests_fail_when_they_skip(self):
         # Both meta tests exit 0 when they find no GPU; the sampler must also run over
