@@ -56,14 +56,38 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False, default=str) + "\n")
 
 
+def retained_chunks(response, saved):
+    while True:
+        try:
+            raw = response.read1(65536)
+        except http.client.IncompleteRead as exc:
+            saved.write(exc.partial)
+            saved.flush()
+            raise
+        if not raw:
+            # read1() does not itself reject EOF before Content-Length is exhausted.
+            remaining = getattr(response, "length", None)
+            if remaining:
+                raise http.client.IncompleteRead(b"", remaining)
+            return
+        saved.write(raw)
+        saved.flush()
+        yield raw
+
+
 def retain_body(response, saved):
-    try:
-        raw = response.read()
-    except http.client.IncompleteRead as exc:
-        saved.write(exc.partial)
-        raise
-    saved.write(raw)
-    return raw
+    return b"".join(retained_chunks(response, saved))
+
+
+def retained_lines(response, saved):
+    pending = b""
+    for chunk in retained_chunks(response, saved):
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            yield line + b"\n"
+    if pending:
+        yield pending
 
 
 def terminate(child):
@@ -196,8 +220,7 @@ class ServingLeg:
         payload = completion_payload("Explain merge sort and give several examples.", 4096, 0) | {"stream": True}
         first = None
         with self.capture_response("/completion", payload, maximum=60) as (stream, saved):
-            for line in stream:
-                saved.write(line)
+            for line in retained_lines(stream, saved):
                 self.timeout()
                 if line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                     item = json.loads(line[6:])

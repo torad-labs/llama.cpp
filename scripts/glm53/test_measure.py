@@ -1,8 +1,11 @@
 import concurrent.futures
 import http.server
+import io
 import json
 import os
 from pathlib import Path
+import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -33,9 +36,15 @@ class ServingStandIn(http.server.BaseHTTPRequestHandler):
         if self.path == "/tokenize":
             self.send(200, {"tokens": list(range(131072))})
             return
+        if self.path == "/v1/chat/completions":
+            self.send(200, {"choices": [{"message": {"tool_calls": [{"function": {
+                "name": "weather", "arguments": '{"city":"Paris"}'}}]}}]})
+            return
         tokens = payload["n_predict"]
         prompt_n = len(payload["prompt"]) if isinstance(payload["prompt"], list) else 4
         response = dict(content="answer", timings=dict(predicted_n=tokens, prompt_n=prompt_n, predicted_ms=100))
+        if "grammar" in payload:
+            response["content"] = '{"ok":true}'
         if tokens != 32:
             self.server.marker.touch()
             time.sleep(0.25)
@@ -59,6 +68,41 @@ class ServingStandIn(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "1000")
                 self.end_headers()
                 self.wfile.write(b'{"content":"partial')
+                return
+            elif case in ("timeout-200", "timeout-503", "reset-200", "reset-503"):
+                self.send_response(int(case[-3:]))
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b'{"content":"partial')
+                self.wfile.flush()
+                time.sleep(0.15 if case.startswith("reset") else 0.5)
+                if case.startswith("reset"):
+                    self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    self.rfile.close()
+                    self.wfile.close()
+                    self.connection.close()
+                    self.wfile = io.BytesIO()  # The handler still flushes once after do_POST returns.
+                return
+            elif case == "stream-timeout" and payload.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b'data: {"content":"partial')
+                self.wfile.flush()
+                time.sleep(2)
+                return
+            elif case == "stream-success" and payload.get("stream"):
+                self.send(200, b'data: {"content":"visible"}\n\n')
+                return
+            elif case == "chunked":
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                raw = json.dumps(response).encode()
+                for part in (raw[:3], raw[3:11], raw[11:]):
+                    self.wfile.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
                 return
         self.send(200, response)
 
@@ -172,6 +216,56 @@ class ServingEvidence(unittest.TestCase):
         self.assertEqual({row["status"] for row in records}, {200, 503})
         self.assertEqual(len({row["body_file"] for row in records}), 3)
         self.assertTrue(all((leg.out / row["body_file"]).stat().st_size for row in records))
+
+    def test_transport_failure_retains_received_body_prefix_and_original_cause(self):
+        for case in ("timeout-200", "timeout-503", "reset-200", "reset-503"):
+            with self.subTest(case=case):
+                self.server.case = self.args.run = case
+                leg = ServingLeg(self.args)
+                leg.out.mkdir(parents=True)
+                maximum = 0.35 if case.startswith("timeout") else 1
+                with self.assertRaises(OSError) as caught:
+                    leg.request("/completion", completion_payload("public", 64, 0), maximum=maximum)
+                record, = self.capture_records(leg)
+                self.assertEqual(record["status"], int(case[-3:]))
+                self.assertEqual((leg.out / record["body_file"]).read_bytes(), b'{"content":"partial')
+                self.assertIn("TimeoutError" if case.startswith("timeout") else "ConnectionResetError", record["error"])
+                self.assertIn("http/", str(caught.exception))
+                self.assertFalse((leg.out / "responses.jsonl").exists())
+
+    def test_stream_timeout_retains_the_incomplete_event_before_a_line_arrives(self):
+        self.server.case = "stream-timeout"
+        self.args.deadline = time.time() + 1.5
+        leg = ServingLeg(self.args)
+        leg.out.mkdir(parents=True)
+        with self.assertRaises(OSError) as caught:
+            leg.semantics()
+        record, = [row for row in self.capture_records(leg) if row["request"].get("stream")]
+        self.assertEqual(record["status"], 200)
+        self.assertEqual((leg.out / record["body_file"]).read_bytes(), b'data: {"content":"partial')
+        self.assertIn("TimeoutError", record["error"])
+        self.assertIn("http/", str(caught.exception))
+        self.assertFalse((leg.out / "cancelled.json").exists())
+
+    def test_chunked_completion_keeps_the_decoded_body_and_passes_validation(self):
+        self.server.case = "chunked"
+        leg = ServingLeg(self.args)
+        leg.out.mkdir(parents=True)
+        row = leg.complete(dict(category="english", prompt="public"), 64)
+        record, = self.capture_records(leg)
+        self.assertEqual(json.loads((leg.out / record["body_file"]).read_bytes()), row["response"])
+        self.assertTrue(validate_response(row["response"], 64))
+
+    def test_successful_stream_can_still_cancel_then_complete_a_followup(self):
+        self.server.case = "stream-success"
+        leg = ServingLeg(self.args)
+        leg.out.mkdir(parents=True)
+        leg.semantics()
+        cancelled = json.loads((leg.out / "cancelled.json").read_text())
+        self.assertEqual(cancelled["first_chunk"]["content"], "visible")
+        self.assertTrue((leg.out / "cancel-followup.json").is_file())
+        record, = [row for row in self.capture_records(leg) if row["request"].get("stream")]
+        self.assertEqual((leg.out / record["body_file"]).read_bytes(), b'data: {"content":"visible"}\n\n')
 
     def test_capacity_requires_live_monitor_and_complete_numeric_memory_evidence(self):
         # The server satisfies the actual HTTP contract; only the external monitor differs between cases.
