@@ -246,6 +246,78 @@ class WindowProcessTest(unittest.TestCase):
                                  dict(passed=False, failures=[failure], baseline_tok_s=141.2, candidate_tok_s=190.5))
                 self.assertFalse((window.out / "qualification.json").exists())
 
+    def publication_window(self, root, script, seconds=5, passed=True):
+        window = Window(SimpleNamespace(root=root, stop_at=time.time()+600+seconds, publication_check=script))
+        window.out.mkdir()
+        calls = []
+        staged(window, calls, lambda label: comparison(passed, [] if passed else ["combined rate below 200 tok/s"],
+                                                       141.2, 230.0 if passed else 190.0))
+        def serve(name, *rest, **kwargs):
+            calls.append(name)
+            if name == "route-diagnostics":
+                folder = window.out/name
+                folder.mkdir()
+                routes = [dict(device=device, calls=1, pairs=1, unique=1, reused=0,
+                               rows=[1]+[0]*7, multiplicity=[1]+[0]*63) for device in (0, 1)]
+                (folder/"server.log").write_text("".join("GLM_ROUTE_STATS "+json.dumps(row)+"\n" for row in routes))
+        window.serve = serve
+        return window, calls
+
+    def test_optional_publication_runs_after_g_and_receives_the_same_deadline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            script = root/"publication.py"
+            script.write_text("import json,sys\nfrom pathlib import Path\n"
+                              "root=Path(sys.argv[sys.argv.index('--root')+1]); out=root/'results'\n"
+                              "assert json.loads((out/'qualification.json').read_text())['passed']\n"
+                              "assert not (out/'outcome.json').exists()\n"
+                              "(out/'driver-only').mkdir()\n"
+                              "(out/'driver-only/driver-only-receipt.json').write_text(json.dumps({'passed':True}))\n"
+                              "print(sys.argv[sys.argv.index('--deadline')+1])\n")
+            window, calls = self.publication_window(root, script)
+            self.assertTrue(execute(window))
+            self.assertEqual(calls[-1], "route-diagnostics")
+            self.assertEqual(float((window.out/"publication.out").read_text()), window.until)
+            commands = json.loads((window.out/"commands.json").read_text())
+            self.assertEqual(commands[-1]["name"], "publication")
+            self.assertEqual(commands[-1]["exit"], 0)
+            self.assertEqual(json.loads((window.out/"outcome.json").read_text())["stage"], "done")
+
+    def test_publication_cannot_run_after_g_failure_or_erase_a_passed_g_on_its_own_failure(self):
+        for qualification_passed in (False, True):
+            with self.subTest(qualified=qualification_passed), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                script = root/"publication.py"
+                script.write_text("from pathlib import Path\nPath('publication-started').touch()\nraise SystemExit(7)\n")
+                window, calls = self.publication_window(root, script, passed=qualification_passed)
+                with self.assertRaises((RuntimeError, ValueError)):
+                    execute(window)
+                self.assertEqual((root/"publication-started").exists(), qualification_passed)
+                self.assertEqual((window.out/"qualification.json").exists(), qualification_passed)
+                outcome = json.loads((window.out/"outcome.json").read_text())
+                self.assertFalse(outcome["passed"])
+                self.assertEqual(outcome["stage"], "driver-only" if qualification_passed else "primary")
+                if qualification_passed:
+                    self.assertTrue(json.loads((window.out/"qualification.json").read_text())["passed"])
+                    self.assertTrue(outcome["verdicts"]["primary"]["passed"])
+
+    def test_publication_requires_its_receipt_and_cannot_outlive_the_original_deadline(self):
+        for timeout in (False, True):
+            with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                script = root/"publication.py"
+                script.write_text("import os,time\nprint(os.getpid(),flush=True)\n"+("time.sleep(60)\n" if timeout else ""))
+                window, calls = self.publication_window(root, script, seconds=0.5 if timeout else 5)
+                with self.assertRaises((ValueError, FileNotFoundError, subprocess.TimeoutExpired)):
+                    execute(window)
+                if timeout:
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(int((window.out/"publication.out").read_text()), 0)
+                self.assertTrue(json.loads((window.out/"qualification.json").read_text())["passed"])
+                outcome = json.loads((window.out/"outcome.json").read_text())
+                self.assertFalse(outcome["passed"])
+                self.assertEqual(outcome["stage"], "driver-only")
+
     def test_each_distribution_result_is_retained_and_checked_before_the_next_context(self):
         # A numerical miss is the cause of failure even if a later context would fail differently.
         for failed_ctx in (2048, 4096, None):

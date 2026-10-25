@@ -292,6 +292,15 @@ class Window:
         if not validate_route_observations(routes):
             raise ValueError("missing or inconsistent per-device route observations")
         write_json(self.out / "qualification.json", dict(passed=True, **comparisons, routes=routes))
+        publication = getattr(self.args, "publication_check", None)
+        if publication is not None:
+            self.stage = "driver-only"
+            def check_publication(stdout, stderr):
+                receipt = json.loads((self.out / "driver-only/driver-only-receipt.json").read_text())
+                if receipt.get("passed") is not True:
+                    raise ValueError("driver-only publication check has no passing receipt")
+            self.command("publication", [sys.executable, publication, "--root", self.root,
+                         "--deadline", str(self.until)], limit=3600, check=check_publication)
         self.stage = "done"
         return True
 
@@ -323,6 +332,8 @@ def main():
     parser.add_argument("--profile", choices=("sm120-balanced", "sm120-wide", "sm120-direct"), default="sm120-balanced")
     parser.add_argument("--stop-at", type=float, required=True, help="already armed provider-stop epoch; includes setup")
     parser.add_argument("--max-hours", type=float, default=1.0, help="the hours approved for the window, setup included")
+    parser.add_argument("--publication-check", type=Path,
+                        help="reviewed driver-only companion; runs only after G passes and shares its work deadline")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     if not args.execute:
