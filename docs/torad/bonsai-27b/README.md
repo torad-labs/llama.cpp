@@ -10,7 +10,7 @@ to reproduce them, then shows how to put the server behind Claude Code with
 ## Headline
 
 One RTX 5070 Ti (16 GB), the public pack, and PrismML's latest release (`prism-b10709-9a9394a`)
-against this fork at `c008fe8`, the engine rig 0.1.2 to 0.1.6 installed. Both were built with the
+against this fork at `c008fe8`, the published `engine-c008fe8` build. Both were built with the
 flags in step 1, and the benchmarks ran only once the shared host had been quiet for two minutes
 (1-minute load under 6; at most 4.4 during the run, [`quiet-rerun.sh`](runs/2026-09-24-headline/quiet-rerun.sh)).
 
@@ -74,7 +74,23 @@ Each change is one commit with its own measurement and an environment switch tha
 | GeForce Blackwell takes the transposed conv-state concat and the float4 scale, which were gated to the DGX Spark | `d371dff` | RTX 5070 Ti, MTP verify step: GPU time 20.0 → 19.4 ms; identical logits | `GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY=1`, `GGML_CUDA_SCALE_VEC4_SM120_LEGACY=1` |
 
 `60feea0` is this branch's first commit: PrismML's tree with the q4_0 flash attention and
-`--checkpoint-every` folded in.
+`--checkpoint-every` folded in. The checkpoint commit itself is `aa8ef36`, the parent of
+`60feea0`.
+
+The message on `60feea0` says the q4_0 read needs `--kv-mean-center` for a usable 4-bit K cache
+at long context. [`ggml_cuda_fattn_mma_raw`](../../../ggml/src/ggml-cuda/fattn.cu) selects that
+read from the cache type (q4_0 K and V), head size 256, and GQA above 4.
+`GGML_CUDA_FATTN_Q4_0_LEGACY=1` remains the off switch. `--kv-mean-center FNAME` is a separate
+option: it loads a bias file from [`tools/kv-mean-center`](../../../tools/kv-mean-center/README.md),
+and `cpy_k()` subtracts that bias before the q4_0 store only after the file is loaded. Context
+creation accepts the flag when `--cache-type-k` is q4_0. Set it when you have a bias calibrated
+with that same cache type. A quantized K cache whose head size is a multiple of 64 (256 on this
+model) is Hadamard-rotated unless `LLAMA_ATTN_ROT_DISABLE=1`. The scripts under `runs/` leave
+that variable unset, and every command on this page leaves `--kv-mean-center` unset. On a
+hybrid-attention model the tool's README reports mean KLD against an f16 K cache of 0.00144
+with rotation alone and 0.00111 with rotation plus a bias calibrated with `-ctk q4_0`. A bias
+recorded in the other basis is rejected at load
+([docs/kv-mean-center.md](../../kv-mean-center.md)).
 
 ## Tried, not shipped
 
@@ -103,30 +119,6 @@ Measured on the RTX 5070 Ti and kept out of `main`, each for the reason given:
   - The numbers are one binary with its switch off / on / off.
 
 ## Run it yourself
-
-### The short way: rig
-
-[rig](https://github.com/torad-labs/rig) does steps 1–3 below on Linux with an RTX 50-series or
-RTX PRO Blackwell card. The machine needs only the NVIDIA driver (CUDA 13 or newer) and glibc 2.35
-or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+):
-
-```bash
-curl -fsSL https://github.com/torad-labs/rig/releases/latest/download/install.sh | sh
-rig up bonsai-2-27b
-```
-
-`rig up`:
-- checks the card and driver;
-- installs this fork's published build ([`engine-3c7e643`](https://github.com/torad-labs/llama.cpp/releases/tag/engine-3c7e643)) and NVIDIA's CUDA 13.3 runtime, each checked by sha256, with no toolkit or compiler;
-- fetches the pack from step 2 by sha256, then writes our retrained MTP draft head over the pack's own ([`bonsai-2-27b-mtp-r2`](https://github.com/torad-labs/rig/releases/tag/bonsai-2-27b-mtp-r2), also checked by sha256; it raises the share of drafted tokens accepted from 0.670 to 0.733 on the pack as published);
-- starts it as a systemd user service on `127.0.0.1:8099`, with step 3's flags and `-c`/`-np` sized to the card. Its draft head
-  drafts three tokens a round and scores a 98,304-id draft vocabulary (step 3 drafts two over the whole vocabulary). On an
-  RTX 5080, over 48 held-out requests at 40,960 tokens of context, rig 0.1.7 decodes 190.2 tok/s and rig 0.1.6 141.9 (+36.8 %).
-
-On a fresh Ubuntu 24.04 with only the driver, the engine install took about 45 seconds, plus the
-7.66 GB pack and the 451 MB head. `rig describe bonsai-2-27b` prints what step 4 needs as JSON. In step 4, use
-`base_url = "http://127.0.0.1:8099/v1"`; the model id can stay `bonsai-2-27b`, since llama-server
-answers for any id.
 
 ### 1. Build (CUDA 12.8 or newer, sm_120: RTX 50-series and RTX PRO Blackwell)
 
@@ -166,12 +158,14 @@ build/bin/llama-server -m models/Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf --alia
 ```
 
 The fork's own flags (`-cts`, `--attn-mask-bits`, `--checkpoint-every`) and the MTP draft head are
-rows in the table above, each with its number; the rest are stock llama-server flags. This command,
-as written, loads on an RTX 5070 Ti in 13,586 MiB and answers a streamed tool call with its usage
+rows in the table above, each with its number; the rest are stock llama-server flags.
+`--kv-mean-center` stays unset, here and in the headline runs; the `60feea0` note above says when
+to set it. This command, as written, loads on an RTX 5070 Ti in 13,586 MiB and answers a streamed
+tool call with its usage
 frame ([`readme-command.sh`](runs/2026-09-22-headline/readme-command.sh),
 [`readme-command.txt`](runs/2026-09-22-headline/readme-command.txt)). On a bigger card, keep each
 conversation's window at 262,144 and add conversations to the shared pool. The larger rows are
-computed by [rig](https://github.com/torad-labs/rig) from VRAM constants measured on the RTX 5080,
+computed from VRAM constants measured on the RTX 5080,
 not measured on those cards:
 
 | card | `-c` | `-np` |
@@ -249,7 +243,7 @@ Three settings carry measurements:
 - **Baseline:** PrismML's llama.cpp at its latest release tag, `prism-b10709-9a9394a`, built
   unmodified. It has no `-cts`, `--attn-mask-bits` or `--checkpoint-every`, so its served runs use
   the same command without those flags. It also refuses this pack's MTP draft head at load
-  ([`server-prism-mtp.log`](runs/2026-09-22-headline/server-prism-mtp.log)): the head reads the
+  ([`served.sh`](runs/2026-09-22-headline/served.sh), last leg): the head reads the
   pack's Hadamard-latent token table without the inverse rotation, and the fork's `514c53c` adds it.
   So the engine comparison runs with MTP off on both sides, and the MTP gain is measured on the
   fork alone, on top of that.
