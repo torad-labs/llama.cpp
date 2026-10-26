@@ -74,7 +74,23 @@ Each change is one commit with its own measurement and an environment switch tha
 | GeForce Blackwell takes the transposed conv-state concat and the float4 scale, which were gated to the DGX Spark | `d371dff` | RTX 5070 Ti, MTP verify step: GPU time 20.0 → 19.4 ms; identical logits | `GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY=1`, `GGML_CUDA_SCALE_VEC4_SM120_LEGACY=1` |
 
 `60feea0` is this branch's first commit: PrismML's tree with the q4_0 flash attention and
-`--checkpoint-every` folded in.
+`--checkpoint-every` folded in. The checkpoint commit itself is `aa8ef36`, the parent of
+`60feea0`.
+
+The message on `60feea0` says the q4_0 read needs `--kv-mean-center` for a usable 4-bit K cache
+at long context. [`ggml_cuda_fattn_mma_raw`](../../../ggml/src/ggml-cuda/fattn.cu) selects that
+read from the cache type (q4_0 K and V), head size 256, and GQA above 4.
+`GGML_CUDA_FATTN_Q4_0_LEGACY=1` remains the off switch. `--kv-mean-center FNAME` is a separate
+option: it loads a bias file from [`tools/kv-mean-center`](../../../tools/kv-mean-center/README.md),
+and `cpy_k()` subtracts that bias before the q4_0 store only after the file is loaded. Context
+creation accepts the flag when `--cache-type-k` is q4_0. Set it when you have a bias calibrated
+with that same cache type. A quantized K cache whose head size is a multiple of 64 (256 on this
+model) is Hadamard-rotated unless `LLAMA_ATTN_ROT_DISABLE=1`. The scripts under `runs/` leave
+that variable unset, and every command on this page leaves `--kv-mean-center` unset. On a
+hybrid-attention model the tool's README reports mean KLD against an f16 K cache of 0.00144
+with rotation alone and 0.00111 with rotation plus a bias calibrated with `-ctk q4_0`. A bias
+recorded in the other basis is rejected at load
+([docs/kv-mean-center.md](../../kv-mean-center.md)).
 
 ## Tried, not shipped
 
@@ -166,8 +182,10 @@ build/bin/llama-server -m models/Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf --alia
 ```
 
 The fork's own flags (`-cts`, `--attn-mask-bits`, `--checkpoint-every`) and the MTP draft head are
-rows in the table above, each with its number; the rest are stock llama-server flags. This command,
-as written, loads on an RTX 5070 Ti in 13,586 MiB and answers a streamed tool call with its usage
+rows in the table above, each with its number; the rest are stock llama-server flags.
+`--kv-mean-center` stays unset, here and in the headline runs; the `60feea0` note above says when
+to set it. This command, as written, loads on an RTX 5070 Ti in 13,586 MiB and answers a streamed
+tool call with its usage
 frame ([`readme-command.sh`](runs/2026-09-22-headline/readme-command.sh),
 [`readme-command.txt`](runs/2026-09-22-headline/readme-command.txt)). On a bigger card, keep each
 conversation's window at 262,144 and add conversations to the shared pool. The larger rows are
@@ -249,7 +267,7 @@ Three settings carry measurements:
 - **Baseline:** PrismML's llama.cpp at its latest release tag, `prism-b10709-9a9394a`, built
   unmodified. It has no `-cts`, `--attn-mask-bits` or `--checkpoint-every`, so its served runs use
   the same command without those flags. It also refuses this pack's MTP draft head at load
-  ([`server-prism-mtp.log`](runs/2026-09-22-headline/server-prism-mtp.log)): the head reads the
+  ([`served.sh`](runs/2026-09-22-headline/served.sh), last leg): the head reads the
   pack's Hadamard-latent token table without the inverse rotation, and the fork's `514c53c` adds it.
   So the engine comparison runs with MTP off on both sides, and the MTP gain is measured on the
   fork alone, on top of that.

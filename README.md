@@ -1,149 +1,250 @@
-# llama.cpp
+# torad-labs/llama.cpp
 
-> [!NOTE]
-> **This is torad-labs/llama.cpp**: PrismML's llama.cpp plus kernels and server features measured on
-> Ternary Bonsai 2 27B on RTX 50-series cards. [The numbers, and how to run it, from Claude Code
-> too](docs/torad/bonsai-27b/README.md). Every change and its off switch: [TORAD.md](TORAD.md).
-> PrismML's own notes follow.
+Torad's public fork of llama.cpp. The CUDA kernels and server features were measured on
+[Ternary Bonsai 2 27B](docs/torad/bonsai-27b/README.md): PrismML's ternary Qwen3.8-27B, packed
+as PQ2_0 at 2.13 bits per weight, 7.66 GB with its MTP draft head. It fits a 16 GB GeForce
+card with a 262,144-token window. The commits are general CUDA and server changes.
+Ternary Bonsai 2 27B is the model the numbers below were measured on.
 
-> [!IMPORTANT]
-> **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
->
-> **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically.
->
-> **Which ternary model file to use:**
->
-> - `*-PQ2_0.gguf` (fork group-128, ggml id 142): preferred on Metal, CUDA, HIP and CPU. About 6% smaller than group-64.
-> - `*-Q2_0_g64.gguf` / 27B `*-Q2_g64.gguf` (official group-64, ggml id 42): runs on every backend here AND on mainline llama.cpp. If unsure, use this. Newer model releases name this file plain `*-Q2_0.gguf`.
-> - `*-Q2_0.gguf` on OLDER model repos is the **deprecated legacy format** (group 128 stored as id 42). It does not load on these builds; the error tells you which file to get instead. If you must run it, use the frozen [`prism-v5`](https://github.com/PrismML-Eng/llama.cpp/tree/prism-v5) line and its final release [`prism-b9601`](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b9601-68faa14).
->
-> **Speculative decoding (dspark)** is supported via mainline's draft-dspark plus fork patches. Drafters published for older model releases need a one-time conversion with `gguf-dspark-to-dflash` (see [SPECULATIVE.md](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/SPECULATIVE.md) in Bonsai-demo); newer releases ship ready-to-use drafters.
->
-> Do NOT build from `prism-v6` (stale mid-migration snapshot) and do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build.
+The base is [PrismML's llama.cpp](https://github.com/PrismML-Eng/llama.cpp), which tracks
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) and adds the ternary formats.
+PrismML's note on which GGUF to load, and the upstream project README, are in
+[docs/upstream-readme.md](docs/upstream-readme.md). Every change on this fork, with its
+measurement and its off switch, is in [TORAD.md](TORAD.md).
 
----
+## Headline
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+One RTX 5070 Ti (16 GB), the public pack, PrismML
+[`prism-b10709-9a9394a`](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10709-9a9394a)
+against this fork at [`c008fe8`][c008fe8]. Both binaries were built with the flags in
+[Build](#1-build). rig 0.1.2 to 0.1.6 was installed. The host had been quiet for two minutes
+(1-minute load under 6; at most 4.4 during the run,
+[`quiet-rerun.sh`](docs/torad/bonsai-27b/runs/2026-09-24-headline/quiet-rerun.sh)).
+[`bench-matrix.sh`](docs/torad/bonsai-27b/bench-matrix.sh): llama-bench, q4_0 K/V, flash
+attention on, no draft head on either side, 3 repetitions.
 
-<div align="center">
+| context | prefill pp512, Prism -> fork | decode tg128, Prism -> fork |
+|---|---|---|
+| 0 | 1,888 -> 2,164 tok/s | 85.8 -> 85.8 tok/s |
+| 16,384 | 1,626 -> 1,994 | 71.2 -> 81.9 |
+| 65,536 | 874 -> 1,479 | 50.3 -> 75.0 |
+| 131,072 | 547 -> 1,104 | **35.5 -> 67.3** |
 
-<b>LLM inference in C/C++</b>
+Depth-0 decode in this table is 85.8 tok/s on both sides. A 5-repetition A-B-A-B on the
+[Bonsai page](docs/torad/bonsai-27b/README.md) gives Prism 88.4 / 88.2 and the fork 87.1 / 87.1
+tok/s. With every off switch set, the fork does 87.4 tok/s, so the gap sits outside those switches.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+Served rows are the 2026-09-22 run, fork at [`c54ace8`][c54ace8]. One conversation, a
+65,536-token window, six prompts of 512 tokens, greedy, two runs each, with Prism measured in
+the same session. The 2026-09-24 served rows ran at host load 20-50. That load moves decode by
+8-12 tok/s, so the table uses the earlier run.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+| server | decode | against Prism, same session |
+|---|---|---|
+| fork, MTP draft head | **104.8 tok/s** (85.8 on prose, 120.8 on step-by-step reasoning) | **1.40x** (Prism 75.0) |
+| fork, no draft head, recurrent state in f32, as Prism keeps it | 77.0 tok/s | -1.5%, within the drift (Prism 78.2) |
+| fork, no draft head, recurrent state in q8_0 (`-cts q8_0`, 3.4x less state VRAM) | 71.3 tok/s | -4.9% (Prism 75.0) |
 
-</div>
+Prism b10709 refuses this pack's draft head at load, so it has no MTP row. On the fork, 47% of
+drafted tokens were accepted on prose and 85% on arithmetic reasoning. The command for that
+row is in [Benchmark](#4-benchmark). Per-prompt rows, logs, and the rest of the method are on
+the [Bonsai page](docs/torad/bonsai-27b/README.md).
 
 ## Quick start
 
-A few options to get `llama.cpp` installed on your machine:
+CUDA 12.8 or newer, architecture sm_120 (RTX 50-series and RTX PRO Blackwell).
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+### rig
 
-Once installed:
+On Linux, [rig](https://github.com/torad-labs/rig) checks the card, installs a build, fetches
+the pack, and serves it. The machine needs the NVIDIA driver (CUDA 13 or newer) and glibc 2.35
+or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+):
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```bash
+curl -fsSL https://github.com/torad-labs/rig/releases/latest/download/install.sh | sh
+rig up bonsai-2-27b
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+`rig up` installs the engine and draft head that rig currently publishes, and listens on
+`127.0.0.1:8099`. The tables above were measured from a source build at the commits named
+there, with the pack's own draft head. Steps 1 to 3 below are that build. What rig pins is
+on the [Bonsai page](docs/torad/bonsai-27b/README.md).
 
-## Description
+### 1. Build
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+```bash
+git clone https://github.com/torad-labs/llama.cpp && cd llama.cpp
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a -DGGML_NATIVE=ON \
+  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=OFF -DGGML_CUDA_GRAPHS=ON \
+  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF
+cmake --build build --target llama-server llama-bench -j
+```
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+### 2. Fetch the model
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+Apache-2.0. The file is ProCreations'
+[Ternary-Bonsai-2-27B-MTP](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP):
+PrismML's 851 tensors byte for byte, plus a 15-tensor MTP draft head in Q8_0.
 
-## Supported backends
+```bash
+hf download ProCreations/Ternary-Bonsai-2-27B-MTP Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf \
+  --revision efffdea64c1f9e93cc7fa6bb24f72ae9d66ecf51 --local-dir models
+echo "3cb3f0056d2e34ee44245a64396004a21f8492573d6ce1266ec4b7222c131dd4  models/Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf" | sha256sum -c
+```
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+### 3. Serve
 
-## Documentation
+For a 16 GB card, four conversations share one 294,912-token pool. Each may use the model's
+full 262,144-token window.
 
-#### Tools
+```bash
+build/bin/llama-server -m models/Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf --alias bonsai-2-27b \
+  -ngl 99 -fa on -c 294912 -np 4 --kv-unified --jinja \
+  --cache-type-k q4_0 --cache-type-v q4_0 -cts q8_0 --attn-mask-bits \
+  --chat-template-file docs/torad/bonsai-27b/chat-template.jinja --reasoning-format deepseek \
+  --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q4_0 -ctvd q4_0 \
+  --checkpoint-every 16384 --cache-ram 8192 \
+  --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+```
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+`chat-template.jinja` is the model's own template with one change: a system message after the
+first turn renders as a system turn. Claude Code sends those.
 
-#### Development
+On a bigger card, keep each conversation's window at 262,144 and add conversations to the
+shared pool. The 32 GB and 96 GB rows are computed by rig from VRAM constants measured on an
+RTX 5080:
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+| card | `-c` | `-np` |
+|---|---|---|
+| 16 GB (RTX 5070 Ti, 5080) | 294912 | 4 |
+| 32 GB (RTX 5090) | 786432 | 8 |
+| 96 GB (RTX PRO 6000 Blackwell) | 3538944 | 16 |
+
+To put the server behind Claude Code, use [splice](https://github.com/torad-labs/splice). The
+Bonsai page has the `splice.toml` and the three settings that were measured.
+
+### 4. Benchmark
+
+The depth table, on the binary from step 1:
+
+```bash
+docs/torad/bonsai-27b/bench-matrix.sh build/bin models/Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf
+```
+
+That runs `llama-bench -ngl 99 -fa 1 -ctk q4_0 -ctv q4_0 -p 512 -n 128` at depths 0, 16384,
+65536, and 131072, three repetitions, no draft head.
+
+The 104.8 tok/s row is [`bench-server.sh`](docs/torad/bonsai-27b/bench-server.sh) against the
+fork-mtp leg of
+[`served.sh`](docs/torad/bonsai-27b/runs/2026-09-22-headline/served.sh). Flags that row depends
+on: `-ngl 99`, `-fa on`, `--cache-type-k q4_0`, `--cache-type-v q4_0`, `-cts q8_0`,
+`--attn-mask-bits`, `--spec-type draft-mtp`, `--spec-draft-n-max 2`, `-ctkd q4_0`,
+`-ctvd q4_0`, and `-c 65536 -np 1`. The client sends temperature 0 and top_k 1, so the row is
+greedy. The recorded script used port 18090. Start the server, then run the client in another
+shell:
+
+```bash
+build/bin/llama-server -m models/Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf --alias bonsai-2-27b \
+  -ngl 99 -fa on -c 65536 -np 1 --jinja \
+  --cache-type-k q4_0 --cache-type-v q4_0 -cts q8_0 --attn-mask-bits \
+  --chat-template-file docs/torad/bonsai-27b/chat-template.jinja --reasoning-format deepseek \
+  --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q4_0 -ctvd q4_0 \
+  --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+```
+
+```bash
+docs/torad/bonsai-27b/bench-server.sh 8080 fork-mtp
+```
+
+Step 3 is the command to leave running on a 16 GB card. It uses `-c 294912 -np 4` and also
+passes `--kv-unified`, `--checkpoint-every 16384`, and `--cache-ram 8192`, which keep several
+conversations resident. The server command above is the one the 104.8 tok/s row measured.
+
+Both commands leave `--kv-mean-center` unset, and so did the headline runs. When to set it is
+the next section.
+
+## q4_0 cache
+
+The message on [`60feea0`][60feea0] says the native q4_0 flash-attention read needs
+`--kv-mean-center` for a usable 4-bit K cache at long context. The kernel selects that read in
+[`ggml_cuda_fattn_mma_raw`](ggml/src/ggml-cuda/fattn.cu) from the cache type (q4_0 K and V),
+head size 256, and GQA above 4. `GGML_CUDA_FATTN_Q4_0_LEGACY=1` is the off switch.
+
+`--kv-mean-center FNAME` is a separate option. The argument is a bias file from
+[`tools/kv-mean-center`](tools/kv-mean-center/README.md). After the file is loaded, `cpy_k()`
+subtracts that bias before the q4_0 store. Context creation accepts the flag when
+`--cache-type-k` is q4_0. Set it when you have a bias calibrated with that same cache type
+([docs/kv-mean-center.md](docs/kv-mean-center.md)).
+
+A quantized K cache whose head size is a multiple of 64 is Hadamard-rotated unless
+`LLAMA_ATTN_ROT_DISABLE=1`. This model's head size is 256, and the scripts in
+[`docs/torad/bonsai-27b/runs/`](docs/torad/bonsai-27b/runs/) leave that variable unset, so the
+headline runs rotated K. On a hybrid-attention model, the tool's README reports mean KLD
+against an f16 K cache of 0.00144 with rotation alone and 0.00111 with rotation plus a bias
+calibrated with `-ctk q4_0`. A bias recorded in the other basis is rejected at load.
+
+## What's different from upstream
+
+Each row is one commit. The Bonsai page has the measurement on this model.
+
+| change | commit | off switch |
+|---|---|---|
+| Tensor-core flash attention reads a q4_0 K/V cache directly, with int8 QK | [60feea0][60feea0] | `GGML_CUDA_FATTN_Q4_0_LEGACY=1` |
+| Chunked tensor-core Gated DeltaNet prefill, a port of [ggml-org#26001](https://github.com/ggml-org/llama.cpp/pull/26001) | [b120f63][b120f63] | `GGML_CUDA_GDN_CHUNKED=0` |
+| The MTP draft head reads the pack's Hadamard-latent token table through the inverse rotation | [514c53c][514c53c] | omit `--spec-type draft-mtp` |
+| Recurrent state cache in a narrower type, `-cts q8_0`. The update math stays f32 | [a941add][a941add] | omit `-cts` (f32) |
+| Attention mask as one bit per KV cell, `--attn-mask-bits` | [9e358e6][9e358e6] | omit the flag |
+| A small float matrix the tiled kernel cannot take goes to the vector kernel | [55b7db6][55b7db6] | `GGML_CUDA_MMVF_UNTILED_LEGACY=1` |
+| GeForce Blackwell takes the transposed conv-state concat and the float4 scale | [d371dff][d371dff] | `GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY=1`, `GGML_CUDA_SCALE_VEC4_SM120_LEGACY=1` |
+| A pinned context checkpoint every N prompt tokens, and one at the token a prompt forked, `--checkpoint-every` | [aa8ef36][aa8ef36] | omit the flag |
+
+[aa8ef36][aa8ef36] is the parent of [60feea0][60feea0]. The Bonsai page lists the checkpoint
+with `60feea0`, which is where both landed on this branch.
+
+The full list is [TORAD.md](TORAD.md).
 
 ## Contributing
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+Issues and pull requests for this fork:
+[issues](https://github.com/torad-labs/llama.cpp/issues),
+[pull requests](https://github.com/torad-labs/llama.cpp/pulls).
 
-## Acknowledgements
+A change here is one commit with its own measurement and its own off switch, so it can be
+rebased, dropped, or sent upstream on its own. [TORAD.md](TORAD.md) is that list.
+[CONTRIBUTING.md](CONTRIBUTING.md) is the upstream llama.cpp rule set, including the note on
+disclosing AI-written changes.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+## License
+
+[MIT](LICENSE). Copyright (c) 2023-2026 The ggml authors. Same license as
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Third-party notices are in the
+[upstream README](docs/upstream-readme.md#acknowledgements).
+
+## Upstream
+
+[PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) is the base. This fork merges
+that line when it takes a newer base (`prism` remote). PrismML tracks
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+
+A fix that belongs upstream can go as its own commit. Opening it there is a separate pull
+request. The maintained description is the last section of [TORAD.md](TORAD.md).
+
+## Documentation
+
+- [Ternary Bonsai 2 27B](docs/torad/bonsai-27b/README.md): the runs, the method, splice
+- [Build](docs/build.md)
+- [llama-server](tools/server/README.md)
+- [Docker](docs/docker.md)
+- [Upstream README](docs/upstream-readme.md): what llama.cpp is, backends, tools
+
+[c008fe8]: https://github.com/torad-labs/llama.cpp/commit/c008fe8cf5d8086586d3527c41868d0da8781f39
+[c54ace8]: https://github.com/torad-labs/llama.cpp/commit/c54ace84bb817d88031c2181e6e3689e1733b8de
+[60feea0]: https://github.com/torad-labs/llama.cpp/commit/60feea00bdfe4bc47a2ba16ab153968c34084ea8
+[b120f63]: https://github.com/torad-labs/llama.cpp/commit/b120f63c003649a4dc9939af4df2e1134d606d1a
+[514c53c]: https://github.com/torad-labs/llama.cpp/commit/514c53c14bf6c4aa8eed8805a34a823938a0247b
+[a941add]: https://github.com/torad-labs/llama.cpp/commit/a941add71eca6c52851422eb30d6f8e275b9cc26
+[9e358e6]: https://github.com/torad-labs/llama.cpp/commit/9e358e628c307255392b5b68287c57d60eaf735d
+[55b7db6]: https://github.com/torad-labs/llama.cpp/commit/55b7db6e20d67ea0ec1b635c2980f37836df7e88
+[d371dff]: https://github.com/torad-labs/llama.cpp/commit/d371dffe4b84c62576a575fd9455e8beb95fc599
+[aa8ef36]: https://github.com/torad-labs/llama.cpp/commit/aa8ef36b689de6dbeeeebe40bfd4990670738034
