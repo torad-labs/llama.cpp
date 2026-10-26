@@ -34,7 +34,8 @@ against this fork at [`c008fe8`][c008fe8]. llama-bench, q4_0 K/V, flash attentio
 <details>
 <summary>How this was measured</summary>
 
-Both binaries were built with the flags in [Build](#1-build). rig 0.1.2 to 0.1.6 was installed.
+Both binaries were built with the flags in [Build](#1-build). The fork side is the published
+[`engine-c008fe8`](https://github.com/torad-labs/llama.cpp/releases/tag/engine-c008fe8) build.
 The host had been quiet for two minutes (1-minute load under 6; at most 4.4 during the run,
 [`quiet-rerun.sh`](docs/torad/bonsai-27b/runs/2026-09-24-headline/quiet-rerun.sh)).
 [`bench-matrix.sh`](docs/torad/bonsai-27b/bench-matrix.sh): llama-bench, q4_0 K/V, flash
@@ -69,24 +70,6 @@ the [Bonsai page](docs/torad/bonsai-27b/README.md).
 </details>
 
 ## Quick start
-
-### Fastest path
-
-```bash
-curl -fsSL https://github.com/torad-labs/rig/releases/latest/download/install.sh | sh
-rig up bonsai-2-27b
-```
-
-On Linux, [rig](https://github.com/torad-labs/rig) checks the card, installs a build, fetches
-the pack, and serves it. The machine needs the NVIDIA driver (CUDA 13 or newer) and glibc 2.35
-or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+).
-
-`rig up` installs the engine and draft head that rig currently publishes, and listens on
-`127.0.0.1:8099`. The tables above were measured from a source build at the commits named
-there, with the pack's own draft head. Steps 1 to 3 below are that build. What rig pins is
-on the [Bonsai page](docs/torad/bonsai-27b/README.md).
-
-### Build from source
 
 CUDA 12.8 or newer, architecture sm_120 (RTX 50-series and RTX PRO Blackwell).
 
@@ -132,14 +115,7 @@ build/bin/llama-server -m models/Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf --alia
 first turn renders as a system turn. Claude Code sends those.
 
 On a bigger card, keep each conversation's window at 262,144 and add conversations to the
-shared pool. The 32 GB and 96 GB rows are computed by rig from VRAM constants measured on an
-RTX 5080:
-
-| card | `-c` | `-np` |
-|---|---|---|
-| 16 GB (RTX 5070 Ti, 5080) | 294912 | 4 |
-| 32 GB (RTX 5090) | 786432 | 8 |
-| 96 GB (RTX PRO 6000 Blackwell) | 3538944 | 16 |
+shared pool.
 
 To put the server behind Claude Code, use [splice](https://github.com/torad-labs/splice). The
 Bonsai page has the `splice.toml` and the three settings that were measured.
