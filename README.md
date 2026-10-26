@@ -1,27 +1,28 @@
 # torad-labs/llama.cpp
 
-Torad's public fork of llama.cpp. The CUDA kernels and server features were measured on
-[Ternary Bonsai 2 27B](docs/torad/bonsai-27b/README.md): PrismML's ternary Qwen3.8-27B, packed
-as PQ2_0 at 2.13 bits per weight, 7.66 GB with its MTP draft head. It fits a 16 GB GeForce
-card with a 262,144-token window. The commits are general CUDA and server changes.
-Ternary Bonsai 2 27B is the model the numbers below were measured on.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CUDA sm_120](https://img.shields.io/badge/CUDA-sm__120-76b900.svg)](#1-build)
 
-The base is [PrismML's llama.cpp](https://github.com/PrismML-Eng/llama.cpp), which tracks
-[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) and adds the ternary formats.
-PrismML's note on which GGUF to load, and the upstream project README, are in
-[docs/upstream-readme.md](docs/upstream-readme.md). Every change on this fork, with its
-measurement and its off switch, is in [TORAD.md](TORAD.md).
+A llama.cpp fork with CUDA and server changes for RTX 50-series cards, on
+[PrismML's llama.cpp](https://github.com/PrismML-Eng/llama.cpp) and
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). On one 16 GB card,
+[Ternary Bonsai 2 27B](docs/torad/bonsai-27b/README.md) decodes at 35.5 -> 67.3 tok/s
+at 131K context against PrismML's release, and at 104.8 tok/s served with the draft head.
+It is for people running that model on one 16 GB RTX 50-series card.
+
+## Why use this fork
+
+- [Ternary Bonsai 2 27B](docs/torad/bonsai-27b/README.md) is PrismML's ternary Qwen3.8-27B, PQ2_0 at 2.13 bits per weight, 7.66 GB with its draft head. It fits one 16 GB card, with a 262,144-token window.
+- The gap is at long context. At 131,072 tokens, prefill goes from 547 to 1,104 tok/s and decode from 35.5 to 67.3, against PrismML's release.
+- With the draft head, served decode is 104.8 tok/s. In the same session PrismML's release is at 75.0 tok/s. That release refuses this pack's head at load.
+- Each change has an off switch and a measurement. The list is [TORAD.md](TORAD.md).
+- Claude Code can use the server through [splice](https://github.com/torad-labs/splice).
 
 ## Headline
 
 One RTX 5070 Ti (16 GB), the public pack, PrismML
 [`prism-b10709-9a9394a`](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10709-9a9394a)
-against this fork at [`c008fe8`][c008fe8]. Both binaries were built with the flags in
-[Build](#1-build). rig 0.1.2 to 0.1.6 was installed. The host had been quiet for two minutes
-(1-minute load under 6; at most 4.4 during the run,
-[`quiet-rerun.sh`](docs/torad/bonsai-27b/runs/2026-09-24-headline/quiet-rerun.sh)).
-[`bench-matrix.sh`](docs/torad/bonsai-27b/bench-matrix.sh): llama-bench, q4_0 K/V, flash
-attention on, no draft head on either side, 3 repetitions.
+against this fork at [`c008fe8`][c008fe8]. llama-bench, q4_0 K/V, flash attention on, no draft head, 3 repetitions.
 
 | context | prefill pp512, Prism -> fork | decode tg128, Prism -> fork |
 |---|---|---|
@@ -30,14 +31,23 @@ attention on, no draft head on either side, 3 repetitions.
 | 65,536 | 874 -> 1,479 | 50.3 -> 75.0 |
 | 131,072 | 547 -> 1,104 | **35.5 -> 67.3** |
 
+<details>
+<summary>How this was measured</summary>
+
+Both binaries were built with the flags in [Build](#1-build). rig 0.1.2 to 0.1.6 was installed.
+The host had been quiet for two minutes (1-minute load under 6; at most 4.4 during the run,
+[`quiet-rerun.sh`](docs/torad/bonsai-27b/runs/2026-09-24-headline/quiet-rerun.sh)).
+[`bench-matrix.sh`](docs/torad/bonsai-27b/bench-matrix.sh): llama-bench, q4_0 K/V, flash
+attention on, no draft head on either side, 3 repetitions.
+
 Depth-0 decode in this table is 85.8 tok/s on both sides. A 5-repetition A-B-A-B on the
 [Bonsai page](docs/torad/bonsai-27b/README.md) gives Prism 88.4 / 88.2 and the fork 87.1 / 87.1
 tok/s. With every off switch set, the fork does 87.4 tok/s, so the gap sits outside those switches.
 
-Served rows are the 2026-09-22 run, fork at [`c54ace8`][c54ace8]. One conversation, a
-65,536-token window, six prompts of 512 tokens, greedy, two runs each, with Prism measured in
-the same session. The 2026-09-24 served rows ran at host load 20-50. That load moves decode by
-8-12 tok/s, so the table uses the earlier run.
+</details>
+
+Served, 2026-09-22, fork at [`c54ace8`][c54ace8]. One conversation, a 65,536-token window,
+six prompts of 512 tokens, greedy.
 
 | server | decode | against Prism, same session |
 |---|---|---|
@@ -45,30 +55,40 @@ the same session. The 2026-09-24 served rows ran at host load 20-50. That load m
 | fork, no draft head, recurrent state in f32, as Prism keeps it | 77.0 tok/s | -1.5%, within the drift (Prism 78.2) |
 | fork, no draft head, recurrent state in q8_0 (`-cts q8_0`, 3.4x less state VRAM) | 71.3 tok/s | -4.9% (Prism 75.0) |
 
+<details>
+<summary>How this was measured</summary>
+
+Two runs each, with Prism measured in the same session. The 2026-09-24 served rows ran at host
+load 20-50. That load moves decode by 8-12 tok/s, so the table uses the earlier run.
+
 Prism b10709 refuses this pack's draft head at load, so it has no MTP row. On the fork, 47% of
 drafted tokens were accepted on prose and 85% on arithmetic reasoning. The command for that
 row is in [Benchmark](#4-benchmark). Per-prompt rows, logs, and the rest of the method are on
 the [Bonsai page](docs/torad/bonsai-27b/README.md).
 
+</details>
+
 ## Quick start
 
-CUDA 12.8 or newer, architecture sm_120 (RTX 50-series and RTX PRO Blackwell).
-
-### rig
-
-On Linux, [rig](https://github.com/torad-labs/rig) checks the card, installs a build, fetches
-the pack, and serves it. The machine needs the NVIDIA driver (CUDA 13 or newer) and glibc 2.35
-or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+):
+### Fastest path
 
 ```bash
 curl -fsSL https://github.com/torad-labs/rig/releases/latest/download/install.sh | sh
 rig up bonsai-2-27b
 ```
 
+On Linux, [rig](https://github.com/torad-labs/rig) checks the card, installs a build, fetches
+the pack, and serves it. The machine needs the NVIDIA driver (CUDA 13 or newer) and glibc 2.35
+or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+).
+
 `rig up` installs the engine and draft head that rig currently publishes, and listens on
 `127.0.0.1:8099`. The tables above were measured from a source build at the commits named
 there, with the pack's own draft head. Steps 1 to 3 below are that build. What rig pins is
 on the [Bonsai page](docs/torad/bonsai-27b/README.md).
+
+### Build from source
+
+CUDA 12.8 or newer, architecture sm_120 (RTX 50-series and RTX PRO Blackwell).
 
 ### 1. Build
 
@@ -186,7 +206,7 @@ calibrated with `-ctk q4_0`. A bias recorded in the other basis is rejected at l
 
 ## What's different from upstream
 
-Each row is one commit. The Bonsai page has the measurement on this model.
+The changes are general CUDA and server changes. Each row is one commit. The Bonsai page has the measurement on this model.
 
 | change | commit | off switch |
 |---|---|---|
@@ -236,7 +256,11 @@ request. The maintained description is the last section of [TORAD.md](TORAD.md).
 - [Build](docs/build.md)
 - [llama-server](tools/server/README.md)
 - [Docker](docs/docker.md)
-- [Upstream README](docs/upstream-readme.md): what llama.cpp is, backends, tools
+- [Upstream README](docs/upstream-readme.md): what llama.cpp is, backends, tools, and PrismML's note on which GGUF to load
+
+## Made by Torad
+
+[Torad](https://torad.ai)
 
 [c008fe8]: https://github.com/torad-labs/llama.cpp/commit/c008fe8cf5d8086586d3527c41868d0da8781f39
 [c54ace8]: https://github.com/torad-labs/llama.cpp/commit/c54ace84bb817d88031c2181e6e3689e1733b8de
