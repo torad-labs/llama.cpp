@@ -1,11 +1,12 @@
-# Ternary Bonsai 2 27B on a Blackwell GPU, driven from Claude Code
+# Ternary Bonsai 2 27B on an sm_120 GPU, driven from Claude Code
 
 Ternary Bonsai 2 27B is PrismML's ternary Qwen3.8-27B: 64 layers (48 Gated DeltaNet + 16 full
 attention), packed as PQ2_0 at 2.13 bits per weight, 7.66 GB with its MTP draft head. It fits a
 16 GB GeForce card with a 262,144-token window. This fork (torad-labs/llama.cpp) is PrismML's llama.cpp plus kernels and server features
 measured on that model on RTX 50-series cards. This page has the numbers and every command needed
 to reproduce them, then shows how to put the server behind Claude Code with
-[splice](https://github.com/torad-labs/splice).
+[splice](https://github.com/torad-labs/splice). Where the optimizations run on other GPUs is in
+[Hardware support](../../../README.md#hardware-support).
 
 ## Headline
 
@@ -120,16 +121,18 @@ Measured on the RTX 5070 Ti and kept out of `main`, each for the reason given:
 
 ## Run it yourself
 
-### 1. Build (CUDA 12.8 or newer, sm_120: RTX 50-series and RTX PRO Blackwell)
+### 1. Build (CUDA 12.8 or newer)
 
 ```bash
 git clone https://github.com/torad-labs/llama.cpp && cd llama.cpp
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a -DGGML_NATIVE=ON \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON \
   -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=OFF -DGGML_CUDA_GRAPHS=ON \
   -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF
 cmake --build build --target llama-server llama-bench -j
 ```
+
+With CMake 3.24 or newer, `-DGGML_NATIVE=ON` sets `CMAKE_CUDA_ARCHITECTURES` to `native` when that value is still unset: the GPUs in the build machine. To build on one machine for another card, set `CMAKE_CUDA_ARCHITECTURES` to that card's architecture: `120a` for RTX 50-series and RTX PRO Blackwell, `121a` for DGX Spark GB10, `100a` for B200, `90a` for H100, `89` for RTX 40-series, `86` for RTX 30-series. The PQ2_0 tensor-core mat-vec launches only on sm_120, and only when the binary includes an sm_120 image. Use `120a` for that card. The CUDA build rewrites a plain `120` to `120a`. See [Hardware support](../../../README.md#hardware-support).
 
 ### 2. Fetch the model (Apache-2.0)
 
@@ -159,6 +162,7 @@ build/bin/llama-server -m models/Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf --alia
 
 The fork's own flags (`-cts`, `--attn-mask-bits`, `--checkpoint-every`) and the MTP draft head are
 rows in the table above, each with its number; the rest are stock llama-server flags.
+`--attn-mask-bits` is CUDA and CPU only.
 `--kv-mean-center` stays unset, here and in the headline runs; the `60feea0` note above says when
 to set it. This command, as written, loads on an RTX 5070 Ti in 13,586 MiB and answers a streamed
 tool call with its usage

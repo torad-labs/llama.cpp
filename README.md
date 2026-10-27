@@ -71,18 +71,20 @@ the [Bonsai page](docs/torad/bonsai-27b/README.md).
 
 ## Quick start
 
-CUDA 12.8 or newer, architecture sm_120 (RTX 50-series and RTX PRO Blackwell).
+CUDA 12.8 or newer. The build targets the GPU in the machine.
 
 ### 1. Build
 
 ```bash
 git clone https://github.com/torad-labs/llama.cpp && cd llama.cpp
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a -DGGML_NATIVE=ON \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON \
   -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=OFF -DGGML_CUDA_GRAPHS=ON \
   -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF
 cmake --build build --target llama-server llama-bench -j
 ```
+
+With CMake 3.24 or newer, `-DGGML_NATIVE=ON` sets `CMAKE_CUDA_ARCHITECTURES` to `native` when that value is still unset: the GPUs in the build machine. To build on one machine for another card, set `CMAKE_CUDA_ARCHITECTURES` to that card's architecture: `120a` for RTX 50-series and RTX PRO Blackwell, `121a` for DGX Spark GB10, `100a` for B200, `90a` for H100, `89` for RTX 40-series, `86` for RTX 30-series. The PQ2_0 tensor-core mat-vec launches only on sm_120, and only when the binary includes an sm_120 image. Use `120a` for that card. The CUDA build rewrites a plain `120` to `120a`.
 
 ### 2. Fetch the model
 
@@ -110,6 +112,8 @@ build/bin/llama-server -m models/Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf --alia
   --checkpoint-every 16384 --cache-ram 8192 \
   --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
 ```
+
+`--attn-mask-bits` is CUDA and CPU only. [Hardware support](#hardware-support) has the detail.
 
 `chat-template.jinja` is the model's own template with one change: a system message after the
 first turn renders as a system turn. Claude Code sends those.
@@ -179,6 +183,19 @@ A quantized K cache whose head size is a multiple of 64 is Hadamard-rotated unle
 headline runs rotated K. On a hybrid-attention model, the tool's README reports mean KLD
 against an f16 K cache of 0.00144 with rotation alone and 0.00111 with rotation plus a bias
 calibrated with `-ctk q4_0`. A bias recorded in the other basis is rejected at load.
+
+## Hardware support
+
+All published numbers come from RTX 50-series and RTX PRO 6000 cards, sm_120 (GeForce and RTX PRO Blackwell), where the defaults were tuned.
+
+| optimization | runs on | elsewhere |
+|---|---|---|
+| int8-query tensor-core flash attention for a q4_0 K/V cache | NVIDIA sm_80 and newer (Ampere, Ada, Hopper, B200, RTX 50-series, GB10), head size 256, GQA above 4 | upstream flash-attention kernels |
+| chunked Gated DeltaNet prefill | NVIDIA sm_80 and newer, head size 128, prompts of 128 or more tokens | upstream recurrent kernel |
+| MTP draft-head Hadamard fix, `--cache-type-s`, small-float mat-vec instead of cuBLAS | The Hadamard fix and `--cache-type-s` run on every backend. The small-float mat-vec runs on every CUDA GPU. | The Hadamard fix and `--cache-type-s` use that same path on every backend. On CUDA, a larger float product stays on cuBLAS. Other backends use their own matmul for that product. |
+| paced L2 prefetch and launch overlap (PDL) | NVIDIA sm_90 and newer (Hopper, B200, RTX 50-series, GB10) | Kernels run in program order. Each kernel fetches its own weights. |
+| PQ2_0 tensor-core mat-vec with a TMA pipeline, evict_first, and L2 prefetch | sm_120 (RTX 5070 Ti, 5080, 5090, RTX PRO Blackwell) | The CUDA-core PQ2_0 kernel on other NVIDIA GPUs, including B200 (sm_100) and DGX Spark GB10 (sm_121). That kernel works and is slower. PQ2_0 also runs on CPU and Metal. Vulkan and SYCL have no PQ2_0 kernel. |
+| `--attn-mask-bits` | CUDA and CPU. Off by default. | Vulkan refuses the bit-packed mask and runs that attention op on the CPU. Metal does not check the mask type, so leave the flag off there. |
 
 ## What's different from upstream
 
