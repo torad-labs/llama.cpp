@@ -214,30 +214,27 @@ class Window:
         quality = {}
         for ctx in (2048, 4096, 16384):
             baseline_run = f"{self.args.run_id}-baseline-{ctx}"
-            for arm, operation in (("baseline", "ident"), ("candidate", "kld")):
-                run = baseline_run if arm == "baseline" else f"{self.args.run_id}-candidate-{ctx}"
+            base = self.out / f"{baseline_run}.kld"
+            for arm in ("baseline", "candidate"):
                 engine_env = {"GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": "internal"}
                 if arm == "candidate":
                     engine_env |= self.profile_env
                 if ctx == 4096:
                     engine_env["LLAMA_KLD_FIRST"] = "0"
-                argv = [self.args.rig, "engine", operation, "--tree", self.root / arm, "--gpu", "0,1",
-                        "--model", self.model, "--text", self.args.fixtures / "final-rental-bundle/kld-public.txt",
-                        "--ctx", str(ctx), "--chunks", "1", "--tag", arm, "--run", run,
-                        "--env", ",".join(f"{k}={v}" for k, v in engine_env.items()), "--json"]
+                binary = self.args.llama_bin_dir / "llama-perplexity" if self.args.llama_bin_dir else self.root / arm / "llama-perplexity"
+                argv = [binary, "-m", self.model, "-f", self.args.fixtures / "final-rental-bundle/kld-public.txt",
+                        "-c", str(ctx), "--chunks", "1", "-ngl", "99", "-sm", "tensor", "-ts", "1,1", "-fa", "on",
+                        "-ctk", "q8_0", "-ctv", "q8_0", "-ctki", "q8_0", "-b", "4096", "-ub", "1024",
+                        "--kl-divergence-base", base]
                 if arm == "candidate":
-                    argv += ["--base", self.args.rig_root / "local/engine-lab" / baseline_run / "baseline.kld"]
-                argv += ["--", "-ngl", "99", "-sm", "tensor", "-ts", "1,1", "-fa", "on", "-ctk", "q8_0",
-                         "-ctv", "q8_0", "-ctki", "q8_0", "-b", "4096", "-ub", "1024"]
-                # Rig's explicit root keeps its result paths independent of this script's cwd.
+                    argv += ["--kl-divergence"]
                 output = self.command(f"kld-{arm}-{ctx}", argv, self.env | {
-                    "RIG_ROOT": str(self.args.rig_root),
                     "LD_LIBRARY_PATH": f"{self.root}/{arm}:{self.root}/cuda-runtime"}, 600)
                 if arm == "candidate":
-                    # Keep invalid numeric literals as text so the failed result still has a valid JSON record.
-                    report = json.loads(output, parse_constant=str,
-                                        parse_float=lambda value: float(value) if math.isfinite(float(value)) else value)
-                    quality[str(ctx)] = report.get("summary") if isinstance(report, dict) else None
+                    mean = re.search(r"Mean\s+KLD:\s*([-+0-9.eE]+)", output)
+                    top = re.search(r"Same top p:\s*([-+0-9.eE]+)", output)
+                    quality[str(ctx)] = dict(meanKld=float(mean.group(1)) if mean else None,
+                                             sameTopP=float(top.group(1)) if top else None)
                     write_json(self.out / "quality.json", quality)
                     check_quality_context(ctx, quality[str(ctx)])
         check_quality(quality)
@@ -333,9 +330,9 @@ def main():
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--fixtures", type=Path, required=True)
     parser.add_argument("--model-root", type=Path, required=True)
-    parser.add_argument("--rig-root", type=Path, default=Path("/workspace/rig"))
-    parser.add_argument("--rig", default="/workspace/rig/dist/rig")
-    parser.add_argument("--run-id", required=True, help="unique Rig KLD output prefix")
+    parser.add_argument("--llama-bin-dir", type=Path,
+                        help="directory containing llama-perplexity; defaults to each arm's build output")
+    parser.add_argument("--run-id", required=True, help="unique KLD output prefix")
     parser.add_argument("--profile", choices=("sm120-balanced", "sm120-wide", "sm120-direct"), default="sm120-balanced")
     parser.add_argument("--stop-at", type=float, required=True, help="already armed provider-stop epoch; includes setup")
     parser.add_argument("--max-hours", type=float, default=1.0, help="the hours approved for the window, setup included")

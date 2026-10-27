@@ -376,17 +376,17 @@ class WindowProcessTest(unittest.TestCase):
         for failed_ctx in (2048, 4096, None):
             with self.subTest(context=failed_ctx), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
-                rig = root / "rig.py"
-                rig.write_text(f"#!{sys.executable}\n" +
-                               "import json, sys\n"
-                               "ctx = int(sys.argv[sys.argv.index('--ctx')+1])\n"
-                               f"failed = {failed_ctx!r}\n"
-                               "if failed is not None and ctx > failed: raise SystemExit(99)\n"
-                               "print(json.dumps({'summary': {'meanKld': 0.001 if ctx == failed else 0.0, "
-                               "'sameTopP': 100.0}}))\n")
-                rig.chmod(0o755)
-                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630, rig=rig,
-                                run_id="quality-test", rig_root=root, fixtures=root))
+                perplexity = root / "llama-perplexity"
+                perplexity.write_text(f"#!{sys.executable}\n" +
+                                      "import sys\n"
+                                      "ctx = int(sys.argv[sys.argv.index('-c')+1])\n"
+                                      f"failed = {failed_ctx!r}\n"
+                                      "if failed is not None and ctx > failed: raise SystemExit(99)\n"
+                                      "print('Mean    KLD:   0.001000 +/-   0.000000' if ctx == failed else 'Mean    KLD:   0.000000 +/-   0.000000')\n"
+                                      "print('Same top p: 100.000 +/- 0.000 %')\n")
+                perplexity.chmod(0o755)
+                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630, llama_bin_dir=root,
+                                run_id="quality-test", fixtures=root))
                 window.out.mkdir()
                 window.model, window.profile_env = root / "model.gguf", {}
                 window.stage = "quality"
