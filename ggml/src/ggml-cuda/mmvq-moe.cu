@@ -27,7 +27,7 @@
 // A gate (vgate) is the up rows' twin, the same rows of the gate matrix beside them in the slot under one barrier, and
 // the GLU (with the SwiGLU limit and the biases) is applied as mul_mat_vec_q applies it.
 //
-// The bytes in flight are the rate (qgre's bulk-copy ladder on sm_120: 861 B/ns at 16 KB an SM, 877 at 32, 884 at 64),
+// The bytes in flight are the rate (a bulk-copy ladder on sm_120: 861 B/ns at 16 KB an SM, 877 at 32, 884 at 64),
 // and a slot a team holds is not in flight: a team that kept its slot through its dot products held two of four, so the
 // ring streamed ~25 KB an SM and 87.5 % of DRAM with the math on against 94 % with it compiled out. So at IQ3_XXS a warp
 // takes its lanes' share of its rows out of the slot into registers (iq3_xxs_frag: the 8 grid indices, the signs and

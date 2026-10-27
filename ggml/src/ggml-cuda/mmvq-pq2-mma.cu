@@ -48,7 +48,7 @@
 // warps take them in turn, so one sub-partition holds 3 of this block's 9 warps; a block of the next kernel lands beside
 // it (PDL: the kernels after a matmul start under it and wait there) only if its warp there finds its registers. At 168
 // that sub-partition kept 256 and the conv after the qkv group (40 registers) started only as the group's blocks exited;
-// at 152 it keeps 1,792, a warp of up to 56 (coresid/pdl-regs.cu in rig's roofline research, RTX 5080), and the conv
+// at 152 it keeps 1,792, a warp of up to 56 (measured on an RTX 5080), and the conv
 // computes the pair under the group. Every other launch keeps 168 (mmvq_pq2_mma_group_168; all of them with
 // GGML_CUDA_PQ2_MMA_GROUP_REGS_LEGACY=1): the norm after an output projection (1,024 threads) finds no room at any count,
 // gate/up ran 1.8 us slower at 152, and alone the cap streams the qkv group 0.7 us slower and buys nothing after it.

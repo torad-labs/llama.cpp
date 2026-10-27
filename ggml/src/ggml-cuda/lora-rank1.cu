@@ -1,6 +1,6 @@
 #include "lora-rank1.cuh"
 
-// A rank-1 adapter (the abliteration LoRAs are rank 1) costs four launches per adapted weight
+// A rank-1 LoRA adapter costs four launches per adapted weight
 // through build_lora_mm: a K-wide dot (cuBLAS gemm k=1), an N-wide outer product with the scalar,
 // a scale, and the add into the base projection. At decode each is ~1-3 us of latency and the
 // model adapts 128 weights, so the four launches are ~0.75 ms of a ~13 ms token. This kernel does

@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-// A request is an 8 KB piece: one uniform-datapath instruction a piece, and inside what the rig measured; pieces go to the
+// A request is an 8 KB piece: one uniform-datapath instruction a piece, and inside the size that was measured; pieces go to the
 // blocks in turn, each block's one thread requesting its next when the grid's position in the ranges is due at the rate.
 #define L2_ISSUE_PIECE 8192
 
@@ -64,7 +64,7 @@ void ggml_cuda_l2_issue(const ggml_cuda_l2_ranges & r, const double rate_gbs, co
     if (r.total <= 0 || rate_gbs <= 0.0) {
         return;
     }
-    // a thread requests ~66 GB/s of bulk prefetches at most (a rig on an RTX 5080), so one block for each 40 GB/s of the
+    // a thread requests ~66 GB/s of bulk prefetches at most (measured on an RTX 5080), so one block for each 40 GB/s of the
     // rate, and no more blocks than pieces
     const int64_t pieces = (r.total + L2_ISSUE_PIECE - 1) / L2_ISSUE_PIECE;
     const int     nb     = (int) std::min<int64_t>({ (int64_t) nsm, pieces, (int64_t) std::ceil(rate_gbs / 40.0) });
