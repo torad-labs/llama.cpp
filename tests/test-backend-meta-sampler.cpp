@@ -1,4 +1,4 @@
-// GOAL: Marcos serves GLM-5.3 Flash (glm5next) on two GPUs with -sm tensor and MTP drafts, sampled at temp 1.0, top-p 0.95
+// GOAL: serving on two GPUs with -sm tensor and MTP drafts, sampled at temp 1.0, top-p 0.95
 // and repeat penalty 1.1 over the last 256 tokens. Under -sm tensor the engine refused backend sampling: every step copied
 // the full vocab-wide logits rows to the host and sampled on the CPU, the MTP drafter's sampler too. Done means: with a
 // model split by -sm tensor, a sequence's sampler chain (penalties, top-k, top-p, min-p, temp, dist, greedy, logit-bias)

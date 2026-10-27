@@ -431,7 +431,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
                       device_vram_mib);
         {
-            // the device's profile, what a roofline or a launch shape is sized from; rig's roofline probe reads this
+            // the device's profile, what a roofline or a launch shape is sized from; a roofline measurement reads this
             // line. DRAM is the peak the memory clock and bus give (two transfers a clock), not a measured rate.
             enum { SM_KHZ, MEM_KHZ, BUS_BITS, REGS_SM, SMEM_SM, THREADS_SM, BLOCKS_SM, L2, L2_PERSIST, L2_WINDOW, N_ATTR };
             const cudaDeviceAttr attrs[N_ATTR] = {

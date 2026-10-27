@@ -10,7 +10,7 @@
 // ggml_cuda_op_fwht, and never reads the matrix); w is the bytes it writes, a SET_ROWS only the rows it scatters. w0 names
 // a matmul's weights. Inside a fused launch an intermediate is counted as written and read though it never leaves the
 // kernel, so a fused group's bytes are an upper bound; a matmul's weights, the bulk of a decode token, are exact. A launch that fuses the nodes after its own marks each one it consumed, inside
-// its range: "fused " and the same name. rig's roofline probe reads these names; the format is its contract.
+// its range: "fused " and the same name. A roofline measurement reads these names; the format is that contract.
 // Off (the default) a node costs one test of a static flag. The ranges are the host's: a CUDA graph replay has none, so a
 // capture for them runs with graphs off.
 

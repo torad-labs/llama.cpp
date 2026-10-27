@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# matrix.sh and d0-decode.sh, run only once the machine is quiet: the 1-minute load under 6 for 120 s
-# straight (a shared 16-core host whose daytime load of 20-50 put ±8-12 tok/s on the decode rows,
-# 2026-09-24), then under the gate card's lock, the load logged every 10 s through the run.
+# On a shared machine, wait for load to drop and hold a GPU lock so runs don't overlap.
+# matrix.sh and d0-decode.sh run once the 1-minute load stays under 6 for 120 s.
+# The load is logged every 10 s through the run.
+# GPU_LOCK sets the flock path. Default: ${XDG_RUNTIME_DIR:-/tmp}/bench-gpu.lock
 #   quiet-rerun.sh [deadline hours, default 16]
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
@@ -19,7 +20,7 @@ done
 echo "quiet at $(date +%T), load $(cut -d' ' -f1-3 /proc/loadavg)"
 (while :; do echo "$(date +%T) $(cut -d' ' -f1 /proc/loadavg)"; sleep 10; done) > quiet-rerun-load.log &
 mon=$!
-flock /run/user/1000/gatecard.lock bash -c 'for s in matrix.sh d0-decode.sh; do
+flock "${GPU_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/bench-gpu.lock}" bash -c 'for s in matrix.sh d0-decode.sh; do
   echo "== $s $(date +%T)"; bash $s > $s.out 2>&1; echo "   exit $? $(date +%T)"; done'
 kill $mon
 echo "load during the rerun: max $(awk '{print $2}' quiet-rerun-load.log | sort -g | tail -1), samples $(wc -l < quiet-rerun-load.log)"
