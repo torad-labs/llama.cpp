@@ -2197,7 +2197,7 @@ static void test_backend_multi_output_cpu_suffix(const test_params & params) {
     printf("backend multi-output CPU suffix test PASSED\n");
 }
 
-// GOAL: Marcos serves GLM-5.3 Flash on two GPUs with -sm tensor and MTP drafts, sampled at temp 1.0, top-p 0.95 and
+// GOAL: serving on two GPUs with -sm tensor and MTP drafts, sampled at temp 1.0, top-p 0.95 and
 // repeat penalty 1.1 over the last 256 tokens. Under -sm tensor the engine refused backend sampling and sampled every
 // sequence on the CPU, the MTP drafter's top-k 10 chain too. With the model split by -sm tensor:
 //   - the served chain and a greedy chain run in the graph: each output has its sampled token, step after step,
@@ -2282,8 +2282,8 @@ static void test_backend_tensor_split(const test_params & params) {
     printf("backend -sm tensor sampling test PASSED\n");
 }
 
-// GOAL: Marcos serves with MTP drafts (n_max 2): each step decodes a verify batch, the last accepted token and the
-// drafts, with one output a draft, and samples every output with his chain (repeat penalty 1.1 over the last 256 tokens,
+// GOAL: serving with MTP drafts (n_max 2): each step decodes a verify batch, the last accepted token and the
+// drafts, with one output a draft, and samples every output with the served chain (repeat penalty 1.1 over the last 256 tokens,
 // top-p 0.95, temp 1.0, dist). The penalties sampler refused the backend for more than one output a sequence, so every
 // verify round fell back to the CPU sampler. Done means: the chain runs on the backend for a verify batch, and for each
 // output row the penalty uses the history as it stands at that row (the accepted prefix plus the batch's earlier drafts),
