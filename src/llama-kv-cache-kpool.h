@@ -112,6 +112,12 @@ private:
 
 using llama_kpool_cells_fn = std::function<const llama_kv_cells &(llama_seq_id)>;
 
+// the pools a ubatch's maps hold: its own sequences' runs (every pool from a sequence's lowest position to its highest,
+// summed over a stream's sequences), padded to 64, plus 2 per sequence; never more than llama_kpool_n_pools of n_kv, and
+// never so few that select_k, and so the dump pools, change
+uint32_t llama_kpool_n_pools_ubatch(const llama_kpool_cells_fn & cells_of, const llama_ubatch & ubatch, uint32_t n_kv,
+        uint32_t kpool, uint32_t n_stream, uint32_t indexer_top_k);
+
 // the pools a compression makes at once: a rebuild re-emits every pool (n_new_max = n_pools, 131,074 at 524,288 cells), and
 // their members and softmax at once took about 1.07 GB of compute buffer at d_idx 128 that no reserve sized; a chunk takes
 // about 34 MB (test-kpool-input: 8,388,608 bytes for 4,096 pools at d_idx 32), and a decode's few pools are one chunk

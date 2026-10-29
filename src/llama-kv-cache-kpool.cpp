@@ -27,6 +27,51 @@ uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs) {
     return n_kv/kpool + 2*n_seqs;
 }
 
+uint32_t llama_kpool_n_pools_ubatch(const llama_kpool_cells_fn & cells_of, const llama_ubatch & ubatch, uint32_t n_kv,
+        uint32_t kpool, uint32_t n_stream, uint32_t indexer_top_k) {
+    GGML_ASSERT(kpool > 0);
+    GGML_ASSERT(n_stream > 0 && ubatch.n_seqs_unq > 0 && ubatch.n_seqs_unq % n_stream == 0);
+
+    const uint32_t n_ps  = ubatch.n_seqs_unq/n_stream;
+    const uint32_t whole = llama_kpool_n_pools(n_kv, kpool, n_ps);
+
+    // the worst-case graph is reserved on a ubatch that names no sequence (ubatch_reserve): it keeps the whole cache's pools,
+    // so the buffers sized at load hold every later graph
+    if (ubatch.n_tokens == 0 || ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr || !cells_of) {
+        return whole;
+    }
+
+    // a stream's maps pack its sequences' runs one after another (llama_kpool_set_input), and every stream's maps are one
+    // width: the longest stream's runs. A run is the one llama_kpool_views::serve takes, from the lowest position to the
+    // highest, so it is never shorter than the run the cells give below n_kv
+    int64_t runs      = 0;
+    int64_t in_stream = 0;
+
+    for (uint32_t k = 0; k < ubatch.n_seqs_unq; ++k) {
+        const llama_seq_id     s     = ubatch.seq_id_unq[k];
+        const llama_kv_cells & cells = cells_of(s);
+
+        const llama_pos p_min = cells.seq_pos_min(s);
+        const llama_pos p_max = cells.seq_pos_max(s);
+
+        if (p_min >= 0 && p_max >= p_min) {
+            in_stream += p_max/(llama_pos) kpool - p_min/(llama_pos) kpool + 1;
+        }
+
+        if ((k + 1) % n_ps == 0) {
+            runs      = std::max(runs, in_stream);
+            in_stream = 0;
+        }
+    }
+
+    // padded so a decode changes its graph's shape once every 64 pools, and never below what select_k takes, so the dump
+    // pools and the sparse attention's width stay as they were
+    const int64_t at_least = std::min<int64_t>(whole, indexer_top_k/kpool);
+    const int64_t own      = GGML_PAD(runs, 64) + 2*(int64_t) n_ps;
+
+    return (uint32_t) std::min<int64_t>(whole, std::max(at_least, own));
+}
+
 uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t kpool) {
     GGML_ASSERT(kpool > 0);
     GGML_ASSERT(n_pools > 0);
