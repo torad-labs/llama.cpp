@@ -601,7 +601,9 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
     }
     dims.n_tps   = ubatch.n_tokens/dims.n_stream;
     dims.n_ps    = ubatch.n_seqs_unq/dims.n_stream;
-    dims.n_pools = llama_kpool_n_pools(dims.n_kv, kpool, dims.n_ps);
+    dims.n_pools = llama_kpool_n_pools_ubatch([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
+        return kv->get_cells(s);
+    }, ubatch, dims.n_kv, kpool, dims.n_stream, hparams.indexer_top_k);
     dims.rebuild = mctx_attn->get_kv()->get_kpool_dirty(ubatch);
     dims.n_new_max = dims.rebuild ? dims.n_pools : dims.n_tps/kpool + dims.n_ps;
     dims.n_tail    = llama_kpool_tail_max([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
@@ -4041,7 +4043,12 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         GGML_ASSERT(n_ps >= 1 && (int64_t) ubatch.n_seqs_unq == n_ps*n_stream);
 
-        const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
+        // sized on the ubatch's own sequences, not on n_kv: with --kv-unified the other conversations' cells would each add
+        // a pool the indexer scores at -inf bias (a 16K prompt beside 100K cells of another took 869 ms of indexer, 73 ms
+        // alone, on the Oct 29 lab box)
+        const int64_t n_pools = llama_kpool_n_pools_ubatch([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
+            return kv->get_cells(s);
+        }, ubatch, n_kv, kpool, n_stream, hparams.indexer_top_k);
         const int64_t n_dump  = llama_kpool_select_k(n_pools, hparams.indexer_top_k, kpool);
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);

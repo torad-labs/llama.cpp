@@ -1,6 +1,7 @@
 #include "llama-kv-cache.h"
 
 #include "gguf.h"
+#include "llama-host-threads.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-kv-cache-kpool.h"
@@ -1996,10 +1997,20 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S 
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
-        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+        // a row after its sequence's first copies that row and redoes only the cells near the batch's positions, reading the
+        // first row and its bookkeeping and never writing them: those rows wait for every first row, then split across
+        // threads (llama-host-threads.h)
+        std::vector<uint32_t> later;
+
+        const auto row = [&](uint32_t ii, bool is_later) {
             const uint32_t i = s*n_tps + ii;
 
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+            if (!alibi && !is_later && seq_srct.find(seq_id) != seq_srct.end()) {
+                later.push_back(ii);
+                return;
+            }
 
             const auto & cells = v_cells.at(seq_to_stream[seq_id]);
 
@@ -2020,11 +2031,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S 
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
             bool prev = false;
 
-            auto & idxs = seq_idxs[seq_id];
+            auto & idxs = is_later ? seq_idxs.find(seq_id)->second : seq_idxs[seq_id];
 
             if (!alibi) {
-                if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
+                if (is_later) {
+                    const uint32_t srct = seq_srct.find(seq_id)->second;
 
                     const uint64_t idst_prev = n_kv*srct;
 
@@ -2125,7 +2136,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S 
                     st.keep_n(idst + j0, scan(j0, (uint32_t) (n_kv - j0)), n_kv - j0);
                 }
 
-                continue;
+                return;
             }
 
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
@@ -2176,7 +2187,17 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, const S 
 skip:
                 st.drop(idst + j);
             }
+        };
+
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            row(ii, false);
         }
+
+        llama_host_rows((int64_t) later.size(), n_kv*(int64_t) sizeof(ggml_fp16_t), [&](int64_t k0, int64_t k1, int) {
+            for (int64_t k = k0; k < k1; ++k) {
+                row(later[k], true);
+            }
+        });
     }
 }
 

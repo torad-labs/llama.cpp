@@ -316,12 +316,14 @@ struct maps {
     ggml_tensor * new_pool_cells = nullptr;
     ggml_tensor * new_pool_reps  = nullptr;
 
-    // n_dump: the top-k's dump pools past the n_pools real ones, with their columns in sel_mask (llm_graph_input_kpool)
-    maps(int64_t n_kv, int64_t n_ns, int64_t n_tps, int64_t n_ps, uint32_t r, bool kcache, bool f16, bool rebuild, int64_t n_dump, int fill) {
+    // n_dump: the top-k's dump pools past the n_pools real ones, with their columns in sel_mask (llm_graph_input_kpool);
+    // n_pools_of > 0 sizes the maps on that many pools instead of the whole cache's
+    maps(int64_t n_kv, int64_t n_ns, int64_t n_tps, int64_t n_ps, uint32_t r, bool kcache, bool f16, bool rebuild, int64_t n_dump, int fill,
+            int64_t n_pools_of = 0) {
         ggml_init_params ip = { 32*ggml_tensor_overhead(), nullptr, true };
         ctx = ggml_init(ip);
 
-        const int64_t n_pools   = llama_kpool_n_pools(n_kv, r, n_ps);
+        const int64_t n_pools   = n_pools_of > 0 ? n_pools_of : llama_kpool_n_pools(n_kv, r, n_ps);
         const int64_t n_new_max = rebuild ? n_pools : n_tps/r + n_ps;
         const ggml_type tm      = f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
