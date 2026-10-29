@@ -22,10 +22,13 @@ static int llama_host_threads_default() {
 
 int llama_host_threads(int64_t n_rows, int64_t row_bytes) {
     static constexpr int64_t min_bytes = 4ll << 20;
+    // a decode or verify ubatch (a draft-mtp verify is n_max + 1 tokens) stays on one thread however deep the pool, so
+    // decode runs as it did
+    static constexpr int64_t min_rows = 8;
 
     const int forced = g_host_threads_set.load(std::memory_order_relaxed);
 
-    int64_t n = forced > 0 ? forced : (n_rows*row_bytes < min_bytes ? 1 : llama_host_threads_default());
+    int64_t n = forced > 0 ? forced : (n_rows < min_rows || n_rows*row_bytes < min_bytes ? 1 : llama_host_threads_default());
 
     n = std::max<int64_t>(1, std::min(n, n_rows));
 

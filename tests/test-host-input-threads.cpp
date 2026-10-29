@@ -153,8 +153,26 @@ static void check_masks(pool & w, const llama_ubatch * ub, uint32_t n_ns, int n_
     }
 }
 
+// the default split: a decode or verify ubatch never splits however deep the pool, so decode runs as before; a prompt
+// ubatch past 4 MiB splits when the machine has the threads
+static void check_policy() {
+    llama_host_threads_set(0);
+
+    // one token, and a draft-mtp verify of n_max 2 plus its token, at 524,288 cells of sel and cand rows
+    CHECK(llama_host_threads(1, 524288*6) == 1, "a decode row of a 512K pool split across %d threads", llama_host_threads(1, 524288*6));
+    CHECK(llama_host_threads(3, 524288*6) == 1, "a 3-token verify of a 512K pool split across %d threads", llama_host_threads(3, 524288*6));
+    CHECK(llama_host_threads(5, 1ll << 30) == 1, "5 rows of 1 GiB split across %d threads", llama_host_threads(5, 1ll << 30));
+    CHECK(llama_host_threads(1024, 1024) == 1, "1 MiB of rows split across %d threads", llama_host_threads(1024, 1024));
+
+    if (std::thread::hardware_concurrency() >= 4) {
+        CHECK(llama_host_threads(1024, 1 << 20) > 1, "a 1,024-row prompt of 1 GiB stayed on one thread");
+    }
+}
+
 int main() {
     std::mt19937 rng(20261029);
+
+    check_policy();
 
     const int threads_of[] = { 2, 3, 8 };
 

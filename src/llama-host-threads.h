@@ -11,8 +11,9 @@
 #include <thread>
 #include <vector>
 
-// the threads a build of n_rows rows, row_bytes each, splits across: one below 4 MiB of rows, else LLAMA_HOST_THREADS
-// (1 keeps one thread) or half the hardware threads, at most 16, and never more than one per row
+// the threads a build of n_rows rows, row_bytes each, splits across: one below 8 rows (a decode or verify ubatch) or 4 MiB
+// of rows, else LLAMA_HOST_THREADS (1 keeps one thread) or half the hardware threads, at most 16, and never more than one
+// per row
 int llama_host_threads(int64_t n_rows, int64_t row_bytes);
 
 // for tests: n > 0 makes every build that splits use n threads, whatever its size (still at most one per row); 0 restores
