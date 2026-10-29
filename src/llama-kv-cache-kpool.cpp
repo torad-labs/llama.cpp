@@ -1,6 +1,7 @@
 #include "llama-kv-cache-kpool.h"
 
 #include "llama-batch.h"
+#include "llama-host-threads.h"
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cells.h"
@@ -10,6 +11,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 bool llama_kpool_needs_scoring(int64_t n_kv, uint32_t n_ctx, uint32_t indexer_top_k, uint32_t kpool) {
@@ -272,41 +274,53 @@ static int64_t kpool_stream_from_view(
     int64_t n_done     = 0;
     int64_t n_tail_max = 0;
 
-    for (int64_t ii = 0; ii < o.n_tps; ++ii) {
-        const int64_t i = s*o.n_tps + ii;
+    std::mutex merge;
 
-        if (ubatch->seq_id[i][0] != seq) {
-            continue;
+    // a row a token, split across threads: a thread writes its own rows only, from reads the rows share
+    llama_host_rows(o.n_tps, (o.n_sel + o.n_kv)*(int64_t) o.mask_ts + o.n_pools*(int64_t) sizeof(float), [&](int64_t i0, int64_t i1, int) {
+        int64_t done     = 0;
+        int64_t tail_max = 0;
+
+        for (int64_t ii = i0; ii < i1; ++ii) {
+            const int64_t i = s*o.n_tps + ii;
+
+            if (ubatch->seq_id[i][0] != seq) {
+                continue;
+            }
+
+            const llama_pos q = ubatch->pos[i];
+
+            GGML_ASSERT(q >= 0);
+
+            done++;
+
+            const llama_pos tail_start = (q + 1)/r*r;
+
+            // the reference tests visibility at a pool's LAST member, so a straddled pool drops whole
+            const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
+
+            char * cur_sel  = o.sel_mask  + ii*o.n_sel*o.mask_ts;
+            char * cur_cand = o.cand_mask + ii*o.n_kv *o.mask_ts;
+
+            const int64_t n_tail = o.mask_f16 ?
+                kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
+                        v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv, q, tail_start, bo_vis) :
+                kpool_mask_row((float *) cur_sel, (float *) cur_cand,
+                        v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv, q, tail_start, bo_vis);
+
+            tail_max = std::max(tail_max, n_tail);
+
+            float * q_pool_bias = o.pool_bias + ii*o.n_pools;
+
+            for (int64_t p = 0, n_vis = std::min(n_run, bo_vis); p < n_vis; ++p) {
+                q_pool_bias[p] = fill[p] == r ? 0.0f : -INFINITY;
+            }
         }
 
-        const llama_pos q = ubatch->pos[i];
-
-        GGML_ASSERT(q >= 0);
-
-        n_done++;
-
-        const llama_pos tail_start = (q + 1)/r*r;
-
-        // the reference tests visibility at a pool's LAST member, so a straddled pool drops whole
-        const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
-
-        char * cur_sel  = o.sel_mask  + ii*o.n_sel*o.mask_ts;
-        char * cur_cand = o.cand_mask + ii*o.n_kv *o.mask_ts;
-
-        const int64_t n_tail = o.mask_f16 ?
-            kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
-                    v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv, q, tail_start, bo_vis) :
-            kpool_mask_row((float *) cur_sel, (float *) cur_cand,
-                    v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv, q, tail_start, bo_vis);
-
-        n_tail_max = std::max(n_tail_max, n_tail);
-
-        float * q_pool_bias = o.pool_bias + ii*o.n_pools;
-
-        for (int64_t p = 0, n_vis = std::min(n_run, bo_vis); p < n_vis; ++p) {
-            q_pool_bias[p] = fill[p] == r ? 0.0f : -INFINITY;
-        }
-    }
+        std::lock_guard<std::mutex> lock(merge);
+        n_done    += done;
+        n_tail_max = std::max(n_tail_max, tail_max);
+    });
 
     // exactly one partition per row, or a query reads another sequence's pools
     GGML_ASSERT(n_done == o.n_tps && "every query must belong to a sequence of the ubatch");
@@ -481,7 +495,10 @@ int64_t llama_kpool_set_input(
         float   * cur_pool_bias  = dst_pool_bias  + s*(n_tps*n_pools);
 
         std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
-        std::fill(cur_pool_bias,  cur_pool_bias  + n_tps*n_pools, -INFINITY);
+
+        llama_host_rows(n_tps, n_pools*(int64_t) sizeof(float), [&](int64_t i0, int64_t i1, int) {
+            std::fill(cur_pool_bias + i0*n_pools, cur_pool_bias + i1*n_pools, -INFINITY);
+        });
 
         // the dump pools name the dump columns, one cell each, so no two slots of a row name one cell
         for (int64_t c = 0; c < r*n_dump; ++c) {
@@ -504,11 +521,13 @@ int64_t llama_kpool_set_input(
         }
 
         // the padded rows whole and a row's dump columns: the rows' first n_kv are kpool_mask_row's
-        for (int64_t ii = 0; ii < n_padq; ++ii) {
-            const int64_t j0 = ii < n_tps ? n_kv : 0;
+        llama_host_rows(n_padq, (n_sel - n_kv)*(int64_t) mask_ts, [&](int64_t i0, int64_t i1, int) {
+            for (int64_t ii = i0; ii < i1; ++ii) {
+                const int64_t j0 = ii < n_tps ? n_kv : 0;
 
-            kpool_mask_fill(cur_sel_mask + (ii*n_sel + j0)*mask_ts, n_sel - j0, mask_f16);
-        }
+                kpool_mask_fill(cur_sel_mask + (ii*n_sel + j0)*mask_ts, n_sel - j0, mask_f16);
+            }
+        });
         kpool_mask_fill(cur_cand_mask + n_tps*n_kv*mask_ts, (n_padq - n_tps)*n_kv, mask_f16);
 
         // a sequence alone in its stream is served from its view; else (or when the view cannot) from the cells below
@@ -716,54 +735,69 @@ int64_t llama_kpool_set_input(
                 }
             }
 
-            for (int64_t ii = 0; ii < n_tps; ++ii) {
-                const int64_t   i = s*n_tps + ii;
+            std::mutex merge;
 
-                if (ubatch->seq_id[i][0] != seq_of_pool) {
-                    continue;
-                }
+            // a row a token, split across threads: a thread writes its own rows only, from reads the rows share
+            const int64_t row_bytes = (n_sel + n_kv)*(int64_t) mask_ts + (dst_bias ? n_kv : 0)*(int64_t) sizeof(float) +
+                n_run*(int64_t) sizeof(float);
 
-                const llama_pos q = ubatch->pos[i];
+            llama_host_rows(n_tps, row_bytes, [&](int64_t i0, int64_t i1, int) {
+                int64_t done     = 0;
+                int64_t tail_max = 0;
 
-                GGML_ASSERT(q >= 0);
+                for (int64_t ii = i0; ii < i1; ++ii) {
+                    const int64_t   i = s*n_tps + ii;
 
-                n_done++;
+                    if (ubatch->seq_id[i][0] != seq_of_pool) {
+                        continue;
+                    }
 
-                const llama_pos tail_start = (q + 1)/r*r;
+                    const llama_pos q = ubatch->pos[i];
 
-                // the reference tests visibility at a pool's LAST member, so a straddled pool drops whole
-                const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
+                    GGML_ASSERT(q >= 0);
 
-                float * cur_bias = dst_bias ? dst_bias + i*n_kv : nullptr;
-                char  * cur_sel  = cur_sel_mask  + ii*n_sel*mask_ts;
-                char  * cur_cand = cur_cand_mask + ii*n_kv *mask_ts;
+                    done++;
 
-                const int64_t n_tail = mask_f16 ?
-                    kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
-                            pos_at.data(), pool_of.data(), 0, n_kv, q, tail_start, bo_vis) :
-                    kpool_mask_row((float *) cur_sel, (float *) cur_cand,
-                            pos_at.data(), pool_of.data(), 0, n_kv, q, tail_start, bo_vis);
+                    const llama_pos tail_start = (q + 1)/r*r;
 
-                n_tail_max = std::max(n_tail_max, n_tail);
+                    // the reference tests visibility at a pool's LAST member, so a straddled pool drops whole
+                    const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
 
-                if (cur_bias) {
-                    for (int64_t j = 0; j < n_kv; ++j) {
-                        const bool vis    = (uint32_t) pos_at [j] <= (uint32_t) q;
-                        const bool pooled = (uint32_t) pool_of[j] <  (uint32_t) bo_vis;
+                    float * cur_bias = dst_bias ? dst_bias + i*n_kv : nullptr;
+                    char  * cur_sel  = cur_sel_mask  + ii*n_sel*mask_ts;
+                    char  * cur_cand = cur_cand_mask + ii*n_kv *mask_ts;
 
-                        cur_bias[j] = vis && pooled ? 0.0f : -INFINITY;
+                    const int64_t n_tail = mask_f16 ?
+                        kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
+                                pos_at.data(), pool_of.data(), 0, n_kv, q, tail_start, bo_vis) :
+                        kpool_mask_row((float *) cur_sel, (float *) cur_cand,
+                                pos_at.data(), pool_of.data(), 0, n_kv, q, tail_start, bo_vis);
+
+                    tail_max = std::max(tail_max, n_tail);
+
+                    if (cur_bias) {
+                        for (int64_t j = 0; j < n_kv; ++j) {
+                            const bool vis    = (uint32_t) pos_at [j] <= (uint32_t) q;
+                            const bool pooled = (uint32_t) pool_of[j] <  (uint32_t) bo_vis;
+
+                            cur_bias[j] = vis && pooled ? 0.0f : -INFINITY;
+                        }
+                    }
+
+                    float * q_pool_bias = cur_pool_bias + ii*n_pools + run_off[ps];
+
+                    for (int64_t p = 0; p < n_run; ++p) {
+                        const bool valid   = filled[p] == (int32_t) r;
+                        const bool visible = p < bo_vis;
+
+                        q_pool_bias[p] = valid && visible ? 0.0f : -INFINITY;
                     }
                 }
 
-                float * q_pool_bias = cur_pool_bias + ii*n_pools + run_off[ps];
-
-                for (int64_t p = 0; p < n_run; ++p) {
-                    const bool valid   = filled[p] == (int32_t) r;
-                    const bool visible = p < bo_vis;
-
-                    q_pool_bias[p] = valid && visible ? 0.0f : -INFINITY;
-                }
-            }
+                std::lock_guard<std::mutex> lock(merge);
+                n_done    += done;
+                n_tail_max = std::max(n_tail_max, tail_max);
+            });
         }
 
         // exactly one partition per row, or a query reads another sequence's pools
