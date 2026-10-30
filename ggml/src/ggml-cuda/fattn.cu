@@ -339,8 +339,8 @@ bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(const int device, const 
     static int smem_sm[GGML_CUDA_MAX_DEVICES]    = {0}; // shared memory an SM holds, and what each block reserves of it
     static int smem_block[GGML_CUDA_MAX_DEVICES] = {0};
     if (smem_sm[id] == 0) {
-        CUDA_CHECK(cudaDeviceGetAttribute(&smem_block[id], cudaDevAttrReservedSharedMemoryPerBlock, ggml_cuda_get_device()));
-        CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm[id], cudaDevAttrMaxSharedMemoryPerMultiprocessor, ggml_cuda_get_device()));
+        CUDA_CHECK(cudaDeviceGetAttribute(&smem_block[id], cudaDevAttrReservedSharedMemoryPerBlock, id));
+        CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm[id], cudaDevAttrMaxSharedMemoryPerMultiprocessor, id));
     }
     const fattn_mma_geometry geom = ggml_cuda_fattn_mma_get_geometry<512, 512, 1, 8, GGML_TYPE_F16, GGML_TYPE_F16>(info.cc, info.warp_size);
     const int64_t blocks = int64_t(smem_sm[id] / (geom.nbytes_shared + smem_block[id])) * info.nsm;

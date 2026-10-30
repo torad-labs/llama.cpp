@@ -5,10 +5,11 @@
 //   1. the q8_0 cache's output is the output of the same launch on an f16 cache that holds the q8_0 cache's values, bit
 //      for bit: a q8_0 value is its integer times the block's f16 scale, rounded to f16 once, and that f16 value is all
 //      an f16 copy of the cache ever held;
-//   2. a sparse launch reserves no f16 copy: the output tensor's allocation is its own bytes, where a copy of a
-//      524,288-cell cache is 512 MiB a card. A launch the sparse kernel does not take (a cache under 4096 cells, or under
-//      the cells its tokens gather, n_kv_max for each of up to 8) reserves the copy its f16 path writes, so the two
-//      never disagree;
+//   2. a sparse launch on a card that reads in place reserves no f16 copy: the output tensor's allocation is its own
+//      bytes, where a copy of a 524,288-cell cache is 512 MiB a card. The in-place read needs cp.async, an NVIDIA card of
+//      compute capability 8.0 or later in a build for sm_80 or later. A launch it does not take (such a card or build
+//      below it, a cache under 4096 cells, or under the cells its tokens gather, n_kv_max for each of up to 8) reserves
+//      the copy its f16 path writes, so the two never disagree;
 //   3. on the f16 cache, V as a view of K gives what V as a separate copy of the same values gives, bit for bit;
 //   4. the f16 cache's output matches the CPU backend's (test-backend-ops' bound), so 1 and 3 compare real attention.
 //
@@ -29,7 +30,9 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <random>
 #include <string>
 #include <thread>
@@ -202,13 +205,54 @@ static double nmse(const std::vector<float> & y, const std::vector<float> & ref)
 
 static constexpr double max_nmse = 5e-4; // test-backend-ops' bound for FLASH_ATTN_EXT
 
+// each CUDA device's compute capability, 100 x major + 10 x minor, as the backend reports it when it starts
+static std::map<int, int> g_cuda_cc;
+
+static void log_cb(ggml_log_level level, const char * text, void * user_data) {
+    int id = 0, major = 0, minor = 0;
+    if (sscanf(text, "  Device %d: %*[^,], compute capability %d.%d", &id, &major, &minor) == 3) {
+        g_cuda_cc[id] = 100*major + 10*minor;
+    }
+    (void) level;
+    (void) user_data;
+    fputs(text, stderr);
+}
+
+// the highest arch the CUDA backend was built for that the device runs (its ARCHS feature), or -1 when it says none
+static int highest_compiled_arch(ggml_backend_reg_t reg, int cc) {
+    auto get_features = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+    if (get_features == nullptr) {
+        return -1;
+    }
+    for (ggml_backend_feature * f = get_features(reg); f->name != nullptr; ++f) {
+        if (strcmp(f->name, "ARCHS") != 0) {
+            continue;
+        }
+        int best = -1;
+        for (const char * s = f->value; *s != '\0'; ) {
+            char * end = nullptr;
+            const long arch = strtol(s, &end, 10);
+            if (end == s) {
+                ++s;
+                continue;
+            }
+            if (arch <= cc) {
+                best = std::max(best, int(arch));
+            }
+            s = end;
+        }
+        return best;
+    }
+    return -1;
+}
+
 // the first cache the sparse launch takes for nb tokens: 4096 cells, and every cell its 8-head tile gathers
 static int64_t sparse_from(int64_t nb) {
     const int64_t cells = std::max<int64_t>(4096, std::min<int64_t>(nb, 8) * n_kv_max);
     return (cells + 255) / 256 * 256;
 }
 
-static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_case & c, uint32_t seed) {
+static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_case & c, bool reads_in_place, uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
 
@@ -256,9 +300,10 @@ static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_cas
     const int64_t diff_q8  = first_bit_difference(y_q8, y_f16);
     const int64_t diff_cpy = first_bit_difference(y_cpy, y_f16);
     const bool    sparse   = c.kv >= sparse_from(c.nb);
+    const bool    in_place = sparse && reads_in_place;
     const bool    no_copy  = alloc_q8 == ggml_nbytes(g.out_q8);
     const bool    finite   = all_finite(y_f16);
-    const bool    ok       = diff_q8 < 0 && diff_cpy < 0 && no_copy == sparse && finite && e < max_nmse;
+    const bool    ok       = diff_q8 < 0 && diff_cpy < 0 && no_copy == in_place && finite && e < max_nmse;
 
     printf("  kv %6" PRId64 ", %3" PRId64 " tokens, %2" PRId64 " heads, %" PRId64 " seq, %-14s: ", c.kv, c.nb, c.nh, c.ns,
            rows_name(c.rows));
@@ -267,17 +312,18 @@ static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_cas
     } else {
         printf("q8_0 differs from f16 at %" PRId64 " (%.9g against %.9g)", diff_q8, y_q8[diff_q8], y_f16[diff_q8]);
     }
-    if (sparse) {
+    if (in_place) {
         if (no_copy) {
             printf(", sparse, no f16 copy");
         } else {
             printf(", sparse, %zu bytes reserved for %zu of output", alloc_q8, ggml_nbytes(g.out_q8));
         }
     } else {
+        const char * path = sparse ? "sparse below sm_80" : "dense";
         if (no_copy) {
-            printf(", dense, NO f16 copy reserved for its f16 path");
+            printf(", %s, NO f16 copy reserved for its f16 path", path);
         } else {
-            printf(", dense, its f16 copy reserved");
+            printf(", %s, its f16 copy reserved", path);
         }
     }
     printf(diff_cpy < 0 ? ", V view = V copy" : ", V view differs from V copy");
@@ -286,6 +332,7 @@ static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_cas
 }
 
 int main() {
+    ggml_log_set(log_cb, nullptr);
     ggml_backend_load_all();
 
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -322,13 +369,32 @@ int main() {
                 strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0) {
             continue;
         }
-        printf("%s (%s):\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+        n_tested++;
+        // CUDA0, CUDA1, ...: the backend's devices in CUDA's order
+        const char * name = ggml_backend_dev_name(dev);
+        const int    id   = strncmp(name, "CUDA", 4) == 0 ? atoi(name + 4) : -1;
+        const auto   cc   = g_cuda_cc.find(id);
+        if (cc == g_cuda_cc.end()) {
+            printf("%s (%s): the backend reported no compute capability for it: FAILED\n", name, ggml_backend_dev_description(dev));
+            ok = false;
+            continue;
+        }
+        const int  arch           = highest_compiled_arch(ggml_backend_dev_backend_reg(dev), cc->second);
+        if (arch < 0) {
+            printf("%s (%s): the backend reported no arch it was built for that runs here: FAILED\n", name,
+                   ggml_backend_dev_description(dev));
+            ok = false;
+            continue;
+        }
+        const bool reads_in_place = arch >= 800;
+        printf("%s (%s), compute capability %d.%d, built for sm_%d: the sparse launch %s\n", name,
+               ggml_backend_dev_description(dev), cc->second / 100, cc->second % 100 / 10, arch / 10,
+               reads_in_place ? "reads the cache in place" : "keeps its f16 copy");
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         for (size_t ic = 0; ic < cases.size(); ++ic) {
-            ok &= run_case(backend, cpu, cases[ic], 0x51A7u + uint32_t(ic));
+            ok &= run_case(backend, cpu, cases[ic], reads_in_place, 0x51A7u + uint32_t(ic));
         }
         ggml_backend_free(backend);
-        n_tested++;
     }
     ggml_backend_free(cpu);
 
