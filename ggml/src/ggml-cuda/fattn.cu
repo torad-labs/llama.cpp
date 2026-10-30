@@ -534,8 +534,8 @@ static bool ggml_cuda_fattn_mma_sparse_deq(const int device, const ggml_tensor *
     const ggml_tensor * mask = dst->src[3];
     const int cc = ggml_cuda_info().devices[device].cc;
 
-    if (deq_legacy || K->type != GGML_TYPE_Q8_0 || Q->ne[0] != 512 || K->ne[0] != 512 || V->ne[0] != 512 ||
-            !ggml_cuda_fattn_V_same_as_K(dst)) {
+    if (deq_legacy || (K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_Q4_0) || Q->ne[0] != 512 || K->ne[0] != 512 ||
+            V->ne[0] != 512 || !ggml_cuda_fattn_V_same_as_K(dst)) {
         return false;
     }
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc)) {
@@ -670,7 +670,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         case 512:
             GGML_ASSERT(V->ne[0] == 512);
             if (ggml_cuda_fattn_mma_sparse_deq(ctx.device, dst)) {
-                ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+                if (K->type == GGML_TYPE_Q4_0) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+                }
                 break;
             }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);

@@ -2826,5 +2826,6 @@ extern DECL_FATTN_MMA_RAW_CASE(256, 256,  4, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(256, 256,  8, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(256, 256, 32, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 
-// GLM-5.3's sparse launch on a q8_0 latent cache, read in place (flash_attn_ext_deq_load_tile):
+// GLM-5.3's sparse launch on a q4_0 or q8_0 latent cache, read in place (flash_attn_ext_deq_load_tile):
+extern DECL_FATTN_MMA_RAW_CASE(512, 512,  1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
 extern DECL_FATTN_MMA_RAW_CASE(512, 512,  1, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
