@@ -440,6 +440,27 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
     return (txs.qs + txs.dm + txs.sc) * 4;
 }
 
+// IQ3_XXS on SM120 stages its steps (GLM-5.3 Flash's routed experts, a long read's largest kernel). A step's raw
+// weight blocks are copied into shared memory by cp.async while the step before it computes, and the step's
+// dequantization reads them and the grid from shared memory; a step's two halves of y are copied into two buffers at
+// once. One block of a row (98 bytes, 2-byte aligned) is staged from the 16-byte boundary at or below its start, in
+// 7 copies of 16 bytes, so it ends at the boundary past the block's end. The dequantized tile is the one
+// ggml_cuda_mmq_load_tiles_iq3_xxs writes, so the products and their order are unchanged.
+#define MMQ_IQ3_XXS_STAGED_ROW 112
+
+static __host__ bool mmq_iq3_xxs_staged(const ggml_type type, const int cc) {
+    return type == GGML_TYPE_IQ3_XXS && blackwell_mma_available(cc);
+}
+
+static constexpr __device__ bool mmq_iq3_xxs_staged(const ggml_type type) {
+#if defined(BLACKWELL_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+    return type == GGML_TYPE_IQ3_XXS;
+#else
+    GGML_UNUSED(type);
+    return false;
+#endif // defined(BLACKWELL_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+}
+
 // ------------------------------------------------------------
 
 #include "mmq-load-tiles.cuh"
@@ -936,6 +957,105 @@ static __device__ __forceinline__ void mmq_prefetch_x_l2(
     }
 }
 
+// The staged IQ3_XXS tile (MMQ_IQ3_XXS_STAGED_ROW). Shared memory holds the ids, y's two halves, the x tile, the
+// staged rows and the grid. A step stages its y and dequantizes its staged rows into the x tile, then, past the
+// barrier, stages the next step's rows while it computes; its last barrier leaves every buffer free for the next tile
+// a block runs.
+template <ggml_type type, int J, bool fallback, bool fixup>
+static __device__ __forceinline__ void mul_mat_q_process_tile_staged(
+        const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+        const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const float * __restrict__ y_scale,
+        const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const int l2_pf) {
+    static_assert(type == GGML_TYPE_IQ3_XXS, "only IQ3_XXS is staged");
+
+    constexpr int              warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int              nthreads    = ggml_cuda_mmq_get_nthreads(type, J, fallback);
+    constexpr int              qk          = ggml_cuda_type_traits<type>::qk;
+    constexpr int              I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int              sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback>();
+    constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback>();
+
+    constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
+    constexpr int blocks_per_iter = ITER_K / qk;
+    static_assert(blocks_per_iter == 1, "a step stages one block of each row");
+
+    constexpr int sz            = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int tile_y_stride = GGML_PAD(J*MMQ_TILE_Y_K, nthreads);
+    constexpr int y_pieces      = J*MMQ_TILE_Y_K*int(sizeof(int)) / 16;
+    static_assert(J*MMQ_TILE_Y_K*int(sizeof(int)) % 16 == 0, "y's half is whole 16-byte copies");
+
+    extern __shared__ int data_mul_mat_q[];
+    int      * tile_y0  = data_mul_mat_q + J;
+    int      * tile_y1  = tile_y0 + tile_y_stride;
+    int      * tile_x   = tile_y1 + tile_y_stride;
+    char     * x_staged = (char *) (tile_x + I*sram_stride);
+    uint32_t * grid     = (uint32_t *) (x_staged + I*MMQ_IQ3_XXS_STAGED_ROW);
+
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+
+    float sum[J*I / nthreads] = {0.0f};
+
+#pragma unroll
+    for (int l0 = 0; l0 < 256; l0 += nthreads) {
+        const int l = l0 + tid;
+        if (l0 + nthreads > 256 && l >= 256) {
+            break;
+        }
+        grid[l] = iq3xxs_grid[l];
+    }
+    if (kb0_start < kb0_stop) {
+        ggml_cuda_mmq_stage_x_iq3_xxs<type, J, fallback>(x, x_staged, offset_x + kb0_start, tile_x_max_i, stride_row_x);
+    }
+    cp_async_wait_all();
+    __syncthreads();
+
+    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        const int kb_pf = kb0 + l2_pf*blocks_per_iter;
+        if (l2_pf > 0 && kb_pf < kb0_stop) {
+            mmq_prefetch_x_l2<type, J, fallback, blocks_per_iter*int(sizeof(block_iq3_xxs))>(
+                x, offset_x + kb_pf, tile_x_max_i, stride_row_x);
+        }
+
+        const char * by0 = (const char *) (y + ncols_y*((kb0*qk/QK8_1_MMQ)*sz +  0));
+        const char * by1 = (const char *) (y + ncols_y*((kb0*qk/QK8_1_MMQ)*sz + sz));
+#pragma unroll
+        for (int p0 = 0; p0 < y_pieces; p0 += nthreads) {
+            const int p = p0 + tid;
+            if (p0 + nthreads > y_pieces && p >= y_pieces) {
+                break;
+            }
+            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared((char *) tile_y0 + 16*p), by0 + 16*p);
+            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared((char *) tile_y1 + 16*p), by1 + 16*p);
+        }
+
+        ggml_cuda_mmq_load_tiles_iq3_xxs_staged<type, J, fallback>(
+            x, x_staged, grid, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+
+        cp_async_wait_all();
+        __syncthreads();
+
+        if (kb0 + blocks_per_iter < kb0_stop) {
+            ggml_cuda_mmq_stage_x_iq3_xxs<type, J, fallback>(
+                x, x_staged, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x);
+        }
+
+        vec_dot(tile_x, tile_y0, sum, 0);
+        vec_dot(tile_x, tile_y1, sum, MMQ_TILE_NE_K);
+
+        cp_async_wait_all();
+        __syncthreads();
+    }
+
+    if (fixup) {
+        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
+    } else {
+        write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
+    }
+}
+
 template <ggml_type type, int J, bool fallback, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
@@ -943,6 +1063,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const int l2_pf) {
+
+    if constexpr (mmq_iq3_xxs_staged(type)) {
+        mul_mat_q_process_tile_staged<type, J, fallback, fixup>(
+            x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
+            tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, l2_pf);
+        return;
+    }
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
@@ -1582,6 +1709,10 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const bool async_buffer_y = cc == GGML_CUDA_CC_DGX_SPARK &&
         (config.type == GGML_TYPE_Q1_0 || config.type == GGML_TYPE_Q2_0 || config.type == GGML_TYPE_PQ2_0);
     const int y_buffers = async_buffer_y ? 2 : 1;
+    if (mmq_iq3_xxs_staged(config.type, cc)) {
+        // both halves of a step's y, the staged weight rows and the 256-entry grid
+        return nbs_ids + nbs_x + 2*nbs_y_padded + config.I*MMQ_IQ3_XXS_STAGED_ROW + 256*sizeof(uint32_t);
+    }
     return nbs_ids + nbs_x + y_buffers*nbs_y_padded;
 }
 
