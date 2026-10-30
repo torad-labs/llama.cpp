@@ -11,6 +11,7 @@
 // Full depth is kept while the tokens past the low depth pay for their added time; at m == n_max the depth stays n_max, and m > n_max disables drafting.
 // When all drafts start landing after two windows capped at m, full depth returns within three windows and stays there.
 // The head's kept hidden row stays the target row that a verification accepted, however the batch is laid out.
+// A request with an image keeps drafting: the head takes the image's rows, so its cells stay consecutive with the target's.
 
 #include "common.h"
 #include "log.h"
@@ -662,6 +663,91 @@ static bool test_kept_row(llama_model * model) {
     return true;
 }
 
+// a request with an image: the target reads text, the image's rows (embeddings and no tokens, cut at n_batch as mtmd cuts
+// a chunk, each piece shown to the drafter by the server's post-decode callback), then the text after it. The head takes
+// every row, so its cells end where the target's end, the kept row is the last target row read, and the head drafts at
+// full depth after the image. Generated: text and image lengths, images longer than n_batch, every slot in turn
+static bool test_media(llama_model * model) {
+    server_rig rig(model, 0.0f);
+    std::mt19937 rng(31);
+    const int n_embd     = llama_model_n_embd_out(model);
+    const int n_embd_inp = llama_model_n_embd_inp(model);
+    const int n_batch    = (int) rig.params.n_batch;
+    auto * mem_tgt = llama_get_memory(rig.tgt.get());
+    auto * mem_dft = llama_get_memory(rig.init->context());
+    std::normal_distribution<float> embd_dis(0.0f, 1.0e-2f);
+    auto kept = [&](llama_seq_id s, llama_pos pos, const std::vector<float> & h) {
+        std::vector<uint8_t> state;
+        if (!common_speculative_get_state(rig.spec.get(), s, state)) return false;
+        if (state.size() != sizeof(llama_pos) + (size_t) n_embd*sizeof(float)) return false;
+        llama_pos p = -1;
+        std::memcpy(&p, state.data(), sizeof(llama_pos));
+        return p == pos && std::memcmp(state.data() + sizeof(llama_pos), h.data(), (size_t) n_embd*sizeof(float)) == 0;
+    };
+    auto same_end = [&](llama_seq_id s) {
+        return llama_memory_seq_pos_max(mem_dft, s) == llama_memory_seq_pos_max(mem_tgt, s) &&
+               llama_memory_seq_pos_max(mem_tgt, s) == rig.seqs[s].n_past - 1;
+    };
+    for (int trial = 0; trial < 9; ++trial) {
+        const llama_seq_id s = trial % N_SEQ;
+        common_speculative_end(rig.spec.get(), s);
+        llama_memory_seq_rm(mem_tgt, s, -1, -1);
+        llama_memory_seq_rm(mem_dft, s, -1, -1);
+        common_speculative_set_state(rig.spec.get(), s, {});
+        rig.seqs[s].n_past = 0;
+        const llama_tokens before = rig.tokens(rng, 1 + rng() % 8);
+        rig.decode({{ s, before }});
+        const int n_img = trial < N_SEQ ? n_batch + 1 + (int) (rng() % n_batch) : 1 + (int) (rng() % (2*n_batch));
+        for (int i0 = 0; i0 < n_img; i0 += n_batch) {
+            const int n = std::min(n_batch, n_img - i0);
+            llama_batch batch = llama_batch_init(n, n_embd_inp, 1);
+            for (int64_t i = 0; i < (int64_t) n*n_embd_inp; ++i) batch.embd[i] = embd_dis(rng);
+            for (int i = 0; i < n; ++i) {
+                batch.pos[i]       = rig.seqs[s].n_past++;
+                batch.n_seq_id[i]  = 1;
+                batch.seq_id[i][0] = s;
+                batch.logits[i]    = false;
+            }
+            batch.n_tokens = n;
+            bool ok = llama_decode(rig.tgt.get(), batch) == 0;
+            std::vector<float> h_last;
+            if (ok) {
+                const float * row = llama_get_embeddings_nextn_ith(rig.tgt.get(), n - 1);
+                h_last.assign(row, row + n_embd);
+                ok = common_speculative_process(rig.spec.get(), batch);
+            }
+            llama_batch_free(batch);
+            if (!ok) return fail("the drafter refused an image's rows");
+            if (!kept(s, rig.seqs[s].n_past - 1, h_last)) return fail("the kept row after an image piece is not its last target row");
+            if (!same_end(s)) return fail("the head's cells do not end where the target's do after an image piece");
+        }
+        const llama_tokens after = rig.tokens(rng, 1 + rng() % 8);
+        try {
+            rig.decode({{ s, after }});
+        } catch (const std::exception &) {
+            return fail("the text after an image did not reach the head");
+        }
+        if (!same_end(s)) return fail("the head's cells do not end where the target's do after the text that follows an image");
+        llama_tokens prompt = before;
+        prompt.insert(prompt.end(), n_img, LLAMA_TOKEN_NULL);
+        prompt.insert(prompt.end(), after.begin(), after.end());
+        rig.seqs[s].prompt = prompt;
+        common_speculative_begin(rig.spec.get(), s, rig.seqs[s].prompt);
+        rig.seqs[s].id_last = rig.tokens(rng, 1)[0];
+        for (int round = 0; round < 3; ++round) {
+            const auto len = rig.draft({ s });
+            if (len.at(s) != N_MAX) return fail("the head drafted fewer than n_max tokens after an image");
+            try {
+                rig.verify({ s });
+            } catch (const std::exception &) {
+                return fail("a verification after an image did not reach the head");
+            }
+            rig.accept(s, (int) (rng() % (N_MAX + 1)), rng);
+        }
+    }
+    return true;
+}
+
 int main(void) {
     common_init();
     common_log_set_verbosity_thold(LOG_LEVEL_WARN);
@@ -680,6 +766,7 @@ int main(void) {
             { "histories", test_histories },
             { "n-min",     test_n_min     },
             { "kept-row",  test_kept_row  },
+            { "media",     test_media     },
         };
         for (const auto & t : tests) {
             const bool pass = t.second(model.get());
