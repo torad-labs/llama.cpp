@@ -509,7 +509,9 @@ static void ggml_compute_forward_dup_from_q(
               ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
+    // DUP/CONT (including ggml_cast) have no second operand. CPY's second
+    // operand describes the same destination layout; use dst for every route.
+    const ggml_tensor * src1 = dst;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -12201,8 +12203,14 @@ void ggml_compute_forward_lightning_indexer(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // (temporary) buffer for K converted to float
-    float * k_row_f32 = (float *) params->wdata + ith*(1*n_embd + CACHE_LINE_SIZE_F32);
+    // ggml_lightning_indexer_set_q8_query: each token's q rounded to 8-bit blocks of 32, every head, before scoring
+    const bool q8_query = ggml_get_op_params_i32(dst, 0) == 1;
+    GGML_ASSERT(!q8_query || n_embd % 32 == 0);
+    const int n_q_round = q8_query ? n_head*n_embd : 0;
+
+    // (temporary) buffers for K converted to float, and the rounded q
+    float * k_row_f32 = (float *) params->wdata + ith*(1*n_embd + n_q_round + CACHE_LINE_SIZE_F32);
+    float * q_round   = k_row_f32 + n_embd;
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
@@ -12216,6 +12224,22 @@ void ggml_compute_forward_lightning_indexer(
             const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
             const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
+            if (q8_query) {
+                for (int h = 0; h < n_head; ++h) {
+                    const float * x = (const float *) ((const char *) q->data + h*nbq1 + t*nbq2 + s*nbq3);
+                    float       * y = q_round + h*n_embd;
+                    for (int i0 = 0; i0 < n_embd; i0 += 32) {
+                        float amax = 0.0f;
+                        for (int j = 0; j < 32; ++j) {
+                            amax = MAX(amax, fabsf(x[i0 + j]));
+                        }
+                        const float d = amax / 127.0f;
+                        for (int j = 0; j < 32; ++j) {
+                            y[i0 + j] = d != 0.0f ? d * roundf(x[i0 + j] / d) : 0.0f;
+                        }
+                    }
+                }
+            }
             for (int ik = ir0; ik < ir1; ++ik) {
                 const int64_t i_row = r ? ((const int32_t *) ((const char *) r->data + s*r->nb[1]))[ik] : ik;
                 GGML_ASSERT(i_row >= 0 && i_row < nek2);
@@ -12229,7 +12253,8 @@ void ggml_compute_forward_lightning_indexer(
                 for (int h = 0; h < n_head; ++h) {
                     // dot product of q and k for head h
                     float qk = 0.0f;
-                    const float * q_row = (float *) ((char *) q->data + h*nbq1 + t*nbq2 + s*nbq3);
+                    const float * q_row = q8_query ? q_round + h*n_embd :
+                        (float *) ((char *) q->data + h*nbq1 + t*nbq2 + s*nbq3);
                     ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, k_row_f32, 0, 1);
                     // ReLU and weights (prescaled)
                     score += MAX(qk, 0.0f) * w_row[h];
