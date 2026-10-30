@@ -106,6 +106,17 @@ def test_prompt_step_reads_whole_batches_alone():
     assert steps[0] == N_BATCH, f"alone, the read's first step took {steps[0]} tokens, not a whole batch of {N_BATCH}: {steps}"
 
 
+def test_a_prompt_step_above_the_batch_reads_whole_batches_beside_a_reply():
+    """any step the parser accepts, the largest int included, bounds a read by the batch and never stops it"""
+    global server
+    server.prompt_step = 2147483647
+    server.start()
+    steps, n_read, still_generating = read_beside_a_reply()
+    assert still_generating, "the read waited for the reply in slot 1 to end"
+    assert sum(steps) == n_read
+    assert max(steps) >= N_BATCH - 2, f"with a step above the batch, a step beside a reply read only {max(steps)}: {steps}"
+
+
 def test_without_prompt_step_a_read_beside_a_reply_fills_its_batches():
     global server
     server.start()

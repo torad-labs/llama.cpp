@@ -3616,7 +3616,7 @@ private:
         // fills the batch. A prompt that cannot be split keeps n_batch
         const int32_t n_generated    = batch.size();
         const int32_t n_batch_prompt = params_base.n_prompt_step > 0 && n_generated > 0 ?
-            std::min(n_batch, n_generated + params_base.n_prompt_step) : n_batch;
+            n_generated + std::min(n_batch - n_generated, params_base.n_prompt_step) : n_batch;
 
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
