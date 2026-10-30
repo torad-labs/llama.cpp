@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-q8-layout.h"
 
 #undef NDEBUG
 #include <assert.h>
@@ -9,6 +10,7 @@
 #include <stdio.h>
 #include <string>
 #include <vector>
+#include <random>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -202,6 +204,76 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+// The CUDA weight buffer's physical representation must preserve arbitrary scale
+// bits and codes, including partial writes and views starting inside a block.
+// Check the planes directly, not merely pack/unpack with the same permutation.
+static int test_q8_copy_aliasing() {
+    std::vector<uint8_t> storage(4096);
+    ggml_tensor a {};
+    a.type = GGML_TYPE_Q8_0;
+    a.ne[0] = 256; a.ne[1] = 4; a.ne[2] = a.ne[3] = 1;
+    a.nb[0] = 34; a.nb[1] = 8*34; a.nb[2] = a.nb[3] = 32*34;
+    a.data = storage.data();
+    auto b = a;
+    // Same address with different row strides is still overlapping reordering.
+    b.nb[1] *= 2;
+    if (!ggml_q8_copy_needs_staging(&a, &b)) {
+        fprintf(stderr, "Q8 copy must stage an overlapping view with different strides\n");
+        return 1;
+    }
+    b = a;
+    if (ggml_q8_copy_needs_staging(&a, &b)) { return 1; }
+    for (size_t offset = 1; offset <= 2*ggml_nbytes(&a); ++offset) {
+        b.data = storage.data() + offset;
+        if (ggml_q8_copy_needs_staging(&a, &b) != (offset < ggml_nbytes(&a))) { return 1; }
+        if (ggml_q8_copy_needs_staging(&b, &a) != (offset < ggml_nbytes(&a))) { return 1; }
+    }
+    return 0;
+}
+
+static int test_q8_split_storage() {
+    std::mt19937 rng(530);
+    for (size_t blocks : {4, 8, 64, 128, 132, 1024}) {
+        const ggml_q8_0_split_layout layout{blocks};
+        std::vector<uint8_t> canonical(layout.size());
+        std::vector<uint8_t> packed(layout.size(), 0);
+        for (auto & byte : canonical) {
+            byte = uint8_t(rng());
+        }
+        // Arbitrary sized transfers reproduce a model loader and byte views.
+        for (size_t begin = 0; begin < canonical.size();) {
+            const size_t end = std::min(canonical.size(), begin + 1 + rng() % 79);
+            for (size_t i = begin; i < end; ++i) {
+                const size_t physical = layout.offset(i);
+                if (physical >= packed.size()) { return 1; }
+                packed[physical] = canonical[i];
+            }
+            begin = end;
+        }
+        for (size_t b = 0; b < blocks; ++b) {
+            for (size_t c = 0; c < 32; ++c) {
+                if (packed[b*32 + c] != canonical[b*34 + 2 + c]) {
+                    fprintf(stderr, "Q8 split storage: code mismatch at block %zu byte %zu\n", b, c);
+                    return 1;
+                }
+            }
+            for (size_t c = 0; c < 2; ++c) {
+                if (packed[blocks*32 + b*2 + c] != canonical[b*34 + c]) { return 1; }
+            }
+        }
+        for (size_t step = 0; step < 100; ++step) {
+            const size_t i = rng() % canonical.size();
+            canonical[i] = uint8_t(rng());
+            packed[layout.offset(i)] = canonical[i];
+        }
+        for (size_t i = 0; i < canonical.size(); ++i) {
+            if (packed[layout.offset(i)] != canonical[i]) { return 1; }
+        }
+        if (layout.scale_offset() % 128 != 0) { return 1; }
+    }
+    return 0;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -221,6 +293,8 @@ int main(int argc, char * argv[]) {
 
     int num_failed = 0;
 
+    num_failed += test_q8_split_storage();
+    num_failed += test_q8_copy_aliasing();
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
 

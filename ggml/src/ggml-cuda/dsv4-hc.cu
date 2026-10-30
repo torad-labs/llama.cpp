@@ -1061,7 +1061,7 @@ static __global__ void __launch_bounds__(DSV4_HC_PRE_GRAM_THR) dsv4_hc_pre_gram_
 // dsv4_hc_pre_gram_f32 reads is read past the PDL wait mix_gram's part took.
 static constexpr int DSV4_HC_FRONT_ONE_CH = 8;
 
-template <typename T, bool fuse_post>
+template <typename T, bool fuse_post, bool cta_publish = false>
 static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_front_one(
         float * x, const T * w, float * partials, const int64_t sx1, const int64_t sw1, const bool w_prewait,
         const dsv4_hc_post_args pa, const dsv4_hc_pre_args pr, unsigned int * tickets) {
@@ -1075,10 +1075,24 @@ static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_front_one(
     // every writer's partials (and slice of the streams) seen device-wide before the block's ticket
     const int it       = blockIdx.y;
     const int n_slices = gridDim.x;
-    __threadfence();
+    if constexpr (!cta_publish) { __threadfence(); }
     __syncthreads();
     if (threadIdx.x == 0) {
-        const unsigned int t = atomicAdd(tickets + it, 1u);
+        unsigned int t;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if constexpr (cta_publish) {
+            // The CTA barrier makes all of this block's writes happen before
+            // this one release. The last RMW acquires every preceding ticket's
+            // release sequence; the following CTA barrier publishes that acquire
+            // to the threads that consume the partials. This is device scope,
+            // independent of the peer packet protocol's system visibility.
+            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"
+                         : "=r"(t) : "l"(tickets + it) : "memory");
+        } else
+#endif
+        {
+            t = atomicAdd(tickets + it, 1u);
+        }
         last = t == (unsigned int) n_slices - 1;
         if (last) {
             tickets[it] = 0;
@@ -1088,7 +1102,7 @@ static __global__ void __launch_bounds__(8*WARP_SIZE) dsv4_hc_front_one(
     if (!last) {
         return;
     }
-    __threadfence();
+    if constexpr (!cta_publish) { __threadfence(); }
 
     const int warp     = threadIdx.x / WARP_SIZE;
     const int n_chunks = (int) ((pr.n_embd + DSV4_HC_PRE_GRAM_THR - 1) / DSV4_HC_PRE_GRAM_THR);
@@ -1410,22 +1424,29 @@ static void dsv4_hc_front(ggml_backend_cuda_context & ctx, const ggml_tensor * p
             ggml_cuda_kernel_launch(kernel, gram_params,
                 (float *) x->data, w, partials.get(), sx1, sw1, w_prewait, pa, pr, tickets);
         };
+        static const bool cta_publish = ggml_env_switch("GGML_CUDA_HC_CTA_PUBLISH");
+        const bool use_cta_publish = cta_publish && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL;
+        const auto dispatch_one = [&](auto publish) {
+            constexpr bool cp = decltype(publish)::value;
         switch (hc_fn->type) {
             case GGML_TYPE_F32:
-                post ? launch_one(dsv4_hc_front_one<float, true>, (const float *) hc_fn->data)
-                     : launch_one(dsv4_hc_front_one<float, false>, (const float *) hc_fn->data);
+                post ? launch_one(dsv4_hc_front_one<float, true, cp>, (const float *) hc_fn->data)
+                     : launch_one(dsv4_hc_front_one<float, false, cp>, (const float *) hc_fn->data);
                 break;
             case GGML_TYPE_F16:
-                post ? launch_one(dsv4_hc_front_one<half, true>, (const half *) hc_fn->data)
-                     : launch_one(dsv4_hc_front_one<half, false>, (const half *) hc_fn->data);
+                post ? launch_one(dsv4_hc_front_one<half, true, cp>, (const half *) hc_fn->data)
+                     : launch_one(dsv4_hc_front_one<half, false, cp>, (const half *) hc_fn->data);
                 break;
             case GGML_TYPE_BF16:
-                post ? launch_one(dsv4_hc_front_one<nv_bfloat16, true>, (const nv_bfloat16 *) hc_fn->data)
-                     : launch_one(dsv4_hc_front_one<nv_bfloat16, false>, (const nv_bfloat16 *) hc_fn->data);
+                post ? launch_one(dsv4_hc_front_one<nv_bfloat16, true, cp>, (const nv_bfloat16 *) hc_fn->data)
+                     : launch_one(dsv4_hc_front_one<nv_bfloat16, false, cp>, (const nv_bfloat16 *) hc_fn->data);
                 break;
             default:
                 GGML_ABORT("unsupported hc_fn type %s", ggml_type_name(hc_fn->type));
         }
+        };
+        if (use_cta_publish) { dispatch_one(std::true_type{}); }
+        else                 { dispatch_one(std::false_type{}); }
 
         if (dsv4_hc_front_check()) {
             dsv4_hc_front_check_bits<<<dim3(1, n_tokens, 1), 256, 0, stream>>>(pr, two);

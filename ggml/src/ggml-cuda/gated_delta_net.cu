@@ -85,7 +85,7 @@ static __device__ __forceinline__ int64_t gdn_state_byte(const int64_t e, const 
 // or with KDA raw_lb * sigmoid(-(g * raw_a[h])), with the unary kernels' formulas.
 // G_PRECOMPUTED: g already holds exp(g) (GB10 long-prompt path), only with RAW == false; with KDA, the decay
 // gdn_kda_precompute_decay wrote, RAW then activating beta alone.
-template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, ggml_type STATE_T>
+template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, ggml_type STATE_T, int KDA_COLS = 1, bool FRONT_SHARED = false, bool F32_INPUT = false>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -121,14 +121,15 @@ gated_delta_net_cuda(const float * q,
                                      ggml_type     s_type,
                                      bool          state_prefetch,
                                      bool          lc_early) {
+    const ggml_type read_type = F32_INPUT ? GGML_TYPE_F32 : s_type;
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // Each warp owns one or more columns, using warp-level primitives to reduce across rows.
     const int      lane     = threadIdx.x;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
-    constexpr int cols_per_warp = S_v == 128 && !KDA ? 4 : 1;
+    constexpr int cols_per_warp = S_v == 128 && !KDA ? 4 : KDA_COLS;
 #else
-    constexpr int cols_per_warp = 1;
+    constexpr int cols_per_warp = KDA_COLS;
 #endif
     const int      col      = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp;
 
@@ -149,6 +150,10 @@ gated_delta_net_cuda(const float * q,
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
     float         s_shard[cols_per_warp][rows_per_lane];
+    // One warp owns the raw-gate/qk front for the CTA's 8/16 columns. Its
+    // handoff is local, so every column keeps its original recurrence fold.
+    __shared__ float front[FRONT_SHARED ? 3*S_v+1 : 1];
+    static_assert(!FRONT_SHARED || (KDA && RAW && !G_PRECOMPUTED && S_v == 128 && STATE_T == GGML_TYPE_F32));
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     // With the fused gather the state is a cache row, from the previous step: the block that starts a head requests the
@@ -157,8 +162,8 @@ gated_delta_net_cuda(const float * q,
     // the next launch, so the gated norm lands under it. Neither changes a result.
     if (state_prefetch && s_ids && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
         const int64_t e0 = (int64_t) s_ids[sequence] * s_row_stride + h_idx * S_v * S_v;
-        const int64_t b0 = gdn_state_byte(e0, s_type);
-        ggml_cuda_prefetch_l2((const char *) curr_state + b0, gdn_state_byte(e0 + S_v * S_v, s_type) - b0);
+        const int64_t b0 = gdn_state_byte(e0, read_type);
+        ggml_cuda_prefetch_l2((const char *) curr_state + b0, gdn_state_byte(e0 + S_v * S_v, read_type) - b0);
     }
     if (lc_early) {
         ggml_cuda_pdl_lc();
@@ -171,7 +176,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * warp_size + lane;
-            s_shard[c][r] = gdn_load_state(curr_state, state_in_offset + (col + c) * S_v + i, s_type);
+            s_shard[c][r] = gdn_load_state(curr_state, state_in_offset + (col + c) * S_v + i, read_type);
         }
     }
 
@@ -184,9 +189,25 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        float beta_val = *beta_t;
-        if constexpr (RAW) {
-            beta_val = 1.0f / (1.0f + expf(-beta_val));
+        float beta_val;
+        if constexpr (FRONT_SHARED) {
+            __syncthreads(); // every consumer has finished the previous token
+            if (threadIdx.y == 0) {
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; ++r) {
+                    const int i = r*warp_size + lane;
+                    front[i] = q_t[i];
+                    front[S_v+i] = k_t[i];
+                    const float gate = raw_lb * (1.0f / (1.0f + expf(g_t[i] * raw_a[h_idx])));
+                    front[2*S_v+i] = expf(gate);
+                }
+                if (lane == 0) front[3*S_v] = 1.0f / (1.0f + expf(-*beta_t));
+            }
+            __syncthreads();
+            beta_val = front[3*S_v];
+        } else {
+            beta_val = *beta_t;
+            if constexpr (RAW) beta_val = 1.0f / (1.0f + expf(-beta_val));
         }
 
         // Cache k and q in registers
@@ -195,8 +216,8 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * warp_size + lane;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
+            k_reg[r] = FRONT_SHARED ? front[S_v+i] : k_t[i];
+            q_reg[r] = FRONT_SHARED ? front[i] : q_t[i];
         }
 
         if constexpr (!KDA) {
@@ -238,8 +259,8 @@ gated_delta_net_cuda(const float * q,
             float g_exp[rows_per_lane];
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                float g_i = g_t[r * warp_size + lane];
-                if constexpr (G_PRECOMPUTED) {
+                float g_i = FRONT_SHARED ? front[2*S_v+r*warp_size+lane] : g_t[r * warp_size + lane];
+                if constexpr (G_PRECOMPUTED || FRONT_SHARED) {
                     g_exp[r] = g_i;
                 } else {
                     if constexpr (RAW) {
@@ -249,31 +270,27 @@ gated_delta_net_cuda(const float * q,
                 }
             }
 
-            // kv[col] = sum_i g[i] * S[i][col] * k[i]
-            float kv_shard = 0.0f;
+            // Each output column retains its original K order and reduction.
+            // q/k and per-key decay are shared across these independent chains.
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                kv_shard += g_exp[r] * s_shard[0][r] * k_reg[r];
-            }
-
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
-
-            // delta[col] = (v[col] - kv[col]) * beta
-            float delta_col = (v_t[col] - kv_col) * beta_val;
-
-            // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
-            float attn_partial = 0.0f;
+            for (int c = 0; c < cols_per_warp; ++c) {
+                float kv_shard = 0.0f;
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[0][r]  = g_exp[r] * s_shard[0][r] + k_reg[r] * delta_col;
-                attn_partial += s_shard[0][r] * q_reg[r];
-            }
-
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
-
-            if (lane == 0) {
-                attn_data[col] = attn_col * scale;
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_shard += g_exp[r] * s_shard[c][r] * k_reg[r];
+                }
+                const float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+                const float delta_col = (v_t[col + c] - kv_col) * beta_val;
+                float attn_partial = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[c][r] = g_exp[r] * s_shard[c][r] + k_reg[r] * delta_col;
+                    attn_partial += s_shard[c][r] * q_reg[r];
+                }
+                const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                if (lane == 0) {
+                    attn_data[col + c] = attn_col * scale;
+                }
             }
         }
 
@@ -328,7 +345,16 @@ static void launch_gated_delta_net(
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int num_warps = 4;
-    const int cols_per_warp = cc == GGML_CUDA_CC_DGX_SPARK && S_v == 128 && !KDA ? 4 : 1;
+    static const int kda_cols = [] {
+        const char * value = getenv("GGML_CUDA_KDA_COLUMNS");
+        if (value == nullptr) { return 1; }
+        if (strcmp(value, "1") == 0) { return 1; }
+        if (strcmp(value, "2") == 0) { return 2; }
+        if (strcmp(value, "4") == 0) { return 4; }
+        GGML_ABORT("GGML_CUDA_KDA_COLUMNS must be 1, 2 or 4");
+    }();
+    const int cols_per_warp = KDA && S_v == 128 && cc == GGML_CUDA_CC_BLACKWELL ? kda_cols :
+        (cc == GGML_CUDA_CC_DGX_SPARK && S_v == 128 && !KDA ? 4 : 1);
     dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols_per_warp - 1) / (num_warps * cols_per_warp));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
@@ -372,11 +398,42 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_T>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
-                state_prefetch, lc_early);
+            const auto launch = [&](auto columns) {
+                constexpr int nc = decltype(columns)::value;
+                const auto launch_state = [&](auto f32_input) {
+                    constexpr bool f32 = decltype(f32_input)::value;
+                    const auto launch_front = [&](auto shared_front) {
+                        constexpr bool front = decltype(shared_front)::value;
+                        ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, STATE_T, nc, front, f32>, launch_params,
+                            q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, rlb, s_d, dst_d, state_d, H,
+                            n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, attn_seq_stride, s_ids, s_row_stride, s_type,
+                            state_prefetch, lc_early);
+                    };
+                    if constexpr (KDA && RAW && !G_PRECOMPUTED && STATE_T == GGML_TYPE_F32 && nc > 1) {
+                        static const bool front_shared = ggml_env_switch("GGML_CUDA_KDA_FRONT_SHARED");
+                        if (front_shared && cc == GGML_CUDA_CC_BLACKWELL && n_tokens <= 8) {
+                            launch_front(std::true_type{});
+                            return;
+                        }
+                    }
+                    launch_front(std::false_type{});
+                };
+                if constexpr (KDA && STATE_T == GGML_TYPE_F32 && nc > 1) {
+                    // The GLM body has no half/quantized state reader or byte
+                    // address conversion; other state types keep their reader.
+                    if (cc == GGML_CUDA_CC_BLACKWELL && s_type == GGML_TYPE_F32) {
+                        launch_state(std::true_type{});
+                        return;
+                    }
+                }
+                launch_state(std::false_type{});
+            };
+            if constexpr (KDA) {
+                if (cols_per_warp == 4) { launch(std::integral_constant<int, 4>{}); break; }
+                if (cols_per_warp == 2) { launch(std::integral_constant<int, 2>{}); break; }
+            }
+            launch(std::integral_constant<int, 1>{});
             break;
         }
         default:

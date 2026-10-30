@@ -57,6 +57,7 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
 
 struct ggml_backend_meta_device_context {
     std::vector<ggml_backend_dev_t>     simple_devs;
+    std::vector<ggml_backend_supports_op_storage_t> storage_support;
     ggml_backend_meta_get_split_state_t get_split_state;
     void *                              get_split_state_ud;
 
@@ -68,13 +69,17 @@ struct ggml_backend_meta_device_context {
             simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
         name        = std::string("Meta(");
         description = std::string("Meta(");
-        for (size_t i = 0; i < simple_devs.size(); i++) {
+        for (size_t i = 0; i < this->simple_devs.size(); i++) {
+            const auto dev = this->simple_devs[i];
+            const auto reg = ggml_backend_dev_backend_reg(dev);
+            storage_support.push_back(reg ? reinterpret_cast<ggml_backend_supports_op_storage_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_supports_op_storage")) : nullptr);
             if (i > 0) {
                 name        += ",";
                 description += ",";
             }
-            name        += ggml_backend_dev_name       (simple_devs[i]);
-            description += ggml_backend_dev_description(simple_devs[i]);
+            name        += ggml_backend_dev_name       (dev);
+            description += ggml_backend_dev_description(dev);
         }
         name        += ")";
         description += ")";
@@ -155,12 +160,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
 
-static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
-    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
-    return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
-        [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
-}
+static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op);
 
 static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
@@ -376,13 +376,9 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
 }
 
 static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
-    for (size_t i = 0; i < n_simple_bufts; i++) {
-        if (!ggml_backend_buft_is_host(ggml_backend_meta_buft_simple_buft(buft, i))) {
-            return false;
-        }
-    }
-    return true;
+    // Meta addresses are virtual even when every underlying buffer is on the host.
+    GGML_UNUSED(buft);
+    return false;
 }
 
 static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_iface = {
@@ -540,6 +536,43 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
     const std::vector<ggml_tensor *> * simple_tensors = buf_ctx->find_simple_tensors(tensor);
     return simple_tensors != nullptr ? (*simple_tensors)[index] : nullptr;
+}
+
+static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const auto * ctx = (const ggml_backend_meta_device_context *) dev->context;
+    for (size_t rank = 0; rank < ctx->simple_devs.size(); ++rank) {
+        // Shape checks use one consistent logical graph. Storage checks use the allocated rank tensors separately.
+        if (!ggml_backend_dev_supports_op(ctx->simple_devs[rank], op)) { return false; }
+        if (!ctx->storage_support[rank]) { continue; }
+        const auto simple = [&](const ggml_tensor * tensor, bool & unresolved) -> const ggml_tensor * {
+            if (!tensor) { return nullptr; }
+            if (tensor->buffer && tensor->data && ggml_backend_buffer_is_meta(tensor->buffer)) {
+                const auto * storage = (const ggml_backend_meta_buffer_context *) tensor->buffer->context;
+                const auto * parts = storage->find_simple_tensors(tensor);
+                if (parts && rank < parts->size()) { return (*parts)[rank]; }
+            }
+            const ggml_tensor * root = tensor;
+            while (root->view_src) { root = root->view_src; }
+            if (root->buffer && root->data && ggml_backend_buffer_is_meta(root->buffer)) {
+                const auto * storage = (const ggml_backend_meta_buffer_context *) root->buffer->context;
+                const auto * parts = storage->find_simple_tensors(root);
+                if (parts && rank < parts->size()) {
+                    unresolved = tensor != root;
+                    return (*parts)[rank];
+                }
+            }
+            return tensor;
+        };
+        bool unresolved[GGML_MAX_SRC + 1] = {};
+        const ggml_tensor * tensors[GGML_MAX_SRC + 1] = {};
+        tensors[0] = simple(op, unresolved[0]);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            tensors[i+1] = simple(op->src[i], unresolved[i+1]);
+        }
+        if (!ctx->storage_support[rank](op, tensors, unresolved)) { return false; }
+    }
+    return true;
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
@@ -1920,6 +1953,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_allreduce_next_t   comm_allreduce_next = nullptr;
     ggml_backend_comm_allgather_tensor_t comm_allgather = nullptr; // null: the generic gather
     std::vector<bool>                    gathers; // a subgraph ends with a gather (ggml_backend_meta_is_gather)
     ggml_backend_graph_next_t            graph_next     = nullptr; // the simple backends' look ahead, or null
@@ -2139,6 +2173,8 @@ struct ggml_backend_meta_context {
             GGML_ASSERT(comm_allreduce != nullptr);
 
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            comm_allreduce_next = (ggml_backend_comm_allreduce_next_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_next");
             comm_allgather = (ggml_backend_comm_allgather_tensor_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allgather_tensor");
             capture.allreduce_capturable = (ggml_backend_comm_allreduce_capturable_t)
@@ -2883,13 +2919,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 bool backend_allreduce_success = false;
                 if (backend_ctx->comm_ctx) {
                     std::vector<ggml_tensor *> nodes;
+                    std::vector<const ggml_cgraph *> next;
                     nodes.reserve(n_backends);
+                    next.reserve(n_backends);
                     for (size_t j = 0; j < n_backends; j++) {
                         auto & bcj = backend_ctx->backend_configs[j];
                         ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                         nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+                        next.push_back(bcj.cgraphs[i + 1].cgraph_main);
                     }
-                    backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                    backend_allreduce_success = backend_ctx->comm_allreduce_next
+                        ? backend_ctx->comm_allreduce_next(backend_ctx->comm_ctx, nodes.data(), next.data())
+                        : backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
                 }
 
                 if (!backend_allreduce_success) {

@@ -4,6 +4,7 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
+#include "glm53-profile.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
@@ -1304,6 +1305,12 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+        if (ex == LLAMA_EXAMPLE_SERVER) {
+            // A remote preset may still turn this process into a router. Only model processes apply kernel defaults.
+            if (!params.glm53_profile.empty()) { common_glm53_profile_resolve(params.glm53_profile); }
+        } else {
+            common_glm53_profile_apply(params);
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -2316,6 +2323,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(json::parse(schema))};
         }
     ).set_sampling());
+    add_opt(common_arg(
+        {"--glm53-profile"}, "{canonical,sm120-balanced,sm120-wide,sm120-direct}",
+        "resolve a complete experimental GLM-5.3-Flash bundle before loading; changing it requires a process restart",
+        [](common_params & params, const std::string & value) {
+            common_glm53_profile_resolve(value);
+            params.glm53_profile = value;
+        }
+    ).set_env("LLAMA_ARG_GLM53_PROFILE"));
     add_opt(common_arg(
         {"-bs", "--backend-sampling"},
         "enable backend sampling (experimental) (default: disabled)",

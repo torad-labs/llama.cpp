@@ -1259,6 +1259,7 @@ struct csv_printer : public printer {
             "op_name",
             "op_params",
             "supported",
+            "passed",
             "error_message",
             "test_mode",
             "backend_reg_name",
@@ -4725,6 +4726,71 @@ struct test_mul_mat_concat : public test_case {
 };
 
 
+// Model-owned Q8 weights must retain their logical bytes across incremental
+// loads, views, prefill, decode, embedding gathers and compute-buffer copies.
+// The CPU reference obtains canonical bytes through the backend API.
+struct test_q8_weight_readers : public test_case {
+    const int64_t k, n, n_rows;
+    const bool sliced;
+    std::vector<ggml_tensor *> results;
+
+    test_q8_weight_readers(int64_t k, int64_t n, bool sliced, int64_t n_rows = 32)
+        : k(k), n(n), n_rows(n_rows), sliced(sliced) {}
+    std::string op_desc(ggml_tensor *) override { return "Q8_WEIGHT_READERS"; }
+    std::string vars() override { return VARS_TO_STR4(k, n, sliced, n_rows); }
+    bool use_weight_context() override { return true; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> forward_first() override { return results; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return results; }
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_w) override {
+        if (ctx_w == nullptr) { ctx_w = ctx; }
+        auto * weight = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, k + (sliced ? 256 : 0), n_rows + 3);
+        ggml_set_name(weight, "q8_weight");
+        auto * view = ggml_view_2d(ctx, weight, k, n_rows, weight->nb[1], weight->nb[1] + (sliced ? 34*8 : 0));
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8);
+        ggml_set_name(ids, "q8_rows");
+        results = { ggml_mul_mat(ctx, view, x), ggml_get_rows(ctx, view, ids),
+                    ggml_cast(ctx, view, GGML_TYPE_F32), ggml_cont(ctx, view) };
+        for (size_t i = 0; i < results.size(); ++i) {
+            ggml_format_name(results[i], "q8_result_%zu", i);
+        }
+        return ggml_mul_mat(ctx, results.back(), x);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q8_rows") == 0) {
+                const int32_t ids[] = {(int32_t) n_rows - 1, 0, 7, 7, 16, 1, 30, 0};
+                ggml_backend_tensor_set(t, ids, 0, sizeof(ids));
+            } else {
+                init_tensor_uniform(t);
+            }
+            if (strcmp(t->name, "q8_weight") == 0) {
+                std::vector<uint8_t> original(ggml_nbytes(t)), roundtrip(original.size());
+                ggml_backend_tensor_get(t, original.data(), 0, original.size());
+                // Deliberately split scales, blocks and rows; every write must
+                // preserve the untouched bytes in the same physical allocation.
+                for (size_t step = 0; step < 64; ++step) {
+                    const size_t off = (step*7919 + step*step*34) % original.size();
+                    const size_t count = std::min<size_t>(17 + off % 251, original.size() - off);
+                    ggml_backend_tensor_set(t, original.data() + off, off, count);
+                }
+                // Noncontiguous source and destination host/device row pitches.
+                ggml_backend_tensor_set_2d(t, original.data() + 17, 17, 257, 7, t->nb[1]*2, t->nb[1]*2);
+                std::vector<uint8_t> gathered(7*263, 0);
+                ggml_backend_tensor_get_2d(t, gathered.data(), 17, 257, 7, t->nb[1]*2, 263);
+                for (size_t row = 0; row < 7; ++row) {
+                    GGML_ASSERT(memcmp(gathered.data() + row*263, original.data() + 17 + row*t->nb[1]*2, 257) == 0);
+                }
+                ggml_backend_tensor_get(t, roundtrip.data(), 0, roundtrip.size());
+                GGML_ASSERT(original == roundtrip);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -8075,6 +8141,53 @@ struct test_moe_ffn_chain : public test_case {
     }
 };
 
+struct test_glm53_moe_routes : public test_moe_ffn_chain {
+    const int overlap;
+    test_glm53_moe_routes(int64_t n, int overlap, int64_t k, int64_t ff)
+        : test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 72, 8, k, ff, n, 7.0f), overlap(overlap) {}
+    std::string op_desc(ggml_tensor *) override { return "GLM53_MOE_ROUTES"; }
+    std::string vars() override { return test_moe_ffn_chain::vars() + "," + VAR_TO_STR(overlap); }
+    void initialize_tensors(ggml_context * ctx) override {
+        // The kernel consumes IQ3 blocks, so generate those directly instead of
+        // repeatedly running the expensive reference quantizer over every expert.
+        // Every code/sign/subscale bit is varied, and each block has a finite,
+        // varied scale. The graph and CPU numerical reference are unchanged.
+        std::mt19937 rng(530 + 17*n_tokens + overlap);
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) { continue; }
+            if (t->type == GGML_TYPE_IQ3_XXS) {
+                const size_t block = ggml_type_size(t->type);
+                GGML_ASSERT(ggml_is_contiguous(t) && block == 98 && ggml_blck_size(t->type) == 256);
+                std::vector<uint8_t> data(ggml_nbytes(t));
+                for (size_t offset = 0; offset < data.size(); offset += block) {
+                    const ggml_fp16_t d = ggml_fp32_to_fp16(0.0001f + float(rng() % 4901)*0.000001f);
+                    memcpy(data.data() + offset, &d, sizeof(d));
+                    for (size_t j = sizeof(d); j < block; j += sizeof(uint32_t)) {
+                        const uint32_t bits = rng();
+                        memcpy(data.data() + offset + j, &bits, sizeof(bits));
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+                continue;
+            }
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::vector<int32_t> ids(ggml_nelements(t));
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                for (int slot = 0; slot < n_mats; ++slot) {
+                    // Unique IDs within a token, with generated rotations;
+                    // either no overlap, all overlap, or groups of three.
+                    const int group = overlap == 0 ? token : overlap == 1 ? 0 : token/3;
+                    ids[token*n_mats + slot] = (slot + 8*group + 17) % n_mats;
+                }
+            }
+            ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(ids[0]));
+        }
+    }
+};
+
 // Routed experts' weighted sum as build_moe_ffn writes it: MUL(experts, weights), each slot's view, and the views added in
 // slot order. The CUDA backend runs the three as one launch (ggml_cuda_op_moe_weighted_sum, GGML_CUDA_MOE_WSUM_LEGACY=1:
 // the MUL and the fused ADDs), which rounds each product and each sum as the nodes do: the check is bit for bit.
@@ -10538,6 +10651,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_concat(GGML_TYPE_Q8_0, 256, 512, n, true));
     }
     test_cases.emplace_back(new test_mul_mat_concat(GGML_TYPE_Q8_0, 101, 4096, 2));
+    for (int64_t k : {256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 16384}) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 33, 128}) {
+            for (bool sliced : {false, true}) {
+                test_cases.emplace_back(new test_q8_weight_readers(k, n, sliced));
+            }
+        }
+    }
+    for (int64_t rows : {31, 33, 35}) {
+        test_cases.emplace_back(new test_q8_weight_readers(1024, 3, false, rows));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -11761,6 +11884,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // and leaves these passing (RTX 5090, 2026-10-06)
     test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 8, 8, 4096, 2048, 8, 7.0f));
     test_cases.emplace_back(new test_moe_ffn_chain(GGML_TYPE_Q8_0, 8, 8, 4096, 2048, 8, 0.0f));
+    for (int n = 1; n <= 8; ++n) {
+        for (int overlap : {0, 1, 2}) {
+            test_cases.emplace_back(new test_glm53_moe_routes(n, overlap, 4096, 1024));
+            test_cases.emplace_back(new test_glm53_moe_routes(n, overlap, 512, 256));
+            test_cases.emplace_back(new test_glm53_moe_routes(n, overlap, 3840, 768));
+        }
+    }
     // and its routed experts at a prefill batch, where MMQ tiles each expert's columns: 64 experts with 8 used, so 64
     // and 256 tokens give 8 and 32 columns an expert on average, the tile width follows them and only the experts'
     // non-empty column tiles are launched
@@ -12794,6 +12924,54 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
     // KDA raw gates (lb * sigmoid(-(g * a)) and sigmoid(beta) folded into the op): decode, a verify's 3 tokens with
     // and without snapshot slots, prefill, other head sizes, strided q/k/v
+    // Every short verification width, including a snapshot prefix that overlaps
+    // the input row. The column-ownership variants must preserve every column
+    // and every retained prefix, not only the final attention output.
+    for (int64_t nt = 1; nt <= 8; ++nt) {
+        for (int64_t ns : { 1, 3 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, ns,
+                    1, false, true, nt + 1, true, ns + 3, true));
+        }
+        for (int64_t row : { 1, 4, 7 }) {
+            test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, nt, 1,
+                    3, 1, true, GGML_TYPE_F32, 3, 1, row, true));
+        }
+        // the same widths with the state passed directly, as glm5next builds them (no rows mode), for one to three
+        // slots decoding together: GLM's K = 3 (two MTP drafts) and the prefix-overlapping K = nt + 1, and at K = 3
+        // with q/k/v as glm5next passes them, views into one conv-output row per token (q's and v's strides differ)
+        for (int64_t ns : { 1, 2, 3 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, ns,
+                    1, false, true, 3, false, -1, true));
+            if (nt + 1 != 3) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, ns,
+                        1, false, true, nt + 1, false, -1, true));
+            }
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, ns,
+                    1, false, true, 3, false, -1, true, true));
+        }
+        // GLM's own head count on each card (64 KDA heads split over two) at the widths it decodes: 1-3 tokens over
+        // 1-3 slots with q/k/v as conv-output views, and the 3-token verify of two and three slots fused into the cache
+        if (nt <= 3) {
+            for (int64_t ns : { 1, 2, 3 }) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, nt, ns,
+                        1, false, true, 3, false, -1, true, true));
+            }
+        }
+        if (nt == 3) {
+            for (int64_t ns : { 2, 3 }) {
+                test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 32, 128, 3, ns,
+                        3, 1, true, GGML_TYPE_F32, 3, 0, -1, true));
+            }
+        }
+        // two and three slots fused into an f32 cache laid out as delta-net-base.cpp lays it out for three slots,
+        // starting at each row a batch of that many slots can start at
+        for (int64_t ns : { 2, 3 }) {
+            for (int64_t kv_head = 0; kv_head + ns <= 3; ++kv_head) {
+                test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, nt, ns,
+                        3, 1, true, GGML_TYPE_F32, 3, kv_head, -1, true));
+            }
+        }
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  1, 1, 1, false, true, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  1, 2, 1, false, true, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  3, 1, 1, false, true, 1, false, -1, true));

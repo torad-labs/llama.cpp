@@ -9,6 +9,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "glm53-profile.h"
 #include "llama.h"
 #include "log.h"
 
@@ -135,6 +136,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
     const bool is_router_server = params.model.path.empty()
                                && params.model.hf_repo.empty()
                                && params.model.docker_repo.empty();
+
+    if (!is_router_server) {
+        try {
+            common_glm53_profile_apply(params);
+        } catch (const std::exception & e) {
+            SRV_ERR("invalid GLM profile: %s\n", e.what());
+            return 1;
+        }
+    }
 
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);

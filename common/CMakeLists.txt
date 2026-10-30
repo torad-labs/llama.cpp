@@ -75,6 +75,8 @@ add_library(${TARGET}
     download.h
     fit.cpp
     fit.h
+    glm53-profile.cpp
+    glm53-profile.h
     hf-cache.cpp
     hf-cache.h
     http.h

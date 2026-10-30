@@ -11,6 +11,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-memory-hybrid.h"
 
 #include <algorithm>
 #include <cmath>
@@ -19,8 +20,14 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <map>
+#include <set>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -876,6 +883,558 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
     return true;
 }
 
+// A speculative prefix must have the same recurrent state and continuation as
+// a context that never evaluated the rejected suffix. Exercise generated rounds
+// at every verification width, including zero/all draft acceptance, IndexPool
+// boundaries, cancellation with a pending restore, and reuse of three slots.
+struct glm_state_comparison {
+    bool equal;
+    std::string reason;
+};
+
+struct glm_state_tensor {
+    size_t offset;
+    ggml_type type;
+    std::vector<float> values;
+};
+
+struct glm_state_view {
+    std::vector<std::pair<std::string, std::string>> metadata;
+    std::vector<glm_state_tensor> tensors;
+    std::string error;
+};
+
+static glm_state_view read_glm_state(const std::vector<uint8_t> & bytes) {
+    glm_state_view result;
+    size_t offset = 0;
+    const auto read = [&](auto & value, const std::string & field) {
+        if (sizeof(value) > bytes.size()-offset) {
+            result.error = "truncated " + field;
+            return false;
+        }
+        memcpy(&value, bytes.data()+offset, sizeof(value));
+        offset += sizeof(value);
+        result.metadata.emplace_back(field, std::to_string(value));
+        return true;
+    };
+    uint32_t magic, cells, transposed, layers;
+    llama_seq_id seq;
+    if (!read(magic, "magic") || !read(seq, "sequence") || !read(cells, "cell_count")) return result;
+    if (magic != 0xaf143cd8 || seq < 0 || cells == 0 || cells > (bytes.size()-offset)/8) {
+        result.error = "invalid recurrent sequence header";
+        return result;
+    }
+    for (uint32_t cell = 0; cell < cells; ++cell) {
+        llama_pos pos;
+        uint32_t sequences;
+        const std::string field = "cell[" + std::to_string(cell) + "]";
+        if (!read(pos, field+".position") || !read(sequences, field+".sequence_count")) return result;
+        if (pos < 0 || sequences != 0) {
+            result.error = "invalid " + field;
+            return result;
+        }
+    }
+    if (!read(transposed, "transposed") || !read(layers, "layer_count")) return result;
+    if (transposed != 0 || layers == 0) {
+        result.error = "unsupported recurrent tensor layout";
+        return result;
+    }
+    while (offset < bytes.size()) {
+        const std::string field = "tensor[" + std::to_string(result.tensors.size()) + "]";
+        int32_t type;
+        uint64_t row_bytes;
+        if (!read(type, field+".type") || !read(row_bytes, field+".row_bytes")) return result;
+        if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16 && type != GGML_TYPE_Q8_0) {
+            result.error = "unsupported " + field+".type";
+            return result;
+        }
+        const auto t = ggml_type(type);
+        const auto * traits = ggml_get_type_traits(t);
+        if (row_bytes == 0 || row_bytes%traits->type_size || row_bytes > (bytes.size()-offset)/cells) {
+            result.error = "invalid or truncated " + field+".payload";
+            return result;
+        }
+        const size_t count = row_bytes*cells;
+        glm_state_tensor tensor {offset, t, std::vector<float>(count/traits->type_size*traits->blck_size)};
+        if (t == GGML_TYPE_F32) memcpy(tensor.values.data(), bytes.data()+offset, count);
+        else traits->to_float(bytes.data()+offset, tensor.values.data(), tensor.values.size());
+        for (size_t i = 0; i < tensor.values.size(); ++i) {
+            if (!std::isfinite(tensor.values[i])) {
+                result.error = field+" nonfinite element="+std::to_string(i)+" payload_offset="+std::to_string(offset);
+                return result;
+            }
+        }
+        offset += count;
+        result.tensors.push_back(std::move(tensor));
+        if (result.tensors.size() > 2*uint64_t(layers)) {
+            result.error = "too many recurrent tensors";
+            return result;
+        }
+    }
+    if (result.tensors.empty() || result.tensors.size()%2) result.error = "incomplete recurrent tensor pairs";
+    return result;
+}
+
+static glm_state_comparison compare_glm_states(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+    const auto actual = read_glm_state(a), reference = read_glm_state(b);
+    if (!actual.error.empty()) return {false, "actual: " + actual.error};
+    if (!reference.error.empty()) return {false, "reference: " + reference.error};
+    if (actual.metadata.size() != reference.metadata.size()) return {false, "metadata field count differs"};
+    for (size_t i = 0; i < actual.metadata.size(); ++i) {
+        if (actual.metadata[i] != reference.metadata[i]) {
+            return {false, "metadata " + actual.metadata[i].first + ": actual=" + actual.metadata[i].second +
+                           " reference=" + reference.metadata[i].second};
+        }
+    }
+    std::string failures;
+    for (size_t t = 0; t < actual.tensors.size(); ++t) {
+        const auto & x = actual.tensors[t];
+        const auto & y = reference.tensors[t];
+        double error = 0, magnitude = 0, max_abs = 0;
+        size_t first = x.values.size();
+        for (size_t i = 0; i < x.values.size(); ++i) {
+            const double d = double(x.values[i])-double(y.values[i]);
+            error += d*d;
+            magnitude += double(y.values[i])*double(y.values[i]);
+            max_abs = std::max(max_abs, std::fabs(d));
+            if (!(std::fabs(x.values[i]-y.values[i]) <= 1e-6f) && first == x.values.size()) first = i;
+        }
+        if (first != x.values.size()) {
+            char line[384];
+            snprintf(line, sizeof(line), "tensor[%zu] type=%s payload_offset=%zu first_element=%zu actual=%.9g reference=%.9g max_abs=%.9g nmse=%.9g finite=1; ",
+                     t, ggml_type_name(x.type), x.offset, first, x.values[first], y.values[first], max_abs,
+                     magnitude > 0 ? error/magnitude : INFINITY);
+            failures += line;
+        }
+    }
+    return {failures.empty(), failures};
+}
+
+static int test_glm_state_comparison() {
+    ggml_context_ptr init(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+    int failed = 0, checked = 0;
+    const auto check = [&](bool ok, const char * name) {
+        ++checked;
+        if (!ok && failed++ < 12) fprintf(stderr, "state comparison regression: %s\n", name);
+    };
+    std::mt19937 rng(1234);
+    for (int trial = 0; trial < 64; ++trial) {
+        std::vector<uint8_t> a;
+        const auto append = [&](const auto value) {
+            const auto * bytes = reinterpret_cast<const uint8_t *>(&value);
+            a.insert(a.end(), bytes, bytes + sizeof(value));
+        };
+        append(uint32_t(0xaf143cd8));
+        append(llama_seq_id(trial%3));
+        append(uint32_t(1));
+        append(llama_pos(256 + rng()%1024));
+        append(uint32_t(0));
+        append(uint32_t(0));
+        append(uint32_t(1));
+        for (int tensor = 0; tensor < 2; ++tensor) {
+            append(int32_t(GGML_TYPE_F32));
+            append(uint64_t(32*sizeof(float)));
+            for (int i = 0; i < 32; ++i) append(float(int(rng()%1000)-500)/10000.0f);
+        }
+        check(compare_glm_states(a, a).equal, "identical finite state");
+        for (const size_t offset : {size_t(0), size_t(4), size_t(12), size_t(24), size_t(28), size_t(32)}) {
+            auto b = a;
+            uint32_t value;
+            memcpy(&value, b.data()+offset, sizeof(value));
+            ++value;
+            memcpy(b.data()+offset, &value, sizeof(value));
+            check(!compare_glm_states(a, b).equal, "changed metadata");
+        }
+        auto b = a;
+        float value;
+        memcpy(&value, b.data()+40, sizeof(value));
+        value += 1e-7f;
+        memcpy(b.data()+40, &value, sizeof(value));
+        check(compare_glm_states(a, b).equal, "numeric difference inside existing tolerance");
+        value += 1e-3f;
+        memcpy(b.data()+40, &value, sizeof(value));
+        check(!compare_glm_states(a, b).equal, "numeric difference outside existing tolerance");
+        value = NAN;
+        memcpy(b.data()+40, &value, sizeof(value));
+        check(!compare_glm_states(b, b).equal, "identical NaN payloads");
+        b = a;
+        b.resize(b.size()-sizeof(float));
+        check(!compare_glm_states(b, b).equal, "identically truncated states");
+        for (const auto type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+            const auto * traits = ggml_get_type_traits(type);
+            std::vector<float> values(32);
+            for (auto & x : values) x = float(int(rng()%1000)-500)/10000.0f;
+            const auto encoded = [&](const std::vector<float> & payload) {
+                std::vector<uint8_t> bytes(a.begin(), a.begin()+28);
+                for (int tensor = 0; tensor < 2; ++tensor) {
+                    const int32_t tag = type;
+                    const uint64_t row_bytes = traits->type_size;
+                    const size_t start = bytes.size();
+                    const size_t row = ggml_row_size(type, payload.size());
+                    const uint64_t size = row;
+                    bytes.resize(start+sizeof(tag)+sizeof(row_bytes)+row);
+                    memcpy(bytes.data()+start, &tag, sizeof(tag));
+                    memcpy(bytes.data()+start+sizeof(tag), &size, sizeof(size));
+                    traits->from_float_ref(payload.data(), bytes.data()+start+sizeof(tag)+sizeof(size), payload.size());
+                }
+                return bytes;
+            };
+            const auto typed = encoded(values);
+            check(compare_glm_states(typed, typed).equal, "identical finite typed state");
+            values[0] += 0.1f;
+            check(!compare_glm_states(typed, encoded(values)).equal, "typed numeric difference outside tolerance");
+            auto nonfinite = typed;
+            const uint16_t bits = type == GGML_TYPE_BF16 ? 0x7fc0 : 0x7e00;
+            memcpy(nonfinite.data()+40, &bits, sizeof(bits)); // first value, or the Q8_0 block scale
+            check(!compare_glm_states(nonfinite, nonfinite).equal, "identical typed nonfinite payloads");
+            auto truncated = typed;
+            truncated.pop_back();
+            check(!compare_glm_states(truncated, truncated).equal, "truncated typed payload");
+        }
+    }
+    fprintf(stderr, "state comparison regressions: %d checks, %d failed\n", checked, failed);
+    return failed ? 1 : 0;
+}
+
+static std::vector<uint8_t> glm_state_bytes(llama_context * ctx, int seq, bool full = false) {
+    constexpr auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    const size_t size = full ? llama_state_get_size(ctx) : llama_state_seq_get_size_ext(ctx, seq, flags);
+    std::vector<uint8_t> bytes(size);
+    const size_t written = full ? llama_state_get_data(ctx, bytes.data(), size) :
+        llama_state_seq_get_data_ext(ctx, bytes.data(), size, seq, flags);
+    if (!size || written != size) throw std::runtime_error("GLM diagnostic state serialization failed");
+    return bytes;
+}
+
+// Read the physical plane before seq_rm chooses it. No engine state is modified.
+static std::vector<uint8_t> glm_snapshot(llama_context * ctx, int seq, int plane, llama_pos position) {
+    llama_synchronize(ctx);
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
+    if (!hybrid) throw std::runtime_error("GLM diagnostic needs hybrid recurrent memory");
+    auto * memory = hybrid->get_mem_recr();
+    if (plane < 0 || uint32_t(plane) > memory->rs_reach.at(seq)) {
+        throw std::runtime_error("GLM diagnostic snapshot exceeds rollback reach");
+    }
+    auto bytes = glm_state_bytes(ctx, seq);
+    const auto view = read_glm_state(bytes);
+    if (!view.error.empty()) throw std::runtime_error("GLM diagnostic snapshot layout: " + view.error);
+    uint32_t cells;
+    memcpy(&cells, bytes.data()+8, sizeof(cells));
+    if (cells != 1) throw std::runtime_error("GLM diagnostic needs one recurrent cell");
+    size_t source = memory->size;
+    for (size_t i = 0; i < memory->cells.size(); ++i) {
+        if (memory->cells[i].has_seq_id(seq)) {
+            if (source != memory->size) throw std::runtime_error("GLM diagnostic found multiple recurrent cells");
+            source = memory->cells[i].src >= 0 ? size_t(memory->cells[i].src) : i;
+        }
+    }
+    if (source >= memory->size) throw std::runtime_error("GLM diagnostic has no recurrent source cell");
+    size_t index = 0;
+    for (const auto * layers : {&memory->r_l, &memory->s_l}) {
+        for (auto * tensor : *layers) {
+            if (!tensor) continue;
+            const auto & saved = view.tensors.at(index++);
+            const size_t row = ggml_row_size(tensor->type, tensor->ne[0]);
+            if (saved.type != tensor->type || row != ggml_row_size(saved.type, saved.values.size()) ||
+                    saved.offset + row > bytes.size()) throw std::runtime_error("GLM diagnostic tensor shape differs");
+            ggml_backend_tensor_get(tensor, bytes.data()+saved.offset, (size_t(plane)*memory->size + source)*row, row);
+        }
+    }
+    if (index != view.tensors.size()) throw std::runtime_error("GLM diagnostic tensor count differs");
+    memcpy(bytes.data()+12, &position, sizeof(position));
+    return bytes;
+}
+
+static void write_glm_diagnostic(const std::string & directory, const std::string & name, const void * data, size_t size) {
+    const auto path = directory + "/" + name;
+    FILE * file = fopen(path.c_str(), "wbx");
+    if (!file) throw std::runtime_error("cannot create GLM diagnostic " + path);
+    const bool written = fwrite(data, 1, size, file) == size;
+    const bool closed = fclose(file) == 0;
+    if (!written || !closed) throw std::runtime_error("cannot persist GLM diagnostic " + path);
+}
+
+
+struct glm_round_evidence {
+    std::string directory;
+    size_t seed;
+    bool unified;
+    int seq, position, width, keep;
+    bool capture = false, prefix_passed = false, correction_passed = false, correction_checked = false, cancelled = false;
+    std::string prefix_reason, correction_reason, diagnostic_error;
+    std::map<std::string, std::vector<uint8_t>> files;
+    std::set<std::string> written;
+
+    void add(const std::string & name, const std::vector<uint8_t> & bytes) {
+        if (!directory.empty()) files[name] = bytes;
+    }
+    void add(const std::string & name, const void * data, size_t size) {
+        if (directory.empty()) return;
+        const auto * bytes = static_cast<const uint8_t *>(data);
+        files[name] = std::vector<uint8_t>(bytes, bytes+size);
+    }
+    void snapshot(const std::string & name, const std::function<std::vector<uint8_t>()> & read) {
+        try { add(name, read()); }
+        catch (const std::exception & error) {
+            diagnostic_error += name + ": " + error.what() + "; ";
+            LOG_ERR("GLM snapshot diagnostic: %s\n", diagnostic_error.c_str());
+        }
+    }
+    std::string report() const {
+        std::ostringstream out;
+        out << "seed=" << seed << "\nunified=" << unified << "\nsequence=" << seq << "\nposition=" << position
+            << "\nwidth=" << width << "\nkeep=" << keep << "\nprefix_passed=" << prefix_passed
+            << "\nprefix_reason=" << prefix_reason << "\ncorrection_checked=" << correction_checked
+            << "\ncorrection_kind=" << (cancelled ? "cancel-reuse" : "continuation")
+            << "\ncontinuation_passed=" << (correction_checked && !cancelled ? (correction_passed ? "1" : "0") : "not-measured")
+            << "\nreuse_passed=" << (correction_checked && cancelled ? (correction_passed ? "1" : "0") : "not-measured")
+            << "\ncorrection_reason=" << correction_reason << "\ndiagnostic_error=" << diagnostic_error
+            << "\nstate_absolute_tolerance=1e-6\nlogit_absolute_tolerance=1e-4\n";
+        return out.str();
+    }
+    void persist(const std::string & phase) {
+        if (directory.empty() || !capture) return;
+        for (const auto & file : files) {
+            if (written.count(file.first)) continue;
+            write_glm_diagnostic(directory, file.first, file.second.data(), file.second.size());
+            written.insert(file.first);
+        }
+        const auto text = report();
+        write_glm_diagnostic(directory, phase+".txt", text.data(), text.size());
+    }
+    bool prefix(const std::vector<uint8_t> & actual, const std::vector<uint8_t> & reference) {
+        add("actual-prefix.bin", actual); add("reference-prefix.bin", reference);
+        const auto comparison = compare_glm_states(actual, reference);
+        prefix_passed = comparison.equal; prefix_reason = comparison.reason;
+        capture = !directory.empty() && (!prefix_passed || !diagnostic_error.empty() || (!unified && width == 4 && keep == 1));
+        if (!prefix_passed) LOG_ERR("GLM generated prefix: unified=%d seq=%d width=%d keep=%d state mismatch: %s\n",
+                                   unified, seq, width, keep, prefix_reason.c_str());
+        persist("prefix-report");
+        return prefix_passed;
+    }
+    bool correction(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> & states,
+                    const std::vector<float> & actual, const std::vector<float> & reference, bool was_cancelled) {
+        correction_checked = true; cancelled = was_cancelled; correction_passed = true;
+        add("actual-logits.f32", actual.data(), actual.size()*sizeof(float));
+        add("reference-logits.f32", reference.data(), reference.size()*sizeof(float));
+        if (actual.size() != reference.size()) {
+            correction_passed = false; correction_reason = "logit count differs; ";
+        } else {
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (!(std::isfinite(actual[i]) && std::isfinite(reference[i]) && std::fabs(actual[i]-reference[i]) <= 1e-4f)) {
+                    correction_passed = false;
+                    correction_reason += "logit mismatch at token " + std::to_string(i) + "; ";
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < states.size(); ++i) {
+            const auto suffix = "-after-seq" + std::to_string(i) + ".bin";
+            add("actual"+suffix, states[i].first); add("reference"+suffix, states[i].second);
+            const auto comparison = compare_glm_states(states[i].first, states[i].second);
+            if (!comparison.equal) {
+                correction_passed = false;
+                correction_reason += "sequence " + std::to_string(i) + ": " + comparison.reason + "; ";
+            }
+        }
+        add("actual-after.bin", states.at(seq).first); add("reference-after.bin", states.at(seq).second);
+        if (!correction_passed) LOG_ERR("GLM correction: unified=%d seq=%d width=%d keep=%d %s\n",
+                                       unified, seq, width, keep, correction_reason.c_str());
+        capture = !directory.empty() && (capture || !correction_passed);
+        persist("correction-report");
+        return correction_passed;
+    }
+};
+
+static int test_glm_capture_failures() {
+    int failed = 0, checked = 0;
+    const auto check = [&](bool ok, const char * name) {
+        ++checked;
+        if (!ok && failed++ < 12) fprintf(stderr, "GLM capture regression: %s\n", name);
+    };
+    const auto root = std::filesystem::temp_directory_path() / ("glm-capture-"+std::to_string(std::random_device{}()));
+    if (!std::filesystem::create_directory(root)) throw std::runtime_error("cannot create capture test directory");
+    const auto read = [](const std::filesystem::path & path) {
+        std::ifstream file(path, std::ios::binary);
+        return std::vector<uint8_t>(std::istreambuf_iterator<char>(file), {});
+    };
+    std::mt19937 rng(2345);
+    for (int trial = 0; trial < 32; ++trial) {
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> states;
+        for (int seq = 0; seq < 3; ++seq) {
+            std::vector<uint8_t> raw;
+            const auto append = [&](const auto value) {
+                const auto * bytes = reinterpret_cast<const uint8_t *>(&value);
+                raw.insert(raw.end(), bytes, bytes+sizeof(value));
+            };
+            append(uint32_t(0xaf143cd8)); append(llama_seq_id(seq)); append(uint32_t(1));
+            append(llama_pos(264)); append(uint32_t(0)); append(uint32_t(0)); append(uint32_t(1));
+            for (int tensor = 0; tensor < 2; ++tensor) {
+                append(int32_t(GGML_TYPE_F32)); append(uint64_t(4)); append(float(rng()%1000)/1000.0f);
+            }
+            states.emplace_back(raw, raw);
+        }
+        for (int failure = 0; failure < 4; ++failure) {
+            const auto directory = root / (std::to_string(trial)+"-"+std::to_string(failure));
+            std::filesystem::create_directory(directory);
+            glm_round_evidence evidence {directory.string(), 1234, false, 2, 264, 1, 1};
+            auto actual = states[2].first, reference = states[2].second;
+            bool threw = false;
+            try {
+                if (failure == 0) {
+                    if (trial%2) actual.pop_back();
+                    else { const float nan = NAN; memcpy(actual.data()+40, &nan, sizeof(nan)); }
+                    reference = actual;
+                    evidence.snapshot("snapshot-selected.bin", [&] {
+                        const auto view = read_glm_state(actual);
+                        if (!view.error.empty()) throw std::runtime_error(view.error);
+                        return actual;
+                    });
+                    check(!evidence.prefix(actual, reference), "invalid prefix remains failed");
+                    // The correction/control step has not run yet: both raw states must already be durable.
+                    check(read(directory/"actual-prefix.bin") == actual && read(directory/"reference-prefix.bin") == reference,
+                          "invalid raw prefix pair retained before continuation");
+                } else if (failure == 1) {
+                    check(evidence.prefix(actual, reference), "equal prefix passes");
+                    check(!evidence.correction(states, {0, 1}, {0, 2}, false), "bad continuation logits fail");
+                    check(!read(directory/"actual-logits.f32").empty() && !read(directory/"correction-report.txt").empty(),
+                          "early continuation logit failure captured");
+                } else if (failure == 2) {
+                    check(evidence.prefix(actual, reference), "equal selected prefix passes");
+                    auto other = states;
+                    const float changed = 4.0f; memcpy(other[1].first.data()+40, &changed, sizeof(changed));
+                    check(!evidence.correction(other, {0, 1}, {0, 1}, false), "other-sequence correction failure fails");
+                    check(read(directory/"actual-after-seq1.bin") == other[1].first &&
+                          read(directory/"reference-after-seq1.bin") == other[1].second,
+                          "other-sequence failing raw pair retained");
+                } else {
+                    evidence.width = 3;
+                    const float changed = 4.0f; memcpy(actual.data()+40, &changed, sizeof(changed));
+                    check(!evidence.prefix(actual, reference), "cancelled prefix failure remains failed");
+                    check(evidence.correction(states, {0, 1}, {0, 1}, true), "reuse can pass separately");
+                    check(evidence.report().find("continuation_passed=not-measured\n") != std::string::npos &&
+                          evidence.report().find("reuse_passed=1\n") != std::string::npos,
+                          "reuse does not claim continuation of discarded state");
+                }
+            } catch (const std::exception &) { threw = true; }
+            check(!threw, "optional snapshot error must not abort evidence capture");
+        }
+    }
+    std::filesystem::remove_all(root);
+    fprintf(stderr, "GLM capture regressions: %d checks, %d failed\n", checked, failed);
+    return failed ? 1 : 0;
+}
+
+static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split, const std::string & diagnostic_dir = "") {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(4));
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::mt19937 rng(seed);
+    const bool diagnostics = !diagnostic_dir.empty();
+    for (const bool unified : {false, true}) {
+        auto params = llama_context_default_params();
+        params.n_ctx = 2048;
+        params.n_seq_max = 3;
+        params.n_rs_seq = 8;
+        params.n_batch = 512;
+        params.n_ubatch = 64;
+        params.n_threads = params.n_threads_batch = 4;
+        params.kv_unified = unified;
+        llama_context_ptr actual(llama_init_from_model(model, params));
+        llama_context_ptr reference(llama_init_from_model(model, params));
+        if (!actual || !reference) return false;
+        std::vector<llama_pos> positions(3, 0);
+        const auto decode = [&](llama_context * ctx, int seq, int pos, const std::vector<llama_token> & input, int n) {
+            llama_batch batch = llama_batch_init(n, 0, 1);
+            for (int i = 0; i < n; ++i) common_batch_add(batch, input[i], pos + i, {seq}, i == n-1);
+            const int status = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+            return status == 0;
+        };
+        const auto random_tokens = [&](int n) {
+            std::vector<llama_token> out(n);
+            for (auto & t : out) t = (llama_token)(rng()%vocab);
+            return out;
+        };
+        for (int seq = 0; seq < 3; ++seq) {
+            const auto input = random_tokens(253 + seq);
+            if (!decode(actual.get(), seq, 0, input, input.size()) ||
+                !decode(reference.get(), seq, 0, input, input.size())) return false;
+            positions[seq] = input.size();
+        }
+        for (int width = 1; width <= 8; ++width) {
+            for (int keep = 1; keep <= width; ++keep) {
+                const int seq = (width + keep)%3;
+                const int pos = positions[seq];
+                const auto input = random_tokens(width);
+                glm_round_evidence evidence {diagnostic_dir, seed, unified, seq, pos, width, keep};
+                std::vector<uint8_t> before_full;
+                if (diagnostics) {
+                    evidence.add("actual-before.bin", glm_state_bytes(actual.get(), seq));
+                    evidence.add("reference-before.bin", glm_state_bytes(reference.get(), seq));
+                    before_full = glm_state_bytes(reference.get(), seq, true);
+                    evidence.add("reference-before-full.bin", before_full);
+                    evidence.add("input.i32", input.data(), input.size()*sizeof(llama_token));
+                }
+                if (!decode(actual.get(), seq, pos, input, width) ||
+                    !decode(reference.get(), seq, pos, input, keep)) return false;
+                if (diagnostics) {
+                    evidence.snapshot("snapshot-selected.bin", [&] { return glm_snapshot(actual.get(), seq, width-keep, pos+keep-1); });
+                    if (keep < width) evidence.snapshot("snapshot-late.bin", [&] { return glm_snapshot(actual.get(), seq, width-keep-1, pos+keep); });
+                }
+                if (keep < width && !llama_memory_seq_rm(llama_get_memory(actual.get()), seq, pos+keep, -1)) return false;
+                const bool prefix_ok = evidence.prefix(glm_state_bytes(actual.get(), seq), glm_state_bytes(reference.get(), seq));
+                if (!prefix_ok && !diagnostics) return false;
+                positions[seq] += keep;
+                const bool cancelled = keep < width && width%3 == 0 && keep == 1;
+                if (cancelled) {
+                    if (!llama_memory_seq_rm(llama_get_memory(actual.get()), seq, -1, -1) ||
+                        !llama_memory_seq_rm(llama_get_memory(reference.get()), seq, -1, -1)) return false;
+                    positions[seq] = 0;
+                }
+                const auto correction = random_tokens(3);
+                if (diagnostics) evidence.add("correction.i32", correction.data(), correction.size()*sizeof(llama_token));
+                if (!decode(actual.get(), seq, positions[seq], correction, correction.size()) ||
+                    !decode(reference.get(), seq, positions[seq], correction, correction.size())) return false;
+                positions[seq] += correction.size();
+                const float * a = llama_get_logits_ith(actual.get(), correction.size()-1);
+                const float * b = llama_get_logits_ith(reference.get(), correction.size()-1);
+                if (!a || !b) return false;
+                std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> states;
+                for (int s = 0; s < 3; ++s) states.emplace_back(glm_state_bytes(actual.get(), s), glm_state_bytes(reference.get(), s));
+                const bool correction_ok = evidence.correction(states, {a, a+vocab}, {b, b+vocab}, cancelled);
+                if (evidence.capture) {
+                    // Independent controls start from the same pre-round reference history.
+                    llama_context_ptr batched(llama_init_from_model(model, params));
+                    llama_context_ptr serial(llama_init_from_model(model, params));
+                    for (auto * ctx : {batched.get(), serial.get()}) {
+                        if (!ctx || llama_state_set_data(ctx, before_full.data(), before_full.size()) != before_full.size()) {
+                            throw std::runtime_error("GLM diagnostic control restore failed");
+                        }
+                    }
+                    if (!decode(batched.get(), seq, pos, input, width)) throw std::runtime_error("GLM diagnostic batch decode failed");
+                    evidence.add("control-batched.bin", glm_snapshot(batched.get(), seq, width-keep, pos+keep-1));
+                    if (keep == 1) evidence.add("control-early.bin", glm_state_bytes(serial.get(), seq));
+                    for (int token = 0; token < std::min(width, keep+1); ++token) {
+                        if (!decode(serial.get(), seq, pos+token, {input[token]}, 1)) throw std::runtime_error("GLM diagnostic serial decode failed");
+                        if (token+1 == keep-1) evidence.add("control-early.bin", glm_state_bytes(serial.get(), seq));
+                        if (token+1 == keep) evidence.add("control-serial.bin", glm_state_bytes(serial.get(), seq));
+                        if (token+1 == keep+1) evidence.add("control-late.bin", glm_state_bytes(serial.get(), seq));
+                    }
+                    evidence.persist("report");
+                    return prefix_ok && correction_ok && evidence.diagnostic_error.empty();
+                }
+                if (!correction_ok) return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1198,6 +1757,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL MTP vocab\033[0m";
                         }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_generated_prefixes(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            throw std::runtime_error("GLM generated speculative prefixes failed");
+                        }
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_short_dense(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL short dense\033[0m";
@@ -1253,6 +1815,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--test-state-comparison") == 0) {
+        const int comparison = test_glm_state_comparison();
+        return test_glm_capture_failures() || comparison;
+    }
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
     std::random_device rd;
@@ -1261,8 +1827,15 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    std::string diagnostic_dir, diagnostic_device;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--glm-prefix-diagnostics") == 0 || strcmp(argv[i], "--glm-prefix-device") == 0) {
+            const bool directory = strcmp(argv[i], "--glm-prefix-diagnostics") == 0;
+            if (i+1 == argc) return 1;
+            (directory ? diagnostic_dir : diagnostic_device) = argv[++i];
+            continue;
+        }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -1300,6 +1873,16 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (!diagnostic_dir.empty() || !diagnostic_device.empty()) {
+            if (arch != LLM_ARCH_GLM5NEXT || diagnostic_dir.empty() || diagnostic_device.empty() || !out.empty()) {
+                throw std::runtime_error("GLM prefix diagnostics require --arch glm5next, a fresh directory and an explicit device");
+            }
+            ggml_backend_load_all();
+            const auto device = ggml_backend_dev_by_name(diagnostic_device.c_str());
+            if (!device) throw std::runtime_error("GLM diagnostic device is unavailable: " + diagnostic_device);
+            if (!std::filesystem::create_directory(diagnostic_dir)) throw std::runtime_error("GLM diagnostic directory already exists");
+            return test_glm_generated_prefixes(seed, {device}, LLAMA_SPLIT_MODE_LAYER, {}, diagnostic_dir) ? 0 : 1;
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }

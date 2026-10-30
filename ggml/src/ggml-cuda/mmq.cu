@@ -205,13 +205,14 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
-        const mmq_args args = {
+        mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1};
+        args.q8_layout = ggml_cuda_q8_layout_of(src0);
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -287,7 +288,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
@@ -295,6 +296,7 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ne12};
 
+    args.q8_layout = ggml_cuda_q8_layout_of(src0);
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
@@ -449,7 +451,7 @@ void ggml_cuda_mul_mat_q_fused_two(
     auto launch_one = [&](const ggml_tensor * src0, ggml_tensor * dst) {
         GGML_ASSERT(src0->type == src0_a->type && src0->ne[0] == ne10);
         const size_t ts0 = ggml_type_size(src0->type);
-        const mmq_args args = {
+        mmq_args args = {
             (const char *) src0->data, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, (float *) dst->data,
             nullptr,
             src0->ne[0], src0->ne[1], dst->ne[1], (int64_t)(src0->nb[1]/ts0), ne11, (int64_t)(dst->nb[1]/sizeof(float)),

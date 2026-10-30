@@ -1,4 +1,5 @@
 #include "llama-memory-recurrent.h"
+#include "../ggml/src/ggml-recurrent-arena.h"
 
 #include "ggml-backend.h"
 #include "llama-impl.h"
@@ -39,17 +40,25 @@ llama_memory_recurrent::llama_memory_recurrent(
     cells.clear();
     cells.resize(mem_size);
 
+    // Independent layer arenas keep every state's current rows and rollback
+    // planes reachable by an access-policy window. They retain the canonical
+    // row layout used by tensor splitting, gather, restore and serialization.
+    const bool state_arena = model.arch == LLM_ARCH_GLM5NEXT && type_s == GGML_TYPE_F32 &&
+                             ggml_env_switch("GGML_CUDA_GDN_STATE_ARENA");
+    using arena_key = std::pair<ggml_backend_buffer_type_t, int>;
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        bool operator()(const arena_key & lhs, const arena_key & rhs) const {
+            const int order = strcmp(ggml_backend_buft_name(lhs.first), ggml_backend_buft_name(rhs.first));
+            return order != 0 ? order < 0 : lhs.second < rhs.second;
         }
     };
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<arena_key, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
     // create a context for each buffer type
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int layer = -1) -> ggml_context * {
+        const arena_key key { buft, layer };
+        auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
@@ -62,7 +71,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                 return nullptr;
             }
 
-            ctx_map.emplace(buft, ctx);
+            ctx_map.emplace(key, ctx);
 
             return ctx;
         }
@@ -99,16 +108,32 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_context * ctx_s = state_arena ? ctx_for_buft(buft, i) : ctx;
+        if (!ctx_s) {
+            throw std::runtime_error("failed to create recurrent state arena");
+        }
+        ggml_tensor * s = ggml_new_tensor_2d(ctx_s, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
     }
 
+    if (state_arena) {
+        std::map<ggml_backend_buffer_type_t, uint32_t> layers;
+        for (const auto & item : ctx_map) {
+            if (item.first.second >= 0) { ++layers[item.first.first]; }
+        }
+        for (const auto & item : ctx_map) {
+            if (item.first.second >= 0) {
+                ggml_recurrent_arena_mark(s_l[item.first.second], mem_size, layers.at(item.first.first));
+            }
+        }
+    }
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+    for (auto & [key, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), key.first);
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
         }
