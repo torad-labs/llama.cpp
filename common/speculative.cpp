@@ -1525,6 +1525,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<common_mtp_depth> depth; // per seq, with --spec-draft-mtp-adaptive
     std::vector<int32_t>          n_draft_max;
 
+    // the token the head reads at an image or audio row, where the target read an embedding (LLAMA_TOKEN_NULL: such
+    // rows stay out of the head, as for models whose media rows share positions under M-RoPE)
+    llama_token media_token = LLAMA_TOKEN_NULL;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1589,6 +1593,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        // a media row takes one position, so it can enter the head in place, under the vocabulary's image placeholder
+        // when it has one, else token 0; the target verifies every draft, so the choice moves acceptance, never output
+        {
+            const llama_model * model = llama_get_model(ctx_dft);
+            const auto rope = llama_model_rope_type(model);
+            if (!is_mem_shared && rope != LLAMA_ROPE_TYPE_MROPE && rope != LLAMA_ROPE_TYPE_IMROPE) {
+                media_token = 0;
+                const llama_vocab * vocab = llama_model_get_vocab(model);
+                if (llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_NONE) {
+                    for (const char * text : { "<|image|>", "<|image_pad|>", "<image_soft_token>" }) {
+                        const llama_tokens t = common_tokenize(vocab, text, false, true);
+                        if (t.size() == 1) {
+                            media_token = t[0];
+                            break;
+                        }
+                    }
+                }
+                SPC_TRC("- media rows enter the head as token %d\n", (int) media_token);
+            }
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1682,10 +1707,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        // an image or audio piece (embeddings, no tokens) enters the head as prompt rows do, each row under media_token
+        // and paired with the target's hidden row before it, so the head's cells stay consecutive with the target's and
+        // the text and drafts after the image decode
+        const bool media = batch_in.token == nullptr;
+        if (media && (batch_in.embd == nullptr || media_token == LLAMA_TOKEN_NULL)) {
             return true;
         }
+        auto token_at = [&](int k) { return media ? media_token : batch_in.token[k]; };
 
         const int32_t n_tokens = batch_in.n_tokens;
 
@@ -1726,14 +1755,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                     evict_to_window(seq_id, i_batch_end[seq_id] - i_batch_beg[seq_id] + 1);
                     for (int k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
-                        common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq_id }, 0);
+                        common_batch_add(batch, token_at(k), batch_in.pos[k], { seq_id }, 0);
                         const float * h = k == i_batch_beg[seq_id] ? h_before(seq_id, batch_in.pos[k]) : h_tgt + (size_t) (k - 1) * n_embd;
                         std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h, row_bytes);
                     }
                 }
             } else {
             for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                common_batch_add(batch, token_at(k), batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
             }
 
             // shift the tgt embeddings to the right by one position
