@@ -9,17 +9,20 @@
 // reaches each reduction first changes from one reduction to the next. The late device's share is still being copied
 // out when its peer's has long arrived. Three graphs take x of 256, 640 and 4,100 columns: 1 MB, 2.5 MB and 16 MB on the
 // BF16 wire, and 2 MB, 5 MB and 33.6 MB on the F32 wire, which is past one pass of the 32 MB staging. They are evaluated
-// A, B, C, A, B, C with a new x each time, and every output is compared with the CPU's. Three passes: the BF16 wire, the
-// F32 wire (GGML_CUDA_AR_BF16_THRESHOLD=0, where each device's share is reduced in place, so a share overwritten before
-// it was copied out reaches the peer already summed), and the F32 wire with GGML_CUDA_AR_COPY_ONE_STREAM=1. Each pass
-// must initialize the internal AllReduce pipeline. On the first two GPUs, or on the first GPU twice; with no GPU the
-// test is skipped.
+// A, B, C, A, B, C with a new x each time, and every output is compared with the CPU's. Four passes: the BF16 wire and
+// the F32 wire (GGML_CUDA_AR_BF16_THRESHOLD=0, where each device's share is reduced in place, so a share overwritten
+// before it was copied out reaches the peer already summed), each with the receives beside the sends and then after
+// them (GGML_CUDA_AR_COPY_ONE_STREAM=1, the order before). The same kernels add the same bytes in both orders, so each
+// output after the sends must equal the one beside them bit for bit: a race that reaches a single chunk shows there,
+// though its error can stay under the CPU comparison's bar. Each pass must initialize the internal AllReduce pipeline
+// in its own order. On the first two GPUs, or on the first GPU twice; with no GPU the test is skipped.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -53,11 +56,13 @@ static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, v
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
 
-static int n_pipelines = 0; // "initialized AllReduce pipeline" lines logged
+static int  n_pipelines     = 0;     // "initialized AllReduce pipeline" lines logged
+static bool last_one_stream = false; // the last one's copy-engine receives run after its sends
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/) {
     if (strstr(text, "initialized AllReduce pipeline") != nullptr) {
         n_pipelines++;
+        last_one_stream = strstr(text, "receives after the sends") != nullptr;
         fputs(text, stderr);
     }
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
@@ -164,6 +169,18 @@ struct ffn_stack {
     }
 };
 
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 static double nmse(const std::vector<float> & ref, const std::vector<float> & v) {
     double err = 0.0;
     double sum = 0.0;
@@ -195,9 +212,9 @@ int main() {
     printf("meta backend over %s and %s\n", ggml_backend_dev_name(gpus[0]), ggml_backend_dev_name(gpus[1]));
 
     ggml_log_set(log_cb, nullptr);
-    setenv("GGML_CUDA_ALLREDUCE", "internal", 1);
-    unsetenv("GGML_CUDA_AR_COPY_THRESHOLD");
-    unsetenv("GGML_CUDA_AR_COPY_CHUNK_BYTES");
+    set_env("GGML_CUDA_ALLREDUCE", "internal");
+    set_env("GGML_CUDA_AR_COPY_THRESHOLD", nullptr);
+    set_env("GGML_CUDA_AR_COPY_CHUNK_BYTES", nullptr);
 
     std::mt19937 rng(42);
     std::vector<std::vector<float>> w_data(2*n_layer);
@@ -236,25 +253,20 @@ int main() {
         const char * bf16_threshold; // GGML_CUDA_AR_BF16_THRESHOLD, nullptr for the default
         bool         one_stream;     // GGML_CUDA_AR_COPY_ONE_STREAM=1
     };
+    // each wire's pass after the sends follows its pass beside them, whose outputs it must equal
     const pass passes[] = {
-        {"BF16 wire",              nullptr, false},
-        {"F32 wire",               "0",     false},
-        {"F32 wire, one stream",   "0",     true},
+        {"BF16 wire, beside the sends", nullptr, false},
+        {"BF16 wire, after the sends",  nullptr, true},
+        {"F32 wire, beside the sends",  "0",     false},
+        {"F32 wire, after the sends",   "0",     true},
     };
 
     bool ok = true;
+    std::vector<std::vector<float>> beside(n_evals); // the last pass beside the sends, its outputs
     ggml_backend_dev_t meta = ggml_backend_meta_device(gpus.data(), 2, split_by_name, nullptr);
     for (const pass & ps : passes) {
-        if (ps.bf16_threshold) {
-            setenv("GGML_CUDA_AR_BF16_THRESHOLD", ps.bf16_threshold, 1);
-        } else {
-            unsetenv("GGML_CUDA_AR_BF16_THRESHOLD");
-        }
-        if (ps.one_stream) {
-            setenv("GGML_CUDA_AR_COPY_ONE_STREAM", "1", 1);
-        } else {
-            unsetenv("GGML_CUDA_AR_COPY_ONE_STREAM");
-        }
+        set_env("GGML_CUDA_AR_BF16_THRESHOLD", ps.bf16_threshold);
+        set_env("GGML_CUDA_AR_COPY_ONE_STREAM", ps.one_stream ? "1" : nullptr);
 
         const int n_pipelines_before = n_pipelines;
         ggml_backend_t cpu     = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -270,11 +282,27 @@ int main() {
                 printf("%s %s, eval %d, %lld columns: NMSE vs CPU %.3e\n", ok_eval ? "ok  " : "FAIL", ps.name, e + 1,
                        (long long) n_tok[k], err);
                 ok = ok && ok_eval;
+                if (!ps.one_stream) {
+                    beside[e] = out;
+                    continue;
+                }
+                size_t n_diff = 0;
+                double max_diff = 0.0;
+                for (size_t i = 0; i < out.size(); i++) {
+                    if (memcmp(&out[i], &beside[e][i], sizeof(float)) != 0) {
+                        n_diff++;
+                        max_diff = std::max(max_diff, (double) std::fabs(out[i] - beside[e][i]));
+                    }
+                }
+                printf("%s %s, eval %d: %zu of %zu values differ from beside the sends (largest by %.3e)\n",
+                       n_diff == 0 ? "ok  " : "FAIL", ps.name, e + 1, n_diff, out.size(), max_diff);
+                ok = ok && n_diff == 0;
             }
         }
-        const bool ok_pipeline = n_pipelines == n_pipelines_before + 1;
-        printf("%s %s: %d internal AllReduce pipeline initialized (1 expected)\n", ok_pipeline ? "ok  " : "FAIL",
-               ps.name, n_pipelines - n_pipelines_before);
+        const bool ok_pipeline = n_pipelines == n_pipelines_before + 1 && last_one_stream == ps.one_stream;
+        printf("%s %s: %d internal AllReduce pipeline initialized (1 expected), receives %s the sends\n",
+               ok_pipeline ? "ok  " : "FAIL", ps.name, n_pipelines - n_pipelines_before,
+               last_one_stream ? "after" : "beside");
         ok = ok && ok_pipeline;
         ggml_backend_free(backend);
         ggml_backend_free(cpu);
