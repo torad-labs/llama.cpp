@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <exception>
 #include <memory>
+#include <random>
 #include <vector>
 
 //
@@ -583,6 +584,65 @@ static void test_reallocation() {
     }
 }
 
+// One allocator reused for graphs of the same ops, as llama.cpp reuses its scheduler's: an input no op reads, a host
+// scratch a graph keeps allocated for its own writer, must still get room for its size in each graph. llama.cpp's MTP
+// draft graph keeps four indexer inputs so; when they grew while every op kept its size, the indexer's writes landed on
+// the draft's token ids and the next get_rows read a cell index as a token. Over generated sizes, every input, read or
+// not, and the output lie apart from one another, but for the output over the input it consumes in place, and inside
+// their buffer.
+static void test_reallocation_unread_input() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    std::mt19937                       rng(7);
+    std::uniform_int_distribution<int> unread_n(1, 64);
+    std::uniform_int_distribution<int> read_n(1, 2);
+
+    for (int round = 0; round < 200; ++round) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+
+        ggml_tensor * unread_a = make_input_1d(ctx, unread_n(rng));
+        ggml_tensor * read     = make_input_1d(ctx, 4*read_n(rng));
+        ggml_tensor * unread_b = make_input_1d(ctx, unread_n(rng));
+        ggml_tensor * out      = ggml_scale(ctx, read, 2.0f);
+        assign_names(ctx);
+
+        ggml_build_forward_expand(graph, unread_a);
+        ggml_set_output(out);
+        ggml_build_forward_expand(graph, out);
+        ggml_build_forward_expand(graph, unread_b);
+
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+
+        ggml_tensor * ts[] = { unread_a, read, unread_b, out };
+
+        for (ggml_tensor * t : ts) {
+            GGML_ASSERT(t->buffer != nullptr && t->data != nullptr);
+
+            const size_t offset = (char *) t->data - (char *) ggml_backend_buffer_get_base(t->buffer);
+
+            if (offset + ggml_nbytes(t) > ggml_backend_buffer_get_size(t->buffer)) {
+                fprintf(stderr, "round %d: %s of %zu bytes at offset %zu passes its buffer's %zu bytes\n", round, t->name,
+                        ggml_nbytes(t), offset, ggml_backend_buffer_get_size(t->buffer));
+                GGML_ABORT("a tensor lies outside its buffer");
+            }
+        }
+        for (size_t i = 0; i < 4; ++i) {
+            for (size_t j = i + 1; j < 4; ++j) {
+                // the scale may write its output over the input it reads last, in place
+                if (ts[i] == read && ts[j] == out) {
+                    continue;
+                }
+                if (memory_overlap(ts[i], ts[j])) {
+                    fprintf(stderr, "round %d: %s (%zu bytes at %p) overlaps %s (%zu bytes at %p)\n", round, ts[i]->name,
+                            ggml_nbytes(ts[i]), ts[i]->data, ts[j]->name, ggml_nbytes(ts[j]), ts[j]->data);
+                    GGML_ABORT("two live tensors share memory");
+                }
+            }
+        }
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -604,5 +664,6 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_reallocation_unread_input", test_reallocation_unread_input);
     return 0;
 }
