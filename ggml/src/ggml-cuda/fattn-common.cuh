@@ -1462,6 +1462,20 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// V is K's data: the same tensor, or a view of K's data at K's offset with K's strides and K's cells, as GLM-5.3's absorbed
+// MLA passes its latent as both. The kernel's V_is_K_view then reads V's rows from K's tile.
+static bool ggml_cuda_fattn_V_same_as_K(const ggml_tensor * dst) {
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (V == K) {
+        return true;
+    }
+    const bool same_data = V->view_src && (V->view_src == K ? V->view_offs == 0 :
+        V->view_src == K->view_src && V->view_offs == K->view_offs);
+    return same_data && V->type == K->type && V->ne[0] <= K->ne[0] && V->ne[1] == K->ne[1] && V->ne[2] == K->ne[2] &&
+        V->ne[3] == K->ne[3] && V->nb[1] == K->nb[1] && V->nb[2] == K->nb[2] && V->nb[3] == K->nb[3];
+}
+
 // A sparse launch that shares its gather with another (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads).
 struct fattn_sparse_launch {
     const int32_t * indices     = nullptr; // the compacted mask rows (ggml_cuda_flash_attn_ext_compact_mask); null: compacted here

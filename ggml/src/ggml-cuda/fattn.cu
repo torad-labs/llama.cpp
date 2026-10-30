@@ -284,9 +284,9 @@ void ggml_cuda_flash_attn_ext_gather_k_q8_0(
 // GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER=1: where the 32-head tile takes the launch (sparse_heads_take), the gather reads a
 // query's cells once for 32 heads, so it wins from 2 queries' cells, 4160 for GLM's 2080. Between that and the 8-head
 // tile's switch-over it replaces the masked dense kernel, a different summation: not bit for bit.
-bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const int ncols2) {
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int device, const ggml_tensor * dst, const int ncols2) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(ctx, dst, ncols2);
+    GGML_UNUSED_VARS(device, dst, ncols2);
     return false;
 #else
     static const bool sparse_legacy    = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_LEGACY");
@@ -295,7 +295,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int cc = ggml_cuda_info().devices[device].cc;
 
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -303,7 +303,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const int32_t n_kv_max = ggml_flash_attn_ext_get_n_kv_max(dst);
-    const int ncols2_gather = heads_switchover && ncols2 == 8 && ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ctx, dst) ? 32 : ncols2;
+    const int ncols2_gather = heads_switchover && ncols2 == 8 && ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(device, dst) ? 32 : ncols2;
     const int64_t n_gather = std::min<int64_t>(Q->ne[1], 64/ncols2_gather) * n_kv_max;
     return !sparse_legacy && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && mask->type == GGML_TYPE_F16 && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -317,9 +317,9 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
 // after the head tile, are then a few of them. The block count is the bound the shared memory sets on the blocks an SM holds,
 // at least the occupancy launch_fattn finds, so the test only errs toward the 8-head launch.
 // GGML_CUDA_FATTN_SPARSE_HEADS_LEGACY=1: the 8-head launch alone.
-bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(const int device, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(ctx, dst);
+    GGML_UNUSED_VARS(device, dst);
     return false;
 #else
     static const bool heads_legacy = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_HEADS_LEGACY");
@@ -327,7 +327,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ggml_backend_cuda_contex
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const int id = ctx.device;
+    const int id = device;
     const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[id];
 
     const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
@@ -357,7 +357,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // the sparse variant is one token a tile, whatever the batch
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
-        if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst, ncols2)) {
+        if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx.device, dst, ncols2)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
         }
@@ -513,6 +513,58 @@ static bool ggml_cuda_fattn_mma_raw(const int cc, const ggml_tensor * dst) {
     return true;
 }
 
+// GLM-5.3's DSA attention on a q8_0 latent cache, V a view of K: the sparse launch reads the q8_0 rows its indices name,
+// each converted to f16 in the K tile and read there by V (flash_attn_ext_deq_load_tile), with no f16 copy of K. The
+// launch ggml_cuda_flash_attn_ext_mma_f16 takes, and the f16 buffer's size (ggml_cuda_flash_attn_ext_get_alloc_size), both
+// ask this, so a launch never writes a copy its buffer has no room for. It holds where the f16 path takes the sparse 8-head
+// launch (switch_ncols2's GQA tile for more than 4 heads on a K head, then shall_use_sparse), and where the rows can be copied
+// in 16-byte chunks: from a view's offset, which data is known by at the graph's allocation. The q8_0 values the kernel
+// converts are an f16 copy's, so its output is the copy's bit for bit.
+// GGML_CUDA_FATTN_SPARSE_DEQ_LEGACY=1: the f16 copy, the cells' gather for a decode or a verify and the whole K otherwise.
+static bool ggml_cuda_fattn_mma_sparse_deq(const int device, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(device, dst);
+    return false;
+#else
+    static const bool deq_legacy = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_DEQ_LEGACY");
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int cc = ggml_cuda_info().devices[device].cc;
+
+    if (deq_legacy || K->type != GGML_TYPE_Q8_0 || Q->ne[0] != 512 || K->ne[0] != 512 || V->ne[0] != 512 ||
+            !ggml_cuda_fattn_V_same_as_K(dst)) {
+        return false;
+    }
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc)) {
+        return false; // cp.async
+    }
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    if (!mask || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[2] % K->ne[2] != 0 || Q->ne[2] / K->ne[2] <= 4) {
+        return false;
+    }
+    for (const ggml_tensor * t : {Q, mask}) {
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false; // use_gqa_opt's alignment
+            }
+        }
+    }
+    // rows copied in 16-byte chunks. Shapes, strides and the view's offset only: get_alloc_size asks before K has an
+    // address and the launch after, and both must agree or the launch writes an f16 copy nobody reserved. A buffer's
+    // base is aligned past 16 bytes, so the address is the launch's assert (ggml_cuda_flash_attn_ext_mma_f16_case).
+    const size_t offs = K->view_src ? K->view_offs : 0;
+    if (offs % 16 != 0 || K->nb[1] % 16 != 0 || K->nb[2] % 16 != 0 || K->nb[3] % 16 != 0) {
+        return false;
+    }
+    return ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(device, dst, 8);
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 template <int DKQ, int DV, ggml_type type_KV>
 static void ggml_cuda_flash_attn_ext_mma_raw_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr int ncols2 = 8;
@@ -617,6 +669,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             break;
         case 512:
             GGML_ASSERT(V->ne[0] == 512);
+            if (ggml_cuda_fattn_mma_sparse_deq(ctx.device, dst)) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+                break;
+            }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
             break;
         case 576: {
@@ -1006,7 +1062,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = true;
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = !ggml_cuda_fattn_mma_raw(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_K = !ggml_cuda_fattn_mma_raw(ggml_cuda_info().devices[device].cc, dst) && !ggml_cuda_fattn_mma_sparse_deq(device, dst);
             need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC:
