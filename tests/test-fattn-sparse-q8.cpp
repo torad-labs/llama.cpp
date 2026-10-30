@@ -1,10 +1,11 @@
-// GLM-5.3's DSA attention on a q8_0 cache: one 512-wide latent head, the V cache a view of the K cache, and each query's
-// n_kv_max cells named by its mask row (ggml_flash_attn_ext_set_n_kv_max). The CUDA backend reads the q8_0 rows a query
-// gathers and uses each row for K and for V, with no f16 copy of the cache. For every launch shape GLM serves:
+// GLM-5.3's DSA attention on a q8_0 or q4_0 cache: one 512-wide latent head, the V cache a view of the K cache, and each
+// query's n_kv_max cells named by its mask row (ggml_flash_attn_ext_set_n_kv_max). The CUDA backend reads the quantized
+// rows a query gathers and uses each row for K and for V, with no f16 copy of the cache. For both cache types and every
+// launch shape GLM serves:
 //
-//   1. the q8_0 cache's output is the output of the same launch on an f16 cache that holds the q8_0 cache's values, bit
-//      for bit: a q8_0 value is its integer times the block's f16 scale, rounded to f16 once, and that f16 value is all
-//      an f16 copy of the cache ever held;
+//   1. the quantized cache's output is the output of the same launch on an f16 cache that holds the quantized cache's
+//      values, bit for bit: a q8_0 or q4_0 value is its integer times the block's f16 scale, rounded to f16 once, and
+//      that f16 value is all an f16 copy of the cache ever held;
 //   2. a sparse launch reserves no f16 copy: the output tensor's allocation is its own bytes, where a copy of a
 //      524,288-cell cache is 512 MiB a card. A launch the sparse kernel does not take (a cache under 4096 cells, or under
 //      the cells its tokens gather, n_kv_max for each of up to 8) reserves the copy its f16 path writes, so the two
@@ -106,7 +107,7 @@ struct fattn_graph {
     ggml_backend_buffer_t buf     = nullptr;
     ggml_gallocr_t        galloc  = nullptr;
     ggml_cgraph *         gf      = nullptr;
-    ggml_tensor *         out_q8  = nullptr; // q8_0 cache, V a view of K
+    ggml_tensor *         out_q   = nullptr; // the quantized cache, V a view of K
     ggml_tensor *         out_f16 = nullptr; // f16 cache of the same values, V a view of K
     ggml_tensor *         out_cpy = nullptr; // the same f16 cache, V a separate copy
 
@@ -126,14 +127,14 @@ static ggml_tensor * attention(ggml_context * ctx, ggml_tensor * q, ggml_tensor 
 }
 
 // builds the three launches on one backend over the same values; with only_f16 the f16 cache's alone (the CPU check)
-static void build(fattn_graph & g, ggml_backend_t backend, const fattn_case & c, const std::vector<float> & q,
-        const std::vector<uint8_t> & cache_q8, const std::vector<ggml_fp16_t> & cache_f16,
+static void build(fattn_graph & g, ggml_backend_t backend, const fattn_case & c, ggml_type type, const std::vector<float> & q,
+        const std::vector<uint8_t> & cache_q, const std::vector<ggml_fp16_t> & cache_f16,
         const std::vector<ggml_fp16_t> & mask, bool only_f16) {
     ggml_init_params params_in = { ggml_tensor_overhead() * 16, nullptr, true };
     g.ctx_in = ggml_init(params_in);
 
     ggml_tensor * tq     = ggml_new_tensor_4d(g.ctx_in, GGML_TYPE_F32,  D, c.nb, c.nh, c.ns);
-    ggml_tensor * tc_q8  = ggml_new_tensor_4d(g.ctx_in, GGML_TYPE_Q8_0, D, c.kv, 1, c.ns); // the caches
+    ggml_tensor * tc_q   = ggml_new_tensor_4d(g.ctx_in, type,           D, c.kv, 1, c.ns); // the caches
     ggml_tensor * tc_f16 = ggml_new_tensor_4d(g.ctx_in, GGML_TYPE_F16,  D, c.kv, 1, c.ns);
     ggml_tensor * tc_cpy = ggml_new_tensor_4d(g.ctx_in, GGML_TYPE_F16,  D, c.kv, 1, c.ns);
     ggml_tensor * tm     = ggml_new_tensor_4d(g.ctx_in, GGML_TYPE_F16,  c.kv, c.nb, 1, c.ns);
@@ -141,7 +142,7 @@ static void build(fattn_graph & g, ggml_backend_t backend, const fattn_case & c,
     g.buf = ggml_backend_alloc_ctx_tensors(g.ctx_in, backend);
     GGML_ASSERT(g.buf != nullptr);
     ggml_backend_tensor_set(tq,     q.data(),         0, ggml_nbytes(tq));
-    ggml_backend_tensor_set(tc_q8,  cache_q8.data(),  0, ggml_nbytes(tc_q8));
+    ggml_backend_tensor_set(tc_q,   cache_q.data(),   0, ggml_nbytes(tc_q));
     ggml_backend_tensor_set(tc_f16, cache_f16.data(), 0, ggml_nbytes(tc_f16));
     ggml_backend_tensor_set(tc_cpy, cache_f16.data(), 0, ggml_nbytes(tc_cpy));
     ggml_backend_tensor_set(tm,     mask.data(),      0, ggml_nbytes(tm));
@@ -156,9 +157,9 @@ static void build(fattn_graph & g, ggml_backend_t backend, const fattn_case & c,
     };
     g.gf = ggml_new_graph(ctx);
     if (!only_f16) {
-        ggml_tensor * k8 = view(tc_q8);
-        g.out_q8 = attention(ctx, tq, k8, view(k8), tm);
-        ggml_build_forward_expand(g.gf, g.out_q8);
+        ggml_tensor * kq = view(tc_q);
+        g.out_q = attention(ctx, tq, kq, view(kq), tm);
+        ggml_build_forward_expand(g.gf, g.out_q);
     }
     ggml_tensor * k16 = view(tc_f16);
     g.out_f16 = attention(ctx, tq, k16, view(k16), tm);
@@ -208,7 +209,7 @@ static int64_t sparse_from(int64_t nb) {
     return (cells + 255) / 256 * 256;
 }
 
-static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_case & c, uint32_t seed) {
+static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_case & c, ggml_type type, uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
 
@@ -217,61 +218,62 @@ static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_cas
         x = uni(rng);
     }
 
-    // the q8_0 cache from generated values, and an f16 cache that holds its values
+    // the quantized cache from generated values, and an f16 cache that holds its values
     const int64_t nrows = c.kv * c.ns;
     std::vector<float> values(size_t(D * nrows));
     for (float & x : values) {
         x = uni(rng);
     }
-    std::vector<uint8_t> cache_q8(ggml_row_size(GGML_TYPE_Q8_0, D) * nrows);
-    ggml_quantize_chunk(GGML_TYPE_Q8_0, values.data(), cache_q8.data(), 0, nrows, D, nullptr);
-    ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(cache_q8.data(), values.data(), D * nrows);
+    std::vector<uint8_t> cache_q(ggml_row_size(type, D) * nrows);
+    ggml_quantize_chunk(type, values.data(), cache_q.data(), 0, nrows, D, nullptr);
+    ggml_get_type_traits(type)->to_float(cache_q.data(), values.data(), D * nrows);
     std::vector<ggml_fp16_t> cache_f16(values.size());
     ggml_fp32_to_fp16_row(values.data(), cache_f16.data(), int64_t(values.size()));
 
     const std::vector<ggml_fp16_t> mask = make_mask(c, rng);
 
     fattn_graph g;
-    build(g, backend, c, q, cache_q8, cache_f16, mask, false);
-    if (!ggml_backend_supports_op(backend, g.out_q8) || !ggml_backend_supports_op(backend, g.out_f16)) {
-        printf("  kv %6" PRId64 ", %3" PRId64 " tokens, %2" PRId64 " heads, %" PRId64 " seq, %s: not supported, skipped\n",
-               c.kv, c.nb, c.nh, c.ns, rows_name(c.rows));
+    build(g, backend, c, type, q, cache_q, cache_f16, mask, false);
+    if (!ggml_backend_supports_op(backend, g.out_q) || !ggml_backend_supports_op(backend, g.out_f16)) {
+        printf("  %s, kv %6" PRId64 ", %3" PRId64 " tokens, %2" PRId64 " heads, %" PRId64 " seq, %s: not supported, skipped\n",
+               ggml_type_name(type), c.kv, c.nb, c.nh, c.ns, rows_name(c.rows));
         return true;
     }
 
     const ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
-    const size_t alloc_q8 = ggml_backend_buft_get_alloc_size(buft, g.out_q8);
+    const size_t alloc_q = ggml_backend_buft_get_alloc_size(buft, g.out_q);
 
     GGML_ASSERT(ggml_backend_graph_compute(backend, g.gf) == GGML_STATUS_SUCCESS);
     ggml_backend_synchronize(backend);
-    const std::vector<float> y_q8  = get(g.out_q8);
+    const std::vector<float> y_q   = get(g.out_q);
     const std::vector<float> y_f16 = get(g.out_f16);
     const std::vector<float> y_cpy = get(g.out_cpy);
 
     fattn_graph g_cpu;
-    build(g_cpu, cpu, c, q, cache_q8, cache_f16, mask, true);
+    build(g_cpu, cpu, c, type, q, cache_q, cache_f16, mask, true);
     GGML_ASSERT(ggml_backend_graph_compute(cpu, g_cpu.gf) == GGML_STATUS_SUCCESS);
     const double e = nmse(y_f16, get(g_cpu.out_f16));
 
-    const int64_t diff_q8  = first_bit_difference(y_q8, y_f16);
+    const int64_t diff_q   = first_bit_difference(y_q, y_f16);
     const int64_t diff_cpy = first_bit_difference(y_cpy, y_f16);
     const bool    sparse   = c.kv >= sparse_from(c.nb);
-    const bool    no_copy  = alloc_q8 == ggml_nbytes(g.out_q8);
+    const bool    no_copy  = alloc_q == ggml_nbytes(g.out_q);
     const bool    finite   = all_finite(y_f16);
-    const bool    ok       = diff_q8 < 0 && diff_cpy < 0 && no_copy == sparse && finite && e < max_nmse;
+    const bool    ok       = diff_q < 0 && diff_cpy < 0 && no_copy == sparse && finite && e < max_nmse;
+    const char *  name     = ggml_type_name(type);
 
-    printf("  kv %6" PRId64 ", %3" PRId64 " tokens, %2" PRId64 " heads, %" PRId64 " seq, %-14s: ", c.kv, c.nb, c.nh, c.ns,
-           rows_name(c.rows));
-    if (diff_q8 < 0) {
-        printf("q8_0 = f16 bit for bit");
+    printf("  %s, kv %6" PRId64 ", %3" PRId64 " tokens, %2" PRId64 " heads, %" PRId64 " seq, %-14s: ", name, c.kv, c.nb, c.nh,
+           c.ns, rows_name(c.rows));
+    if (diff_q < 0) {
+        printf("%s = f16 bit for bit", name);
     } else {
-        printf("q8_0 differs from f16 at %" PRId64 " (%.9g against %.9g)", diff_q8, y_q8[diff_q8], y_f16[diff_q8]);
+        printf("%s differs from f16 at %" PRId64 " (%.9g against %.9g)", name, diff_q, y_q[diff_q], y_f16[diff_q]);
     }
     if (sparse) {
         if (no_copy) {
             printf(", sparse, no f16 copy");
         } else {
-            printf(", sparse, %zu bytes reserved for %zu of output", alloc_q8, ggml_nbytes(g.out_q8));
+            printf(", sparse, %zu bytes reserved for %zu of output", alloc_q, ggml_nbytes(g.out_q));
         }
     } else {
         if (no_copy) {
@@ -324,8 +326,10 @@ int main() {
         }
         printf("%s (%s):\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-        for (size_t ic = 0; ic < cases.size(); ++ic) {
-            ok &= run_case(backend, cpu, cases[ic], 0x51A7u + uint32_t(ic));
+        for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+            for (size_t ic = 0; ic < cases.size(); ++ic) {
+                ok &= run_case(backend, cpu, cases[ic], type, 0x51A7u + uint32_t(ic) + (type == GGML_TYPE_Q4_0 ? 0x100u : 0u));
+            }
         }
         ggml_backend_free(backend);
         n_tested++;
