@@ -2193,7 +2193,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
 }
 
 // use_sparse: KV_max_ptr holds each mask row's n_kv_max cell indices (ggml_cuda_flash_attn_ext_compact_mask) and ne11 is
-// n_kv_max; the kernel steps over those cells in place of the cache.
+// n_kv_max; the kernel steps over those cells in place of the cache, and KV_live_ptr, if set, holds the rows' counts.
 // sparse_seams: only the tiles the stream-k split cuts, each piece as the whole launch does it; the whole tiles are the head
 // tile's (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads).
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, ggml_type type_K, ggml_type type_V,
@@ -2231,11 +2231,12 @@ static __global__ void flash_attn_ext_f16(
     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max   = use_sparse ? nullptr : KV_max_ptr;
-    const int  * GGML_CUDA_RESTRICT KV_live  = KV_live_ptr;
+    const int  * GGML_CUDA_RESTRICT KV_live  = use_sparse ? nullptr : KV_live_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
     const int32_t * GGML_CUDA_RESTRICT sparse_indices = use_sparse ? KV_max_ptr : nullptr;
+    const int32_t * GGML_CUDA_RESTRICT sparse_counts  = use_sparse ? KV_live_ptr : nullptr;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
@@ -2382,6 +2383,13 @@ static __global__ void flash_attn_ext_f16(
             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
             kb0_live = max(kb0_start, min(KV_max[iter_j*ne03 + sequence*iter_j + jt] / nbatch_fa, kb0_stop - 1));
         }
+        // The sparse list's slots past the row's count are -1, masked: the tile stops at its last live step. A masked step
+        // keeps KQ_max, scales by exp(0) = 1 and adds 0, so the result is the whole list's; a block whose range is past the
+        // count runs one masked step, as above.
+        if (use_sparse_arch && sparse_counts) {
+            static_assert(!use_sparse_arch || ncols1 == 1, "a sparse tile is one row");
+            kb0_stop = min(kb0_stop, (sparse_counts[int64_t(sequence % ne33)*ne31 + jt] + nbatch_fa - 1) / nbatch_fa);
+        }
         // A block that ends inside the tile writes to the fixup buffer, to avoid data races with the blocks after it; one that ends
         // a tile it did not start writes to dst and needs the fixup; one that did the whole tile writes its final result.
         const bool is_fixup    = last_tile;
@@ -2493,13 +2501,15 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads(ggml_backend_cuda_cont
     }
 
     const int32_t n_kv_max = ggml_flash_attn_ext_get_n_kv_max(dst);
-    ggml_cuda_pool_alloc<int32_t> indices(ctx.pool(), size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
-    ggml_cuda_flash_attn_ext_compact_mask(mask, indices.ptr, n_kv_max, ctx.stream());
+    const size_t  nrows    = size_t(mask->ne[1]) * mask->ne[3];
+    ggml_cuda_pool_alloc<int32_t> indices(ctx.pool(), size_t(n_kv_max) * nrows + nrows); // the indices, then the counts
+    const int32_t * counts = indices.ptr + size_t(n_kv_max) * nrows;
+    ggml_cuda_flash_attn_ext_compact_mask(mask, indices.ptr, indices.ptr + size_t(n_kv_max) * nrows, n_kv_max, ctx.stream());
 
     launch_fattn<DV, 1, ncols2_heads>(ctx, dst, kernel_heads, geom_heads.nwarps, geom_heads.nbytes_shared, geom_heads.nbatch_fa,
-        true, true, true, warp_size, true, true, {indices.ptr, true, nullptr});
+        true, true, true, warp_size, true, true, {indices.ptr, true, nullptr, counts});
     launch_fattn<DV, 1, ncols2>(ctx, dst, kernel_seams, geom_tile.nwarps, geom_tile.nbytes_shared, geom_tile.nbatch_fa,
-        true, true, true, warp_size, true, true, {indices.ptr, false, kernel_tile});
+        true, true, true, warp_size, true, true, {indices.ptr, false, kernel_tile, counts});
     return true;
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

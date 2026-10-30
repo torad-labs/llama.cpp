@@ -299,27 +299,56 @@ static void init_tensor_kq_mask_band(ggml_tensor * tensor, int band) {
     set_tensor_kq_mask(tensor, data_f32);
 }
 
-// n_kv_max (ggml_flash_attn_ext_set_n_kv_max): each row finite at n_kv_max - row % 17 random cells, as a sparse attention's
-// top-k selects them, the other cells -inf; rows differ in their count, so a row's list ends at different points
-static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
+// n_kv_max (ggml_flash_attn_ext_set_n_kv_max): each row finite at some random cells, as a sparse attention's top-k selects
+// them, the other cells -inf. sparse_rows picks the counts:
+// 0: n_kv_max - row % 17, a long conversation's rows, every list ending near the bound
+// 1: rows far under the bound, as a short conversation's beside others' cells: 1, a KV step either side of 32 and 64 cells,
+//    half the bound, the bound and one under it, then spread over [1, n_kv_max]
+// 2: a sequence's first ubatch, whose own cells are the cache's last: row r of a stream sees min(r + 1, n_kv_max) of them
+static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max, int sparse_rows) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
     GGML_ASSERT(n_kv_max > 1 && n_kv_max <= tensor->ne[0]);
+    GGML_ASSERT(sparse_rows >= 0 && sparse_rows <= 2);
 
     const int64_t ne0 = tensor->ne[0];
+    const int64_t ne1 = tensor->ne[1];
     const int64_t nrows = ggml_nrows(tensor);
     std::vector<float> data_f32(ggml_nelements(tensor), -INFINITY);
-    std::vector<int32_t> order(ne0);
+
+    std::mt19937 gen(0x5A17);
+    std::vector<int32_t> order(ne0); // a permutation of the cells, its first count a row's (a partial Fisher-Yates)
     for (int64_t i = 0; i < ne0; ++i) {
         order[i] = i;
     }
-
-    std::mt19937 gen(0x5A17);
+    std::vector<int32_t> cells;
     for (int64_t row = 0; row < nrows; ++row) {
-        std::shuffle(order.begin(), order.end(), gen);
-        const int64_t count = n_kv_max - row % std::min<int64_t>(n_kv_max, 17);
-        std::sort(order.begin(), order.begin() + count);
+        int64_t count;
+        switch (sparse_rows) {
+            case 0: count = n_kv_max - row % std::min<int64_t>(n_kv_max, 17); break;
+            case 1: {
+                const int64_t first[] = {1, 31, 32, 33, 63, 64, 65, n_kv_max/2, n_kv_max - 1, n_kv_max};
+                const int64_t nfirst = sizeof(first)/sizeof(first[0]);
+                count = row < nfirst ? first[row] : 1 + (row*389) % n_kv_max;
+            } break;
+            default: count = std::min<int64_t>(row % ne1 + 1, n_kv_max); break;
+        }
+        count = std::max<int64_t>(1, std::min<int64_t>(count, n_kv_max));
+
+        cells.clear();
+        if (sparse_rows == 2) {
+            for (int64_t i = 0; i < count; ++i) {
+                cells.push_back(ne0 - n_kv_max + i);
+            }
+        } else {
+            for (int64_t i = 0; i < count; ++i) {
+                std::uniform_int_distribution<int64_t> dis(i, ne0 - 1);
+                std::swap(order[i], order[dis(gen)]);
+            }
+            cells.assign(order.begin(), order.begin() + count);
+            std::sort(cells.begin(), cells.end());
+        }
         for (int64_t i = 0; i < count; ++i) {
-            data_f32[row*ne0 + order[i]] = -0.03125f * (1 + (i + row) % 7);
+            data_f32[row*ne0 + cells[i]] = -0.03125f * (1 + (i + row) % 7);
         }
     }
 
@@ -8831,11 +8860,12 @@ struct test_flash_attn_ext : public test_case {
     const int mask_band; // 0: random mask; else every row sees only a band of the cells, see kq_mask_band
     const bool mask_prefix; // ggml_flash_attn_ext_set_mask_prefix: a hint only, the result must not depend on it
     const int64_t n_kv_max; // ggml_flash_attn_ext_set_n_kv_max: each mask row has at most this many finite cells
+    const int sparse_rows; // with n_kv_max: how many cells each row has, see init_tensor_kq_mask_sparse
 
     std::string vars() override {
         return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k)
             + "," + VAR_TO_STR(mask_bits) + (mask_band ? "," + VAR_TO_STR(mask_band) : "") + (mask_prefix ? "," + VAR_TO_STR(mask_prefix) : "")
-            + (n_kv_max ? "," + VAR_TO_STR(n_kv_max) : "");
+            + (n_kv_max ? "," + VAR_TO_STR(n_kv_max) : "") + (sparse_rows ? "," + VAR_TO_STR(sparse_rows) : "");
     }
 
     double max_nmse_err() override {
@@ -8853,10 +8883,10 @@ struct test_flash_attn_ext : public test_case {
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
                         bool kv_view = true, bool v_is_view_of_k = false, bool mask_bits = false, int mask_band = 0, bool mask_prefix = false,
-                        int64_t n_kv_max = 0)
+                        int64_t n_kv_max = 0, int sparse_rows = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_bits(mask_bits), mask_band(mask_band),
-          mask_prefix(mask_prefix), n_kv_max(n_kv_max) {}
+          mask_prefix(mask_prefix), n_kv_max(n_kv_max), sparse_rows(sparse_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8932,7 +8962,7 @@ struct test_flash_attn_ext : public test_case {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
-                    init_tensor_kq_mask_sparse(t, n_kv_max);
+                    init_tensor_kq_mask_sparse(t, n_kv_max, sparse_rows);
                 } else if (mask_band) {
                     init_tensor_kq_mask_band(t, mask_band);
                 } else {
@@ -12485,6 +12515,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
     }
 
+    // Rows far under the bound (sparse_rows 1: 1 cell, a KV step either side of 32 and 64, half the bound, then spread; 2: a
+    // sequence's first ubatch, row r on its r + 1 cells at the cache's end), as a short conversation beside others' cells
+    // gives them: the 8-head launch's stream-k blocks, a decode and a verify, 2 streams, the 576-wide K, a q8_0 K's gather,
+    // and the 32-head tile (from 376 rows at 32 heads, 188 at 64, on an RTX PRO 6000's 188 SMs) with its seams pass
+    for (int sparse_rows : { 1, 2 }) {
+        for (int64_t nb : { 1, 3, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, 0, false, 512, sparse_rows));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 2}, 4096,   3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, 0, false,  768, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096,   2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  false, 0, false,  512, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 4352,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 8448,   3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16640, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+    }
+
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -13307,6 +13354,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t nb : { 1, 2, 3, 4, 8, 16, 64, 512 }) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
         }
+    }
+    // a 2048-token ubatch beside 100K cells of other conversations: a sequence's first (row r on its r + 1 cells) and a long
+    // one's (every row near the bound), then a short conversation's decode and verify (1, 31 and 32 cells)
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 116736, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 2));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 116736, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 0));
+    for (int64_t nb : { 1, 3 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 116736, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 1));
     }
 
     // q8_0 KV cases with long context (decode and prompt)

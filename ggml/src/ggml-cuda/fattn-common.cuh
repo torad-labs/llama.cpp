@@ -839,9 +839,10 @@ static __global__ void flash_attn_mask_to_KV_max(
 }
 
 // The sparse mode (ggml_flash_attn_ext_set_n_kv_max): each f16 mask row's finite entries as ascending cell indices, n_kv_max
-// a row (sequence, then row, of mask->ne[1] rows), -1 past the row's count. Defined in fattn.cu.
+// a row (sequence, then row, of mask->ne[1] rows), -1 past the row's count, and if counts is set the counts, one a row in
+// the same order. Defined in fattn.cu.
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_kv_max, cudaStream_t stream);
 
 // A q8_0 K read by a sparse launch: only the cells the indices name (ggml_cuda_flash_attn_ext_compact_mask's lists for
 // `n_tokens` rows of `n_seq` sequences, `ne31` mask rows a sequence) and cell 0, which a slot with no cell reads,
@@ -1466,6 +1467,7 @@ struct fattn_sparse_launch {
     const int32_t * indices     = nullptr; // the compacted mask rows (ggml_cuda_flash_attn_ext_compact_mask); null: compacted here
     bool            whole_tiles = false;   // one block a tile: no tile split, no fixup
     fattn_kernel_t  grid_kernel = nullptr; // the stream-k grid is the one this kernel's occupancy gives (same block and shared memory)
+    const int32_t * counts      = nullptr; // the rows' counts, with indices
 };
 
 template <int DV, int ncols1, int ncols2>
@@ -1526,16 +1528,29 @@ void launch_fattn(
     // use_sparse: the mask rows compacted to their live cells, which the kernel reads in place of the whole cache, so none
     // of the scans below
     const int32_t n_kv_max = use_sparse ? ggml_flash_attn_ext_get_n_kv_max(KQV) : 0;
+    // use_sparse: each tile stops at its row's last live step (the kernel reads the rows' counts where KV_live goes), as a
+    // step past a row's count is all -1 slots: masked, the softmax as it was, but loaded, and at cell 0 for every such slot
+    // of every row, which a sequence's first ubatch beside others' cells is mostly (5.7x the attention of a full ubatch on
+    // an RTX PRO 6000). GGML_CUDA_FATTN_SPARSE_STEPS_LEGACY=1: every row steps over its n_kv_max slots.
+    static const bool sparse_steps_legacy = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_STEPS_LEGACY");
+    const int32_t * sparse_counts = nullptr;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr && !mask_packed);
         GGML_ASSERT(n_kv_max > 0);
 
         if (!sparse_launch.indices) {
-            KV_max.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
-            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+            const size_t nrows = size_t(mask->ne[1]) * mask->ne[3];
+            KV_max.alloc(size_t(n_kv_max) * nrows + nrows); // the indices, then the counts
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max) * nrows, n_kv_max, main_stream);
+            sparse_counts = KV_max.ptr + size_t(n_kv_max) * nrows;
+        } else {
+            sparse_counts = sparse_launch.counts;
+        }
+        if (sparse_steps_legacy) {
+            sparse_counts = nullptr;
         }
     }
-    GGML_ASSERT(use_sparse || (!sparse_launch.indices && !sparse_launch.whole_tiles && !sparse_launch.grid_kernel));
+    GGML_ASSERT(use_sparse || (!sparse_launch.indices && !sparse_launch.whole_tiles && !sparse_launch.grid_kernel && !sparse_launch.counts));
 
     // A sparse launch of a q8_0 K whose queries gather fewer cells than the cache holds (a decode, an MTP verify: the whole
     // K's conversion reads and writes the cache a token, 411 MB a layer at 262,144 cells, for the 2,051 cells it uses)
@@ -1856,7 +1871,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         sparse_launch.indices ? sparse_launch.indices : KV_max.ptr,
-        KV_live_ptr,
+        use_sparse ? sparse_counts : KV_live_ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
