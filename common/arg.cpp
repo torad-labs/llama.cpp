@@ -1722,6 +1722,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--prompt-step"}, "N",
+        string_format("at most N text prompt tokens in a step in which another slot is generating, so its reply is held "
+            "back by one short step instead of a whole batch (an image chunk is still decoded whole); a prompt read "
+            "while no slot generates still takes whole batches (default: %d, 0 = up to the batch size)",
+            params.n_prompt_step),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prompt-step must be non-negative");
+            }
+            params.n_prompt_step = value;
+        }
+    ).set_env("LLAMA_ARG_PROMPT_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

@@ -123,6 +123,7 @@ class ServerProcess:
     mcp_servers_config: str | None = None
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
+    prompt_step: int | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -188,6 +189,8 @@ class ServerProcess:
             server_args.extend(["--batch-size", self.n_batch])
         if self.n_ubatch:
             server_args.extend(["--ubatch-size", self.n_ubatch])
+        if self.prompt_step is not None:
+            server_args.extend(["--prompt-step", self.prompt_step])
         if self.n_threads:
             server_args.extend(["--threads", self.n_threads])
         if self.n_gpu_layer:

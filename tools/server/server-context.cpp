@@ -3611,6 +3611,13 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // with --prompt-step, a step in which a slot generates takes at most that many prompt tokens besides the generated
+        // ones, so the reply waits one short step instead of a whole batch; a prompt read while no slot generates still
+        // fills the batch. A prompt that cannot be split keeps n_batch
+        const int32_t n_generated    = batch.size();
+        const int32_t n_batch_prompt = params_base.n_prompt_step > 0 && n_generated > 0 ?
+            n_generated + std::min(n_batch - n_generated, params_base.n_prompt_step) : n_batch;
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
@@ -3637,6 +3644,13 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    const int32_t n_fill = slot.can_split() ? n_batch_prompt : n_batch;
+
+                    // this step's prompt tokens are already --prompt-step beside a reply: the read goes on next step
+                    if (batch.size() >= n_fill) {
+                        return;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -4060,7 +4074,7 @@ private:
                     };
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_fill) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
