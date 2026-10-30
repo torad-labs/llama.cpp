@@ -12240,3 +12240,66 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_kpool_mask
+
+void ggml_compute_forward_kpool_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * cells = dst->src[0]; // I32 [n_kv, 2, n_ps, n_stream]: a cell's position, then its pool
+    const ggml_tensor * rows  = dst->src[1]; // I32 [4, n_rows, n_stream]: q, sequence (-1 padded), tail, pools seen
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+
+    const bool cand = ggml_get_op_params_i32(dst, 0) == GGML_KPOOL_MASK_CAND;
+
+    const int64_t n_kv     = cells->ne[0];
+    const int64_t n_ps     = cells->ne[2];
+    const int64_t n_cols   = dst->ne[0];
+    const int64_t n_rows   = dst->ne[1];
+    const int64_t n_stream = dst->ne[3];
+
+    const ggml_fp16_t v_keep = GGML_CPU_FP32_TO_FP16(0.0f);
+    const ggml_fp16_t v_mask = GGML_CPU_FP32_TO_FP16(-INFINITY);
+
+    // the rows split across threads
+    const int64_t n_all = n_rows*n_stream;
+    const int64_t dr    = (n_all + params->nth - 1)/params->nth;
+    const int64_t ir0   = dr*params->ith;
+    const int64_t ir1   = MIN(ir0 + dr, n_all);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t s  = ir/n_rows;
+        const int64_t ii = ir % n_rows;
+
+        const int32_t * row = (const int32_t *) ((const char *) rows->data + ii*rows->nb[1] + s*rows->nb[2]);
+
+        const int32_t q      = row[0];
+        const int32_t ps     = row[1];
+        const int32_t tail   = row[2];
+        const int32_t bo_vis = row[3];
+
+        ggml_fp16_t * out = (ggml_fp16_t *) ((char *) dst->data + ii*dst->nb[1] + s*dst->nb[3]);
+
+        int64_t j = 0;
+
+        if (ps >= 0 && ps < n_ps) {
+            const int32_t * pos  = (const int32_t *) ((const char *) cells->data + ps*cells->nb[2] + s*cells->nb[3]);
+            const int32_t * pool = (const int32_t *) ((const char *) pos + cells->nb[1]);
+
+            // kpool_mask_row's tests: a cell not holding the sequence (-1) is never visible
+            for (; j < n_kv; ++j) {
+                const bool vis    = (uint32_t) pos[j] <= (uint32_t) q;
+                const bool in_tl  = pos[j] >= tail;
+                const bool pooled = cand && (uint32_t) pool[j] < (uint32_t) bo_vis;
+
+                out[j] = vis && (in_tl || pooled) ? v_keep : v_mask;
+            }
+        }
+
+        // a padded row whole, and the columns past n_kv
+        for (; j < n_cols; ++j) {
+            out[j] = v_mask;
+        }
+    }
+}

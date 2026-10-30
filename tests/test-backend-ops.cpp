@@ -9540,6 +9540,94 @@ struct test_lightning_indexer_rows : public test_case {
     }
 };
 
+// GGML_OP_KPOOL_MASK: GLM-5-Next's pooled-indexer masks from a cell's position and pool and a query row's position,
+// sequence, tail and visible pools (kpool_mask_row in src/llama-kv-cache-kpool.cpp is the reference). Every element is 0
+// or -inf, so the backends must agree on every one: the compare checks the -inf pattern element by element, and err()
+// counts the finite elements that differ
+struct test_kpool_mask : public test_case {
+    const int64_t n_kv;
+    const int64_t n_rows;
+    const int64_t n_ps;    // sequences in a stream
+    const int64_t ns;      // streams
+    const int64_t n_extra; // -inf columns past n_kv
+    const int     mode;    // ggml_kpool_mask_mode
+    const int     r;       // cells a pool
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_kv, n_rows, n_ps, ns, n_extra, mode, r);
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        size_t n_diff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += std::isfinite(a[i]) && a[i] != b[i];
+        }
+        return (double) n_diff;
+    }
+
+    test_kpool_mask(int64_t n_kv = 256, int64_t n_rows = 8, int64_t n_ps = 1, int64_t ns = 1, int64_t n_extra = 0,
+            int mode = GGML_KPOOL_MASK_SEL, int r = 4)
+        : n_kv(n_kv), n_rows(n_rows), n_ps(n_ps), ns(ns), n_extra(n_extra), mode(mode), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv, 2, n_ps, ns);
+        ggml_set_name(cells, "cells");
+
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_rows, ns);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * out = ggml_kpool_mask(ctx, cells, rows, (ggml_kpool_mask_mode) mode, n_extra);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x6B70);
+
+        // positions over a quarter more than the cells, so some rows see most cells and some few; a pool's number from
+        // below the run to past its end, so both bounds of bo_vis are crossed
+        const int32_t n_pos   = (int32_t) (n_kv + n_kv/4 + r);
+        const int32_t n_pools = n_pos/r + 1;
+
+        std::uniform_int_distribution<int32_t> pos(0, n_pos - 1);
+        std::uniform_int_distribution<int32_t> pool(-3, n_pools + 2);
+        std::uniform_int_distribution<int32_t> seq(0, (int32_t) n_ps - 1);
+        std::uniform_int_distribution<int32_t> vis(0, n_pools);
+        std::uniform_int_distribution<int32_t> ten(0, 9);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<int32_t> data(ggml_nelements(t));
+
+            if (strcmp(t->name, "cells") == 0) {
+                for (int64_t k = 0; k < (int64_t) data.size(); k += n_kv) {
+                    const bool is_pool = (k/n_kv) % 2 == 1;
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        // a cell not holding the sequence is -1, about a third of them
+                        data[k + j] = is_pool ? pool(rng) : (ten(rng) < 3 ? -1 : pos(rng));
+                    }
+                }
+            } else if (strcmp(t->name, "rows") == 0) {
+                for (int64_t k = 0; k < (int64_t) data.size(); k += 4) {
+                    const int32_t q = pos(rng);
+                    data[k + 0] = q;
+                    data[k + 1] = ten(rng) == 0 ? -1 : seq(rng); // a padded row now and then
+                    data[k + 2] = (q + 1)/r*r;
+                    data[k + 3] = ten(rng) == 0 ? 0 : vis(rng);
+                }
+            } else {
+                continue;
+            }
+
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -12853,6 +12941,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // kpool_mask: a tail and pools, one and three sequences a stream, streams, dump columns, a row past a block of 32
+    for (int mode : { GGML_KPOOL_MASK_SEL, GGML_KPOOL_MASK_CAND }) {
+        for (int r : { 1, 4, 8 }) {
+            for (auto [n_kv, n_rows] : { std::pair{256, 1}, std::pair{256, 7}, std::pair{1000, 33}, std::pair{4096, 64} }) {
+                for (auto [n_ps, ns] : { std::pair{1, 1}, std::pair{3, 1}, std::pair{1, 4} }) {
+                    for (int n_extra : { 0, 4, 37 }) {
+                        test_cases.emplace_back(new test_kpool_mask(n_kv, n_rows, n_ps, ns, n_extra, mode, r));
+                    }
+                }
+            }
+        }
+    }
+
     // q or a float k one element into its buffer
     for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_lightning_indexer_view(type_K, 1, 0));
@@ -13406,6 +13507,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
+    }
+    // kpool_mask at GLM-5.3's served shapes: 4 cells a pool, a 2048-token ubatch, 512 dump pools' columns on sel
+    for (int64_t n_kv : { 16384, 131072 }) {
+        test_cases.emplace_back(new test_kpool_mask(n_kv, 2048, 1, 1, 4*512, GGML_KPOOL_MASK_SEL,  4));
+        test_cases.emplace_back(new test_kpool_mask(n_kv, 2048, 1, 1, 0,     GGML_KPOOL_MASK_CAND, 4));
     }
     // GLM-5.3's pooled keys (4 cells a pool) for a 1024-token ubatch at 64K and 256K cells
     for (int64_t kv : { 16384, 65536 }) {

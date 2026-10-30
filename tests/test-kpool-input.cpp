@@ -13,8 +13,14 @@
 //
 // Two controls: a view whose changes were taken by someone else must be caught by the comparison, and the log of the cells
 // is checked against a snapshot of the cells on its own.
+//
+// The device build (mask_cells and mask_rows in place of sel_mask and cand_mask) must give, through ggml_kpool_mask, both
+// masks byte for byte as the host writes them, from the views and from the cells, with every other tensor and the tail the
+// same. And a cell cand_mask lets a row attend to must be one the KQ mask lets it attend to, so the sparse attention can
+// leave out its add of the KQ mask (build_attn_sparse) without changing a mask.
 
 #include "../src/llama-batch.h"
+#include "../src/llama-hparams.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cache-kpool.h"
 #include "../src/llama-kv-cells.h"
@@ -316,10 +322,14 @@ struct maps {
     ggml_tensor * new_pool_cells = nullptr;
     ggml_tensor * new_pool_reps  = nullptr;
 
+    // a device build's facts, in place of sel_mask and cand_mask
+    ggml_tensor * mask_cells     = nullptr;
+    ggml_tensor * mask_rows      = nullptr;
+
     // n_dump: the top-k's dump pools past the n_pools real ones, with their columns in sel_mask (llm_graph_input_kpool);
-    // n_pools_of > 0 sizes the maps on that many pools instead of the whole cache's
+    // n_pools_of > 0 sizes the maps on that many pools instead of the whole cache's; device: the facts, not the masks
     maps(int64_t n_kv, int64_t n_ns, int64_t n_tps, int64_t n_ps, uint32_t r, bool kcache, bool f16, bool rebuild, int64_t n_dump, int fill,
-            int64_t n_pools_of = 0) {
+            int64_t n_pools_of = 0, bool device = false) {
         ggml_init_params ip = { 32*ggml_tensor_overhead(), nullptr, true };
         ctx = ggml_init(ip);
 
@@ -329,8 +339,13 @@ struct maps {
 
         pool_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*(n_pools + n_dump), n_ns);
         pool_bias  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_pools, n_tps, n_ns);
-        sel_mask   = ggml_new_tensor_4d(ctx, tm, n_kv + r*n_dump, n_tps, 1, n_ns);
-        cand_mask  = ggml_new_tensor_4d(ctx, tm, n_kv, n_tps, 1, n_ns);
+        if (device) {
+            mask_cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv, 2, n_ps, n_ns);
+            mask_rows  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_tps, n_ns);
+        } else {
+            sel_mask   = ggml_new_tensor_4d(ctx, tm, n_kv + r*n_dump, n_tps, 1, n_ns);
+            cand_mask  = ggml_new_tensor_4d(ctx, tm, n_kv, n_tps, 1, n_ns);
+        }
 
         if (kcache) {
             pool_reps      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_pools, n_ns);
@@ -518,6 +533,93 @@ static bool dump_safe(const maps & m, int64_t n_kv, uint32_t r, char * what, siz
     return true;
 }
 
+// both masks as ggml_kpool_mask builds them, on the CPU backend, from the facts of a device build
+static void op_masks(const maps & dev, int64_t n_extra, std::vector<ggml_fp16_t> & sel, std::vector<ggml_fp16_t> & cand) {
+    static ggml_backend_t cpu = ggml_backend_cpu_init();
+
+    ggml_init_params gp = { 8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * cg = ggml_init(gp);
+    ggml_cgraph  * gf = ggml_new_graph(cg);
+
+    ggml_tensor * t_sel  = ggml_kpool_mask(cg, dev.mask_cells, dev.mask_rows, GGML_KPOOL_MASK_SEL,  n_extra);
+    ggml_tensor * t_cand = ggml_kpool_mask(cg, dev.mask_cells, dev.mask_rows, GGML_KPOOL_MASK_CAND, 0);
+    ggml_build_forward_expand(gf, t_sel);
+    ggml_build_forward_expand(gf, t_cand);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    CHECK(ggml_gallocr_alloc_graph(galloc, gf), "the mask graph did not allocate");
+    ggml_backend_graph_compute(cpu, gf);
+
+    sel .resize(ggml_nelements(t_sel));
+    cand.resize(ggml_nelements(t_cand));
+    ggml_backend_tensor_get(t_sel,  sel .data(), 0, ggml_nbytes(t_sel));
+    ggml_backend_tensor_get(t_cand, cand.data(), 0, ggml_nbytes(t_cand));
+
+    ggml_gallocr_free(galloc);
+    ggml_free(cg);
+}
+
+// a host mask against the op's, as f16 bits: the elements are 0 and -inf, exact in either type
+static bool mask_equal(const ggml_tensor * ref, const std::vector<ggml_fp16_t> & got, const char * name, char * what, size_t n_what) {
+    const int64_t n = ggml_nelements(ref);
+
+    if ((int64_t) got.size() != n) {
+        snprintf(what, n_what, "%s: the op gave %zu elements, the host %lld", name, got.size(), (long long) n);
+        return false;
+    }
+
+    for (int64_t k = 0; k < n; ++k) {
+        const ggml_fp16_t want = ref->type == GGML_TYPE_F16 ? ((const ggml_fp16_t *) ref->data)[k] :
+                                                              ggml_fp32_to_fp16(((const float *) ref->data)[k]);
+        if (got[k] != want) {
+            snprintf(what, n_what, "%s column %lld row %lld of %lld x %lld: %04x from the op, %04x from the host", name,
+                    (long long) (k % ref->ne[0]), (long long) (k/ref->ne[0]), (long long) ref->ne[0],
+                    (long long) (n/ref->ne[0]), got[k], want);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// every cell cand_mask lets a row attend to is one the KQ mask does: a cell of the row's sequence at or before its position
+static bool cand_in_kq(const maps & ref, pool & w, const llama_ubatch * ub, char * what, size_t n_what) {
+    const int64_t n_kv  = ref.cand_mask->ne[0];
+    const int64_t n_tps = ref.cand_mask->ne[1];
+    const int64_t n_ns  = ref.cand_mask->ne[3];
+
+    ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor  * kq  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_tps, 1, n_ns);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+
+    llama_hparams hparams{};
+    llama_kv_cache_set_input_kq_mask(kq, ub, /*causal_attn =*/ true, hparams, w.v_cells, w.seq_to_stream, 0, LLAMA_SWA_TYPE_NONE,
+            /*scan_cells =*/ true, /*seq_bits =*/ false);
+
+    bool ok = true;
+
+    for (int64_t k = 0; ok && k < n_kv*n_tps*n_ns; ++k) {
+        const float c = ref.cand_mask->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) ref.cand_mask->data)[k]) :
+                                                               ((const float *) ref.cand_mask->data)[k];
+        const float q = ((const float *) kq->data)[k];
+
+        if (c == 0.0f && q != 0.0f) {
+            snprintf(what, n_what, "cand_mask lets row %lld attend to cell %lld, the KQ mask does not (%g)", (long long) (k/n_kv),
+                    (long long) (k % n_kv), q);
+            ok = false;
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+
+    return ok;
+}
+
+// builds whose masks the op built, and cells among them a row's candidates hold
+static int64_t n_device_builds = 0;
+
 // the most finite columns a row of sel_mask holds among its first n_kv: the cells its tail grants
 static int64_t sel_tail_max(const maps & m, int64_t n_kv) {
     const int64_t n_sel  = m.sel_mask->ne[0];
@@ -655,8 +757,72 @@ static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, 
         ((uint8_t *) inc.sel_mask->data)[0] ^= 0x80;
     }
 
-    return write_rows_safe(ref, w, n_ns, cfg.r, what, n_what) && write_rows_safe(inc, w, n_ns, cfg.r, what, n_what) &&
-           dump_safe(ref, n_kv, cfg.r, what, n_what) && same(inc, ref, what, n_what);
+    if (!(write_rows_safe(ref, w, n_ns, cfg.r, what, n_what) && write_rows_safe(inc, w, n_ns, cfg.r, what, n_what) &&
+          dump_safe(ref, n_kv, cfg.r, what, n_what) && same(inc, ref, what, n_what))) {
+        return false;
+    }
+
+    if (ctl != CONTROL_NONE) {
+        return true;
+    }
+
+    if (!cand_in_kq(ref, w, ub, what, n_what)) {
+        return false;
+    }
+
+    // the device build, from the views and from the cells: the masks through the op, everything else as the host wrote it;
+    // and the facts of the two the same bytes, as LLAMA_KPOOL_INPUT_CHECK compares them
+    std::vector<uint8_t> facts_views;
+
+    for (const bool from_views : { true, false }) {
+        maps dev(n_kv, n_ns, n_tokens/n_ns, n_ps, cfg.r, cfg.kcache, cfg.f16, rebuild, n_dump, from_views ? 0x3C : 0xC3, 0, true);
+
+        const int64_t tail_dev = llama_kpool_set_input(cells_of, from_views ? &views : nullptr, nullptr, dev.pool_cells, nullptr,
+                dev.pool_bias, nullptr, nullptr, dev.pool_reps, dev.new_pool_cells, dev.new_pool_reps, strm_of.data(),
+                w.v_cells[0].size(), rebuild, ub, cfg.r, dev.mask_cells, dev.mask_rows);
+
+        std::vector<ggml_fp16_t> sel;
+        std::vector<ggml_fp16_t> cand;
+        op_masks(dev, cfg.r*n_dump, sel, cand);
+
+        char sub[200];
+        bool ok = true;
+
+        if (tail_dev != tail_ref) {
+            snprintf(sub, sizeof(sub), "tail: %lld cells, the host build %lld", (long long) tail_dev, (long long) tail_ref);
+            ok = false;
+        } else {
+            ok = mask_equal(ref.sel_mask, sel, "sel_mask", sub, sizeof(sub)) && mask_equal(ref.cand_mask, cand, "cand_mask", sub, sizeof(sub)) &&
+                 same(dev, ref, sub, sizeof(sub));
+        }
+
+        std::vector<uint8_t> facts(ggml_nbytes(dev.mask_cells) + ggml_nbytes(dev.mask_rows));
+        memcpy(facts.data(), dev.mask_cells->data, ggml_nbytes(dev.mask_cells));
+        memcpy(facts.data() + ggml_nbytes(dev.mask_cells), dev.mask_rows->data, ggml_nbytes(dev.mask_rows));
+
+        if (ok && !from_views && facts != facts_views) {
+            size_t k = 0;
+            while (facts[k] == facts_views[k]) {
+                ++k;
+            }
+            snprintf(sub, sizeof(sub), "the facts from the views and from the cells differ at byte %zu of %zu (mask_cells holds %zu)", k,
+                    facts.size(), ggml_nbytes(dev.mask_cells));
+            ok = false;
+        }
+
+        if (!ok) {
+            snprintf(what, n_what, "device build from the %s: %s", from_views ? "views" : "cells", sub);
+            return false;
+        }
+
+        if (from_views) {
+            facts_views = std::move(facts);
+        }
+    }
+
+    n_device_builds++;
+
+    return true;
 }
 
 static void run_round(std::mt19937 & rng, const config & cfg, uint32_t size, uint32_t n_seq, int n_ops, llama_kpool_views::stats & total) {
@@ -1176,6 +1342,8 @@ int main() {
     CHECK(total.n_direct > 100,  "only %llu streams took the maps from the cells: the fallbacks are not reached", (unsigned long long) total.n_direct);
 
     printf("random rounds: %lld builds with a tail over r - 1 cells, each within llama_kpool_tail_max\n", (long long) n_tail_long);
+    printf("random rounds: %lld builds whose masks ggml_kpool_mask built from the device facts\n", (long long) n_device_builds);
+    CHECK(n_device_builds > 2000, "only %lld device builds: the facts are not tested", (long long) n_device_builds);
     CHECK(n_tail_long > 0, "no build held a tail over r - 1 cells: the bound is not tested");
 
     if (n_fail == 0) {

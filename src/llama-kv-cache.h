@@ -463,6 +463,10 @@ public:
 
     const llama_kv_cache * get_kv() const;
 
+    // the full-cache context the worst-case graph is reserved on (init_full). It is never applied, so a graph input sized on
+    // the cells of its ubatch's sequences takes the whole cache instead
+    bool is_full() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -505,6 +509,8 @@ private:
 
     llama_kv_cache * kv;
     llama_context * lctx;
+
+    bool full = false;
 
     //
     // update context

@@ -1104,7 +1104,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
             case GGML_OP_DSV4_HC_POST:
-            case GGML_OP_DSV4_HC_WEIGHTS: {
+            case GGML_OP_DSV4_HC_WEIGHTS:
+            case GGML_OP_KPOOL_MASK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {

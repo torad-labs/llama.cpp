@@ -1100,6 +1100,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "DSV4_HC_WEIGHTS",
+    "KPOOL_MASK",
 
     "UNARY",
 
@@ -1117,7 +1118,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "dsv4_hc_weights(mixes, scale, base)",
+    "kpool_mask(cells, rows)",
 
     "unary(x)",
 
@@ -1233,7 +1235,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6729,6 +6731,33 @@ struct ggml_tensor * ggml_dsv4_hc_weights(
     result->src[0] = mixes;
     result->src[1] = scale;
     result->src[2] = base;
+
+    return result;
+}
+
+// ggml_kpool_mask
+
+struct ggml_tensor * ggml_kpool_mask(
+        struct ggml_context     * ctx,
+        struct ggml_tensor      * cells,
+        struct ggml_tensor      * rows,
+        enum ggml_kpool_mask_mode mode,
+        int64_t                   n_extra) {
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && ggml_is_contiguous(cells));
+    GGML_ASSERT( rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows));
+    GGML_ASSERT(cells->ne[1] == 2 && "a cell's position and its pool");
+    GGML_ASSERT( rows->ne[0] == 4 && "a row's position, sequence, tail and visible pools");
+    GGML_ASSERT( rows->ne[2] == cells->ne[3] && rows->ne[3] == 1);
+    GGML_ASSERT(mode == GGML_KPOOL_MASK_SEL || mode == GGML_KPOOL_MASK_CAND);
+    GGML_ASSERT(n_extra >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cells->ne[0] + n_extra, rows->ne[1], 1, cells->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) mode);
+
+    result->op     = GGML_OP_KPOOL_MASK;
+    result->src[0] = cells;
+    result->src[1] = rows;
 
     return result;
 }
