@@ -18,13 +18,13 @@ static __device__ __forceinline__ void flash_attn_sparse_check_count(
 }
 
 // A block a mask row: its finite entries' cells, ascending, into the row's n_kv_max indices, -1 past its count (a count
-// over n_kv_max writes the first n_kv_max and traps: the bound is the graph's to keep).
+// over n_kv_max writes the first n_kv_max and traps: the bound is the graph's to keep), and the count into counts_ptr if set.
 // Upstream's scan (8e93a9773): 256 threads, 2048 columns a round of scalar loads. A decode's one row is one block, so
 // a round is a memory round trip: 11 us at 32K columns. GGML_CUDA_FATTN_SPARSE_SCAN_LEGACY=1, or a mask row not
 // 16-byte aligned.
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices_legacy(
-        const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
+        const half * mask_ptr, int32_t * indices_ptr, int32_t * counts_ptr, const int ne30, const int n_kv_max,
         const int64_t s31, const int64_t s33) {
     ggml_cuda_pdl_sync();
 
@@ -96,6 +96,9 @@ static __global__ void flash_attn_mask_to_sparse_indices_legacy(
 
     const int count = row_count;
     flash_attn_sparse_check_count(count, n_kv_max, query, sequence);
+    if (counts_ptr && tid == 0) {
+        counts_ptr[int64_t(sequence)*gridDim.x + query] = min(count, n_kv_max);
+    }
     for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
         indices[i] = -1;
     }
@@ -113,7 +116,7 @@ static constexpr int sparse_scan_cols    = 32;
 
 __launch_bounds__(sparse_scan_threads, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
-        const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
+        const half * mask_ptr, int32_t * indices_ptr, int32_t * counts_ptr, const int ne30, const int n_kv_max,
         const int64_t s31, const int64_t s33) {
     ggml_cuda_pdl_sync();
 
@@ -186,6 +189,9 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     }
 
     flash_attn_sparse_check_count(row_count, n_kv_max, query, sequence);
+    if (counts_ptr && tid == 0) {
+        counts_ptr[int64_t(sequence)*gridDim.x + query] = min(row_count, n_kv_max);
+    }
     for (int i = row_count + tid; i < n_kv_max; i += sparse_scan_threads) {
         indices[i] = -1;
     }
@@ -197,9 +203,9 @@ static __global__ void flash_attn_mask_to_sparse_indices(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_kv_max, cudaStream_t stream) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(mask, indices, n_kv_max, stream);
+    GGML_UNUSED_VARS(mask, indices, counts, n_kv_max, stream);
     GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
 #else
     GGML_ASSERT(mask->type == GGML_TYPE_F16);
@@ -212,7 +218,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const dim3 block_dim(wide ? sparse_scan_threads : 256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     ggml_cuda_kernel_launch(wide ? flash_attn_mask_to_sparse_indices : flash_attn_mask_to_sparse_indices_legacy, launch_params,
-        (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
+        (const half *) mask->data, indices, counts, int(mask->ne[0]), n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
