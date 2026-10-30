@@ -2691,6 +2691,11 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // a ggml_lightning_indexer_rows op over a Q8_0 k scores q rounded to 8-bit blocks of 32, which int8 tensor cores
+    // can read (lossy, opt-in): each run of 32 values of a head's row gets the scale d = max |x| / 127 in f32, and each
+    // value becomes d * roundf(x / d), or 0 when d is 0. op_params[0] is 1; a backend that ignores it must refuse the op
+    GGML_API void ggml_lightning_indexer_set_q8_query(struct ggml_tensor * a);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.

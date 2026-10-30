@@ -6570,6 +6570,13 @@ struct ggml_tensor * ggml_lightning_indexer_rows(
     return result;
 }
 
+void ggml_lightning_indexer_set_q8_query(struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_LIGHTNING_INDEXER);
+    GGML_ASSERT(a->src[4] != NULL && "the q8 query is a ggml_lightning_indexer_rows mode");
+    GGML_ASSERT(a->src[1]->type == GGML_TYPE_Q8_0 && "the q8 query scores a Q8_0 k");
+    ggml_set_op_params_i32(a, 0, 1);
+}
+
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(
