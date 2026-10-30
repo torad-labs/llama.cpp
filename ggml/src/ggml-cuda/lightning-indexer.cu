@@ -2,6 +2,8 @@
 #include "lightning-indexer.cuh"
 #include "fattn-common.cuh"
 #include "convert.cuh"
+#include "mma.cuh"
+#include "vecdotq.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #if defined(TURING_MMA_AVAILABLE)
@@ -680,6 +682,223 @@ static __global__ void lightning_indexer_kernel_oct(
     }
 }
 
+// ggml_lightning_indexer_set_q8_query: q rounded to 8-bit blocks of 32 as the CPU rounds it, d = max |x| / 127 and
+// roundf(x / d); __fdiv_rn keeps both divisions IEEE under -use_fast_math, so the integers are the CPU's
+static __device__ __forceinline__ float lightning_indexer_q8_scale(const float amax) {
+    return __fdiv_rn(amax, 127.0f);
+}
+
+static __device__ __forceinline__ int lightning_indexer_q8_round(const float x, const float d) {
+    return d != 0.0f ? (int) roundf(__fdiv_rn(x, d)) : 0;
+}
+
+// the q8 query where the int8 kernel does not run: q rounded into dst at q's own offsets, for the vector kernels to
+// score (the CPU's arithmetic: d times the rounded integer, in f32). A warp a row of 128, 4 values a lane, so a block
+// of 32 is 8 lanes.
+template <int N_EMBD>
+static __global__ void lightning_indexer_round_q8(
+        const char * Q, char * dst, int64_t n_head, int64_t n_batch, int64_t n_q_rows, size_t nbq1, size_t nbq2, size_t nbq3) {
+    static_assert(N_EMBD == 4*WARP_SIZE, "a lane rounds 4 values");
+    const int64_t i_row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y;
+    if (i_row >= n_q_rows) {
+        return;
+    }
+    const int64_t i_head  = i_row % n_head;
+    const int64_t i_batch = (i_row / n_head) % n_batch;
+    const int64_t i_strm  = i_row / (n_head*n_batch);
+    const size_t  off     = i_head*nbq1 + i_batch*nbq2 + i_strm*nbq3;
+
+    const float4 x = ((const float4 *) (Q + off))[threadIdx.x];
+    float amax = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w)));
+#pragma unroll
+    for (int m = 1; m < 8; m *= 2) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, m, WARP_SIZE));
+    }
+    const float d = lightning_indexer_q8_scale(amax);
+    float4 y;
+    y.x = d * (float) lightning_indexer_q8_round(x.x, d);
+    y.y = d * (float) lightning_indexer_q8_round(x.y, d);
+    y.z = d * (float) lightning_indexer_q8_round(x.z, d);
+    y.w = d * (float) lightning_indexer_q8_round(x.w, d);
+    ((float4 *) (dst + off))[threadIdx.x] = y;
+}
+
+static __device__ __forceinline__ int lightning_indexer_q8_pack(const float4 x, const float d) {
+    char4 c;
+    c.x = (signed char) lightning_indexer_q8_round(x.x, d);
+    c.y = (signed char) lightning_indexer_q8_round(x.y, d);
+    c.z = (signed char) lightning_indexer_q8_round(x.z, d);
+    c.w = (signed char) lightning_indexer_q8_round(x.w, d);
+    return *((const int *) &c);
+}
+
+static constexpr int LIGHTNING_INDEXER_Q8_WARPS = 8;  // tokens a block, a warp each
+static constexpr int LIGHTNING_INDEXER_Q8_POOLS = 64; // keys a tile of shared memory
+// a warp scores one token, so a decode or a verify leaves most of the kernel's warps idle and the rounded buffer is faster
+static constexpr int LIGHTNING_INDEXER_Q8_MIN_TOKENS = 8;
+static constexpr int LIGHTNING_INDEXER_Q8_KSTR  = 36; // ints a key's row in shared memory: 32 and 4 of padding, so a
+                                                      // B fragment's 8 keys x 4 ints fall on 32 banks
+
+// The q8 query on int8 tensor cores, for a Q8_0 k of 128 values a key and 32 heads (GLM-5.3). A warp holds one token:
+// its q rounded once into the A fragments of m16n8k32 (2 tiles of 16 heads x 4 blocks of 32, with each row's 4 block
+// scales), and the block's warps share each tile of 64 keys in shared memory, B fragments of 8 keys. A key's dot with a
+// head is the sum over its 4 blocks of the int32 block dot times q's and k's block scales, in f32; then ReLU, the head's
+// weight, and the sum over the 32 heads (the lane's 4 rows, then across the 8 lanes of a column), and the mask.
+template <int N_WARPS>
+static __global__ void __launch_bounds__(N_WARPS*WARP_SIZE, 2) lightning_indexer_kernel_q8_mma(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        int64_t n_batch, int64_t n_kv, int64_t kv_per_block,
+        size_t nb1, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbk2, size_t nbk3,
+        size_t nbw1, size_t nbw3,
+        size_t nbm1, size_t nbm3,
+        int64_t nem3,
+        const int32_t * rows, int64_t s_rows) {
+#if defined(TURING_MMA_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    using namespace ggml_cuda_mma;
+    constexpr int N_EMBD = 128;
+    constexpr int N_BLK  = N_EMBD / QK8_0; // 4 blocks of 32 a key
+    constexpr int N_HT   = 2;              // tiles of 16 heads
+    constexpr int P      = LIGHTNING_INDEXER_Q8_POOLS;
+    constexpr int KSTR   = LIGHTNING_INDEXER_Q8_KSTR;
+    constexpr int N_THREADS = N_WARPS*WARP_SIZE;
+
+    const int i_warp   = threadIdx.y;
+    const int lane     = threadIdx.x;
+    const int tid      = i_warp*WARP_SIZE + lane;
+    const int g        = lane / 4; // the fragments' row (head) or column (key) group
+    const int tig      = lane % 4;
+    const int i_stream = blockIdx.z;
+    const int64_t i_batch = (int64_t) blockIdx.x*N_WARPS + i_warp;
+    const bool active  = i_batch < n_batch;
+
+    const int64_t kv0 = (int64_t) blockIdx.y*kv_per_block;
+    const int64_t kv1 = min(kv0 + kv_per_block, n_kv);
+
+    // a0..a3 of head tile ht, block b: rows (heads) g and g + 8 at the block's values 4 tig..4 tig + 3 (a0, a1) and
+    // 16 + 4 tig.. (a2, a3); dq the two rows' block scales; wv their weights
+    tile<16, 8, int> A[N_HT][N_BLK];
+    float dq[N_HT][N_BLK][2];
+    float wv[N_HT][2];
+    if (active) {
+        const char  * q_base = (const char  *) Q + i_batch*nbq2 + i_stream*nbq3;
+        const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
+#pragma unroll
+        for (int ht = 0; ht < N_HT; ++ht) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int i_head = 16*ht + 8*r + g;
+                const float4 * qh = (const float4 *) (q_base + i_head*nbq1);
+                wv[ht][r] = w_base[i_head];
+#pragma unroll
+                for (int b = 0; b < N_BLK; ++b) {
+                    const float4 lo = qh[(QK8_0*b +      4*tig)/4];
+                    const float4 hi = qh[(QK8_0*b + 16 + 4*tig)/4];
+                    float amax = fmaxf(fmaxf(fmaxf(fabsf(lo.x), fabsf(lo.y)), fmaxf(fabsf(lo.z), fabsf(lo.w))),
+                                       fmaxf(fmaxf(fabsf(hi.x), fabsf(hi.y)), fmaxf(fabsf(hi.z), fabsf(hi.w))));
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, WARP_SIZE));
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, WARP_SIZE));
+                    const float d = lightning_indexer_q8_scale(amax);
+                    A[ht][b].x[r]     = lightning_indexer_q8_pack(lo, d);
+                    A[ht][b].x[2 + r] = lightning_indexer_q8_pack(hi, d);
+                    dq[ht][b][r] = d;
+                }
+            }
+        }
+    }
+
+    __shared__ int   k_s[P*KSTR];
+    __shared__ float dk_s[P*N_BLK];
+
+    const int32_t * rows_s = rows ? rows + i_stream*s_rows : nullptr;
+    const half  * m_base   = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+    float       * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+
+    for (int64_t kv_tile = kv0; kv_tile < kv1; kv_tile += P) {
+        __syncthreads(); // the previous tile is read
+
+        // a thread a block of a key: its scale, and its 32 values as 8 ints (2-byte aligned in a block_q8_0)
+        for (int u = tid; u < P*N_BLK; u += N_THREADS) {
+            const int p = u / N_BLK;
+            const int b = u % N_BLK;
+            const int64_t i_kv = kv_tile + p;
+            int * kp = k_s + p*KSTR + 8*b;
+            if (i_kv < kv1) {
+                const int64_t i_row = rows_s ? rows_s[i_kv] : i_kv;
+                const block_q8_0 * kb = (const block_q8_0 *) (K + i_row*nbk2 + i_stream*nbk3) + b;
+                dk_s[p*N_BLK + b] = __half2float(kb->d);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    kp[j] = get_int_b2(kb->qs, j);
+                }
+            } else {
+                dk_s[p*N_BLK + b] = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    kp[j] = 0;
+                }
+            }
+        }
+
+        __syncthreads();
+
+        if (!active) {
+            continue;
+        }
+
+#pragma unroll 2
+        for (int nt = 0; nt < P/8; ++nt) {
+            // D of a head tile: rows g and g + 8, columns (keys) 2 tig and 2 tig + 1 of the 8
+            float acc[N_HT][4] = {{0.0f}};
+#pragma unroll
+            for (int b = 0; b < N_BLK; ++b) {
+                tile<8, 8, int> B; // b0, b1: key g at the block's values 4 tig.. and 16 + 4 tig..
+                B.x[0] = k_s[(8*nt + g)*KSTR + 8*b +     tig];
+                B.x[1] = k_s[(8*nt + g)*KSTR + 8*b + 4 + tig];
+                const float dk0 = dk_s[(8*nt + 2*tig + 0)*N_BLK + b];
+                const float dk1 = dk_s[(8*nt + 2*tig + 1)*N_BLK + b];
+#pragma unroll
+                for (int ht = 0; ht < N_HT; ++ht) {
+                    tile<16, 8, int> D;
+                    mma(D, A[ht][b], B);
+                    acc[ht][0] += (dq[ht][b][0]*dk0) * (float) D.x[0];
+                    acc[ht][1] += (dq[ht][b][0]*dk1) * (float) D.x[1];
+                    acc[ht][2] += (dq[ht][b][1]*dk0) * (float) D.x[2];
+                    acc[ht][3] += (dq[ht][b][1]*dk1) * (float) D.x[3];
+                }
+            }
+
+            // ReLU, weight, and the sum over heads: the lane's 4 rows of each column, then the 8 lanes that share it
+            float s0 = 0.0f;
+            float s1 = 0.0f;
+#pragma unroll
+            for (int ht = 0; ht < N_HT; ++ht) {
+                s0 += fmaxf(acc[ht][0], 0.0f)*wv[ht][0] + fmaxf(acc[ht][2], 0.0f)*wv[ht][1];
+                s1 += fmaxf(acc[ht][1], 0.0f)*wv[ht][0] + fmaxf(acc[ht][3], 0.0f)*wv[ht][1];
+            }
+#pragma unroll
+            for (int m = 4; m < WARP_SIZE; m *= 2) {
+                s0 += __shfl_xor_sync(0xffffffff, s0, m, WARP_SIZE);
+                s1 += __shfl_xor_sync(0xffffffff, s1, m, WARP_SIZE);
+            }
+
+            const int64_t i_kv = kv_tile + 8*nt + 2*tig;
+            if (g == 0 && i_kv < kv1) {
+                dst_base[i_kv] = s0 + __half2float(m_base[i_kv]);
+            }
+            if (g == 0 && i_kv + 1 < kv1) {
+                dst_base[i_kv + 1] = s1 + __half2float(m_base[i_kv + 1]);
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, W, M, dst, n_batch, n_kv, kv_per_block, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3,
+        nbw1, nbw3, nbm1, nbm3, nem3, rows, s_rows);
+    NO_DEVICE_CODE;
+#endif // defined(TURING_MMA_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
 // GGML_CUDA_LIGHTNING_INDEXER_CHECK=1: the vector kernel runs beside the octet (or quad) kernel and a differing bit traps
 static __global__ void lightning_indexer_check(const float * quad, const float * vec, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
@@ -830,6 +1049,46 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
+
+    // ggml_lightning_indexer_set_q8_query: the int8 kernel where it runs (NVIDIA from Turing, 32 heads) on 8 tokens or
+    // more, elsewhere q rounded into a buffer the kernels below score, the same scores to f32 rounding.
+    // GGML_CUDA_LIGHTNING_INDEXER_Q8_MMA_LEGACY=1 takes the buffer everywhere.
+    const bool q8_query = ggml_get_op_params_i32(dst, 0) == 1;
+    ggml_cuda_pool_alloc<char> q_round_buf(ctx.pool());
+    if (q8_query) {
+        GGML_ASSERT(k->type == GGML_TYPE_Q8_0 && rows_d != nullptr && n_embd == 128);
+        static const bool q8_mma_legacy = ggml_env_switch("GGML_CUDA_LIGHTNING_INDEXER_Q8_MMA_LEGACY");
+        if (!q8_mma_legacy && n_head == 32 && n_batch >= LIGHTNING_INDEXER_Q8_MIN_TOKENS && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                turing_mma_available(cc)) {
+            constexpr int N_WARPS = LIGHTNING_INDEXER_Q8_WARPS;
+            constexpr int P       = LIGHTNING_INDEXER_Q8_POOLS;
+            const int64_t n_tiles = (n_kv + P - 1) / P;
+            const int64_t n_bx    = (n_batch + N_WARPS - 1) / N_WARPS;
+            const int64_t nsm     = ggml_cuda_info().devices[device].nsm;
+            // the keys split so the grid is about 4 blocks an SM
+            const int64_t n_by = std::max<int64_t>(1, std::min<int64_t>(n_tiles, (4*nsm + n_bx*n_stream - 1) / (n_bx*n_stream)));
+            const int64_t kv_per_block = (n_tiles + n_by - 1) / n_by * P;
+            const dim3 grid(n_bx, (n_kv + kv_per_block - 1) / kv_per_block, n_stream);
+            const dim3 block(WARP_SIZE, N_WARPS);
+            lightning_indexer_kernel_q8_mma<N_WARPS><<<grid, block, 0, ctx.stream()>>>(
+                q_d, k_d, w_d, m_d, dst_d,
+                n_batch, n_kv, kv_per_block,
+                nb1, nb3,
+                nbq1, nbq2, nbq3,
+                nbk2, nbk3,
+                nbw1, nbw3,
+                nbm1, nbm3,
+                nem3,
+                rows_d, s_rows);
+            return;
+        }
+        constexpr int ROUND_ROWS = 4; // warps a block
+        const int64_t n_q_rows = (int64_t) n_head*n_batch*n_stream;
+        q_round_buf.alloc(ggml_nbytes(q));
+        lightning_indexer_round_q8<128><<<(n_q_rows + ROUND_ROWS - 1) / ROUND_ROWS, dim3(WARP_SIZE, ROUND_ROWS), 0, ctx.stream()>>>(
+            (const char *) q_d, q_round_buf.get(), n_head, n_batch, n_q_rows, nbq1, nbq2, nbq3);
+        q_d = (const float *) q_round_buf.get();
+    }
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
