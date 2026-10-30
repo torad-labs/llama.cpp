@@ -588,12 +588,10 @@ static void test_reallocation() {
 // scratch a graph keeps allocated for its own writer, must still get room for its size in each graph. llama.cpp's MTP
 // draft graph keeps four indexer inputs so; when they grew while every op kept its size, the indexer's writes landed on
 // the draft's token ids and the next get_rows read a cell index as a token. Over generated sizes, every input, read or
-// not, and the output lie apart from one another, but for the output over the input it consumes in place, and inside
-// their buffer.
-static void test_reallocation_unread_input() {
-    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
-    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
-
+// not, and the output lie apart from one another, but for the output in place over the input it consumes, and inside
+// their buffer. With two buffer types the allocator cannot reserve by itself and answers false, and the caller reserves
+// and allocates again, as ggml_backend_sched_alloc_splits does.
+static void run_unread_input_rounds(ggml_gallocr_t galloc, bool two_buffers) {
     std::mt19937                       rng(7);
     std::uniform_int_distribution<int> unread_n(1, 64);
     std::uniform_int_distribution<int> read_n(1, 2);
@@ -612,7 +610,19 @@ static void test_reallocation_unread_input() {
         ggml_build_forward_expand(graph, out);
         ggml_build_forward_expand(graph, unread_b);
 
-        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        if (two_buffers) {
+            GGML_ASSERT(graph->n_leafs == 3 && graph->leafs[0] == unread_a && graph->leafs[1] == read && graph->leafs[2] == unread_b);
+
+            const int node_ids[1] = { 0 };
+            const int leaf_ids[3] = { 0, 0, 1 };
+
+            if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+                GGML_ASSERT(ggml_gallocr_reserve_n(galloc, graph, node_ids, leaf_ids));
+                GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, graph));
+            }
+        } else {
+            GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, graph));
+        }
 
         ggml_tensor * ts[] = { unread_a, read, unread_b, out };
 
@@ -629,8 +639,8 @@ static void test_reallocation_unread_input() {
         }
         for (size_t i = 0; i < 4; ++i) {
             for (size_t j = i + 1; j < 4; ++j) {
-                // the scale may write its output over the input it reads last, in place
-                if (ts[i] == read && ts[j] == out) {
+                // the scale may write its output in place over the input it reads last
+                if (ts[i] == read && ts[j] == out && read->data == out->data) {
                     continue;
                 }
                 if (memory_overlap(ts[i], ts[j])) {
@@ -641,6 +651,23 @@ static void test_reallocation_unread_input() {
             }
         }
     }
+}
+
+static void test_reallocation_unread_input() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    run_unread_input_rounds(galloc.get(), false);
+}
+
+static void test_reallocation_unread_input_two_buffers() {
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+
+    ggml_backend_buffer_type_t bufts[2] = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_gallocr_ptr           galloc   = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+
+    run_unread_input_rounds(galloc.get(), true);
 }
 
 static void run(const char * name, void (*f)()) {
@@ -665,5 +692,6 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_reallocation_unread_input", test_reallocation_unread_input);
+    run("test_reallocation_unread_input_two_buffers", test_reallocation_unread_input_two_buffers);
     return 0;
 }
