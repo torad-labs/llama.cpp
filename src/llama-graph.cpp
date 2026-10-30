@@ -655,6 +655,15 @@ bool llm_graph_input_kpool::shapes_match(const llm_graph_input_kpool_dims & dims
     res &= inp.cand_mask->ne[2] == 1;
     res &= inp.cand_mask->ne[3] == dims.n_stream;
 
+    if (inp.mask_cells) {
+        res &= inp.mask_cells->ne[0] == dims.n_kv;
+        res &= inp.mask_cells->ne[2] == dims.n_ps;
+        res &= inp.mask_cells->ne[3] == dims.n_stream;
+
+        res &= inp.mask_rows->ne[1] == dims.n_tps;
+        res &= inp.mask_rows->ne[2] == dims.n_stream;
+    }
+
     res &= inp.pool_reps->ne[0] == dims.n_pools;
     res &= inp.pool_reps->ne[1] == dims.n_stream;
 
@@ -1290,7 +1299,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // unallocated when no layer reads it: the pooled indexer's sparse attention leaves it out (build_attn_sparse)
+    if (inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     inp_rs->set_input_rs(mctx->get_recr(), ubatch);
 }
@@ -4077,14 +4089,36 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
             ggml_set_name(inp->pool_bias_f16, "kpool_pool_bias_f16");
         }
 
-        // lossless in f16 (only 0.0f and -INFINITY), and f16 + f32 -> f16 adds the KQ mask uncast
-        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv + kpool*n_dump, n_tps, 1, n_stream);
-        ggml_set_input(inp->sel_mask);
-        ggml_set_name(inp->sel_mask, "kpool_sel_mask");
+        // the masks are n_kv wide a row: built on the device from O(n_kv + n_tps) facts, not written by the host and copied
+        // to every card each ubatch. A 16K read beside 100K cells of another conversation spent 996 ms of host gaps and
+        // 341 ms of host-to-device copies a card on them and the KQ mask (the Oct 29 lab box, run 11)
+        static const bool mask_host = ggml_env_switch("LLAMA_KPOOL_MASK_HOST_LEGACY");
 
-        inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
-        ggml_set_input(inp->cand_mask);
-        ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+        if (mask_host) {
+            // lossless in f16 (only 0.0f and -INFINITY), and f16 + f32 -> f16 adds the KQ mask uncast
+            inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv + kpool*n_dump, n_tps, 1, n_stream);
+            ggml_set_input(inp->sel_mask);
+            ggml_set_name(inp->sel_mask, "kpool_sel_mask");
+
+            inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+            ggml_set_input(inp->cand_mask);
+            ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+        } else {
+            inp->mask_cells = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_kv, 2, n_ps, n_stream);
+            ggml_set_input(inp->mask_cells);
+            ggml_set_name(inp->mask_cells, "kpool_mask_cells");
+
+            inp->mask_rows = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_tps, n_stream);
+            ggml_set_input(inp->mask_rows);
+            ggml_set_name(inp->mask_rows, "kpool_mask_rows");
+
+            // sel_mask is the template a layer's own copy is made from (build_attn_sparse), and only cand_mask is shared
+            inp->sel_mask = ggml_kpool_mask(ctx0, inp->mask_cells, inp->mask_rows, GGML_KPOOL_MASK_SEL, kpool*n_dump);
+            ggml_set_name(inp->sel_mask, "kpool_sel_mask");
+
+            inp->cand_mask = ggml_kpool_mask(ctx0, inp->mask_cells, inp->mask_rows, GGML_KPOOL_MASK_CAND, 0);
+            ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+        }
 
         // n_new_max is an exact bound (a contiguous run of L tokens closes at most L/kpool + 1
         // pools), FIXED for the decode phase so the graph shape does not track pools-closed-this-
@@ -4170,8 +4204,11 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     GGML_ASSERT(sel_mask->ne[0] >= n_kv);
 
-    // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy
-    ggml_tensor * mask_all = ggml_dup(ctx0, sel_mask);
+    // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy. Built on the device, the copy
+    // is the op made again, which writes the mask where the copy would read and write it
+    ggml_tensor * mask_all = sel_mask->op == GGML_OP_KPOOL_MASK ?
+        ggml_kpool_mask(ctx0, sel_mask->src[0], sel_mask->src[1], GGML_KPOOL_MASK_SEL, sel_mask->ne[0] - sel_mask->src[0]->ne[0]) :
+        ggml_dup(ctx0, sel_mask);
 
     mask_all = ggml_view_4d(ctx0, mask_all, 1, mask_all->ne[0], mask_all->ne[1], mask_all->ne[3],
             mask_all->nb[0], mask_all->nb[1], mask_all->nb[2], 0);
@@ -4197,8 +4234,15 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         mask_top_k = ggml_cast(ctx0, mask_top_k, GGML_TYPE_F16);
     }
 
-    // load bearing: keeps an empty, future or foreign-sequence cell masked whatever top-k said
-    mask_top_k = ggml_add(ctx0, mask_top_k, kq_mask);
+    // An empty, future or foreign-sequence cell stays masked whatever top-k said: cand_mask keeps only cells of the row's
+    // sequence at or before its position (kpool_mask_row; test-kpool-input checks its zeros against the KQ mask's), so
+    // adding the KQ mask changes nothing while that mask is 0 or -inf on those cells and -inf elsewhere. A window, ALiBi or
+    // 2-D positions make it more than that, and it is added
+    static const bool kq_add = ggml_env_switch("LLAMA_KPOOL_KQ_ADD_LEGACY");
+
+    if (kq_add || hparams.use_alibi || hparams.swa_type != LLAMA_SWA_TYPE_NONE || hparams.n_pos_per_embd() != 1) {
+        mask_top_k = ggml_add(ctx0, mask_top_k, kq_mask);
+    }
     cb(mask_top_k, "kpool_kq_mask", il);
 
     ggml_tensor * q = q_cur;

@@ -581,6 +581,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_DSV4_HC_WEIGHTS,
+        GGML_OP_KPOOL_MASK,
 
         GGML_OP_UNARY,
 
@@ -2742,6 +2743,31 @@ extern "C" {
             struct ggml_tensor  * base,
             float                 eps,
             int32_t               n_iter);
+
+    // GLM-5-Next's pooled-indexer masks, built where the graph runs: the host writes O(n_kv + n_rows) facts instead of
+    // the O(n_kv*n_rows) masks (src/llama-kv-cache-kpool.cpp, kpool_mask_row is the reference). Every element is 0.0f or
+    // -INFINITY. A cell j is visible to a row at position q when (uint32) pos[j] <= (uint32) q, so a cell not holding the
+    // row's sequence (pos -1) never is.
+    //   GGML_KPOOL_MASK_SEL:  0 at a visible cell in the row's tail, pos[j] >= tail; -inf past n_kv (the dump columns)
+    //   GGML_KPOOL_MASK_CAND: 0 at a visible cell in the tail or in a pool the row sees, (uint32) pool[j] < (uint32) bo_vis
+    // cells: I32 [n_kv, 2, n_ps, n_stream]: for each sequence of a stream, row 0 holds a cell's position if the cell holds
+    //        the sequence, else -1, and row 1 its complete pool counted from the sequence's run (anything outside
+    //        [0, bo_vis) when the pool is not complete)
+    // rows:  I32 [4, n_rows, n_stream]: a query row's position q, its sequence among the stream's (-1: a padded row,
+    //        masked whole), the first position of its tail and the pools it sees (bo_vis)
+    // n_extra: -inf columns after the n_kv
+    // res:   F16 [n_kv + n_extra, n_rows, 1, n_stream]
+    enum ggml_kpool_mask_mode {
+        GGML_KPOOL_MASK_SEL  = 0,
+        GGML_KPOOL_MASK_CAND = 1,
+    };
+
+    GGML_API struct ggml_tensor * ggml_kpool_mask(
+            struct ggml_context     * ctx,
+            struct ggml_tensor      * cells,
+            struct ggml_tensor      * rows,
+            enum ggml_kpool_mask_mode mode,
+            int64_t                   n_extra);
 
     // custom operators
 

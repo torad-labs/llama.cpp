@@ -155,7 +155,9 @@ int64_t llama_kpool_n_kv_max(int64_t n_top_k, int64_t n_tail);
 
 // the maps of llama_kv_cache_set_input_kpool from a cells accessor. views == nullptr builds them from the cells
 // every call; else a sequence alone in its stream is served from its view, byte for byte the same maps.
-// Returns the most cells a row's tail was granted (sel_mask's finite columns in a row)
+// mask_cells and mask_rows (I32, ggml_kpool_mask's cells and rows) instead of sel_mask and cand_mask: the facts the
+// device builds both masks from, O(n_kv + n_rows) where the masks are O(n_kv*n_rows); ggml_kpool_mask on them gives
+// the masks byte for byte. Returns the most cells a row's tail was granted (sel_mask's finite columns in a row)
 int64_t llama_kpool_set_input(
         const llama_kpool_cells_fn & cells_of,
               llama_kpool_views    * views,
@@ -172,7 +174,9 @@ int64_t llama_kpool_set_input(
               int64_t          kv_size,
               bool             rebuild,
         const llama_ubatch   * ubatch,
-              uint32_t         kpool);
+              uint32_t         kpool,
+              ggml_tensor    * mask_cells = nullptr,
+              ggml_tensor    * mask_rows  = nullptr);
 
 // `kv` must be the ATTENTION (MLA) cache; the indexer cache shares its slot layout.
 // LLAMA_KPOOL_INPUT_LEGACY=1 builds the maps from the cells every call; LLAMA_KPOOL_INPUT_CHECK=1 builds them both
@@ -201,7 +205,10 @@ int64_t llama_kv_cache_set_input_kpool(
         // re-emit every complete pool, not only those this ubatch closed; set after a position mutation
               bool             rebuild,
         const llama_ubatch   * ubatch,
-              uint32_t         kpool);
+              uint32_t         kpool,
+        // the device's mask facts in place of sel_mask and cand_mask (llama_kpool_set_input)
+              ggml_tensor    * mask_cells = nullptr,
+              ggml_tensor    * mask_rows  = nullptr);
 
 // current decode geometry for the reuse check below, in the same units the
 // builder sizes the tensors with (llm_graph_context::build_inp_kpool)
@@ -280,6 +287,12 @@ public:
 
     ggml_tensor * sel_mask   = nullptr;   // F16 [n_kv + kpool*n_dump, n_batch, 1, n_stream]; the dump columns -inf
     ggml_tensor * cand_mask  = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
+
+    // the facts ggml_kpool_mask builds both masks from on the device, sel_mask and cand_mask then its results: a cell's
+    // position and pool per sequence of a stream, a row's position, sequence, tail and pools seen. nullptr when the host
+    // writes the masks (LLAMA_KPOOL_MASK_HOST_LEGACY=1)
+    ggml_tensor * mask_cells = nullptr;   // I32 [n_kv, 2, n_ps, n_stream]
+    ggml_tensor * mask_rows  = nullptr;   // I32 [4, n_batch, n_stream]
 
     const llama_kv_cache_context * mctx_attn;
     const llama_kv_cache_context * mctx_idx;
