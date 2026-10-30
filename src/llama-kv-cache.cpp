@@ -3081,7 +3081,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), full(true) {
     n_kv = kv->get_size();
 
     const uint32_t n_stream = kv->get_n_stream();
@@ -3177,6 +3177,10 @@ uint32_t llama_kv_cache_context::get_strm(uint32_t s) const {
 
 const llama_kv_cache * llama_kv_cache_context::get_kv() const {
     return kv;
+}
+
+bool llama_kv_cache_context::is_full() const {
+    return full;
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

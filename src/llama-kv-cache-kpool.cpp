@@ -35,8 +35,9 @@ uint32_t llama_kpool_n_pools_ubatch(const llama_kpool_cells_fn & cells_of, const
     const uint32_t n_ps  = ubatch.n_seqs_unq/n_stream;
     const uint32_t whole = llama_kpool_n_pools(n_kv, kpool, n_ps);
 
-    // the worst-case graph is reserved on a ubatch that names no sequence (ubatch_reserve): it keeps the whole cache's pools,
-    // so the buffers sized at load hold every later graph
+    // the worst-case graph is reserved on the full-cache context (init_full), which gives no cells: it keeps the whole cache's
+    // pools, so the buffers sized at load hold every later graph. Its ubatch names sequences (ubatch_prepare_reserve points
+    // every token at one), so the ubatch alone cannot tell the reserve apart
     if (ubatch.n_tokens == 0 || ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr || !cells_of) {
         return whole;
     }

@@ -690,6 +690,75 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
     return true;
 }
 
+// Reading a prompt allocates no compute memory past load: the buffers reserved at load hold every ubatch of a read that
+// fills the cache, in the main context and in the MTP context, for one sequence and for the served shape (three slots
+// in one unified cache). A decode step's graph slot is allocated on its first use, so decode is not measured here. The
+// worst-case graph sized the pooled indexer's inputs on the cells of the reserve ubatch's sequences, empty at load, so
+// every ubatch of a long read outgrew them and reallocated the buffer: a 45K first read on the Oct 29 lab box (run 12)
+// made 44 cudaMallocHost calls (771 ms) and 44 cudaFreeHost calls (496 ms), and ran 5% slower than the pin.
+static bool test_glm_reserve_holds_reads(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int n_ctx   = 1024;
+    const int n_embd  = llama_model_n_embd(model);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto tokens = get_tokens(n_ctx, n_vocab, seed);
+    std::vector<float> hidden((size_t) n_ctx*n_embd, 0.1f);
+
+    const auto compute = [](const llama_context * ctx) {
+        std::map<ggml_backend_buffer_type_t, size_t> sizes;
+        for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+            sizes[buft] = mb.compute;
+        }
+        return sizes;
+    };
+
+    for (const bool mtp : {false, true}) {
+        for (const bool unified : {false, true}) {
+            llama_context_params params = llama_context_default_params();
+            if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            params.n_ctx      = n_ctx;
+            params.n_batch    = n_ctx;
+            params.n_ubatch   = 64;
+            params.n_seq_max  = unified ? 3 : 1;
+            params.kv_unified = unified;
+            params.n_threads  = params.n_threads_batch = 4;
+            llama_context_ptr ctx(llama_init_from_model(model, params));
+            if (!ctx) return false;
+            const auto at_load = compute(ctx.get());
+
+            const auto decode = [&](int begin, int end) {
+                llama_batch batch = llama_batch_init(end - begin, 0, 1);
+                for (int pos = begin; pos < end; ++pos) {
+                    common_batch_add(batch, tokens[pos], pos, {0}, pos == end - 1);
+                }
+                if (mtp) batch.embd = hidden.data() + (size_t) begin*n_embd;
+                const int result = llama_decode(ctx.get(), batch);
+                batch.embd = nullptr;
+                llama_batch_free(batch);
+                if (result) {
+                    LOG_ERR("GLM reserve: mtp=%d unified=%d decode of %d:%d failed (%d)\n", mtp, unified, begin, end, result);
+                    return false;
+                }
+                const auto now = compute(ctx.get());
+                if (now != at_load) {
+                    for (const auto & [buft, size] : now) {
+                        LOG_ERR("GLM reserve: mtp=%d unified=%d %s compute buffer %zu bytes at load, %zu after %d:%d\n", mtp,
+                                unified, ggml_backend_buft_name(buft), at_load.count(buft) ? at_load.at(buft) : 0, size, begin, end);
+                    }
+                    return false;
+                }
+                return true;
+            };
+
+            if (!decode(0, n_ctx)) return false;
+        }
+    }
+    return true;
+}
+
 static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
@@ -1140,6 +1209,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_mtp_index_sequences(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL MTP sequences\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_reserve_holds_reads(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL reserve\033[0m";
                         }
                     }
 

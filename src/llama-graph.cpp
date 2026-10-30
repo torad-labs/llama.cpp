@@ -4057,10 +4057,14 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         // sized on the ubatch's own sequences, not on n_kv: with --kv-unified the other conversations' cells would each add
         // a pool the indexer scores at -inf bias (a 16K prompt beside 100K cells of another took 869 ms of indexer, 73 ms
-        // alone, on the Oct 29 lab box)
-        const int64_t n_pools = llama_kpool_n_pools_ubatch([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
+        // alone, on the Oct 29 lab box). The worst-case graph reserved at load is given no cells and takes the whole cache's
+        // pools: its ubatch's sequences have no cells of their own, and sized on them it was outgrown by every ubatch of a long
+        // read (a 45K first read reallocated the pinned buffer 44 times, 1.27 s, on the Oct 29 lab box, run 12)
+        const llama_kpool_cells_fn cells_of = mctx_attn->is_full() ? llama_kpool_cells_fn() :
+                llama_kpool_cells_fn([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
             return kv->get_cells(s);
-        }, ubatch, n_kv, kpool, n_stream, hparams.indexer_top_k);
+        });
+        const int64_t n_pools = llama_kpool_n_pools_ubatch(cells_of, ubatch, n_kv, kpool, n_stream, hparams.indexer_top_k);
         const int64_t n_dump  = llama_kpool_select_k(n_pools, hparams.indexer_top_k, kpool);
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
