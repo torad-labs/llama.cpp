@@ -3030,9 +3030,12 @@ struct ggml_cplan ggml_graph_plan(
                     }
                 case GGML_OP_LIGHTNING_INDEXER:
                     {
-                        // temp buffer for dequantizing lightning indexer keys
+                        // temp buffers for dequantizing lightning indexer keys, and a token's q rounded to 8-bit
+                        // blocks under ggml_lightning_indexer_set_q8_query
                         const int64_t ne10 = node->src[1]->ne[0];
-                        cur += sizeof(float)*ne10*n_tasks;
+                        const int64_t n_q_round = ggml_get_op_params_i32(node, 0) == 1 ?
+                            node->src[0]->ne[0]*node->src[0]->ne[1] : 0;
+                        cur += sizeof(float)*(ne10 + n_q_round)*n_tasks;
                     } break;
                 default:
                     break;

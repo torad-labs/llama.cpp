@@ -9502,7 +9502,8 @@ struct test_lightning_indexer_view : public test_case {
 };
 
 // ggml_lightning_indexer_rows: kv keys read through random rows (repeats included) of a cache laid out as GLM-5.3's pooled
-// indexer cache, 3 heads a cell and the key the third, so k is a strided view at the third head's offset.
+// indexer cache, 3 heads a cell and the key the third, so k is a strided view at the third head's offset. q8: the op
+// scores q rounded to 8-bit blocks (ggml_lightning_indexer_set_q8_query), and every 7th block of q is zero.
 struct test_lightning_indexer_rows : public test_case {
     const int64_t nh;     // num indexer heads
     const int64_t kv;     // keys scored (pools)
@@ -9510,9 +9511,10 @@ struct test_lightning_indexer_rows : public test_case {
     const int64_t nb;     // batch size
     const int64_t ns;     // num streams
     const ggml_type type_K;
+    const bool q8;
 
     std::string vars() override {
-        return VARS_TO_STR6(nh, kv, n_rows, nb, ns, type_K);
+        return VARS_TO_STR7(nh, kv, n_rows, nb, ns, type_K, q8);
     }
 
     double max_nmse_err() override {
@@ -9520,8 +9522,8 @@ struct test_lightning_indexer_rows : public test_case {
     }
 
     test_lightning_indexer_rows(int64_t nh = 32, int64_t kv = 256, int64_t n_rows = 1027, int64_t nb = 1, int64_t ns = 1,
-            ggml_type type_K = GGML_TYPE_F16)
-        : nh(nh), kv(kv), n_rows(n_rows), nb(nb), ns(ns), type_K(type_K) {}
+            ggml_type type_K = GGML_TYPE_F16, bool q8 = false)
+        : nh(nh), kv(kv), n_rows(n_rows), nb(nb), ns(ns), type_K(type_K), q8(q8) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk = 128;
@@ -9544,6 +9546,9 @@ struct test_lightning_indexer_rows : public test_case {
         ggml_set_name(m, "m");
 
         ggml_tensor * out = ggml_lightning_indexer_rows(ctx, q, k, rows, w, m);
+        if (q8) {
+            ggml_lightning_indexer_set_q8_query(out);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -9556,6 +9561,14 @@ struct test_lightning_indexer_rows : public test_case {
             }
             if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else if (q8 && strcmp(t->name, "q") == 0) {
+                // a zero block has scale 0
+                std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (i/32) % 7 == 3 ? 0.0f : u(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (t->type == GGML_TYPE_I32) {
                 std::uniform_int_distribution<int32_t> row(0, (int32_t) n_rows - 1);
                 std::vector<int32_t> data(ggml_nelements(t));
@@ -13038,6 +13051,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_lightning_indexer_rows(32, 77, 311, 3, 1, type_K));
     }
+    // the q8 query over a Q8_0 cache: those shapes, 7 and 8 tokens either side of CUDA's switch to its int8 kernel, prefill
+    // ubatches whose tokens and pools end off any tile, and 64 heads
+    for (int64_t nh : { 32, 64 }) {
+        for (int64_t nb : { 1, 3, 7, 8, 64 }) {
+            for (int64_t ns : { 1, 2 }) {
+                test_cases.emplace_back(new test_lightning_indexer_rows(nh, 256, 1027, nb, ns, GGML_TYPE_Q8_0, true));
+            }
+        }
+        test_cases.emplace_back(new test_lightning_indexer_rows(nh, 77, 311, 3, 1, GGML_TYPE_Q8_0, true));
+        test_cases.emplace_back(new test_lightning_indexer_rows(nh, 1000, 4003, 301, 1, GGML_TYPE_Q8_0, true));
+    }
+    test_cases.emplace_back(new test_lightning_indexer_rows(32, 4103, 16411, 517, 2, GGML_TYPE_Q8_0, true));
 
     return test_cases;
 }
@@ -13622,6 +13647,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // GLM-5.3-Flash's pooled indexer at 32K cached tokens: 8258 pools read by rows from the f16 cache, decode and a 3-token verify
     for (int bs : { 1, 3 }) {
         test_cases.emplace_back(new test_lightning_indexer_rows(32, 8258, 33040, bs, 1, GGML_TYPE_F16));
+    }
+    // the q8_0 cache it serves (-ctki q8_0), scored in f32 and with the q8 query: the served 2048-token ubatch at 45K, 64K
+    // and 256K cells, the 1024-token one at 64K, and a decode and a 3-token verify at 32K
+    for (bool q8 : { false, true }) {
+        for (int64_t kv : { 11264, 16384, 65536 }) {
+            test_cases.emplace_back(new test_lightning_indexer_rows(32, kv, 4*kv, 2048, 1, GGML_TYPE_Q8_0, q8));
+        }
+        test_cases.emplace_back(new test_lightning_indexer_rows(32, 16384, 65536, 1024, 1, GGML_TYPE_Q8_0, q8));
+        for (int bs : { 1, 3 }) {
+            test_cases.emplace_back(new test_lightning_indexer_rows(32, 8258, 33040, bs, 1, GGML_TYPE_Q8_0, q8));
+        }
+    }
+    // where the q8 query's int8 kernel overtakes its rounded-buffer path: 2 to 256 tokens at 32K
+    for (bool q8 : { false, true }) {
+        for (int bs : { 2, 4, 6, 8, 12, 16, 32, 64, 256 }) {
+            test_cases.emplace_back(new test_lightning_indexer_rows(32, 8258, 33040, bs, 1, GGML_TYPE_Q8_0, q8));
+        }
     }
 
     return test_cases;
