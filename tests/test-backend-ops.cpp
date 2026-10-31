@@ -12537,6 +12537,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 2}, 16640, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
     }
 
+    // a q4_0 K on GLM-5.3's sparse launch, read in place as the q8_0 K is: a decode and a verify either side of the
+    // sparse launch's switch-over and at 40960 cells, prefill batches on the 8-head and the 32-head tile, 2 sequences,
+    // and rows near the bound, far under it and a sequence's first ubatch
+    for (int64_t kv : { 4096, 4352, 6144, 8448, 40960 }) {
+        for (int64_t nb : { 1, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+        }
+    }
+    for (int sparse_rows : { 0, 1, 2 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16640, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 2}, 16640, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+    }
+
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -13383,6 +13397,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 0));
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 0));
         }
+    }
+    // the same launches on a q4_0 cache, at 32 heads
+    for (int64_t kv : { 16640, 33280, 116736, 262144 }) {
+        for (int64_t nb : { 1, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 0));
+        }
+    }
+    for (int64_t nb : { 64, 512 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 33280, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+    }
+    for (int sparse_rows : { 2, 0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 116736, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
     }
 
     // q8_0 KV cases with long context (decode and prompt)
