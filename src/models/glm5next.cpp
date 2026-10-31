@@ -474,6 +474,13 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
                     kbuf->nb[1], kbuf->nb[2], kbuf->nb[3], 2*kbuf->nb[1]);
 
             pool_score = ggml_lightning_indexer_rows(ctx0, iq, pooled, inp_kp->pool_reps, w, inp_kp->pool_bias_f16);
+
+            // LLAMA_INDEXER_Q8_QUERY=1, lossy and off unless set: over a q8_0 cache (-ctki q8_0) the query is rounded
+            // to 8-bit blocks and scored on int8 tensor cores where the backend has them
+            static const bool q8_query = ggml_env_switch("LLAMA_INDEXER_Q8_QUERY");
+            if (q8_query && pooled->type == GGML_TYPE_Q8_0) {
+                ggml_lightning_indexer_set_q8_query(pool_score);
+            }
         } else {
             // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
             ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, gather_pool_k(), d_idx, 1, n_pools, n_stream);
