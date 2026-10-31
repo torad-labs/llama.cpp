@@ -11781,6 +11781,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 64, 8, true,  2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 64, 8, false, 4096, n, 2048));
     }
+    // and at the served ubatch's width: 2,048 tokens x 8 used over 288 experts is 57 columns an expert, which MMQ tiles
+    // 80 wide, and 114 tokens over 16 experts give the same 57. On SM120 that tile copies each step's weights and
+    // activations into shared memory while the step before it computes, so each case runs several steps a tile: a
+    // card's gate/up under -sm tensor (1,024 rows over 4,096, 16 steps), its down (4,096 over 1,024, 4 steps), and rows
+    // of 768 (3 blocks, so a row's blocks start 4-byte aligned and not in turn), 1,000 of them for the fallback's
+    // 128-wide tile past the last full 128 rows
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 8, true,  1024, 114, 4096));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 8, false, 4096, 114, 1024));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 8, false, 1024, 114,  768));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 8, true,  1000, 114,  768));
     // and the experts' weighted sum after the down: GLM's (4,096 and 8 slots) at a decode, an MTP verify and a batch, and
     // other widths and slot counts (gpt-oss's 2,880 and 4, a row past a block)
     for (int64_t n_embd : { 4096, 2880 }) {
@@ -13350,6 +13360,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 32, 8, false, 2048, bs, 4096, 1));
         }
     }
+    // and a card's share of them under -sm tensor at the served ubatch's 57 columns an expert (2,048 tokens x 8 / 288):
+    // gate/up 4096 -> 1024 and down 1024 -> 4096, 912 tokens over 128 experts, whose 205 MB of weights are past an RTX
+    // PRO 6000's 128 MB L2, as the served 288 experts' 462 MB are
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 128, 8, true,  1024, 912, 4096));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 128, 8, false, 4096, 912, 1024));
     // glm5next's real non-expert shapes, at one row and at an MTP verify's width. The candidate 4-bit formats run
     // beside Q8_0 because the 8.9 GB of non-expert weight is 70 % of what a token reads, and a format that cuts bytes
     // 47 % while losing 30 % of achieved bandwidth is not a 47 % win. 4096 x 154880 is the output head, read every

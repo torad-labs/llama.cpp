@@ -1528,6 +1528,95 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// The staged IQ3_XXS step (mmq.cuh, MMQ_IQ3_XXS_STAGED_ROW): issues the cp.async copies of each row's block kbx0 into
+// x_staged, a row every MMQ_IQ3_XXS_STAGED_ROW bytes. Rows past i_max are not copied: the dequantization reads row
+// i_max in their place, as ggml_cuda_mmq_load_tiles_iq3_xxs does.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_stage_x_iq3_xxs(
+        const char * __restrict__ x, char * __restrict__ x_staged, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads  = ggml_cuda_mmq_get_nthreads(type, J, fallback);
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int pieces    = MMQ_IQ3_XXS_STAGED_ROW/16;
+    static_assert(MMQ_IQ3_XXS_STAGED_ROW % 16 == 0 && MMQ_IQ3_XXS_STAGED_ROW >= 14 + int(sizeof(block_iq3_xxs)),
+        "a staged row holds its block from any 2-byte offset in a 16-byte line");
+
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+
+#pragma unroll
+    for (int c0 = 0; c0 < I*pieces; c0 += nthreads) {
+        const int c = c0 + tid;
+
+        if (c0 + nthreads > I*pieces && c >= I*pieces) {
+            break;
+        }
+
+        const int i     = c / pieces;
+        const int piece = c % pieces;
+
+        if (fallback && i > i_max) {
+            continue;
+        }
+
+        const char * block = (const char *) ((const block_iq3_xxs *) x + kbx0 + i*stride);
+        const char * line  = (const char *) (uintptr_t(block) & ~uintptr_t(15));
+        cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(x_staged + i*MMQ_IQ3_XXS_STAGED_ROW + 16*piece), line + 16*piece);
+    }
+}
+
+// The staged IQ3_XXS step's dequantization: ggml_cuda_mmq_load_tiles_iq3_xxs's MMA tile, from the rows
+// ggml_cuda_mmq_stage_x_iq3_xxs copied for the same kbx0 and from the grid in shared memory.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_xxs_staged(
+        const char * __restrict__ x, const char * __restrict__ x_staged, const uint32_t * __restrict__ grid,
+        int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+
+    constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR3_XXS)) / 2;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        // the block's offset in its staged row is its address's offset in its 16-byte line
+        const uintptr_t       addr = uintptr_t((const block_iq3_xxs *) x + kbx0 + i*stride);
+        const block_iq3_xxs * bxi  = (const block_iq3_xxs *) (x_staged + i*MMQ_IQ3_XXS_STAGED_ROW + (addr & 15));
+
+        const int2 q3_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+        const uint8_t * q3 = (const uint8_t *) &q3_packed;
+        const uint32_t aux32 = get_int_b2(bxi->qs, QK_K/16 + kqsx);
+
+#pragma unroll
+        for (int l = 0; l < QR3_XXS; ++l) {
+            const int2 grid_pos = make_int2(grid[q3[2*l+0]], grid[q3[2*l+1]]);
+            const uint32_t signs = unpack_ksigns(aux32 >> (7*l));
+
+            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+
+            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+            x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;
+            x_qs[i*sram_stride + 8*kqsx + (2*l + 1)] = grid_h;
+        }
+
+        const int ls = aux32 >> 28;
+        const float d = bxi->d;
+        x_df[i*sram_stride + kqsx] = (ls*d + d/2)/2;
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_s(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
