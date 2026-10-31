@@ -12498,10 +12498,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // under the 8-head tile's switch-over: the masked dense kernel, and the 32-head tile with GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER=1
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},  8192, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
 
-    // q8_0 K on GLM-5.3's sparse launch (the V cache a view of it): a decode and a verify gather only the cells their
-    // indices name (2 x batch x n_kv_max cells under the cache: kv 4352 is the first a decode gathers at a quantized cache's
-    // 256-cell pad, 4096 the last whole conversion), prefill batches and a cache under their cells convert the whole K;
-    // 2 sequences; 576-wide K with 16 heads
+    // q8_0 K on GLM-5.3's sparse launch (the V cache a view of it): the kernel reads the q8_0 rows its indices name and
+    // each serves K and V, for a decode, a verify and prefill batches alike; with GGML_CUDA_FATTN_SPARSE_DEQ_LEGACY=1 a
+    // decode and a verify gather only those cells into an f16 copy (2 x batch x n_kv_max cells under the cache: kv 4352 is
+    // the first a decode gathers at a quantized cache's 256-cell pad, 4096 the last whole conversion), and prefill batches
+    // and a cache under their cells convert the whole K; 2 sequences; 576-wide K with 16 heads
     for (int64_t kv : { 4096, 4352, 8448, 16640, 40960 }) {
         for (int64_t nb : { 1, 2, 3 }) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
@@ -12518,7 +12519,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Rows far under the bound (sparse_rows 1: 1 cell, a KV step either side of 32 and 64, half the bound, then spread; 2: a
     // sequence's first ubatch, row r on its r + 1 cells at the cache's end), as a short conversation beside others' cells
     // gives them: the 8-head launch's stream-k blocks, a decode and a verify, 2 streams, the 576-wide K, a q8_0 K's gather,
-    // and the 32-head tile (from 376 rows at 32 heads, 188 at 64, on an RTX PRO 6000's 188 SMs) with its seams pass
+    // and the 32-head tile (from 376 rows at 32 heads, 188 at 64, on an RTX PRO 6000's 188 SMs) with its seams pass, on an
+    // f16 K and on a q8_0 K read in place
     for (int sparse_rows : { 1, 2 }) {
         for (int64_t nb : { 1, 3, 16 }) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, 0, false, 512, sparse_rows));
@@ -12530,6 +12532,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16640, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 16640,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16640, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 2}, 16640, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
     }
 
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
@@ -13361,6 +13366,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 116736, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 0));
     for (int64_t nb : { 1, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 116736, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 1));
+    }
+    // the same on the q8_0 cache GLM-5.3 serves (GGML_CUDA_FATTN_SPARSE_DEQ_LEGACY=1: through an f16 copy), and at 64 heads, one
+    // card's, and the 262,144 cells of a long conversation
+    for (int64_t kv : { 8448, 16640, 33280 }) {
+        for (int64_t nb : { 1, 3, 64, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080));
+        }
+    }
+    for (int sparse_rows : { 2, 0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 116736, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 116736, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, sparse_rows));
+    }
+    for (int64_t kv : { 116736, 262144 }) {
+        for (int64_t nb : { 1, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 0));
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, false, 0, false, 2080, 0));
+        }
     }
 
     // q8_0 KV cases with long context (decode and prompt)

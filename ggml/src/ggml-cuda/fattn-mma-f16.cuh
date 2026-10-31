@@ -674,9 +674,75 @@ static __device__ __forceinline__ void flash_attn_ext_raw_load(
     }
 }
 
-// Each thread converts 2 blocks (36 bytes for q4_0, 68 for q8_0, 4-byte aligned). The result is bit-identical to
-// dequantize_block_q4_0 and dequantize_block_q8_0: the integer values are exact in f16 and one __hmul2 rounds the
-// product with the block scale once, as the f32 product converted to f16 does.
+// A pair of q4_0 or q8_0 blocks, 36 or 68 bytes as 32-bit words, converted to f16: 32 half2 at dst. The result is
+// bit-identical to dequantize_block_q4_0 and dequantize_block_q8_0: the integer values are exact in f16 and one __hmul2
+// rounds the product with the block scale once, as the f32 product converted to f16 does.
+template<ggml_type type>
+static __device__ __forceinline__ void flash_attn_ext_raw_dequant_pair(const int * const w, half2 * const dst) {
+    static_assert(type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0, "no raw tile of this type");
+    if constexpr (type == GGML_TYPE_Q4_0) {
+        const half2 bias = make_half2(1032.0f, 1032.0f); // 0x6400 | q is 1024 + q, remove 1024 and the q4_0 offset 8
+
+        // Block 0: d in bytes 0-1, qs in bytes 2-17. Block 1: d in bytes 18-19, qs in bytes 20-35.
+        int qs[2][4];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            qs[0][l] = __byte_perm(w[l], w[l + 1], 0x5432);
+            qs[1][l] = w[l + 5];
+        }
+        const half d[2] = {__ushort_as_half(w[0] & 0xFFFF), __ushort_as_half(uint32_t(w[4]) >> 16)};
+
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {
+            const half2 d2 = __half2half2(d[b]);
+            half2 lo[8]; // values 0-15 of the block, from the low nibbles
+            half2 hi[8]; // values 16-31 of the block, from the high nibbles
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int v = __byte_perm(qs[b][t], 0, h == 0 ? 0x4140 : 0x4342); // two bytes, one per half
+                    const int vlo = ( v       & 0x000F000F) | 0x64006400;
+                    const int vhi = ((v >> 4) & 0x000F000F) | 0x64006400;
+                    lo[2*t + h] = __hmul2(__hsub2(*((const half2 *) &vlo), bias), d2);
+                    hi[2*t + h] = __hmul2(__hsub2(*((const half2 *) &vhi), bias), d2);
+                }
+            }
+            half2 * dst_b = dst + b*(QK4_0/2);
+            ggml_cuda_memcpy_1<16>(dst_b +  0, lo + 0);
+            ggml_cuda_memcpy_1<16>(dst_b +  4, lo + 4);
+            ggml_cuda_memcpy_1<16>(dst_b +  8, hi + 0);
+            ggml_cuda_memcpy_1<16>(dst_b + 12, hi + 4);
+        }
+    } else {
+        // A signed byte q flipped to q + 128 under the f16 exponent byte 0x64 is 1024 + 128 + q: remove 1152.
+        const half2 bias = make_half2(1152.0f, 1152.0f);
+
+        // Block 0: d in bytes 0-1, qs in bytes 2-33. Block 1: d in bytes 34-35, qs in bytes 36-67.
+        const half d[2] = {__ushort_as_half(w[0] & 0xFFFF), __ushort_as_half(uint32_t(w[8]) >> 16)};
+
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {
+            const half2 d2 = __half2half2(d[b]);
+            half2 v[QK8_0/2]; // values 2l and 2l+1 of the block
+#pragma unroll
+            for (int l = 0; l < QK8_0/4; ++l) {
+                const int qs = (b == 0 ? __byte_perm(w[l], w[l + 1], 0x5432) : w[l + 9]) ^ 0x80808080;
+                const int v0 = __byte_perm(qs, 0x64646464, 0x4140); // values 4l and 4l+1, one per half
+                const int v1 = __byte_perm(qs, 0x64646464, 0x4342); // values 4l+2 and 4l+3
+                v[2*l + 0] = __hmul2(__hsub2(*((const half2 *) &v0), bias), d2);
+                v[2*l + 1] = __hmul2(__hsub2(*((const half2 *) &v1), bias), d2);
+            }
+            half2 * dst_b = dst + b*(QK8_0/2);
+#pragma unroll
+            for (int l = 0; l < QK8_0/2; l += 4) {
+                ggml_cuda_memcpy_1<16>(dst_b + l, v + l);
+            }
+        }
+    }
+}
+
+// Each thread converts 2 blocks (flash_attn_ext_raw_dequant_pair), 4-byte aligned in the raw tile.
 // 8 consecutive threads take the same block pair of 8 consecutive rows. A 16-byte store is served 8 threads at a time,
 // and a row stride of an odd number of 16 bytes puts 8 rows in 8 distinct bank quads; 8 threads on 2 rows hit 2, a
 // 4-way conflict that was 3.2M of the 4.4M shared store wavefronts (ncu, RTX 5080, head 256 at 65,536 cells). A warp
@@ -710,68 +776,101 @@ static __device__ __forceinline__ void flash_attn_ext_raw_dequant_tile(
         for (int l = 0; l < pair_words; ++l) {
             w[l] = src[l];
         }
+        flash_attn_ext_raw_dequant_pair<type>(w, tile + i*stride_tile + bp*QK8_0);
+    }
+}
 
-        if constexpr (type == GGML_TYPE_Q4_0) {
-            const half2 bias = make_half2(1032.0f, 1032.0f); // 0x6400 | q is 1024 + q, remove 1024 and the q4_0 offset 8
+// The sparse launch's K tile from a q4_0 or q8_0 K whose V is a view of it (GLM's 512-wide latent): the raw rows the indices
+// name are copied asynchronously to the end of their own f16 rows in the tile, raw_offset bytes in, then each warp converts
+// 8 rows in place, reading all of a row's raw words before it writes any of the row. VRAM and L2 are read in the cache's
+// size, the tile takes no shared memory beyond the f16 one, and V reads the same tile. A slot with no cell (-1, or past i_sup)
+// is zeros; the mask is -inf there, as it is at the row 0 the f16 load reads for such a slot, so the output is that of an f16
+// copy of K bit for bit.
+// Each lane takes the block pairs bp and bp + 4 of one of 8 rows: per load, 8 rows x 4 pairs of raw words fall in 32 distinct
+// banks for a row stride of an odd number of 16 bytes, and per 16-byte store 8 rows fall in 8 distinct bank quads.
+template<ggml_type type, int D, int nwarps, int nbatch_fa, int stride_tile>
+static __device__ __forceinline__ void flash_attn_ext_deq_load_tile(
+        const char * const __restrict__ K, half2 * const __restrict__ tile, const int stride_K,
+        const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices) {
+#ifdef CP_ASYNC_AVAILABLE
+    constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
+    constexpr int row_bytes      = fattn_raw_row_bytes<type, D>();
+    constexpr int chunks_per_row = row_bytes/16;
+    constexpr int nchunks        = nbatch_fa*chunks_per_row;
+    constexpr int stride_bytes   = stride_tile*sizeof(half2);
+    constexpr int raw_offset     = stride_bytes - row_bytes;
+    constexpr int pairs_per_row  = D/(2*QK8_0);
+    constexpr int pair_bytes     = 2*fattn_raw_block_bytes<type>();
+    constexpr int pair_words     = pair_bytes/sizeof(int);
+    constexpr int ngroups        = nbatch_fa/8;
+    static_assert(warp_size == 32, "bad warp_size");
+    static_assert(row_bytes > 0 && row_bytes % 16 == 0, "raw rows are copied in 16-byte chunks");
+    static_assert(stride_bytes >= D*int(sizeof(half)) && raw_offset % 16 == 0, "the raw row must fit the end of its f16 row");
+    static_assert(stride_bytes % 32 == 16, "the row stride must be an odd number of 16 bytes");
+    static_assert(pairs_per_row == 8 && nbatch_fa % 8 == 0, "a warp converts 8 rows of 8 block pairs");
 
-            // Block 0: d in bytes 0-1, qs in bytes 2-17. Block 1: d in bytes 18-19, qs in bytes 20-35.
-            int qs[2][4];
+    const unsigned int tile_32 = ggml_cuda_cvta_generic_to_shared(tile);
+
 #pragma unroll
-            for (int l = 0; l < 4; ++l) {
-                qs[0][l] = __byte_perm(w[l], w[l + 1], 0x5432);
-                qs[1][l] = w[l + 5];
+    for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
+        const int c = c0 + threadIdx.y*warp_size + threadIdx.x;
+
+        if (c0 + nwarps*warp_size > nchunks && c >= nchunks) {
+            break;
+        }
+
+        const int i = c / chunks_per_row;
+        const int k = c % chunks_per_row;
+        const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
+        if (index >= 0) {
+            cp_async_cg_16<64>(tile_32 + i*stride_bytes + raw_offset + k*16, K + int64_t(index)*stride_K + k*16);
+        }
+    }
+    cp_async_wait_all();
+    __syncthreads();
+
+    const int r  = threadIdx.x % 8;
+    const int bp = threadIdx.x / 8;
+#pragma unroll
+    for (int g0 = 0; g0 < ngroups; g0 += nwarps) {
+        const int g = g0 + threadIdx.y;
+
+        if (g0 + nwarps > ngroups && g >= ngroups) {
+            break;
+        }
+
+        const int i = 8*g + r;
+        const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
+
+        int w[2][pair_words];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int * src = (const int *) ((const char *) tile + i*stride_bytes + raw_offset + (bp + 4*h)*pair_bytes);
+#pragma unroll
+            for (int l = 0; l < pair_words; ++l) {
+                w[h][l] = src[l];
             }
-            const half d[2] = {__ushort_as_half(w[0] & 0xFFFF), __ushort_as_half(uint32_t(w[4]) >> 16)};
+        }
+        __syncwarp(); // the warp's 8 rows are read before any of them is written
 
 #pragma unroll
-            for (int b = 0; b < 2; ++b) {
-                const half2 d2 = __half2half2(d[b]);
-                half2 lo[8]; // values 0-15 of the block, from the low nibbles
-                half2 hi[8]; // values 16-31 of the block, from the high nibbles
+        for (int h = 0; h < 2; ++h) {
+            half2 * dst = tile + i*stride_tile + (bp + 4*h)*QK8_0;
+            if (index >= 0) {
+                flash_attn_ext_raw_dequant_pair<type>(w[h], dst);
+            } else {
+                const int4 zero = {0, 0, 0, 0};
 #pragma unroll
-                for (int t = 0; t < 4; ++t) {
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        const int v = __byte_perm(qs[b][t], 0, h == 0 ? 0x4140 : 0x4342); // two bytes, one per half
-                        const int vlo = ( v       & 0x000F000F) | 0x64006400;
-                        const int vhi = ((v >> 4) & 0x000F000F) | 0x64006400;
-                        lo[2*t + h] = __hmul2(__hsub2(*((const half2 *) &vlo), bias), d2);
-                        hi[2*t + h] = __hmul2(__hsub2(*((const half2 *) &vhi), bias), d2);
-                    }
-                }
-                half2 * dst = tile + i*stride_tile + (2*bp + b)*(QK4_0/2);
-                ggml_cuda_memcpy_1<16>(dst +  0, lo + 0);
-                ggml_cuda_memcpy_1<16>(dst +  4, lo + 4);
-                ggml_cuda_memcpy_1<16>(dst +  8, hi + 0);
-                ggml_cuda_memcpy_1<16>(dst + 12, hi + 4);
-            }
-        } else {
-            // A signed byte q flipped to q + 128 under the f16 exponent byte 0x64 is 1024 + 128 + q: remove 1152.
-            const half2 bias = make_half2(1152.0f, 1152.0f);
-
-            // Block 0: d in bytes 0-1, qs in bytes 2-33. Block 1: d in bytes 34-35, qs in bytes 36-67.
-            const half d[2] = {__ushort_as_half(w[0] & 0xFFFF), __ushort_as_half(uint32_t(w[8]) >> 16)};
-
-#pragma unroll
-            for (int b = 0; b < 2; ++b) {
-                const half2 d2 = __half2half2(d[b]);
-                half2 v[QK8_0/2]; // values 2l and 2l+1 of the block
-#pragma unroll
-                for (int l = 0; l < QK8_0/4; ++l) {
-                    const int qs = (b == 0 ? __byte_perm(w[l], w[l + 1], 0x5432) : w[l + 9]) ^ 0x80808080;
-                    const int v0 = __byte_perm(qs, 0x64646464, 0x4140); // values 4l and 4l+1, one per half
-                    const int v1 = __byte_perm(qs, 0x64646464, 0x4342); // values 4l+2 and 4l+3
-                    v[2*l + 0] = __hmul2(__hsub2(*((const half2 *) &v0), bias), d2);
-                    v[2*l + 1] = __hmul2(__hsub2(*((const half2 *) &v1), bias), d2);
-                }
-                half2 * dst = tile + i*stride_tile + (2*bp + b)*(QK8_0/2);
-#pragma unroll
-                for (int l = 0; l < QK8_0/2; l += 4) {
-                    ggml_cuda_memcpy_1<16>(dst + l, v + l);
+                for (int l = 0; l < QK8_0; l += 4) {
+                    *((int4 *) (dst + l)) = zero;
                 }
             }
         }
     }
+#else
+    GGML_UNUSED_VARS(K, tile, stride_K, k_VKQ_0, i_sup, indices);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
 }
 
 // K*Q for q4_0 or q8_0 K runs as int8 tensor core MMAs on the raw values, 4x the rate of the f16 MMA with f32
@@ -971,10 +1070,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols_cfg);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols_cfg);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse);
-    constexpr bool raw_KV          = type_K != GGML_TYPE_F16;
-    static_assert(raw_KV == (type_V != GGML_TYPE_F16), "K and V are both raw or both f16");
-    static_assert(!use_sparse || !raw_KV, "the sparse gather reads f16 K/V");
+    // raw: K*Q on the int8 values (the multi-stage pipeline); deq: the sparse K tile converted to f16 as it loads, V that tile
+    constexpr bool raw_KV          = type_K != GGML_TYPE_F16 && !use_sparse;
+    constexpr bool deq_K           = type_K != GGML_TYPE_F16 &&  use_sparse;
+    static_assert((type_K != GGML_TYPE_F16) == (type_V != GGML_TYPE_F16), "K and V are both raw or both f16");
     static_assert(!raw_KV || cols_per_warp == 16, "raw K*Q needs 16 Q columns per warp");
+    static_assert(!deq_K || (V_is_K_view && nstages == 1 && nbatch_K2 == DKQ/2 && DV <= DKQ),
+        "a sparse q4_0/q8_0 K tile loads whole rows in one stage and V reads it");
     // The next raw K tile loads as soon as K*Q has read this one, in flight beside this step's V through the softmax,
     // where 2 blocks share an SM: the 4-warp tiles of a verify, whose K then loaded only after V arrived, 1-3 % slower at
     // 65,536 cells. With 3 blocks an SM (a decode token's 2-warp tile) K loads after V arrives: loaded early it ran 1-2 %
@@ -1030,12 +1132,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
 
         if constexpr (nstages <= 1) {
-            const int k0_diff = k0_stop - k0_start;
-            constexpr bool use_cp_async = nstages == 1;
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
-            if (use_cp_async) {
-                cp_async_wait_all();
+            if constexpr (deq_K) {
+                flash_attn_ext_deq_load_tile<type_K, DKQ, nwarps, nbatch_fa, stride_tile_K>
+                    ((const char *) K_h2, tile_K, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+            } else {
+                const int k0_diff = k0_stop - k0_start;
+                constexpr bool use_cp_async = nstages == 1;
+                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                    (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+                if (use_cp_async) {
+                    cp_async_wait_all();
+                }
             }
             __syncthreads();
         }
@@ -1641,7 +1748,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
     char  * tile_raw  = (char *) (tile_mask + ncols1*(nbatch_fa + 8)); // raw K/V only: raw K tile, then raw V tile
 
-    constexpr bool raw_KV = type_K != GGML_TYPE_F16;
+    constexpr bool raw_KV = type_K != GGML_TYPE_F16 && !use_sparse; // a sparse q4_0/q8_0 K is converted as it loads
     T_B_KQ    Q_B[(Q_in_reg && !raw_KV ? DKQ/(2*T_B_KQ::J) : 1)];
     fattn_raw_Q8<DKQ> Q8; // Q for the int8 K*Q of raw K, used instead of Q_B
 #if defined(TURING_MMA_AVAILABLE)
@@ -2183,6 +2290,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
+// The q4_0 and q8_0 K the sparse launch reads in place, each row it gathers converted to f16 in the K tile, which V reads:
+// GLM-5.3's 512-wide latent, V a view of K (flash_attn_ext_deq_load_tile).
+static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_sparse_deq_type(const int DKQ, const int DV, const ggml_type type_K) {
+    return DKQ == 512 && DV == 512 && (type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q8_0);
+}
+
 // The instances with a sparse variant (ggml_flash_attn_ext_set_n_kv_max): one token a tile, DeepSeek's and GLM's MLA heads,
 // and GLM's 32-head tile (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads).
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
@@ -2244,7 +2357,8 @@ static __global__ void flash_attn_ext_f16(
         return;
     }
     // the sparse variant only where the host launches it, so no other instance compiles its code
-    constexpr bool use_sparse_arch = use_sparse && !use_logit_softcap && type_K == GGML_TYPE_F16 &&
+    constexpr bool use_sparse_arch = use_sparse && !use_logit_softcap &&
+        (type_K == GGML_TYPE_F16 || (V_is_K_view && ggml_cuda_fattn_mma_sparse_deq_type(DKQ, DV, type_K))) &&
         ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2);
     if (use_sparse != use_sparse_arch) {
         NO_DEVICE_CODE;
@@ -2282,13 +2396,14 @@ static __global__ void flash_attn_ext_f16(
     }
 #endif // defined(AMD_MFMA_AVAILABLE)
 
-    // Raw K/V needs cp.async and the int8 m16n8k32 MMA, see ggml_cuda_fattn_mma_raw.
-    constexpr bool raw_KV = type_K != GGML_TYPE_F16;
+    // Raw K/V needs cp.async and the int8 m16n8k32 MMA, see ggml_cuda_fattn_mma_raw; a sparse q4_0/q8_0 K, cp.async
+    // (flash_attn_ext_deq_load_tile). Both read K and V in bytes.
+    constexpr bool quant_KV = type_K != GGML_TYPE_F16;
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr ggml_type type_K_arch = type_K;
     constexpr ggml_type type_V_arch = type_V;
 #else
-    if (raw_KV) {
+    if (quant_KV) {
         NO_DEVICE_CODE;
         return;
     }
@@ -2307,10 +2422,10 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
-    const int stride_K    = raw_KV ? nb11 : nb11 / sizeof(half2); // raw strides stay in bytes
+    const int stride_K    = quant_KV ? nb11 : nb11 / sizeof(half2); // raw strides stay in bytes
     const int stride_mask = nb31 / sizeof(half);
 
-    const int stride_V = V_is_K_view ? stride_K : (raw_KV ? nb21 : nb21 / sizeof(half2));
+    const int stride_V = V_is_K_view ? stride_K : (quant_KV ? nb21 : nb21 / sizeof(half2));
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
@@ -2416,7 +2531,7 @@ static __global__ void flash_attn_ext_f16(
 
 // Whether dst runs the sparse variant: n_kv_max set, an f16 mask of one head, no ALiBi or softcap, and a cache at least
 // 4096 cells and as many as the gather reads for the queries one dense pass covers. Defined in fattn.cu.
-bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int ncols2);
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(int device, const ggml_tensor * dst, int ncols2);
 
 // A launch's warps, KV step and shared memory, the layout flash_attn_ext_f16_process_tile carves.
 struct fattn_mma_geometry {
@@ -2426,7 +2541,8 @@ struct fattn_mma_geometry {
     size_t nbytes_shared;
 };
 
-template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
+// use_sparse: a q4_0/q8_0 K is converted as it loads (flash_attn_ext_deq_load_tile), in the f16 tile; else it is raw.
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool use_sparse = false>
 static fattn_mma_geometry ggml_cuda_fattn_mma_get_geometry(const int cc, const int warp_size) {
     constexpr int ncols     = ncols1 * ncols2;
     constexpr int ncols_cfg = ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2);
@@ -2443,7 +2559,7 @@ static fattn_mma_geometry ggml_cuda_fattn_mma_get_geometry(const int cc, const i
     const int cols_per_warp = std::min(ncols_cfg, get_cols_per_warp(cc));
     const int nwarps        = nthreads / warp_size;
 
-    constexpr bool raw_KV = type_K != GGML_TYPE_F16;
+    constexpr bool raw_KV = type_K != GGML_TYPE_F16 && !use_sparse;
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_KV_2stage = (fattn_mma_tile_K_h2(type_K, nbatch_fa, nbatch_K2 + 4) + nbatch_fa*(nbatch_V2 + 4))
@@ -2451,7 +2567,7 @@ static fattn_mma_geometry ggml_cuda_fattn_mma_get_geometry(const int cc, const i
     const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
     const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
-    const size_t nbytes_shared_raw       = nbatch_fa*(fattn_raw_row_bytes<type_K, DKQ>() + fattn_raw_row_bytes<type_V, DV>());
+    const size_t nbytes_shared_raw       = raw_KV ? nbatch_fa*(fattn_raw_row_bytes<type_K, DKQ>() + fattn_raw_row_bytes<type_V, DV>()) : 0;
 
     GGML_ASSERT(!raw_KV || nstages > 1);
     const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
@@ -2464,7 +2580,7 @@ static fattn_mma_geometry ggml_cuda_fattn_mma_get_geometry(const int cc, const i
 }
 
 // Whether dst's sparse launch is the 32-head tile's (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads). Defined in fattn.cu.
-bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(int device, const ggml_tensor * dst);
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // GLM-5.3's DSA prefill: a query's heads on the latent (64 on one card, 32 a card under -sm tensor) gather the same cells,
@@ -2472,14 +2588,14 @@ bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ggml_backend_cuda_contex
 // whole: the ncols2-head launch's result wherever that launch does the tile in one piece. The tiles its stream-k grid splits
 // are then redone by that launch's kernel on that grid, the whole tiles skipped, and combined by its fixup, so the output is
 // the ncols2-head launch's bit for bit.
-template <int DKQ, int DV, int ncols2>
+template <int DKQ, int DV, int ncols2, bool V_is_K_view, ggml_type type_K>
 static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const fattn_kernel_t kernel_tile, const fattn_mma_geometry & geom_tile, const int warp_size) {
-    constexpr int       ncols2_heads = 32;
-    constexpr ggml_type F16          = GGML_TYPE_F16;
+    constexpr int  ncols2_heads = 32;
+    constexpr bool deq_K        = type_K != GGML_TYPE_F16; // read in place, see flash_attn_ext_deq_load_tile
     static_assert(ggml_cuda_fattn_mma_head_groups(DKQ, DV, 1, ncols2_heads)*ncols2 == ncols2_heads, "a head group is the tile");
 
-    if (!ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ctx, dst)) {
+    if (!ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(ctx.device, dst)) {
         return false;
     }
 
@@ -2488,9 +2604,9 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads(ggml_backend_cuda_cont
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
 
-    const fattn_kernel_t     kernel_heads = flash_attn_ext_f16<DKQ, DV, 1, ncols2_heads, false, false, F16, F16, true>;
-    const fattn_kernel_t     kernel_seams = flash_attn_ext_f16<DKQ, DV, 1, ncols2,       false, false, F16, F16, true, true>;
-    const fattn_mma_geometry geom_heads   = ggml_cuda_fattn_mma_get_geometry<DKQ, DV, 1, ncols2_heads, F16, F16>(cc, warp_size);
+    const fattn_kernel_t     kernel_heads = flash_attn_ext_f16<DKQ, DV, 1, ncols2_heads, false, V_is_K_view, type_K, type_K, true>;
+    const fattn_kernel_t     kernel_seams = flash_attn_ext_f16<DKQ, DV, 1, ncols2,       false, V_is_K_view, type_K, type_K, true, true>;
+    const fattn_mma_geometry geom_heads   = ggml_cuda_fattn_mma_get_geometry<DKQ, DV, 1, ncols2_heads, type_K, type_K, true>(cc, warp_size);
     GGML_ASSERT(geom_heads.nstages <= 1 && geom_heads.nbatch_fa == geom_tile.nbatch_fa);
 
     static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -2507,10 +2623,36 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads(ggml_backend_cuda_cont
     ggml_cuda_flash_attn_ext_compact_mask(mask, indices.ptr, indices.ptr + size_t(n_kv_max) * nrows, n_kv_max, ctx.stream());
 
     launch_fattn<DV, 1, ncols2_heads>(ctx, dst, kernel_heads, geom_heads.nwarps, geom_heads.nbytes_shared, geom_heads.nbatch_fa,
-        true, true, true, warp_size, true, true, {indices.ptr, true, nullptr, counts});
+        !deq_K, !deq_K, true, warp_size, true, true, {indices.ptr, true, nullptr, counts});
     launch_fattn<DV, 1, ncols2>(ctx, dst, kernel_seams, geom_tile.nwarps, geom_tile.nbytes_shared, geom_tile.nbatch_fa,
-        true, true, true, warp_size, true, true, {indices.ptr, false, kernel_tile, counts});
+        !deq_K, !deq_K, true, warp_size, true, true, {indices.ptr, false, kernel_tile, counts});
     return true;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// The sparse launch: the ncols2-head tile, or for GLM's latent the 32-head tile where it takes the launch. V_is_K_view: V reads
+// K's tile and gathers no rows of its own (ggml_cuda_fattn_V_same_as_K).
+template <int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_mma_f16_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const fattn_mma_geometry & geom, const int warp_size) {
+    constexpr bool deq_K = type_K != GGML_TYPE_F16; // read in place, see flash_attn_ext_deq_load_tile
+    const int id = ggml_cuda_get_device();
+
+    const fattn_kernel_t kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, type_K, type_V, true>;
+    static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+    if (!shared_memory_limit_raised[id]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, geom.nbytes_shared));
+        shared_memory_limit_raised[id] = true;
+    }
+
+    if constexpr (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) {
+        if (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads<DKQ, DV, ncols2, V_is_K_view, type_K>(ctx, dst, kernel, geom, warp_size)) {
+            return;
+        }
+    }
+    launch_fattn<DV, ncols1, ncols2>(ctx, dst, kernel, geom.nwarps, geom.nbytes_shared, geom.nbatch_fa, !deq_K, !deq_K, true,
+        warp_size, true, true);
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -2520,50 +2662,71 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
 
+    // A q4_0 or q8_0 K is raw (head size 256: the int8 K*Q of the multi-stage pipeline) or, on a sparse instance, read in
+    // place (GLM's latent: ggml_cuda_fattn_mma_sparse_deq takes it for a sparse launch with V a view of K, and nothing else).
+    constexpr bool deq_K  = type_K != GGML_TYPE_F16 && ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2);
+    constexpr bool raw_KV = type_K != GGML_TYPE_F16 && !deq_K;
+
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
-    const fattn_mma_geometry geom = ggml_cuda_fattn_mma_get_geometry<DKQ, DV, ncols1, ncols2, type_K, type_V>(cc, warp_size_host);
-    const int    nwarps              = geom.nwarps;
-    const int    nbatch_fa           = geom.nbatch_fa;
-    const int    nstages             = geom.nstages;
-    const size_t nbytes_shared_total = geom.nbytes_shared;
+    const fattn_mma_geometry geom = ggml_cuda_fattn_mma_get_geometry<DKQ, DV, ncols1, ncols2, type_K, type_V, deq_K>(cc, warp_size_host);
 
-    constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
-    constexpr bool raw_KV      = type_K != GGML_TYPE_F16;
+    if constexpr (deq_K) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        static_assert(ggml_cuda_fattn_mma_sparse_deq_type(DKQ, DV, type_K) && type_V == type_K, "no in-place read of this K");
+        GGML_ASSERT(geom.nstages <= 1 && ggml_cuda_fattn_V_same_as_K(dst) && (uintptr_t) dst->src[1]->data % 16 == 0);
+        ggml_cuda_flash_attn_ext_mma_f16_sparse<DKQ, DV, ncols1, ncols2, true, type_K, type_V>(ctx, dst, geom, warp_size_host);
+#else
+        GGML_UNUSED_VARS(ctx, dst, geom);
+        GGML_ABORT("fatal error");
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    } else {
+        const int    nwarps              = geom.nwarps;
+        const int    nbatch_fa           = geom.nbatch_fa;
+        const int    nstages             = geom.nstages;
+        const size_t nbytes_shared_total = geom.nbytes_shared;
 
-    float logit_softcap;
-    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
+
+        float logit_softcap;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
 #if defined(GGML_USE_HIP)
-    using fattn_kernel_ptr_t = const void*;
+        using fattn_kernel_ptr_t = const void*;
 #else
-    using fattn_kernel_ptr_t = fattn_kernel_t;
+        using fattn_kernel_ptr_t = fattn_kernel_t;
 #endif // defined(GGML_USE_HIP)
-    fattn_kernel_t fattn_kernel;
-    bool use_sparse = false;
-    if (logit_softcap == 0.0f) {
-        constexpr bool use_logit_softcap = false;
+        fattn_kernel_t fattn_kernel;
+        if (logit_softcap == 0.0f) {
+            constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        if constexpr (!raw_KV && ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
-            if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst, ncols2)) {
-                GGML_ASSERT(nstages <= 1); // the shared memory sized here is the device's single stage
-                use_sparse = true;
-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V, true>;
-
-                static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-                if (!shared_memory_limit_raised[id]) {
-                    CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-                    shared_memory_limit_raised[id] = true;
-                }
-
-                if constexpr (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) {
-                    if (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads<DKQ, DV, ncols2>(ctx, dst, fattn_kernel, geom, warp_size_host)) {
-                        return;
+            if constexpr (!raw_KV && ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
+                if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx.device, dst, ncols2)) {
+                    GGML_ASSERT(nstages <= 1); // the shared memory sized here is the device's single stage
+                    // GLM's latent is one tensor as K and V: V reads K's tile. GGML_CUDA_FATTN_SPARSE_V_LEGACY=1: V gathers
+                    // its own rows, the same rows, so the output is the same bit for bit.
+                    if constexpr (DKQ == 512 && DV == 512) {
+                        static const bool v_legacy = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_V_LEGACY");
+                        if (!v_legacy && ggml_cuda_fattn_V_same_as_K(dst)) {
+                            ggml_cuda_flash_attn_ext_mma_f16_sparse<DKQ, DV, ncols1, ncols2, true, type_K, type_V>(ctx, dst, geom, warp_size_host);
+                            return;
+                        }
                     }
+                    ggml_cuda_flash_attn_ext_mma_f16_sparse<DKQ, DV, ncols1, ncols2, V_is_K_view, type_K, type_V>(ctx, dst, geom, warp_size_host);
+                    return;
                 }
             }
-        }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        if (!use_sparse) {
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V, false>;
+
+#if !defined(GGML_USE_MUSA)
+            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+            if (!shared_memory_limit_raised[id]) {
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+                shared_memory_limit_raised[id] = true;
+            }
+#endif // !defined(GGML_USE_MUSA)
+        } else {
+            constexpr bool use_logit_softcap = true;
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V, false>;
 
 #if !defined(GGML_USE_MUSA)
@@ -2574,21 +2737,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             }
 #endif // !defined(GGML_USE_MUSA)
         }
-    } else {
-        constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V, false>;
 
-#if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
-        }
-#endif // !defined(GGML_USE_MUSA)
+        launch_fattn<DV, ncols1, ncols2>
+            (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, !raw_KV, !raw_KV, true, warp_size_host, true, false);
     }
-
-    launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, !raw_KV, !raw_KV, true, warp_size_host, true, use_sparse);
 }
 
 
@@ -2673,3 +2825,6 @@ extern DECL_FATTN_MMA_RAW_CASE(256, 256,  2, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(256, 256,  4, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(256, 256,  8, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(256, 256, 32, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+
+// GLM-5.3's sparse launch on a q8_0 latent cache, read in place (flash_attn_ext_deq_load_tile):
+extern DECL_FATTN_MMA_RAW_CASE(512, 512,  1, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
