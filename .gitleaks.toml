@@ -12,27 +12,46 @@
 # line a finding sits on, which would hide a real credential sharing it. Proven with canaries on
 # 2026-09-20 (see TORAD.md): control = 12 + canaries with no config; red = a canary on the same
 # line as an allowlisted value still fires with this config; green = 0 on main.
+#
+# Each entry sits on the allowlist of the rule whose findings it silences, never on the global
+# [allowlist]. gitleaks v8.21.2 appends its own default global regexes to that one and tests
+# them against its regexTarget: under "match", the default `(?i)^true|false|null$` silenced any
+# finding whose match, variable name included, held `false` (review of grailseeker-app#32 and
+# github-operator#129, 2026-11-03). Nothing is appended to a rule's own allowlist, so the
+# defaults keep the secret as their target. Entries unchanged; the full-history scan on
+# 2026-11-03 found no finding that only the widened default silenced.
 [extend]
 useDefault = true
 
-[allowlist]
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
 description = """
 1. GitHub Actions cache keys in upstream's build workflows (`key: ggml-ci-arm64-cpu-kleidiai`,
    `key: arm64-cpu-kleidiai-graviton4`, commented or not): a cache name, not a credential.
 2. xxhash's AVX-512 lane variables `data_key_lo` / `data_key_hi` in the vendored
    examples/gguf-hash/deps/xxhash/xxhash.h.
-3. The placeholder `x-api-key: your-api-key` in tools/server/README.md's Anthropic-API example.
-4. The recorded tokenizer git revision (40 hex) and the tokenizer JSON SHA256 (64 hex) in
+3. The recorded tokenizer git revision (40 hex) and the tokenizer JSON SHA256 (64 hex) in
    scripts/glm53/assets/README.md: content hashes that pin an asset, not credentials.
-5. The 1x1 PNG under JSON_MULTIMODAL_KEY in upstream's tools/server/tests/unit/test_completion.py,
+4. The 1x1 PNG under JSON_MULTIMODAL_KEY in upstream's tools/server/tests/unit/test_completion.py,
    a base64 image fixture the generic-api-key rule reads as a key (iVBORw0KGgo is the PNG header).
 """
 regexTarget = "match"
 regexes = [
   '''key: (ggml-ci-|arm64-cpu-)[a-z0-9-]+''',
   '''data_key_(lo|hi) = _mm512_srli_epi64''',
-  '''x-api-key: your-api-key''',
   '''tokenizer revision: `[0-9a-f]{40}`''',
   '''Tokenizer JSON SHA256:\s*`[0-9a-f]{64}`''',
   '''JSON_MULTIMODAL_KEY: "iVBORw0KGgo[A-Za-z0-9+/=]+"''',
+]
+
+[[rules]]
+id = "curl-auth-header"
+
+[[rules.allowlists]]
+description = "The placeholder `x-api-key: your-api-key` in tools/server/README.md's Anthropic-API example."
+regexTarget = "match"
+regexes = [
+  '''x-api-key: your-api-key''',
 ]
