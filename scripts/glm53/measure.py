@@ -81,6 +81,36 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False, default=str) + "\n")
 
 
+def finish_nsys_capture(process, session, output, deadline):
+    """Drain an owned Nsight exporter before its process group is terminated, even after an application abort."""
+    report = output.with_name(output.name+'.nsys-rep')
+    result = dict(report=str(report), report_present=False, capture_verified=False,
+                  deadline_reached=time.time() >= deadline)
+    if not result['deadline_reached']:
+        stopped_ok = False
+        try:
+            stopped = subprocess.run(['nsys', 'stop', '--session='+session], capture_output=True, text=True,
+                                     timeout=min(60, max(0.001, deadline-time.time())))
+            result['stop'] = dict(exit=stopped.returncode, stdout=stopped.stdout, stderr=stopped.stderr)
+            stopped_ok = stopped.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            result['stop_error'] = str(exc)
+        # After a target abort, 'stop' may refuse because automatic export has already started.
+        # 'shutdown' or killing the launch process here would truncate that export.
+        if (not stopped_ok or not report.is_file()) and process is not None and process.poll() is None:
+            wait = min(120, max(0, deadline-time.time()))
+            if wait:
+                try:
+                    process.wait(timeout=wait)
+                except subprocess.TimeoutExpired:
+                    result['export_wait_expired'] = True
+        result['deadline_reached'] = time.time() >= deadline
+    result['report_present'] = report.is_file() and report.stat().st_size > 0
+    # The report must be exported and checked with decode_trace.capture_readiness on the analysis machine.
+    write_json(output.with_name(output.name+'-finalize.json'), result)
+    return result
+
+
 def retained_chunks(response, saved, timeout):
     while True:
         timeout()

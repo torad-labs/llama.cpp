@@ -28,6 +28,48 @@ TABLES = {
 }
 
 
+def capture_readiness(db, devices):
+    """Reject startup/probe exports without model phase markers and kernels from the same process on every card."""
+    expected = set(devices)
+    if not expected or any(type(d) is not int or d < 0 for d in expected):
+        raise ValueError('expected devices must be nonnegative device IDs')
+    required = {
+        'CUPTI_ACTIVITY_KIND_KERNEL': {'start', 'end', 'deviceId', 'globalPid'},
+        'NVTX_EVENTS': {'start', 'end', 'globalTid', 'text', 'textId'},
+    }
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    result = dict(usable=False, expected_devices=sorted(expected), kernel_counts={}, phase_markers=0,
+                  missing_tables=sorted(set(required)-tables), missing_columns={},
+                  note='Capture integrity only; does not qualify model correctness, throughput or capacity.')
+    for table, fields in required.items():
+        if table in tables:
+            available = {r[1] for r in db.execute('PRAGMA table_info("'+table+'")')}
+            if fields-available:
+                result['missing_columns'][table] = sorted(fields-available)
+    if result['missing_tables'] or result['missing_columns']:
+        return result
+    strings = dict(db.execute('SELECT id,value FROM StringIds')) if 'StringIds' in tables else {}
+    processes = {}
+    for start, end, tid, label, label_id in db.execute('SELECT start,end,globalTid,text,textId FROM NVTX_EVENTS'):
+        fields = parse_marker(label or strings.get(label_id, ''))
+        if fields and fields['stage'] in ('proposal', 'target_eval', 'catchup') and tid is not None and start is not None:
+            result['phase_markers'] += 1
+            pid = (int(tid) >> 24) << 24
+            processes[pid] = min(start, processes.get(pid, start))
+    # Startup work and separate preflight processes cannot supply missing decode devices.
+    # GPU work may finish after a host scope, so this is only a lower bound, not phase attribution.
+    by_process = {}
+    for pid, first_phase in processes.items():
+        by_process[pid] = dict(db.execute('SELECT deviceId,COUNT(*) FROM CUPTI_ACTIVITY_KIND_KERNEL '
+                                         'WHERE globalPid=? AND start>=? AND end>start GROUP BY deviceId',
+                                         (pid, first_phase)))
+    result['processes'] = {str(pid): {str(d): n for d, n in counts.items()} for pid, counts in by_process.items()}
+    for device in expected:
+        result['kernel_counts'][str(device)] = sum(counts.get(device, 0) for counts in by_process.values())
+    result['usable'] = any(expected <= set(counts) for counts in by_process.values())
+    return result
+
+
 def export_dependencies(db, origin, strings):
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     result: dict[str, Any] = dict(schema='glm53-cuda-trace-v1', clock='relative-nanoseconds',
@@ -139,3 +181,19 @@ def semantic_evaluations(db, tables, strings, origin, trace):
     coverage = dict(assigned_kernels=assigned['kernels'],unassigned_kernels=len(trace['kernels'])-assigned['kernels'],
                     assigned_copies=assigned['copies'],unassigned_copies=len(trace['copies'])-assigned['copies'])
     return markers,evaluations,coverage
+
+
+if __name__ == '__main__':
+    import argparse
+    import json
+    from pathlib import Path
+    import sqlite3
+
+    parser = argparse.ArgumentParser(description='Check an exported Nsight SQLite capture locally; no GPU required.')
+    parser.add_argument('sqlite', type=Path)
+    parser.add_argument('--devices', nargs='+', type=int, required=True)
+    args = parser.parse_args()
+    with sqlite3.connect(args.sqlite.resolve().as_uri()+'?mode=ro', uri=True) as db:
+        result = capture_readiness(db, args.devices)
+    print(json.dumps(result, indent=2, allow_nan=False))
+    raise SystemExit(0 if result['usable'] else 1)

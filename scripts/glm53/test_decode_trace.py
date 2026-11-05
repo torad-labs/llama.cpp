@@ -3,7 +3,13 @@ import json
 import sqlite3
 import tempfile
 import random
+from pathlib import Path
+import subprocess
+import sys
+import time
+from unittest.mock import patch
 import decode_trace
+import measure
 import unittest
 
 import decode_lab
@@ -11,6 +17,84 @@ import test_decode_lab as fixtures
 
 
 class TraceRecoveryTest(unittest.TestCase):
+    def test_capture_requires_workload_markers_and_kernels_on_every_expected_device(self):
+        db = sqlite3.connect(':memory:')
+        db.executescript('''
+            CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,deviceId INTEGER,globalPid INTEGER);
+            CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,globalTid INTEGER,text TEXT,textId INTEGER);
+            CREATE TABLE StringIds(id INTEGER,value TEXT);
+            INSERT INTO StringIds VALUES (1,'glm53.v1 stage=target_eval rows=36');
+            INSERT INTO NVTX_EVENTS VALUES (1,90,16777217,NULL,1);
+        ''')
+        for device in range(4):
+            db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10,100,?,16777216)',(device,))
+        self.assertTrue(decode_trace.capture_readiness(db, range(4))['usable'])
+        db.execute('DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE deviceId=3')
+        self.assertFalse(decode_trace.capture_readiness(db, range(4))['usable'])
+        # An unrelated preflight kernel on device 3 does not complete the model's capture.
+        db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10,100,3,33554432)')
+        self.assertFalse(decode_trace.capture_readiness(db, range(4))['usable'])
+        db.execute('DELETE FROM NVTX_EVENTS')
+        self.assertFalse(decode_trace.capture_readiness(db, range(4))['usable'])
+        db.close()
+
+    def test_runtime_only_export_is_not_a_model_capture(self):
+        db = sqlite3.connect(':memory:')
+        db.execute('CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME(start INTEGER,end INTEGER)')
+        result = decode_trace.capture_readiness(db, range(4))
+        self.assertFalse(result['usable'])
+        self.assertIn('CUPTI_ACTIVITY_KIND_KERNEL', result['missing_tables'])
+        db.close()
+
+    def test_startup_kernels_do_not_fill_a_missing_decode_device(self):
+        db = sqlite3.connect(':memory:')
+        db.executescript('''
+            CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,deviceId INTEGER,globalPid INTEGER);
+            CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,globalTid INTEGER,text TEXT,textId INTEGER);
+            INSERT INTO NVTX_EVENTS VALUES (100,190,16777217,'glm53.v1 stage=target_eval rows=36',NULL);
+        ''')
+        for device in range(4):
+            db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10,90,?,16777216)', (device,))
+        for device in range(3):
+            db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (110,200,?,16777216)', (device,))
+        self.assertFalse(decode_trace.capture_readiness(db, range(4))['usable'])
+        db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (110,200,3,16777216)')
+        self.assertTrue(decode_trace.capture_readiness(db, range(4))['usable'])
+        db.close()
+
+    def test_aborted_application_can_finish_export_before_profiler_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)/'concurrency.v2'
+            report = output.with_name(output.name+'.nsys-rep')
+            report.write_bytes(b'partial')
+            # Stand-in exporter: the application has failed, but the profiler is still writing its report.
+            child = subprocess.Popen([sys.executable, '-c',
+                'import pathlib,sys,time; time.sleep(0.1); pathlib.Path(sys.argv[1]).write_bytes(b"report")',
+                str(report)])
+            try:
+                with patch.object(measure.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1,
+                        stdout='', stderr='Collection stop is not allowed in this state.')) as stop:
+                    result = measure.finish_nsys_capture(child, 'owned-test', output, time.time()+5)
+                self.assertEqual(child.poll(), 0)
+                self.assertTrue(result['report_present'])
+                self.assertFalse(result['capture_verified'])
+                self.assertEqual(stop.call_count, 1)
+                self.assertEqual(stop.call_args.args[0], ['nsys','stop','--session=owned-test'])
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+
+    def test_profile_finalization_never_waits_beyond_the_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)/'concurrency'
+            with patch.object(measure.subprocess, 'run') as stop:
+                result = measure.finish_nsys_capture(None, 'owned-test', output, time.time()-1)
+            stop.assert_not_called()
+            self.assertFalse(result['report_present'])
+            self.assertFalse(result['capture_verified'])
+            self.assertTrue(result['deadline_reached'])
+
     def test_generated_marker_metadata_round_trips_but_free_text_never_does(self):
         rng=random.Random(53)
         fields=sorted(decode_trace.MARKER_FIELDS)
