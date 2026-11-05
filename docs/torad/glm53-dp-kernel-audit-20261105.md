@@ -1,8 +1,32 @@
 # Four-card DP kernel audit, November 5
 
-The local candidate fixes an expert-routing bounds error and removes a separate expert-output clearing launch in the normal partitioned path. It also keeps infrequent CUDA graph shapes alive within the existing node budget and repairs two profiling gaps. CUDA compilation and CPU checks pass. These changes have not been executed on GPUs; neither the observed concurrent launch failure nor a throughput improvement is established as fixed.
+The candidate fixes an expert-routing bounds error and removes a separate expert-output clearing launch in the normal partitioned path. It also keeps infrequent CUDA graph shapes alive within the existing node budget and repairs profiling gaps. Runtime `136589f16066dc02c5eb5fb5fd324acf2fe1ed0d` now passes the focused GPU kernel tests, but full-model serving still crashes during four-session decode. It is not qualified for concurrent serving, and no throughput improvement is established.
 
-## Recorded failure
+## Physical test of the candidate
+
+Vast instance 59286015, machine 44690, supplied four RTX PRO 6000 Blackwell Server Edition cards, each with 97,887 MiB, 600 W limits and PCIe 5 x16 capability, on driver 580.95.05. Rig provisioned one lab box from the existing CUDA image, fetched the pinned public pack and verified its hashes. The binary archive and all 46 manifested files were checked remotely. The text-only serving configuration matched the preceding short run: 36 reserved private slots, resident Q8 caches/state and adaptive MTP maximum depth 2. No projector was loaded; no 400K fill was attempted.
+
+| Check | Result |
+|---|---|
+| Peer access and four-card direct collectives | Pass |
+| Expert kernels under Compute Sanitizer | All 84 cases pass: 72 new routing cases and 12 existing fused cases; zero reported memory errors |
+| 36 reserved slots and initial arithmetic response | Pass; 442,368 cells per slot |
+| One active session, 512-token prompt, 128-token cached continuation | 71.203 tokens/s uninstrumented; cache retained |
+| Four active sessions, same configuration | All four initial 16-token responses complete; the server segfaults during the cached continuation after one request finishes |
+| Twelve and 36 active sessions | Not reached |
+| Nsight replay and CUDA-GDB replay | Both reproduce the four-session failure |
+
+The baseline observed at least 7,724 MiB free on every card; the trace and debugger runs observed at least 7,706 and 7,700 MiB respectively. None breached the 4,096 MiB reserve. These are periodic samples, not a proof of continuous-time minima. The single-session rate does not improve on the prior 73.216 tokens/s observation; different hosts/drivers and short windows prevent a controlled speedup or regression claim.
+
+The debugger stops on SIGSEGV in `ggml_backend_meta_get_split_state`, with repeated recursive frames through its source-analysis lambda. Matching call-return addresses against the exact packaged ELF places the fault at offset `0x65fd4`: the stack-page probe `orq $0x0,(%rsp)` in the function prologue. This supports CPU stack exhaustion during recursive split-state traversal. The 20-frame backtrace does not establish whether an excessively deep valid dependency chain or a dependency cycle caused that recursion. In the traced failure, the last target evaluation has seven rows across sequences 0, 2 and 3, with row counts 3/3/1 after sequence 1 has completed. This still requires a source fix and regression coverage; the expert-kernel changes do not resolve the full-model failure.
+
+The first trace launch was refused because the image's Nsight Systems 2025.3.1 does not accept `--discard-environment=true`. The diagnostic harness was corrected while the box was stopped, then the same box resumed for a bounded replay using its existing model files. The successful capture exports locally and passes the integrity check: 834,978 kernel events across all four GPUs and 485 model phase markers. Nsight Compute reports `ERR_NVGPUCTRPERM`; no hardware-counter result is claimed and host permissions were not changed.
+
+Within 55 completed twelve-row target-evaluation host scopes, the two collective kernels account for 60.46% of summed per-device kernel duration. This includes waiting, overlaps across devices and profiler overhead; it is not wall time or a removable-overhead estimate. Collective coordination is the next performance investigation after the stack failure. The graph log records 62 Meta LRU evictions and no CUDA node-cap or idle evictions, so this run does not justify raising the CUDA node budget.
+
+All evidence is local under `.Codex/analysis/glm53-dp-candidate-20261105/`: `results-manifest.json` hashes 263 collected files (56,786,533 bytes); `capture-integrity.json`, `nsys-target12-summary.json`, `graph-events.json` and `split-state-fault.json` record the offline analysis. The box was requested stopped about 1.5 seconds after the first remote window ended and about 2.5 seconds after the replay ended, allowing only file collection before those requests. Stop confirmations were 15:47:55 and 15:56:42 UTC. It was destroyed and confirmed absent afterward; unrelated stopped instance 59024660 remains untouched. Rig reports $1.40 + $0.42 = $1.82 of running cost, excluding storage/transfer and provider invoice reconciliation.
+
+## Earlier recorded failure
 
 The tested runtime was `e2435726a4eeb4d9b51520fe52625d81620c93be`, with the BoldingBuilds uncensored IQ3_XXS pack, four-way DP, resident Q8 target/indexer/recurrent/draft caches and adaptive MTP maximum depth 2. Forty reserved slots left only 2,989 MiB free on the most constrained card, below the 4,096 MiB requirement. Thirty-six reserved slots fit the short tests. Neither configuration qualified populated concurrent 400K sessions.
 
@@ -41,7 +65,7 @@ The launcher, qualification, trace, comparison and measurement Python suites pas
 
 Build and test logs are under `.Codex/analysis/glm53-concurrency-trace-20261105/local-fixes-*`. Record the actual candidate commit and runtime artifact hash for the next run; the old `e2435726` package does not contain these changes.
 
-## Next GPU gate
+## Planned GPU gate before the physical test
 
 Keep the same resident 36-slot serving configuration, MTP maximum depth 2, pack, projector and 4,096 MiB minimum free-memory requirement. First run the focused expert cases under Compute Sanitizer on the remote box, including existing fused cases and the new routing matrix. Then reproduce one, four and twelve active sessions in that order on the same server at 512 populated prompt tokens. Only proceed to 36 active sessions after the shorter sequence passes. A fresh twelve-session server alone does not reproduce the observed history.
 
