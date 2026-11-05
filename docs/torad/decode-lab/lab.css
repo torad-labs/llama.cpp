@@ -79,6 +79,19 @@ input::placeholder { color:var(--muted); opacity:1; }
 .waffle .transfer { background-image:repeating-linear-gradient(135deg,transparent 0 4px,var(--surface) 4px 5px); }
 .chip-foot { display:block; margin-top:10px; font-size:13px; color:var(--muted); }
 .unknown-chip .waffle { display:grid; place-items:center; background:repeating-linear-gradient(135deg,transparent 0 8px,var(--quiet) 8px 9px); font-size:32px; color:var(--muted); }
+.pending-label { color:var(--muted); font-size:15px; padding:8px 0; }
+.pending-track { display:block; width:100%; min-height:0; height:14px; padding:0; border:1px dashed var(--line); background:repeating-linear-gradient(135deg,transparent 0 8px,var(--quiet) 8px 9px); }
+.pending-cell { border:1px solid var(--line); background:transparent; }
+.pending-chip { border-style:dashed; }
+.pending-phase { background:transparent; outline:1px dashed var(--line); outline-offset:-1px; }
+.pending-rule { display:block; height:4px; margin-top:10px; border-bottom:1px dashed var(--line); }
+.pending-layer-track { display:block; width:100%; height:100%; border:1px dashed var(--line); border-radius:3px 3px 0 0; }
+.pending-detail { padding:24px; border:1px dashed var(--line); text-align:center; color:var(--muted); }
+.raw-capture-controls { display:flex; align-items:center; flex-wrap:wrap; gap:24px; margin-bottom:24px; }
+.raw-capture-controls label { display:grid; gap:8px; }
+#raw-status { color:var(--muted); font-size:14px; margin-top:4px; }
+.connections[data-state="pending"] path { stroke-dasharray:4 4; stroke:var(--line); }
+.connections[data-state="pending"] .host-node { border:1px dashed var(--line); background:transparent; }
 .connections { position:relative; height:152px; }
 .connections svg { position:absolute; width:100%; height:100%; overflow:visible; fill:none; color:var(--muted); }
 .connections path { stroke:currentColor; stroke-width:1.5; vector-effect:non-scaling-stroke; }
@@ -210,7 +223,7 @@ footer { border-top:1px solid var(--line); padding-top:16px; font-size:13px; col
   .comparison-tools { padding-block:28px; }
   .mismatch,.legend button,.workload,.time-reading,.composition-labels { font-size:20px; }
   .time-reading { margin-block:32px 24px; } .time-reading strong { font-size:28px; }
-  .composition-track { height:20px; } .composition { margin-bottom:48px; }
+  .composition-track,.pending-track { height:20px; } .pending-label { font-size:20px; } .composition { margin-bottom:48px; }
   .gpu-chip { padding:24px; } .chip-head { font-size:22px; margin-bottom:20px; }
   .chip-owner,.chip-foot,.scene-note { font-size:18px; }
   .waffle { gap:4px; }
@@ -254,7 +267,7 @@ footer { border-top:1px solid var(--line); padding-top:16px; font-size:13px; col
   .visual-compare { grid-template-columns:1fr; gap:24px; }
   .machine { padding:16px; } .machine-heading { align-items:center; flex-wrap:nowrap; }
   .machine-heading h2 { font-size:24px; }
-  .machine-heading button,.machine-heading select { font-size:14px; }
+  .machine-heading button,.machine-heading select,.pending-label { font-size:14px; }
   .workload { font-size:13px; } .time-reading { font-size:13px; margin-block:20px 16px; }
   .time-reading strong { font-size:19px; }
   .mobile-comparison { display:block; background:var(--surface); padding:16px; margin-bottom:24px; }

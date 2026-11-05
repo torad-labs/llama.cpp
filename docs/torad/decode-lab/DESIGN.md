@@ -2,13 +2,13 @@
 
 ## Purpose
 
-An operating screen for seeing where four-GPU decode spends time, ideal and recorded side by side. The user's direction is visual-first: understand the difference at a glance, inspect for detail. The ledger is evidence, not the interface.
+An operating screen for seeing the ideal four-GPU decode budget beside the matching slots for a future measurement. The default is one active session at 400,000 context. The user's direction is visual-first: see the known budget and the missing evidence at a glance, inspect for detail. The ledger is evidence, not the interface.
 
 ## Composition
 
-Two equal-width GPU diagrams occupy the desk viewport (3840 x 2050). Each GPU's 100-square time mosaic uses the same resource encoding: blue local work, hatched orange transfer/wait, neutral unrecorded activity. Logical PCIe paths connect the GPU row to its host. Link width does not encode throughput.
+Two equal-width GPU diagrams occupy the desk viewport (3840 x 2050). Each modeled GPU's 100-square time mosaic uses the resource encoding: blue local work, hatched orange transfer/wait, neutral unknown activity. Future GPUs have empty outlined squares rather than a fictional zero-time distribution. Logical PCIe paths connect the GPU row to its host; future paths are dashed. Link width does not encode throughput.
 
-The ideal has a four-phase path and 45 layer budget bars. The recorded side has four interval timelines. These are independent scopes, not aligned execution traces. Workload identity and the mismatch stay visible. Numeric readouts remain subordinate to the graphics.
+Both sides have the same four phase slots and 45 target-layer slots. The left shows model budgets; the right shows empty outlines and missing values. The future total is '--', never zero. Workload identity and the pending state stay visible. Numeric readouts remain subordinate to the graphics. Historical whole-capture timelines live only in raw evidence, not opposite a single ideal cycle.
 
 ## Interaction
 
@@ -22,4 +22,4 @@ At laptop width the diagrams remain side by side. On phones a paired time-share 
 
 ## Evidence limits
 
-Gray is missing exported activity, not proven idle. Ideal blue is a byte budget, not measured compute occupancy. Unbalanced ownership does not acquire invented per-rank timings. Kernel-driven PCIe bandwidth remains unmeasured. The data's scopes are part of the visual design, not footnotes to erase.
+Empty future slots mean not measured, never zero. Historical gray means missing exported activity, not proven idle. Ideal blue is a byte budget, not measured compute occupancy. Unbalanced ownership does not acquire invented per-rank timings: with one session only the busiest owner's full timing is modeled. The real launcher is adaptive; the displayed reference is a two-proposal cycle, not a prediction of every adaptive cycle. Kernel-driven PCIe bandwidth remains unmeasured. Imports stay in raw evidence and never silently fill the future slots. Automatic rendering of matched-cycle comparison output is not implemented.

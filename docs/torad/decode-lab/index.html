@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light dark">
   <title>Decode comparison</title>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:wght@400;500;600;700&display=swap">
-  <link rel="stylesheet" href="lab.css">
-  <script type="module" src="lab.mjs"></script>
+  <link rel="stylesheet" href="lab.css?v=future-1">
+  <script type="module" src="lab.mjs?v=future-1"></script>
 </head>
 <body>
 <a class="skip" href="#visual-compare">Skip to comparison</a>
@@ -25,7 +25,7 @@
   <div class="comparison-tools">
     <div id="mismatch" class="mismatch" role="note">
       <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24"><path d="M12 3 22 21H2Z M12 9v5 M12 17v1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <div><strong id="comparison-status">Different workloads. No direct speedup ratio.</strong><span id="mismatch-detail"></span></div>
+      <div><strong id="comparison-status">Ideal budget / future measurement</strong><span id="mismatch-detail">Loading the one-session reference...</span></div>
     </div>
     <div class="legend" aria-label="Time categories; select to inspect">
       <button type="button" data-inspect="local"><i class="swatch local"></i>GPU-local work</button>
@@ -34,14 +34,14 @@
     </div>
   </div>
   <section class="mobile-comparison" aria-label="Both workloads at a glance">
-    <h2>Time share</h2><p>Each workload has its own time scale.</p>
+    <h2>Time share</h2><p>Ideal budget beside empty measurement slots.</p>
     <h3>Ideal budget</h3><div id="mobile-ideal"></div>
-    <h3>Recorded capture</h3><div id="mobile-profile"></div>
+    <h3>Future capture</h3><div id="mobile-profile"></div>
   </section>
-  <main id="visual-compare" class="visual-compare" tabindex="-1" aria-label="Ideal and recorded GPU time, side by side">
+  <main id="visual-compare" class="visual-compare" tabindex="-1" aria-label="Ideal GPU budgets and future capture slots, side by side">
     <article class="machine" aria-labelledby="ideal-title">
       <div class="machine-heading"><h2 id="ideal-title">Ideal model</h2><button id="configure" type="button" aria-controls="settings" aria-expanded="false">Adjust model</button></div>
-      <p class="workload" id="ideal-workload">40 active sessions / 400,000 context / fixed MTP2</p>
+      <p class="workload" id="ideal-workload">1 active session / 400,000 context / two-proposal cycle</p>
       <div class="time-reading"><span><strong id="ideal-cycle">--</strong> ms / cycle</span><span id="ideal-rate"></span></div>
       <div class="composition" id="ideal-composition"></div>
       <div class="gpu-grid" id="ideal-gpus" aria-label="Four modeled GPUs"></div>
@@ -55,24 +55,25 @@
       <p class="scene-note" id="ideal-note">Balanced ownership assumed. Each square is 1% of modeled time.</p>
     </article>
     <article class="machine" aria-labelledby="recorded-title">
-      <div class="machine-heading"><h2 id="recorded-title">Recorded profile</h2><select id="capture" aria-label="Recorded capture"><option value="timeline-4k">4,096 context</option><option value="timeline-512">512 context</option></select></div>
-      <p class="workload" id="profile-workload">Reading captured workload...</p>
-      <div class="time-reading"><span><strong id="profile-span">--</strong> ms / capture</span><span id="profile-rate"></span></div>
+      <div class="machine-heading"><h2 id="recorded-title">Future capture</h2><span class="pending-label">Not recorded yet</span></div>
+      <p class="workload" id="profile-workload">Expected: one active session / 400,000 context</p>
+      <div class="time-reading"><span><strong id="profile-span">--</strong> ms / cycle</span><span id="profile-rate"></span></div>
       <div class="composition" id="profile-composition"></div>
-      <div class="gpu-grid" id="profile-gpus" aria-label="Recorded GPU time"></div>
+      <div class="gpu-grid" id="profile-gpus" aria-label="Four GPUs awaiting capture"></div>
       <div class="connections" id="profile-connections"></div>
       <section class="secondary-visual" aria-labelledby="activity-title">
-        <div class="section-heading"><h3 id="activity-title">Across the capture</h3><span>Actual kernel + copy intervals</span></div>
-        <div id="visual-timeline" class="visual-timeline"></div>
-        <div class="axis"><span>0 ms</span><span id="timeline-mid"></span><span id="timeline-end"></span></div>
+        <div class="section-heading"><h3 id="activity-title">One decode cycle</h3><span>Matching measurement slots</span></div>
+        <div id="future-cycle-path" class="cycle-path"></div>
+        <div id="future-layer-map" class="layer-map" aria-label="45 target layers awaiting measurement"></div>
+        <div class="axis"><span>Layer 0</span><span>45 matching layer slots</span><span>44</span></div>
       </section>
-      <p class="scene-note">Each square is 1% of captured time. Gray is unrecorded activity, not proven idle.</p>
+      <p class="scene-note">Same GPUs, phases and layers. Empty slots mean not measured, never zero.</p>
     </article>
   </main>
   <aside id="settings" class="attached-panel" aria-labelledby="settings-title" hidden>
     <div class="section-heading"><h2 id="settings-title">Adjust the ideal model</h2><button id="settings-close" type="button">Close</button></div>
     <form id="assumptions">
-      <label>Active sessions<select id="active" name="sessions"><option>1</option><option>4</option><option>8</option><option>12</option><option>24</option><option>36</option><option selected>40</option></select></label>
+      <label>Active sessions<select id="active" name="sessions"><option selected>1</option><option>4</option><option>8</option><option>12</option><option>24</option><option>36</option><option>40</option></select></label>
       <label>Expert reuse<select name="expert_span"><option value="independent">Independent verify rows</option><option value="same-within-sequence">Same experts within a session</option></select></label>
       <label>Collective protocol<select name="protocol"><option value="optimized">Proposed owner slices</option><option value="current">Current full buffers</option></select></label>
       <label>Latent KV placement<select name="kv"><option value="resident">GPU resident</option><option value="host-reuse">Host / reuse selected rows</option><option value="host-per-query">Host / fetch each query</option></select></label>
@@ -98,8 +99,17 @@
     <button type="button" id="raw-toggle" aria-expanded="false" aria-controls="raw-data">Open raw evidence</button>
   </div>
   <section id="raw-data" class="raw-data" aria-label="Full evidence ledger" hidden>
+    <div class="raw-capture-controls">
+      <label>Historical / imported evidence<select id="capture"><option value="">No raw capture loaded</option><option value="timeline-4k">Historical: 4,096 context</option><option value="timeline-512">Historical: 512 context</option></select></label>
+      <div><p id="raw-workload">No capture loaded</p><p id="raw-status">Raw evidence does not fill the future cycle without a verified match.</p></div>
+    </div>
     <div class="evidence-info"><span id="provenance">Local source evidence</span><span id="profile-count"></span><span id="profile-attribution"></span><a href="README.md">Method &amp; sources</a></div>
     <details><summary>GPU time values as a table</summary><div class="table-wrap" id="activity-table"></div></details>
+    <section id="history-activity" class="secondary-visual" hidden>
+      <div class="section-heading"><h3>Historical capture timeline</h3><span>Raw evidence, not the future cycle</span></div>
+      <div id="visual-timeline" class="visual-timeline"></div>
+      <div class="axis"><span>0 ms</span><span id="timeline-mid"></span><span id="timeline-end"></span></div>
+    </section>
     <div class="raw-workspace">
       <div class="work">
         <div class="tabs" role="tablist" aria-label="Evidence view">
@@ -124,7 +134,7 @@
       <aside id="inspector" class="inspector" aria-label="Selected step details"><h2>Inspect a step</h2></aside>
     </div>
   </section>
-  <footer><span>Historical capture. No 40-session / 400k qualification.</span><a href="README.md">Method &amp; sources</a><span>Local files. Nothing uploaded.</span></footer>
+  <footer><span>Ideal values are model budgets, not a measured execution trace.</span><a href="README.md">Method &amp; sources</a><span>Local files. Nothing uploaded.</span></footer>
 </div>
 <div id="tooltip" role="tooltip" hidden></div>
 </body>

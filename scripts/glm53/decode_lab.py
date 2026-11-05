@@ -392,6 +392,7 @@ def make_server(directory, port):
             super().__init__(*args, directory=str(directory), **kwargs)
 
         def end_headers(self):
+            self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
             self.send_header('Content-Security-Policy',

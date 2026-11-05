@@ -1,5 +1,5 @@
 import { number, bytes, compareStatus, filterRecords, joinWeight, copyFloor, selectEvents, parseProfile } from './lab-core.mjs';
-import { createVisual } from './visual.mjs';
+import { createVisual } from './visual.mjs?v=future-1';
 
 const $ = selector => document.querySelector(selector);
 const el = (tag, text, cls) => {
@@ -10,7 +10,12 @@ const el = (tag, text, cls) => {
 };
 const us = value => number(value, 3) + ' us';
 const phaseNames = { target: 'Target verification', 'proposal-1': 'Draft proposal 1', 'proposal-2': 'Draft proposal 2', catchup: 'Cache-only catch-up', all: 'Complete cycle' };
-const state = { ideal: null, profile: null, view: 'layers', phase: 'target', layer: null, device: '0',
+function emptyEvidence() {
+  return {pending:true, metadata:{}, source:{}, counts:{kernels:0,copies:0}, coverage:{attributed_kernels:0},
+    summary:{span_us:null}, devices:[], operations:[], kernels:[], copies:[], apis:[], caveats:[],
+    kernel_events:[], copy_events:[], api_events:[]};
+}
+const state = { ideal: null, profile: emptyEvidence(), view: 'layers', phase: 'target', layer: null, device: '0',
   search: '', page: 0, selected: null, eventPage: 0, pending: 0, captureTicket: 0, modelTicket: 0 };
 const PAGE = 24;
 const visual = createVisual({tooltip, openEvidence});
@@ -104,25 +109,24 @@ function groups() {
   return [...map.values()];
 }
 function renderHead() {
-  const r = state.ideal.result, p = state.profile, m = p.metadata;
-  $('#ideal-workload').textContent = number(r.sessions) + ' active sessions / 400,000 context / fixed MTP2';
-  $('#ideal-cycle').textContent = number(r.cycle_ms, 3);
-  $('#ideal-rate').textContent = number(r.tps_per_session, 2) + ' tokens/s/session';
-  $('#profile-workload').textContent = number(m.active) + ' active session' + (m.active === 1 ? '' : 's')
-    + ' / ' + number(m.context) + ' context / ' + (m.depth_policy || 'unknown') + ' drafts';
-  $('#profile-span').textContent = number(p.summary.span_us / 1000, 2);
-  const rate = m.timings?.predicted_per_second;
-  $('#profile-rate').textContent = Number.isFinite(rate) ? number(rate, 2) + ' tokens/s (profiled request)' : 'Request throughput not reported';
-  $('#profile-count').textContent = number(p.counts.kernels, 0) + ' kernels / ' + number(p.counts.copies, 0) + ' explicit copies';
-  const share = p.coverage.attributed_kernels / p.counts.kernels;
-  $('#profile-attribution').textContent = number(share * 100, 1) + '% assigned to operations';
-  const status = compareStatus(r, m);
-  $('#comparison-status').textContent = status.workloadMatches ? 'Batch settings match. Cycle timing is not aligned.' : 'Different workloads. No direct speedup ratio.';
-  $('#mismatch-detail').textContent = number(r.sessions) + ' vs ' + number(m.active) + ' sessions / 400,000 vs '
-    + number(m.context) + ' tokens / ' + (m.depth_policy || 'unknown') + ' capture depth';
-  $('#mismatch').title = status.reasons.join('\n');
-  $('#provenance').textContent = 'Captured runtime ' + (m.runtime || 'unknown') + ' / source ' + (p.source.file || 'local import')
-    + ' / no 40-session 400k qualification';
+  const r=state.ideal.result,p=state.profile,m=p.metadata;
+  const workload=number(r.sessions)+' active session'+(r.sessions===1?'':'s')+' / 400,000 context / two-proposal cycle';
+  $('#ideal-workload').textContent=workload;
+  $('#ideal-cycle').textContent=number(r.cycle_ms,3);
+  $('#ideal-rate').textContent=number(r.tps_per_session,2)+' tokens/s/session (budget)';
+  $('#profile-workload').textContent='Expected: '+workload;
+  $('#profile-span').textContent='--';
+  $('#profile-rate').textContent='Awaiting capture';
+  $('#comparison-status').textContent='Ideal budget / future measurement';
+  $('#mismatch-detail').textContent='Same '+number(r.sessions)+'-session, 400,000-context cycle. Capture slots are empty.';
+  $('#mismatch').title='The prepared launcher is adaptive. This reference models a cycle with two proposals; a future measurement must identify that same work.';
+  $('#profile-count').textContent=p.pending?'No raw capture loaded':number(p.counts.kernels,0)+' kernels / '+number(p.counts.copies,0)+' explicit copies';
+  $('#profile-attribution').textContent=p.pending?'':number(p.coverage.attributed_kernels/p.counts.kernels*100,1)+'% assigned to operations';
+  $('#raw-workload').textContent=p.pending?'No capture loaded':number(m.active)+' active / '+number(m.context)+' context / '+(m.depth_policy||'unknown')+' drafts';
+  const status=compareStatus(r,m);
+  $('#raw-status').textContent=p.pending?'Historical and imported evidence stays here until a cycle match is established.'
+    :status.workloadMatches?'Batch settings match. Cycle timing is not aligned.':'Different workload. Raw evidence only; future slots stay empty.';
+  $('#provenance').textContent=p.pending?'': 'Captured runtime '+(m.runtime||'unknown')+' / source '+(p.source.file||'local import');
 }
 function rowsForView() {
   if (state.view === 'layers') return groups().filter(row => (row.name + ' ' + row.description).toLowerCase().includes(state.search.toLowerCase()));
@@ -363,6 +367,7 @@ async function readStream(stream) {
 }
 async function loadCapture(name) {
   if(name==='imported')return;
+  if(!name){++state.captureTicket;state.profile=emptyEvidence();state.selected=null;renderAll();return;}
   const ticket=++state.captureTicket;busy(1,'Reading captured events...');clearError();
   try {
     const response=await fetch('data/'+name+'.json.gz');
@@ -396,7 +401,7 @@ $('#phase').addEventListener('change',event=>{state.phase=event.target.value;sta
 $('#assumptions').addEventListener('submit',event=>event.preventDefault());
 $('#assumptions').addEventListener('change',event=>{if(event.target.id!=='phase')updateIdeal();});
 $('#capture').addEventListener('change',event=>loadCapture(event.target.value));
-$('#retry').addEventListener('click',()=>loadCapture($('#capture').value==='imported'?'timeline-4k':$('#capture').value));
+$('#retry').addEventListener('click',()=>state.ideal?loadCapture($('#capture').value):loadInitial());
 $('#back-layers').addEventListener('click',()=>{state.view='layers';state.page=0;state.search='';$('#search').value='';renderTable();$('#ledger-title').focus();});
 $('#previous').addEventListener('click',()=>{state.page--;renderTable();});
 $('#next').addEventListener('click',()=>{state.page++;renderTable();});
@@ -425,10 +430,14 @@ $('#theme').addEventListener('click',()=>{
 });
 try{const theme=localStorage.getItem('decode-lab-theme');if(theme==='dark'||theme==='light')setTheme(theme);}catch{}
 $('#raw-toggle').disabled=true;$('#configure').disabled=true;
-try {
-  const response=await fetch('data/ideal.json');
-  if(!response.ok)throw new Error('Ideal data is missing. Rebuild the evidence pack using README.md.');
-  const pack=await response.json();state.ideal=pack.detail;
-  await loadCapture('timeline-4k');
-} catch(e){error(e.message);}
-finally {busy(0);$('#app').setAttribute('aria-busy','false');}
+async function loadInitial() {
+  clearError();
+  try {
+    const response=await fetch('/api/ideal?sessions=1');
+    if(!response.ok)throw new Error('Cannot load the one-session ideal. Check the local comparison server and retry.');
+    state.ideal=await response.json();renderAll();
+    $('#load-state').textContent='One-session ideal loaded. Future capture slots are empty.';
+  } catch(e){error(e.message);}
+  finally {busy(0);$('#app').setAttribute('aria-busy','false');}
+}
+await loadInitial();

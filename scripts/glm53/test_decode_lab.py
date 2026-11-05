@@ -146,6 +146,7 @@ class LocalComparisonServerTest(unittest.TestCase):
             base = 'http://127.0.0.1:' + str(server.server_port)
             with urllib.request.urlopen(base + '/api/ideal?sessions=4&peer_gbps=27') as response:
                 result = json.load(response)
+            self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
             self.assertEqual(result['result']['sessions'], 4)
             self.assertEqual(result['result']['parameters']['peer_gbps'], 27)
             self.assertAlmostEqual(sum(r['time_us'] for r in result['rows']),

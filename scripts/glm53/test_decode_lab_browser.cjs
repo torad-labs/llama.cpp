@@ -6,7 +6,7 @@ const { chromium } = require(require.resolve('playwright-core', {
 }));
 (async () => {
   const browser = await chromium.connectOverCDP(process.env.DECODE_LAB_CDP);
-  const context = browser.contexts()[0];
+  const context = await browser.newContext();
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -14,26 +14,44 @@ const { chromium } = require(require.resolve('playwright-core', {
     await page.setViewportSize({ width: 3840, height: 2050 });
     await page.goto(process.env.DECODE_LAB_URL || 'http://127.0.0.1:8768');
     await page.waitForSelector('[data-ready="true"]', { timeout: 30000 });
+    if (process.argv.includes('--future-only')) {
+      assert.match(await page.locator('#ideal-workload').innerText(), /^1 active/);
+      assert.equal(await page.locator('#profile-span').innerText(), '--');
+      assert.match(await page.locator('#profile-workload').innerText(), /Expected: 1 active/);
+      assert.equal(await page.locator('#profile-gpus [data-state="pending"]').count(), 4);
+      assert.deepEqual(await page.locator('#future-cycle-path .phase-step b').allTextContents(),
+        await page.locator('#cycle-path .phase-step b').allTextContents());
+      assert.equal(await page.locator('#future-layer-map [data-state="pending"]').count(), 45);
+      assert.equal(await page.locator('#visual-timeline').isVisible(), false);
+      assert.equal(await page.locator('table:visible').count(), 0);
+      await page.locator('#future-cycle-path button').first().click();
+      assert.match(await page.locator('#visual-inspector').innerText(), /Awaiting capture/);
+      assert.deepEqual(errors, []);
+      console.log('PASS: ideal and empty future capture share GPU, phase and layer slots');
+      return;
+    }
     if (process.argv.includes('--import-only')) {
       const fs = require('node:fs');
       const zlib = require('node:zlib');
       const path = require('node:path');
       const profile = JSON.parse(zlib.gunzipSync(fs.readFileSync(path.resolve(__dirname,
         '../../docs/torad/decode-lab/data/timeline-4k.json.gz'))));
-      profile.metadata.active = 40;
+      profile.metadata.active = 1;
       profile.metadata.context = 400000;
       profile.metadata.depth_policy = 'fixed-2';
       profile.kernels[0].name = '<img src=x onerror="window.__decode_injected=1"> probe';
       await page.locator('#import-file').setInputFiles({
         name: 'new-profile.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(profile))
       });
-      await page.waitForFunction(() => document.querySelector('#comparison-status').textContent.includes('Batch settings match'));
+      await page.waitForFunction(() => document.querySelector('#raw-status').textContent.includes('Batch settings match'));
       await page.locator('#raw-toggle').click();
       await page.locator('#view-kernels').click();
       await page.locator('#search').fill('probe');
       assert.match(await page.locator('#ledger').innerText(), /<img/);
       assert.equal(await page.evaluate(() => window.__decode_injected), undefined);
       assert.equal(await page.locator('#ledger img').count(), 0);
+      assert.equal(await page.locator('#profile-span').innerText(), '--');
+      assert.equal(await page.locator('#profile-gpus [data-state="pending"]').count(), 4);
       assert.deepEqual(errors, []);
       console.log('PASS: valid local import, matching batch status, untrusted labels rendered as text');
       return;
@@ -48,7 +66,7 @@ const { chromium } = require(require.resolve('playwright-core', {
       return;
     }
     assert.match(await page.locator('#mismatch').innerText(), /400,000/);
-    assert.match(await page.locator('#profile-workload').innerText(), /4,096/);
+    assert.match(await page.locator('#profile-workload').innerText(), /Expected: 1 active/);
     assert.equal(await page.locator('#visual-compare').isVisible(), true);
     assert.equal(await page.locator('table:visible').count(), 0);
     assert.equal(await page.locator('.gpu-chip').count(), 8);
@@ -74,13 +92,15 @@ const { chromium } = require(require.resolve('playwright-core', {
     await page.getByRole('button', {name:'Inspect every substep',exact:true}).click();
     assert.match(await page.locator('#ledger-title').innerText(), /Layer 3/);
     await page.locator('#raw-toggle').click();
+    await page.locator('#raw-toggle').click();
+    await page.locator('#capture').selectOption('timeline-4k');
+    await page.waitForFunction(() => document.querySelector('#raw-workload').textContent.includes('4,096 context'));
     await page.locator('#visual-timeline .timeline-bin').first().focus();
     await page.keyboard.press('ArrowRight');
     assert.equal(await page.locator('#visual-timeline .timeline-bin').nth(1).evaluate(el => el === document.activeElement), true);
     await page.keyboard.press('Enter');
     assert.match(await page.locator('#visual-inspector').innerText(), /captured window/);
     await page.keyboard.press('Escape');
-    await page.locator('#raw-toggle').click();
     await page.locator('#raw-data > details > summary').click();
     await page.locator('#activity-table summary').click();
     assert.equal(await page.locator('#activity-windows tbody tr').count(), 96);
@@ -95,7 +115,9 @@ const { chromium } = require(require.resolve('playwright-core', {
     await page.locator('#search').fill('');
     assert.match(await page.locator('#ledger').innerText(), /GB\/s/);
     await page.locator('#capture').selectOption('timeline-512');
-    await page.waitForFunction(() => document.querySelector('#profile-workload').textContent.includes('512 context'));
+    await page.waitForFunction(() => document.querySelector('#raw-workload').textContent.includes('512 context'));
+    assert.equal(await page.locator('#profile-span').innerText(), '--');
+    assert.equal(await page.locator('#profile-gpus [data-state="pending"]').count(), 4);
     await page.locator('#import-file').setInputFiles({
       name: 'bad.json', mimeType: 'application/json', buffer: Buffer.from('{"schema":"wrong"}')
     });
@@ -110,7 +132,7 @@ const { chromium } = require(require.resolve('playwright-core', {
     assert.deepEqual(errors, []);
     console.log('PASS: comparison, assumptions, kernels, raw events, copies, capture switch, invalid import, responsive layout');
   } finally {
-    await page.close();
+    await context.close();
     await browser.close();
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

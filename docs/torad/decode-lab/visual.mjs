@@ -22,6 +22,7 @@ const ms = value => number(value/1000,3)+' ms';
 const fractions = rank => fields.map(field => rank.total_us ? rank[field]/rank.total_us : 0);
 const isTransfer = row => row.route || row.kind === 'latency';
 const cache = new WeakMap();
+const futureActivity = owners => ({aggregate:{pending:true}, devices:owners.map((count,device)=>({device,owners:count,known:false,pending:true}))});
 
 export function createVisual({tooltip, openEvidence}) {
   let ideal, profile, modeled, measured, opener;
@@ -62,11 +63,19 @@ export function createVisual({tooltip, openEvidence}) {
     }
     parent.append(list);
   }
+  function pending(title, value=null) {
+    inspect(title+' / future capture',body=>{
+      sideValues(body,[value===null?'Not modeled':ms(value),'Ideal budget for this slot'],
+        ['Awaiting capture','No measured time, traffic or speedup yet'],'Ideal','Future capture');
+      body.append(e('div','Not measured','pending-detail'),
+        e('p','This slot is reserved for the same GPU, phase or layer. Historical raw evidence is kept separate.'));
+    });
+  }
   function category(index) {
     inspect(names[index], body=>{
-      const a=modeled.aggregate, b=measured.aggregate, n=measured.devices.length || 1;
+      const a=modeled.aggregate;
       sideValues(body, [ms(a[fields[index]]),pct(fractions(a)[index])+' of the modeled cycle'],
-        [ms(b[fields[index]]/n),pct(fractions(b)[index])+' of recorded GPU-time']);
+        ['Awaiting capture','No measurement in this slot'],'Ideal / one cycle','Future capture');
       if (index===1) {
         definition(body,'PCIe bandwidth: Not measured','Only explicit copies record payload bytes.');
         body.append(e('h3','Assumed link rates'));
@@ -101,11 +110,11 @@ export function createVisual({tooltip, openEvidence}) {
   function gpu(device) {
     inspect('GPU '+device, body=>{
       const a=modeled.devices.find(d=>d.device===device);
-      const b=measured.devices.find(d=>d.device===device);
+      const b=null;
       sideValues(body, [a?.known?ms(a.total_us):'Not modeled',a?.known?'Busiest-owner model / not a measurement':'Unequal ownership; per-rank timing is unavailable'],
-        [b?ms(b.total_us):'Not captured','Complete captured interval on this GPU'],
-        'Ideal / GPU '+device,'Recorded / GPU '+device);
-      for(const [label,rank] of [['Ideal',a],['Recorded',b]]) {
+        ['Awaiting capture','No recorded interval on this GPU'],
+        'Ideal / GPU '+device,'Future / GPU '+device);
+      for(const [label,rank] of [['Ideal',a],['Future capture',b]]) {
         body.append(e('h3',label));
         if (rank?.known) bars(body, fields.map((field,i)=>({label:names[i],value:rank[field]/1000,kind:classes[i]})));
         else body.append(e('p','No per-rank timing available.'));
@@ -119,11 +128,9 @@ export function createVisual({tooltip, openEvidence}) {
     const title=layer===undefined?stageNames[stage]:'Target layer '+layer;
     inspect(title,body=>{
       const sum=rows.reduce((value,row)=>value+row.time_us,0);
-      const ops=layer===undefined?[]:profile.operations.filter(op=>op.layer===layer && op.device===0);
       sideValues(body,[ms(sum),'Ideal byte + dependency budget'],
-        [ops.length?ms(ops.reduce((value,op)=>value+op.gpu_sum_us,0)):'Not segmented',
-          ops.length?'GPU 0 kernel sum across the capture, NOT per cycle':'No trusted per-cycle boundaries in this capture'],
-        'Ideal / one cycle','Recorded / capture');
+        ['Awaiting capture','Same logical step / no measurement yet'],
+        'Ideal / one cycle','Future / one cycle');
       const groups=new Map();
       for (const row of rows) {
         const label=row.kind.replaceAll('-',' ');
@@ -135,6 +142,12 @@ export function createVisual({tooltip, openEvidence}) {
     });
   }
   function composition(target, rank) {
+    if(rank.pending) {
+      const track=button(undefined,'pending-track',()=>pending('Cycle'));
+      tooltip(track,'Awaiting matching capture. No time shares have been measured.');
+      const labels=e('div',undefined,'composition-labels');labels.append(e('span','Awaiting measurements'),e('span','--'));
+      target.replaceChildren(track,labels);return;
+    }
     const track=e('div',undefined,'composition-track'), labels=e('div',undefined,'composition-labels');
     fractions(rank).forEach((share,i)=>{
       if (share>0) {
@@ -151,9 +164,11 @@ export function createVisual({tooltip, openEvidence}) {
   function chips(target, activity, side) {
     target.replaceChildren();
     for(const rank of activity.devices) {
-      const b=button(undefined,'gpu-chip'+(rank.known?'':' unknown-chip'),()=>gpu(rank.device));
+      const b=button(undefined,'gpu-chip'+(rank.pending?' pending-chip':rank.known?'':' unknown-chip'),
+        ()=>rank.pending?pending('GPU '+rank.device,modeled.devices[rank.device]?.total_us??null):gpu(rank.device));
+      if(rank.pending)b.dataset.state='pending';
       const head=e('span',undefined,'chip-head');head.append(e('span','GPU '+rank.device),
-        e('span',side==='ideal'?rank.owners+' sessions':'captured','chip-owner'));
+        e('span',side==='ideal'?rank.owners+' owners':'expected','chip-owner'));
       const grid=e('span',undefined,'waffle');grid.setAttribute('aria-hidden','true');
       let foot='Not modeled', description='Per-rank timing not modeled for unequal ownership';
       if(rank.known) {
@@ -162,9 +177,12 @@ export function createVisual({tooltip, openEvidence}) {
         const dominant=f.indexOf(Math.max(...f));
         foot=number(f[dominant]*100,0)+'% '+['local','transfer','unrecorded'][dominant];
         description=names.map((name,i)=>name+' '+pct(f[i])).join(', ');
+      } else if(rank.pending) {
+        for(let i=0;i<100;i++)grid.append(e('i',undefined,'pending-cell'));
+        foot='Not recorded';description='Awaiting capture; empty time slots';
       } else grid.textContent='?';
       b.append(head,grid,e('span',foot,'chip-foot'));
-      tooltip(b,(side==='ideal'?'Ideal':'Recorded')+' GPU '+rank.device+'. '+description+'. Select to inspect.');
+      tooltip(b,(side==='ideal'?'Ideal':'Future capture')+' GPU '+rank.device+'. '+description+'. Select to inspect.');
       target.append(b);
     }
   }
@@ -187,10 +205,12 @@ export function createVisual({tooltip, openEvidence}) {
     const trunk=document.createElementNS(NS,'path');trunk.classList.add('mobile-trunk');trunk.setAttribute('d','M500 0V44');svg.append(trunk);
     const host=document.createElementNS(NS,'path');host.setAttribute('d','M500 44V105');
     host.classList.add('host-route');host.setAttribute('marker-end','url(#'+side+'-arrow)');svg.append(host);
-    const kv=side==='ideal'?ideal.result.kv:profile.metadata.kv;
+    const kv=ideal.result.kv;
+    target.dataset.state=side==='future'?'pending':'modeled';
     const note=kv==='resident'?'KV stays on GPU':kv==='unknown'||!kv?'KV location unknown':'Selected KV rows + controls';
-    const peer=button('PCIe / gather + reduce','bus-label',()=>category(1));
-    const cpu=button('Host','host-node',()=>category(1));cpu.append(e('small',note));
+    const action=()=>side==='future'?pending('PCIe / host'):category(1);
+    const peer=button('PCIe / gather + reduce','bus-label',action);
+    const cpu=button('Host','host-node',action);cpu.append(e('small',(side==='future'?'Expected: ':'')+note));
     target.replaceChildren(svg,peer,e('span','hidden state + controls','connection-caption'),cpu);
     target.setAttribute('aria-label','Logical paths: GPU gather and reduce over PCIe, host hidden-state and control handoffs. Not physical topology.');
   }
@@ -221,6 +241,22 @@ export function createVisual({tooltip, openEvidence}) {
         if(value>0){const mark=e('i',undefined,cls);mark.style.flex=String(value);stack.append(mark);}
       }
       b.append(stack);tooltip(b,'Layer '+row.layer+': '+ms(row.total)+' ideal budget; '+ms(row.transfer)+' transfer/wait');map.append(b);
+    }
+  }
+  function futureCycle() {
+    const path=$('#future-cycle-path');path.replaceChildren();
+    for(const stage of ['proposal-1','proposal-2','target','catchup']) {
+      const total=ideal.rows.filter(row=>row.stage===stage).reduce((sum,row)=>sum+row.time_us,0);
+      const b=button(undefined,'phase-step pending-phase',()=>pending(stageNames[stage],total));
+      b.dataset.state='pending';b.append(e('b',stageNames[stage]),e('span','-- ms'),e('span',undefined,'pending-rule'));
+      tooltip(b,stageNames[stage]+': awaiting capture');path.append(b);
+    }
+    const map=$('#future-layer-map');map.replaceChildren();
+    for(let layer=0;layer<45;layer++) {
+      const total=ideal.rows.filter(row=>row.stage==='target'&&row.layer===layer).reduce((sum,row)=>sum+row.time_us,0);
+      const b=button(undefined,'layer-column pending-layer',()=>pending('Target layer '+layer,total));
+      b.dataset.state='pending';b.append(e('span',undefined,'pending-layer-track'));
+      tooltip(b,'Layer '+layer+': no measurement yet');map.append(b);
     }
   }
   function timeline() {
@@ -293,14 +329,21 @@ export function createVisual({tooltip, openEvidence}) {
   });
   return {render(nextIdeal,nextProfile) {
     ideal=nextIdeal;profile=nextProfile;modeled=idealActivity(ideal);
-    if(!cache.has(profile)) cache.set(profile,profileActivity(profile));
-    measured=cache.get(profile);
+    if(!profile.pending&&!cache.has(profile))cache.set(profile,profileActivity(profile));
+    measured=profile.pending?null:cache.get(profile);
+    const future=futureActivity(ideal.result.owners);
     close('#visual-inspector',false);
-    composition($('#ideal-composition'),modeled.aggregate);composition($('#profile-composition'),measured.aggregate);
-    composition($('#mobile-ideal'),modeled.aggregate);composition($('#mobile-profile'),measured.aggregate);
-    chips($('#ideal-gpus'),modeled,'ideal');chips($('#profile-gpus'),measured,'profile');
-    connections($('#ideal-connections'),'ideal');connections($('#profile-connections'),'profile');
-    cycle();timeline();valueTable();
+    composition($('#ideal-composition'),modeled.aggregate);composition($('#profile-composition'),future.aggregate);
+    composition($('#mobile-ideal'),modeled.aggregate);composition($('#mobile-profile'),future.aggregate);
+    chips($('#ideal-gpus'),modeled,'ideal');chips($('#profile-gpus'),future,'future');
+    connections($('#ideal-connections'),'ideal');connections($('#profile-connections'),'future');
+    cycle();futureCycle();
+    $('#history-activity').hidden=profile.pending;
+    if(!profile.pending){timeline();valueTable();}
+    else {
+      $('#visual-timeline').replaceChildren();
+      $('#activity-table').textContent='No raw capture loaded. Choose historical evidence above or import a profile.';
+    }
     $('#ideal-note').textContent=modeled.balanced
       ?'Balanced ownership assumed. Each square is 1% of modeled time.'
       :'Unequal ownership. Only busiest-owner timing is modeled; other GPU times remain unknown.';

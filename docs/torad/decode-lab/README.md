@@ -12,25 +12,32 @@ python3 scripts/glm53/decode_lab.py serve --port 8768
 
 Open **http://127.0.0.1:8768**. The server binds only to loopback, serves this analysis folder, and recalculates the ideal ledger using the existing Python estimator. Stop it with Ctrl-C. No inference server, GPU or external service is required.
 
-The default comparison is **40 active sessions at 400k context** versus the recorded **one-session 4096-context** capture. These are intentionally labeled different workloads. This page does not manufacture a speedup by dividing their totals.
+The default is **one active session at 400k context on four GPUs**. The left shows the ideal budget; **Future capture** on the right mirrors its GPUs, phases and layers with empty measurement slots. No historical capture loads automatically. Empty means not measured, never zero. The page does not manufacture a speedup ratio.
+
+The server sends `Cache-Control: no-store` for local responses. If a browser still retains the older page, open **http://127.0.0.1:8768/?view=future**.
 
 ## Matched-comparison preparation
 
-This page is not yet a cycle-aligned 1:1 comparison. The [CPU-only preparation package](../glm53-comparison-preparation.md) encodes the real one-active-session/four-GPU recipe, adds opt-in host phase markers, recovers scheduling records omitted from the compact export, and tests matched logical-work comparison. Its readiness report keeps missing device counters and complete ideal costs explicit. No new GPU measurement has been made.
+The page now has a 1:1 visual structure, but no matched measurement yet. The [CPU-only preparation package](../glm53-comparison-preparation.md) encodes the real one-active-session/four-GPU recipe, adds opt-in host phase markers, recovers scheduling records omitted from the compact export, and tests matched logical-work comparison. Its readiness report keeps missing device counters and complete ideal costs explicit. No new GPU measurement has been made.
+
+The real launcher uses adaptive MTP2. The ideal reference shows a cycle with two proposals and perfect acceptance, not an adaptive sequence or a variation distribution. A future match must identify that same work. The page does not yet render `glm53-matched-comparison-v1` results into the pending slots.
 
 ## Visual comparison
 
-The default view contains no tables. Two four-GPU diagrams show the same categories:
+The default view contains no tables. Both sides have four GPUs, the same Draft 1 / Draft 2 / Verify / Catch up phases, and 45 target layers:
 
-- **Blue:** ideal GDDR work, or recorded local kernels/device copies.
-- **Orange:** transfer/wait budgets, or recorded collective/host-KV kernels and copies other than known local D2D copies.
-- **Gray:** no exported kernel/copy interval. This is not proof of idle hardware.
+- **Blue:** ideal GDDR work.
+- **Hatched orange:** ideal transfer/wait budgets.
+- **Empty outlines:** future measurements, all still pending.
+- **Hatched '?' on the ideal:** a per-rank timing the model cannot supply, distinct from an unrecorded future measurement.
 
-Each GPU contains 100 squares: one square is 1% of that GPU's interval, not a core or a memory-capacity unit. Overlapping recorded intervals count once; transfer/wait takes priority. Summary shares use the sum of per-GPU intervals, not a claimed critical-path duration. The ideal uses the busiest-owner model. Balanced owners share that assumption; timings for less-busy owners remain unknown when ownership is uneven.
+A filled GPU mosaic has 100 squares: one square is 1% of modeled time, not a core or a memory-capacity unit. The ideal uses the busiest-owner model. Balanced owners share that assumption; timings for less-busy owners remain unknown when ownership is uneven. With one active session, GPU 0 owns its sequence and the other three still participate in routed-expert work; their full per-rank times are not modeled.
 
-Click a GPU or a category for exact values. Click a PCIe path for transfer evidence. The model's four phase buttons and 45 layer bars open the underlying costs. On the recorded timeline, hover or focus a window; arrow keys move between windows, and selecting one opens its exact proportions. The two sides deliberately do not share a clock or a speedup ratio.
+Click a GPU, category, PCIe path, phase or layer to inspect it. The ideal's four phase buttons and 45 layer bars open underlying budgets; the future counterparts explicitly say **Awaiting capture**. These are budgets and empty measurement slots, not aligned CUDA traces.
 
-**Adjust model** opens assumptions. **Open raw evidence** reveals the full ledger. Close an inspector with its Close button or Escape. Import remains local and retains the previous evidence on failure.
+**Adjust model** changes the ideal and expected workload. **Open raw evidence** reveals the ledger and the historical-capture selector. Imported profiles also stay in raw evidence; even matching batch metadata does not fill a future cycle. Close an inspector with its Close button or Escape. Import remains local and retains the previous evidence on failure.
+
+Historical activity uses blue for local kernels/device copies, orange for collective/host-KV kernels and copies other than known local D2D copies, and gray for no exported kernel/copy interval. Gray is not proof of idle hardware. Overlapping intervals count once, with transfer/wait taking priority. Summary shares use per-GPU interval totals, not a claimed critical-path duration. Timeline windows retain hover, focus, arrow-key navigation and exact-value inspection.
 
 ## What can be inspected
 
@@ -72,7 +79,7 @@ The exported profiles retain the source filename and complete SQLite SHA-256, bu
 
 ### Ideal detail
 
-The default ideal ledger has **1,955 entries**. Its leaf times sum to the parent PCIe-aware estimate, 30.5645796776 ms/cycle in the default independent-routing scenario. The underlying pack includes all 1,412 exact GGUF tensor records; token embeddings remain row-lookups rather than a full table read.
+The default one-session ideal ledger has **1,955 entries**: 1,850 target entries, 44 for proposal 1, 42 for proposal 2 and 19 for catch-up. Its leaf times sum to the parent PCIe-aware estimate, **9.0958282554 ms/cycle**, under the displayed ideal assumptions. This is not a measured or complete compute-cost prediction. The underlying pack includes all 1,412 exact GGUF tensor records; token embeddings remain row-lookups rather than a full table read.
 
 - Memory budgets use the busiest sequence owner and balanced expert work.
 - Routed expert reads use the expected distinct-expert union, not eight entirely new experts for every row.
@@ -110,15 +117,15 @@ Export an Nsight Systems report to SQLite using the profiler's `nsys export` com
 ```sh
 python3 scripts/glm53/decode_lab.py profile \
   --sqlite /path/to/capture.sqlite \
-  --label run-name --active 40 --context 400000 \
-  --runtime ACTUAL_COMMIT --slots 40 --depth-max 2 \
-  --depth-policy fixed-2 --kv host --scope request \
-  --output /tmp/run-name.json.gz
+  --label run-name --active 1 --context 400000 \
+  --runtime ACTUAL_COMMIT --slots 1 --depth-max 2 \
+  --depth-policy adaptive --kv resident --scope request \
+  --output .Codex/analysis/run-name/profile.json.gz
 ```
 
 Set active count and context from the actual workload, not the server's slot reservation. Optional `--measurements /path/to/measurements.json` attaches the matching label's request timings.
 
-Choose **Import profile** on the page and select that JSON or gzip file. Parsing happens in the browser. Nothing is uploaded. Invalid imports leave the previous evidence in place. Expanded files are limited to 80 MB; larger traces should be exported as shorter captures.
+Choose **Import profile** on the page and select that JSON or gzip file, then **Open raw evidence** to inspect it. Parsing happens in the browser. Nothing is uploaded. Invalid imports leave the previous evidence in place. Expanded files are limited to 80 MB; larger traces should be exported as shorter captures. Future-cycle slots remain empty after any raw-profile import.
 
 Unspecified slot counts, depth policy and KV placement remain unknown in new exports. Supply the flags only from the actual run; do not set `--depth-policy fixed-2` unless established. The bundled historical captures use `--slots 40 --depth-max 2 --depth-policy adaptive --kv host --scope request`. Matching session/context/depth metadata does not establish cycle alignment. The page explicitly retains that distinction and does not display a cycle speedup ratio.
 
@@ -157,7 +164,9 @@ Gzip output is deterministic. The page has no frontend build step. Font requests
 - The browser test initially inherited a phone-sized context before navigation. Its setup now sets the desk viewport before loading the page; the full journey passed after that correction.
 - Light and dark 3840 x 2050 captures, plus laptop and phone captures, are retained under `.Codex/analysis/glm53-decode-lab/screens/`.
 - The earlier table-first page passed an independent visual check but was rejected by the user as too text-heavy and busy. It has been replaced with the visual-first comparison; the earlier scores do not qualify this redesign.
-- The final fresh visual judge scored the redesigned 3840 x 2050 light and dark views 9.6/10, and the open inspector 9.7/10, with no criterion below 9. Fine annotations and the low-emphasis inspection hint remain advisories. Two batched visual rounds were used; final captures are under `.Codex/analysis/glm53-decode-visual/screens/r2-*.png`.
+- The previous historical-comparison layout scored 9.6/10 in its fresh 4K light/dark visual check and 9.7/10 with the inspector. Those scores do not qualify the newer future-capture layout. Its captures remain under `.Codex/analysis/glm53-decode-visual/screens/r2-*.png`.
+- The future-capture journey failed first on the old 40-session default, then passed with one session, four pending GPUs, four matching phases, 45 pending layers and no visible historical timeline or tables. The main journey, separate local-import safety journey and first-viewport phone journey passed. Raw imports leave the future side empty.
+- The local-server freshness assertion failed before `Cache-Control: no-store` was added; all nine exporter/server/detail tests then passed. Browser tests now create a fresh context instead of inheriting older cached pages from the automation session.
 - The page build made no inference-engine changes. The later CPU-only preparation adds opt-in host tracing, not inference-algorithm changes. No new GPU run, paid hardware, deployment or matched 40-session/400k measurement was performed.
 
 ## Checks
@@ -179,6 +188,12 @@ PLAYWRIGHT_NODE_PATH=/tmp/glm53-browser-tools \
 PLAYWRIGHT_NODE_PATH=/tmp/glm53-browser-tools \
   DECODE_LAB_CDP=THE_PRINTED_WEBSOCKET_URL \
   node scripts/glm53/test_decode_lab_browser.cjs --import-only
+PLAYWRIGHT_NODE_PATH=/tmp/glm53-browser-tools \
+  DECODE_LAB_CDP=THE_PRINTED_WEBSOCKET_URL \
+  node scripts/glm53/test_decode_lab_browser.cjs --future-only
+PLAYWRIGHT_NODE_PATH=/tmp/glm53-browser-tools \
+  DECODE_LAB_CDP=THE_PRINTED_WEBSOCKET_URL \
+  node scripts/glm53/test_decode_lab_browser.cjs --phone-only
 agent-browser --session glm53-lab-test close
 ```
 
