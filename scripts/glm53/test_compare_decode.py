@@ -1,4 +1,4 @@
-"""Goal: prepare one active session offline, then compare only the same work."""
+"""Goal: vary load on one fixed 40-slot/four-GPU setup, then compare the same work."""
 import copy
 import json
 from pathlib import Path
@@ -29,15 +29,32 @@ class PreparationTest(unittest.TestCase):
         self.assertEqual(case['workload']['active_sessions'], 1)
         self.assertEqual(case['workload']['context_tokens'], 400000)
         self.assertEqual(case['configuration']['gpu_count'], 4)
-        self.assertEqual(case['configuration']['reserved_slots'], 1)
+        self.assertEqual(case['configuration']['reserved_slots'], 40)
         self.assertEqual(case['configuration']['reserved_context_per_slot'], serve.DP_SLOT_CONTEXT)
         self.assertEqual(case['configuration']['depth_policy'], 'adaptive')
         args = serve.arguments(['--model', '/tmp/not-loaded.gguf', '--server', '/tmp/not-executed-server',
-                                '--profile', 'dp-4', '--slots', '1', '--dry-run'])
+                                '--profile', 'dp-4', '--slots', '40', '--dry-run'])
         argv, env = serve.make_plan(args)
         self.assertEqual(case['resolved_launch']['argv'], argv)
         self.assertEqual(case['resolved_launch']['env'], env)
         self.assertFalse(case['gpu_validated'])
+
+    def test_active_load_does_not_change_the_serving_configuration(self):
+        bindings = dict(model='/tmp/not-loaded.gguf', server='/tmp/not-executed-server')
+        target = comparison.prepare_case(active=40, **bindings)
+        self.assertEqual(target['configuration']['owners'], [10, 10, 10, 10])
+        expected = {key: value for key, value in target['configuration'].items() if key != 'owners'}
+        for active in range(1, 41):
+            with self.subTest(active=active):
+                case = comparison.prepare_case(active=active, **bindings)
+                self.assertEqual(case['resolved_launch'], target['resolved_launch'])
+                self.assertEqual(case['model'], target['model'])
+                config = {key: value for key, value in case['configuration'].items() if key != 'owners'}
+                self.assertEqual(config, expected)
+                self.assertEqual(case['workload']['active_sessions'], active)
+                owners = case['configuration']['owners']
+                self.assertEqual(sum(owners), active)
+                self.assertLessEqual(max(owners) - min(owners), 1)
 
     def test_unbound_model_is_explicit_and_reserved_is_not_active(self):
         case = comparison.prepare_case(slots=40)
@@ -64,6 +81,7 @@ class PreparationTest(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             case = json.loads(out.read_text())
             self.assertEqual(case['workload']['active_sessions'], 1)
+            self.assertEqual(case['configuration']['reserved_slots'], 40)
             self.assertEqual(case['schema'], 'glm53-comparison-case-v1')
             self.assertFalse(case['gpu_validated'])
 

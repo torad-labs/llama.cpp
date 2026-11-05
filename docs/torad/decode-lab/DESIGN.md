@@ -2,13 +2,13 @@
 
 ## Purpose
 
-An operating screen for seeing the ideal four-GPU decode budget beside the matching slots for a future measurement. The default is one active session at 400,000 context. The user's direction is visual-first: see the known budget and the missing evidence at a glance, inspect for detail. The ledger is evidence, not the interface.
+An operating screen for seeing the ideal four-GPU decode budget beside the matching slots for a future measurement. The performance target and default are 40 active sessions, each at 400,000 context, on one fixed four-GPU serving design. One-session runs are bring-up checks of that same configuration, not a different architecture or the throughput target. The user's direction is visual-first: see the known budget and the missing evidence at a glance, inspect for detail. The ledger is evidence, not the interface.
 
 ## Composition
 
 Two equal-width GPU diagrams occupy the desk viewport (3840 x 2050). Each modeled GPU's 100-square time mosaic uses the resource encoding: blue local work, hatched orange transfer/wait, neutral unknown activity. Future GPUs have empty outlined squares rather than a fictional zero-time distribution. Logical PCIe paths connect the GPU row to its host; future paths are dashed. Link width does not encode throughput.
 
-Both sides have the same four phase slots and 45 target-layer slots. The left shows model budgets; the right shows empty outlines and missing values. The future total is '--', never zero. Workload identity and the pending state stay visible. Numeric readouts remain subordinate to the graphics. Historical whole-capture timelines live only in raw evidence, not opposite a single ideal cycle.
+Both sides have the same four phase slots and 45 target-layer slots. The default left shows model budgets for all four GPUs, each owning 10 active sequences; the right shows empty outlines and missing values for that same 40-session workload. The future total is '--', never zero. Workload identity and the pending state stay visible. Numeric readouts remain subordinate to the graphics. Historical whole-capture timelines live only in raw evidence, not opposite a single ideal cycle.
 
 ## Interaction
 

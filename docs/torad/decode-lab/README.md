@@ -12,13 +12,15 @@ python3 scripts/glm53/decode_lab.py serve --port 8768
 
 Open **http://127.0.0.1:8768**. The server binds only to loopback, serves this analysis folder, and recalculates the ideal ledger using the existing Python estimator. Stop it with Ctrl-C. No inference server, GPU or external service is required.
 
-The default is **one active session at 400k context on four GPUs**. The left shows the ideal budget; **Future capture** on the right mirrors its GPUs, phases and layers with empty measurement slots. No historical capture loads automatically. Empty means not measured, never zero. The page does not manufacture a speedup ratio.
+The performance target and default are **40 concurrent sessions, each at 400k context, on one fixed four-GPU serving design**. All four GPUs appear with ideal budgets and 10 sequence owners each. **Future capture** mirrors those GPUs, phases and layers with empty measurement slots for the same workload. No historical capture loads automatically. Empty means not measured, never zero. The page does not manufacture a speedup ratio.
 
-The server sends `Cache-Control: no-store` for local responses. If a browser still retains the older page, open **http://127.0.0.1:8768/?view=future**.
+The design mirrors dense/attention/shared weights, keeps sequence-owned KV and recurrent state local, and partitions routed experts across all four GPUs. One active session is a bring-up check of this same 40-slot configuration; it is not a different architecture or the throughput target. Increasing active load changes work assigned to the existing owners, not the serving configuration.
+
+The server sends `Cache-Control: no-store` for local responses. If a browser still retains an older page, open **http://127.0.0.1:8768/?view=throughput40**.
 
 ## Matched-comparison preparation
 
-The page now has a 1:1 visual structure, but no matched measurement yet. The [CPU-only preparation package](../glm53-comparison-preparation.md) encodes the real one-active-session/four-GPU recipe, adds opt-in host phase markers, recovers scheduling records omitted from the compact export, and tests matched logical-work comparison. Its readiness report keeps missing device counters and complete ideal costs explicit. No new GPU measurement has been made.
+The page has a 1:1 visual structure, but no matched measurement yet. The [CPU-only preparation package](../glm53-comparison-preparation.md) encodes one fixed 40-slot/four-GPU recipe with separate one-active-session bring-up and 40-active-session throughput cases, adds opt-in host phase markers, recovers scheduling records omitted from the compact export, and tests matched logical-work comparison. Its readiness report keeps missing device counters and complete ideal costs explicit. No new GPU measurement has been made.
 
 The real launcher uses adaptive MTP2. The ideal reference shows a cycle with two proposals and perfect acceptance, not an adaptive sequence or a variation distribution. A future match must identify that same work. The page does not yet render `glm53-matched-comparison-v1` results into the pending slots.
 
@@ -79,7 +81,7 @@ The exported profiles retain the source filename and complete SQLite SHA-256, bu
 
 ### Ideal detail
 
-The default one-session ideal ledger has **1,955 entries**: 1,850 target entries, 44 for proposal 1, 42 for proposal 2 and 19 for catch-up. Its leaf times sum to the parent PCIe-aware estimate, **9.0958282554 ms/cycle**, under the displayed ideal assumptions. This is not a measured or complete compute-cost prediction. The underlying pack includes all 1,412 exact GGUF tensor records; token embeddings remain row-lookups rather than a full table read.
+The default 40-session ideal ledger has **1,955 entries**: 1,850 target entries, 44 for proposal 1, 42 for proposal 2 and 19 for catch-up. Its leaf times sum to the parent PCIe-aware estimate, **30.5645796776 ms/cycle**. With perfect two-proposal acceptance, that budget corresponds to **98.1528 tokens/s/session**, or **3,926.1132 tokens/s aggregate**. These are optimistic memory-and-PCIe budgets, not measured throughput, complete compute-cost predictions or proof of a globally optimal architecture. The underlying pack includes all 1,412 exact GGUF tensor records; token embeddings remain row-lookups rather than a full table read.
 
 - Memory budgets use the busiest sequence owner and balanced expert work.
 - Routed expert reads use the expected distinct-expert union, not eight entirely new experts for every row.
@@ -117,8 +119,8 @@ Export an Nsight Systems report to SQLite using the profiler's `nsys export` com
 ```sh
 python3 scripts/glm53/decode_lab.py profile \
   --sqlite /path/to/capture.sqlite \
-  --label run-name --active 1 --context 400000 \
-  --runtime ACTUAL_COMMIT --slots 1 --depth-max 2 \
+  --label run-name --active 40 --context 400000 \
+  --runtime ACTUAL_COMMIT --slots 40 --depth-max 2 \
   --depth-policy adaptive --kv resident --scope request \
   --output .Codex/analysis/run-name/profile.json.gz
 ```
@@ -165,9 +167,9 @@ Gzip output is deterministic. The page has no frontend build step. Font requests
 - Light and dark 3840 x 2050 captures, plus laptop and phone captures, are retained under `.Codex/analysis/glm53-decode-lab/screens/`.
 - The earlier table-first page passed an independent visual check but was rejected by the user as too text-heavy and busy. It has been replaced with the visual-first comparison; the earlier scores do not qualify this redesign.
 - The previous historical-comparison layout scored 9.6/10 in its fresh 4K light/dark visual check and 9.7/10 with the inspector. Those scores do not qualify the newer future-capture layout. Its captures remain under `.Codex/analysis/glm53-decode-visual/screens/r2-*.png`.
-- The future-capture journey failed first on the old 40-session default, then passed with one session, four pending GPUs, four matching phases, 45 pending layers and no visible historical timeline or tables. The main journey, separate local-import safety journey and first-viewport phone journey passed. Raw imports leave the future side empty.
+- The fixed-throughput-reference journey failed first on the one-session default, then passed at 40 sessions with four populated ideal GPUs (10 owners each), four pending future GPUs, four matching phases, 45 pending layers and no visible historical timeline or tables. The main journey, separate local-import safety journey and first-viewport phone journey passed. Raw imports leave the future side empty.
 - The local-server freshness assertion failed before `Cache-Control: no-store` was added; all nine exporter/server/detail tests then passed. Browser tests now create a fresh context instead of inheriting older cached pages from the automation session.
-- The future-capture layout passed an independent screenshot-only check at 3840 x 2050: light 9.5/10, dark 9.1/10, with no criterion below 7. The review initially mixed up filenames; the judge reread the two desk captures separately and corrected those assessments. Small secondary annotations and faint dark-theme placeholder outlines remain advisories. Captures are retained under `.Codex/analysis/glm53-future-capture/screens/`.
+- The previous one-session placeholder layout passed an independent screenshot-only check at 3840 x 2050: light 9.5/10, dark 9.1/10, with no criterion below 7. The review initially mixed up filenames; the judge reread the two desk captures separately and corrected those assessments. Those scores do not qualify the current 40-session reference. Its earlier captures are retained under `.Codex/analysis/glm53-future-capture/screens/`.
 - The page build made no inference-engine changes. The later CPU-only preparation adds opt-in host tracing, not inference-algorithm changes. No new GPU run, paid hardware, deployment or matched 40-session/400k measurement was performed.
 
 ## Checks

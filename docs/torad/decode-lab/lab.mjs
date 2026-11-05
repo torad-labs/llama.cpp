@@ -117,8 +117,8 @@ function renderHead() {
   $('#profile-workload').textContent='Expected: '+workload;
   $('#profile-span').textContent='--';
   $('#profile-rate').textContent='Awaiting capture';
-  $('#comparison-status').textContent='Ideal budget / future measurement';
-  $('#mismatch-detail').textContent='Same '+number(r.sessions)+'-session, 400,000-context cycle. Capture slots are empty.';
+  $('#comparison-status').textContent=r.sessions===40?'40-session throughput reference':'Workload check / 40-session design';
+  $('#mismatch-detail').textContent='Fixed four-GPU layout. Future capture uses the same workload.';
   $('#mismatch').title='The prepared launcher is adaptive. This reference models a cycle with two proposals; a future measurement must identify that same work.';
   $('#profile-count').textContent=p.pending?'No raw capture loaded':number(p.counts.kernels,0)+' kernels / '+number(p.counts.copies,0)+' explicit copies';
   $('#profile-attribution').textContent=p.pending?'':number(p.coverage.attributed_kernels/p.counts.kernels*100,1)+'% assigned to operations';
@@ -433,10 +433,10 @@ $('#raw-toggle').disabled=true;$('#configure').disabled=true;
 async function loadInitial() {
   clearError();
   try {
-    const response=await fetch('/api/ideal?sessions=1');
-    if(!response.ok)throw new Error('Cannot load the one-session ideal. Check the local comparison server and retry.');
+    const response=await fetch('/api/ideal?sessions=40');
+    if(!response.ok)throw new Error('Cannot load the 40-session ideal. Check the local comparison server and retry.');
     state.ideal=await response.json();renderAll();
-    $('#load-state').textContent='One-session ideal loaded. Future capture slots are empty.';
+    $('#load-state').textContent='40-session throughput reference loaded. Future capture slots are empty.';
   } catch(e){error(e.message);}
   finally {busy(0);$('#app').setAttribute('aria-busy','false');}
 }

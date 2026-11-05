@@ -21,7 +21,7 @@ IDENTITY = ('cycle', 'phase', 'layer', 'operation', 'device', 'work')
 
 def prepare_case(*, active=1, context=400000, slots=None, model=None, server=None,
                  mmproj=None, kv='resident', host_budget_mib=None, trace_decode=False):
-    slots = active if slots is None else slots
+    slots = 40 if slots is None else slots
     if type(active) is not int or type(slots) is not int or not 1 <= active <= slots <= 40:
         raise ValueError('active sessions must be 1..reserved slots, with at most 40 slots')
     if type(context) is not int or not 1 <= context <= serve.DP_SLOT_CONTEXT:
@@ -242,10 +242,10 @@ def inspect_profile(profile):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest='command',required=True)
-    prep=sub.add_parser('prepare',help='Write a one-session case; never launch inference')
+    prep=sub.add_parser('prepare',help='Write a workload case for the fixed 40-slot setup; never launch inference')
     prep.add_argument('--active',type=int,default=1)
     prep.add_argument('--context',type=int,default=400000)
-    prep.add_argument('--slots',type=int)
+    prep.add_argument('--slots',type=int,help='Reserved server slots (default: 40, independent of active load)')
     prep.add_argument('--model')
     prep.add_argument('--server')
     prep.add_argument('--mmproj')

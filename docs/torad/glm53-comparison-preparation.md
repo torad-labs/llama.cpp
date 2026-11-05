@@ -1,10 +1,10 @@
-# One-session decode comparison preparation
+# Fixed four-GPU throughput comparison preparation
 
 ## Goal
 
-Prepare a reproducible, CPU-testable path to compare the same decode work on four GPUs, beginning with one active session. Preparation never starts inference, reserves hardware, or claims GPU qualification. The existing DP4 launcher is the configuration source of truth.
+Prepare one fixed four-GPU serving configuration for a throughput target of **40 concurrent sessions, each at 400,000 tokens**. A one-session run validates that same configuration; it is not the performance target or a different serving architecture. Preparation never starts inference, reserves hardware, or claims GPU qualification. The existing DP4 launcher is the configuration source of truth.
 
-The first target is **one active 400,000-token session across all four GPUs**, with one reserved slot and resident KV. One session does not mean one GPU or only one measured cycle. Collect multiple identified decode cycles before expanding concurrency.
+The default preparation keeps **40 reserved slots and resident KV** at every active-session count. First validate one active session, then increase offered load without changing the launcher configuration. At 40 active sessions each GPU owns 10 sequences; at one active session only GPU 0 owns a sequence, while all four retain their expert shards. Collect multiple identified decode cycles, not just one.
 
 The launcher uses **adaptive MTP, maximum depth two, threshold 0.18**, not fixed MTP2. The case records that fact. It reserves 442,368 context cells per slot; the workload's 400,000 populated tokens are a separate quantity. Slots and active sessions are separate too.
 
@@ -29,10 +29,15 @@ python3 scripts/glm53/compare_decode.py prepare \
   --output .Codex/analysis/glm53-comparison-preparation/case.json
 
 python3 scripts/glm53/compare_decode.py prepare --trace-decode \
-  --output .Codex/analysis/glm53-comparison-preparation/capture-case.json
+  --output .Codex/analysis/glm53-comparison-preparation/bringup-case.json
+
+python3 scripts/glm53/compare_decode.py prepare --active 40 --trace-decode \
+  --output .Codex/analysis/glm53-comparison-preparation/throughput-case.json
 ```
 
-Defaults are one active session and 400,000 initial context tokens. Use `--model` and optionally `--server` / `--mmproj` to bind paths on the eventual GPU host. Even with bound paths, **prepare only writes JSON**. The model and projector files still need verification against their pinned artifact hashes before a real run.
+Defaults are one active session, 400,000 initial context tokens and 40 reserved server slots. `--active 40` changes only the offered workload and resulting ownership counts; it leaves the default launch command and environment unchanged. An explicit `--slots` override remains available for a deliberately different capacity experiment, not an automatic response to active load. Use `--model` and optionally `--server` / `--mmproj` to bind paths on the eventual GPU host. Even with bound paths, **prepare only writes JSON**. The model and projector files still need verification against their pinned artifact hashes before a real run.
+
+The prepared fixed-configuration cases are `fixed40-one-active.json` and `fixed40-forty-active.json` in `.Codex/analysis/glm53-comparison-preparation/`. Earlier one-slot case files are historical preparation artifacts, not the current fixed-configuration recipe.
 
 The baseline is text-only unless a projector is supplied. A served configuration with a loaded projector must keep that explicit because it changes available memory. Host KV can be selected with `--kv host`; its required allocation is not treated as proof of available RAM.
 
@@ -91,7 +96,7 @@ The executable synthetic example lives in `scripts/glm53/test_compare_decode.py`
 
 This preparation does **not** establish:
 
-- Occupied one-session/400k capacity, numerical correctness or decode speed.
+- Resident capacity for the fixed 40-slot reservation, occupied one-session or 40-session/400k capacity, numerical correctness or decode speed.
 - Per-cycle/per-layer actual expert routing, KV selection/reuse, or collective arrival skew. Existing route counters are cumulative and path-dependent; selected KV IDs are usually device-resident. Device-side collection must avoid forced readbacks/synchronization in the timed path and quantify its overhead.
 - Hardware DRAM/PCIe bytes for kernel-driven transfers. Logical payload, hardware traffic and kernel duration remain distinct.
 - Sustained simultaneous four-way bandwidth, latency distributions, or calibrated compute/dequantization and temporary-memory costs.
@@ -103,6 +108,7 @@ These gaps remain visible in the readiness report. They are not turned into zero
 
 - All **149 GLM Python tooling tests passed**, including generated DAG/resource and marker-parser properties, real SQLite export, real CLI comparison and compilation/execution of the C++ marker emitter.
 - A **CPU-only llama-server build passed** with CUDA disabled. The CUDA/NVTX build path and execution were not validated on GPUs.
+- After fixing the capacity reservation across loads, all 14 comparison-tool tests passed. The new property checks every active count from 1 through 40 against the same real-launcher command, environment and serving settings; it failed on the prior load-dependent reservation before the fix.
 - Existing capture recovery ran locally, read-only.
 - No GPU inference, hardware rental, external publication or production restart occurred.
 

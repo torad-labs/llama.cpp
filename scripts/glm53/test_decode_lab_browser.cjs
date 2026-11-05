@@ -15,9 +15,15 @@ const { chromium } = require(require.resolve('playwright-core', {
     await page.goto(process.env.DECODE_LAB_URL || 'http://127.0.0.1:8768');
     await page.waitForSelector('[data-ready="true"]', { timeout: 30000 });
     if (process.argv.includes('--future-only')) {
-      assert.match(await page.locator('#ideal-workload').innerText(), /^1 active/);
+      assert.match(await page.locator('#ideal-workload').innerText(), /^40 active/);
+      assert.match(await page.locator('#comparison-status').innerText(), /40-session throughput/);
+      assert.equal(await page.locator('#ideal-gpus .gpu-chip').count(), 4);
+      assert.equal(await page.locator('#ideal-gpus .unknown-chip').count(), 0);
+      for (const gpu of await page.locator('#ideal-gpus .gpu-chip').allTextContents()) {
+        assert.match(gpu, /10 owners/);
+      }
       assert.equal(await page.locator('#profile-span').innerText(), '--');
-      assert.match(await page.locator('#profile-workload').innerText(), /Expected: 1 active/);
+      assert.match(await page.locator('#profile-workload').innerText(), /Expected: 40 active/);
       assert.equal(await page.locator('#profile-gpus [data-state="pending"]').count(), 4);
       assert.deepEqual(await page.locator('#future-cycle-path .phase-step b').allTextContents(),
         await page.locator('#cycle-path .phase-step b').allTextContents());
@@ -36,7 +42,7 @@ const { chromium } = require(require.resolve('playwright-core', {
       const path = require('node:path');
       const profile = JSON.parse(zlib.gunzipSync(fs.readFileSync(path.resolve(__dirname,
         '../../docs/torad/decode-lab/data/timeline-4k.json.gz'))));
-      profile.metadata.active = 1;
+      profile.metadata.active = 40;
       profile.metadata.context = 400000;
       profile.metadata.depth_policy = 'fixed-2';
       profile.kernels[0].name = '<img src=x onerror="window.__decode_injected=1"> probe';
@@ -65,8 +71,8 @@ const { chromium } = require(require.resolve('playwright-core', {
       console.log('PASS: both workloads visible in the first phone viewport');
       return;
     }
-    assert.match(await page.locator('#mismatch').innerText(), /400,000/);
-    assert.match(await page.locator('#profile-workload').innerText(), /Expected: 1 active/);
+    assert.match(await page.locator('#ideal-workload').innerText(), /400,000/);
+    assert.match(await page.locator('#profile-workload').innerText(), /Expected: 40 active/);
     assert.equal(await page.locator('#visual-compare').isVisible(), true);
     assert.equal(await page.locator('table:visible').count(), 0);
     assert.equal(await page.locator('.gpu-chip').count(), 8);
