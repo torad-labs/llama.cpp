@@ -41,6 +41,8 @@ def arguments(argv=None):
     parser.add_argument("--mtp-depth", choices=["1", "2", "off"], default=DEFAULT_MTP_DEPTH)
     parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
     parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP; 0 removes the cap")
+    parser.add_argument("--trace-decode", action="store_true",
+                        help="Opt-in host phase/batch markers, graph identity and CUDA NVTX; not an unprofiled speed run")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -102,6 +104,9 @@ def make_plan(args):
         env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
+    if args.trace_decode:
+        env.update({"LLAMA_DECODE_TRACE": "1", "GGML_CUDA_NVTX": "1",
+                    "GGML_GRAPH_TRACE": "1", "LLAMA_TIME_DECODE": "1"})
     return argv, env
 
 

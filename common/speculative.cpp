@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "decode-trace.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1928,6 +1929,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (device) {
                     batch.embd = nullptr;
                 }
+                common_decode_trace::range trace_catchup([&] {
+                    return "stage=catchup head=" + std::to_string(head) + " rows=" + std::to_string(batch.n_tokens);
+                });
                 const int32_t rc = llama_decode(ctx_dft, batch);
                 batch.embd = embd;
                 if (rc != 0) {
@@ -2058,7 +2062,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             static const bool index_share_legacy = ggml_env_switch("LLAMA_MTP_INDEX_SHARE_LEGACY");
             if (!index_share_legacy) llama_mtp_draft_step(ctx_dft, i);
-            int ret = llama_decode(ctx_dft, batch);
+            int ret;
+            {
+                common_decode_trace::range trace_proposal([&] {
+                    return "stage=proposal proposal=" + std::to_string(i + 1) + " rows=" + std::to_string(batch.n_tokens);
+                });
+                ret = llama_decode(ctx_dft, batch);
+            }
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 service.invalidate();

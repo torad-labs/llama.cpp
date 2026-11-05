@@ -14,6 +14,10 @@ Open **http://127.0.0.1:8768**. The server binds only to loopback, serves this a
 
 The default comparison is **40 active sessions at 400k context** versus the recorded **one-session 4096-context** capture. These are intentionally labeled different workloads. This page does not manufacture a speedup by dividing their totals.
 
+## Matched-comparison preparation
+
+This page is not yet a cycle-aligned 1:1 comparison. The [CPU-only preparation package](../glm53-comparison-preparation.md) encodes the real one-active-session/four-GPU recipe, adds opt-in host phase markers, recovers scheduling records omitted from the compact export, and tests matched logical-work comparison. Its readiness report keeps missing device counters and complete ideal costs explicit. No new GPU measurement has been made.
+
 ## Visual comparison
 
 The default view contains no tables. Two four-GPU diagrams show the same categories:
@@ -154,7 +158,7 @@ Gzip output is deterministic. The page has no frontend build step. Font requests
 - Light and dark 3840 x 2050 captures, plus laptop and phone captures, are retained under `.Codex/analysis/glm53-decode-lab/screens/`.
 - The earlier table-first page passed an independent visual check but was rejected by the user as too text-heavy and busy. It has been replaced with the visual-first comparison; the earlier scores do not qualify this redesign.
 - The final fresh visual judge scored the redesigned 3840 x 2050 light and dark views 9.6/10, and the open inspector 9.7/10, with no criterion below 9. Fine annotations and the low-emphasis inspection hint remain advisories. Two batched visual rounds were used; final captures are under `.Codex/analysis/glm53-decode-visual/screens/r2-*.png`.
-- No inference-engine change, new GPU run, paid hardware, deployment or matched 40-session/400k measurement was performed.
+- The page build made no inference-engine changes. The later CPU-only preparation adds opt-in host tracing, not inference-algorithm changes. No new GPU run, paid hardware, deployment or matched 40-session/400k measurement was performed.
 
 ## Checks
 

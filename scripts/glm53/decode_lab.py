@@ -13,6 +13,7 @@ import sqlite3
 from urllib.parse import parse_qs, urlsplit
 
 import estimate_decode_pcie as roofline
+from decode_trace import export_dependencies
 
 ROOT = Path(__file__).resolve().parents[2]
 CATCH = {
@@ -107,7 +108,7 @@ class Ranges:
         return best
 
 
-def export_trace(path, metadata):
+def export_trace(path, metadata, *, include_trace=False):
     """Read only whitelisted Nsight tables; never export environment or prompt text."""
     path = Path(path)
     db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
@@ -247,6 +248,7 @@ def export_trace(path, metadata):
         devices.append(dict(device=device, kernel_union_us=union_ns(intervals)/1000,
                             kernel_sum_us=sum(b-a for a,b in intervals)/1000, bins=bins))
     gpu_names = [row[0] for row in db.execute('SELECT name FROM TARGET_INFO_GPU')] if 'TARGET_INFO_GPU' in tables else []
+    trace = export_dependencies(db, origin, strings) if include_trace else None
     db.close()
     checksum = hashlib.sha256()
     with path.open('rb') as stream:
@@ -263,7 +265,7 @@ def export_trace(path, metadata):
                              kernel_sum_us=sum(r['end']-r['start'] for r in raw)/1000,
                              kernel_union_us=union_ns([(r['start'],r['end']) for r in raw])/1000),
                 kernels=kernels, operations=operations, copies=copy_output, apis=apis, devices=devices,
-                kernel_events=kernel_events, copy_events=copy_events, api_events=api_events,
+                kernel_events=kernel_events, copy_events=copy_events, api_events=api_events, trace=trace,
                 event_columns=dict(kernel=['start_ns','duration_ns','device','kernel_index','operation_index'],
                                    copy=['start_ns','duration_ns','device','bytes','copy_index'],
                                    api=['start_ns','duration_ns','api_index']),
@@ -436,6 +438,8 @@ def main():
     profile.add_argument('--kv', choices=('unknown', 'host', 'resident'), default='unknown')
     profile.add_argument('--scope', choices=('unknown', 'request', 'cycle'), default='unknown')
     profile.add_argument('--measurements', type=Path)
+    profile.add_argument('--include-trace', action='store_true',
+                         help='Preserve rich scheduling records for offline matching; output may exceed browser import limits')
     ideal = sub.add_parser('ideal')
     ideal.add_argument('--manifest', type=Path, required=True)
     ideal.add_argument('--output', type=Path, required=True)
@@ -465,7 +469,7 @@ def main():
             record = next(r for r in records if r.get('label') == args.label)
             metadata['timings'] = record['timings']
             metadata['request_wall_seconds'] = record['wall_seconds']
-        value = export_trace(args.sqlite, metadata)
+        value = export_trace(args.sqlite, metadata, include_trace=args.include_trace)
     else:
         manifest = json.loads(args.manifest.read_text())
         tensors = [t for shard in manifest['shards'] for t in shard['tensors']]

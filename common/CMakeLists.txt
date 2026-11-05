@@ -71,6 +71,7 @@ add_library(${TARGET}
     console.h
     debug.cpp
     debug.h
+    decode-trace.h
     download.cpp
     download.h
     fit.cpp
@@ -135,6 +136,14 @@ set_target_properties(${TARGET} PROPERTIES
 target_include_directories(${TARGET} PUBLIC .)
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+
+# Host phase ranges use the same header-only NVTX API as the CUDA backend.
+# CPU-only builds retain the opt-in text journal and need no CUDA dependency.
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_include_directories(${TARGET} PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(${TARGET} PUBLIC ${CMAKE_DL_LIBS})
+endif()
 
 if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
