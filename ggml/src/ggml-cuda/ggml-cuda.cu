@@ -3425,13 +3425,20 @@ static void ggml_cuda_dp_expert_stats_free(ggml_backend_cuda_context & ctx) {
 }
 
 static __global__ void ggml_cuda_local_expert_ids(const int32_t * ids, int32_t * local,
-        int64_t n, int n_used, int64_t stride, int first, int count, int missing, unsigned long long * hits) {
-    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (i < n) {
-        const int expert = ids[(i/n_used)*stride + i % n_used] - first;
-        const bool owned = expert >= 0 && expert < count;
+        float * dst, int64_t n, int64_t rows, int64_t row_blocks, int n_used, int64_t stride,
+        int first, int count, int missing, unsigned long long * hits) {
+    const int64_t i = dst ? blockIdx.x / row_blocks : int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n) { return; }
+    const int64_t row = dst ? (blockIdx.x % row_blocks)*blockDim.x + threadIdx.x : 0;
+    const int expert = ids[(i/n_used)*stride + i % n_used] - first;
+    const bool owned = expert >= 0 && expert < count;
+    if (row == 0) {
         local[i] = owned ? expert : missing;
         if (hits && owned) { atomicAdd(hits + expert, 1ULL); }
+    }
+    // Every local row is overwritten by its expert. Only absent experts need zero contributions.
+    if (dst && !owned && row < rows) {
+        dst[i*rows + row] = 0.0f;
     }
 }
 
@@ -3445,13 +3452,22 @@ static void ggml_cuda_mul_mat_id_partition(ggml_backend_cuda_context & ctx, cons
     GGML_ASSERT(ggml_is_contiguous(dst) && ids->nb[0] == sizeof(int32_t));
     GGML_ASSERT(!fusion || vector);
     const int64_t n = ggml_nelements(ids);
+    const int64_t rows = mm->ne[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_nelements(dst) == n*rows);
+    const int64_t row_blocks = (rows + 255)/256;
+    GGML_ASSERT(n*row_blocks <= INT_MAX);
     ggml_cuda_pool_alloc<int32_t> local_ids(ctx.pool(), n);
     auto * hits = ggml_cuda_dp_expert_counters(ctx, mm);
-    ggml_cuda_local_expert_ids<<<(n + 255)/256, 256, 0, ctx.stream()>>>(
-        (const int32_t *) ids->data, local_ids.get(), n, ids->ne[0], ids->nb[1]/sizeof(int32_t),
+    // A fused output can reuse storage whose last reader was one of the fused nodes. Read all IDs before clearing it.
+    const uintptr_t ids_begin = (uintptr_t) ids->data;
+    const uintptr_t dst_begin = (uintptr_t) dst->data;
+    const bool overlap = ids_begin < dst_begin + ggml_nbytes(dst) && dst_begin < ids_begin + ggml_nbytes(ids);
+    ggml_cuda_local_expert_ids<<<overlap ? (n + 255)/256 : n*row_blocks, 256, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, local_ids.get(), overlap ? nullptr : (float *) dst->data, n, rows, row_blocks,
+        ids->ne[0], ids->nb[1]/sizeof(int32_t),
         ggml_get_op_params_i32(mm, 1), src0->ne[2], vector ? -1 : src0->ne[2], hits);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+    if (overlap) { CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream())); }
     ggml_tensor mapped = *ids;
     mapped.data = local_ids.get();
     mapped.nb[1] = mapped.ne[0]*sizeof(int32_t);

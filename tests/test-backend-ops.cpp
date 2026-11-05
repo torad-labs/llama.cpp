@@ -6116,11 +6116,15 @@ struct test_mul_mat_id_partition : public test_mul_mat_id {
     const int first;
     const int local;
     const bool fused;
+    const int routing;
     test_mul_mat_id_partition(ggml_type type, bool broadcast, int64_t tokens, int first,
-            int total = 8, int used = 2, int local = 2, int64_t m = 256, int64_t k = 256, bool fused = false)
-        : test_mul_mat_id(type, GGML_TYPE_F32, total, used, broadcast, m, tokens, k), first(first), local(local), fused(fused) {}
+            int total = 8, int used = 2, int local = 2, int64_t m = 256, int64_t k = 256, bool fused = false, int routing = 0)
+        : test_mul_mat_id(type, GGML_TYPE_F32, total, used, broadcast, m, tokens, k), first(first), local(local), fused(fused), routing(routing) {}
 
-    std::string vars() override { return test_mul_mat_id::vars() + "," + VARS_TO_STR3(first, local, fused); }
+    std::string vars() override {
+        return test_mul_mat_id::vars() + "," + VARS_TO_STR3(first, local, fused) +
+            (routing ? "," + VAR_TO_STR(routing) : "");
+    }
 
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_PARTITION"; }
 
@@ -6150,7 +6154,16 @@ struct test_mul_mat_id_partition : public test_mul_mat_id {
         ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
         std::vector<int32_t> values(n_mats*n);
         for (int64_t row = 0; row < n; ++row) {
-            for (int slot = 0; slot < n_mats; ++slot) { values[row*n_mats + slot] = (2*row + slot*(n_mats > 8 ? 37 : 1)) % n_mats; }
+            for (int slot = 0; slot < n_mats; ++slot) {
+                int id = (2*row + slot*(n_mats > 8 ? 37 : 1)) % n_mats;
+                if (routing == 1) {
+                    // All local, including the last expert: its final tile has fewer than J valid indices.
+                    id = first + local - 1 - slot % local;
+                } else if (routing == 2) {
+                    id = (first + local + slot) % n_mats;
+                }
+                values[row*n_mats + slot] = id;
+            }
         }
         ggml_backend_tensor_set(ids, values.data(), 0, ggml_nbytes(ids));
     }
@@ -10662,6 +10675,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t tokens : {3, 8}) {
         for (int first : {0, 216}) {
             test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, tokens, first, 288, 8, 72, 2048, 4096, true));
+        }
+    }
+    // Cover the ring/vector/MMQ boundaries and the verification widths of 12 and 36 MTP-2 sessions.
+    for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q8_0}) {
+        for (int64_t tokens : {1, 3, 8, 9, 16, 17, 36, 108}) {
+            for (bool broadcast : {false, true}) {
+                for (int routing : {1, 2}) {
+                    test_cases.emplace_back(new test_mul_mat_id_partition(type, broadcast, tokens, 216, 288, 8, 72,
+                        256, 256, false, routing));
+                }
+            }
+        }
+        for (bool broadcast : {false, true}) {
+            for (int routing : {1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_id_partition(type, broadcast, 36, 216, 288, 8, 72,
+                    264, 256, false, routing));
+            }
         }
     }
     std::default_random_engine rng(0);
