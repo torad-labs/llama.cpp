@@ -2,7 +2,9 @@
 
 Experimental DP from [PR #110](https://github.com/torad-labs/llama.cpp/pull/110), combined with main for the November 2 baseline and extended by the November 3 completion work below. Four RTX PRO 6000 96 GB cards and 40 long-context slots are the target. The selected model is the BoldingBuilds uncensored pack. Capacity and numerical qualification remain separate requirements; a successful boot or component test does not qualify concurrent 400K sessions.
 
-Latest four-card throughput measurement: the November 4 profiling run below uses 40 configured private slots, host KV and MTP2 on runtime `82ad56cb8`. One active session produces 128-token replies at 45.3 tokens/s with a 512-token prompt, 35.2 at 4,096 and 31.7 at 24,576. The shorter concurrent probes return about 28 tokens/s per session at two sessions, 12-16 at four and 6 at eight. Fully occupied concurrent 400K capacity remains unqualified. The temporary rental was deleted after collection; production pins and placed profiles are unchanged.
+Latest four-card bring-up: the November 5 run used runtime `e2435726a`, 36 reserved private slots, resident Q8 caches/state and adaptive MTP maximum depth 2. One uninstrumented active session delivered a cached continuation at 73.216 tokens/s after a 512-token prompt. An instrumented one-to-four-to-twelve-session sequence failed during twelve-session target verification; concurrent 400K capacity remains unqualified. Forty reserved slots failed the 4,096 MiB free-memory requirement. See the [failure evidence, TensorFold comparison and unqualified local fixes](glm53-dp-kernel-audit-20261105.md). The temporary rentals were destroyed after collection; production pins and placed profiles are unchanged.
+
+The November 4 host-KV measurements below used a different configuration: 40 private slots and MTP2 on runtime `82ad56cb8`. One active session produced 128-token replies at 45.3 tokens/s with a 512-token prompt, 35.2 at 4,096 and 31.7 at 24,576. The shorter concurrent probes returned about 28 tokens/s per session at two sessions, 12-16 at four and 6 at eight. These are historical host-KV results, not the resident-cache baseline.
 
 The earlier 72-slot capacity probe allocated private 442,368-cell slots and passed short concurrent decode at a median 0.587 tokens/s per request. That historical result is not the current throughput baseline. Long-context capacity testing remains deferred until concurrent throughput is usable.
 
@@ -107,6 +109,8 @@ python3 scripts/glm53/serve.py --profile dp-4 --slots 36 --mtp-depth 2 \
 ```
 
 The second command is unqualified for 36 concurrent 400K sessions. The team configuration keeps MTP enabled. The previous 40-slot MTP-off proposal is withdrawn; its projected savings were not measured. The launcher retains its explicit draft-off option for independent experiments, but neither the capacity calculator nor the host-KV recipe relies on it.
+
+The DP launcher disables idle graph expiry with `GGML_CUDA_GRAPH_IDLE_MS=0` while retaining the finite 32,768-node budget. It does not disable node-based eviction or establish memory headroom under concurrent work. `--trace-decode` enables verbosity 4 alongside graph and phase diagnostics; omit it for uninstrumented throughput measurements.
 
 The launcher removes inherited engine overrides for reproducibility. Use the raw command below for controlled wire-format and expert-counter diagnostics instead of expecting inherited environment variables to override the launcher.
 
