@@ -1,4 +1,5 @@
 import { number, bytes, compareStatus, filterRecords, joinWeight, copyFloor, selectEvents, parseProfile } from './lab-core.mjs';
+import { createVisual } from './visual.mjs';
 
 const $ = selector => document.querySelector(selector);
 const el = (tag, text, cls) => {
@@ -12,6 +13,7 @@ const phaseNames = { target: 'Target verification', 'proposal-1': 'Draft proposa
 const state = { ideal: null, profile: null, view: 'layers', phase: 'target', layer: null, device: '0',
   search: '', page: 0, selected: null, eventPage: 0, pending: 0, captureTicket: 0, modelTicket: 0 };
 const PAGE = 24;
+const visual = createVisual({tooltip, openEvidence});
 function busy(change, message) {
   state.pending += change;
   $('#app').setAttribute('aria-busy', String(state.pending > 0));
@@ -119,52 +121,8 @@ function renderHead() {
   $('#mismatch-detail').textContent = number(r.sessions) + ' vs ' + number(m.active) + ' sessions / 400,000 vs '
     + number(m.context) + ' tokens / ' + (m.depth_policy || 'unknown') + ' capture depth';
   $('#mismatch').title = status.reasons.join('\n');
-  const recordedStrip = $('#recorded-strip'); recordedStrip.replaceChildren();
-  const activeShare = p.summary.kernel_union_us / p.summary.span_us;
-  for (const [label, fraction] of [['Any GPU kernel active', activeShare], ['No kernel active', 1 - activeShare]]) {
-    const b = el('button'); b.type = 'button'; b.style.flex = String(fraction);
-    tooltip(b, label + ': ' + number(fraction * 100, 1) + '% of captured GPU interval');
-    recordedStrip.append(b);
-  }
-  $('#recorded-active-label').textContent = number(activeShare * 100, 1) + '% any GPU kernel active';
-  const strip = $('#cost-strip'); strip.replaceChildren();
-  for (const [label, duration] of [['GDDR work', r.dram_ms], ['PCIe and host boundaries', r.exposed_pcie_ms]]) {
-    const b = el('button'); b.type = 'button'; b.style.flex = String(duration);
-    tooltip(b, label + ': ' + number(duration, 3) + ' ms per ideal cycle'); strip.append(b);
-  }
   $('#provenance').textContent = 'Captured runtime ' + (m.runtime || 'unknown') + ' / source ' + (p.source.file || 'local import')
     + ' / no 40-session 400k qualification';
-}
-function renderActivity() {
-  const profile = state.profile;
-  const lanes = $('#activity-lanes'); lanes.replaceChildren();
-  const table = el('table'); const header = el('thead'); const hr = el('tr');
-  for (const title of ['Time window / ms', ...profile.devices.map(d => 'GPU ' + d.device)]) hr.append(el('th', title));
-  header.append(hr); table.append(header); const body = el('tbody');
-  profile.devices.forEach(device => {
-    const lane = el('div', null, 'gpu-lane'); lane.append(el('span', 'GPU ' + device.device));
-    const bins = el('div', null, 'gpu-bins');
-    device.bins.forEach((value, i) => {
-      const b = el('button'); b.type = 'button'; b.style.opacity = String(.12 + .88 * value);
-      const a = profile.summary.span_us * i / device.bins.length / 1000;
-      const z = profile.summary.span_us * (i + 1) / device.bins.length / 1000;
-      tooltip(b, 'GPU ' + device.device + ' / ' + number(a, 2) + '-' + number(z, 2) + ' ms / '
-        + number(value * 100, 1) + '% kernel occupancy');
-      bins.append(b);
-    });
-    lane.append(bins, el('span', number(device.kernel_union_us / profile.summary.span_us * 100, 1) + '%'));
-    lanes.append(lane);
-  });
-  const n = profile.devices[0]?.bins.length || 0;
-  for (let i = 0; i < n; i++) {
-    const row = el('tr');
-    row.append(el('td', number(profile.summary.span_us * i / n / 1000, 2) + '-' + number(profile.summary.span_us * (i+1) / n / 1000, 2)));
-    for (const device of profile.devices) row.append(el('td', number(device.bins[i]*100, 1) + '%'));
-    body.append(row);
-  }
-  table.append(body); $('#activity-table').replaceChildren(table);
-  $('#activity-mid').textContent = number(profile.summary.span_us / 2000, 0) + ' ms';
-  $('#activity-end').textContent = number(profile.summary.span_us / 1000, 0) + ' ms';
 }
 function rowsForView() {
   if (state.view === 'layers') return groups().filter(row => (row.name + ' ' + row.description).toLowerCase().includes(state.search.toLowerCase()));
@@ -366,13 +324,32 @@ function eventDetails(target,view,row) {
 }
 function renderAll() {
   if (!state.ideal || !state.profile) return;
-  renderHead();renderActivity();renderTable();
+  renderHead();visual.render(state.ideal,state.profile);renderTable();
   if (!state.selected) {
     const row=groups().find(g=>g.layer===3)||groups()[0];
     state.selected=row?{view:'layers',row}:null;
   }
   renderInspector();$('#app').dataset.ready='true';
+  $('#raw-toggle').disabled=false;$('#configure').disabled=false;
 }
+function openEvidence({view,phase,layer,search='',device=state.device}={}) {
+  $('#raw-data').hidden=false;$('#raw-toggle').setAttribute('aria-expanded','true');
+  $('#raw-toggle').textContent='Close raw evidence';
+  if(view)state.view=view;
+  if(phase){state.phase=phase;$('#phase').value=phase;}
+  if(layer!==undefined)state.layer=layer;
+  state.search=search;$('#search').value=search;state.device=device;$('#device').value=device;
+  state.page=0;state.selected=null;state.eventPage=0;renderTable();renderInspector();
+  $('#ledger-title').focus();$('#raw-data').scrollIntoView({block:'start'});
+}
+$('#raw-toggle').addEventListener('click',()=>{
+  if($('#raw-data').hidden)openEvidence();
+  else {
+    $('#raw-data').hidden=true;$('#raw-toggle').setAttribute('aria-expanded','false');
+    $('#raw-toggle').textContent='Open raw evidence';
+  }
+});
+$('#import-trigger').addEventListener('click',()=>$('#import-file').click());
 async function readStream(stream) {
   const reader=stream.getReader(), decoder=new TextDecoder();
   let result='', size=0;
@@ -439,7 +416,7 @@ $('#import-file').addEventListener('change',async event=>{
   finally{busy(-1);event.target.value='';}
 });
 function setTheme(theme) {
-  document.documentElement.dataset.theme=theme;$('#theme').textContent=theme==='dark'?'Daylight':'Candlelight';
+  document.documentElement.dataset.theme=theme;$('#theme').textContent=theme==='dark'?'Light theme':'Dark theme';
   try{localStorage.setItem('decode-lab-theme',theme);}catch{}
 }
 $('#theme').addEventListener('click',()=>{
@@ -447,7 +424,7 @@ $('#theme').addEventListener('click',()=>{
   setTheme(dark?'light':'dark');
 });
 try{const theme=localStorage.getItem('decode-lab-theme');if(theme==='dark'||theme==='light')setTheme(theme);}catch{}
-if(matchMedia('(max-width: 900px)').matches)$('#config-panel').open=false;
+$('#raw-toggle').disabled=true;$('#configure').disabled=true;
 try {
   const response=await fetch('data/ideal.json');
   if(!response.ok)throw new Error('Ideal data is missing. Rebuild the evidence pack using README.md.');

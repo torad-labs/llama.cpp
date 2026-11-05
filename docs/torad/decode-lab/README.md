@@ -14,6 +14,20 @@ Open **http://127.0.0.1:8768**. The server binds only to loopback, serves this a
 
 The default comparison is **40 active sessions at 400k context** versus the recorded **one-session 4096-context** capture. These are intentionally labeled different workloads. This page does not manufacture a speedup by dividing their totals.
 
+## Visual comparison
+
+The default view contains no tables. Two four-GPU diagrams show the same categories:
+
+- **Blue:** ideal GDDR work, or recorded local kernels/device copies.
+- **Orange:** transfer/wait budgets, or recorded collective/host-KV kernels and copies other than known local D2D copies.
+- **Gray:** no exported kernel/copy interval. This is not proof of idle hardware.
+
+Each GPU contains 100 squares: one square is 1% of that GPU's interval, not a core or a memory-capacity unit. Overlapping recorded intervals count once; transfer/wait takes priority. Summary shares use the sum of per-GPU intervals, not a claimed critical-path duration. The ideal uses the busiest-owner model. Balanced owners share that assumption; timings for less-busy owners remain unknown when ownership is uneven.
+
+Click a GPU or a category for exact values. Click a PCIe path for transfer evidence. The model's four phase buttons and 45 layer bars open the underlying costs. On the recorded timeline, hover or focus a window; arrow keys move between windows, and selecting one opens its exact proportions. The two sides deliberately do not share a clock or a speedup ratio.
+
+**Adjust model** opens assumptions. **Open raw evidence** reveals the full ledger. Close an inspector with its Close button or Escape. Import remains local and retains the previous evidence on failure.
+
 ## What can be inspected
 
 - **Layer budgets:** all 45 target layers, output/host boundaries, both draft proposals and the hypothetical cache-only catch-up. Open any group to inspect its substeps.
@@ -22,7 +36,7 @@ The default comparison is **40 active sessions at 400k context** versus the reco
 - **Kernels:** exact signature and GPU, invocation count, mean/P50/P95/max, summed duration, and every individual captured kernel event.
 - **Memory copies:** actual CUDA copy payload and duration, a byte-matched reference at the selected directional link rate, measured payload GB/s and every copy event.
 - **CUDA APIs:** host call count and duration, including graph creation/instantiation and synchronization. These are not added to GPU totals.
-- **Activity:** per-GPU kernel occupancy over 96 equal capture windows, with hover/focus details and an accessible data table.
+- **Activity:** per-GPU local/transfer/unrecorded time over 96 equal capture windows, with hover/focus inspection and an on-demand numeric table. These are disjoint interval unions, not summed kernel durations.
 
 Both bundled captures retain **all** kernel, explicit-copy and runtime-API records, at the nanosecond units exported by Nsight. Event pagination does not sample or discard records. The source SQLite files also contain OS-runtime and other profiler tables that this CUDA-focused page does not export.
 
@@ -131,18 +145,21 @@ Gzip output is deterministic. The page has no frontend build step. Font requests
 ## Validation performed
 
 - All 130 tests in the GLM Python tooling suite passed. After correcting unspecified export metadata to remain unknown, all nine new exporter/server/detail tests passed again.
-- All seven browser-data tests passed.
+- All seven browser-data tests passed in the original build; those helpers are unchanged.
+- Six new visual-accounting tests passed, including generated overlapping event sequences and area-rounding properties. They failed on missing behavior before implementation.
+- The revised browser journey passed: no default tables, GPU inspection, uneven ownership, layer drill-down, keyboard timeline navigation, all 96 numeric windows, model settings, evidence tables and responsive bounds. Separate import-safety and first-viewport phone-comparison journeys passed.
+- The inspector-overlap and absent phone-comparison cases were reproduced in failing browser tests, then fixed. The desk inspector now reserves space instead of covering the recorded GPUs.
 - Playwright exercised assumption changes, kernel search, raw-event inspection, copy rates, capture switching, valid/invalid local imports, untrusted labels, and 3840/1440/390 layout bounds.
 - The browser test initially inherited a phone-sized context before navigation. Its setup now sets the desk viewport before loading the page; the full journey passed after that correction.
 - Light and dark 3840 x 2050 captures, plus laptop and phone captures, are retained under `.Codex/analysis/glm53-decode-lab/screens/`.
-- The fresh final visual judge scored the owner-screen light/dark captures **8.5/10 each**, with every criterion at least 7: the binding desk-screen check passes. The phone scored 8.8; the laptop scored 7.9 with a readability advisory. The judge also could not see the below-fold pagination: the implementation bounds lists to 24 rows per page. No third polishing round was run.
+- The earlier table-first page passed an independent visual check but was rejected by the user as too text-heavy and busy. It has been replaced with the visual-first comparison; the earlier scores do not qualify this redesign.
 - No inference-engine change, new GPU run, paid hardware, deployment or matched 40-session/400k measurement was performed.
 
 ## Checks
 
 ```sh
 python3 -m unittest discover -s scripts/glm53 -p 'test_decode_lab.py'
-node --test scripts/glm53/test_decode_lab_core.mjs
+node --test scripts/glm53/test_decode_lab_core.mjs scripts/glm53/test_decode_visual.mjs
 ```
 
 The lasting browser test uses Playwright over an isolated agent-browser CDP connection:

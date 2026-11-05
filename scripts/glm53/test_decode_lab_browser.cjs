@@ -28,6 +28,7 @@ const { chromium } = require(require.resolve('playwright-core', {
         name: 'new-profile.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(profile))
       });
       await page.waitForFunction(() => document.querySelector('#comparison-status').textContent.includes('Batch settings match'));
+      await page.locator('#raw-toggle').click();
       await page.locator('#view-kernels').click();
       await page.locator('#search').fill('probe');
       assert.match(await page.locator('#ledger').innerText(), /<img/);
@@ -37,11 +38,53 @@ const { chromium } = require(require.resolve('playwright-core', {
       console.log('PASS: valid local import, matching batch status, untrusted labels rendered as text');
       return;
     }
+    if (process.argv.includes('--phone-only')) {
+      await page.setViewportSize({width:390,height:844});
+      const recorded = await page.locator('#mobile-profile').boundingBox();
+      assert.notEqual(recorded, null, 'Phone must show the recorded comparison at a glance');
+      assert.ok(recorded.y + recorded.height <= 844, 'Both time shares fit in the first phone viewport');
+      assert.deepEqual(errors, []);
+      console.log('PASS: both workloads visible in the first phone viewport');
+      return;
+    }
     assert.match(await page.locator('#mismatch').innerText(), /400,000/);
     assert.match(await page.locator('#profile-workload').innerText(), /4,096/);
-    assert.match(await page.locator('#ledger').innerText(), /Ideal/);
+    assert.equal(await page.locator('#visual-compare').isVisible(), true);
+    assert.equal(await page.locator('table:visible').count(), 0);
+    assert.equal(await page.locator('.gpu-chip').count(), 8);
+    await page.locator('[data-inspect="transfer"]').first().click();
+    assert.equal(await page.locator('#visual-inspector').isVisible(), true);
+    assert.match(await page.locator('#visual-inspector').innerText(), /Not measured/);
+    assert.ok((await page.locator('#visual-compare').boundingBox()).x + (await page.locator('#visual-compare').boundingBox()).width <= (await page.locator('#visual-inspector').boundingBox()).x,
+      'Desk inspector must not cover the comparison');
+    await page.locator('#visual-inspector-close').click();
+    await page.locator('#ideal-gpus .gpu-chip').first().click();
+    assert.match(await page.locator('#visual-inspector').innerText(), /100 squares|1%/);
+    await page.keyboard.press('Escape');
+    assert.equal(await page.locator('#visual-inspector').isVisible(), false);
+    assert.equal(await page.locator('#ideal-gpus .gpu-chip').first().evaluate(el => el === document.activeElement), true);
+    await page.locator('#configure').click();
+    await page.locator('#active').selectOption('1');
+    await page.waitForFunction(() => document.querySelector('#ideal-workload').textContent.startsWith('1 active'));
+    assert.equal(await page.locator('#ideal-gpus .unknown-chip').count(), 3);
     await page.locator('#active').selectOption('4');
     await page.waitForFunction(() => document.querySelector('#ideal-workload').textContent.startsWith('4 active'));
+    await page.locator('#settings-close').click();
+    await page.locator('#layer-map button').nth(3).click();
+    await page.getByRole('button', {name:'Inspect every substep',exact:true}).click();
+    assert.match(await page.locator('#ledger-title').innerText(), /Layer 3/);
+    await page.locator('#raw-toggle').click();
+    await page.locator('#visual-timeline .timeline-bin').first().focus();
+    await page.keyboard.press('ArrowRight');
+    assert.equal(await page.locator('#visual-timeline .timeline-bin').nth(1).evaluate(el => el === document.activeElement), true);
+    await page.keyboard.press('Enter');
+    assert.match(await page.locator('#visual-inspector').innerText(), /captured window/);
+    await page.keyboard.press('Escape');
+    await page.locator('#raw-toggle').click();
+    await page.locator('#raw-data > details > summary').click();
+    await page.locator('#activity-table summary').click();
+    assert.equal(await page.locator('#activity-windows tbody tr').count(), 96);
+    assert.match(await page.locator('#ledger').innerText(), /Ideal/);
     await page.locator('#view-kernels').click();
     await page.locator('#search').fill('ggml_cuda_ar');
     assert.ok(await page.locator('#ledger tbody tr').count() > 0);
