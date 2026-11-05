@@ -329,6 +329,8 @@ class ServingRecipeTest(unittest.TestCase):
                     self.assertEqual(env["GGML_CUDA_ALLREDUCE"], "internal")
                     self.assertEqual(env["GGML_CUDA_GRAPH_MAX"], "0")
                     self.assertEqual(env["GGML_CUDA_GRAPH_MEM_STATS"], "0")
+                    self.assertEqual(env["GGML_CUDA_GRAPH_NODES"], "32768")
+                    self.assertEqual(env["GGML_CUDA_GRAPH_IDLE_MS"], "0")
                     self.assertNotIn("LLAMA_KPOOL_DIRECT_INDICES", env)
                     for flag, value in {"-ubd": "512", "-ctkd": "q8_0", "-ctvd": "q8_0"}.items():
                         if depth == "off":

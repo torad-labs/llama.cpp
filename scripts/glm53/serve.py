@@ -99,12 +99,15 @@ def make_plan(args):
         "LD_LIBRARY_PATH": str(server.parent),
     }
     if dp:
-        env["GGML_CUDA_GRAPH_MEM_STATS"] = "0"
+        # Keep infrequent shapes warm with a finite node budget; qualification still enforces 4096 MiB free per GPU.
+        env.update({"GGML_CUDA_GRAPH_MEM_STATS": "0", "GGML_CUDA_GRAPH_NODES": "32768",
+                    "GGML_CUDA_GRAPH_IDLE_MS": "0"})
     if not dp:
         env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
     if args.trace_decode:
+        argv += ["-lv", "4"]
         env.update({"LLAMA_DECODE_TRACE": "1", "GGML_CUDA_NVTX": "1",
                     "GGML_GRAPH_TRACE": "1", "LLAMA_TIME_DECODE": "1"})
     return argv, env

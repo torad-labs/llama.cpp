@@ -275,6 +275,31 @@ static bool test_graph_lifetime() {
 #endif
 }
 
+static bool test_graph_lifetime_disabled() {
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context ctx(0);
+    ggml_cuda_graph_key a, b;
+    a.first_node = reinterpret_cast<const void *>(0x1);
+    b.first_node = reinterpret_cast<const void *>(0x2);
+    auto * graph_a = ctx.cuda_graph(a, 1'000'000);
+    auto * graph_b = ctx.cuda_graph(b, 2'000'000);
+    for (int64_t seconds = 3; seconds <= 80; ++seconds) {
+        ctx.cuda_graph(b, seconds*1'000'000);
+    }
+    // A shape may be infrequent under continuous traffic, or unused overnight.
+    bool kept = ctx.cuda_graphs.count(a) && ctx.cuda_graph(a, 81'000'000) == graph_a;
+    ctx.cuda_graph(b, 90'000'000'000);
+    ctx.cuda_graph(b, 90'020'000'000);
+    kept &= ctx.cuda_graphs.count(a) && ctx.cuda_graphs.count(b) &&
+        ctx.cuda_graph(a, 90'021'000'000) == graph_a && ctx.cuda_graph(b, 90'022'000'000) == graph_b;
+    printf("  idle expiration disabled keeps infrequent and overnight shapes: %s\n", kept ? "ok" : "FAILED");
+    return kept;
+#else
+    puts("CUDA graph lifetime test skipped: CUDA graphs are not built");
+    return true;
+#endif
+}
+
 static void set_env(const char * name, const char * value) {
 #ifdef _WIN32
     _putenv_s(name, value != nullptr ? value : "");
@@ -298,10 +323,16 @@ static std::string join(const std::vector<int> & v) {
 int main(int argc, char ** argv) {
     const bool nodes = argc > 1 && strcmp(argv[1], "nodes") == 0;
     const bool idle  = argc > 1 && strcmp(argv[1], "idle") == 0;
+    const bool no_idle = argc > 1 && strcmp(argv[1], "no-idle") == 0;
     const bool no_mem_stats = argc > 1 && strcmp(argv[1], "no-mem-stats") == 0;
 
     if (idle) {
+        set_env("GGML_CUDA_GRAPH_IDLE_MS", nullptr);
         return test_graph_lifetime() ? 0 : 1;
+    }
+    if (no_idle) {
+        set_env("GGML_CUDA_GRAPH_IDLE_MS", "0");
+        return test_graph_lifetime_disabled() ? 0 : 1;
     }
 
     // the caps are read once, when the first CUDA backend is made

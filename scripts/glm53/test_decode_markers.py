@@ -41,14 +41,18 @@ int main() {
 
     def test_launcher_explicitly_preserves_requested_diagnostics_only(self):
         normal=serve.arguments(['--model','/tmp/not-loaded.gguf','--profile','dp-4','--slots','1'])
-        _,base=serve.make_plan(normal)
+        argv,base=serve.make_plan(normal)
         self.assertNotIn('LLAMA_DECODE_TRACE',base)
+        self.assertNotIn('-lv',argv)
         traced=serve.arguments(['--model','/tmp/not-loaded.gguf','--profile','dp-4','--slots','1','--trace-decode'])
-        _,env=serve.make_plan(traced)
+        argv,env=serve.make_plan(traced)
         self.assertEqual(env['LLAMA_DECODE_TRACE'],'1')
         self.assertEqual(env['GGML_CUDA_NVTX'],'1')
         self.assertEqual(env['GGML_GRAPH_TRACE'],'1')
         self.assertEqual(env['LLAMA_TIME_DECODE'],'1')
+        # ggml INFO is routed through common's TRACE level (4), above the server default (3).
+        self.assertIn('-lv',argv)
+        self.assertEqual(argv[argv.index('-lv')+1],'4')
 
 
 if __name__ == '__main__':
