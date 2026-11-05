@@ -153,6 +153,7 @@ Gzip output is deterministic. The page has no frontend build step. Font requests
 - The browser test initially inherited a phone-sized context before navigation. Its setup now sets the desk viewport before loading the page; the full journey passed after that correction.
 - Light and dark 3840 x 2050 captures, plus laptop and phone captures, are retained under `.Codex/analysis/glm53-decode-lab/screens/`.
 - The earlier table-first page passed an independent visual check but was rejected by the user as too text-heavy and busy. It has been replaced with the visual-first comparison; the earlier scores do not qualify this redesign.
+- The final fresh visual judge scored the redesigned 3840 x 2050 light and dark views 9.6/10, and the open inspector 9.7/10, with no criterion below 9. Fine annotations and the low-emphasis inspection hint remain advisories. Two batched visual rounds were used; final captures are under `.Codex/analysis/glm53-decode-visual/screens/r2-*.png`.
 - No inference-engine change, new GPU run, paid hardware, deployment or matched 40-session/400k measurement was performed.
 
 ## Checks
