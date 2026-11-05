@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Decode comparison</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:wght@400;500;600;700&family=Source+Serif+4:wght@400;500&display=swap">
+  <link rel="stylesheet" href="lab.css">
+  <script type="module" src="lab.mjs"></script>
+</head>
+<body>
+<a class="skip" href="#ledger-title">Skip to comparison</a>
+<header class="masthead">
+  <div><h1>Decode comparison</h1><p>GLM-5.3 Flash <span class="separator">/</span> Four RTX PRO 6000 Blackwell cards</p></div>
+  <div class="header-actions">
+    <a href="README.md">Method &amp; sources</a>
+    <button id="theme" type="button" aria-label="Switch color theme">Candlelight</button>
+    <label class="button primary" for="import-file">Import profile</label>
+    <input class="visually-hidden" id="import-file" type="file" accept=".json,.gz,application/json,application/gzip">
+  </div>
+</header>
+
+<div id="app" aria-busy="true">
+  <div id="load-error" class="error" role="alert" hidden><span id="error-text"></span><button id="retry" type="button">Reload capture</button></div>
+  <div class="status-line"><span id="load-state" role="status">Reading local evidence...</span><span>Local files only. Nothing is uploaded.</span></div>
+  <div id="mismatch" class="mismatch" role="note">
+    <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24"><path d="M12 3 22 21H2Z M12 9v5 M12 17v1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <div><strong id="comparison-status">Different workloads. No direct speedup ratio.</strong><span id="mismatch-detail"></span></div>
+  </div>
+  <section class="comparison-head" aria-label="Workload comparison">
+    <div class="ideal-summary">
+      <h2><span class="key ideal-key"></span>Ideal model</h2>
+      <p id="ideal-workload">40 active sessions / 400,000 context</p>
+      <div class="summary-reading"><strong id="ideal-cycle">--</strong><span>ms / decode cycle</span><span class="summary-secondary" id="ideal-rate"></span></div>
+      <div class="cost-strip" id="cost-strip" aria-label="Ideal cycle components"></div>
+      <div class="strip-labels"><span>GDDR work</span><span>PCIe &amp; host boundaries</span></div>
+    </div>
+    <div class="observed-summary">
+      <div class="section-heading"><h2><span class="key profile-key"></span>Recorded profile</h2>
+        <label class="capture-label">Capture<select id="capture"><option value="timeline-4k">4,096 context</option><option value="timeline-512">512 context</option></select></label>
+      </div>
+      <p id="profile-workload">Loading captured workload</p>
+      <div class="summary-reading"><strong id="profile-span">--</strong><span>ms / captured interval</span><span class="summary-secondary" id="profile-rate"></span></div>
+      <div class="cost-strip recorded-strip" id="recorded-strip" aria-label="Recorded kernel activity share"></div>
+      <div class="strip-labels"><span id="recorded-active-label">Any GPU kernel active</span><span>No kernel active</span></div>
+      <div class="profile-facts"><span id="profile-count"></span><span id="profile-attribution"></span></div>
+    </div>
+  </section>
+
+  <div class="workspace">
+    <aside class="settings" aria-label="Ideal model settings">
+      <details id="config-panel" open>
+        <summary>Model assumptions</summary>
+        <form id="assumptions">
+          <label>Active sessions<select id="active" name="sessions"><option>1</option><option>4</option><option>8</option><option>12</option><option>24</option><option>36</option><option selected>40</option></select></label>
+          <label>Model phase<select id="phase"><option value="target">Target verification</option><option value="proposal-1">Draft proposal 1</option><option value="proposal-2">Draft proposal 2</option><option value="catchup">Cache-only catch-up</option><option value="all">Complete cycle</option></select></label>
+          <label>Expert reuse<select name="expert_span"><option value="independent">Independent verify rows</option><option value="same-within-sequence">Same experts within a session</option></select></label>
+          <label>Collective protocol<select name="protocol"><option value="optimized">Proposed owner slices</option><option value="current">Current full buffers</option></select></label>
+          <label>Latent KV placement<select name="kv"><option value="resident">GPU resident</option><option value="host-reuse">Host / reuse selected rows</option><option value="host-per-query">Host / fetch each query</option></select></label>
+          <details class="advanced"><summary>Bandwidth &amp; latency</summary>
+            <label>Peer link / GPU <span>GB/s</span><input name="peer_gbps" type="number" value="54" min="0.01" step="0.01" required></label>
+            <label>Shared peer fabric <span>GB/s</span><input name="fabric_gbps" type="number" value="216" min="0.01" step="0.01" required></label>
+            <label>Host link / GPU <span>GB/s</span><input name="host_gbps" type="number" value="40" min="0.01" step="0.01" required></label>
+            <label>Shared host path <span>GB/s</span><input name="host_fabric_gbps" type="number" value="128" min="0.01" step="0.01" required></label>
+            <label>Collective latency <span>us / boundary</span><input name="collective_us" type="number" value="5" min="0" step="1" required></label>
+            <label>Host event latency <span>us / event</span><input name="host_stage_us" type="number" value="5" min="0" step="1" required></label>
+            <label>Graph boundary <span>us / graph</span><input name="graph_boundary_us" type="number" value="20" min="0" step="1" required></label>
+            <label>DRAM efficiency <span>fraction of 1,597 GB/s</span><input name="dram_efficiency" type="number" value="1" min="0.01" max="1" step="0.01" required></label>
+          </details>
+        </form>
+      </details>
+      <section class="cycle-key"><h3>One modeled cycle</h3><ol><li><b>1</b><span>Draft proposal<br><small>One row per session</small></span></li><li><b>2</b><span>Draft proposal<br><small>Depends on proposal 1</small></span></li><li><b>3</b><span>Target verification<br><small>Three rows per session</small></span></li><li><b>4</b><span>Cache-only catch-up<br><small>Proposed, not implemented</small></span></li></ol></section>
+      <details class="limits"><summary>What the ideal does not time</summary><p>Arithmetic and dequantization, most temporary activations, graph rebuilds, replay, and serving overhead. Tensor byte budgets do not predict individual kernel implementations.</p><p>Perfect acceptance means three delivered tokens per cycle. Cache-only catch-up and owner-slice communication are proposed optimizations.</p></details>
+      <div class="source-note"><strong>Evidence, not a forecast</strong><p>Exact GGUF tensor sizes. Source-derived dependencies. Captured CUDA events.</p><a href="README.md">How to add a new capture</a></div>
+    </aside>
+
+    <main class="work">
+      <section class="activity" aria-label="Captured GPU activity">
+        <div class="section-heading"><h2>Captured GPU activity</h2><span>Kernel occupancy / 96 time windows</span></div>
+        <div id="activity-lanes"></div>
+        <div class="time-axis"><span>0 ms</span><span id="activity-mid"></span><span id="activity-end"></span></div>
+        <details class="activity-values"><summary>Activity values as a table</summary><div class="table-wrap" id="activity-table"></div></details>
+      </section>
+      <section class="ledger-section" aria-labelledby="ledger-title">
+        <div class="tabs" role="tablist" aria-label="Evidence view">
+          <button id="view-layers" type="button" data-view="layers" role="tab" aria-selected="true">Layer budgets</button>
+          <button id="view-operations" type="button" data-view="operations" role="tab" aria-selected="false">Operations</button>
+          <button id="view-kernels" type="button" data-view="kernels" role="tab" aria-selected="false">Kernels</button>
+          <button id="view-copies" type="button" data-view="copies" role="tab" aria-selected="false">Memory copies</button>
+          <button id="view-apis" type="button" data-view="apis" role="tab" aria-selected="false">CUDA APIs</button>
+        </div>
+        <div class="ledger-tools">
+          <div><button id="back-layers" type="button" hidden>All layers</button><h2 id="ledger-title" tabindex="-1">Target layer budgets</h2></div>
+          <div class="filters"><label>Profile device<select id="device"><option value="0">GPU 0</option><option value="1">GPU 1</option><option value="2">GPU 2</option><option value="3">GPU 3</option><option value="all">All GPUs</option></select></label><label class="search-label">Find a step<input id="search" type="search" placeholder="Layer, weight, kernel or copy" autocomplete="off"></label></div>
+        </div>
+        <p id="table-scope" class="table-scope"></p>
+        <div class="table-wrap"><table id="ledger"><thead></thead><tbody></tbody></table></div>
+        <div class="pagination"><span id="row-count"></span><div><button id="previous" type="button">Previous</button><button id="next" type="button">Next</button></div></div>
+      </section>
+    </main>
+
+    <aside id="inspector" class="inspector" aria-label="Selected step details">
+      <h2>Inspect a step</h2><p>Select a row for its bytes, timing basis and captured events.</p>
+    </aside>
+  </div>
+  <footer><span id="provenance">Local source evidence</span><a href="README.md">Reproduce these numbers</a></footer>
+</div>
+<div id="tooltip" role="tooltip" hidden></div>
+</body>
+</html>
