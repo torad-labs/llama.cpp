@@ -40,6 +40,8 @@
 #include <thread>
 #include <vector>
 
+#include <nvtx3/nvToolsExt.h>
+
 static constexpr int64_t n_embd  = 2048;
 static constexpr int64_t n_ff    = 4096;
 static constexpr int64_t n_lo    = 32; // up rows and down columns on the light device
@@ -524,6 +526,8 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
     {
         benchmark_launcher runner(backends, launch);
         for (const char * route : {"peer_ll", "host_ll", "peer_copy", "host_copy", "owner-slice"}) {
+            const char * only_route = getenv("GGML_TEST_COLLECTIVE_ROUTE");
+            if (only_route != nullptr && strcmp(route, only_route) != 0) { continue; }
             const bool peer = strncmp(route, "peer", 4) == 0 || strcmp(route, "owner-slice") == 0;
             const bool copy = strstr(route, "copy") != nullptr;
             set_env("GGML_CUDA_AR_LL_MAX_BYTES", peer || copy ? "0" : "1048576");
@@ -542,6 +546,8 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                     return 1;
                 }
                 for (int rows : {1, 4, 8, 40, 65, 108, 128, 512, 513}) {
+                    const char * only_rows = getenv("GGML_TEST_COLLECTIVE_ROWS");
+                    if (only_rows != nullptr && rows != atoi(only_rows)) { continue; }
                     for (int operation : {0, 1, 2}) { // reset only, reduce, gather
                         if ((bf16 && operation != 1) || (operation == 2 && rows < (int) devices.size())) { continue; } // gather preserves F32 bits
                         const int64_t ne = int64_t(rows)*4096;
@@ -606,7 +612,9 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                         };
                         queue(); // allocate transport scratch outside capture
                         for (auto backend : backends) { ggml_backend_synchronize(backend); }
-                        const bool captured = operation == 0 || (operation == 1 ? can_sum(comm, outputs.data()) : can_gather(comm, outputs.data()));
+                        const bool counter_run = operation == 2 && getenv("GGML_TEST_COUNTER_RUN") != nullptr;
+                        const bool captured = !counter_run &&
+                            (operation == 0 || (operation == 1 ? can_sum(comm, outputs.data()) : can_gather(comm, outputs.data())));
                         std::vector<void *> execs;
                         if (captured) {
                             for (auto backend : backends) { begin(backend); }
@@ -622,13 +630,20 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                                 for (auto backend : backends) { ggml_backend_synchronize(backend); }
                             }
                         };
-                        run(8);
                         constexpr int samples = 20, replays = 16;
                         std::vector<double> us;
-                        for (int i = 0; i < samples; ++i) {
-                            const auto start = ggml_time_us();
-                            run(replays);
-                            us.push_back(double(ggml_time_us() - start)/replays);
+                        if (counter_run) {
+                            const nvtxRangeId_t counter_range = nvtxRangeStartA("collective-counter-replay");
+                            run(1);
+                            nvtxRangeEnd(counter_range);
+                            us.push_back(0.0);
+                        } else {
+                            run(8);
+                            for (int i = 0; i < samples; ++i) {
+                                const auto start = ggml_time_us();
+                                run(replays);
+                                us.push_back(double(ggml_time_us() - start)/replays);
+                            }
                         }
                         std::vector<float> actual(ne);
                         bool correct = true;
