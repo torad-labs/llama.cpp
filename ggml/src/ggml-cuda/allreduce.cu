@@ -815,6 +815,8 @@ static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 // Maximum chunk size (bytes per GPU) handled by one chunked kernel launch.
 // Larger tensors are reduced by issuing multiple chunked launches.
 static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
+// Peer inboxes can hold a larger gather without splitting its owners across synchronization rounds.
+static constexpr size_t GGML_CUDA_AR_PEER_MAX_BYTES = 2 * 1024 * 1024;
 
 // Largest wire size the host LL path reduces by default; GGML_CUDA_AR_LL_MAX_BYTES overrides (0 disables this path).
 static constexpr size_t GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT = 16 * 1024; // 16 KB
@@ -1432,7 +1434,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         p->dev_tmp[i].size = receive_bytes;
     }
 
-    const size_t gather_bytes = GGML_CUDA_AR_POOL_SIZE * p->buf_bytes * (n_devices - 1);
+    const size_t gather_bytes = GGML_CUDA_AR_POOL_SIZE * GGML_CUDA_AR_PEER_MAX_BYTES * (n_devices - 1);
     p->gather_peer = p->copy_peer;
     for (size_t i = 0; p->gather_peer && i < n_devices; ++i) {
         if (!ggml_cuda_ar_peer_alloc(p, (int) i, gather_bytes, p->gather_buf[i])) {
@@ -1886,13 +1888,12 @@ static void ggml_cuda_ar_launch_kernels(
         const bool            * zero_first,
         int64_t                 ne,
         const ggml_cuda_ar_owner_layout * owner = nullptr) {
-    // host_buf carries T_wire data: max_chunk_elems is what one slot holds
-    const size_t max_chunk_elems = p->buf_bytes / sizeof(T_wire);
     // nbytes on the wire is the same on both devices, so both take the same kernel and buffers
     const size_t wire_bytes      = (size_t) ne * sizeof(T_wire);
     const bool   use_p2p         = wire_bytes <= p->p2p_max_bytes;
     const bool   use_ll          = use_p2p || wire_bytes <= p->ll_max_bytes;
     const bool   gather_peer     = p->gather_peer && !use_ll;
+    const size_t max_chunk_elems = (gather_peer ? GGML_CUDA_AR_PEER_MAX_BYTES : p->buf_bytes) / sizeof(T_wire);
     if constexpr (!std::is_same_v<T_dst, uint32_t>) {
         if (!use_ll) { (gather_peer ? p->n_chunked_peer : p->n_chunked_host)++; }
     }
@@ -2304,7 +2305,7 @@ template <typename T_dst, typename T_wire>
 static void ggml_cuda_ar_launch_owner_reduce(
         ggml_cuda_ar_pipeline * p, ggml_backend_t * backends, void * const * data, const bool * zero_first, int64_t ne,
         const ggml_cuda_ar_owner_layout & owner) {
-    const size_t max_chunk_elems = p->buf_bytes / sizeof(T_wire);
+    const size_t max_chunk_elems = (p->gather_peer ? GGML_CUDA_AR_PEER_MAX_BYTES : p->buf_bytes) / sizeof(T_wire);
     (p->gather_peer ? p->n_chunked_peer : p->n_chunked_host)++;
     for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
         const int64_t chunk_elems = std::min(ne - chunk_start, (int64_t) max_chunk_elems);
