@@ -339,7 +339,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", strcmp(route.name, "owner-slice") == 0 ? "1" : "0");
             const int before = n_pipelines;
             void * comm = init(backends.data(), backends.size());
-            if (!comm || n_pipelines != before + 1) {
+            if (!comm || n_pipelines != before + 1 || n_nccl_fallbacks != 0) {
                 fprintf(stderr, "FAIL: %d-rank internal pipeline did not initialize\n", n);
                 if (comm) { free(comm); }
                 for (auto backend : backends) { ggml_backend_free(backend); }
@@ -648,6 +648,12 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                 set_env("GGML_CUDA_AR_BF16_THRESHOLD", bf16 ? "1" : "0");
                 void * comm = init(backends.data(), backends.size());
                 GGML_ASSERT(comm);
+                if (n_nccl_fallbacks != 0) {
+                    fprintf(stderr, "FAIL: requested NCCL gather fell back\n");
+                    release(comm);
+                    for (auto backend : backends) { ggml_backend_free(backend); }
+                    return 1;
+                }
                 const bool peer_active = last_p2p;
                 if (strcmp(route, "owner-slice") == 0 && !last_owner_slice) {
                     fprintf(stderr, "FAIL: owner-slice-peer protocol was not selected\n");
@@ -777,8 +783,8 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                         ok = ok && correct;
                         const auto raw_us = us;
                         std::sort(us.begin(), us.end());
-                        printf("{\"ranks\":%zu,\"operation\":\"%s\",\"route_requested\":\"%s\",\"peer_enabled\":%s,\"wire\":\"%s\",\"elements\":%lld,\"owner_delay_steps\":%d,\"delay_elements\":262144,\"whole_eval_capture\":%s,\"iterations_per_sample\":%d,\"samples\":%d,\"wall_us_min\":%.3f,\"wall_us_p50\":%.3f,\"wall_us_p95\":%.3f,\"correct\":%s,\"sample_wall_us\":[",
-                            devices.size(), operation == 0 ? "reset_only" : operation == 1 ? "reduce" : "gather", route,
+                        printf("{\"ranks\":%zu,\"backend\":\"%s\",\"operation\":\"%s\",\"route_requested\":\"%s\",\"peer_enabled\":%s,\"wire\":\"%s\",\"elements\":%lld,\"owner_delay_steps\":%d,\"delay_elements\":262144,\"whole_eval_capture\":%s,\"iterations_per_sample\":%d,\"samples\":%d,\"wall_us_min\":%.3f,\"wall_us_p50\":%.3f,\"wall_us_p95\":%.3f,\"correct\":%s,\"sample_wall_us\":[",
+                            devices.size(), getenv("GGML_CUDA_ALLREDUCE"), operation == 0 ? "reset_only" : operation == 1 ? "reduce" : "gather", route,
                             peer_active ? "true" : "false", bf16 ? "BF16" : "F32", (long long) ne, delay_steps, captured ? "true" : "false", replays, samples,
                             us.front(), us[samples/2], us[samples*95/100], correct ? "true" : "false");
                         for (size_t i = 0; i < raw_us.size(); ++i) { printf("%s%.3f", i ? "," : "", raw_us[i]); }
@@ -800,19 +806,22 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
 }
 
 int main(int argc, char ** argv) {
-    const bool gather_graph = argc == 5 && strcmp(argv[1], "--gather-graph") == 0 && strcmp(argv[3], "--backend") == 0;
+    const bool select_backend = argc == 5 && strcmp(argv[3], "--backend") == 0;
+    const char * backend_name = select_backend ? argv[4] : "internal";
+    const bool gather_graph = select_backend && strcmp(argv[1], "--gather-graph") == 0;
     const bool logical_benchmark = (argc == 3 || argc == 5) && strcmp(argv[1], "--bench-logical") == 0;
     const bool benchmark = (argc == 3 || argc == 5) &&
         (strcmp(argv[1], "--bench") == 0 || logical_benchmark);
     const int delay_steps = benchmark && argc == 5 && strcmp(argv[3], "--delay") == 0 ? atoi(argv[4]) : 0;
     const bool logical = logical_benchmark || (argc == 3 && strcmp(argv[1], "--logical") == 0);
     const bool require_p2p = argc == 4 && strcmp(argv[3], "--require-p2p") == 0;
-    const bool direct = logical || ((argc == 3 || require_p2p) && strcmp(argv[1], "--direct") == 0);
+    const bool direct = logical || ((argc == 3 || require_p2p || select_backend) && strcmp(argv[1], "--direct") == 0);
     const int n_devices = direct || benchmark || gather_graph ? atoi(argv[2]) : 2;
     if ((argc != 1 && !direct && !benchmark && !gather_graph) || n_devices < 2 || n_devices > 4 || delay_steps < 0 || delay_steps > 64 ||
-            (benchmark && argc == 5 && strcmp(argv[3], "--delay") != 0) ||
-            (gather_graph && strcmp(argv[4], "internal") != 0 && strcmp(argv[4], "nccl") != 0)) {
-        fprintf(stderr, "usage: %s [--direct 2|3|4 [--require-p2p] | --logical 2|3|4 | --bench[-logical] 2|3|4 [--delay 0..64] | --gather-graph 2|3|4 --backend internal|nccl]\n", argv[0]);
+            (benchmark && argc == 5 && strcmp(argv[3], "--delay") != 0 && !select_backend) ||
+            (strcmp(backend_name, "internal") != 0 && strcmp(backend_name, "internal-nccl-gather") != 0 &&
+                !(gather_graph && strcmp(backend_name, "nccl") == 0))) {
+        fprintf(stderr, "usage: %s [--direct 2|3|4 [--require-p2p | --backend internal|internal-nccl-gather] | --logical 2|3|4 | --bench[-logical] 2|3|4 [--delay 0..64 | --backend internal|internal-nccl-gather] | --gather-graph 2|3|4 --backend internal|nccl|internal-nccl-gather]\n", argv[0]);
         return 1;
     }
     std::vector<ggml_backend_dev_t> gpus;
@@ -846,17 +855,17 @@ int main(int argc, char ** argv) {
     fprintf(benchmark ? stderr : stdout, "meta backend over %s and %s\n", ggml_backend_dev_name(gpus[0]), ggml_backend_dev_name(gpus[1]));
 
     ggml_log_set(log_cb, nullptr);
-    set_env("GGML_CUDA_ALLREDUCE", gather_graph ? argv[4] : "internal");
+    set_env("GGML_CUDA_ALLREDUCE", backend_name);
     set_env("GGML_CUDA_AR_COPY_THRESHOLD", nullptr);
     set_env("GGML_CUDA_AR_COPY_CHUNK_BYTES", nullptr);
     if (gather_graph) {
         bool ok = test_gather_graph(gpus, 40, 4093);
         ok = test_gather_graph(gpus, 108, 4096) && ok;
         ok = test_gather_graph(gpus, 513, 4097) && ok;
-        const bool native = strcmp(argv[4], "nccl") == 0;
+        const bool native = strcmp(backend_name, "nccl") == 0;
         const bool transport_ok = n_nccl_fallbacks == 0 && (native ? n_pipelines == 0 : n_pipelines == 3);
         printf("%s: requested %s, %d internal pipelines, %d NCCL fallbacks\n",
-            transport_ok ? "ok" : "FAIL", argv[4], n_pipelines, n_nccl_fallbacks.load());
+            transport_ok ? "ok" : "FAIL", backend_name, n_pipelines, n_nccl_fallbacks.load());
         return ok && transport_ok ? 0 : 1;
     }
     if (benchmark) {

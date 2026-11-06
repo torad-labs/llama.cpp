@@ -1480,7 +1480,7 @@ struct ggml_backend_cuda_comm_context {
 
     // Set by the init chain (comm_init_{nccl, internal, none}) to one of
     // try_allreduce_{nccl, internal, butterfly}.  nccl needs `comms`,
-    // internal needs `ar_pipeline`, butterfly needs nothing.  Per-call
+    // internal needs `ar_pipeline`, butterfly needs nothing. NCCL gathers can also use `comms` with internal reductions. Per-call
     // failures return false; the meta backend's generic implementation then
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
@@ -1754,6 +1754,13 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         std::string env_str(env);
         if (env_str == "nccl") {
             ggml_backend_cuda_comm_init_nccl(ret);
+        } else if (env_str == "internal-nccl-gather") {
+            ggml_backend_cuda_comm_init_nccl(ret);
+#ifdef GGML_USE_NCCL
+            if (!ret->comms.empty()) {
+                ggml_backend_cuda_comm_init_internal(ret);
+            }
+#endif // GGML_USE_NCCL
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
         } else if (env_str == "none") {
@@ -1815,7 +1822,7 @@ static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct gg
         return true;
     }
 #ifdef GGML_USE_NCCL
-    if (comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_nccl) {
+    if (!comm_ctx->comms.empty()) {
         for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -1873,14 +1880,21 @@ static bool ggml_backend_cuda_comm_allreduce_capturable(void * comm_ctx_v, struc
         ggml_cuda_ar_capturable(comm_ctx->ar_pipeline, tensors[0]);
 }
 
-// The gather is captured on the internal pipeline, whose kernels it always takes; not an empty one (above).
+// Both native integer gathers and the internal pipeline support capture; not an empty gather (above).
 static bool ggml_backend_cuda_comm_allgather_capturable(void * comm_ctx_v, struct ggml_tensor ** tensors) {
     if (comm_ctx_v == nullptr) {
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
-    return comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal &&
-        ggml_backend_cuda_comm_allgather_takes(comm_ctx, tensors) && ggml_nbytes(tensors[0]) > 0;
+    if (!ggml_backend_cuda_comm_allgather_takes(comm_ctx, tensors) || ggml_nbytes(tensors[0]) == 0) {
+        return false;
+    }
+#ifdef GGML_USE_NCCL
+    if (!comm_ctx->comms.empty()) {
+        return true;
+    }
+#endif // GGML_USE_NCCL
+    return comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal;
 }
 #endif // USE_CUDA_GRAPH
 
