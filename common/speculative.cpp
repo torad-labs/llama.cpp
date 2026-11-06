@@ -1659,6 +1659,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         llama_set_mtp_graph_reuse(ctx_dft, this->params.n_max);
+        llama_set_mtp_graph_reuse(ctx_tgt, this->params.n_max);
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
         timing = this->params.mtp_adaptive > 0.0f && !is_mem_shared && !chain_heads && !decode_only &&
             !ggml_env_switch("LLAMA_MTP_TIMING_LEGACY");

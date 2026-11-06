@@ -1417,6 +1417,62 @@ static bool test_graph_shapes(llama_model * model) {
     return true;
 }
 
+// Goal: a target that verifies MTP drafts keeps its verification graphs past 32 rows, as the MTP head keeps its own, so
+// a row count it has computed before is reused, with the logits it gives without reuse. A target kept only graphs of up
+// to 32 rows: at 36 sessions over four data-parallel ranks, a verify of 108 rows was rebuilt whenever its row count
+// changed, about 720 ms against a 121 ms pass, and a session joining or leaving changes it.
+static bool test_target_graph_shapes(llama_model * model) {
+    for (int n_seq : {33, 40}) {
+        server_rig rig(model, 0, N_MAX, 0, 128, GGML_TYPE_F16, 128, true, false, n_seq);
+        set_env("LLAMA_GRAPH_REUSE_DISABLE", "1");
+        server_rig ref(model, 0, N_MAX, 0, 128, GGML_TYPE_F16, 128, true, false, n_seq);
+        set_env("LLAMA_GRAPH_REUSE_DISABLE", nullptr);
+
+        // a decode round of every sequence and a verify of N_MAX drafts each, alternating, then a session leaving
+        for (int round = 0; round < 8; ++round) {
+            const int width = round % 2 ? N_MAX + 1 : 1;
+            const int active = round < 6 ? n_seq : n_seq - (round - 5);
+            llama_batch batch = llama_batch_init(active*width, 0, 1);
+            for (int s = 0; s < active; ++s) {
+                for (int p = 0; p < width; ++p) {
+                    common_batch_add(batch, (s + p + round) % rig.n_vocab, p, {s}, true);
+                }
+            }
+            std::vector<float> expected;
+            for (auto * current : {&ref, &rig}) {
+                auto * ctx = current->tgt.get();
+                llama_memory_clear(llama_get_memory(ctx), true);
+                const auto before = llama_perf_context(ctx).n_reused;
+                if (llama_decode(ctx, batch) != 0) {
+                    llama_batch_free(batch);
+                    return fail("target verification decode failed");
+                }
+                std::vector<float> actual;
+                for (int i = 0; i < active*width; ++i) {
+                    const auto * row = llama_get_logits_ith(ctx, i);
+                    actual.insert(actual.end(), row, row + rig.n_vocab);
+                }
+                if (current == &ref) {
+                    expected = std::move(actual);
+                    continue;
+                }
+                if (actual != expected) {
+                    llama_batch_free(batch);
+                    return fail("retained target graph changed logits");
+                }
+                if (round >= 2 && round < 6 && llama_perf_context(ctx).n_reused != before + 1) {
+                    fprintf(stderr, "target graph reuse: %d sequences, %d rows, round %d\n", n_seq, active*width, round);
+                    llama_batch_free(batch);
+                    return fail("a target verification shape computed before was rebuilt");
+                }
+            }
+            llama_batch_free(batch);
+        }
+    }
+    printf("DP MTP target: verifications of 33 and 40 sequences reuse their graphs past 32 rows\n");
+    return true;
+}
+
 static bool test_sampler_graphs(llama_model * model) {
     constexpr int n_seq = 4;
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1848,7 +1904,7 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
     printf("DP MTP %zu ranks %s: 48 identical draft/verify rounds, %zu greedy matches, controlled 0/1/2 accepts %zu/%zu/%zu\n",
         devices.size(), q8_cache ? "Q8" : "default", greedy_accepted, forced_counts[0], forced_counts[1], forced_counts[2]);
     printf("DP MTP selection bank: %zu observed sequence reads; host control used none\n", dp.selection_reads);
-    return q8_cache || test_graph_shapes(split.get());
+    return q8_cache || (test_graph_shapes(split.get()) && test_target_graph_shapes(split.get()));
 }
 
 // Goal: sequences that draft in the same round draft the same length, the deepest any of them chose (each still capped
