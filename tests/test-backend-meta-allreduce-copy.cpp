@@ -541,7 +541,7 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                     fprintf(stderr, "FAIL: owner-slice-peer protocol was not selected\n");
                     return 1;
                 }
-                for (int rows : {1, 4, 8, 40, 65, 128, 512, 513}) {
+                for (int rows : {1, 4, 8, 40, 65, 108, 128, 512, 513}) {
                     for (int operation : {0, 1, 2}) { // reset only, reduce, gather
                         if (bf16 && operation != 1) { continue; } // gather preserves F32 bits, regardless of the sum wire
                         const int64_t ne = int64_t(rows)*4096;
