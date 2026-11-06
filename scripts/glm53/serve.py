@@ -86,9 +86,7 @@ def make_plan(args):
     argv += ["-c", str(slots * DP_SLOT_CONTEXT) if dp else "524288", "-np", str(slots)]
     if not dp:
         argv += ["--kv-unified"]
-    argv += ["--cache-ram", "32768"]
-    if not dp:
-        argv += ["--no-cache-idle-slots"]
+    argv += ["--cache-ram", "32768", "--no-cache-idle-slots"]
     argv += ["--metrics", "--host", args.host, "--port", str(args.port), "--log-timestamps"]
     env = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3" if dp else "0,1",

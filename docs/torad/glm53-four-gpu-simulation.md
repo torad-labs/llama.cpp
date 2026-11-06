@@ -33,7 +33,7 @@ The entry point is `scripts/glm53/serve.py --profile dp-4`, not `--glm53-profile
 | Draft | Microbatch 512 and explicit Q8 K/V | Separate defaults |
 | Sampler | Backend sampling explicitly enabled | Not explicitly enabled by this launcher |
 | Allocation fitting | Off | Not overridden |
-| Idle-slot RAM snapshots | Enabled | Disabled |
+| Idle-slot RAM snapshots | Disabled | Disabled |
 | Host prompt-cache budget | 32,768 MiB | 32,768 MiB |
 | CUDA graphs | Count cap 0 means unlimited count, not disabled graphs | Same |
 | Collectives | Internal | Same |

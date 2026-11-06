@@ -323,7 +323,12 @@ class ServingRecipeTest(unittest.TestCase):
                     for flag, value in expected.items():
                         self.assertEqual(argv[argv.index(flag) + 1], value)
                     self.assertNotIn("--kv-unified", argv)
-                    self.assertNotIn("--no-cache-idle-slots", argv)
+                    # each slot keeps its own state in VRAM, and a slot taken by another conversation still saves its
+                    # state to host RAM first, so copying every idle slot there when a request starts only held the
+                    # others back: at 36 sessions on four PCIe cards each next turn's first token waited 5.5-14.5 s
+                    # for it, and 1.3-1.6 s without it
+                    self.assertEqual(argv[argv.index("--cache-ram") + 1], "32768")
+                    self.assertIn("--no-cache-idle-slots", argv)
                     self.assertIn("--backend-sampling", argv)
                     self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
                     self.assertEqual(env["GGML_CUDA_ALLREDUCE"], "internal")
