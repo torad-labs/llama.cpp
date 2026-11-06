@@ -5031,6 +5031,7 @@ static int ggml_cuda_try_gdn_rows_fusion(const ggml_cgraph * cgraph, int node_id
     const size_t slot_bytes = ggml_row_size(GGML_TYPE_F32, D * n_seqs);
 
     ggml_cuda_gated_delta_net_store_rows rows;
+    std::array<const ggml_tensor *, GGML_CUDA_GDN_STORE_ROWS_MAX> snapshots{};
     const ggml_tensor * cache = nullptr; // the first store's destination: every store writes the same cache
     int found = 0;
     int last  = first;
@@ -5045,8 +5046,13 @@ static int ggml_cuda_try_gdn_rows_fusion(const ggml_cgraph * cgraph, int node_id
                 cont->ne[0] != D || ggml_nelements(cont) != D * n_seqs || !ggml_is_contiguous(cont) ||
                 ggml_node_get_use_count(cgraph, j) != 1 ||
                 view->op != GGML_OP_VIEW || view->view_src != gdn || view->type != GGML_TYPE_F32 ||
+                (view->flags & GGML_TENSOR_FLAG_OUTPUT) ||
                 ggml_nelements(view) != D * n_seqs || !ggml_is_contiguous(view) ||
                 view->view_offs < tail_off || (view->view_offs - tail_off) % slot_bytes != 0) {
+            return 0;
+        }
+        const size_t view_pos = ggml_hash_find(&cgraph->visited_hash_set, view);
+        if (!ggml_bitset_get(cgraph->visited_hash_set.used, view_pos) || cgraph->use_counts[view_pos] != 1) {
             return 0;
         }
         const size_t slot = (view->view_offs - tail_off) / slot_bytes;
@@ -5075,12 +5081,26 @@ static int ggml_cuda_try_gdn_rows_fusion(const ggml_cgraph * cgraph, int node_id
         }
         cache           = set;
         rows.slot[slot] = (const int64_t *) ids->data;
+        snapshots[slot] = view;
         ++found;
         last = j = k;
     }
     if (found != n_written || !ggml_cuda_gdn_store_fusable(gdn, cache->type)) {
         return 0;
     }
+    // Only the matched stores may read the omitted tail; attention-only views still read the normal output.
+    int uses_left = ggml_node_get_use_count(cgraph, node_idx);
+    for (int j = node_idx + 1; j < cgraph->n_nodes && uses_left > 0; ++j) {
+        const ggml_tensor * user = cgraph->nodes[j];
+        int uses = 0;
+        for (const ggml_tensor * src : user->src) { uses += src == gdn; }
+        if (uses == 0) { continue; }
+        uses_left -= uses;
+        if (uses != 1 || user->view_src != gdn) { return 0; }
+        if (user->view_offs < tail_off && ggml_nbytes(user) <= tail_off - user->view_offs) { continue; }
+        if (std::find(snapshots.begin(), snapshots.end(), user) == snapshots.end()) { return 0; }
+    }
+    if (uses_left != 0) { return 0; }
     rows.row_stride   = (int64_t) (cache->nb[1] / ggml_type_size(cache->type)) * ggml_blck_size(cache->type);
     fused.data        = cache->data;
     fused.slot_stride = 0;

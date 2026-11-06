@@ -13,7 +13,7 @@
 // rows. It is computed twice on the device, once as is and once with every cont a graph output, which keeps each cont
 // and its set_rows. The two caches (every row, the unwritten ones too) and the two attention outputs must be equal byte
 // for byte, and in the first graph each cont's buffer, filled with a sentinel before the compute, must still hold it:
-// no snapshot was copied.
+// no snapshot was copied. Requested snapshot outputs and other readers must still receive the complete state.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -44,10 +44,13 @@ struct inputs {
     std::vector<uint8_t> cache;
 };
 
+enum class snapshot_read { none, output, consumer, alias };
+
 struct result {
     std::vector<uint8_t>              cache;
     std::vector<uint8_t>              attn;
     std::vector<std::vector<uint8_t>> conts;
+    std::vector<std::vector<uint8_t>> snapshots;
     bool                              ok = false;
 };
 
@@ -81,7 +84,8 @@ inputs make_inputs(const shape & s) {
     return in;
 }
 
-result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool conts_as_outputs) {
+result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool conts_as_outputs,
+        snapshot_read read = snapshot_read::none) {
     result r;
     const int64_t n_written = std::min(s.n_tokens, s.K);
 
@@ -110,6 +114,7 @@ result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool 
     const size_t attn_bytes = ggml_row_size(GGML_TYPE_F32, S_v * H * s.n_tokens * s.n_seqs);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     std::vector<ggml_tensor *> conts(n_written);
+    std::vector<ggml_tensor *> snapshots;
     for (int64_t slot = 0; slot < n_written; ++slot) {
         ggml_tensor * states = ggml_view_2d(ctx, gdn, D, s.n_seqs, ggml_row_size(GGML_TYPE_F32, D),
                 attn_bytes + slot * ggml_row_size(GGML_TYPE_F32, D * s.n_seqs));
@@ -118,7 +123,22 @@ result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool 
             ggml_set_output(conts[slot]);
         }
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache, conts[slot], rows[slot]));
+        if (read != snapshot_read::none) {
+            ggml_tensor * observed = states;
+            if (read == snapshot_read::consumer) {
+                observed = ggml_scale(ctx, states, 1.0f);
+            } else if (read == snapshot_read::alias) {
+                observed = ggml_scale(ctx, ggml_view_2d(ctx, gdn, D, s.n_seqs, ggml_row_size(GGML_TYPE_F32, D),
+                        attn_bytes + slot * ggml_row_size(GGML_TYPE_F32, D * s.n_seqs)), 1.0f);
+            }
+            ggml_set_output(observed);
+            snapshots.push_back(observed);
+        }
     }
+    for (ggml_tensor * observed : snapshots) { ggml_build_forward_expand(gf, observed); }
+    ggml_tensor * attn = ggml_cont(ctx, ggml_view_1d(ctx, gdn, attn_bytes / sizeof(float), 0));
+    ggml_set_output(attn);
+    ggml_build_forward_expand(gf, attn);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (buf == nullptr) {
@@ -133,6 +153,8 @@ result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool 
     ggml_backend_tensor_set(state, in.state.data(), 0, ggml_nbytes(state));
     ggml_backend_tensor_set(a, in.a.data(), 0, ggml_nbytes(a));
     ggml_backend_tensor_set(cache, in.cache.data(), 0, ggml_nbytes(cache));
+    const std::vector<uint8_t> tail_sentinel(ggml_nbytes(gdn) - attn_bytes, 0xA5);
+    ggml_backend_tensor_set(gdn, tail_sentinel.data(), attn_bytes, tail_sentinel.size());
     for (int64_t slot = 0; slot < n_written; ++slot) {
         std::vector<int64_t> ids(s.n_seqs);
         for (int64_t seq = 0; seq < s.n_seqs; ++seq) ids[seq] = slot * mem_size + cells[seq];
@@ -145,10 +167,14 @@ result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool 
         r.cache.resize(ggml_nbytes(cache));
         ggml_backend_tensor_get(cache, r.cache.data(), 0, r.cache.size());
         r.attn.resize(attn_bytes);
-        ggml_backend_tensor_get(gdn, r.attn.data(), 0, attn_bytes);
+        ggml_backend_tensor_get(attn, r.attn.data(), 0, attn_bytes);
         for (ggml_tensor * c : conts) {
             r.conts.emplace_back(ggml_nbytes(c));
             ggml_backend_tensor_get(c, r.conts.back().data(), 0, r.conts.back().size());
+        }
+        for (ggml_tensor * observed : snapshots) {
+            r.snapshots.emplace_back(ggml_nbytes(observed));
+            ggml_backend_tensor_get(observed, r.snapshots.back().data(), 0, r.snapshots.back().size());
         }
         r.ok = true;
     }
@@ -185,7 +211,16 @@ bool run(ggml_backend_t backend, const shape & s) {
             }
         }
     }
-    printf("OK, the kernel wrote every snapshot into its sequence's row, the same bytes\n");
+    bool readers_ok = true;
+    for (snapshot_read read : {snapshot_read::output, snapshot_read::consumer, snapshot_read::alias}) {
+        const result observed = compute(backend, s, in, false, read);
+        if (!observed.ok || observed.snapshots != kept.conts || observed.cache != kept.cache || observed.attn != kept.attn) {
+            printf("FAILED, requested snapshot output/consumer %d lost its state\n", (int) read);
+            readers_ok = false;
+        }
+    }
+    if (!readers_ok) { return false; }
+    printf("OK, cache bytes and all requested snapshot readers are preserved\n");
     return true;
 }
 
