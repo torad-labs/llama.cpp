@@ -182,11 +182,13 @@ struct server_rig {
     std::vector<float> logits;
     size_t selection_reads = 0;
     std::vector<bool> selection_seqs;
+    // with count_passes: the target graphs computed so far, one per ubatch the batch was split into
+    int target_passes = 0;
 
     server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0,
                ggml_type type_idx = GGML_TYPE_F16, int32_t n_ubatch_tgt = 512,
                bool private_streams = false, bool q8_cache = false, int32_t n_seq = N_SEQ,
-               bool observe_selections = false) : n_max(n_max) {
+               bool observe_selections = false, bool count_passes = false) : n_max(n_max) {
         seqs.resize(n_seq);
         selection_seqs.resize(n_seq);
         params.n_ctx      = 8192;
@@ -214,7 +216,17 @@ struct server_rig {
         params.n_outputs_max         = limits.total;
         params.n_outputs_max_per_seq = limits.per_seq;
 
+        if (count_passes) {
+            // every target graph ends in its logits: one result_output per computed ubatch
+            params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+                if (ask && strcmp(t->name, "result_output") == 0) { ++static_cast<server_rig *>(data)->target_passes; }
+                return false;
+            };
+            params.cb_eval_user_data = this;
+        }
         tgt.reset(llama_init_from_model(model, common_context_params_to_llama(params)));
+        params.cb_eval = nullptr;
+        params.cb_eval_user_data = nullptr;
         if (!tgt) {
             throw std::runtime_error("failed to create the target context");
         }
@@ -661,6 +673,14 @@ static bool test_baseline(llama_model * model) {
 // the one whose second token never lands drop to one token after the first window, probing once a window. A new request
 // on a slot starts at full depth again, and leaves the other slots as they were. A sequence that starts to land again
 // returns to the full depth within three windows
+// each sequence drafts alone and the three verify in one batch: a sequence's length is its own adaptive depth (drafting
+// together, sequences draft the deepest of their depths: test_dp_uniform_width)
+static std::map<llama_seq_id, int> draft_alone(server_rig & rig, const std::vector<llama_seq_id> & which) {
+    std::map<llama_seq_id, int> len;
+    for (const llama_seq_id s : which) len[s] = rig.draft({s}).at(s);
+    return len;
+}
+
 static bool test_adaptive(llama_model * model) {
     server_rig rig(model, 0.18f);
     std::mt19937 rng(2);
@@ -669,7 +689,7 @@ static bool test_adaptive(llama_model * model) {
     std::vector<int> len[N_SEQ];
     auto run = [&](int rounds) {
         for (int round = 0; round < rounds; ++round) {
-            const auto l = rig.draft({0, 1, 2});
+            const auto l = draft_alone(rig, {0, 1, 2});
             rig.verify(round % 2 ? std::vector<llama_seq_id>{1, 2, 0} : std::vector<llama_seq_id>{0, 1, 2});
             for (llama_seq_id s = 0; s < N_SEQ; ++s) {
                 len[s].push_back(l.at(s));
@@ -764,8 +784,9 @@ static std::vector<history_round> generate(std::mt19937 & rng, int n_rounds, con
 }
 
 // plays rounds; each sequence's acceptance draws from its own stream, so that a sequence's own rounds alone decide its
-// draws. Returns, per sequence, its draft lengths with replayed rounds left out
-static std::vector<std::vector<int>> play(server_rig & rig, const std::vector<history_round> & rounds, std::vector<std::mt19937> & draws) {
+// draws. Returns, per sequence, its draft lengths with replayed rounds left out; with per_round, every round's lengths
+static std::vector<std::vector<int>> play(server_rig & rig, const std::vector<history_round> & rounds, std::vector<std::mt19937> & draws,
+        std::vector<std::map<llama_seq_id, int>> * per_round = nullptr) {
     std::vector<std::vector<int>> len(N_SEQ);
     std::mt19937 rng(7);
     for (const auto & r : rounds) {
@@ -773,6 +794,7 @@ static std::vector<std::vector<int>> play(server_rig & rig, const std::vector<hi
             continue;
         }
         const auto l = rig.draft(r.drafting);
+        if (per_round) per_round->push_back(l);
         rig.verify(r.drafting);
         std::vector<llama_seq_id> replayed;
         for (size_t i = 0; i < r.drafting.size(); ++i) {
@@ -796,9 +818,9 @@ static std::vector<std::vector<int>> play(server_rig & rig, const std::vector<hi
     return len;
 }
 
-// over generated histories: shapes stay stable, no round drafts fewer than n_min tokens, a sequence's depths follow from
-// its own rounds alone (the same rounds alone, or among other sequences' rounds, give the same lengths), and a slot's
-// earlier request never reaches the next
+// over generated histories: no round drafts fewer than n_min tokens, and sequences drafting in one round draft one
+// length (test_dp_uniform_width). A sequence drafting alone keeps its own depth: over its own rounds alone, shapes stay
+// stable, and a slot's earlier request never reaches the next (the same rounds after one give the same lengths)
 static bool histories(llama_model * model, int n_max, int n_min, uint32_t n_seeds) {
     const int n_low = std::min(std::max(1, n_min), n_max);
     int n_low_rounds = 0;
@@ -810,21 +832,23 @@ static bool histories(llama_model * model, int n_max, int n_min, uint32_t n_seed
         server_rig together(model, 0.18f, n_max, n_min);
         std::vector<std::mt19937> draws = { std::mt19937(seed*3 + 0), std::mt19937(seed*3 + 1), std::mt19937(seed*3 + 2) };
         for (llama_seq_id s = 0; s < N_SEQ; ++s) together.request(s, rng, 6 + s);
-        const auto len = play(together, rounds, draws);
+        std::vector<std::map<llama_seq_id, int>> per_round;
+        const auto len = play(together, rounds, draws, &per_round);
+        for (const auto & l : per_round) {
+            if (std::any_of(l.begin(), l.end(), [&](const auto & e) { return e.second != l.begin()->second; })) {
+                std::string lens;
+                for (const auto & e : l) lens += " " + std::to_string(e.first) + ":" + std::to_string(e.second);
+                fprintf(stderr, "n_max %d n_min %d seed %u round lengths%s\n", n_max, n_min, seed, lens.c_str());
+                return fail("sequences drafting in one round drafted different lengths");
+            }
+        }
 
         for (llama_seq_id s = 0; s < N_SEQ; ++s) {
-            if (n_low < n_max) {
-                n_low_rounds += (int) std::count(len[s].begin(), len[s].end(), n_low);
-            }
             if (std::any_of(len[s].begin(), len[s].end(), [&](int l) { return l < std::max(1, n_min); })) {
                 fprintf(stderr, "n_max %d n_min %d seed %u seq %d: %s\n", n_max, n_min, seed, s, str(len[s]).c_str());
                 return fail("a generated history drafted fewer than n_min tokens");
             }
-            if (!stable_shape(len[s], true, n_max, n_low)) {
-                fprintf(stderr, "n_max %d n_min %d seed %u seq %d: %s\n", n_max, n_min, seed, s, str(len[s]).c_str());
-                return fail("a generated history changed a depth inside a window");
-            }
-            // the same sequence's rounds alone, after an earlier request of its own on the slot
+            // the same sequence's rounds alone: on a fresh slot, and after an earlier request of its own on the slot
             std::vector<history_round> own;
             for (const auto & r : rounds) {
                 history_round o;
@@ -837,6 +861,21 @@ static bool histories(llama_model * model, int n_max, int n_min, uint32_t n_seed
                 }
                 own.push_back(o);
             }
+            server_rig fresh(model, 0.18f, n_max, n_min);
+            fresh.request(s, rng, 8);
+            std::vector<std::mt19937> draws_fresh = { std::mt19937(seed*3 + 0), std::mt19937(seed*3 + 1), std::mt19937(seed*3 + 2) };
+            const auto len_fresh = play(fresh, own, draws_fresh);
+            if (n_low < n_max) {
+                n_low_rounds += (int) std::count(len_fresh[s].begin(), len_fresh[s].end(), n_low);
+            }
+            if (std::any_of(len_fresh[s].begin(), len_fresh[s].end(), [&](int l) { return l < std::max(1, n_min); })) {
+                fprintf(stderr, "n_max %d n_min %d seed %u seq %d alone: %s\n", n_max, n_min, seed, s, str(len_fresh[s]).c_str());
+                return fail("a generated history drafted fewer than n_min tokens");
+            }
+            if (!stable_shape(len_fresh[s], true, n_max, n_low)) {
+                fprintf(stderr, "n_max %d n_min %d seed %u seq %d alone: %s\n", n_max, n_min, seed, s, str(len_fresh[s]).c_str());
+                return fail("a generated history changed a depth inside a window");
+            }
             server_rig alone(model, 0.18f, n_max, n_min);
             std::vector<std::mt19937> earlier = { std::mt19937(99), std::mt19937(98), std::mt19937(97) };
             alone.request(s, rng, 5);
@@ -848,9 +887,9 @@ static bool histories(llama_model * model, int n_max, int n_min, uint32_t n_seed
             alone.request(s, rng, 8);
             std::vector<std::mt19937> draws_alone = { std::mt19937(seed*3 + 0), std::mt19937(seed*3 + 1), std::mt19937(seed*3 + 2) };
             const auto len_alone = play(alone, own, draws_alone);
-            if (len_alone[s] != len[s]) {
-                fprintf(stderr, "n_max %d n_min %d seed %u seq %d: together %s, alone %s\n", n_max, n_min, seed, s, str(len[s]).c_str(), str(len_alone[s]).c_str());
-                return fail("a sequence's depths depend on other sequences or on the slot's earlier request");
+            if (len_alone[s] != len_fresh[s]) {
+                fprintf(stderr, "n_max %d n_min %d seed %u seq %d: fresh %s, after an earlier request %s\n", n_max, n_min, seed, s, str(len_fresh[s]).c_str(), str(len_alone[s]).c_str());
+                return fail("a sequence's depths depend on the slot's earlier request");
             }
         }
     }
@@ -877,7 +916,7 @@ static bool test_n_min(llama_model * model) {
         const acceptance acc[N_SEQ] = { {1.0f, 1.0f}, {0.0f, 0.0f}, {1.0f, 1.0f, c.n_min} };
         std::vector<int> len[N_SEQ];
         for (int round = 0; round < 3*WINDOW; ++round) {
-            const auto l = rig.draft({0, 1, 2});
+            const auto l = draft_alone(rig, {0, 1, 2});
             rig.verify(round % 2 ? std::vector<llama_seq_id>{2, 0, 1} : std::vector<llama_seq_id>{0, 1, 2});
             for (llama_seq_id s = 0; s < N_SEQ; ++s) {
                 len[s].push_back(l.at(s));
@@ -1784,6 +1823,50 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
     return q8_cache || test_graph_shapes(split.get());
 }
 
+// Goal: sequences that draft in the same round draft the same length, the deepest any of them chose (each still capped
+// by its own output limit), so a data-parallel verification of all of them is one target pass. The rollback split keeps
+// each sequence's verified rows in one ubatch and takes as many rows from every sequence of a ubatch, so a sequence
+// whose rows differ from the others' goes into a pass of its own: with every sequence on its own adaptive depth, one
+// short draft split a 36-session round into one pass per session (34-36 passes, 4.2 s, where an equal-width round of
+// the same sessions was one 121 ms pass on four RTX PRO 6000 cards). A sequence that drafts alone keeps its own depth.
+static bool test_dp_uniform_width(const std::vector<ggml_backend_dev_t> & devices) {
+    auto split = glm_model(1234, devices, LLAMA_SPLIT_MODE_DATA);
+    constexpr int n_seq = 8;
+    server_rig rig(split.get(), 0.18f, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, false, n_seq, false, true);
+    std::vector<llama_seq_id> all(n_seq);
+    std::iota(all.begin(), all.end(), 0);
+    std::mt19937 rng(7);
+    for (const llama_seq_id s : all) rig.request(s, rng, 9 + 3*s);
+    // even sequences land every draft and odd ones none: drafting alone, an odd one drops to one token after a window
+    const acceptance land = {1.0f, 1.0f}, miss = {0.0f, 0.0f};
+    for (int round = 0; round < 3*WINDOW; ++round) {
+        const auto len = rig.draft(all);
+        for (const llama_seq_id s : all) {
+            if (len.at(s) != N_MAX) {
+                fprintf(stderr, "round %d: sequence %d drafted %d, the round's depth is %d\n", round, s, len.at(s), N_MAX);
+                return fail("a sequence drafting with others did not draft the round's depth");
+            }
+        }
+        rig.target_passes = 0;
+        rig.verify(all);
+        if (rig.target_passes != 1) {
+            fprintf(stderr, "round %d: %d target passes for %d rows\n", round, rig.target_passes, n_seq*(N_MAX + 1));
+            return fail("a data-parallel verification of equal drafts was not one target pass");
+        }
+        for (const llama_seq_id s : all) rig.accept(s, (s % 2 ? miss : land)(len.at(s), rng), rng);
+    }
+    // sequences that all chose one token draft one token together: the round's depth is the deepest chosen, not the maximum
+    std::vector<llama_seq_id> odd;
+    for (const llama_seq_id s : all) if (s % 2) odd.push_back(s);
+    for (const auto & [s, n] : rig.draft(odd)) {
+        if (n != 1) return fail("sequences that all chose one token drafted more together");
+    }
+    // an odd sequence drafting alone takes the depth its own misses earned
+    if (rig.draft({1}).at(1) != 1) return fail("a sequence drafting alone lost its own adaptive depth");
+    printf("DP MTP %zu ranks: %d rounds of %d equal drafts, one target pass each\n", devices.size(), 3*WINDOW, n_seq);
+    return true;
+}
+
 int main(int argc, char ** argv) {
     common_init();
     common_log_set_verbosity_thold(LOG_LEVEL_WARN);
@@ -1801,6 +1884,11 @@ int main(int argc, char ** argv) {
                 devices.push_back(device);
             }
             if (devices.empty()) { throw std::runtime_error("DP devices are empty"); }
+            {
+                std::vector<ggml_backend_dev_t> ranks;
+                for (size_t i = 0; i < 4; ++i) { ranks.push_back(devices[i % devices.size()]); }
+                ok = test_dp_uniform_width(ranks) && ok;
+            }
             for (size_t count : {2u, 4u}) {
                 std::vector<ggml_backend_dev_t> ranks;
                 for (size_t i = 0; i < count; ++i) { ranks.push_back(devices[i % devices.size()]); }

@@ -2041,6 +2041,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // Sequences drafting together draft the deepest length any of them chose. The target's rollback split keeps
+        // each sequence's rows in one ubatch and takes equal rows per sequence, so one shorter draft splits the
+        // verification into a pass per sequence (36 passes and 4.2 s, where 36 equal drafts verify in one 121 ms pass
+        // on four PCIe cards). Each sequence still learns its own depth from its own acceptance, used when it drafts
+        // alone, and its own output limit still truncates it.
+        if (params.mtp_adaptive > 0.0f && n_drafting > 1) {
+            int32_t n_round = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) n_round = std::max(n_round, n_draft_max[seq_id]);
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) n_draft_max[seq_id] = n_round;
+            }
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
