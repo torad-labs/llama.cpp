@@ -72,6 +72,10 @@ static bool last_card_to_card = false; // the last one's copy-engine receives co
 static bool last_p2p          = false; // the last one's cards map each other's memory: its LL card-to-card limit is above 0
 static bool last_gather_peer  = false;
 static bool last_owner_slice  = false;
+// from the last pipeline freed: its reductions on the chunked kernel that moved card to card and through host memory
+static bool               last_chunked_seen = false;
+static unsigned long long last_chunked_peer = 0;
+static unsigned long long last_chunked_host = 0;
 static std::atomic<int> n_captures{0};
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/) {
@@ -88,6 +92,10 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/
         unsigned long long ll_bytes = 0;
         last_p2p = ll != nullptr && sscanf(ll, "LL card to card up to %llu", &ll_bytes) == 1 && ll_bytes > 0;
         fputs(text, stderr);
+    }
+    if (const char * chunked = strstr(text, "on the chunked kernel ")) {
+        last_chunked_seen = sscanf(chunked, "on the chunked kernel %llu card to card, %llu through host memory",
+                                   &last_chunked_peer, &last_chunked_host) == 2;
     }
     if (strstr(text, "ggml_backend_cuda_capture_end") && strstr(text, " nodes, ")) { ++n_captures; }
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
@@ -306,6 +314,11 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
         {"host serial",  "0",       "0",       "1", true},
         {"peer copy",    "0",       "1048576", "1", false},
         {"owner-slice",  "0",       "1048576", "0", false},
+        // past the LL and short of the copy engines, where the cards map each other's memory: a -sm dp verify's expert
+        // reduce (36 to 108 rows of 4096, up to 864 KB on the BF16 wire) used to stage through host memory, crossing
+        // the link twice and reading it back at about 3.5 GB/s; its shares now go card to card, through the inboxes
+        // the gathers use, and the receivers add the same bytes in the same order
+        {"peer chunked", "0",       "16",      "0", false},
     };
     bool ok = true;
     for (bool bf16 : {false, true}) {
@@ -422,7 +435,9 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                 // and, past one chunk, across chunks. It must take the chunked kernel's route with more than two ranks,
                 // where a -sm dp verify's bytes are (36 to 108 rows of 4096 on the BF16 wire, past the LL and short of
                 // the copy engines); elsewhere it may decline, and then it must have changed nothing.
-                const bool must_own = n > 2 && strcmp(route.name, "host chunked") == 0;
+                const bool chunked = strcmp(route.name, "host chunked") == 0 ||
+                    (strcmp(route.name, "peer chunked") == 0 && (size_t) ne*(bf16 ? 2 : 4) > 16);
+                const bool must_own = n > 2 && chunked;
                 bool reduced_owned = true;
                 {
                     std::vector<int64_t> begin(n), len(n);
@@ -507,7 +522,21 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                        reduced_owned ? "reduced to owners" : "reduce to owners declined, nothing changed");
             }
             if (pair_comm) { free(pair_comm); }
+            last_chunked_seen = false;
             free(comm);
+            // the pipeline's reductions on the chunked kernel moved card to card where its cards map each other's memory,
+            // and through host memory where they do not
+            const bool peer_chunked = strcmp(route.name, "peer chunked") == 0 && peer_active && last_gather_peer;
+            if (strcmp(route.name, "host chunked") == 0 || peer_chunked) {
+                const bool moved = last_chunked_seen && (peer_chunked ? last_chunked_peer > 0 && last_chunked_host == 0
+                                                                      : last_chunked_host > 0 && last_chunked_peer == 0);
+                if (!moved) {
+                    fprintf(stderr, "FAIL: %d-rank %s %s: %s chunked reductions, %llu card to card and %llu through host memory\n",
+                            n, route.name, bf16 ? "BF16" : "F32", last_chunked_seen ? "counted" : "no count of",
+                            last_chunked_peer, last_chunked_host);
+                    ok = false;
+                }
+            }
             if (!bf16 && (strcmp(route.name, "peer copy") == 0 || strcmp(route.name, "host chunked") == 0 || strcmp(route.name, "owner-slice") == 0)) {
                 set_env("GGML_CUDA_GRAPH_MAX", "0");
                 ok = test_gather_graph(devices, 512) && ok;
