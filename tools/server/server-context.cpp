@@ -509,7 +509,8 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    // n_generating sequences generate in this batch, each given n_per_slot rows past its next token
+    int get_n_draft_max(int32_t n_generating, int32_t n_per_slot) const {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
@@ -519,11 +520,8 @@ struct server_slot {
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
-        int n_draft_max = n_ctx - prompt.n_tokens() - 2;
-
-        if (n_remaining() > 0) {
-            n_draft_max = std::min(n_draft_max, n_remaining() - 1);
-        }
+        const int n_draft_max = common_speculative_draft_limit(
+                ctx_tgt, n_generating, n_ctx - prompt.n_tokens() - 2, n_remaining(), n_per_slot);
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
@@ -3573,7 +3571,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = std::min(slot.get_n_draft_max(), n_draft_per_slot);
+                const int n_draft_max = slot.get_n_draft_max(n_generating, n_draft_per_slot);
                 if ((int) slot.spec_draft.size() > std::max(0, n_draft_max)) {
                     slot.spec_draft.resize(std::max(0, n_draft_max));
                     if (slot.spec_draft.empty()) {

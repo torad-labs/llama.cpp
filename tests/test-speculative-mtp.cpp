@@ -355,6 +355,34 @@ struct server_rig {
         return len;
     }
 
+    // the sequences given generate together and draft as the server sets them up: left holds the tokens a sequence's
+    // request may still emit (none listed: no limit), and a sequence whose limit leaves it no draft does not draft
+    std::map<llama_seq_id, int> draft(const std::vector<llama_seq_id> & which, const std::map<llama_seq_id, int32_t> & left) {
+        const int32_t n_generating = (int32_t) which.size();
+        const int32_t n_per_slot   = std::max(0, params.n_batch / std::max(1, n_generating) - 1);
+        for (const llama_seq_id s : which) {
+            seqs[s].draft.clear();
+            const auto it = left.find(s);
+            const int32_t n_max = common_speculative_draft_limit(tgt.get(), n_generating,
+                    (int32_t) llama_n_ctx_seq(tgt.get()) - seqs[s].n_past - 2, it == left.end() ? -1 : it->second, n_per_slot);
+            common_speculative_get_draft_params(spec.get(), s) = {
+                /* .drafting = */ n_max > 0,
+                /* .n_max    = */ n_max,
+                /* .n_past   = */ seqs[s].n_past,
+                /* .id_last  = */ seqs[s].id_last,
+                /* .prompt   = */ &seqs[s].prompt,
+                /* .result   = */ &seqs[s].draft,
+            };
+        }
+        common_speculative_draft(spec.get());
+        std::map<llama_seq_id, int> len;
+        for (const llama_seq_id s : which) {
+            len[s] = (int) seqs[s].draft.size();
+            llama_memory_seq_rm(llama_get_memory(init->context()), s, seqs[s].n_past, -1);
+        }
+        return len;
+    }
+
     // the verification batch of the drafted sequences, in the given row order
     std::map<llama_seq_id, int> verify(const std::vector<llama_seq_id> & order) {
         std::vector<std::pair<llama_seq_id, llama_tokens>> rows;
@@ -1867,6 +1895,45 @@ static bool test_dp_uniform_width(const std::vector<ggml_backend_dev_t> & device
     return true;
 }
 
+// Goal: a sequence close to its request's output limit still drafts the round's depth when it verifies with others,
+// so a data-parallel verification of them all stays one target pass; the server emits none of the tokens past the
+// limit. The limit used to cut its draft (with one token left it did not draft at all), so its rows differed from the
+// others' and the rollback split verified the round one sequence at a time: at 36 sessions, about 4.2 s for a round
+// that takes 0.12 s, in the last round of most sessions. A sequence that drafts alone keeps its limit.
+static bool test_dp_output_limit(const std::vector<ggml_backend_dev_t> & devices) {
+    auto split = glm_model(1234, devices, LLAMA_SPLIT_MODE_DATA);
+    constexpr int n_seq = 8;
+    server_rig rig(split.get(), 0.18f, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, false, n_seq, false, true);
+    std::vector<llama_seq_id> all(n_seq);
+    std::iota(all.begin(), all.end(), 0);
+    std::mt19937 rng(11);
+    for (const llama_seq_id s : all) rig.request(s, rng, 9 + 3*s);
+    const acceptance land = {1.0f, 1.0f};
+    // sequence 0 has one token left to emit and sequence 1 two; the others have no limit
+    const std::map<llama_seq_id, int32_t> left = {{0, 1}, {1, 2}};
+    for (int round = 0; round < WINDOW; ++round) {
+        const auto len = rig.draft(all, left);
+        for (const llama_seq_id s : all) {
+            if (len.at(s) != N_MAX) {
+                fprintf(stderr, "round %d: sequence %d drafted %d, the round's depth is %d\n", round, s, len.at(s), N_MAX);
+                return fail("a sequence near its output limit, drafting with others, did not draft the round's depth");
+            }
+        }
+        rig.target_passes = 0;
+        rig.verify(all);
+        if (rig.target_passes != 1) {
+            fprintf(stderr, "round %d: %d target passes for %d rows\n", round, rig.target_passes, n_seq*(N_MAX + 1));
+            return fail("a data-parallel verification with sequences near their output limits was not one target pass");
+        }
+        for (const llama_seq_id s : all) rig.accept(s, land(len.at(s), rng), rng);
+    }
+    // drafting alone, a sequence's output limit still cuts its draft
+    if (rig.draft({1}, left).at(1) != 1) return fail("a sequence drafting alone drafted past its output limit");
+    if (rig.draft({0}, left).at(0) != 0) return fail("a sequence drafting alone with one token left drafted");
+    printf("DP MTP %zu ranks: %d rounds with sequences at their output limits, one target pass each\n", devices.size(), WINDOW);
+    return true;
+}
+
 int main(int argc, char ** argv) {
     common_init();
     common_log_set_verbosity_thold(LOG_LEVEL_WARN);
@@ -1888,6 +1955,7 @@ int main(int argc, char ** argv) {
                 std::vector<ggml_backend_dev_t> ranks;
                 for (size_t i = 0; i < 4; ++i) { ranks.push_back(devices[i % devices.size()]); }
                 ok = test_dp_uniform_width(ranks) && ok;
+                ok = test_dp_output_limit(ranks) && ok;
             }
             for (size_t count : {2u, 4u}) {
                 std::vector<ggml_backend_dev_t> ranks;

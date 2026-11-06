@@ -73,6 +73,13 @@ struct common_speculative_output_limits {
 common_speculative_output_limits common_speculative_get_output_limits(
         int32_t n_batch, int32_t n_parallel, int32_t n_draft);
 
+// the most tokens a sequence may draft this round: what its context has room for past the next token (n_room), what
+// the batch gives each of the n_generating sequences (n_per_seq), and one less than the tokens its request may still
+// emit (n_remaining, -1 when it has no limit) unless it verifies with other sequences in a target that keeps each
+// sequence's rollback rows in one ubatch, where a shorter draft would split the verification into a pass per sequence
+int32_t common_speculative_draft_limit(
+        const llama_context * ctx_tgt, int32_t n_generating, int32_t n_room, int32_t n_remaining, int32_t n_per_seq);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);

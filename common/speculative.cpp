@@ -3123,6 +3123,21 @@ common_speculative_output_limits common_speculative_get_output_limits(
     };
 }
 
+int32_t common_speculative_draft_limit(
+        const llama_context * ctx_tgt, int32_t n_generating, int32_t n_room, int32_t n_remaining, int32_t n_per_seq) {
+    int32_t n_max = std::min(n_room, n_per_seq);
+    // A target that keeps each sequence's rollback rows in one ubatch takes as many rows from every sequence of a
+    // ubatch, so a sequence verifying with others whose draft its output limit shortened (or, one token from the
+    // limit, left out) split their verification into a pass per sequence: at 36 sessions on four PCIe cards, about
+    // 4.2 s for a round that takes 0.12 s, in most sessions' last round. It drafts what the others draft instead,
+    // and the tokens past its limit are verified and dropped (the server stops emitting at the limit).
+    const bool verifies_with_others = n_generating > 1 && ctx_tgt != nullptr && llama_n_rs_seq(ctx_tgt) > 0;
+    if (n_remaining > 0 && !verifies_with_others) {
+        n_max = std::min(n_max, n_remaining - 1);
+    }
+    return n_max;
+}
+
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
