@@ -1353,21 +1353,25 @@ static bool test_graph_shapes(llama_model * model) {
 static bool test_sampler_graphs(llama_model * model) {
     constexpr int n_seq = 4;
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto make_sampler = [n_vocab](int seq) {
+        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        const llama_logit_bias bias[] = {{5, 0.3f}, {17, -INFINITY}};
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_logit_bias(n_vocab, 2, bias));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, 16, 1.1f, 0.1f, 0.1f));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(40));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(0.95f, 1));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(0.8f));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(1000 + seq));
+        for (llama_token t : {5, 5, 12, 17}) { llama_sampler_accept(chain.get(), t); }
+        return chain;
+    };
     std::vector<llama_sampler_ptr> samplers[2];
     std::vector<llama_sampler_seq_config> configs[2];
     llama_context_ptr contexts[2];
     for (int side = 0; side < 2; ++side) {
         for (int s = 0; s < n_seq; ++s) {
-            samplers[side].emplace_back(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+            samplers[side].push_back(make_sampler(s));
             auto * chain = samplers[side].back().get();
-            const llama_logit_bias bias[] = {{5, 0.3f}, {17, -INFINITY}};
-            llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(n_vocab, 2, bias));
-            llama_sampler_chain_add(chain, llama_sampler_init_penalties(n_vocab, 16, 1.1f, 0.1f, 0.1f));
-            llama_sampler_chain_add(chain, llama_sampler_init_top_k(40));
-            llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.95f, 1));
-            llama_sampler_chain_add(chain, llama_sampler_init_temp(0.8f));
-            llama_sampler_chain_add(chain, llama_sampler_init_dist(1000 + s));
-            for (llama_token t : {5, 5, 12, 17}) { llama_sampler_accept(chain, t); }
             configs[side].push_back({s, chain});
         }
         auto params = llama_context_default_params();
@@ -1376,6 +1380,7 @@ static bool test_sampler_graphs(llama_model * model) {
         params.n_batch = params.n_ubatch = 32;
         params.n_outputs_max = 3*n_seq;
         params.n_outputs_max_per_seq = 3;
+        params.n_rs_seq = N_MAX;
         params.n_threads = params.n_threads_batch = 4;
         params.no_perf = false;
         params.kv_unified = false;
@@ -1429,6 +1434,53 @@ static bool test_sampler_graphs(llama_model * model) {
             if (i % width <= round % width) {
                 for (int side = 0; side < 2; ++side) { llama_sampler_accept(samplers[side][batch.seq_id[i][0]].get(), a); }
             }
+        }
+        llama_batch_free(batch);
+        if (!ok) { return false; }
+    }
+    // Finish one sequence after warming all owners, then keep decoding the unequal verification tails without clearing KV.
+    for (auto & ctx : contexts) { llama_memory_clear(llama_get_memory(ctx.get()), true); }
+    llama_pos positions[n_seq] = {};
+    for (int round = 0; round < 6; ++round) {
+        if (round == 2 || round == 5) {
+            for (int side = 0; side < 2; ++side) {
+                if (round == 5) { samplers[side][1] = make_sampler(1); }
+                if (!llama_set_sampler(contexts[side].get(), 1, round == 2 ? nullptr : samplers[side][1].get())) {
+                    return fail("sampler completion detach/reattach failed");
+                }
+            }
+        }
+        const bool completed = round >= 2 && round < 5;
+        llama_batch batch = llama_batch_init(3*n_seq, 0, 1);
+        for (int s = 0; s < n_seq; ++s) {
+            const int width = completed ? (s == 1 ? 0 : s == 3 ? 1 : 3) : 3;
+            for (int i = 0; i < width; ++i) {
+                common_batch_add(batch, (s*11 + positions[s]) % n_vocab, positions[s], {s}, true);
+                ++positions[s];
+            }
+        }
+        bool ok = true;
+        const auto reused = llama_perf_context(contexts[1].get()).n_reused;
+        for (auto & ctx : contexts) {
+            if (llama_decode(ctx.get(), batch) != 0) { ok = fail("sampler completion decode failed"); break; }
+        }
+        if (ok && round == 4 && llama_perf_context(contexts[1].get()).n_reused <= reused) {
+            ok = fail("sampler completion never returned to graph reuse");
+        }
+        for (int i = 0; ok && i < batch.n_tokens; ++i) {
+            const auto token = llama_get_sampled_token_ith(contexts[0].get(), i);
+            if (token == LLAMA_TOKEN_NULL || token != llama_get_sampled_token_ith(contexts[1].get(), i)) {
+                ok = fail("sampler completion changed a seeded token"); break;
+            }
+            const auto a = llama_get_sampling_row_ith(contexts[0].get(), i);
+            const auto b = llama_get_sampling_row_ith(contexts[1].get(), i);
+            if (a.n_sampled_probs != b.n_sampled_probs || a.n_sampled_logits != b.n_sampled_logits || a.n_candidates != b.n_candidates ||
+                    memcmp(a.sampled_probs, b.sampled_probs, a.n_sampled_probs*sizeof(float)) ||
+                    memcmp(a.sampled_logits, b.sampled_logits, a.n_sampled_logits*sizeof(float)) ||
+                    memcmp(a.candidates, b.candidates, a.n_candidates*sizeof(llama_token))) {
+                ok = fail("sampler completion changed sampling outputs"); break;
+            }
+            for (int side = 0; side < 2; ++side) { llama_sampler_accept(samplers[side][batch.seq_id[i][0]].get(), token); }
         }
         llama_batch_free(batch);
         if (!ok) { return false; }
