@@ -7583,26 +7583,29 @@ struct test_concat : public test_case {
     }
 };
 
-// GGML_OP_CONCAT along dim 0 of a short contiguous state and a transposed block of rows: a GDN layer's
-// conv state [d_conv - 1, channels] joined with the new tokens' projection [channels, n_tokens]^T
+// GGML_OP_CONCAT along dim 0 of a short contiguous state and a transposed block of rows: a GDN or KDA layer's
+// conv state [d_conv - 1, channels, n_seqs] joined with the new tokens' projection [channels, n_tokens, n_seqs]^T,
+// one plane per sequence of the ubatch
 struct test_concat_conv_state : public test_case {
     const ggml_type type;
     const int64_t n_state; // d_conv - 1
     const int64_t n_channels;
     const int64_t n_tokens;
+    const int64_t n_seqs;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, n_state, n_channels, n_tokens);
+        return VARS_TO_STR5(type, n_state, n_channels, n_tokens, n_seqs);
     }
 
-    test_concat_conv_state(ggml_type type = GGML_TYPE_F32, int64_t n_state = 3, int64_t n_channels = 10240, int64_t n_tokens = 3)
-        : type(type), n_state(n_state), n_channels(n_channels), n_tokens(n_tokens) {}
+    test_concat_conv_state(ggml_type type = GGML_TYPE_F32, int64_t n_state = 3, int64_t n_channels = 10240, int64_t n_tokens = 3,
+                           int64_t n_seqs = 1)
+        : type(type), n_state(n_state), n_channels(n_channels), n_tokens(n_tokens), n_seqs(n_seqs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, n_state, n_channels);
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type, n_state, n_channels, n_seqs);
         ggml_set_name(a, "a");
 
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, type, n_channels, n_tokens);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, type, n_channels, n_tokens, n_seqs);
         ggml_set_name(x, "x");
 
         ggml_tensor * b = ggml_transpose(ctx, x);
@@ -12447,6 +12450,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat_conv_state(type, 3, 1000, n_tokens));
         }
         test_cases.emplace_back(new test_concat_conv_state(type, 9, 1000, 3));
+        // a ubatch of several sequences: an MTP verify of 36 sessions over four data-parallel ranks puts 9 sequences
+        // of 1 + its drafts' rows in each rank's ubatch, one plane each
+        for (int64_t n_seqs : { 2, 9 }) {
+            for (int64_t n_tokens : { 1, 3, 33 }) {
+                test_cases.emplace_back(new test_concat_conv_state(type, 3, 10240, n_tokens, n_seqs));
+                test_cases.emplace_back(new test_concat_conv_state(type, 3, 1000, n_tokens, n_seqs));
+            }
+        }
+        test_cases.emplace_back(new test_concat_conv_state(type, 9, 1000, 3, 2));
     }
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
@@ -13471,6 +13483,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
+
+    // GLM-5.3 Flash's KDA conv-state concat (24576 channels) on one data-parallel rank of 36 sessions over four: 9
+    // sequences of a decode row or an MTP verify's 3, one plane each, and one sequence's for comparison
+    for (int64_t n_seqs : { 1, 9 }) {
+        for (int64_t n_tokens : { 1, 3 }) {
+            test_cases.emplace_back(new test_concat_conv_state(GGML_TYPE_F32, 3, 24576, n_tokens, n_seqs));
+        }
+    }
 
     // Ternary Bonsai 2 27B at decode and an MTP verify's width (1-5 columns): the FFN's gate/up + GLU and the residual adds
     // after the FFN down and a Gated DeltaNet layer's output projection, each one fused graph where the backend fuses it
