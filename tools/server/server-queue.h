@@ -2,12 +2,15 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <exception>
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 #include <unordered_set>
 
 // struct for managing server tasks
@@ -162,9 +165,26 @@ private:
     std::vector<server_task_result_ptr> queue_results;
 
     std::mutex mutex_results;
-    std::condition_variable condition_results;
+
+    // A reader blocked in recv() or recv_with_timeout() is listed under each of its tasks, and a result wakes only the
+    // readers of its own task. One condition for every reader woke them all for each result, and each took the lock
+    // to scan the queue: at 36 streaming sessions the decode loop spent 21 ms of a 148 ms round waiting for it.
+    struct waiter {
+        std::condition_variable cv;
+        bool woken = false;
+    };
+    std::unordered_multimap<int, waiter *> waiters;
+
+    // with mutex_results held
+    void list(const std::unordered_set<int> & id_tasks, waiter & w);
+    void unlist(const std::unordered_set<int> & id_tasks, const waiter & w);
+    void wake(int id_task);
+    void wake_all();
 
 public:
+    // how many times a reader waiting in recv() or recv_with_timeout() woke, other than at its timeout
+    std::atomic<uint64_t> n_wakeups{0};
+
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task);
 
