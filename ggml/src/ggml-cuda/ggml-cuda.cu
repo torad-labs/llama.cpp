@@ -4966,6 +4966,114 @@ static bool ggml_cuda_node_is_folded(ggml_backend_cuda_context & ctx, const ggml
 
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
+// Whether the recurrent kernel can write gdn's snapshots into a cache of this type here (gdn_store_state). f16 and q8_0:
+// the recurrent kernel, with the scalar gate or KDA's (the chunked prefill pipeline writes f32; its stores stay). KDA
+// stores its state as the scalar gate does, one column a warp, and until it was taken here glm5next under -cts f16 paid
+// the f32 -> f16 cpy on every KDA layer: 262 us a token against 289 for the kernel, the 44-layer GLM-5.3 proxy on an RTX
+// 5070 Ti. q8_0 besides: the kernel quantizes one block per warp-wide slice of a state column, so a 32-lane warp and a
+// head width that is a multiple of 32. GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate store,
+// GGML_CUDA_GDN_KDA_CACHE_LEGACY=1 a KDA layer's f16 or q8_0 one.
+static bool ggml_cuda_gdn_store_fusable(const ggml_tensor * gdn, ggml_type type) {
+    static const bool q8_legacy  = ggml_env_switch("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
+    static const bool kda_legacy = ggml_env_switch("GGML_CUDA_GDN_KDA_CACHE_LEGACY");
+    const int64_t S_v = gdn->src[2]->ne[0];
+    if (!ggml_cuda_gdn_cache_type_fusable(type)) {
+        return false;
+    }
+    if (type != GGML_TYPE_F32 && ((kda_legacy && gdn->src[3]->ne[0] == S_v) || ggml_cuda_should_use_chunked_gdn(gdn))) {
+        return false;
+    }
+    return type != GGML_TYPE_Q8_0 ||
+        (!q8_legacy && S_v % QK8_0 == 0 && ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == QK8_0);
+}
+
+// -sm dp: build_rs_store_local stores each written snapshot slot on its own, view -> cont -> set_rows into the sequence
+// owner's cache at each sequence's row (I64 ids, the owner's cells in any order). Matched from the first cont after the
+// gdn: one store per written slot, each slot once, only views and no-ops between, all into one cache. The kernel then
+// writes every snapshot to its row (ggml_cuda_gated_delta_net_store_rows) and the conts and set_rows are skipped: under
+// four-way -sm dp a 36-session verify made three f32 copies of 4 MiB a session per KDA layer, each quantized again, about
+// 12% of the 108-row target pass. Returns the nodes to skip, 0 to keep the stores. GGML_CUDA_GDN_ROWS_STORE_LEGACY=1
+// keeps them.
+static int ggml_cuda_try_gdn_rows_fusion(const ggml_cgraph * cgraph, int node_idx, int first,
+        ggml_cuda_gated_delta_net_fused_cache & fused) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_GDN_ROWS_STORE_LEGACY");
+    if (legacy) {
+        return 0;
+    }
+    const ggml_tensor * gdn       = cgraph->nodes[node_idx];
+    const ggml_tensor * src_v     = gdn->src[2];
+    const int64_t       S_v       = src_v->ne[0];
+    const int64_t       n_tokens  = src_v->ne[2];
+    const int64_t       n_seqs    = src_v->ne[3];
+    const int64_t       D         = S_v * S_v * src_v->ne[1];
+    const int64_t       K         = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       n_written = std::min<int64_t>(n_tokens, K);
+    if (n_written > GGML_CUDA_GDN_STORE_ROWS_MAX || ggml_cuda_should_use_chunked_gdn(gdn)) {
+        return 0;
+    }
+    // slot i of the snapshot tail starts i slots after the attention scores
+    const size_t tail_off   = ggml_row_size(GGML_TYPE_F32, S_v * src_v->ne[1] * n_tokens * n_seqs);
+    const size_t slot_bytes = ggml_row_size(GGML_TYPE_F32, D * n_seqs);
+
+    ggml_cuda_gated_delta_net_store_rows rows;
+    const ggml_tensor * cache = nullptr; // the first store's destination: every store writes the same cache
+    int found = 0;
+    int last  = first;
+    for (int j = first; j < cgraph->n_nodes && found < n_written; ++j) {
+        const ggml_tensor * cont = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(cont)) {
+            continue;
+        }
+        // one written slot's cont: [D, n_seqs] f32 of the slot's view, read by its set_rows alone
+        const ggml_tensor * view = cont->src[0];
+        if (cont->op != GGML_OP_CONT || cont->type != GGML_TYPE_F32 || (cont->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                cont->ne[0] != D || ggml_nelements(cont) != D * n_seqs || !ggml_is_contiguous(cont) ||
+                ggml_node_get_use_count(cgraph, j) != 1 ||
+                view->op != GGML_OP_VIEW || view->view_src != gdn || view->type != GGML_TYPE_F32 ||
+                ggml_nelements(view) != D * n_seqs || !ggml_is_contiguous(view) ||
+                view->view_offs < tail_off || (view->view_offs - tail_off) % slot_bytes != 0) {
+            return 0;
+        }
+        const size_t slot = (view->view_offs - tail_off) / slot_bytes;
+        if (slot >= (size_t) n_written || rows.slot[slot] != nullptr) {
+            return 0;
+        }
+        // its set_rows, the next real node: the sequences' rows of this slot in the cache
+        int k = j + 1;
+        while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            ++k;
+        }
+        if (k == cgraph->n_nodes) {
+            return 0;
+        }
+        const ggml_tensor * set = cgraph->nodes[k];
+        const ggml_tensor * ids = set->src[1];
+        if (set->op != GGML_OP_SET_ROWS || set->src[0] != cont || (set->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                set->data == nullptr || !ggml_cuda_gdn_cache_type_fusable(set->type) || set->ne[0] != D ||
+                set->nb[0] != ggml_type_size(set->type) || set->nb[1] != ggml_row_size(set->type, D) ||
+                ids->type != GGML_TYPE_I64 || ids->data == nullptr || !ggml_is_contiguous(ids) ||
+                ids->ne[0] != n_seqs || ggml_nelements(ids) != n_seqs) {
+            return 0;
+        }
+        if (cache != nullptr && (set->data != cache->data || set->type != cache->type || set->nb[1] != cache->nb[1])) {
+            return 0;
+        }
+        cache           = set;
+        rows.slot[slot] = (const int64_t *) ids->data;
+        ++found;
+        last = j = k;
+    }
+    if (found != n_written || !ggml_cuda_gdn_store_fusable(gdn, cache->type)) {
+        return 0;
+    }
+    rows.row_stride   = (int64_t) (cache->nb[1] / ggml_type_size(cache->type)) * ggml_blck_size(cache->type);
+    fused.data        = cache->data;
+    fused.slot_stride = 0;
+    fused.type        = cache->type;
+    fused.rows        = rows;
+    return last - node_idx;
+}
+
 static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
@@ -4995,6 +5103,9 @@ static int ggml_cuda_try_gdn_cache_fusion(
         if (ggml_cuda_is_view_or_noop(n)) {
             continue;
         }
+        if (n->op == GGML_OP_CONT) {
+            return ggml_cuda_try_gdn_rows_fusion(cgraph, node_idx, j, fused_state_cpy);
+        }
         if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             return 0;
         }
@@ -5018,7 +5129,6 @@ static int ggml_cuda_try_gdn_cache_fusion(
     // of D (the per-seq stride the kernel assumes) and nb[2] a whole number of blocks (the slot stride below is nb[2]
     // in elements; a remainder would be truncated and every slot after the first written shifted). ggml_cpy pins src
     // to the same element count.
-    const bool q8 = dst->type == GGML_TYPE_Q8_0;
     const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
     if (dst->op != GGML_OP_VIEW || !ggml_cuda_gdn_cache_type_fusable(dst->type) || dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
@@ -5026,19 +5136,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
         dst->nb[2] % ggml_type_size(dst->type) != 0) {
         return 0;
     }
-    // f16 and q8_0: the recurrent kernel, with the scalar gate or KDA's (the chunked prefill pipeline writes f32; its
-    // cpy stays). KDA stores its state as the scalar gate does, one column a warp (gdn_store_state), and until it was
-    // taken here glm5next under -cts f16 paid the f32 -> f16 cpy on every KDA layer: 262 us a token against 289 for the
-    // kernel, the 44-layer GLM-5.3 proxy on an RTX 5070 Ti. q8_0 besides: the kernel quantizes one block per warp-wide
-    // slice of a state column (gdn_store_state), so a 32-lane warp and a head width that is a multiple of 32.
-    // GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate cpy, GGML_CUDA_GDN_KDA_CACHE_LEGACY=1 a KDA
-    // layer's f16 or q8_0 one.
-    static const bool q8_legacy  = ggml_env_switch("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
-    static const bool kda_legacy = ggml_env_switch("GGML_CUDA_GDN_KDA_CACHE_LEGACY");
-    if (dst->type != GGML_TYPE_F32 && ((kda_legacy && gdn->src[3]->ne[0] == S_v) || ggml_cuda_should_use_chunked_gdn(gdn))) {
-        return 0;
-    }
-    if (q8 && (q8_legacy || S_v % QK8_0 != 0 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != QK8_0)) {
+    if (!ggml_cuda_gdn_store_fusable(gdn, dst->type)) {
         return 0;
     }
 
