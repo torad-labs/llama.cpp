@@ -4,6 +4,8 @@
 #include "common.h"
 
 #include <array>
+#include <functional>
+#include <vector>
 
 // Pure MTP policy and service-cycle observer. Timestamps are completed first-draft-step boundaries, in any common unit.
 struct common_mtp_service {
@@ -79,6 +81,16 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // sequence's rollback rows in one ubatch, where a shorter draft would split the verification into a pass per sequence
 int32_t common_speculative_draft_limit(
         const llama_context * ctx_tgt, int32_t n_generating, int32_t n_room, int32_t n_remaining, int32_t n_per_seq);
+
+struct common_sampler;
+
+// samples a sequence's verification rows (idxs: the row of the token before its draft, then one row per draft token)
+// and keeps the prefix of its draft the target agrees with, then the target's own next token, as
+// common_sampler_sample_and_accept_n does, but no more than n_remaining tokens, what its request may still emit (-1 when
+// it has no limit): draft rows past the output limit roll back as rejected ones
+std::vector<llama_token> common_speculative_sample_and_accept(
+        common_sampler * smpl, llama_context * ctx_tgt, const std::vector<int> & idxs, const llama_tokens & draft,
+        int32_t n_remaining, const std::function<void(size_t, llama_token)> & on_sample = nullptr);
 
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 

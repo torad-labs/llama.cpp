@@ -4635,7 +4635,8 @@ private:
                         spec_probs.push_back(std::move(out));
                     };
                 }
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, false, on_sample);
+                auto accepted = common_speculative_sample_and_accept(
+                        slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.n_remaining(), on_sample);
                 // here, before a checkpoint restore rewinds the sampler to its passive state: the replay must sample the
                 // row after the switching token on the CPU, or it stops at the same token on every pass
                 slot.release_backend_sampler_if_constrained();

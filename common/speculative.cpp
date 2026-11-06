@@ -3131,12 +3131,32 @@ int32_t common_speculative_draft_limit(
     // ubatch, so a sequence verifying with others whose draft its output limit shortened (or, one token from the
     // limit, left out) split their verification into a pass per sequence: at 36 sessions on four PCIe cards, about
     // 4.2 s for a round that takes 0.12 s, in most sessions' last round. It drafts what the others draft instead,
-    // and the tokens past its limit are verified and dropped (the server stops emitting at the limit).
+    // and the tokens past its limit are verified and rolled back as rejected (common_speculative_sample_and_accept).
     const bool verifies_with_others = n_generating > 1 && ctx_tgt != nullptr && llama_n_rs_seq(ctx_tgt) > 0;
     if (n_remaining > 0 && !verifies_with_others) {
         n_max = std::min(n_max, n_remaining - 1);
     }
     return n_max;
+}
+
+std::vector<llama_token> common_speculative_sample_and_accept(
+        common_sampler * smpl, llama_context * ctx_tgt, const std::vector<int> & idxs, const llama_tokens & draft,
+        int32_t n_remaining, const std::function<void(size_t, llama_token)> & on_sample) {
+    // A sequence verifying with others drafts past its output limit (common_speculative_draft_limit). It checks at most
+    // n_remaining - 1 of its draft tokens, so with the target's own next token it keeps at most n_remaining: the rows
+    // past them roll back as rejected ones, and its cache ends where it would had it never drafted them. Kept, they
+    // left the cache a token or two past the request's end, and on four PCIe cards at 36 sessions half the next
+    // requests restored a checkpoint 20 tokens back (about 4.8 s each) instead of reusing the cache to the last token.
+    size_t n_check = draft.size();
+    if (n_remaining > 0) {
+        n_check = std::min(n_check, (size_t) n_remaining - 1);
+    }
+    if (n_check == draft.size()) {
+        return common_sampler_sample_and_accept_n(smpl, ctx_tgt, idxs, draft, false, on_sample);
+    }
+    const std::vector<int> idxs_checked(idxs.begin(), idxs.begin() + n_check + 1);
+    const llama_tokens     draft_checked(draft.begin(), draft.begin() + n_check);
+    return common_sampler_sample_and_accept_n(smpl, ctx_tgt, idxs_checked, draft_checked, false, on_sample);
 }
 
 // initialization of the speculative decoding system

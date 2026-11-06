@@ -21,6 +21,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "speculative.h"
+#include "sampling.h"
 #include "gguf.h"
 #include "ggml-cpp.h"
 
@@ -1982,6 +1983,34 @@ static bool test_dp_output_limit(const std::vector<ggml_backend_dev_t> & devices
             return fail("a data-parallel verification with sequences near their output limits was not one target pass");
         }
         for (const llama_seq_id s : all) rig.accept(s, land(len.at(s), rng), rng);
+    }
+    // a round where the target agrees with every draft: a sequence keeps no token past its output limit, so the rows it
+    // drafted past the limit roll back as rejected ones and its cache ends where a sequence that never drafted them would
+    // (the next request of its session then reuses the cache up to its last token)
+    {
+        const auto len = rig.draft(all, left);
+        const llama_token agreed = 7;
+        common_params_sampling sp;
+        sp.temp = 0.0f;
+        sp.logit_bias.push_back({agreed, 1.0e4f});
+        for (const llama_seq_id s : all) rig.seqs[s].draft.assign(len.at(s), agreed);
+        const auto first = rig.verify(all);
+        for (const llama_seq_id s : all) {
+            std::vector<int> idxs(len.at(s) + 1);
+            std::iota(idxs.begin(), idxs.end(), first.at(s));
+            const auto it = left.find(s);
+            const int32_t n_left = it == left.end() ? -1 : it->second;
+            common_sampler * smpl = common_sampler_init(split.get(), sp);
+            const auto kept = common_speculative_sample_and_accept(smpl, rig.tgt.get(), idxs, rig.seqs[s].draft, n_left);
+            common_sampler_free(smpl);
+            const size_t expected = n_left > 0 ? std::min((size_t) n_left, idxs.size()) : idxs.size();
+            if (kept.size() != expected || std::count(kept.begin(), kept.end(), agreed) != (std::ptrdiff_t) kept.size()) {
+                fprintf(stderr, "sequence %d with %d tokens left kept %zu tokens of %zu verified rows, expected %zu\n",
+                        s, n_left, kept.size(), idxs.size(), expected);
+                return fail("a sequence that drafted past its output limit kept tokens past it");
+            }
+            rig.accept(s, (int) kept.size() - 1, rng);
+        }
     }
     // drafting alone, a sequence's output limit still cuts its draft
     if (rig.draft({1}, left).at(1) != 1) return fail("a sequence drafting alone drafted past its output limit");
