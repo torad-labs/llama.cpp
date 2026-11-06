@@ -10623,8 +10623,8 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     // Decode, draft and one/two/three-slot n_max=2 verification. Include the
-    // M=9 MMQ boundary and full/trimmed vocabulary shards, not just M=1.
-    for (int64_t n : {1, 2, 3, 6, 9}) {
+    // M=9 MMQ boundary, 36-session MTP verification and full/trimmed vocabulary shards, not just M=1.
+    for (int64_t n : {1, 2, 3, 6, 9, 27}) {
         for (int64_t m : {512, 1536, 2048, 4096, 8192, 16384, 32768, 77440}) {
             cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 4096, {1, 1}, {1, 1}));
         }
@@ -10653,9 +10653,22 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
         false, 1, 1, false, false, /*with_gate =*/ true, false, {1, 1}));
 }
 
+static void add_glm_moe_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    // One expert shard at 36-session decode and MTP verification widths, with spread and concentrated routing.
+    for (int64_t tokens : {36, 108}) {
+        for (int routing : {0, 1}) {
+            cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, tokens, 216, 288, 8, 72,
+                2048, 4096, false, routing));
+            cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, false, tokens, 216, 288, 8, 72,
+                4096, 2048, false, routing));
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
+    add_glm_moe_cases(test_cases);
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
         for (int64_t tokens : {1, 17, 40}) {
@@ -13483,6 +13496,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
+    add_glm_moe_cases(test_cases);
 
     // GLM-5.3 Flash's KDA conv-state concat (24576 channels) on one data-parallel rank of 36 sessions over four: 9
     // sequences of a decode row or an MTP verify's 3, one plane each, and one sequence's for comparison
