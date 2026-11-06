@@ -69,14 +69,19 @@ static bool last_one_stream   = false; // the last one's copy-engine receives ru
 static bool last_card_to_card = false; // the last one's copy-engine receives come card to card
 static bool last_p2p          = false; // the last one's cards map each other's memory: its LL card-to-card limit is above 0
 static bool last_gather_peer  = false;
+static bool last_owner_slice  = false;
 static std::atomic<int> n_captures{0};
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (strstr(text, "owner-slice-peer") != nullptr) {
+        last_owner_slice = true;
+    }
     if (strstr(text, "initialized AllReduce pipeline") != nullptr) {
         n_pipelines++;
         last_one_stream   = strstr(text, "receives after the sends") != nullptr;
         last_card_to_card = strstr(text, "receives card to card") != nullptr;
         last_gather_peer = strstr(text, "large gather card to card") != nullptr;
+        last_owner_slice = strstr(text, "owner-slice-peer") != nullptr;
         const char * ll   = strstr(text, "LL card to card up to ");
         unsigned long long ll_bytes = 0;
         last_p2p = ll != nullptr && sscanf(ll, "LL card to card up to %llu", &ll_bytes) == 1 && ll_bytes > 0;
@@ -293,6 +298,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
         {"host copy",    "0",       "0",       "1", false},
         {"host serial",  "0",       "0",       "1", true},
         {"peer copy",    "0",       "1048576", "1", false},
+        {"owner-slice",  "0",       "1048576", "0", false},
     };
     bool ok = true;
     for (bool bf16 : {false, true}) {
@@ -303,6 +309,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             set_env("GGML_CUDA_AR_COPY_THRESHOLD", route.copy);
             set_env("GGML_CUDA_AR_COPY_ONE_STREAM", route.one_stream ? "1" : "0");
             set_env("GGML_CUDA_AR_COPY_PEER", "1");
+            set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", strcmp(route.name, "owner-slice") == 0 ? "1" : "0");
             const int before = n_pipelines;
             void * comm = init(backends.data(), backends.size());
             if (!comm || n_pipelines != before + 1) {
@@ -313,8 +320,10 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             }
             const bool peer_requested = route.p2p[0] != '0';
             const bool peer_active = last_p2p;
+            const bool owner_requested = strcmp(route.name, "owner-slice") == 0;
             if (last_one_stream != route.one_stream || (!peer_requested && (last_p2p || last_card_to_card)) ||
-                    (peer_requested && require_p2p && (!last_p2p || !last_gather_peer || (route.copy[0] == '1' && !last_card_to_card)))) {
+                    (peer_requested && require_p2p && (!last_p2p || !last_gather_peer ||
+                        (route.copy[0] == '1' && !last_card_to_card) || (owner_requested && !last_owner_slice)))) {
                 fprintf(stderr, "FAIL: %d-rank %s did not select the required transport\n", n, route.name);
                 free(comm);
                 for (auto backend : backends) { ggml_backend_free(backend); }
@@ -431,7 +440,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             }
             if (pair_comm) { free(pair_comm); }
             free(comm);
-            if (!bf16 && (strcmp(route.name, "peer copy") == 0 || strcmp(route.name, "host chunked") == 0)) {
+            if (!bf16 && (strcmp(route.name, "peer copy") == 0 || strcmp(route.name, "host chunked") == 0 || strcmp(route.name, "owner-slice") == 0)) {
                 set_env("GGML_CUDA_GRAPH_MAX", "0");
                 ok = test_gather_graph(devices, 512) && ok;
                 ok = test_gather_graph(devices, 513) && ok;
@@ -514,20 +523,25 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
     bool ok = true;
     {
         benchmark_launcher runner(backends, launch);
-        for (const char * route : {"peer_ll", "host_ll", "peer_copy", "host_copy"}) {
-            const bool peer = strncmp(route, "peer", 4) == 0;
+        for (const char * route : {"peer_ll", "host_ll", "peer_copy", "host_copy", "owner-slice"}) {
+            const bool peer = strncmp(route, "peer", 4) == 0 || strcmp(route, "owner-slice") == 0;
             const bool copy = strstr(route, "copy") != nullptr;
             set_env("GGML_CUDA_AR_LL_MAX_BYTES", peer || copy ? "0" : "1048576");
             set_env("GGML_CUDA_AR_P2P_MAX_BYTES", peer ? "1048576" : "0");
             set_env("GGML_CUDA_AR_COPY_THRESHOLD", copy ? "1" : "0");
             set_env("GGML_CUDA_AR_COPY_PEER", peer ? "1" : "0");
             set_env("GGML_CUDA_AR_COPY_ONE_STREAM", "0");
+            set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", strcmp(route, "owner-slice") == 0 ? "1" : "0");
             for (bool bf16 : {false, true}) {
                 set_env("GGML_CUDA_AR_BF16_THRESHOLD", bf16 ? "1" : "0");
                 void * comm = init(backends.data(), backends.size());
                 GGML_ASSERT(comm);
                 const bool peer_active = last_p2p;
-                for (int rows : {1, 4, 8, 40}) {
+                if (strcmp(route, "owner-slice") == 0 && !last_owner_slice) {
+                    fprintf(stderr, "FAIL: owner-slice-peer protocol was not selected\n");
+                    return 1;
+                }
+                for (int rows : {1, 4, 8, 40, 65, 128, 512, 513}) {
                     for (int operation : {0, 1, 2}) { // reset only, reduce, gather
                         if (bf16 && operation != 1) { continue; } // gather preserves F32 bits, regardless of the sum wire
                         const int64_t ne = int64_t(rows)*4096;
@@ -539,7 +553,15 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                             auto * ctx = ggml_init({(size_t(delay_steps) + 16)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
                             contexts.push_back(ctx);
                             auto * graph = ggml_new_graph(ctx);
-                            auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
+                            auto * input = operation == 2 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, rows) :
+                                ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
+                            if (operation == 2) {
+                                std::vector<int64_t> owned(devices.size());
+                                for (size_t owner = 0; owner < devices.size(); ++owner) {
+                                    owned[owner] = rows*(owner + 1)/devices.size() - rows*owner/devices.size();
+                                }
+                                ggml_backend_meta_split_input(input, 1, owned.data(), owned.size());
+                            }
                             ggml_set_input(input);
                             ggml_set_output(input); // replay always starts from the original contribution
                             ggml_tensor * delay = nullptr;
@@ -551,7 +573,7 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                                 for (int step = 0; step < delay_steps; ++step) { current = ggml_scale(ctx, current, 1.0f); }
                                 ggml_build_forward_expand(graph, current);
                             }
-                            auto * out = ggml_scale(ctx, input, 1.0f);
+                            auto * out = operation == 2 ? ggml_backend_meta_gather(ctx, input) : ggml_scale(ctx, input, 1.0f);
                             ggml_set_output(out);
                             ggml_build_forward_expand(graph, out);
                             auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backends[rank]);
@@ -559,7 +581,13 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                             buffers.push_back(buffer);
                             std::vector<float> values(ne, float(rank + 1));
                             if (operation == 2) {
-                                for (int64_t i = 0; i < ne; ++i) { if (i % devices.size() != rank) { values[i] = 0; } }
+                                for (int64_t i = 0; i < ne; ++i) {
+                                    const int64_t row = i/4096;
+                                    if (row < int64_t(rows*rank)/int64_t(devices.size()) ||
+                                            row >= int64_t(rows*(rank + 1))/int64_t(devices.size())) {
+                                        values[i] = 0;
+                                    }
+                                }
                             }
                             ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
                             if (delay) {
@@ -607,8 +635,13 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                         for (size_t rank = 0; rank < devices.size(); ++rank) {
                             ggml_backend_tensor_get(outputs[rank], actual.data(), 0, ggml_nbytes(outputs[rank]));
                             for (int64_t i = 0; i < ne; ++i) {
+                                const int64_t row = i/4096;
+                                size_t owner = 0;
+                                while (owner + 1 < devices.size() && row >= int64_t(rows*(owner + 1))/int64_t(devices.size())) {
+                                    ++owner;
+                                }
                                 const float expected = operation == 1 ? float(devices.size()*(devices.size()+1)/2) :
-                                    operation == 2 ? float(i % devices.size() + 1) : float(rank + 1);
+                                    operation == 2 ? float(owner + 1) : float(rank + 1);
                                 correct = correct && actual[i] == expected;
                             }
                         }
@@ -638,15 +671,17 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
 }
 
 int main(int argc, char ** argv) {
-    const bool benchmark = (argc == 3 || argc == 5) && strcmp(argv[1], "--bench") == 0;
+    const bool logical_benchmark = (argc == 3 || argc == 5) && strcmp(argv[1], "--bench-logical") == 0;
+    const bool benchmark = (argc == 3 || argc == 5) &&
+        (strcmp(argv[1], "--bench") == 0 || logical_benchmark);
     const int delay_steps = benchmark && argc == 5 && strcmp(argv[3], "--delay") == 0 ? atoi(argv[4]) : 0;
-    const bool logical = argc == 3 && strcmp(argv[1], "--logical") == 0;
+    const bool logical = logical_benchmark || (argc == 3 && strcmp(argv[1], "--logical") == 0);
     const bool require_p2p = argc == 4 && strcmp(argv[3], "--require-p2p") == 0;
     const bool direct = logical || ((argc == 3 || require_p2p) && strcmp(argv[1], "--direct") == 0);
     const int n_devices = direct || benchmark ? atoi(argv[2]) : 2;
     if ((argc != 1 && !direct && !benchmark) || n_devices < 2 || n_devices > 4 || delay_steps < 0 || delay_steps > 64 ||
             (benchmark && argc == 5 && strcmp(argv[3], "--delay") != 0)) {
-        fprintf(stderr, "usage: %s [--direct 2|3|4 [--require-p2p] | --logical 2|3|4 | --bench 2|3|4 [--delay 0..64]]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--direct 2|3|4 [--require-p2p] | --logical 2|3|4 | --bench[-logical] 2|3|4 [--delay 0..64]]\n", argv[0]);
         return 1;
     }
     std::vector<ggml_backend_dev_t> gpus;
