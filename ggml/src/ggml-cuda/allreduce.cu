@@ -525,52 +525,44 @@ static __device__ int ggml_cuda_ar_owner_of(const ggml_cuda_ar_owner_layout & ow
     return -1;
 }
 
-template <typename T_dst, typename T_wire>
+// The sender and receiver use the same stripe within each owner, so each arrival flag covers its block's reads.
+static __device__ __forceinline__ void ggml_cuda_ar_copy_owner(
+        uint32_t * dst, const uint32_t * src, int begin, int end, int gtid, int gnt) {
+    const int first = min(end, (begin + 3) & ~3);
+    const int last = max(first, end & ~3);
+    if (begin + gtid < first) { dst[begin + gtid] = src[begin + gtid]; }
+    for (int i = first/4 + gtid; i < last/4; i += gnt) {
+        reinterpret_cast<uint4 *>(dst)[i] = reinterpret_cast<const uint4 *>(src)[i];
+    }
+    if (last + gtid < end) { dst[last + gtid] = src[last + gtid]; }
+}
+
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#define GGML_CUDA_AR_GRID_CONSTANT __grid_constant__
+#else
+#define GGML_CUDA_AR_GRID_CONSTANT
+#endif
+
 static __global__ void ggml_cuda_ar_owner_gather_kernel_n(
-        T_dst * data, ggml_cuda_ar_rank_ptrs<T_wire> staging, ggml_cuda_ar_rank_ptrs<T_wire> receives, size_t slot_elems, int count,
-        ggml_cuda_ar_owner_layout owner, int * arrival, int rank, int n_ranks, int * counter) {
-    constexpr int V = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
+        uint32_t * data, GGML_CUDA_AR_GRID_CONSTANT const ggml_cuda_ar_rank_ptrs<uint32_t> staging,
+        GGML_CUDA_AR_GRID_CONSTANT const ggml_cuda_ar_rank_ptrs<uint32_t> receives, size_t slot_elems,
+        GGML_CUDA_AR_GRID_CONSTANT const ggml_cuda_ar_owner_layout owner, int * arrival, int rank, int n_ranks, int * counter) {
     constexpr int A = GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int);
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
     const int gtid = bid * blockDim.x + tid;
     const int gnt = gridDim.x * blockDim.x;
-    const int nv = count / V;
-    const int tail = nv * V;
     __shared__ int token_shared;
     if (tid == 0) { token_shared = ggml_cuda_ar_signal_get(counter) + 1; }
     __syncthreads();
     const int token = token_shared;
     const size_t offset = (size_t) (token & 1) * slot_elems;
-    for (int i = gtid; i < nv; i += gnt) {
-        const int first = i*V;
-        const int peer = ggml_cuda_ar_owner_of(owner, first, n_ranks);
-        if (peer >= 0 && first + V <= owner.begin[peer] + owner.len[peer]) {
-            if (peer == rank) {
-                T_wire wire[V];
-#pragma unroll
-                for (int k = 0; k < V; ++k) { wire[k] = ggml_cuda_cast<T_wire>(data[first + k]); }
-                for (int dst = 0; dst < n_ranks; ++dst) {
-                    if (dst != rank) { ggml_cuda_memcpy_1<sizeof(wire)>(staging.ptr[dst] + offset + first, wire); }
-                }
-            }
-            continue;
-        }
-#pragma unroll
-        for (int k = 0; k < V; ++k) {
-            const int index = first + k;
-            if (ggml_cuda_ar_owner_of(owner, index, n_ranks) == rank) {
-                const T_wire wire = ggml_cuda_cast<T_wire>(data[index]);
-                for (int dst = 0; dst < n_ranks; ++dst) {
-                    if (dst != rank) { staging.ptr[dst][offset + index] = wire; }
-                }
-            }
-        }
-    }
-    if (bid == 0 && tid < count - tail && ggml_cuda_ar_owner_of(owner, tail + tid, n_ranks) == rank) {
-        const T_wire wire = ggml_cuda_cast<T_wire>(data[tail + tid]);
-        for (int peer = 0; peer < n_ranks; ++peer) {
-            if (peer != rank) { staging.ptr[peer][offset + tail + tid] = wire; }
+    const int own_begin = (int) owner.begin[rank];
+    const int own_end = own_begin + (int) owner.len[rank];
+#pragma unroll 1
+    for (int dst = 0; dst < n_ranks; ++dst) {
+        if (dst != rank) {
+            ggml_cuda_ar_copy_owner(staging.ptr[dst] + offset, data, own_begin, own_end, gtid, gnt);
         }
     }
     __threadfence_system();
@@ -592,32 +584,12 @@ static __global__ void ggml_cuda_ar_owner_gather_kernel_n(
     }
     __syncthreads();
     __threadfence_system();
-    for (int i = gtid; i < nv; i += gnt) {
-        const int first = i*V;
-        const int peer = ggml_cuda_ar_owner_of(owner, first, n_ranks);
-        if (peer >= 0 && first + V <= owner.begin[peer] + owner.len[peer]) {
-            if (peer != rank) {
-                T_wire wire[V];
-                ggml_cuda_memcpy_1<sizeof(wire)>(wire, receives.ptr[peer] + offset + first);
-#pragma unroll
-                for (int k = 0; k < V; ++k) { data[first + k] = ggml_cuda_cast<T_dst>(wire[k]); }
-            }
-            continue;
-        }
-#pragma unroll
-        for (int k = 0; k < V; ++k) {
-            const int index = first + k;
-            const int src = ggml_cuda_ar_owner_of(owner, index, n_ranks);
-            if (src >= 0 && src != rank) {
-                data[index] = ggml_cuda_cast<T_dst>(receives.ptr[src][offset + index]);
-            }
-        }
-    }
-    if (bid == 0 && tid < count - tail) {
-        const int index = tail + tid;
-        const int src = ggml_cuda_ar_owner_of(owner, index, n_ranks);
-        if (src >= 0 && src != rank) {
-            data[index] = ggml_cuda_cast<T_dst>(receives.ptr[src][offset + index]);
+#pragma unroll 1
+    for (int src = 0; src < n_ranks; ++src) {
+        if (src != rank) {
+            const int begin = (int) owner.begin[src];
+            const int end = begin + (int) owner.len[src];
+            ggml_cuda_ar_copy_owner(data, receives.ptr[src] + offset, begin, end, gtid, gnt);
         }
     }
     if (tid == 0) {
@@ -635,6 +607,8 @@ static __global__ void ggml_cuda_ar_owner_gather_kernel_n(
 // sums only its own, from the same shares (receives.ptr[peer]) in the same increasing rank order, so its elements take
 // the AllReduce's bits while its others keep its share. Every block still waits for that block of every peer, so the
 // ranks stay in lockstep (a rank that owns nothing would otherwise run ahead into a slot its peers still read).
+#undef GGML_CUDA_AR_GRID_CONSTANT
+
 template <typename T_dst, typename T_wire>
 static __global__ void ggml_cuda_ar_owner_reduce_kernel_n(
         T_dst * data, ggml_cuda_ar_rank_ptrs<T_wire> sends, ggml_cuda_ar_rank_ptrs<T_wire> receives, size_t slot_elems, int count,
@@ -1943,15 +1917,18 @@ static void ggml_cuda_ar_launch_kernels(
             if (gather_peer) {
                 ggml_cuda_ar_rank_ptrs<T_wire> sends, receives;
                 ggml_cuda_ar_peer_inboxes<T_wire>(p, i, max_chunk_elems, sends, receives);
-                if (p->owner_slices && chunk_owner.valid) {
-                    ggml_cuda_ar_owner_gather_kernel_n<T_dst, T_wire><<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
-                        chunk, sends, receives, max_chunk_elems, (int) chunk_elems, chunk_owner,
-                        reinterpret_cast<int *>(p->arrival.dev), i, p->n_devices, p->counter[i]);
-                } else {
-                    ggml_cuda_ar_kernel_n<T_dst, T_wire, true><<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
-                        chunk, sends, receives, max_chunk_elems, (int) chunk_elems, reinterpret_cast<int *>(p->arrival.dev),
-                        i, p->n_devices, p->counter[i]);
+                if constexpr (std::is_same_v<T_dst, uint32_t> && std::is_same_v<T_wire, uint32_t>) {
+                    if (p->owner_slices && chunk_owner.valid) {
+                        ggml_cuda_ar_owner_gather_kernel_n<<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
+                            chunk, sends, receives, max_chunk_elems, chunk_owner,
+                            reinterpret_cast<int *>(p->arrival.dev), i, p->n_devices, p->counter[i]);
+                        CUDA_CHECK(cudaGetLastError());
+                        continue;
+                    }
                 }
+                ggml_cuda_ar_kernel_n<T_dst, T_wire, true><<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
+                    chunk, sends, receives, max_chunk_elems, (int) chunk_elems, reinterpret_cast<int *>(p->arrival.dev),
+                    i, p->n_devices, p->counter[i]);
                 CUDA_CHECK(cudaGetLastError());
                 continue;
             }

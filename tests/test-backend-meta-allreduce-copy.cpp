@@ -229,11 +229,11 @@ static ggml_backend_meta_split_state mirrored(const ggml_tensor *, void *) {
 }
 
 // Several gathers in one graph, followed by replay with new data, exercise the shared parity ring across captures.
-static bool test_gather_graph(std::vector<ggml_backend_dev_t> devices, int64_t rows) {
+static bool test_gather_graph(std::vector<ggml_backend_dev_t> devices, int64_t rows, int64_t width = 4096) {
     auto * meta = ggml_backend_meta_device(devices.data(), devices.size(), mirrored, nullptr);
     auto * backend = ggml_backend_dev_init(meta, nullptr);
     auto * ctx = ggml_init({64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
-    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, rows);
+    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
     std::vector<int64_t> owned(devices.size(), 0);
     owned.front() = 1;
     owned.back() = rows - 1;
@@ -271,8 +271,8 @@ static bool test_gather_graph(std::vector<ggml_backend_dev_t> devices, int64_t r
         for (size_t j = 0; j < got.size(); ++j) { ok = ok && got[j] == 16.0f*values[j]; }
     }
     const bool captured = n_captures > captures_before;
-    printf("%s: %zu-rank gather graph, %lld rows, rotating empty ranks, values %s, %d captures\n",
-        ok && captured ? "ok" : "FAIL", devices.size(), (long long) rows, ok ? "equal" : "differ", n_captures.load() - captures_before);
+    printf("%s: %zu-rank gather graph, %lld rows of %lld, rotating empty ranks, values %s, %d captures\n",
+        ok && captured ? "ok" : "FAIL", devices.size(), (long long) rows, (long long) width, ok ? "equal" : "differ", n_captures.load() - captures_before);
     ggml_backend_sched_free(sched);
     ggml_free(ctx);
     ggml_backend_free(backend);
@@ -541,6 +541,12 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                 set_env("GGML_CUDA_GRAPH_MAX", "0");
                 ok = test_gather_graph(devices, 512) && ok;
                 ok = test_gather_graph(devices, 513) && ok;
+                if (owner_requested) {
+                    // Ownership cuts through vector lanes and chunk boundaries, including empty owners.
+                    for (int64_t width : {4093, 4095, 4097}) {
+                        ok = test_gather_graph(devices, 513, width) && ok;
+                    }
+                }
             }
         }
     }
