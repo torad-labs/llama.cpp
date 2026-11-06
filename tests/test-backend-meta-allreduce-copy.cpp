@@ -82,8 +82,10 @@ static bool               last_chunked_seen = false;
 static unsigned long long last_chunked_peer = 0;
 static unsigned long long last_chunked_host = 0;
 static std::atomic<int> n_captures{0};
+static std::atomic<int> n_nccl_fallbacks{0};
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (strstr(text, "falling back to internal AllReduce") != nullptr) { ++n_nccl_fallbacks; }
     if (strstr(text, "owner-slice-peer") != nullptr) {
         last_owner_slice = true;
     }
@@ -798,6 +800,7 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
 }
 
 int main(int argc, char ** argv) {
+    const bool gather_graph = argc == 5 && strcmp(argv[1], "--gather-graph") == 0 && strcmp(argv[3], "--backend") == 0;
     const bool logical_benchmark = (argc == 3 || argc == 5) && strcmp(argv[1], "--bench-logical") == 0;
     const bool benchmark = (argc == 3 || argc == 5) &&
         (strcmp(argv[1], "--bench") == 0 || logical_benchmark);
@@ -805,10 +808,11 @@ int main(int argc, char ** argv) {
     const bool logical = logical_benchmark || (argc == 3 && strcmp(argv[1], "--logical") == 0);
     const bool require_p2p = argc == 4 && strcmp(argv[3], "--require-p2p") == 0;
     const bool direct = logical || ((argc == 3 || require_p2p) && strcmp(argv[1], "--direct") == 0);
-    const int n_devices = direct || benchmark ? atoi(argv[2]) : 2;
-    if ((argc != 1 && !direct && !benchmark) || n_devices < 2 || n_devices > 4 || delay_steps < 0 || delay_steps > 64 ||
-            (benchmark && argc == 5 && strcmp(argv[3], "--delay") != 0)) {
-        fprintf(stderr, "usage: %s [--direct 2|3|4 [--require-p2p] | --logical 2|3|4 | --bench[-logical] 2|3|4 [--delay 0..64]]\n", argv[0]);
+    const int n_devices = direct || benchmark || gather_graph ? atoi(argv[2]) : 2;
+    if ((argc != 1 && !direct && !benchmark && !gather_graph) || n_devices < 2 || n_devices > 4 || delay_steps < 0 || delay_steps > 64 ||
+            (benchmark && argc == 5 && strcmp(argv[3], "--delay") != 0) ||
+            (gather_graph && strcmp(argv[4], "internal") != 0 && strcmp(argv[4], "nccl") != 0)) {
+        fprintf(stderr, "usage: %s [--direct 2|3|4 [--require-p2p] | --logical 2|3|4 | --bench[-logical] 2|3|4 [--delay 0..64] | --gather-graph 2|3|4 --backend internal|nccl]\n", argv[0]);
         return 1;
     }
     std::vector<ggml_backend_dev_t> gpus;
@@ -824,7 +828,7 @@ int main(int argc, char ** argv) {
         }
         printf("%d logical ranks on %zu physical GPUs; not a four-card qualification\n", n_devices, physical.size());
     }
-    if ((direct || benchmark) && gpus.size() < (size_t) n_devices) {
+    if ((direct || benchmark || gather_graph) && gpus.size() < (size_t) n_devices) {
         printf("need %d physical GPUs for direct collectives, found %zu, skipped\n", n_devices, gpus.size());
         return 77;
     }
@@ -837,14 +841,24 @@ int main(int argc, char ** argv) {
     }
     if (strncmp(ggml_backend_dev_name(gpus[0]), "CUDA", 4) != 0) {
         printf("%s has no internal AllReduce, skipped\n", ggml_backend_dev_name(gpus[0]));
-        return direct || benchmark ? 77 : 0;
+        return direct || benchmark || gather_graph ? 77 : 0;
     }
     fprintf(benchmark ? stderr : stdout, "meta backend over %s and %s\n", ggml_backend_dev_name(gpus[0]), ggml_backend_dev_name(gpus[1]));
 
     ggml_log_set(log_cb, nullptr);
-    set_env("GGML_CUDA_ALLREDUCE", "internal");
+    set_env("GGML_CUDA_ALLREDUCE", gather_graph ? argv[4] : "internal");
     set_env("GGML_CUDA_AR_COPY_THRESHOLD", nullptr);
     set_env("GGML_CUDA_AR_COPY_CHUNK_BYTES", nullptr);
+    if (gather_graph) {
+        bool ok = test_gather_graph(gpus, 40, 4093);
+        ok = test_gather_graph(gpus, 108, 4096) && ok;
+        ok = test_gather_graph(gpus, 513, 4097) && ok;
+        const bool native = strcmp(argv[4], "nccl") == 0;
+        const bool transport_ok = n_nccl_fallbacks == 0 && (native ? n_pipelines == 0 : n_pipelines == 3);
+        printf("%s: requested %s, %d internal pipelines, %d NCCL fallbacks\n",
+            transport_ok ? "ok" : "FAIL", argv[4], n_pipelines, n_nccl_fallbacks.load());
+        return ok && transport_ok ? 0 : 1;
+    }
     if (benchmark) {
         set_env("GGML_CUDA_GRAPH_MEM_STATS", "0");
         return benchmark_collectives(gpus, delay_steps);
