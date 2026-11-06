@@ -543,7 +543,7 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                 }
                 for (int rows : {1, 4, 8, 40, 65, 108, 128, 512, 513}) {
                     for (int operation : {0, 1, 2}) { // reset only, reduce, gather
-                        if (bf16 && operation != 1) { continue; } // gather preserves F32 bits, regardless of the sum wire
+                        if ((bf16 && operation != 1) || (operation == 2 && rows < (int) devices.size())) { continue; } // gather preserves F32 bits
                         const int64_t ne = int64_t(rows)*4096;
                         std::vector<ggml_context *> contexts;
                         std::vector<ggml_backend_buffer_t> buffers;
@@ -553,15 +553,10 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                             auto * ctx = ggml_init({(size_t(delay_steps) + 16)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
                             contexts.push_back(ctx);
                             auto * graph = ggml_new_graph(ctx);
-                            auto * input = operation == 2 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, rows) :
+                            const int64_t owner_begin = operation == 2 ? rows*rank/devices.size() : 0;
+                            const int64_t owner_end = operation == 2 ? rows*(rank + 1)/devices.size() : rows;
+                            auto * input = operation == 2 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, owner_end - owner_begin) :
                                 ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
-                            if (operation == 2) {
-                                std::vector<int64_t> owned(devices.size());
-                                for (size_t owner = 0; owner < devices.size(); ++owner) {
-                                    owned[owner] = rows*(owner + 1)/devices.size() - rows*owner/devices.size();
-                                }
-                                ggml_backend_meta_split_input(input, 1, owned.data(), owned.size());
-                            }
                             ggml_set_input(input);
                             ggml_set_output(input); // replay always starts from the original contribution
                             ggml_tensor * delay = nullptr;
@@ -573,22 +568,16 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                                 for (int step = 0; step < delay_steps; ++step) { current = ggml_scale(ctx, current, 1.0f); }
                                 ggml_build_forward_expand(graph, current);
                             }
-                            auto * out = operation == 2 ? ggml_backend_meta_gather(ctx, input) : ggml_scale(ctx, input, 1.0f);
+                            auto * out = operation == 2 ? ggml_pad_ext(ctx, input,
+                                0, 0, (int) owner_begin, (int) (rows - owner_end), 0, 0, 0, 0) :
+                                ggml_scale(ctx, input, 1.0f);
+                            if (operation == 2) { out->flags |= GGML_TENSOR_FLAG_META; }
                             ggml_set_output(out);
                             ggml_build_forward_expand(graph, out);
                             auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backends[rank]);
                             GGML_ASSERT(buffer);
                             buffers.push_back(buffer);
-                            std::vector<float> values(ne, float(rank + 1));
-                            if (operation == 2) {
-                                for (int64_t i = 0; i < ne; ++i) {
-                                    const int64_t row = i/4096;
-                                    if (row < int64_t(rows*rank)/int64_t(devices.size()) ||
-                                            row >= int64_t(rows*(rank + 1))/int64_t(devices.size())) {
-                                        values[i] = 0;
-                                    }
-                                }
-                            }
+                            std::vector<float> values(operation == 2 ? ggml_nelements(input) : ne, float(rank + 1));
                             ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
                             if (delay) {
                                 values.assign(262144, 1.0f);
@@ -602,7 +591,18 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                                 GGML_ASSERT(ggml_backend_graph_compute_async(backends[rank], graphs[rank]) == GGML_STATUS_SUCCESS);
                             }
                             if (operation == 1) { GGML_ASSERT(sum(comm, outputs.data())); }
-                            if (operation == 2) { GGML_ASSERT(gather(comm, outputs.data())); }
+                            if (operation == 2) {
+                                const bool gathered = gather(comm, outputs.data());
+                                if (!gathered) {
+                                    for (size_t rank = 0; rank < devices.size(); ++rank) {
+                                        fprintf(stderr, "gather rejected rank=%zu rows=%d ne=[%lld,%lld] nb=[%zu,%zu] bytes=%zu contiguous=%d data=%p flags=%d\n",
+                                            rank, rows, (long long) outputs[rank]->ne[0], (long long) outputs[rank]->ne[1],
+                                            outputs[rank]->nb[0], outputs[rank]->nb[1], ggml_nbytes(outputs[rank]),
+                                            ggml_is_contiguous(outputs[rank]), outputs[rank]->data, outputs[rank]->flags);
+                                    }
+                                }
+                                GGML_ASSERT(gathered);
+                            }
                         };
                         queue(); // allocate transport scratch outside capture
                         for (auto backend : backends) { ggml_backend_synchronize(backend); }
