@@ -36,6 +36,17 @@ bool ggml_cuda_ar_allgather(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// The AllReduce's sum, delivered only to each rank's own elements [begin[i], begin[i] + len[i]) of tensors[i] (same
+// preconditions), with the bits the AllReduce gives them; a rank's other elements keep its share (zeros on an inactive
+// rank). It runs on the chunked kernel with more than two ranks, and declines (false, nothing queued or changed) on the
+// LL and copy-engine routes, two ranks, overlapping or out-of-range owners, or GGML_CUDA_AR_REDUCE_OWNERS=0.
+bool ggml_cuda_ar_reduce_owned(
+    ggml_cuda_ar_pipeline * pipeline,
+    ggml_backend_t        * backends,
+    ggml_tensor           ** tensors,
+    const int64_t         * begin,
+    const int64_t         * len);
+
 // Whether the AllReduce of a tensor like t (same preconditions) can be captured
 // into a CUDA graph and replayed: it runs on the chunked kernel, which takes its
 // tokens and slots from the device, and not over the copy engines, whose

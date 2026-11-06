@@ -1838,6 +1838,21 @@ static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct gg
     return false;
 }
 
+// The internal AllReduce's sum, delivered to each rank's own elements only (ggml_cuda_ar_reduce_owned). NCCL and the
+// meta backend's own reduction decline, and the caller reduces to every rank.
+static bool ggml_backend_cuda_comm_reduce_owned_tensor(
+        void * comm_ctx_v, struct ggml_tensor ** tensors, const int64_t * begin, const int64_t * len) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal || comm_ctx->ar_pipeline == nullptr ||
+            ggml_nelements(tensors[0]) == 0 || !ggml_backend_cuda_comm_internal_supports(comm_ctx, tensors)) {
+        return false;
+    }
+    return ggml_cuda_ar_reduce_owned(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, begin, len);
+}
+
 // Whether the AllReduce of these tensors can be captured with the rest of an
 // evaluation (ggml_backend_cuda_capture_begin) and replayed: only on the
 // internal pipeline's chunked kernel (ggml_cuda_ar_capturable), since NCCL's is
@@ -9214,6 +9229,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allgather_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allgather_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_reduce_owned_tensor") == 0) {
+        return (void *)ggml_backend_cuda_comm_reduce_owned_tensor;
     }
     if (strcmp(name, "ggml_backend_graph_next") == 0) {
         return (void *)ggml_backend_cuda_graph_next;

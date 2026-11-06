@@ -31,16 +31,36 @@ static constexpr int64_t n_rows = 8;
 
 static std::atomic<int> captured {0};
 static unsigned long long expert_hits = 0;
+static unsigned long long reductions_to_owners = 0; // the internal AllReduce's, logged when its pipeline is freed
+static unsigned long long reductions_to_all = 0;
 static ggml_backend_dev_t peer = nullptr;
 static std::array<ggml_backend_dev_t, 4> host_devices = {};
 
 static ggml_backend_dev_t second_device(ggml_backend_dev_t first) { return peer ? peer : first; }
+
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
 
 static void log_cb(ggml_log_level level, const char * text, void *) {
     if (strstr(text, "ggml_backend_cuda_capture_end") && strstr(text, " nodes, ")) { ++captured; }
     int device, first;
     unsigned long long total;
     if (sscanf(text, "dp_experts device=%d first=%d total=%llu", &device, &first, &total) == 3) { expert_hits += total; }
+    unsigned long long owners, all;
+    if (const char * counts = strstr(text, "ggml_cuda_ar_pipeline_free: ");
+            counts && sscanf(counts, "ggml_cuda_ar_pipeline_free: %llu reductions to owners, %llu to every rank", &owners, &all) == 2) {
+        reductions_to_owners += owners;
+        reductions_to_all += all;
+    }
     if (level != GGML_LOG_LEVEL_DEBUG) { fputs(text, stderr); }
 }
 
@@ -641,12 +661,12 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
     const int captured_before = captured;
     const auto hits_before = expert_hits;
     ggml_backend_dev_t devs[] = {gpu, second_device(gpu), gpu, second_device(gpu)};
-    ggml_backend_t meta = ggml_backend_dev_init(ggml_backend_meta_device(devs, 4, split_rows, nullptr), nullptr);
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devs, 4, split_rows, nullptr);
+    ggml_backend_t meta = ggml_backend_dev_init(meta_dev, nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    std::vector<float> results[2];
-    for (int mode = 0; mode < 2; ++mode) {
-        const bool partition = mode == 1;
-        ggml_backend_t backend = partition ? meta : cpu;
+    // six routes through the experts, unsplit on the CPU or split over the meta backend's four ranks
+    const auto run = [&](ggml_backend_t backend, bool partition) {
+        std::vector<float> result;
         ggml_context * weights = ggml_init({8*ggml_tensor_overhead(), nullptr, true});
         ggml_tensor * w[3];
         const int64_t counts[] = {2, 2, 2, 2};
@@ -701,7 +721,7 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
         for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 17) - 8)/16; }
         // The last rank has no selected experts; rows also mix local and remote expert lanes.
         const int32_t selected[] = {0, 1, 2, 3, 1, 4, 3, 0, 5, 2};
-        results[mode].resize(6*256*5);
+        result.resize(6*256*5);
         for (int iteration = 0; iteration < 6; ++iteration) {
             int32_t routed[10];
             float probabilities[10];
@@ -711,13 +731,15 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
             ggml_backend_tensor_set(ids, routed, 0, ggml_nbytes(ids));
             ggml_backend_tensor_set(routing, probabilities, 0, ggml_nbytes(routing));
             GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
-            ggml_backend_tensor_get(out, results[mode].data() + iteration*256*5, 0, ggml_nbytes(out));
+            ggml_backend_tensor_get(out, result.data() + iteration*256*5, 0, ggml_nbytes(out));
         }
         ggml_backend_sched_free(sched);
         ggml_free(ctx);
         ggml_backend_buffer_free(buffer);
         ggml_free(weights);
-    }
+        return result;
+    };
+    const std::vector<float> results[2] = {run(cpu, false), run(meta, true)};
     double error = 0, norm = 0;
     for (size_t i = 0; i < results[0].size(); ++i) {
         const double delta = results[1][i] - results[0][i];
@@ -730,12 +752,41 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
     }
     printf("%s %s expert partition against unsplit CPU, NMSE %.9g, %d captures\n", ok ? "ok  " : "FAIL", ggml_type_name(type), error/norm, captured - captured_before);
     ggml_backend_free(meta);
-    ggml_backend_free(cpu);
     if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu)), "CUDA") == 0) {
         const auto hits = expert_hits - hits_before;
         printf("%s expert telemetry: %llu hits in six routes, expected 60\n", hits == 60 ? "ok  " : "FAIL", hits);
         ok = ok && hits == 60;
+
+        // -sm dp reduces the experts' sum before a scatter by rows: each card takes only its own rows of it, and the
+        // output is the one the reduction to every card gives, bit for bit (the internal AllReduce's pipeline counts
+        // its reductions and logs them when it is freed). The sum goes the chunked kernel's way, as a 36- to 108-row
+        // verify's at 4096 wide does; this one, 5 KB, would otherwise take the LL kernel.
+        std::vector<float> outputs[2];
+        unsigned long long to_owners[2], to_all[2];
+        set_env("GGML_CUDA_ALLREDUCE", "internal");
+        set_env("GGML_CUDA_AR_LL_MAX_BYTES", "0");
+        set_env("GGML_CUDA_AR_P2P_MAX_BYTES", "0");
+        for (int all = 0; all < 2; ++all) {
+            set_env("GGML_CUDA_AR_REDUCE_OWNERS", all ? "0" : nullptr);
+            const auto owners_before = reductions_to_owners, all_before = reductions_to_all;
+            ggml_backend_t backend = ggml_backend_dev_init(meta_dev, nullptr);
+            outputs[all] = run(backend, true);
+            ggml_backend_free(backend);
+            to_owners[all] = reductions_to_owners - owners_before;
+            to_all[all] = reductions_to_all - all_before;
+        }
+        set_env("GGML_CUDA_AR_REDUCE_OWNERS", nullptr);
+        set_env("GGML_CUDA_AR_P2P_MAX_BYTES", nullptr);
+        set_env("GGML_CUDA_AR_LL_MAX_BYTES", nullptr);
+        set_env("GGML_CUDA_ALLREDUCE", nullptr);
+        const bool same = memcmp(outputs[0].data(), outputs[1].data(), outputs[0].size()*sizeof(float)) == 0;
+        const bool owned = to_owners[0] > 0 && to_all[0] == 0 && to_owners[1] == 0 && to_all[1] > 0;
+        printf("%s %s experts' sum to its rows' owners: %llu reductions to owners and %llu to every card, against %llu "
+               "and %llu with GGML_CUDA_AR_REDUCE_OWNERS=0; outputs %s\n", same && owned ? "ok  " : "FAIL", ggml_type_name(type),
+               to_owners[0], to_all[0], to_owners[1], to_all[1], same ? "equal bit for bit" : "differ");
+        ok = ok && same && owned;
     }
+    ggml_backend_free(cpu);
     return ok;
 }
 

@@ -217,6 +217,12 @@ extern "C" {
     // everywhere else, and every tensor ends up with every part, bit for bit. False: not done, the caller gathers
     typedef bool   (*ggml_backend_comm_allgather_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
     typedef bool   (*ggml_backend_comm_allgather_capturable_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Reduce to owners (meta backend, a reduce whose only reader is a scatter): tensors[i] holds backend i's share, and
+    // afterwards its elements [begin[i], begin[i] + len[i]) hold the sum of every share there, the bits the AllReduce
+    // gives them, while its other elements are left unspecified: each backend receives only what it owns. Captured where
+    // the AllReduce of these tensors is. False: nothing was done or changed, the caller reduces to every backend
+    typedef bool   (*ggml_backend_comm_reduce_owned_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors,
+                                                              const int64_t * begin, const int64_t * len);
 
     // Capture of a whole evaluation across backends, into one graph a backend replayed with one launch (meta backend):
     // begin starts capturing what is queued on the backend, the graphs computed on it meanwhile included, and end returns

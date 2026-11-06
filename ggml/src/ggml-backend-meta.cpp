@@ -2671,7 +2671,15 @@ struct ggml_backend_meta_context {
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_comm_allreduce_next_t   comm_allreduce_next = nullptr;
     ggml_backend_comm_allgather_tensor_t comm_allgather = nullptr; // null: the generic gather
+    ggml_backend_comm_reduce_owned_tensor_t comm_reduce_owned = nullptr; // null: every reduction goes to every device
     std::vector<bool>                    gathers; // a subgraph ends with a gather (ggml_backend_meta_is_gather)
+    // A subgraph's reduction whose only reader is a scatter by rows: the elements each device reads of it, else !valid
+    struct owned_layout {
+        bool    valid = false;
+        int64_t begin[GGML_BACKEND_META_MAX_DEVICES] = {};
+        int64_t len[GGML_BACKEND_META_MAX_DEVICES]   = {};
+    };
+    std::vector<owned_layout>            owned;
     ggml_backend_graph_next_t            graph_next     = nullptr; // the simple backends' look ahead, or null
 
     // A whole evaluation of a cgraph, every step's subgraph and all-reduce on every device, captured into one graph a
@@ -2903,6 +2911,8 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_next");
             comm_allgather = (ggml_backend_comm_allgather_tensor_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allgather_tensor");
+            comm_reduce_owned = (ggml_backend_comm_reduce_owned_tensor_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_reduce_owned_tensor");
             capture.allreduce_capturable = (ggml_backend_comm_allreduce_capturable_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_capturable");
             capture.allgather_capturable = (ggml_backend_comm_allgather_capturable_t)
@@ -3332,7 +3342,58 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return i_delayed;
             };
 
+            // The elements each device reads of the reduction of node i, when its one reader is a scatter by rows
+            // (ggml_backend_meta_scatter, a view of device j's own rows at their offset): only those need the sum there.
+            using owned_layout = std::remove_reference_t<decltype(backend_ctx->owned)>::value_type;
+            auto get_owned = [&](const int i) -> owned_layout {
+                owned_layout owned;
+                ggml_tensor * node = cgraph->nodes[i];
+                if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
+                        !ggml_is_contiguous(node) || ggml_blck_size(node->type) != 1) {
+                    return owned;
+                }
+                // every later node that reads node, directly or through a view of it, counts: one alone, the scatter
+                ggml_tensor * reader = nullptr;
+                for (int id = i + 1; id < cgraph->n_nodes; id++) {
+                    ggml_tensor * next = cgraph->nodes[id];
+                    bool reads = next->view_src == node;
+                    for (int s = 0; s < GGML_MAX_SRC; s++) {
+                        reads = reads || next->src[s] == node;
+                    }
+                    if (reads && reader != nullptr) {
+                        return owned;
+                    }
+                    reader = reads ? next : reader;
+                }
+                if (reader == nullptr || reader->op != GGML_OP_RESHAPE || !(reader->flags & GGML_TENSOR_FLAG_META) ||
+                        reader->view_src != node || reader->view_offs != 0 || !ggml_are_same_shape(reader, node) ||
+                        !ggml_are_same_stride(reader, node)) {
+                    return owned;
+                }
+                const ggml_backend_meta_split_state split = ggml_backend_meta_get_split_state(reader, /*assume_sync =*/ true);
+                const int axis = split.axis;
+                if (axis < 0 || axis >= GGML_MAX_DIMS || split.n_segments != 1 || split.nr[0] != 1 ||
+                        node->nb[axis] % ggml_type_size(node->type) != 0) {
+                    return owned;
+                }
+                for (int d = axis + 1; d < GGML_MAX_DIMS; d++) {
+                    if (node->ne[d] != 1) {
+                        return owned;
+                    }
+                }
+                const int64_t per_row = (int64_t) (node->nb[axis] / ggml_type_size(node->type));
+                int64_t total = 0;
+                for (size_t j = 0; j < n_backends; j++) {
+                    owned.begin[j] = total * per_row;
+                    owned.len[j]   = split.ne[j] * per_row;
+                    total += split.ne[j];
+                }
+                owned.valid = total == node->ne[axis];
+                return owned;
+            };
+
             backend_ctx->gathers.clear();
+            backend_ctx->owned.clear();
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -3369,6 +3430,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 i = i_delayed;
+                backend_ctx->owned.push_back(gather || i + 1 == cgraph->n_nodes ? owned_layout{} : get_owned(i));
 
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
@@ -3703,9 +3765,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                         next.push_back(bcj.cgraphs[i + 1].cgraph_main);
                     }
-                    backend_allreduce_success = backend_ctx->comm_allreduce_next
+                    // a reduction read only by a scatter by rows goes to each device's rows alone, where the comm can
+                    const auto & owned = backend_ctx->owned[i];
+                    backend_allreduce_success = owned.valid && backend_ctx->comm_reduce_owned &&
+                        backend_ctx->comm_reduce_owned(backend_ctx->comm_ctx, nodes.data(), owned.begin, owned.len);
+                    backend_allreduce_success = backend_allreduce_success || (backend_ctx->comm_allreduce_next
                         ? backend_ctx->comm_allreduce_next(backend_ctx->comm_ctx, nodes.data(), next.data())
-                        : backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                        : backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data()));
                 }
 
                 if (!backend_allreduce_success) {

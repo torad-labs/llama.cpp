@@ -280,7 +280,12 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
     auto free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free");
     auto sum  = (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
     auto gather = (ggml_backend_comm_allgather_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allgather_tensor");
+    auto owned = (ggml_backend_comm_reduce_owned_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_reduce_owned_tensor");
     GGML_ASSERT(init && free && sum && gather);
+    if (!owned) {
+        fprintf(stderr, "FAIL: %s has no reduce to owners\n", ggml_backend_reg_name(reg));
+        return 1;
+    }
     std::vector<ggml_backend_t> backends(n);
     for (int rank = 0; rank < n; ++rank) {
         backends[rank] = ggml_backend_dev_init(devices[rank], nullptr);
@@ -410,6 +415,66 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                         }
                     }
                 }
+                // Reduce to owners (-sm dp's experts: the meta backend's reduce before a scatter by rows). Each rank's own
+                // elements end with the sum the AllReduce gives them, the same ordered sum, and nothing else reaches it:
+                // its other elements still hold its share as the reduction took it, zero where it was inactive. The
+                // owners split the tensor unevenly, one rank owns nothing, and their bounds fall off the vector widths
+                // and, past one chunk, across chunks. It must take the chunked kernel's route with more than two ranks,
+                // where a -sm dp verify's bytes are (36 to 108 rows of 4096 on the BF16 wire, past the LL and short of
+                // the copy engines); elsewhere it may decline, and then it must have changed nothing.
+                const bool must_own = n > 2 && strcmp(route.name, "host chunked") == 0;
+                bool reduced_owned = true;
+                {
+                    std::vector<int64_t> begin(n), len(n);
+                    int64_t at = 0;
+                    for (int rank = 0; rank < n; ++rank) {
+                        len[rank] = rank == n - 1 ? ne - at : rank == 1 ? 0 : std::min(ne - at, ne/(n + 1) + 3);
+                        begin[rank] = at;
+                        at += len[rank];
+                    }
+                    std::vector<std::vector<float>> sent(n, std::vector<float>(ne)), kept(n, std::vector<float>(ne));
+                    for (int iteration = 0; iteration < 6; ++iteration) {
+                        std::fill(expected.begin(), expected.end(), 0.0f);
+                        for (int rank = 0; rank < n; ++rank) {
+                            const bool active = iteration < 2 || (iteration < 5 && rank != iteration % n);
+                            tensors[rank]->flags = active ? GGML_TENSOR_FLAG_COMPUTE : 0;
+                            for (int64_t j = 0; j < ne; ++j) {
+                                float v = active ? value(rank, j, iteration) : 0.0f;
+                                sent[rank][j] = active ? v : 12345.0f;
+                                kept[rank][j] = v;
+                                if (bf16) { v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v)); }
+                                volatile float reduced = rank == 0 ? v : expected[j] + v;
+                                expected[j] = reduced;
+                            }
+                            ggml_backend_tensor_set(tensors[rank], sent[rank].data(), 0, ne*sizeof(float));
+                        }
+                        const bool ran = owned(comm, tensors.data(), begin.data(), len.data());
+                        if (!ran && must_own) {
+                            fprintf(stderr, "FAIL: %s %s ne=%lld iteration=%d did not reduce to owners\n",
+                                    route.name, bf16 ? "BF16" : "F32", (long long) ne, iteration);
+                            case_ok = false;
+                        }
+                        reduced_owned = reduced_owned && ran;
+                        for (auto backend : backends) { ggml_backend_synchronize(backend); }
+                        for (int rank = 0; rank < n; ++rank) {
+                            ggml_backend_tensor_get(tensors[rank], output.data(), 0, ne*sizeof(float));
+                            int64_t n_wrong_owned = 0, n_wrong_other = 0;
+                            for (int64_t j = 0; j < ne; ++j) {
+                                const bool own = j >= begin[rank] && j < begin[rank] + len[rank];
+                                const float want = !ran ? sent[rank][j] : own ? expected[j] : kept[rank][j];
+                                if (memcmp(&output[j], &want, sizeof(float)) != 0) { (own ? n_wrong_owned : n_wrong_other)++; }
+                            }
+                            if (n_wrong_owned || n_wrong_other) {
+                                fprintf(stderr, "FAIL: %s %s ne=%lld iteration=%d rank=%d owns [%lld, %lld): %lld of its own "
+                                        "elements differ from the ordered sum, %lld others %s\n", route.name, bf16 ? "BF16" : "F32",
+                                        (long long) ne, iteration, rank, (long long) begin[rank], (long long) (begin[rank] + len[rank]),
+                                        (long long) n_wrong_owned, (long long) n_wrong_other,
+                                        ran ? "received something" : "changed though it declined");
+                                case_ok = false;
+                            }
+                        }
+                    }
+                }
                 if (ne <= 512*4096 + 3) {
                     std::vector<uint32_t> words(ne), want(ne), got(ne);
                     for (int iteration = 0; iteration < 6; ++iteration) {
@@ -436,9 +501,10 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                     ggml_free(contexts[rank]);
                 }
                 ok = ok && case_ok;
-                printf("%s: %d ranks, %s%s, %s wire, %lld elements%s\n", case_ok ? "ok" : "FAIL", n, route.name,
+                printf("%s: %d ranks, %s%s, %s wire, %lld elements%s, %s\n", case_ok ? "ok" : "FAIL", n, route.name,
                        peer_requested && !peer_active ? " (host fallback)" : "", bf16 ? "BF16" : "F32", (long long) ne,
-                       pair_comm ? ", including two-rank parity" : "");
+                       pair_comm ? ", including two-rank parity" : "",
+                       reduced_owned ? "reduced to owners" : "reduce to owners declined, nothing changed");
             }
             if (pair_comm) { free(pair_comm); }
             free(comm);
