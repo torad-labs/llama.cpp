@@ -40,7 +40,12 @@
 #include <thread>
 #include <vector>
 
+#if __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
+#define TEST_HAS_NVTX 1
+#else
+#define TEST_HAS_NVTX 0
+#endif
 
 static constexpr int64_t n_embd  = 2048;
 static constexpr int64_t n_ff    = 4096;
@@ -731,13 +736,19 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                                 for (auto backend : backends) { ggml_backend_synchronize(backend); }
                             }
                         };
-                        constexpr int samples = 20, replays = 16;
+                        const int samples = counter_run ? 1 : 20;
+                        const int replays = counter_run ? 1 : 16;
                         std::vector<double> us;
                         if (counter_run) {
+                            const auto start = ggml_time_us();
+#if TEST_HAS_NVTX
                             const nvtxRangeId_t counter_range = nvtxRangeStartA("collective-counter-replay");
+#endif
                             run(1);
+#if TEST_HAS_NVTX
                             nvtxRangeEnd(counter_range);
-                            us.push_back(0.0);
+#endif
+                            us.push_back(double(ggml_time_us() - start));
                         } else {
                             run(8);
                             for (int i = 0; i < samples; ++i) {
