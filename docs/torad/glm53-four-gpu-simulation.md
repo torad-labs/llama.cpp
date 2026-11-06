@@ -2,7 +2,7 @@
 
 ## Goal
 
-Explain how this fork serves GLM-5.3 Flash on four RTX PRO 6000 cards, and give Marcos a reproducible, CPU-only model of the memory, sequence ownership, inference phases and communication required for multiple independent 400,000-token histories. Also show 409,600 tokens, the documented client budget. The simulation must distinguish reserved slots from active sessions, latent attention history from indexer and recurrent state, resident KV from mapped host KV, and speculative proposals from delivered tokens.
+Explain how this fork serves GLM-5.3 Flash on four RTX PRO 6000 cards, and give the serving team a reproducible, CPU-only model of the memory, sequence ownership, inference phases and communication required for multiple independent 400,000-token histories. Also show 409,600 tokens, the documented client budget. The simulation must distinguish reserved slots from active sessions, latent attention history from indexer and recurrent state, resident KV from mapped host KV, and speculative proposals from delivered tokens.
 
 Success means the model conserves tokens and owner-local storage, exposes its assumptions and source references, and identifies optimization candidates without presenting analytical byte counts as measured latency or throughput. It must not allocate model weights, start a server, contact a GPU, change the inference engine, or promise numerical/quality equivalence. Current four-card performance and full-context qualification remain separate from this simulation.
 

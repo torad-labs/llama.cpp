@@ -8,7 +8,7 @@ Web, local to the llama.cpp checkout. Static HTML/CSS/JavaScript is the implemen
 
 ## Users and purpose
 
-Marcos and the inference team need to compare the ideal four-RTX-PRO-6000 GLM-5.3 Flash decode budget with actual profiler evidence, down to the smallest operation or transfer the evidence supports.
+The inference team needs to compare the ideal four-RTX-PRO-6000 GLM-5.3 Flash decode budget with actual profiler evidence, down to the smallest operation or transfer the evidence supports.
 
 ## Evidence and constraints
 
