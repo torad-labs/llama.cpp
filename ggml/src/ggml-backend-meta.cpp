@@ -2703,7 +2703,8 @@ struct ggml_backend_meta_context {
             std::vector<void *> execs;           // its graphs, one a device, once captured
             uint64_t            t_used  = 0;     // the evaluation it was last used by
         };
-        static constexpr size_t n_graphs_max = 4; // the least recently used goes first
+        static constexpr size_t n_graphs_max = 4; // scheduler graphs, not individual splits
+        size_t                  n_splits_max = 1;
         std::vector<graph>      graphs;
         uint64_t                t_now = 0; // the evaluations so far, t_used's clock
 
@@ -2721,7 +2722,9 @@ struct ggml_backend_meta_context {
     }
 
     // the state of the cgraph of this uid, new if it has none
-    capture_state::graph & capture_graph(uint64_t uid, int n_nodes) {
+    capture_state::graph & capture_graph(uint64_t uid, int n_nodes, int n_backend_splits) {
+        // Keep all fragments of the active graph slots, including their first evaluations before capture.
+        capture.n_splits_max = std::max(capture.n_splits_max, (size_t) std::max(1, n_backend_splits));
         capture.t_now++;
         for (capture_state::graph & g : capture.graphs) {
             if (g.uid == uid) {
@@ -2729,7 +2732,7 @@ struct ggml_backend_meta_context {
                 return g;
             }
         }
-        if (capture.graphs.size() < capture_state::n_graphs_max) {
+        if (capture.graphs.size() < capture_state::n_graphs_max*capture.n_splits_max) {
             capture.graphs.emplace_back();
         } else {
             capture_state::graph & lru = *std::min_element(capture.graphs.begin(), capture.graphs.end(),
@@ -3129,7 +3132,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_backend_meta_context::capture_state & cap = backend_ctx->capture;
     ggml_backend_meta_context::capture_state::graph * cg = nullptr;
     if (!capture_legacy && n_backends > 1 && cgraph->uid != 0 && cap.available()) {
-        cg = &backend_ctx->capture_graph(cgraph->uid, cgraph->n_nodes);
+        cg = &backend_ctx->capture_graph(cgraph->uid, cgraph->n_nodes, cgraph->n_backend_splits);
         if (!cg->execs.empty()) {
             if (backend_ctx->trace_graphs) {
                 GGML_LOG_INFO("graph_trace layer=meta event=replay context=%p uid=%llu ranks=%zu nodes=%d\n",

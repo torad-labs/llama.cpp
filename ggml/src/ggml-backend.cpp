@@ -1545,8 +1545,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     int total_inputs = sched->n_graph_inputs;
+    std::vector<int> backend_splits(sched->n_backends, 0);
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
+        backend_splits[sched->splits[i].backend_id]++;
     }
     int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies;
 
@@ -1569,6 +1571,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
+        split->graph.n_backend_splits = backend_splits[split->backend_id];
 
         // Optimize this split of the graph. This needs to happen before we make graph_copy,
         // so they are in sync.
