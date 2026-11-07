@@ -13,6 +13,10 @@ BASELINE_COMMIT = "776b8f577dec45f2fba79b6a41ae8b782f5fc3b3"
 BASELINE_ARCHIVE = "48358002368846e49d93da500a852f8b6fb51a53655d563fdbdacddb6c8aa4ef"
 
 
+def serving_window_seconds(profiled):
+    return 360 if profiled else 240
+
+
 def profile_evidence(requested, running, record):
     result = dict(capture_verified=False)
     if not requested:

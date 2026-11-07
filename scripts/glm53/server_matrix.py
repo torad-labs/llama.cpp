@@ -26,7 +26,7 @@ CARD_INDICES = [card['index'] for card in selected_cards]
 CARD_UUIDS = [card['uuid'] for card in selected_cards]
 sys.path.insert(0, str(root/'scripts/glm53'))
 import serve
-from qualification import matrix_succeeded, profile_evidence
+from qualification import matrix_succeeded, profile_evidence, serving_window_seconds
 sys.path.insert(0, str(root))
 import engines
 
@@ -287,8 +287,11 @@ try:
         if not engines.installed(root, engine):
             report['servers'].append(dict(engine=engine, depth=depth, skipped='engine not installed'))
             continue
-        if a.deadline - time.time() < 600:
-            report['servers'].append(dict(engine=engine, depth=depth, skipped='window'))
+        required_seconds = serving_window_seconds(bool((extra or {}).get('profile')))
+        remaining_seconds = a.deadline - time.time()
+        if remaining_seconds < required_seconds:
+            report['servers'].append(dict(engine=engine, depth=depth, skipped='window',
+                                          required_seconds=required_seconds, remaining_seconds=remaining_seconds))
             continue
         server = Server(engine, depth, ordinal, extra)
         entry = dict(label=server.label, engine=engine, depth=depth, runs=[])

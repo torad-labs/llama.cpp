@@ -77,6 +77,12 @@ class QualificationTest(unittest.TestCase):
             self.assertTrue((root/"results/gpu-work-complete-fixture").is_file())
 
     def test_controller_retains_failed_leg_and_returns_failure_after_cleanup(self):
+        self.exercise_controller_failure(False, 300)
+
+    def test_profile_controller_uses_the_same_six_minute_reserve_as_preparation(self):
+        self.exercise_controller_failure(True, 480)
+
+    def exercise_controller_failure(self, profiled, seconds_left):
         import runpy
         import subprocess
         import time
@@ -93,7 +99,7 @@ class QualificationTest(unittest.TestCase):
                 return 0
 
         def launch(command, **kwargs):
-            if Path(command[0]).name == "llama-server":
+            if any(Path(arg).name == "llama-server" for arg in command):
                 return ServerProcess()
             return original_popen(command, **kwargs)
 
@@ -121,8 +127,9 @@ class QualificationTest(unittest.TestCase):
                 "out=root/'results'/name; out.mkdir()\n"
                 "(out/'run.json').write_text(json.dumps({'passed':False,'error':'fixture failure'}))\n"
                 "sys.exit(7)\n")
-            argv = ["server_matrix", "--root", folder, "--deadline", str(time.time()+1200),
-                    "--tag", "failed-leg", "--plan", json.dumps([["B","2",[[36,512]],[]]])]
+            plan = [["B","2",[[36,512]],[],dict(label="fixture", profile=profiled)]]
+            argv = ["server_matrix", "--root", folder, "--deadline", str(time.time()+seconds_left),
+                    "--tag", "failed-leg", "--plan", json.dumps(plan)]
             memory = "\n".join(f"{i}, 98000, 1000, 97000, 100, 0, 2400, 10000, 40" for i in range(4))
             engine = SimpleNamespace(install_pending=lambda root: [], installed=lambda root, name: True)
             with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "path", sys.path.copy()), \
@@ -138,7 +145,7 @@ class QualificationTest(unittest.TestCase):
             row = report["servers"][0]["runs"][0]
             self.assertEqual(row["exit"], 7)
             self.assertFalse(row["passed"])
-            self.assertEqual(row["profile"]["state"], "not_requested")
+            self.assertEqual(row["profile"]["state"], "invalid" if profiled else "not_requested")
             self.assertTrue((root/"results/gpu-work-complete-failed-leg").exists())
 
     def test_retained_files_are_verified_without_replacement(self):
