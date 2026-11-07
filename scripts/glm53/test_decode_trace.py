@@ -1,5 +1,6 @@
 """Goal: recover real scheduling evidence without changing its identity or clock."""
 import json
+import contextlib
 import sqlite3
 import tempfile
 import random
@@ -182,6 +183,156 @@ class TraceRecoveryTest(unittest.TestCase):
         self.assertEqual(trace['cuda_events'], [])
         self.assertIn('CUPTI_ACTIVITY_KIND_CUDA_EVENT', trace['missing_tables'])
         self.assertEqual(trace['clock'], 'relative-nanoseconds')
+
+
+class DecodeReportTest(unittest.TestCase):
+    def fixture(self, folder):
+        import hashlib
+        root = Path(folder)
+        launch = root/"launch.json"
+        launch.write_text(json.dumps(dict(
+            argv=["/workspace/engines/B/bin/llama-server"],
+            env={"GGML_CUDA_ALLREDUCE": "internal-nccl-gather", "CUDA_VISIBLE_DEVICES": "0,1",
+                 "PRIVATE_SECRET": "do-not-export"},
+            source="a"*40)))
+        run = root/"run.json"
+        run.write_text(json.dumps(dict(active_sessions=2, context_tokens=512,
+            initial_prompt_tokens=512, decode_prompt_tokens=[528, 528],
+            warmup_tokens_per_session=[16, 16], warmup_generated_tokens=32,
+            decode_tokens=256, draft_n=0, draft_n_accepted=0,
+            started_epoch=1000, finished_epoch=1001,
+            decode_started_epoch=1000.01, decode_finished_epoch=1000.02,
+            launch_sha256=hashlib.sha256(launch.read_bytes()).hexdigest())))
+        db = root/"trace.sqlite"
+        with contextlib.closing(sqlite3.connect(db)) as con, con:
+            con.executescript("""
+                CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,globalTid INTEGER,text TEXT,textId INTEGER);
+                CREATE TABLE StringIds(id INTEGER,value TEXT);
+                CREATE TABLE PROCESSES(globalPid INTEGER,pid INTEGER,name TEXT);
+                INSERT INTO PROCESSES VALUES (16777216,1,'/workspace/engines/B/bin/llama-server');
+                INSERT INTO PROCESSES VALUES (33554432,2,'/workspace/other/bin/llama-server');
+                CREATE TABLE TARGET_INFO_SESSION_START_TIME(utcEpochNs INTEGER);
+                INSERT INTO TARGET_INFO_SESSION_START_TIME VALUES (1000000000000);
+                CREATE TABLE TARGET_INFO_GPU(id INTEGER,name TEXT);
+                INSERT INTO TARGET_INFO_GPU VALUES (0,'fixture'),(1,'fixture');
+                CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,deviceId INTEGER,
+                    globalPid INTEGER,shortName INTEGER,gridX INTEGER,gridY INTEGER,gridZ INTEGER,
+                    blockX INTEGER,blockY INTEGER,blockZ INTEGER,registersPerThread INTEGER,
+                    staticSharedMemory INTEGER,dynamicSharedMemory INTEGER,graphNodeId INTEGER);
+                CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY(start INTEGER,end INTEGER,deviceId INTEGER,globalPid INTEGER);
+                CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET(start INTEGER,end INTEGER,deviceId INTEGER,globalPid INTEGER);
+            """)
+            for pid in (16777216, 33554432):
+                for iteration in range(3):
+                    con.execute("INSERT INTO NVTX_EVENTS VALUES (?,?,?,?,NULL)",
+                        (iteration*10000000, (iteration+1)*10000000, pid+1,
+                         f"glm53.v1 stage=iteration iteration={iteration}"))
+                for seq in range(2):
+                    con.execute("INSERT INTO NVTX_EVENTS VALUES (?,NULL,?,?,NULL)",
+                        (19000000, pid+1, f"glm53.v1 stage=accept sequence={seq} accepted=0"))
+            con.execute("INSERT INTO NVTX_EVENTS VALUES (11000000,18000000,16777217,?,NULL)",
+                        ("glm53.v1 stage=target_eval rows=2",))
+            for idx, name in enumerate(("ncclDevKernel_AllReduce_u32_RING",
+                                       "ncclDevKernel_AllReduce_bf16_RING",
+                                       "ggml_cuda_ar_owner_reduce_kernel_n", "foreign_kernel"), 1):
+                con.execute("INSERT INTO StringIds VALUES (?,?)", (idx,name))
+                for device in range(2):
+                    con.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (12000000, 14000000, device, 33554432 if idx==4 else 16777216,
+                         idx,1,1,1,128,1,1,32,0,0,idx))
+        return root, db, run, launch
+
+    def report(self, root, db, run, launch):
+        output = root/"report.txt"
+        result = subprocess.run([sys.executable, "-I", str(Path(__file__).with_name("decode_report.py")),
+            "--db", str(db), "--run-json", str(run), "--launch-json", str(launch),
+            "--output", str(output)], capture_output=True, text=True, timeout=15)
+        return result, output
+
+    def test_report_binds_process_and_time_and_includes_native_collectives_without_claiming_operations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.fixture(tmp)
+            result, output = self.report(*paths)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = output.read_text()
+        self.assertIn("2-session", report)
+        self.assertIn("512 initial prompt tokens", report)
+        self.assertIn("528..528", report)
+        self.assertIn("warmup evidence: 16..16 tokens/session; 32 generated tokens", report)
+        self.assertIn("process/time-correlated, not unique workload identity", report)
+        self.assertIn("launch digest: matched", report)
+        self.assertIn("trace process: matched", report)
+        self.assertIn("trace time: matched measured decode", report)
+        self.assertIn("graph-node kernels: 6/6", report)
+        collectives = report.split("Collectives\n")[1]
+        self.assertIn("ncclDevKernel_AllReduce_u32_RING", collectives)
+        self.assertIn("ncclDevKernel_AllReduce_bf16_RING", collectives)
+        self.assertIn("ggml_cuda_ar_owner_reduce_kernel_n", collectives)
+        self.assertIn("ordinal", collectives)
+        self.assertIn("not proven logical operations", collectives)
+        self.assertNotIn("foreign_kernel", report)
+        self.assertNotIn("do-not-export", report)
+        self.assertNotIn("below", report)
+        self.assertNotIn("logical 4-GPU ops", report)
+
+    def test_mismatched_launch_process_or_clock_cannot_produce_a_report(self):
+        for mismatch in ("launch", "process", "clock", "devices"):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as tmp:
+                root, db, run, launch = self.fixture(tmp)
+                if mismatch == "launch":
+                    launch.write_text(launch.read_text()+" ")
+                else:
+                    with contextlib.closing(sqlite3.connect(db)) as con, con:
+                        if mismatch == "process":
+                            con.execute("UPDATE PROCESSES SET name='/workspace/wrong/llama-server'")
+                        elif mismatch == "clock":
+                            con.execute("UPDATE TARGET_INFO_SESSION_START_TIME SET utcEpochNs=2000000000000")
+                        else:
+                            con.execute("DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE deviceId=1")
+                result, output = self.report(root, db, run, launch)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(mismatch, result.stderr.lower())
+                self.assertFalse(output.exists())
+
+    def test_current_prompt_handoff_requires_complete_consistent_warmup(self):
+        for bad in (None, [16], [16, 15], [16, 17]):
+            with self.subTest(warmup=bad), tempfile.TemporaryDirectory() as tmp:
+                root, db, run, launch = self.fixture(tmp)
+                metadata = json.loads(run.read_text())
+                if bad is None:
+                    del metadata["warmup_tokens_per_session"]
+                else:
+                    metadata["warmup_tokens_per_session"] = bad
+                run.write_text(json.dumps(metadata))
+                result, output = self.report(root, db, run, launch)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("warmup", result.stderr.lower())
+                self.assertFalse(output.exists())
+
+    def test_legacy_missing_evidence_is_explicit_and_never_invented(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, db, run, launch = self.fixture(tmp)
+            metadata = json.loads(run.read_text())
+            for key in ("launch_sha256", "initial_prompt_tokens", "decode_prompt_tokens",
+                        "decode_started_epoch", "decode_finished_epoch",
+                        "warmup_tokens_per_session", "warmup_generated_tokens"):
+                del metadata[key]
+            run.write_text(json.dumps(metadata))
+            with contextlib.closing(sqlite3.connect(db)) as con, con:
+                con.execute("DROP TABLE TARGET_INFO_SESSION_START_TIME")
+                con.execute("ALTER TABLE CUPTI_ACTIVITY_KIND_KERNEL DROP COLUMN graphNodeId")
+            result, output = self.report(root, db, run, launch)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = output.read_text()
+        self.assertIn("launch digest: unavailable", report)
+        self.assertIn("trace time: unavailable", report)
+        self.assertIn("warmup evidence: unavailable", report)
+        self.assertIn("initial prompt: unavailable", report)
+        self.assertIn("legacy reported context: 512", report)
+        self.assertNotIn("512 initial prompt tokens", report)
+        self.assertIn("effective prompt: unavailable", report)
+        self.assertIn("graph-node kernels: unavailable", report)
+        self.assertNotIn("528", report)
 
 
 if __name__ == '__main__':
