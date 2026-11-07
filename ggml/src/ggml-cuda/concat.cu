@@ -141,11 +141,19 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
 // Transpose a dimension-0 view while prepending a small contiguous state. The
 // generic non-contiguous kernel assigns a CTA to each output row, which makes
-// every warp gather with a large stride for this layout.
+// every warp gather with a large stride for this layout. Each grid z plane is one
+// sequence of the ubatch, its operands that far apart (src0 and dst in elements,
+// src1 in bytes): a KDA verify of 9 sequences of 3 rows over 24576 channels took
+// 233 us on the generic kernel on an RTX 5070 Ti.
 static __global__ void concat_dim0_transpose_u32(
         const uint32_t * src0, const char * src1, uint32_t * dst,
-        int ne00, int rows, int cols, uint64_t src1_col_stride, int dst_row_stride) {
+        int ne00, int rows, int cols, uint64_t src1_col_stride, int dst_row_stride,
+        int64_t src0_seq_stride, uint64_t src1_seq_stride, int64_t dst_seq_stride) {
     __shared__ uint32_t tile[32][33];
+
+    src0 += blockIdx.z*src0_seq_stride;
+    src1 += blockIdx.z*src1_seq_stride;
+    dst  += blockIdx.z*dst_seq_stride;
 
     const int input_x = (int) blockIdx.x*32 + threadIdx.x; // output row / input column
     const int input_y0 = (int) blockIdx.y*32 + threadIdx.y; // output column / input row
@@ -205,18 +213,21 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
             static const bool sm120_legacy = ggml_env_switch("GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY");
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const bool transpose_dim0 = (cc == GGML_CUDA_CC_DGX_SPARK || (cc == GGML_CUDA_CC_BLACKWELL && !sm120_legacy)) &&
-                dim == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-                dst->ne[2] == 1 && dst->ne[3] == 1 && src0->ne[0] <= 8 &&
+                dim == 0 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
+                src0->ne[2] == dst->ne[2] && src1->ne[2] == dst->ne[2] && dst->ne[2] <= 65535 &&
+                src0->nb[2] % sizeof(uint32_t) == 0 && src1->nb[2] % sizeof(uint32_t) == 0 &&
+                dst->nb[2] % sizeof(uint32_t) == 0 && src0->ne[0] <= 8 &&
                 src0->nb[0] == sizeof(uint32_t) && src0->nb[1] == (uint64_t) src0->ne[0]*sizeof(uint32_t) &&
                 src1->nb[1] == sizeof(uint32_t) && dst->nb[0] == sizeof(uint32_t) &&
                 dst->nb[1] == (uint64_t) dst->ne[0]*sizeof(uint32_t) &&
                 src0->ne[1] == src1->ne[1] && src0->ne[1] == dst->ne[1] &&
                 src0->ne[0] + src1->ne[0] == dst->ne[0];
             if (transpose_dim0) {
-                const dim3 grid((dst->ne[1] + 31)/32, (src1->ne[0] + 31)/32, 1);
+                const dim3 grid((dst->ne[1] + 31)/32, (src1->ne[0] + 31)/32, dst->ne[2]);
                 concat_dim0_transpose_u32<<<grid, dim3(32, 8, 1), 0, stream>>>(
                     (const uint32_t *) src0->data, (const char *) src1->data, (uint32_t *) dst->data,
-                    src0->ne[0], dst->ne[1], src1->ne[0], src1->nb[0], dst->nb[1]/sizeof(uint32_t));
+                    src0->ne[0], dst->ne[1], src1->ne[0], src1->nb[0], dst->nb[1]/sizeof(uint32_t),
+                    src0->nb[2]/sizeof(uint32_t), src1->nb[2], dst->nb[2]/sizeof(uint32_t));
                 return;
             }
         }

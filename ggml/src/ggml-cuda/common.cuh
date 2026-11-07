@@ -2089,18 +2089,27 @@ struct ggml_backend_cuda_context {
         return enabled;
     }
 
+    static int64_t cuda_graph_idle_us() {
+        static const int64_t timeout = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_IDLE_MS");
+            return env ? int64_t(std::max(0, atoi(env)))*1000 : int64_t(10'000'000);
+        }();
+        return timeout;
+    }
+
     ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key, int64_t time_now = ggml_time_us()) {
-        // Give cached graphs 10s to be reused after an idle period, without updating each graph.
-        if (!cuda_graphs.empty() && time_now - last_graph_use_time >= 10'000'000) {
-            next_graph_eviction_time = time_now + 10'000'000;
+        const int64_t idle_us = cuda_graph_idle_us();
+        // Give cached graphs another idle interval to be reused after the context wakes up.
+        if (idle_us && !cuda_graphs.empty() && time_now - last_graph_use_time >= idle_us) {
+            next_graph_eviction_time = time_now + idle_us;
         }
         last_graph_use_time = time_now;
 
-        // sweep every 5s during active use, evicting graphs unused for >=10s
-        if (time_now >= next_graph_eviction_time) {
-            next_graph_eviction_time = time_now + 5'000'000;
+        // Zero disables time-based eviction; the node and executable caps still apply.
+        if (idle_us && time_now >= next_graph_eviction_time) {
+            next_graph_eviction_time = time_now + std::min<int64_t>(idle_us, 5'000'000);
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (!(it->first == key) && time_now - it->second->last_used_time >= 10'000'000) {
+                if (!(it->first == key) && time_now - it->second->last_used_time >= idle_us) {
                     if (graph_trace_enabled()) {
                         GGML_LOG_INFO("graph_trace layer=cuda event=evict context=%p device=%d uid=%llu reason=idle nodes=%zu\n",
                             (void *) this, device, (unsigned long long) it->second->uid, it->second->num_nodes);
@@ -2128,7 +2137,7 @@ struct ggml_backend_cuda_context {
     // KiB for each node of its graph (2.75 on an RTX 5080), from a pool of the driver's that never shrinks: destroying
     // one returns nothing to the device, a later one reuses it, and the pool stays at the most nodes held at once. The
     // graphs a context computes follow its traffic (one per graph shape, and per graph slot for the same shape), bounded
-    // otherwise only by the 10 s eviction above, so a new one evicts the least recently used others until the nodes held
+    // otherwise only by GGML_CUDA_GRAPH_IDLE_MS (default 10000; 0 disables expiry), so a new one evicts the least recently used others until the nodes held
     // fit under GGML_CUDA_GRAPH_NODES (default 32768, 88 MiB on that card; 0 for no cap) and the executables under
     // GGML_CUDA_GRAPH_MAX (default 0, no cap). The memory follows the nodes, not the count: a -sm tensor split computes a
     // small graph for each all-reduce step on each device, hundreds a token, and a cap on the count below that evicts

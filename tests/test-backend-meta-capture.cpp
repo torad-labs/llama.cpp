@@ -1,6 +1,6 @@
 // The meta backend (-sm tensor) captures a cgraph's whole evaluation, every step's subgraph and all-reduce on every
 // device, into one graph a device on its second evaluation, and replays those graphs for the evaluations after it, for
-// the last 4 cgraphs evaluated (ggml_backend_meta_graph_compute). A replay runs the all-reduces with no host between
+// four graph slots, including their scheduler splits (ggml_backend_meta_graph_compute). A replay runs the all-reduces with no host between
 // them, so each one takes its token and staging slot from the device (ggml_cuda_ar_kernel).
 //
 // A stack of feed-forward layers, x = x + down(up(x)), is split over two devices with the up rows and the down columns
@@ -39,8 +39,9 @@ static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, v
         const int n = *(const int *) userdata;
         const int layer = atoi(strchr(tensor->name, '.') + 1);
         const int heavy = n == 2 ? 1 : layer % n;
+        const int64_t width = tensor->ne[tensor->name[0] == 'u' ? 1 : 0];
         for (int rank = 0; rank < n; ++rank) {
-            split_state.ne[rank] = rank == heavy ? n_ff - (n - 1)*n_lo : n_lo;
+            split_state.ne[rank] = rank == heavy ? width - (n - 1)*n_lo : n_lo;
         }
         return split_state;
     }
@@ -258,12 +259,119 @@ static bool check_collective_hint_scope(const std::vector<ggml_backend_dev_t> & 
     return ok;
 }
 
+// CPU bridges split each identity chain into multiple meta graphs that must survive together in the capture cache.
+static bool check_split_capture(std::vector<ggml_backend_dev_t> gpus, int n_fragments) {
+    constexpr int width = 128;
+    constexpr int n_graphs = 5;
+    int n_devices = (int) gpus.size();
+    log_counts counts;
+    ggml_log_set(log_cb, &counts);
+    ggml_backend_dev_t meta = ggml_backend_meta_device(gpus.data(), n_devices, split_by_name, (void *) &n_devices);
+    ggml_backend_t backend = ggml_backend_dev_init(meta, nullptr);
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t backends[] = {backend, cpu};
+
+    ggml_context * weights = ggml_init({2*ggml_tensor_overhead(), nullptr, true});
+    ggml_tensor * up = ggml_new_tensor_2d(weights, GGML_TYPE_F32, width, width);
+    ggml_tensor * down = ggml_new_tensor_2d(weights, GGML_TYPE_F32, width, width);
+    ggml_set_name(up, "up.0");
+    ggml_set_name(down, "down.0");
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(weights, ggml_backend_dev_buffer_type(meta));
+    GGML_ASSERT(buffer);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<float> identity(width*width, 0.0f);
+    for (int i = 0; i < width; ++i) { identity[i*width + i] = 1.0f; }
+    for (auto * weight : {up, down}) {
+        ggml_backend_tensor_set(weight, identity.data(), 0, ggml_nbytes(weight));
+    }
+
+    ggml_context * contexts[n_graphs];
+    ggml_cgraph * graphs[n_graphs];
+    ggml_tensor * inputs[n_graphs];
+    ggml_tensor * outputs[n_graphs];
+    ggml_backend_sched_t scheds[n_graphs];
+    bool ok = true;
+    for (int slot = 0; slot < n_graphs; ++slot) {
+        contexts[slot] = ggml_init({(4*n_fragments + 1)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        auto * ctx = contexts[slot];
+        scheds[slot] = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+        inputs[slot] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, slot + 1);
+        ggml_set_input(inputs[slot]);
+        ggml_tensor * cur = inputs[slot];
+        for (int fragment = 0; fragment < n_fragments; ++fragment) {
+            ggml_tensor * residual = cur;
+            cur = ggml_mul_mat(ctx, up, cur);
+            ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
+            cur = ggml_mul_mat(ctx, down, cur);
+            ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
+            cur = ggml_add(ctx, cur, residual);
+            ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
+            cur = ggml_scale(ctx, cur, 0.5f);
+            ggml_backend_sched_set_tensor_backend(scheds[slot], cur, fragment + 1 < n_fragments ? cpu : backend);
+        }
+        outputs[slot] = cur;
+        ggml_set_output(cur);
+        graphs[slot] = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graphs[slot], cur);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(scheds[slot], graphs[slot]));
+        const int splits = ggml_backend_sched_get_n_splits(scheds[slot]);
+        if (splits != 2*n_fragments - 1) {
+            fprintf(stderr, "FAIL %d fragments: scheduler made %d splits, expected %d\n",
+                n_fragments, splits, 2*n_fragments - 1);
+            ok = false;
+        }
+    }
+
+    const bool legacy = ggml_env_switch("GGML_META_CAPTURE_LEGACY");
+    int n_eval = 0;
+    auto run = [&](int slot, int expected_captures) {
+        std::vector<float> input(ggml_nelements(inputs[slot]));
+        ++n_eval;
+        for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int((i + 7*n_eval)%31) - 15)/16.0f; }
+        ggml_backend_tensor_set(inputs[slot], input.data(), 0, ggml_nbytes(inputs[slot]));
+        const bool computed = ggml_backend_sched_graph_compute(scheds[slot], graphs[slot]) == GGML_STATUS_SUCCESS;
+        std::vector<float> output(input.size());
+        ggml_backend_tensor_get(outputs[slot], output.data(), 0, ggml_nbytes(outputs[slot]));
+        const int expected = legacy ? 0 : expected_captures*n_fragments*n_devices;
+        const bool passed = computed && output == input && counts.executables == expected && counts.not_captured == 0;
+        if (!passed) {
+            fprintf(stderr, "FAIL %d fragments, slot %d: identity=%d, executables=%d (expected %d), refused=%d\n",
+                n_fragments, slot, int(computed && output == input), counts.executables, expected, counts.not_captured);
+        }
+        ok = ok && passed;
+    };
+    for (int slot = 0; slot < 4; ++slot) { run(slot, 0); }
+    for (int slot = 0; slot < 4; ++slot) { run(slot, slot + 1); }
+    std::mt19937 rng(17);
+    for (int i = 0; i < 24; ++i) { run(rng()%4, 4); }
+    for (int slot = 0; slot < 4; ++slot) { run(slot, 4); } // slot 0 is now the oldest
+    run(4, 4);
+    run(4, 5);
+    run(4, 5);
+    run(0, 5);
+    run(0, 6);
+    run(0, 6);
+
+    for (int slot = 0; slot < n_graphs; ++slot) {
+        ggml_backend_sched_free(scheds[slot]);
+        ggml_free(contexts[slot]);
+    }
+    ggml_backend_free(backend);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(weights);
+    ggml_backend_free(cpu);
+    ggml_log_set(nullptr, nullptr);
+    printf("%s %d-fragment capture reuse and eviction\n", ok ? "ok" : "FAIL", n_fragments);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
+    const bool split_only = argc == 2 && strcmp(argv[1], "--split-capture") == 0;
     const bool logical = argc == 3 && strcmp(argv[1], "--logical") == 0;
     const bool physical = argc == 3 && strcmp(argv[1], "--devices") == 0;
     const int n_devices = logical || physical ? atoi(argv[2]) : 2;
-    if ((argc != 1 && !logical && !physical) || n_devices < 2 || n_devices > 4) {
-        fprintf(stderr, "usage: %s [--devices 2|3|4 | --logical 2|3|4]\n", argv[0]);
+    if ((argc != 1 && !logical && !physical && !split_only) || n_devices < 2 || n_devices > 4) {
+        fprintf(stderr, "usage: %s [--devices 2|3|4 | --logical 2|3|4 | --split-capture]\n", argv[0]);
         return 1;
     }
     std::vector<ggml_backend_dev_t> gpus;
@@ -285,6 +393,9 @@ int main(int argc, char ** argv) {
         gpus.push_back(gpus[rank % n_physical]);
     }
     printf("meta backend over %d ranks on %zu physical GPUs\n", n_devices, n_physical);
+    bool split_ok = true;
+    for (int fragments : {5, 11}) { split_ok = check_split_capture(gpus, fragments) && split_ok; }
+    if (split_only) { return split_ok ? 0 : 1; }
 
     const char * ar = getenv("GGML_CUDA_ALLREDUCE");
     if (ggml_env_switch("TEST_GLM_HC") && ggml_env_switch("GGML_CUDA_AR_HC_POST") &&
@@ -333,7 +444,7 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(ggml_backend_sched_alloc_graph(scheds_cpu.back(), graphs_cpu.back()->gf));
     }
 
-    bool ok = true;
+    bool ok = split_ok;
     int  n_eval = 0;
     auto run = [&](int k) {
         std::vector<float> x(ggml_nelements(graphs[k]->x));

@@ -6116,11 +6116,15 @@ struct test_mul_mat_id_partition : public test_mul_mat_id {
     const int first;
     const int local;
     const bool fused;
+    const int routing;
     test_mul_mat_id_partition(ggml_type type, bool broadcast, int64_t tokens, int first,
-            int total = 8, int used = 2, int local = 2, int64_t m = 256, int64_t k = 256, bool fused = false)
-        : test_mul_mat_id(type, GGML_TYPE_F32, total, used, broadcast, m, tokens, k), first(first), local(local), fused(fused) {}
+            int total = 8, int used = 2, int local = 2, int64_t m = 256, int64_t k = 256, bool fused = false, int routing = 0)
+        : test_mul_mat_id(type, GGML_TYPE_F32, total, used, broadcast, m, tokens, k), first(first), local(local), fused(fused), routing(routing) {}
 
-    std::string vars() override { return test_mul_mat_id::vars() + "," + VARS_TO_STR3(first, local, fused); }
+    std::string vars() override {
+        return test_mul_mat_id::vars() + "," + VARS_TO_STR3(first, local, fused) +
+            (routing ? "," + VAR_TO_STR(routing) : "");
+    }
 
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_PARTITION"; }
 
@@ -6150,7 +6154,16 @@ struct test_mul_mat_id_partition : public test_mul_mat_id {
         ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
         std::vector<int32_t> values(n_mats*n);
         for (int64_t row = 0; row < n; ++row) {
-            for (int slot = 0; slot < n_mats; ++slot) { values[row*n_mats + slot] = (2*row + slot*(n_mats > 8 ? 37 : 1)) % n_mats; }
+            for (int slot = 0; slot < n_mats; ++slot) {
+                int id = (2*row + slot*(n_mats > 8 ? 37 : 1)) % n_mats;
+                if (routing == 1) {
+                    // All local, including the last expert: its final tile has fewer than J valid indices.
+                    id = first + local - 1 - slot % local;
+                } else if (routing == 2) {
+                    id = (first + local + slot) % n_mats;
+                }
+                values[row*n_mats + slot] = id;
+            }
         }
         ggml_backend_tensor_set(ids, values.data(), 0, ggml_nbytes(ids));
     }
@@ -7570,26 +7583,29 @@ struct test_concat : public test_case {
     }
 };
 
-// GGML_OP_CONCAT along dim 0 of a short contiguous state and a transposed block of rows: a GDN layer's
-// conv state [d_conv - 1, channels] joined with the new tokens' projection [channels, n_tokens]^T
+// GGML_OP_CONCAT along dim 0 of a short contiguous state and a transposed block of rows: a GDN or KDA layer's
+// conv state [d_conv - 1, channels, n_seqs] joined with the new tokens' projection [channels, n_tokens, n_seqs]^T,
+// one plane per sequence of the ubatch
 struct test_concat_conv_state : public test_case {
     const ggml_type type;
     const int64_t n_state; // d_conv - 1
     const int64_t n_channels;
     const int64_t n_tokens;
+    const int64_t n_seqs;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, n_state, n_channels, n_tokens);
+        return VARS_TO_STR5(type, n_state, n_channels, n_tokens, n_seqs);
     }
 
-    test_concat_conv_state(ggml_type type = GGML_TYPE_F32, int64_t n_state = 3, int64_t n_channels = 10240, int64_t n_tokens = 3)
-        : type(type), n_state(n_state), n_channels(n_channels), n_tokens(n_tokens) {}
+    test_concat_conv_state(ggml_type type = GGML_TYPE_F32, int64_t n_state = 3, int64_t n_channels = 10240, int64_t n_tokens = 3,
+                           int64_t n_seqs = 1)
+        : type(type), n_state(n_state), n_channels(n_channels), n_tokens(n_tokens), n_seqs(n_seqs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, n_state, n_channels);
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type, n_state, n_channels, n_seqs);
         ggml_set_name(a, "a");
 
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, type, n_channels, n_tokens);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, type, n_channels, n_tokens, n_seqs);
         ggml_set_name(x, "x");
 
         ggml_tensor * b = ggml_transpose(ctx, x);
@@ -10607,8 +10623,8 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     // Decode, draft and one/two/three-slot n_max=2 verification. Include the
-    // M=9 MMQ boundary and full/trimmed vocabulary shards, not just M=1.
-    for (int64_t n : {1, 2, 3, 6, 9}) {
+    // M=9 MMQ boundary, 36-session MTP verification and full/trimmed vocabulary shards, not just M=1.
+    for (int64_t n : {1, 2, 3, 6, 9, 27}) {
         for (int64_t m : {512, 1536, 2048, 4096, 8192, 16384, 32768, 77440}) {
             cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 4096, {1, 1}, {1, 1}));
         }
@@ -10637,9 +10653,22 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
         false, 1, 1, false, false, /*with_gate =*/ true, false, {1, 1}));
 }
 
+static void add_glm_moe_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    // One expert shard at 36-session decode and MTP verification widths, with spread and concentrated routing.
+    for (int64_t tokens : {36, 108}) {
+        for (int routing : {0, 1}) {
+            cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, tokens, 216, 288, 8, 72,
+                2048, 4096, false, routing));
+            cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, false, tokens, 216, 288, 8, 72,
+                4096, 2048, false, routing));
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
+    add_glm_moe_cases(test_cases);
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
         for (int64_t tokens : {1, 17, 40}) {
@@ -10662,6 +10691,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t tokens : {3, 8}) {
         for (int first : {0, 216}) {
             test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, tokens, first, 288, 8, 72, 2048, 4096, true));
+        }
+    }
+    // Cover the ring/vector/MMQ boundaries and the verification widths of 12 and 36 MTP-2 sessions.
+    for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q8_0}) {
+        for (int64_t tokens : {1, 3, 8, 9, 16, 17, 36, 108}) {
+            for (bool broadcast : {false, true}) {
+                for (int routing : {1, 2}) {
+                    test_cases.emplace_back(new test_mul_mat_id_partition(type, broadcast, tokens, 216, 288, 8, 72,
+                        256, 256, false, routing));
+                }
+            }
+        }
+        for (bool broadcast : {false, true}) {
+            for (int routing : {1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_id_partition(type, broadcast, 36, 216, 288, 8, 72,
+                    264, 256, false, routing));
+            }
         }
     }
     std::default_random_engine rng(0);
@@ -12417,6 +12463,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat_conv_state(type, 3, 1000, n_tokens));
         }
         test_cases.emplace_back(new test_concat_conv_state(type, 9, 1000, 3));
+        // a ubatch of several sequences: an MTP verify of 36 sessions over four data-parallel ranks puts 9 sequences
+        // of 1 + its drafts' rows in each rank's ubatch, one plane each
+        for (int64_t n_seqs : { 2, 9 }) {
+            for (int64_t n_tokens : { 1, 3, 33 }) {
+                test_cases.emplace_back(new test_concat_conv_state(type, 3, 10240, n_tokens, n_seqs));
+                test_cases.emplace_back(new test_concat_conv_state(type, 3, 1000, n_tokens, n_seqs));
+            }
+        }
+        test_cases.emplace_back(new test_concat_conv_state(type, 9, 1000, 3, 2));
     }
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
@@ -13441,6 +13496,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
+    add_glm_moe_cases(test_cases);
+
+    // GLM-5.3 Flash's KDA conv-state concat (24576 channels) on one data-parallel rank of 36 sessions over four: 9
+    // sequences of a decode row or an MTP verify's 3, one plane each, and one sequence's for comparison
+    for (int64_t n_seqs : { 1, 9 }) {
+        for (int64_t n_tokens : { 1, 3 }) {
+            test_cases.emplace_back(new test_concat_conv_state(GGML_TYPE_F32, 3, 24576, n_tokens, n_seqs));
+        }
+    }
 
     // Ternary Bonsai 2 27B at decode and an MTP verify's width (1-5 columns): the FFN's gate/up + GLU and the residual adds
     // after the FFN down and a Gated DeltaNet layer's output projection, each one fused graph where the backend fuses it

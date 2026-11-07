@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "decode-trace.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1658,6 +1659,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         llama_set_mtp_graph_reuse(ctx_dft, this->params.n_max);
+        llama_set_mtp_graph_reuse(ctx_tgt, this->params.n_max);
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
         timing = this->params.mtp_adaptive > 0.0f && !is_mem_shared && !chain_heads && !decode_only &&
             !ggml_env_switch("LLAMA_MTP_TIMING_LEGACY");
@@ -1928,6 +1930,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (device) {
                     batch.embd = nullptr;
                 }
+                common_decode_trace::range trace_catchup([&] {
+                    return "stage=catchup head=" + std::to_string(head) + " rows=" + std::to_string(batch.n_tokens);
+                });
                 const int32_t rc = llama_decode(ctx_dft, batch);
                 batch.embd = embd;
                 if (rc != 0) {
@@ -2037,6 +2042,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // Sequences drafting together draft the deepest length any of them chose. The target's rollback split keeps
+        // each sequence's rows in one ubatch and takes equal rows per sequence, so one shorter draft splits the
+        // verification into a pass per sequence (36 passes and 4.2 s, where 36 equal drafts verify in one 121 ms pass
+        // on four PCIe cards). Each sequence still learns its own depth from its own acceptance, used when it drafts
+        // alone, and its own output limit still truncates it.
+        if (params.mtp_adaptive > 0.0f && n_drafting > 1) {
+            int32_t n_round = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) n_round = std::max(n_round, n_draft_max[seq_id]);
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) n_draft_max[seq_id] = n_round;
+            }
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -2058,7 +2078,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             static const bool index_share_legacy = ggml_env_switch("LLAMA_MTP_INDEX_SHARE_LEGACY");
             if (!index_share_legacy) llama_mtp_draft_step(ctx_dft, i);
-            int ret = llama_decode(ctx_dft, batch);
+            int ret;
+            {
+                common_decode_trace::range trace_proposal([&] {
+                    return "stage=proposal proposal=" + std::to_string(i + 1) + " rows=" + std::to_string(batch.n_tokens);
+                });
+                ret = llama_decode(ctx_dft, batch);
+            }
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 service.invalidate();
@@ -3096,6 +3122,41 @@ common_speculative_output_limits common_speculative_get_output_limits(
         /* .total   = */ (int32_t) std::min<int64_t>(n_batch, total),
         /* .per_seq = */ (int32_t) std::min<int64_t>(n_batch, per_seq),
     };
+}
+
+int32_t common_speculative_draft_limit(
+        const llama_context * ctx_tgt, int32_t n_generating, int32_t n_room, int32_t n_remaining, int32_t n_per_seq) {
+    int32_t n_max = std::min(n_room, n_per_seq);
+    // A target that keeps each sequence's rollback rows in one ubatch takes as many rows from every sequence of a
+    // ubatch, so a sequence verifying with others whose draft its output limit shortened (or, one token from the
+    // limit, left out) split their verification into a pass per sequence: at 36 sessions on four PCIe cards, about
+    // 4.2 s for a round that takes 0.12 s, in most sessions' last round. It drafts what the others draft instead,
+    // and the tokens past its limit are verified and rolled back as rejected (common_speculative_sample_and_accept).
+    const bool verifies_with_others = n_generating > 1 && ctx_tgt != nullptr && llama_n_rs_seq(ctx_tgt) > 0;
+    if (n_remaining > 0 && !verifies_with_others) {
+        n_max = std::min(n_max, n_remaining - 1);
+    }
+    return n_max;
+}
+
+std::vector<llama_token> common_speculative_sample_and_accept(
+        common_sampler * smpl, llama_context * ctx_tgt, const std::vector<int> & idxs, const llama_tokens & draft,
+        int32_t n_remaining, const std::function<void(size_t, llama_token)> & on_sample) {
+    // A sequence verifying with others drafts past its output limit (common_speculative_draft_limit). It checks at most
+    // n_remaining - 1 of its draft tokens, so with the target's own next token it keeps at most n_remaining: the rows
+    // past them roll back as rejected ones, and its cache ends where it would had it never drafted them. Kept, they
+    // left the cache a token or two past the request's end, and on four PCIe cards at 36 sessions half the next
+    // requests restored a checkpoint 20 tokens back (about 4.8 s each) instead of reusing the cache to the last token.
+    size_t n_check = draft.size();
+    if (n_remaining > 0) {
+        n_check = std::min(n_check, (size_t) n_remaining - 1);
+    }
+    if (n_check == draft.size()) {
+        return common_sampler_sample_and_accept_n(smpl, ctx_tgt, idxs, draft, false, on_sample);
+    }
+    const std::vector<int> idxs_checked(idxs.begin(), idxs.begin() + n_check + 1);
+    const llama_tokens     draft_checked(draft.begin(), draft.begin() + n_check);
+    return common_sampler_sample_and_accept_n(smpl, ctx_tgt, idxs_checked, draft_checked, false, on_sample);
 }
 
 // initialization of the speculative decoding system

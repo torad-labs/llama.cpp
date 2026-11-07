@@ -1480,7 +1480,7 @@ struct ggml_backend_cuda_comm_context {
 
     // Set by the init chain (comm_init_{nccl, internal, none}) to one of
     // try_allreduce_{nccl, internal, butterfly}.  nccl needs `comms`,
-    // internal needs `ar_pipeline`, butterfly needs nothing.  Per-call
+    // internal needs `ar_pipeline`, butterfly needs nothing. NCCL gathers can also use `comms` with internal reductions. Per-call
     // failures return false; the meta backend's generic implementation then
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
@@ -1754,6 +1754,13 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         std::string env_str(env);
         if (env_str == "nccl") {
             ggml_backend_cuda_comm_init_nccl(ret);
+        } else if (env_str == "internal-nccl-gather") {
+            ggml_backend_cuda_comm_init_nccl(ret);
+#ifdef GGML_USE_NCCL
+            if (!ret->comms.empty()) {
+                ggml_backend_cuda_comm_init_internal(ret);
+            }
+#endif // GGML_USE_NCCL
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
         } else if (env_str == "none") {
@@ -1815,7 +1822,7 @@ static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct gg
         return true;
     }
 #ifdef GGML_USE_NCCL
-    if (comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_nccl) {
+    if (!comm_ctx->comms.empty()) {
         for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -1838,6 +1845,21 @@ static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct gg
     return false;
 }
 
+// The internal AllReduce's sum, delivered to each rank's own elements only (ggml_cuda_ar_reduce_owned). NCCL and the
+// meta backend's own reduction decline, and the caller reduces to every rank.
+static bool ggml_backend_cuda_comm_reduce_owned_tensor(
+        void * comm_ctx_v, struct ggml_tensor ** tensors, const int64_t * begin, const int64_t * len) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal || comm_ctx->ar_pipeline == nullptr ||
+            ggml_nelements(tensors[0]) == 0 || !ggml_backend_cuda_comm_internal_supports(comm_ctx, tensors)) {
+        return false;
+    }
+    return ggml_cuda_ar_reduce_owned(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, begin, len);
+}
+
 // Whether the AllReduce of these tensors can be captured with the rest of an
 // evaluation (ggml_backend_cuda_capture_begin) and replayed: only on the
 // internal pipeline's chunked kernel (ggml_cuda_ar_capturable), since NCCL's is
@@ -1858,14 +1880,21 @@ static bool ggml_backend_cuda_comm_allreduce_capturable(void * comm_ctx_v, struc
         ggml_cuda_ar_capturable(comm_ctx->ar_pipeline, tensors[0]);
 }
 
-// The gather is captured on the internal pipeline, whose kernels it always takes; not an empty one (above).
+// Both native integer gathers and the internal pipeline support capture; not an empty gather (above).
 static bool ggml_backend_cuda_comm_allgather_capturable(void * comm_ctx_v, struct ggml_tensor ** tensors) {
     if (comm_ctx_v == nullptr) {
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
-    return comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal &&
-        ggml_backend_cuda_comm_allgather_takes(comm_ctx, tensors) && ggml_nbytes(tensors[0]) > 0;
+    if (!ggml_backend_cuda_comm_allgather_takes(comm_ctx, tensors) || ggml_nbytes(tensors[0]) == 0) {
+        return false;
+    }
+#ifdef GGML_USE_NCCL
+    if (!comm_ctx->comms.empty()) {
+        return true;
+    }
+#endif // GGML_USE_NCCL
+    return comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -3425,13 +3454,20 @@ static void ggml_cuda_dp_expert_stats_free(ggml_backend_cuda_context & ctx) {
 }
 
 static __global__ void ggml_cuda_local_expert_ids(const int32_t * ids, int32_t * local,
-        int64_t n, int n_used, int64_t stride, int first, int count, int missing, unsigned long long * hits) {
-    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (i < n) {
-        const int expert = ids[(i/n_used)*stride + i % n_used] - first;
-        const bool owned = expert >= 0 && expert < count;
+        float * dst, int64_t n, int64_t rows, int64_t row_blocks, int n_used, int64_t stride,
+        int first, int count, int missing, unsigned long long * hits) {
+    const int64_t i = dst ? blockIdx.x / row_blocks : int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n) { return; }
+    const int64_t row = dst ? (blockIdx.x % row_blocks)*blockDim.x + threadIdx.x : 0;
+    const int expert = ids[(i/n_used)*stride + i % n_used] - first;
+    const bool owned = expert >= 0 && expert < count;
+    if (row == 0) {
         local[i] = owned ? expert : missing;
         if (hits && owned) { atomicAdd(hits + expert, 1ULL); }
+    }
+    // Every local row is overwritten by its expert. Only absent experts need zero contributions.
+    if (dst && !owned && row < rows) {
+        dst[i*rows + row] = 0.0f;
     }
 }
 
@@ -3445,13 +3481,22 @@ static void ggml_cuda_mul_mat_id_partition(ggml_backend_cuda_context & ctx, cons
     GGML_ASSERT(ggml_is_contiguous(dst) && ids->nb[0] == sizeof(int32_t));
     GGML_ASSERT(!fusion || vector);
     const int64_t n = ggml_nelements(ids);
+    const int64_t rows = mm->ne[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_nelements(dst) == n*rows);
+    const int64_t row_blocks = (rows + 255)/256;
+    GGML_ASSERT(n*row_blocks <= INT_MAX);
     ggml_cuda_pool_alloc<int32_t> local_ids(ctx.pool(), n);
     auto * hits = ggml_cuda_dp_expert_counters(ctx, mm);
-    ggml_cuda_local_expert_ids<<<(n + 255)/256, 256, 0, ctx.stream()>>>(
-        (const int32_t *) ids->data, local_ids.get(), n, ids->ne[0], ids->nb[1]/sizeof(int32_t),
+    // A fused output can reuse storage whose last reader was one of the fused nodes. Read all IDs before clearing it.
+    const uintptr_t ids_begin = (uintptr_t) ids->data;
+    const uintptr_t dst_begin = (uintptr_t) dst->data;
+    const bool overlap = ids_begin < dst_begin + ggml_nbytes(dst) && dst_begin < ids_begin + ggml_nbytes(ids);
+    ggml_cuda_local_expert_ids<<<overlap ? (n + 255)/256 : n*row_blocks, 256, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, local_ids.get(), overlap ? nullptr : (float *) dst->data, n, rows, row_blocks,
+        ids->ne[0], ids->nb[1]/sizeof(int32_t),
         ggml_get_op_params_i32(mm, 1), src0->ne[2], vector ? -1 : src0->ne[2], hits);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+    if (overlap) { CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream())); }
     ggml_tensor mapped = *ids;
     mapped.data = local_ids.get();
     mapped.nb[1] = mapped.ne[0]*sizeof(int32_t);
@@ -4950,6 +4995,134 @@ static bool ggml_cuda_node_is_folded(ggml_backend_cuda_context & ctx, const ggml
 
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
+// Whether the recurrent kernel can write gdn's snapshots into a cache of this type here (gdn_store_state). f16 and q8_0:
+// the recurrent kernel, with the scalar gate or KDA's (the chunked prefill pipeline writes f32; its stores stay). KDA
+// stores its state as the scalar gate does, one column a warp, and until it was taken here glm5next under -cts f16 paid
+// the f32 -> f16 cpy on every KDA layer: 262 us a token against 289 for the kernel, the 44-layer GLM-5.3 proxy on an RTX
+// 5070 Ti. q8_0 besides: the kernel quantizes one block per warp-wide slice of a state column, so a 32-lane warp and a
+// head width that is a multiple of 32. GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate store,
+// GGML_CUDA_GDN_KDA_CACHE_LEGACY=1 a KDA layer's f16 or q8_0 one.
+static bool ggml_cuda_gdn_store_fusable(const ggml_tensor * gdn, ggml_type type) {
+    static const bool q8_legacy  = ggml_env_switch("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
+    static const bool kda_legacy = ggml_env_switch("GGML_CUDA_GDN_KDA_CACHE_LEGACY");
+    const int64_t S_v = gdn->src[2]->ne[0];
+    if (!ggml_cuda_gdn_cache_type_fusable(type)) {
+        return false;
+    }
+    if (type != GGML_TYPE_F32 && ((kda_legacy && gdn->src[3]->ne[0] == S_v) || ggml_cuda_should_use_chunked_gdn(gdn))) {
+        return false;
+    }
+    return type != GGML_TYPE_Q8_0 ||
+        (!q8_legacy && S_v % QK8_0 == 0 && ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == QK8_0);
+}
+
+// -sm dp: build_rs_store_local stores each written snapshot slot on its own, view -> cont -> set_rows into the sequence
+// owner's cache at each sequence's row (I64 ids, the owner's cells in any order). Matched from the first cont after the
+// gdn: one store per written slot, each slot once, only views and no-ops between, all into one cache. The kernel then
+// writes every snapshot to its row (ggml_cuda_gated_delta_net_store_rows) and the conts and set_rows are skipped: under
+// four-way -sm dp a 36-session verify made three f32 copies of 4 MiB a session per KDA layer, each quantized again, about
+// 12% of the 108-row target pass. Returns the nodes to skip, 0 to keep the stores. GGML_CUDA_GDN_ROWS_STORE_LEGACY=1
+// keeps them.
+static int ggml_cuda_try_gdn_rows_fusion(const ggml_cgraph * cgraph, int node_idx, int first,
+        ggml_cuda_gated_delta_net_fused_cache & fused) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_GDN_ROWS_STORE_LEGACY");
+    if (legacy) {
+        return 0;
+    }
+    const ggml_tensor * gdn       = cgraph->nodes[node_idx];
+    const ggml_tensor * src_v     = gdn->src[2];
+    const int64_t       S_v       = src_v->ne[0];
+    const int64_t       n_tokens  = src_v->ne[2];
+    const int64_t       n_seqs    = src_v->ne[3];
+    const int64_t       D         = S_v * S_v * src_v->ne[1];
+    const int64_t       K         = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       n_written = std::min<int64_t>(n_tokens, K);
+    if (n_written > GGML_CUDA_GDN_STORE_ROWS_MAX || ggml_cuda_should_use_chunked_gdn(gdn)) {
+        return 0;
+    }
+    // slot i of the snapshot tail starts i slots after the attention scores
+    const size_t tail_off   = ggml_row_size(GGML_TYPE_F32, S_v * src_v->ne[1] * n_tokens * n_seqs);
+    const size_t slot_bytes = ggml_row_size(GGML_TYPE_F32, D * n_seqs);
+
+    ggml_cuda_gated_delta_net_store_rows rows;
+    std::array<const ggml_tensor *, GGML_CUDA_GDN_STORE_ROWS_MAX> snapshots{};
+    const ggml_tensor * cache = nullptr; // the first store's destination: every store writes the same cache
+    int found = 0;
+    int last  = first;
+    for (int j = first; j < cgraph->n_nodes && found < n_written; ++j) {
+        const ggml_tensor * cont = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(cont)) {
+            continue;
+        }
+        // one written slot's cont: [D, n_seqs] f32 of the slot's view, read by its set_rows alone
+        const ggml_tensor * view = cont->src[0];
+        if (cont->op != GGML_OP_CONT || cont->type != GGML_TYPE_F32 || (cont->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                cont->ne[0] != D || ggml_nelements(cont) != D * n_seqs || !ggml_is_contiguous(cont) ||
+                ggml_node_get_use_count(cgraph, j) != 1 ||
+                view->op != GGML_OP_VIEW || view->view_src != gdn || view->type != GGML_TYPE_F32 ||
+                (view->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                ggml_nelements(view) != D * n_seqs || !ggml_is_contiguous(view) ||
+                view->view_offs < tail_off || (view->view_offs - tail_off) % slot_bytes != 0) {
+            return 0;
+        }
+        const size_t view_pos = ggml_hash_find(&cgraph->visited_hash_set, view);
+        if (!ggml_bitset_get(cgraph->visited_hash_set.used, view_pos) || cgraph->use_counts[view_pos] != 1) {
+            return 0;
+        }
+        const size_t slot = (view->view_offs - tail_off) / slot_bytes;
+        if (slot >= (size_t) n_written || rows.slot[slot] != nullptr) {
+            return 0;
+        }
+        // its set_rows, the next real node: the sequences' rows of this slot in the cache
+        int k = j + 1;
+        while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            ++k;
+        }
+        if (k == cgraph->n_nodes) {
+            return 0;
+        }
+        const ggml_tensor * set = cgraph->nodes[k];
+        const ggml_tensor * ids = set->src[1];
+        if (set->op != GGML_OP_SET_ROWS || set->src[0] != cont || (set->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                set->data == nullptr || !ggml_cuda_gdn_cache_type_fusable(set->type) || set->ne[0] != D ||
+                set->nb[0] != ggml_type_size(set->type) || set->nb[1] != ggml_row_size(set->type, D) ||
+                ids->type != GGML_TYPE_I64 || ids->data == nullptr || !ggml_is_contiguous(ids) ||
+                ids->ne[0] != n_seqs || ggml_nelements(ids) != n_seqs) {
+            return 0;
+        }
+        if (cache != nullptr && (set->data != cache->data || set->type != cache->type || set->nb[1] != cache->nb[1])) {
+            return 0;
+        }
+        cache           = set;
+        rows.slot[slot] = (const int64_t *) ids->data;
+        snapshots[slot] = view;
+        ++found;
+        last = j = k;
+    }
+    if (found != n_written || !ggml_cuda_gdn_store_fusable(gdn, cache->type)) {
+        return 0;
+    }
+    // Only the matched stores may read the omitted tail; attention-only views still read the normal output.
+    int uses_left = ggml_node_get_use_count(cgraph, node_idx);
+    for (int j = node_idx + 1; j < cgraph->n_nodes && uses_left > 0; ++j) {
+        const ggml_tensor * user = cgraph->nodes[j];
+        int uses = 0;
+        for (const ggml_tensor * src : user->src) { uses += src == gdn; }
+        if (uses == 0) { continue; }
+        uses_left -= uses;
+        if (uses != 1 || user->view_src != gdn) { return 0; }
+        if (user->view_offs < tail_off && ggml_nbytes(user) <= tail_off - user->view_offs) { continue; }
+        if (std::find(snapshots.begin(), snapshots.end(), user) == snapshots.end()) { return 0; }
+    }
+    if (uses_left != 0) { return 0; }
+    rows.row_stride   = (int64_t) (cache->nb[1] / ggml_type_size(cache->type)) * ggml_blck_size(cache->type);
+    fused.data        = cache->data;
+    fused.slot_stride = 0;
+    fused.type        = cache->type;
+    fused.rows        = rows;
+    return last - node_idx;
+}
+
 static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
@@ -4979,6 +5152,9 @@ static int ggml_cuda_try_gdn_cache_fusion(
         if (ggml_cuda_is_view_or_noop(n)) {
             continue;
         }
+        if (n->op == GGML_OP_CONT) {
+            return ggml_cuda_try_gdn_rows_fusion(cgraph, node_idx, j, fused_state_cpy);
+        }
         if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             return 0;
         }
@@ -5002,7 +5178,6 @@ static int ggml_cuda_try_gdn_cache_fusion(
     // of D (the per-seq stride the kernel assumes) and nb[2] a whole number of blocks (the slot stride below is nb[2]
     // in elements; a remainder would be truncated and every slot after the first written shifted). ggml_cpy pins src
     // to the same element count.
-    const bool q8 = dst->type == GGML_TYPE_Q8_0;
     const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
     if (dst->op != GGML_OP_VIEW || !ggml_cuda_gdn_cache_type_fusable(dst->type) || dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
@@ -5010,19 +5185,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
         dst->nb[2] % ggml_type_size(dst->type) != 0) {
         return 0;
     }
-    // f16 and q8_0: the recurrent kernel, with the scalar gate or KDA's (the chunked prefill pipeline writes f32; its
-    // cpy stays). KDA stores its state as the scalar gate does, one column a warp (gdn_store_state), and until it was
-    // taken here glm5next under -cts f16 paid the f32 -> f16 cpy on every KDA layer: 262 us a token against 289 for the
-    // kernel, the 44-layer GLM-5.3 proxy on an RTX 5070 Ti. q8_0 besides: the kernel quantizes one block per warp-wide
-    // slice of a state column (gdn_store_state), so a 32-lane warp and a head width that is a multiple of 32.
-    // GGML_CUDA_GDN_Q8_CACHE_LEGACY=1 keeps a q8_0 cache on the separate cpy, GGML_CUDA_GDN_KDA_CACHE_LEGACY=1 a KDA
-    // layer's f16 or q8_0 one.
-    static const bool q8_legacy  = ggml_env_switch("GGML_CUDA_GDN_Q8_CACHE_LEGACY");
-    static const bool kda_legacy = ggml_env_switch("GGML_CUDA_GDN_KDA_CACHE_LEGACY");
-    if (dst->type != GGML_TYPE_F32 && ((kda_legacy && gdn->src[3]->ne[0] == S_v) || ggml_cuda_should_use_chunked_gdn(gdn))) {
-        return 0;
-    }
-    if (q8 && (q8_legacy || S_v % QK8_0 != 0 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != QK8_0)) {
+    if (!ggml_cuda_gdn_store_fusable(gdn, dst->type)) {
         return 0;
     }
 
@@ -9100,6 +9263,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allgather_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allgather_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_reduce_owned_tensor") == 0) {
+        return (void *)ggml_backend_cuda_comm_reduce_owned_tensor;
     }
     if (strcmp(name, "ggml_backend_graph_next") == 0) {
         return (void *)ggml_backend_cuda_graph_next;

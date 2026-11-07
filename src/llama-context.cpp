@@ -4732,8 +4732,9 @@ bool llama_mtp_draft_step(llama_context * ctx, int32_t step) {
 }
 
 bool llama_context::set_mtp_graph_reuse(int32_t n_max) {
-    if (model.arch != LLM_ARCH_GLM5NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
-            model.hparams.n_layer_nextn != 1 || n_max < 0) { return false; }
+    // the MTP head's context and the target that verifies its drafts: a verify of every sequence's n_max drafts is
+    // past 32 rows from 11 sessions at n_max 2, and rebuilt whenever its row count changed
+    if (model.arch != LLM_ARCH_GLM5NEXT || model.hparams.n_layer_nextn != 1 || n_max < 0) { return false; }
     const uint32_t seq_tokens = n_max == 0 ? 0 : std::min<uint64_t>(uint64_t(n_max) + 1, cparams.n_ubatch);
     if (seq_tokens != graph_slot_mtp_seq_tokens) {
         graph_slot_mtp_seq_tokens = seq_tokens;

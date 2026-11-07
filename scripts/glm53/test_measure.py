@@ -445,6 +445,80 @@ class ServedContract(unittest.TestCase):
 
 
 class DecodeWindows(unittest.TestCase):
+    def test_workload_records_initial_and_effective_prompts_without_prefill_rate(self):
+        import hashlib
+        import subprocess
+
+        class Handler(ServingStandIn):
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path == "/apply-template":
+                    self.send(200, {"prompt": "public fixture"})
+                    return
+                if self.path == "/tokenize":
+                    self.send(200, {"tokens": list(range(1024))})
+                    return
+                self.server.requests.append(payload)
+                count = payload["n_predict"]
+                self.server.barrier.wait(timeout=5)
+                self.send_response(200)
+                self.end_headers()
+                for part in ([0], list(range(1, count-1)), [count-1]):
+                    self.wfile.write(b"data: " + json.dumps(dict(content="x", tokens=part)).encode() + b"\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.03)
+                cached = payload["cache_prompt"]
+                final = dict(stop=True, id_slot=payload["id_slot"], tokens=[], timings=dict(
+                    predicted_n=count, prompt_n=1 if cached else len(payload["prompt"]),
+                    cache_n=len(payload["prompt"])-1 if cached else 0))
+                self.wfile.write(b"data: " + json.dumps(final).encode() + b"\n\n")
+
+            def do_GET(self):
+                self.send(503, {"error": "metrics offline"})
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.requests, server.barrier = [], threading.Barrier(2)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root/"public-corpus.txt").write_text("public source text\n"*100)
+                launch = root/"launch.json"
+                launch.write_text(json.dumps(dict(argv=["/workspace/llama-server"])))
+                command = [sys.executable, str(Path(__file__).with_name("workload.py")),
+                    "--root", tmp, "--name", "short", "--binary", tmp, "--depth", "2",
+                    "--port", str(server.server_port), "--slots", "2", "--active", "2",
+                    "--context", "512", "--tokens", "32", "--deadline", str(time.time()+15),
+                    "--launch-json", str(launch)]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                report = json.loads((root/"results/short/run.json").read_text())
+                warmup = json.loads((root/"results/short/warmup.json").read_text())
+                self.assertTrue(report["passed"])
+                self.assertEqual(report["launch_sha256"], hashlib.sha256(launch.read_bytes()).hexdigest())
+                self.assertEqual(report["initial_prompt_tokens"], 512)
+                self.assertEqual(report["decode_prompt_tokens"], [528, 528])
+                self.assertEqual(report["warmup_generated_tokens"], 32)
+                self.assertEqual(report["warmup_tokens_per_session"], [16, 16])
+                self.assertEqual(report["metrics"]["before"], dict(available=False, error_kind="HTTPError", status=503))
+                self.assertEqual(report["metrics"]["after"], report["metrics"]["before"])
+                self.assertEqual(report["warmup_seconds"], warmup["wall"]["seconds"])
+                self.assertNotIn("prefill_tokens_per_second_wall", report)
+                self.assertNotIn("context_tokens", report)
+                self.assertNotIn("prefill_seconds", report)
+                self.assertGreater(report["decode_finished_epoch"], report["decode_started_epoch"])
+                for slot in range(2):
+                    requests = [p for p in server.requests if p["id_slot"] == slot]
+                    self.assertEqual([p["n_predict"] for p in requests], [16, 32])
+                    self.assertEqual(requests[1]["prompt"], requests[0]["prompt"]+list(range(16)))
+                    expected = hashlib.sha256(json.dumps(requests[1]["prompt"]).encode()).hexdigest()
+                    self.assertEqual(report["decode_prompt_sha256"][slot], expected)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_dp_measurement_uses_shared_four_card_recipe(self):
         args = SimpleNamespace(recipe="dp-4", profile="", ubatch=512, slots=40, context=40*442368,
                                adaptive=0.18, binary="/bin", model="/model.gguf", port=8102, depth=2,

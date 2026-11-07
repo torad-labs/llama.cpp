@@ -424,49 +424,91 @@ void server_response::remove_waiting_task_ids(const std::unordered_set<int> & id
     }
 }
 
-server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
-    while (true) {
-        std::unique_lock<std::mutex> lock(mutex_results);
-        condition_results.wait(lock, [&]{
-            if (!running) {
-                RES_DBG("%s : queue result stop\n", "recv");
-                std::terminate(); // we cannot return here since the caller is HTTP code
-            }
-            return !queue_results.empty();
-        });
+void server_response::list(const std::unordered_set<int> & id_tasks, waiter & w) {
+    for (const int id_task : id_tasks) {
+        waiters.emplace(id_task, &w);
+    }
+}
 
-        for (size_t i = 0; i < queue_results.size(); i++) {
-            if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
-                server_task_result_ptr res = std::move(queue_results[i]);
-                queue_results.erase(queue_results.begin() + i);
-                return res;
+void server_response::unlist(const std::unordered_set<int> & id_tasks, const waiter & w) {
+    for (const int id_task : id_tasks) {
+        const auto range = waiters.equal_range(id_task);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second == &w) {
+                waiters.erase(it);
+                break;
             }
         }
+    }
+}
+
+void server_response::wake(int id_task) {
+    const auto range = waiters.equal_range(id_task);
+    for (auto it = range.first; it != range.second; ++it) {
+        it->second->woken = true;
+        it->second->cv.notify_one();
+    }
+}
+
+void server_response::wake_all() {
+    for (auto & entry : waiters) {
+        entry.second->woken = true;
+        entry.second->cv.notify_one();
+    }
+}
+
+// the first queued result of one of id_tasks, taken out of the queue (with mutex_results held), or nullptr
+static server_task_result_ptr server_response_take(std::vector<server_task_result_ptr> & queue_results, const std::unordered_set<int> & id_tasks) {
+    for (size_t i = 0; i < queue_results.size(); i++) {
+        if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
+            server_task_result_ptr res = std::move(queue_results[i]);
+            queue_results.erase(queue_results.begin() + i);
+            return res;
+        }
+    }
+    return nullptr;
+}
+
+server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    while (true) {
+        if (!running) {
+            RES_DBG("%s : queue result stop\n", "recv");
+            std::terminate(); // we cannot return here since the caller is HTTP code
+        }
+        if (server_task_result_ptr res = server_response_take(queue_results, id_tasks)) {
+            return res;
+        }
+
+        waiter w;
+        list(id_tasks, w);
+        w.cv.wait(lock, [&] { return w.woken || !running; });
+        unlist(id_tasks, w);
+        n_wakeups++;
     }
 
     // should never reach here
 }
 
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+    std::unique_lock<std::mutex> lock(mutex_results);
     while (true) {
-        std::unique_lock<std::mutex> lock(mutex_results);
-
-        for (int i = 0; i < (int) queue_results.size(); i++) {
-            if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
-                server_task_result_ptr res = std::move(queue_results[i]);
-                queue_results.erase(queue_results.begin() + i);
-                return res;
-            }
+        if (server_task_result_ptr res = server_response_take(queue_results, id_tasks)) {
+            return res;
         }
 
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+        waiter w;
+        list(id_tasks, w);
+        const bool woken = w.cv.wait_for(lock, std::chrono::seconds(timeout), [&] { return w.woken || !running; });
+        unlist(id_tasks, w);
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
             std::terminate(); // we cannot return here since the caller is HTTP code
         }
-        if (cr_res == std::cv_status::timeout) {
+        if (!woken) {
             return nullptr;
         }
+        n_wakeups++;
     }
 
     // should never reach here
@@ -481,15 +523,14 @@ void server_response::send(server_task_result_ptr && result) {
     RES_DBG("sending result for task id = %d\n", result->id);
 
     std::unique_lock<std::mutex> lock(mutex_results);
-    for (const auto & id_task : waiting_task_ids) {
-        if (result->id == id_task) {
-            RES_DBG("task id = %d pushed to result queue\n", result->id);
-
-            queue_results.emplace_back(std::move(result));
-            condition_results.notify_all();
-            return;
-        }
+    const int id_task = result->id;
+    if (waiting_task_ids.count(id_task) == 0) {
+        return;
     }
+    RES_DBG("task id = %d pushed to result queue\n", id_task);
+
+    queue_results.emplace_back(std::move(result));
+    wake(id_task);
 }
 
 void server_response::broadcast(server_task_result_ptr && result) {
@@ -500,12 +541,13 @@ void server_response::broadcast(server_task_result_ptr && result) {
         res_copy->id = id_task; // override id with target task id
         queue_results.emplace_back(std::move(res_copy));
     }
-    condition_results.notify_all();
+    wake_all();
 }
 
 void server_response::terminate() {
+    std::unique_lock<std::mutex> lock(mutex_results);
     running = false;
-    condition_results.notify_all();
+    wake_all();
 }
 
 //

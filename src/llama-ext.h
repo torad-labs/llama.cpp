@@ -26,8 +26,9 @@ LLAMA_API bool llama_model_set_draft_vocab(struct llama_model * model, const lla
 // decodes must happen outside a round. KV mutations invalidate every retained selection.
 LLAMA_API bool llama_mtp_draft_step(struct llama_context * ctx, int32_t step);
 
-// Retain bounded GLM MTP generation/catch-up shapes in the existing three extra graph slots.
-// Set during drafter setup. Zero restores the default 32-row limit; unsupported contexts return false.
+// Retain bounded GLM MTP shapes in the existing three extra graph slots: the head's generation/catch-up shapes on its
+// context, and the verifications of its drafts on the target's (n_max + 1 rows a sequence). Set during drafter setup.
+// Zero restores the default 32-row limit; unsupported contexts return false.
 LLAMA_API bool llama_set_mtp_graph_reuse(struct llama_context * ctx, int32_t n_max);
 
 // True while a lazy grammar sampler waits for its trigger: its apply leaves every logit as it is until then.

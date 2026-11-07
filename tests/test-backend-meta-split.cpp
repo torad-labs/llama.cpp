@@ -22,21 +22,45 @@
 #include <random>
 #include <vector>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/resource.h>
+#endif
+
 static constexpr int64_t n_cols = 64;
 static constexpr int64_t n_rows = 8;
 
 static std::atomic<int> captured {0};
 static unsigned long long expert_hits = 0;
+static unsigned long long reductions_to_owners = 0; // the internal AllReduce's, logged when its pipeline is freed
+static unsigned long long reductions_to_all = 0;
 static ggml_backend_dev_t peer = nullptr;
 static std::array<ggml_backend_dev_t, 4> host_devices = {};
 
 static ggml_backend_dev_t second_device(ggml_backend_dev_t first) { return peer ? peer : first; }
+
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
 
 static void log_cb(ggml_log_level level, const char * text, void *) {
     if (strstr(text, "ggml_backend_cuda_capture_end") && strstr(text, " nodes, ")) { ++captured; }
     int device, first;
     unsigned long long total;
     if (sscanf(text, "dp_experts device=%d first=%d total=%llu", &device, &first, &total) == 3) { expert_hits += total; }
+    unsigned long long owners, all;
+    if (const char * counts = strstr(text, "ggml_cuda_ar_pipeline_free: ");
+            counts && sscanf(counts, "ggml_cuda_ar_pipeline_free: %llu reductions to owners, %llu to every rank", &owners, &all) == 2) {
+        reductions_to_owners += owners;
+        reductions_to_all += all;
+    }
     if (level != GGML_LOG_LEVEL_DEBUG) { fputs(text, stderr); }
 }
 
@@ -131,6 +155,152 @@ static bool test_rows(ggml_backend_dev_t gpu, bool explicit_layout) {
     ggml_free(ctx);
     ggml_backend_buffer_free(buffer);
     ggml_free(weights);
+    ggml_backend_free(backend);
+    return ok;
+}
+
+static bool split_test_stack_limit() {
+#if defined(__unix__) || defined(__APPLE__)
+    rlimit limit;
+    if (getrlimit(RLIMIT_STACK, &limit) != 0) { return false; }
+    limit.rlim_cur = std::min(limit.rlim_cur, rlim_t(8*1024*1024));
+    if (setrlimit(RLIMIT_STACK, &limit) != 0) { return false; }
+#endif
+    return true;
+}
+
+static bool test_split_cache(ggml_backend_dev_t device, bool cycle = false) {
+    ggml_backend_dev_t devices[] = {device, device, device, device};
+    ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_meta_device(devices, 4, split_rows, nullptr), nullptr);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    constexpr size_t graph_size = 1024;
+    ggml_context * ctx = ggml_init({graph_size*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false), nullptr, true});
+    const int64_t layouts[][4] = {{2, 2, 2, 2}, {3, 0, 3, 1}, {0, 0, 3, 0}, {0, 0, 0, 1}};
+    bool ok = true;
+    for (int depth : {16, 512}) {
+        for (const auto & rows : layouts) {
+            // Reuse the tensor arena and allocator while the active owners and graph shape change.
+            ggml_reset(ctx);
+            ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+            const int64_t count = rows[0] + rows[1] + rows[2] + rows[3];
+            ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, count);
+            ggml_set_input(input);
+            ggml_backend_meta_split_input(input, 1, rows, 4);
+            ggml_tensor * out = input;
+            ggml_tensor * first = nullptr;
+            for (int i = 0; i < depth; ++i) {
+                out = ggml_scale(ctx, out, 1.0f);
+                if (i == 0) { first = out; }
+                // Keep graph construction shallow too: only the new node is unvisited.
+                ggml_build_forward_expand(graph, out);
+            }
+            ggml_set_name(first, "split_chain_first");
+            ggml_set_name(out, "split_chain_last");
+            ggml_set_output(out);
+            GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+            std::vector<float> data(4*count), result(4*count);
+            for (size_t i = 0; i < data.size(); ++i) { data[i] = float(i + 1); }
+            ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+            GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
+            ok = result == data && ok;
+            if (cycle) {
+                GGML_ASSERT(ok);
+                first->src[0] = out;
+                ggml_set_abort_callback([](const char * message) {
+                    const bool detected = strstr(message, "cycle in Meta split") && strstr(message, "split_chain_first") && strstr(message, "split_chain_last");
+                    fprintf(stderr, "%s split dependency cycle: %s\n", detected ? "ok  " : "FAIL", message);
+                    std::exit(detected ? 0 : 1);
+                });
+            }
+            // A name change invalidates the cached header without changing the valid graph's arithmetic or layout.
+            ggml_set_name(out, "split_chain_last_cold");
+            ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
+            ok = !cycle && result == data && ok;
+            printf("%s cold split cache depth %d owners %lld/%lld/%lld/%lld\n", ok ? "ok  " : "FAIL", depth,
+                (long long) rows[0], (long long) rows[1], (long long) rows[2], (long long) rows[3]);
+        }
+    }
+
+    ggml_context * leaves = ggml_init({2*ggml_tensor_overhead(), nullptr, true});
+    ggml_tensor * a = ggml_new_tensor_2d(leaves, GGML_TYPE_F32, 4, 8);
+    ggml_tensor * b = ggml_new_tensor_2d(leaves, GGML_TYPE_F32, 4, 8);
+    for (auto * leaf : {a, b}) { ggml_backend_meta_split_input(leaf, 1, layouts[0], 4); }
+    ggml_backend_buffer_t leaf_buffer = ggml_backend_alloc_ctx_tensors_from_buft(leaves, ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(leaf_buffer);
+    ggml_reset(ctx);
+    ggml_tensor * sum = ggml_add(ctx, a, b);
+    ggml_set_output(sum);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_build_forward_expand(graph, sum);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+    std::vector<float> data(32), result(32);
+    for (size_t i = 0; i < data.size(); ++i) { data[i] = float(i + 1); }
+    for (auto * leaf : {a, b}) { ggml_backend_tensor_set(leaf, data.data(), 0, ggml_nbytes(leaf)); }
+    GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(sum, result.data(), 0, ggml_nbytes(sum));
+    for (size_t i = 0; i < data.size(); ++i) { ok = result[i] == 2*data[i] && ok; }
+    // A fresh root keeps its entry lookup from clearing the cache. The stale later sibling clears it only after the
+    // earlier sibling has resolved, forcing the root to resolve that earlier sibling again before it can finish.
+    ggml_set_name(b, "changed_late_dependency");
+    ggml_context * root_ctx = ggml_init({ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false), nullptr, true});
+    ggml_tensor * cold_root = ggml_add(root_ctx, a, b);
+    ggml_set_output(cold_root);
+    ggml_cgraph * cold_graph = ggml_new_graph_custom(root_ctx, graph_size, false);
+    ggml_build_forward_expand(cold_graph, cold_root);
+    ggml_backend_buffer_t root_buffer = ggml_backend_alloc_ctx_tensors_from_buft(root_ctx, ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(root_buffer);
+    ggml_backend_buffer_free(root_buffer);
+    cold_root->buffer = nullptr;
+    cold_root->data = nullptr;
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, cold_graph));
+    GGML_ASSERT(ggml_backend_graph_compute(backend, cold_graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(cold_root, result.data(), 0, ggml_nbytes(cold_root));
+    for (size_t i = 0; i < data.size(); ++i) { ok = result[i] == 2*data[i] && ok; }
+    printf("%s split cache invalidation during dependency traversal\n", ok ? "ok  " : "FAIL");
+    ggml_free(root_ctx);
+
+    ggml_reset(ctx);
+    ggml_tensor * shared = ggml_scale(ctx, a, 2.0f);
+    ggml_tensor * left = ggml_scale(ctx, shared, 3.0f);
+    ggml_tensor * right = ggml_scale(ctx, shared, 5.0f);
+    ggml_tensor * joined = ggml_add(ctx, left, right);
+    ggml_set_output(joined);
+    graph = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_build_forward_expand(graph, joined);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+    GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(joined, result.data(), 0, ggml_nbytes(joined));
+    for (size_t i = 0; i < data.size(); ++i) { ok = result[i] == 16*data[i] && ok; }
+    ggml_set_name(joined, "cold_shared_descendant");
+    ggml_backend_tensor_get(joined, result.data(), 0, ggml_nbytes(joined));
+    for (size_t i = 0; i < data.size(); ++i) { ok = result[i] == 16*data[i] && ok; }
+    printf("%s split cache shared descendant branches\n", ok ? "ok  " : "FAIL");
+
+    ggml_reset(ctx);
+    ggml_tensor * view = ggml_view_2d(ctx, a, 4, 4, 2*a->nb[1], 0);
+    GGML_ASSERT(!ggml_is_contiguous(view));
+    for (int i = 0; i < 512; ++i) { view = ggml_view_2d(ctx, view, 4, 4, view->nb[1], 0); }
+    ggml_tensor * deep_view = ggml_scale(ctx, view, 1.0f);
+    ggml_set_output(deep_view);
+    graph = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_build_forward_expand(graph, deep_view);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+    GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> view_expected(16), view_result(16);
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) { view_expected[row*4 + col] = data[row*8 + col]; }
+    }
+    ggml_backend_tensor_get(deep_view, view_result.data(), 0, ggml_nbytes(deep_view));
+    ok = view_result == view_expected && ok;
+    ggml_set_name(deep_view, "cold_nested_view_chain");
+    ggml_backend_tensor_get(deep_view, view_result.data(), 0, ggml_nbytes(deep_view));
+    ok = view_result == view_expected && ok;
+    printf("%s split cache nested view chain depth 512\n", ok ? "ok  " : "FAIL");
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(leaf_buffer);
+    ggml_free(leaves);
     ggml_backend_free(backend);
     return ok;
 }
@@ -491,12 +661,12 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
     const int captured_before = captured;
     const auto hits_before = expert_hits;
     ggml_backend_dev_t devs[] = {gpu, second_device(gpu), gpu, second_device(gpu)};
-    ggml_backend_t meta = ggml_backend_dev_init(ggml_backend_meta_device(devs, 4, split_rows, nullptr), nullptr);
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devs, 4, split_rows, nullptr);
+    ggml_backend_t meta = ggml_backend_dev_init(meta_dev, nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    std::vector<float> results[2];
-    for (int mode = 0; mode < 2; ++mode) {
-        const bool partition = mode == 1;
-        ggml_backend_t backend = partition ? meta : cpu;
+    // six routes through the experts, unsplit on the CPU or split over the meta backend's four ranks
+    const auto run = [&](ggml_backend_t backend, bool partition) {
+        std::vector<float> result;
         ggml_context * weights = ggml_init({8*ggml_tensor_overhead(), nullptr, true});
         ggml_tensor * w[3];
         const int64_t counts[] = {2, 2, 2, 2};
@@ -551,7 +721,7 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
         for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 17) - 8)/16; }
         // The last rank has no selected experts; rows also mix local and remote expert lanes.
         const int32_t selected[] = {0, 1, 2, 3, 1, 4, 3, 0, 5, 2};
-        results[mode].resize(6*256*5);
+        result.resize(6*256*5);
         for (int iteration = 0; iteration < 6; ++iteration) {
             int32_t routed[10];
             float probabilities[10];
@@ -561,13 +731,15 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
             ggml_backend_tensor_set(ids, routed, 0, ggml_nbytes(ids));
             ggml_backend_tensor_set(routing, probabilities, 0, ggml_nbytes(routing));
             GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
-            ggml_backend_tensor_get(out, results[mode].data() + iteration*256*5, 0, ggml_nbytes(out));
+            ggml_backend_tensor_get(out, result.data() + iteration*256*5, 0, ggml_nbytes(out));
         }
         ggml_backend_sched_free(sched);
         ggml_free(ctx);
         ggml_backend_buffer_free(buffer);
         ggml_free(weights);
-    }
+        return result;
+    };
+    const std::vector<float> results[2] = {run(cpu, false), run(meta, true)};
     double error = 0, norm = 0;
     for (size_t i = 0; i < results[0].size(); ++i) {
         const double delta = results[1][i] - results[0][i];
@@ -580,12 +752,41 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
     }
     printf("%s %s expert partition against unsplit CPU, NMSE %.9g, %d captures\n", ok ? "ok  " : "FAIL", ggml_type_name(type), error/norm, captured - captured_before);
     ggml_backend_free(meta);
-    ggml_backend_free(cpu);
     if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu)), "CUDA") == 0) {
         const auto hits = expert_hits - hits_before;
         printf("%s expert telemetry: %llu hits in six routes, expected 60\n", hits == 60 ? "ok  " : "FAIL", hits);
         ok = ok && hits == 60;
+
+        // -sm dp reduces the experts' sum before a scatter by rows: each card takes only its own rows of it, and the
+        // output is the one the reduction to every card gives, bit for bit (the internal AllReduce's pipeline counts
+        // its reductions and logs them when it is freed). The sum goes the chunked kernel's way, as a 36- to 108-row
+        // verify's at 4096 wide does; this one, 5 KB, would otherwise take the LL kernel.
+        std::vector<float> outputs[2];
+        unsigned long long to_owners[2], to_all[2];
+        set_env("GGML_CUDA_ALLREDUCE", "internal");
+        set_env("GGML_CUDA_AR_LL_MAX_BYTES", "0");
+        set_env("GGML_CUDA_AR_P2P_MAX_BYTES", "0");
+        for (int all = 0; all < 2; ++all) {
+            set_env("GGML_CUDA_AR_REDUCE_OWNERS", all ? "0" : nullptr);
+            const auto owners_before = reductions_to_owners, all_before = reductions_to_all;
+            ggml_backend_t backend = ggml_backend_dev_init(meta_dev, nullptr);
+            outputs[all] = run(backend, true);
+            ggml_backend_free(backend);
+            to_owners[all] = reductions_to_owners - owners_before;
+            to_all[all] = reductions_to_all - all_before;
+        }
+        set_env("GGML_CUDA_AR_REDUCE_OWNERS", nullptr);
+        set_env("GGML_CUDA_AR_P2P_MAX_BYTES", nullptr);
+        set_env("GGML_CUDA_AR_LL_MAX_BYTES", nullptr);
+        set_env("GGML_CUDA_ALLREDUCE", nullptr);
+        const bool same = memcmp(outputs[0].data(), outputs[1].data(), outputs[0].size()*sizeof(float)) == 0;
+        const bool owned = to_owners[0] > 0 && to_all[0] == 0 && to_owners[1] == 0 && to_all[1] > 0;
+        printf("%s %s experts' sum to its rows' owners: %llu reductions to owners and %llu to every card, against %llu "
+               "and %llu with GGML_CUDA_AR_REDUCE_OWNERS=0; outputs %s\n", same && owned ? "ok  " : "FAIL", ggml_type_name(type),
+               to_owners[0], to_all[0], to_owners[1], to_all[1], same ? "equal bit for bit" : "differ");
+        ok = ok && same && owned;
     }
+    ggml_backend_free(cpu);
     return ok;
 }
 
@@ -893,6 +1094,9 @@ int main(int argc, char ** argv) {
 #endif
     ggml_log_set(log_cb, nullptr);
     ggml_backend_dev_t gpu = nullptr;
+    if (argc == 2 && (strcmp(argv[1], "--split-cache-cpu") == 0 || strcmp(argv[1], "--split-cycle-cpu") == 0)) {
+        return split_test_stack_limit() && test_split_cache(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), strcmp(argv[1], "--split-cycle-cpu") == 0) ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--host-layout-cpu") == 0) {
         return test_host_layout(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
     }

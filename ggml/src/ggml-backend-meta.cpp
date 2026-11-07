@@ -714,6 +714,30 @@ static bool ggml_backend_meta_has_stream_view(const ggml_tensor * tensor) {
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+static const ggml_backend_meta_buffer_context::cached_split * ggml_backend_meta_find_split(const ggml_tensor * tensor, bool assume_sync) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+    auto * ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const auto it = ctx->split_state_cache.find({tensor, assume_sync});
+    if (it == ctx->split_state_cache.end()) { return nullptr; }
+    if (memcmp(it->second.second, tensor, sizeof(it->second.second)) != 0) {
+        ctx->split_state_cache.clear();
+        return nullptr;
+    }
+    return &it->second;
+}
+
+static const ggml_backend_meta_buffer_context::cached_split & ggml_backend_meta_cached_split(const ggml_tensor * tensor, bool assume_sync) {
+    const auto * ctx = (const ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const auto it = ctx->split_state_cache.find({tensor, assume_sync});
+    GGML_ASSERT(it != ctx->split_state_cache.end());
+    GGML_ASSERT(memcmp(it->second.second, tensor, sizeof(it->second.second)) == 0);
+    return it->second;
+}
+
+static bool ggml_backend_meta_cached_owns_rows(const ggml_tensor * tensor) {
+    return tensor && ggml_backend_buffer_is_meta(tensor->buffer) && ggml_backend_meta_cached_split(tensor, true).owned_rows;
+}
+
 // Whether a tensor holds rows the devices own (-sm dp): its split was declared with ggml_backend_meta_split_input, a
 // scatter or a stream view, or it was computed from a tensor that was. Each device then holds a contiguous run of the
 // tensor's bytes along the split axis. A tensor split by the device's callback (-sm tensor) holds no such run: the
@@ -728,10 +752,10 @@ static bool ggml_backend_meta_owns_rows(const ggml_tensor * tensor) {
 }
 
 static bool ggml_backend_meta_slice_view(const ggml_tensor * tensor, const ggml_backend_meta_split_state & source,
-        size_t n_devices, ggml_backend_meta_view_layout & layout) {
+        size_t n_devices, bool owns_rows, ggml_backend_meta_view_layout & layout) {
     const ggml_tensor * root = ggml_backend_meta_view_base(tensor);
     if (tensor->op != GGML_OP_VIEW || root == nullptr || !ggml_is_contiguous(root) ||
-            source.axis < 0 || source.axis >= GGML_MAX_DIMS || !ggml_backend_meta_owns_rows(root)) {
+            source.axis < 0 || source.axis >= GGML_MAX_DIMS || !owns_rows) {
         return false;
     }
     for (int d = source.axis + 1; d < GGML_MAX_DIMS; ++d) { if (root->ne[d] != 1) { return false; } }
@@ -810,14 +834,14 @@ static bool ggml_backend_meta_slice_view(const ggml_tensor * tensor, const ggml_
     return true;
 }
 
-static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 
-    const auto owned_rows = ggml_backend_meta_owns_rows;
+    const auto owned_rows = ggml_backend_meta_cached_owns_rows;
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
@@ -1257,7 +1281,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
         if (tensor->op == GGML_OP_VIEW && (tensor->flags & GGML_TENSOR_FLAG_META)) {
-            const auto source = ggml_backend_meta_get_split_state(tensor->src[0], true);
+            const auto source = ggml_backend_meta_cached_split(tensor->src[0], true).first;
             GGML_ASSERT(source.axis == GGML_BACKEND_SPLIT_AXIS_2 && source.n_segments == 1 && source.nr[0] == 1);
             ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_3, {0}, {1}, 1};
             int64_t total = 0;
@@ -1273,7 +1297,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         }
         if ((tensor->flags & GGML_TENSOR_FLAG_META) && (tensor->op == GGML_OP_NONE || tensor->op == GGML_OP_RESHAPE)) {
             if (tensor->op == GGML_OP_RESHAPE) {
-                GGML_ASSERT(ggml_backend_meta_get_split_state(tensor->src[0], true).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(ggml_backend_meta_cached_split(tensor->src[0], true).first.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             uint32_t params[GGML_BACKEND_META_MAX_DEVICES];
             memcpy(params, tensor->op_params, sizeof(params));
@@ -1311,8 +1335,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
 
         if (tensor->op == GGML_OP_VIEW && tensor->view_src != nullptr && !ggml_backend_meta_has_stream_view(tensor->src[0])) {
             ggml_backend_meta_view_layout layout;
-            const auto root_split = ggml_backend_meta_get_split_state(ggml_backend_meta_view_base(tensor), true);
-            if (ggml_backend_meta_slice_view(tensor, root_split, n_bufs, layout)) { return layout.split; }
+            const auto * root = ggml_backend_meta_view_base(tensor);
+            const auto root_split = ggml_backend_meta_cached_split(root, true).first;
+            if (ggml_backend_meta_slice_view(tensor, root_split, n_bufs, owned_rows(root), layout)) { return layout.split; }
         }
 
         std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
@@ -1321,7 +1346,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
                 src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
                 continue;
             }
-            src_ss[i] = ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true);
+            src_ss[i] = ggml_backend_meta_cached_split(tensor->src[i], /*assume_sync =*/ true).first;
             if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
                 GGML_ABORT("unknown split for %s (%s) source %zu %s (%s) [%lld,%lld,%lld,%lld]",
                     tensor->name, ggml_op_name(tensor->op), i, tensor->src[i]->name, ggml_op_name(tensor->src[i]->op),
@@ -1706,13 +1731,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     };
 
     const std::pair key = std::make_pair(tensor, assume_sync);
-    auto it = buf_ctx->split_state_cache.find(key);
-    if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        buf_ctx->split_state_cache.clear();
-        it = buf_ctx->split_state_cache.end();
-    }
-
-    if (it == buf_ctx->split_state_cache.end()) {
+    {
         const auto state = calculate_split_state();
         bool is_owned = false;
         if (state.axis >= 0 && state.axis < GGML_MAX_DIMS) {
@@ -1736,7 +1755,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
                     srcs_info += ", ";
                 }
                 const ggml_backend_meta_split_state split_state =
-                        ggml_backend_meta_get_split_state(tensor->src[i], true);
+                        ggml_backend_meta_cached_split(tensor->src[i], true).first;
                 GGML_ASSERT(split_state.n_segments == 1);
                 const char * axis_name = ggml_backend_meta_split_axis_name(split_state.axis);
                 std::string ne_info;
@@ -1775,6 +1794,65 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     }
 #endif // NDEBUG
     return ret;
+}
+
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    if (const auto * cached = ggml_backend_meta_find_split(tensor, assume_sync)) { return cached->first; }
+
+    using key_type = std::pair<const ggml_tensor *, bool>;
+    std::vector<key_type> pending = {{tensor, assume_sync}};
+    std::map<key_type, size_t> visiting = {{pending.back(), 0}};
+    while (!pending.empty()) {
+        const auto key = pending.back();
+        const auto * node = key.first;
+        if (ggml_backend_meta_find_split(node, key.second)) {
+            visiting.erase(key);
+            pending.pop_back();
+            continue;
+        }
+
+        const auto * ctx = (const ggml_backend_meta_buffer_context *) node->buffer->context;
+        const bool explicit_layout = (node->flags & GGML_TENSOR_FLAG_META) &&
+            (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE);
+        const bool terminal = ggml_nelements(node) == 0 || (node->op == GGML_OP_PAD && ggml_is_empty(node->src[0])) ||
+            (explicit_layout && node->op == GGML_OP_NONE);
+        const bool from_callback = ggml_backend_buffer_get_usage(node->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && !node->view_src;
+        const ggml_tensor * missing = nullptr;
+
+        // A header mismatch can clear states completed earlier in this walk. Recheck dependencies after each descent.
+        if (!terminal || ctx->debug > 0) {
+            const int n_src = explicit_layout && ctx->debug == 0 ? 1 : GGML_MAX_SRC;
+            for (int i = 0; i < n_src; ++i) {
+                const auto * source = node->src[i];
+                if (!source || source == node || (from_callback && !ggml_backend_buffer_is_meta(source->buffer))) { continue; }
+                if (!ggml_backend_meta_find_split(source, true)) { missing = source; break; }
+            }
+            if (!missing && node->op == GGML_OP_VIEW && node->view_src && !explicit_layout) {
+                const auto * root = ggml_backend_meta_view_base(node);
+                if (!ggml_backend_meta_find_split(root, true)) { missing = root; }
+            }
+        }
+        if (missing) {
+            const key_type dependency = {missing, true};
+            if (const auto it = visiting.find(dependency); it != visiting.end()) {
+                std::string path;
+                const size_t start = std::max(it->second, pending.size() > 8 ? pending.size() - 8 : 0);
+                for (size_t i = start; i < pending.size(); ++i) {
+                    if (!path.empty()) { path += " -> "; }
+                    path += std::string(pending[i].first->name) + ":" + ggml_op_name(pending[i].first->op);
+                }
+                GGML_ABORT("cycle in Meta split dependencies: %s -> %s:%s", path.c_str(), missing->name, ggml_op_name(missing->op));
+            }
+            visiting.emplace(dependency, pending.size());
+            pending.push_back(dependency);
+            continue;
+        }
+
+        ggml_backend_meta_calculate_split_state(node, key.second);
+        visiting.erase(key);
+        pending.pop_back();
+    }
+    return ggml_backend_meta_cached_split(tensor, assume_sync).first;
 }
 
 // A pad along the axis its source is split by gathers the source. Each device pads its own slice out to the whole
@@ -1831,7 +1909,8 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
     int64_t expert_offset = 0;
     ggml_backend_meta_view_layout view_layout;
     const bool sliced_view = tensor->op == GGML_OP_VIEW && !stream_view && !local_view && tensor->view_src != nullptr &&
-        ggml_backend_meta_slice_view(tensor, ggml_backend_meta_get_split_state(ggml_backend_meta_view_base(tensor), true), n_simple_bufs, view_layout);
+        ggml_backend_meta_slice_view(tensor, ggml_backend_meta_get_split_state(ggml_backend_meta_view_base(tensor), true), n_simple_bufs,
+            ggml_backend_meta_owns_rows(ggml_backend_meta_view_base(tensor)), view_layout);
 
     simple_tensors.clear();
     simple_tensors.reserve(n_simple_bufs);
@@ -2592,7 +2671,15 @@ struct ggml_backend_meta_context {
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_comm_allreduce_next_t   comm_allreduce_next = nullptr;
     ggml_backend_comm_allgather_tensor_t comm_allgather = nullptr; // null: the generic gather
+    ggml_backend_comm_reduce_owned_tensor_t comm_reduce_owned = nullptr; // null: every reduction goes to every device
     std::vector<bool>                    gathers; // a subgraph ends with a gather (ggml_backend_meta_is_gather)
+    // A subgraph's reduction whose only reader is a scatter by rows: the elements each device reads of it, else !valid
+    struct owned_layout {
+        bool    valid = false;
+        int64_t begin[GGML_BACKEND_META_MAX_DEVICES] = {};
+        int64_t len[GGML_BACKEND_META_MAX_DEVICES]   = {};
+    };
+    std::vector<owned_layout>            owned;
     ggml_backend_graph_next_t            graph_next     = nullptr; // the simple backends' look ahead, or null
 
     // A whole evaluation of a cgraph, every step's subgraph and all-reduce on every device, captured into one graph a
@@ -2616,7 +2703,8 @@ struct ggml_backend_meta_context {
             std::vector<void *> execs;           // its graphs, one a device, once captured
             uint64_t            t_used  = 0;     // the evaluation it was last used by
         };
-        static constexpr size_t n_graphs_max = 4; // the least recently used goes first
+        static constexpr size_t n_graphs_max = 4; // scheduler graphs, not individual splits
+        size_t                  n_splits_max = 1;
         std::vector<graph>      graphs;
         uint64_t                t_now = 0; // the evaluations so far, t_used's clock
 
@@ -2634,7 +2722,9 @@ struct ggml_backend_meta_context {
     }
 
     // the state of the cgraph of this uid, new if it has none
-    capture_state::graph & capture_graph(uint64_t uid, int n_nodes) {
+    capture_state::graph & capture_graph(uint64_t uid, int n_nodes, int n_backend_splits) {
+        // Keep all fragments of the active graph slots, including their first evaluations before capture.
+        capture.n_splits_max = std::max(capture.n_splits_max, (size_t) std::max(1, n_backend_splits));
         capture.t_now++;
         for (capture_state::graph & g : capture.graphs) {
             if (g.uid == uid) {
@@ -2642,7 +2732,7 @@ struct ggml_backend_meta_context {
                 return g;
             }
         }
-        if (capture.graphs.size() < capture_state::n_graphs_max) {
+        if (capture.graphs.size() < capture_state::n_graphs_max*capture.n_splits_max) {
             capture.graphs.emplace_back();
         } else {
             capture_state::graph & lru = *std::min_element(capture.graphs.begin(), capture.graphs.end(),
@@ -2824,6 +2914,8 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_next");
             comm_allgather = (ggml_backend_comm_allgather_tensor_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allgather_tensor");
+            comm_reduce_owned = (ggml_backend_comm_reduce_owned_tensor_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_reduce_owned_tensor");
             capture.allreduce_capturable = (ggml_backend_comm_allreduce_capturable_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_capturable");
             capture.allgather_capturable = (ggml_backend_comm_allgather_capturable_t)
@@ -3040,7 +3132,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_backend_meta_context::capture_state & cap = backend_ctx->capture;
     ggml_backend_meta_context::capture_state::graph * cg = nullptr;
     if (!capture_legacy && n_backends > 1 && cgraph->uid != 0 && cap.available()) {
-        cg = &backend_ctx->capture_graph(cgraph->uid, cgraph->n_nodes);
+        cg = &backend_ctx->capture_graph(cgraph->uid, cgraph->n_nodes, cgraph->n_backend_splits);
         if (!cg->execs.empty()) {
             if (backend_ctx->trace_graphs) {
                 GGML_LOG_INFO("graph_trace layer=meta event=replay context=%p uid=%llu ranks=%zu nodes=%d\n",
@@ -3253,7 +3345,58 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return i_delayed;
             };
 
+            // The elements each device reads of the reduction of node i, when its one reader is a scatter by rows
+            // (ggml_backend_meta_scatter, a view of device j's own rows at their offset): only those need the sum there.
+            using owned_layout = std::remove_reference_t<decltype(backend_ctx->owned)>::value_type;
+            auto get_owned = [&](const int i) -> owned_layout {
+                owned_layout owned;
+                ggml_tensor * node = cgraph->nodes[i];
+                if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
+                        !ggml_is_contiguous(node) || ggml_blck_size(node->type) != 1) {
+                    return owned;
+                }
+                // every later node that reads node, directly or through a view of it, counts: one alone, the scatter
+                ggml_tensor * reader = nullptr;
+                for (int id = i + 1; id < cgraph->n_nodes; id++) {
+                    ggml_tensor * next = cgraph->nodes[id];
+                    bool reads = next->view_src == node;
+                    for (int s = 0; s < GGML_MAX_SRC; s++) {
+                        reads = reads || next->src[s] == node;
+                    }
+                    if (reads && reader != nullptr) {
+                        return owned;
+                    }
+                    reader = reads ? next : reader;
+                }
+                if (reader == nullptr || reader->op != GGML_OP_RESHAPE || !(reader->flags & GGML_TENSOR_FLAG_META) ||
+                        reader->view_src != node || reader->view_offs != 0 || !ggml_are_same_shape(reader, node) ||
+                        !ggml_are_same_stride(reader, node)) {
+                    return owned;
+                }
+                const ggml_backend_meta_split_state split = ggml_backend_meta_get_split_state(reader, /*assume_sync =*/ true);
+                const int axis = split.axis;
+                if (axis < 0 || axis >= GGML_MAX_DIMS || split.n_segments != 1 || split.nr[0] != 1 ||
+                        node->nb[axis] % ggml_type_size(node->type) != 0) {
+                    return owned;
+                }
+                for (int d = axis + 1; d < GGML_MAX_DIMS; d++) {
+                    if (node->ne[d] != 1) {
+                        return owned;
+                    }
+                }
+                const int64_t per_row = (int64_t) (node->nb[axis] / ggml_type_size(node->type));
+                int64_t total = 0;
+                for (size_t j = 0; j < n_backends; j++) {
+                    owned.begin[j] = total * per_row;
+                    owned.len[j]   = split.ne[j] * per_row;
+                    total += split.ne[j];
+                }
+                owned.valid = total == node->ne[axis];
+                return owned;
+            };
+
             backend_ctx->gathers.clear();
+            backend_ctx->owned.clear();
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -3290,6 +3433,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 i = i_delayed;
+                backend_ctx->owned.push_back(gather || i + 1 == cgraph->n_nodes ? owned_layout{} : get_owned(i));
 
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
@@ -3624,9 +3768,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                         next.push_back(bcj.cgraphs[i + 1].cgraph_main);
                     }
-                    backend_allreduce_success = backend_ctx->comm_allreduce_next
+                    // a reduction read only by a scatter by rows goes to each device's rows alone, where the comm can
+                    const auto & owned = backend_ctx->owned[i];
+                    backend_allreduce_success = owned.valid && backend_ctx->comm_reduce_owned &&
+                        backend_ctx->comm_reduce_owned(backend_ctx->comm_ctx, nodes.data(), owned.begin, owned.len);
+                    backend_allreduce_success = backend_allreduce_success || (backend_ctx->comm_allreduce_next
                         ? backend_ctx->comm_allreduce_next(backend_ctx->comm_ctx, nodes.data(), next.data())
-                        : backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                        : backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data()));
                 }
 
                 if (!backend_allreduce_success) {

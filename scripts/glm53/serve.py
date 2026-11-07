@@ -41,6 +41,8 @@ def arguments(argv=None):
     parser.add_argument("--mtp-depth", choices=["1", "2", "off"], default=DEFAULT_MTP_DEPTH)
     parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
     parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP; 0 removes the cap")
+    parser.add_argument("--trace-decode", action="store_true",
+                        help="Opt-in host phase/batch markers, graph identity and CUDA NVTX; not an unprofiled speed run")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -84,9 +86,7 @@ def make_plan(args):
     argv += ["-c", str(slots * DP_SLOT_CONTEXT) if dp else "524288", "-np", str(slots)]
     if not dp:
         argv += ["--kv-unified"]
-    argv += ["--cache-ram", "32768"]
-    if not dp:
-        argv += ["--no-cache-idle-slots"]
+    argv += ["--cache-ram", "32768", "--no-cache-idle-slots"]
     argv += ["--metrics", "--host", args.host, "--port", str(args.port), "--log-timestamps"]
     env = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3" if dp else "0,1",
@@ -97,11 +97,17 @@ def make_plan(args):
         "LD_LIBRARY_PATH": str(server.parent),
     }
     if dp:
-        env["GGML_CUDA_GRAPH_MEM_STATS"] = "0"
+        # Keep infrequent shapes warm with a finite node budget; qualification still enforces 4096 MiB free per GPU.
+        env.update({"GGML_CUDA_GRAPH_MEM_STATS": "0", "GGML_CUDA_GRAPH_NODES": "32768",
+                    "GGML_CUDA_GRAPH_IDLE_MS": "0"})
     if not dp:
         env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
+    if args.trace_decode:
+        argv += ["-lv", "4"]
+        env.update({"LLAMA_DECODE_TRACE": "1", "GGML_CUDA_NVTX": "1",
+                    "GGML_GRAPH_TRACE": "1", "LLAMA_TIME_DECODE": "1"})
     return argv, env
 
 

@@ -13,6 +13,45 @@ BASELINE_COMMIT = "776b8f577dec45f2fba79b6a41ae8b782f5fc3b3"
 BASELINE_ARCHIVE = "48358002368846e49d93da500a852f8b6fb51a53655d563fdbdacddb6c8aa4ef"
 
 
+def serving_window_seconds(profiled):
+    return 360 if profiled else 240
+
+
+def profile_evidence(requested, running, record):
+    result = dict(capture_verified=False)
+    if not requested:
+        return result | dict(state="not_requested")
+    if running or not record:
+        return result | dict(state="invalid", reason="unfinished_profiler" if running else "missing_profile_record")
+    if record.get("error_kind"):
+        return result | dict(state="invalid", reason=record["error_kind"])
+    start = record.get("start", {})
+    if start.get("exit") is not None and start["exit"] != 0:
+        return result | dict(state="start_failed", exit=start["exit"])
+    if start.get("exit") == 0 and (record.get("finalize") or {}).get("report_present") is True:
+        return result | dict(state="exported_unverified")
+    return result | dict(state="invalid", reason="missing_export")
+
+
+def matrix_succeeded(report):
+    plan, servers = report["plan"], report["servers"]
+    if report.get("error") or not plan or len(servers) != len(plan):
+        return False
+    for specification, server in zip(plan, servers):
+        if server.get("skipped") or server.get("error") or server.get("guard") or server.get("short_ok") is not True:
+            return False
+        expected = specification[2] + specification[3]
+        rows = server.get("runs", [])
+        if not expected or len(rows) != len(expected):
+            return False
+        for (active, context), row in zip(expected, rows):
+            if (row.get("skipped") or row.get("error") or row.get("exit") != 0 or row.get("passed") is not True
+                    or (row.get("active"), row.get("context")) != (active, context)
+                    or row.get("profile", {}).get("state") not in ("not_requested", "exported_unverified", "usable")):
+                return False
+    return True
+
+
 def digest(path):
     sha = hashlib.sha256()
     with path.open("rb") as stream:

@@ -18,6 +18,136 @@ from qualification import (BASELINE_COMMIT, device_cases, check_run_identity, ch
 
 
 class QualificationTest(unittest.TestCase):
+    def test_collection_status_cannot_hide_missing_or_failed_profile(self):
+        import qualification
+        cases = [
+            (False, False, None, "not_requested"),
+            (True, True, None, "invalid"),
+            (True, False, None, "invalid"),
+            (True, False, {"start": {"exit": 7}}, "start_failed"),
+            (True, False, {"start": {"exit": 0}, "finalize": {"report_present": False}}, "invalid"),
+            (True, False, {"start": {"exit": 0}, "finalize": {"report_present": True}}, "exported_unverified"),
+        ]
+        for requested, running, record, expected in cases:
+            with self.subTest(expected=expected, record=record):
+                result = qualification.profile_evidence(requested, running, record)
+                self.assertEqual(result["state"], expected)
+                self.assertFalse(result["capture_verified"])
+
+    def test_matrix_success_requires_every_planned_leg_and_quality_check(self):
+        import qualification
+        good = dict(plan=[["B","2",[[36,512]],[]]], servers=[
+            dict(short_ok=True, runs=[dict(active=36, context=512, exit=0, passed=True,
+                                           profile={"state": "not_requested"})])])
+        self.assertTrue(qualification.matrix_succeeded(good))
+        variants = [dict(plan=good["plan"], servers=[]), dict(plan=[], servers=[])]
+        for scope, key, value in (("server","short_ok",False), ("server","error","failed"),
+                                  ("server","guard","memory_reserve"), ("run","exit",1),
+                                  ("run","passed",False), ("run","skipped","window"),
+                                  ("run","profile",{"state":"start_failed"})):
+            bad = copy.deepcopy(good)
+            target = bad["servers"][0]
+            if scope == "run":
+                target = target["runs"][0]
+            target[key] = value
+            variants.append(bad)
+        bad = copy.deepcopy(good)
+        bad["servers"][0]["runs"] = []
+        variants.append(bad)
+        for bad in variants:
+            self.assertFalse(qualification.matrix_succeeded(bad), bad)
+
+    def test_controller_exits_nonzero_but_keeps_teardown_marker_when_engine_is_missing(self):
+        import subprocess
+        import time
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root/"results").mkdir()
+            (root/"results/selected-gpus.json").write_text(json.dumps(dict(
+                selected=[dict(index=i,uuid=f"GPU-fixture-{i}") for i in range(4)])))
+            (root/"engines.py").write_text(
+                "def install_pending(root): return []\ndef installed(root, engine): return False\n")
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name("server_matrix.py")),
+                "--root", folder, "--deadline", str(time.time()+1200), "--tag", "fixture",
+                "--plan", json.dumps([["B","2",[[36,512]],[]]])],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            report = json.loads((root/"results/matrix-fixture.json").read_text())
+            self.assertIs(report["passed"], False)
+            self.assertTrue((root/"results/gpu-work-complete-fixture").is_file())
+
+    def test_controller_retains_failed_leg_and_returns_failure_after_cleanup(self):
+        self.exercise_controller_failure(False, 300)
+
+    def test_profile_controller_uses_the_same_six_minute_reserve_as_preparation(self):
+        self.exercise_controller_failure(True, 480)
+
+    def exercise_controller_failure(self, profiled, seconds_left):
+        import runpy
+        import subprocess
+        import time
+        from types import SimpleNamespace
+        original_popen = subprocess.Popen
+
+        class ServerProcess:
+            pid = 12345
+            returncode = None
+            def poll(self):
+                return self.returncode
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+        def launch(command, **kwargs):
+            if any(Path(arg).name == "llama-server" for arg in command):
+                return ServerProcess()
+            return original_popen(command, **kwargs)
+
+        def response(request, **kwargs):
+            if request.full_url.endswith("/health"):
+                data = {"status": "ok"}
+            elif request.full_url.endswith("/v1/chat/completions"):
+                data = {"choices": [{"message": {"content": "4"}}]}
+            else:
+                data = {"tokens": [1]*96}
+            return io.BytesIO(json.dumps(data).encode())
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root/"results").mkdir()
+            (root/"results/selected-gpus.json").write_text(json.dumps(dict(
+                selected=[dict(index=i,uuid=f"GPU-fixture-{i}") for i in range(4)])))
+            (root/"engines/B/bin").mkdir(parents=True)
+            (root/"engines/B/SOURCE").write_text("a"*40)
+            (root/"scripts/glm53").mkdir(parents=True)
+            (root/"scripts/glm53/workload.py").write_text(
+                "import json,pathlib,sys\n"
+                "root=pathlib.Path(sys.argv[sys.argv.index('--root')+1])\n"
+                "name=sys.argv[sys.argv.index('--name')+1]\n"
+                "out=root/'results'/name; out.mkdir()\n"
+                "(out/'run.json').write_text(json.dumps({'passed':False,'error':'fixture failure'}))\n"
+                "sys.exit(7)\n")
+            plan = [["B","2",[[36,512]],[],dict(label="fixture", profile=profiled)]]
+            argv = ["server_matrix", "--root", folder, "--deadline", str(time.time()+seconds_left),
+                    "--tag", "failed-leg", "--plan", json.dumps(plan)]
+            memory = "\n".join(f"{i}, 98000, 1000, 97000, 100, 0, 2400, 10000, 40" for i in range(4))
+            engine = SimpleNamespace(install_pending=lambda root: [], installed=lambda root, name: True)
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "path", sys.path.copy()), \
+                    mock.patch.dict(sys.modules, {"engines": engine}), \
+                    mock.patch("subprocess.Popen", side_effect=launch), \
+                    mock.patch("subprocess.check_output", return_value=memory), \
+                    mock.patch("urllib.request.urlopen", side_effect=response), mock.patch("os.killpg"), \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit_:
+                runpy.run_path(str(Path(__file__).with_name("server_matrix.py")), run_name="__main__")
+            self.assertEqual(exit_.exception.code, 1)
+            report = json.loads((root/"results/matrix-failed-leg.json").read_text())
+            self.assertFalse(report["passed"])
+            row = report["servers"][0]["runs"][0]
+            self.assertEqual(row["exit"], 7)
+            self.assertFalse(row["passed"])
+            self.assertEqual(row["profile"]["state"], "invalid" if profiled else "not_requested")
+            self.assertTrue((root/"results/gpu-work-complete-failed-leg").exists())
+
     def test_retained_files_are_verified_without_replacement(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -323,12 +453,19 @@ class ServingRecipeTest(unittest.TestCase):
                     for flag, value in expected.items():
                         self.assertEqual(argv[argv.index(flag) + 1], value)
                     self.assertNotIn("--kv-unified", argv)
-                    self.assertNotIn("--no-cache-idle-slots", argv)
+                    # each slot keeps its own state in VRAM, and a slot taken by another conversation still saves its
+                    # state to host RAM first, so copying every idle slot there when a request starts only held the
+                    # others back: at 36 sessions on four PCIe cards each next turn's first token waited 5.5-14.5 s
+                    # for it, and 1.3-1.6 s without it
+                    self.assertEqual(argv[argv.index("--cache-ram") + 1], "32768")
+                    self.assertIn("--no-cache-idle-slots", argv)
                     self.assertIn("--backend-sampling", argv)
                     self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
                     self.assertEqual(env["GGML_CUDA_ALLREDUCE"], "internal")
                     self.assertEqual(env["GGML_CUDA_GRAPH_MAX"], "0")
                     self.assertEqual(env["GGML_CUDA_GRAPH_MEM_STATS"], "0")
+                    self.assertEqual(env["GGML_CUDA_GRAPH_NODES"], "32768")
+                    self.assertEqual(env["GGML_CUDA_GRAPH_IDLE_MS"], "0")
                     self.assertNotIn("LLAMA_KPOOL_DIRECT_INDICES", env)
                     for flag, value in {"-ubd": "512", "-ctkd": "q8_0", "-ctvd": "q8_0"}.items():
                         if depth == "off":

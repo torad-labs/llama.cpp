@@ -9,6 +9,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "decode-trace.h"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -18,6 +19,8 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
+#include <map>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -506,7 +509,8 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    // n_generating sequences generate in this batch, each given n_per_slot rows past its next token
+    int get_n_draft_max(int32_t n_generating, int32_t n_per_slot) const {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
@@ -516,11 +520,8 @@ struct server_slot {
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
-        int n_draft_max = n_ctx - prompt.n_tokens() - 2;
-
-        if (n_remaining() > 0) {
-            n_draft_max = std::min(n_draft_max, n_remaining() - 1);
-        }
+        const int n_draft_max = common_speculative_draft_limit(
+                ctx_tgt, n_generating, n_ctx - prompt.n_tokens() - 2, n_remaining(), n_per_slot);
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
@@ -3341,6 +3342,13 @@ private:
     }
 
     void update_slots() {
+        // One server iteration may contain prompt work, retries or several sequence cycles.
+        // Do not call it a decode cycle until its recorded phases and rows establish that.
+        static std::atomic<uint64_t> trace_iteration{0};
+        const uint64_t trace_id = common_decode_trace::enabled() ? ++trace_iteration : 0;
+        common_decode_trace::range trace_scope([&] {
+            return "stage=iteration iteration=" + std::to_string(trace_id);
+        });
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3432,7 +3440,7 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
-                bool ok = decode(n_batch, off, batch_view);
+                bool ok = decode(n_batch, off, batch_view, trace_id);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -3563,7 +3571,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = std::min(slot.get_n_draft_max(), n_draft_per_slot);
+                const int n_draft_max = slot.get_n_draft_max(n_generating, n_draft_per_slot);
                 if ((int) slot.spec_draft.size() > std::max(0, n_draft_max)) {
                     slot.spec_draft.resize(std::max(0, n_draft_max));
                     if (slot.spec_draft.empty()) {
@@ -4298,7 +4306,7 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
+    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view, uint64_t trace_id) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
@@ -4333,6 +4341,29 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            common_decode_trace::range trace_eval([&] {
+                return "stage=target_eval iteration=" + std::to_string(trace_id) +
+                        " rows=" + std::to_string(batch_view.n_tokens) + " offset=" + std::to_string(off);
+            });
+            if (common_decode_trace::enabled()) {
+                // Position and ownership only; do not log prompt text or token IDs.
+                std::map<int32_t, std::vector<const server_batch::token *>> by_slot;
+                for (int i = off; i < off + batch_view.n_tokens; ++i) {
+                    by_slot[batch.tokens[i].id_slot].push_back(&batch.tokens[i]);
+                }
+                for (const auto & entry : by_slot) {
+                    int prompt_rows = 0;
+                    llama_pos first = entry.second.front()->pos, last = first;
+                    for (const auto * row : entry.second) {
+                        prompt_rows += row->is_prompt;
+                        first = std::min(first, row->pos);
+                        last = std::max(last, row->pos);
+                    }
+                    common_decode_trace::mark("stage=batch sequence=" + std::to_string(entry.first) +
+                            " rows=" + std::to_string(entry.second.size()) + " prompt_rows=" + std::to_string(prompt_rows) +
+                            " position_min=" + std::to_string(first) + " position_max=" + std::to_string(last));
+                }
+            }
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -4604,7 +4635,8 @@ private:
                         spec_probs.push_back(std::move(out));
                     };
                 }
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, false, on_sample);
+                auto accepted = common_speculative_sample_and_accept(
+                        slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.n_remaining(), on_sample);
                 // here, before a checkpoint restore rewinds the sampler to its passive state: the replay must sample the
                 // row after the switching token on the CPU, or it stops at the same token on every pass
                 slot.release_backend_sampler_if_constrained();
@@ -4616,6 +4648,13 @@ private:
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+                if (common_decode_trace::enabled()) {
+                    common_decode_trace::mark("stage=accept_candidate sequence=" + std::to_string(slot.id) +
+                            " drafted=" + std::to_string(n_draft) + " accepted=" + std::to_string(accepted.size() - 1) +
+                            " verified_rows=" + std::to_string(spec_i_batch.size()) +
+                            " rollback_rows=" + std::to_string(n_rollback) +
+                            " replay=" + std::to_string(slot.spec_is_replay));
+                }
 
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
@@ -4657,6 +4696,10 @@ private:
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                if (common_decode_trace::enabled()) {
+                    common_decode_trace::mark("stage=accept sequence=" + std::to_string(slot.id) +
+                            " drafted=" + std::to_string(n_draft) + " accepted=" + std::to_string(accepted.size() - 1));
+                }
 
                 slot.spec_draft = std::move(accepted);
             }
