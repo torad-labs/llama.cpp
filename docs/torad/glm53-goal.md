@@ -79,8 +79,8 @@ python3 scripts/glm53/rate.py --sessions 23
   -DGGML_CUDA_GRAPHS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF` and
   `cmake --build build --target llama-server`.
 - The DFlash2 draft: `Anbeeld/GLM-5.3-Flash-DFlash2-GGUF` at `f3569acb7f9cee95e66d24442d75536eb00ab842`,
-  `GLM-5.3-Flash-DFlash2-Q8_0.gguf`. Its context is as long as the target's, so it runs on a smaller pool until its
-  cache has a window.
+  `GLM-5.3-Flash-DFlash2-Q8_0.gguf`. The draft declares a 2,048-token attention window; whether the engine sizes its
+  cache by that window or by the whole pool is read from its first load's log, and until then it runs on a smaller pool.
 
 On vast.ai, rig rents the box, pulls the pack by its hashes and ships the engine build; the launch is still the two
 lines above.
