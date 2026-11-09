@@ -2933,6 +2933,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+        // -sm tensor and -sm dp describe how the target spans the cards. A draft model of its own is a small separate
+        // model, and none of the draft architectures has split-state rules: loaded with the target's mode, a DFlash
+        // draft aborts in its first decode (GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0))
+        if (result.split_mode == LLAMA_SPLIT_MODE_TENSOR || result.split_mode == LLAMA_SPLIT_MODE_DATA) {
+            result.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        }
 
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
