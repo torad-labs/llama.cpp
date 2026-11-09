@@ -573,6 +573,32 @@ static bool test_glm_arch_alias(const size_t seed) {
     return ok;
 }
 
+// GLM-5.3 under -sm tensor over the given ranks (a device may repeat: one GPU twice splits as two GPUs do), against
+// one device under -sm layer: the same bar as the two-rank regression in test_glm_dp
+static int test_glm_tensor(const size_t seed, const std::vector<ggml_backend_dev_t> & ranks, bool q8_cache) {
+    GGML_ASSERT(!ranks.empty());
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true);
+    llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+    ms.add_kv(LLM_KV_EXPERT_USED_COUNT, uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(64));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(128));
+    ms.add_kv(LLM_KV_CONTEXT_LENGTH, uint32_t(256));
+    auto reference = get_model_and_ctx(gguf.get(), nullptr, seed, {ranks.front()}, LLAMA_SPLIT_MODE_LAYER, false, {}, false, q8_cache);
+    const auto tokens = get_tokens(128, 128, seed);
+    const auto expected = get_logits(reference.first.get(), reference.second.get(), tokens);
+    auto tensor = get_model_and_ctx(gguf.get(), nullptr, seed, ranks, LLAMA_SPLIT_MODE_TENSOR, false, {}, false, q8_cache);
+    if (!tensor.first || !tensor.second) {
+        fprintf(stderr, "GLM tensor %zu ranks, %s cache: the model or context did not load\n", ranks.size(), q8_cache ? "q8_0" : "default");
+        return 1;
+    }
+    const auto actual = get_logits(tensor.first.get(), tensor.second.get(), tokens);
+    size_t differ, tied;
+    const double kl = mean_kld(expected, actual, 128, differ, tied);
+    fprintf(stderr, "GLM tensor %zu ranks, %s cache: mean KL %.9g, %zu differing top tokens\n", ranks.size(), q8_cache ? "q8_0" : "default", kl, differ);
+    return !std::isfinite(kl) || kl > 1e-6 || differ != 0 ? 1 : 0;
+}
+
 static int test_glm_dp(const size_t seed, const std::vector<ggml_backend_dev_t> & devices, bool q8_cache = false, size_t selected_ranks = 0) {
     GGML_ASSERT(!devices.empty());
     const auto ranks_on = [&](size_t count) {
@@ -2780,6 +2806,7 @@ int main(int argc, char ** argv) {
     std::string out;
     std::string diagnostic_dir, diagnostic_device;
     std::string dp_device;
+    std::string tensor_device; // --glm-tensor-device CUDA0,CUDA1,CUDA0,CUDA1: one rank per name, repeats allowed
     bool glm_alias_only = false;
     bool glm_kpool_only = false;
 
@@ -2795,6 +2822,11 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--glm-dp-device") == 0) {
             if (i + 1 == argc) return 1;
             dp_device = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--glm-tensor-device") == 0) {
+            if (i + 1 == argc) return 1;
+            tensor_device = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--glm-prefix-diagnostics") == 0 || strcmp(argv[i], "--glm-prefix-device") == 0) {
@@ -2849,6 +2881,18 @@ int main(int argc, char ** argv) {
             ggml_backend_load_all();
             if (!test_glm_arch_alias(seed)) { return 1; }
             if (glm_alias_only) { return 0; }
+        }
+        if (!tensor_device.empty()) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> ranks;
+            for (const auto & name : string_split<std::string>(tensor_device, ',')) {
+                const auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) throw std::runtime_error("GLM tensor device is unavailable: " + name);
+                ranks.push_back(device);
+            }
+            const int plain = test_glm_tensor(seed, ranks, false);
+            const int quantized = test_glm_tensor(seed, ranks, true);
+            return plain || quantized;
         }
         if (!dp_device.empty()) {
             ggml_backend_load_all();
