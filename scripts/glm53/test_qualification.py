@@ -480,7 +480,7 @@ class ServingRecipeTest(unittest.TestCase):
     def test_four_card_tensor_recipe_shares_one_pool_on_the_four_bit_cache(self):
         args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "tensor-4"])
         argv, env = self.serve.make_plan(args)
-        expected = {"-sm": "tensor", "-ts": "1,1,1,1", "-np": "23", "-c": str(23 * 262144), "-b": "2048", "-ub": "2048",
+        expected = {"-sm": "tensor", "-ts": "1,1,1,1", "-np": "23", "-c": "524288", "-b": "2048", "-ub": "2048",
                     "--prompt-step": "1024", "--cache-type-k": "q4_0", "--cache-type-v": "q4_0", "-ctki": "q8_0",
                     "--spec-type": "draft-mtp", "--spec-draft-n-max": "2", "--spec-draft-mtp-adaptive": "0.18"}
         for flag, value in expected.items():

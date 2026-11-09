@@ -7,55 +7,68 @@ Read this before starting any GLM-5.3 work, and check the work against it when i
 GLM-5.3 Flash, the BoldingBuilds IQ3_XXS pack, served by this fork on four RTX PRO 6000 cards for 23 concurrent agent sessions of up to 256K tokens each (decided Nov 9; 36-40 sessions was the earlier target):
 
 - **70 decode tokens/s per session, with all of them decoding at once** (50 is the floor worth serving).
-- Context: one shared pool under the layout below, on the 4-bit latent cache (`--cache-type-k q4_0 --cache-type-v q4_0`, accepted Nov 9 with its Oct 30 measurement: same speed, KLD 1.26x the reorder floor at 196K-262K): 8,352 bytes a token mirrored on every card, about 6.0M tokens, so 23 sessions at 256K at once. At q8_0 it is 4.4M (17 sessions at 256K). `dp-4` holds 15.9M private cells (442K a slot, one copy of each cache) and stays in the tree; no engine on these cards has served that at speed.
+- Context: one shared pool on the 4-bit latent cache (`--cache-type-k q4_0 --cache-type-v q4_0`, accepted Nov 9 with its Oct 30 measurement: same speed, KLD 1.26x the reorder floor at 196K-262K), 8,352 bytes a token mirrored on every card. The pool that holds 23 sessions of 256K (6,029,312 tokens) does not load yet: see cause 3.
 
 Per-session decode rate at N concurrent sessions is the number. Aggregate is N times it. A single-session rate, a kernel time or a trace share is not progress toward the goal until it moves that number.
 
 ## Where it stands (measured)
 
-| What | Value | Source |
+Four RTX PRO 6000 Max-Q, the real pack, engine `d9626d7`, `serve.py --profile tensor-4 --context 524288`, MTP depth 2, `rate.py` (sampled, temperature 1, top-p 0.95), Nov 9:
+
+| Sessions | tok/s a session | Tokens a step | ms a step | Cards busy |
+| ---: | ---: | ---: | ---: | --- |
+| 1 | 149 | 2.23 | 15 | |
+| 2 | 101 | 2.33 | 23 | 25-44 % |
+| 4 | 51 | 2.18 | 43 | 34-46 % |
+| 8 | 35 | 2.10 | 60 | 29-33 % |
+| 16 | 20 | 2.11 | 104 | 27-30 % |
+| 23 | 13.8-14.6 (15.4 greedy) | 2.14-2.16 (2.23) | 148-156 (144) | 23-30 % |
+
+| What else | Value | Source |
 | --- | --- | --- |
-| One session, `dp-4` | 45-73 tok/s | Nov 4 profile; Nov 5 audit (71.2 uninstrumented) |
-| 2 / 4 / 8 / 40 sessions, `dp-4`, per session | 28 / 12-16 / 6 / 0.9 tok/s | Nov 3-4 (`glm53-dp.md`) |
-| 36 sessions, `dp-4`, one pass a step, equal drafts | 148 ms a round (121 ms the 108-row target pass, 21 ms a result-queue lock since removed), about 13 tok/s a session at ~1.9 tokens a round | Nov 5 box: `9ca2776d0`, `6384cd2ac` commit messages |
-| The fork's own model of an optimized `dp-4`, 40 sessions (not measured) | 30.6 ms a round: 98-119 tok/s a session if every draft lands, 65-79 with one of two, 47-57 with one of two and 70 % of rated memory bandwidth | `glm53-decode-pcie.md` |
+| The same server on two of the cards (`-ts 1,1`), 23 sessions / 1 session | 13.5 tok/s, 156 ms a step / 155 tok/s, 15.5 ms | same box |
+| `--backend-sampling`, 23 sessions / 1 session | 11.4 tok/s, 186 ms a step / 118 tok/s | same box |
+| 36 sessions, `dp-4`, one pass a step, equal drafts | 148 ms a round, about 13 tok/s a session | Nov 5 box: `9ca2776d0`, `6384cd2ac` commit messages |
+| One session, `dp-4` | 45-73 tok/s | Nov 4 profile; Nov 5 audit |
+| The fork's own model of the memory work at 23 sessions (not measured) | 26 ms a step at rated memory bandwidth, 37 ms at 70 % of it | `glm53-decode-pcie.md`, `estimate_decode_pcie.py` |
 | Same model and cards, another engine (TensorFold, EXL3 4-bit experts, FP8 dense, DFlash2) | 70 tok/s per request at 16 concurrent (prose), 86 (code); 40 slots, shared 5.1M-token pool | mia-ai.net, measured Oct 4 |
 
-The measured round is about 5x the modeled one, before slot gaps. The goal sits where the model puts an engine running at 70-100 % of rated memory bandwidth with ordinary draft acceptance: the low end is within reach, the high end needs near-roofline kernels or more tokens landed a round.
+## Where a step goes
+
+A step at 23 sessions is about 150 ms on four cards, on two cards and on `dp-4`. The layout does not move it, and neither do card-to-card reductions or weight reads:
+
+- The cards are busy 23-30 % of the step: about 40 ms of work, which is the model's 26-37 ms. One host thread, the server's loop, is at 100 % of a core for the whole step, and every other thread is idle.
+- The step grows by about 5.5 ms for each session added, in a straight line from 2 to 23.
+- `LLAMA_TIME_DECODE=1` at 23 sessions: about four `llama_decode` calls a step (the target's pass and the MTP head's), about 25 ms each: `graph_compute` 69 %, `alloc_graph` 15.5 % (12-13 ms each time it runs, in under half the calls), 13 % in none of its phases, `build_graph` and `set_inputs` 1 % each. That is about 100 ms of the step inside `llama_decode` and about 60 ms outside it, in the server's own work for each slot.
+- With every host cost gone the step would be the cards' 40 ms: 54 tok/s a session at 2.16 tokens a step. 70 needs that and either 3 tokens a step at the same rows or less work on the cards.
 
 ## Known causes, each a number
 
-1. **Passes per step.** Every ubatch is a full weight read. Drafts of different lengths (fixed on main: `9ca2776d0`, `861d22f10`, `e18d70a0b` for MTP depth and the output limit, `a3eff8478` pads any shorter draft, such as one cut at the end token, to the step's longest) and idle slots between busy ones (open: `split_equal`'s sequential split and `split_cache_view` need each card's busy streams consecutive; 8 passes a step measured on CPU once replies end at different times) multiply the step.
-2. **Time per pass.** 121 ms measured for the target pass against about 28 ms of modeled memory work. Nov 4 trace: collectives 74 % of summed kernel time, cards idle 46-51 % of the step, hundreds of graph instantiations per request. Collective dispatch picks its transport by message size (≤128 KB peer packets, 128 KB-1 MB host-staged chunks, ≥1 MB copy path); a 36-session step's reductions sit at about 1.3 MB.
-3. **Crashes at 4 and 12 sessions** (Nov 5). The split-state stack overflow has a fix on main (`ea2201d80`), not run on cards since.
+1. **Host work for each session in each step, on one thread** (open; the cause of the 150 ms). About 5.5 ms a session a step, split as above. A GLM fixture of the pack's attention shape grows the same way (2.7 ms a step at 1 session and 17.2 at 23 on the box's four cards, 11.7 at 23 over four ranks on one local card, the server's loop at 100 % of a core), so it is found and fixed without a rental; the cards confirm it.
+2. **Passes per step** (fixed on main for the shared pool). Every ubatch is a full weight read: `9ca2776d0`, `861d22f10`, `e18d70a0b` for MTP depth and the output limit, `a3eff8478` pads any shorter draft to the step's longest. `dp-4`'s private streams still split on idle slots between busy ones.
+3. **The pool for 23 sessions of 256K does not load.** At `-ub 2048` the graph reserve asks for a compute buffer that grows with the pool: 31.8 GiB on a card at 6,029,312 tokens, on top of 48 GiB of cache and 32 GiB of weights. A 524,288-token pool loads with 48.6 GiB used a card. What the reserve costs a pool token, and at which batch step, has two measurements and needs a third to be a rule.
+4. **`dp-4` crashes at 4 and 12 sessions** (Nov 5). The split-state stack overflow has a fix on main (`ea2201d80`), not run on cards since.
 
 ## Tokens a step
 
-Rate a session = tokens landed a step / time a step, and 23 sessions against 36 shortens the step only about 12 % (it still reads about 86 % of the experts). The fork's model at 23 sessions: 26 ms a step at rated memory bandwidth, 37 ms at 70 % of it, so 70 tok/s needs about 2.6 tokens a step at 37 ms.
+Rate a session = tokens landed a step / time a step.
 
 | Drafter | Tokens a step | Source |
 | --- | --- | --- |
-| MTP depth 2 (served) | 2.0-2.35 | Oct 30 box, mean accepted length |
-| MTP depth 1 / 2 / 3 / 4 | 1.7 / 2.1 / 2.4 / 2.5 from acceptance 0.73 / 0.55 / 0.47 / 0.38 | `evidence.md`, single session, greedy; deeper lost alone, unmeasured with many sessions where rows are nearly free |
-| DFlash2 for GLM-5.3 Flash (block of 8: up to 7 drafts a pass; reads target layers 6, 15, 25, 34, 43) | not measured on the pack | runs beside a four-rank tensor split on a 45-layer fixture of the pack's width and vocabulary (8 sessions, 7 drafts each, every step one pass); a random target accepts nothing, so its acceptance needs the real pack; cc-by-nc-nd-4.0; trained on the original model, not the uncensored pack |
+| MTP depth 2, 23 sessions | 2.14-2.16 sampled, 2.23 greedy (58-62 % of drafts accepted) | Nov 9 box |
+| MTP depth 1 / 2 / 3 / 4, one session | 1.7 / 2.1 / 2.4 / 2.5 from acceptance 0.73 / 0.55 / 0.47 / 0.38 | `evidence.md`, greedy; depth 3 and 4 unmeasured at 23 sessions |
+| DFlash2 for GLM-5.3 Flash, 7 drafts a step, 23 sessions | 2.58 sampled, 2.89 greedy (23-28 % of drafts accepted) | Nov 9 box, first run on the real pack; the draft was trained on the original model, not the uncensored pack |
+| DFlash2, one session on a coding task | 3.66 | Nov 9 box |
 
-## The layout being taken
+DFlash2 verifies 8 rows a session a step against MTP depth 2's 3, and while a step is bound by host work for each row it pays for them: 166-210 ms a step at 23 sessions against 144-156.
 
-Four-way tensor split (`-sm tensor`, every card on every request) with one shared unified pool, instead of `dp-4`'s
-experts split across cards and private per-slot cells. Measured on the fork before any rental:
+## The layout
 
-- Shapes divide four ways on whole IQ3_XXS blocks: expert and shared feed-forward 2,048, dense 12,288, 64 heads,
-  32 indexer heads, vocabulary 154,880 (the pack's GGUF header).
-- The DSA latent cache and the indexer cache are mirrored on every card under `-sm tensor` (`llama-model.cpp`'s split
-  rules). At q8_0 the caches take 11.2 KiB a token (target, indexer and MTP, from the served pack's load logs), so the
-  shared pool holds about 4.4M tokens: roughly 120K per session at 36, with any one session able to grow past 400K.
-- `test-llama-archs --glm-tensor-device CUDA0,CUDA0,CUDA0,CUDA0`: four ranks against one device, mean KL 2.7e-15 with
-  the default cache and 2.4e-15 with q8_0, no differing top tokens.
-- A GLM fixture with the served pack's attention shape, served by `llama-server` over four ranks with `--kv-unified`
-  and MTP depth 2, 36 slots, 20 of them ending early: 332 of 333 decode steps are one pass, no assert, replies identical
-  to one card 36/36. The same server on `dp-4`'s private slots split 337 of 358 steps, mostly into 8 passes.
+`tensor-4`: four-way tensor split (`-sm tensor -ts 1,1,1,1`, every card on every request) with one shared unified pool. It is the layout the reads run on because it is one pass a step whichever slots are busy, with no engine change. It ran on four real cards for the first time on Nov 9 (a fixture of the pack's attention shape, then the pack). `dp-4` (experts split across cards, private 442,368-cell slots) stays in the tree.
 
-On paper the two layouts tie on round time (`dp-4` reads replicated dense weights and moves about 94 MB a card a round; four-way tensor reads every weight once and moves about 240 MB a card a round in reductions). What tensor buys is one pass a step whichever slots are busy, with no engine change, on the path this fork has served on two cards since September; what it costs is the pool above. Its round time at 36 sessions has never been measured on cards.
+- Shapes divide four ways on whole IQ3_XXS blocks: expert and shared feed-forward 2,048, dense 12,288, 64 heads, 32 indexer heads, vocabulary 154,880. A fixture with fewer heads than ranks asserts in the meta backend; the pack does not.
+- The DSA latent cache and the indexer cache are mirrored on every card under `-sm tensor`.
+- Load takes 67-74 s from a warm page cache.
 
 ## Launch
 
@@ -69,8 +82,8 @@ python3 scripts/glm53/serve.py --profile tensor-4 \
 python3 scripts/glm53/rate.py --sessions 23
 ```
 
-- `tensor-4` is `-sm tensor -ts 1,1,1,1 --kv-unified`, 23 slots on one pool of 6,029,312 tokens, the 4-bit latent
-  cache, MTP depth 2. `--slots`, `--context`, `--mtp-depth 1..4`, `--mtp-adaptive`, `--backend-sampling` and
+- `tensor-4` is `-sm tensor -ts 1,1,1,1 --kv-unified`, 23 slots on one pool of 524,288 tokens (the pool measured to
+  load), the 4-bit latent cache, MTP depth 2. `--slots`, `--context`, `--mtp-depth 1..4`, `--mtp-adaptive`, `--backend-sampling` and
   `--dflash FILE --dflash-depth N` change one thing each; `--dry-run` prints the argv and environment as JSON.
 - The pack: `BoldingBuilds/orcarouter_GLM-5.3-Flash-Uncensored-GGUF` at revision
   `1bc0afadd92f4ff9fc2b1281a95a7921b058d35d`, the three `IQ3_XXS/` shards in one directory (134.3 GB).
@@ -88,26 +101,11 @@ python3 scripts/glm53/rate.py --sessions 23
 On vast.ai, rig rents the box, pulls the pack by its hashes and ships the engine build; the launch is still the two
 lines above.
 
-## The read (written before the box, Nov 9)
+## The next number
 
-Four RTX PRO 6000 cards, the real pack, `tensor-4`, 23 short sessions decoding at once, `rate.py` run as soon as
-`/health` answers. It moves the per-session rate at 23 sessions, which has no measurement on this layout.
+The step at 23 sessions, from 150 ms toward the cards' own 40 ms: cause 1. It is read as `rate.py --sessions 23` reads it, on the fixture on one local card while the host work is being found and removed (stack samples of the server's loop say which function a change must move, and the fixture's step at 23 sessions against 1 says whether it did), then on four cards with the pack.
 
-| Leg | Expected | From |
-| --- | --- | --- |
-| Load, 6,029,312-token pool | loads, a few GiB free a card | 8,352 bytes a token and the q8_0 load logs |
-| MTP depth 2, as served | 2.0-2.35 tokens a step greedy, fewer sampled; 26-37 ms a step, so 54-90 tok/s a session | the tables above |
-| MTP depth 3, 4, fixed depth | more tokens a step than depth 2 if a row is nearly free at 23 sessions | acceptance 0.47 / 0.38 alone |
-| Backend sampling on | a shorter step: 69 rows of 154,880 logits stay on the cards | `10d6bd57d`, two cards |
-| DFlash2, depth 7 | unknown: never run here, and trained on the original model | |
-| 1 and 36 sessions | 1: near `tensor-2`'s 155-174 tok/s; 36: a step about 12 % longer than at 23 | Oct 22 box; the 86 % / 95 % expert reads |
-
-Under 30 tok/s a session at depth 2, no drafter measured anywhere lands enough tokens to reach the 50 floor on that step
-(it would take 3.5 a step): the other legs are dropped and the box is destroyed once three things are read from it,
-which say where that step goes: the step at 1 session against 23 (what a step costs before its rows), each card's
-utilization during the 23-session read (busy cards are weight reads, waiting cards are reductions or the host), and one
-leg with `LLAMA_TIME_DECODE=1` for the host's share. At or over it, the legs run in the order above, each read as it
-ends, and the box is destroyed after the last.
+A box read starts with the pack already on the box's disk and the step read in the first two minutes after load. Under 30 tok/s a session at MTP depth 2, no drafter lands enough tokens to reach the 50 floor (it would take 3.5 a step), and nothing else is read from that box but where the step goes.
 
 ## Before any work
 
