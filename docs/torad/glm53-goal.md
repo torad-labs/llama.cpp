@@ -29,6 +29,24 @@ The gap is about 5x on time per step, before slot gaps.
 2. **Time per pass.** 121 ms against a ~24 ms floor. Nov 4 trace: collectives 74 % of summed kernel time, cards idle 46-51 % of the step, hundreds of graph instantiations per request. Collective dispatch picks its transport by message size (≤128 KB peer packets, 128 KB-1 MB host-staged chunks, ≥1 MB copy path); a 36-session step's reductions sit at about 1.3 MB.
 3. **Crashes at 4 and 12 sessions** (Nov 5). The split-state stack overflow has a fix on main (`ea2201d80`), not run on cards since.
 
+## The layout being taken
+
+Four-way tensor split (`-sm tensor`, every card on every request) with one shared unified pool, instead of `dp-4`'s
+experts split across cards and private per-slot cells. Measured on the fork before any rental:
+
+- Shapes divide four ways on whole IQ3_XXS blocks: expert and shared feed-forward 2,048, dense 12,288, 64 heads,
+  32 indexer heads, vocabulary 154,880 (the pack's GGUF header).
+- The DSA latent cache and the indexer cache are mirrored on every card under `-sm tensor` (`llama-model.cpp`'s split
+  rules). At q8_0 the caches take 11.2 KiB a token (target, indexer and MTP, from the served pack's load logs), so the
+  shared pool holds about 4.4M tokens: roughly 120K per session at 36, with any one session able to grow past 400K.
+- `test-llama-archs --glm-tensor-device CUDA0,CUDA0,CUDA0,CUDA0`: four ranks against one device, mean KL 2.7e-15 with
+  the default cache and 2.4e-15 with q8_0, no differing top tokens.
+- A GLM fixture with the served pack's attention shape, served by `llama-server` over four ranks with `--kv-unified`
+  and MTP depth 2, 36 slots, 20 of them ending early: 332 of 333 decode steps are one pass, no assert, replies identical
+  to one card 36/36. The same server on `dp-4`'s private slots split 337 of 358 steps, mostly into 8 passes.
+
+The next number is four RTX PRO 6000 cards serving the real pack this way at 1, 8, 16 and 36 short sessions.
+
 ## Before any work
 
 Write down which of the three it moves, the number expected, and how it will be read, then do it. Use a rented box only to read a number the local cards and CPU runs can't give, read the target number in its first minutes, and destroy it the moment the number is clearly short.
