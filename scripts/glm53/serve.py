@@ -15,9 +15,10 @@ TEMPLATE = ROOT / "models/templates/GLM-5.3-Flash.jinja"
 DRAFT_VOCAB = ROOT / "scripts/glm53/assets/mtp-draft-vocab-98304.i32"
 DEFAULT_MTP_DEPTH = "2"
 DP_SLOT_CONTEXT = 442368
-# tensor-4's shared pool: 23 sessions of 262144 tokens on the 4-bit latent cache (docs/torad/glm53-goal.md)
+# tensor-4's sessions and shared pool: the pool measured to load beside 23 slots (48.6 GiB used a card). The
+# 6,029,312 tokens that 23 sessions of 262144 need fail in the graph reserve (docs/torad/glm53-goal.md, cause 3)
 POOL_SLOTS = 23
-POOL_CONTEXT = POOL_SLOTS * 262144
+POOL_CONTEXT = 524288
 # the engine's sequence limit (LLAMA_MAX_SEQ)
 MAX_SLOTS = 256
 # Inherited engine, profile and diagnostic overrides are removed before the exec; the server's own access controls stay.
@@ -43,7 +44,7 @@ def arguments(argv=None):
                              "four-card DP capacity recipe")
     parser.add_argument("--slots", type=int, help="tensor-4: sessions sharing the pool, 1..256 (default: 23). "
                         "DP private caches of 442368 cells each: 1..40 resident, 1..256 host KV (default: 36)")
-    parser.add_argument("--context", type=int, help="tensor-4: tokens in the shared pool (default: 6029312, 23 sessions of 262144)")
+    parser.add_argument("--context", type=int, help="tensor-4: tokens in the shared pool (default: 524288)")
     parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
@@ -101,8 +102,8 @@ def make_plan(args):
     argv = [str(server), "-m", own_path(args.model)]
     if args.mmproj:
         argv += ["--mmproj", own_path(args.mmproj)]
-    # tensor-4's latent cache is 4-bit: 288 bytes a row against 544, which is what lets the pool hold 23 sessions of
-    # 262144; the indexer's keys stay q8_0, the one other type the engine takes for them
+    # tensor-4's latent cache is 4-bit: 288 bytes a row against 544; the indexer's keys stay q8_0, the one other
+    # type the engine takes for them
     latent = "q4_0" if four else "q8_0"
     argv += ["-ngl", "99", "-sm", "dp" if dp else "tensor", "-ts", "1,1,1,1" if dp or four else "1,1",
              "--jinja", "-fa", "on",
