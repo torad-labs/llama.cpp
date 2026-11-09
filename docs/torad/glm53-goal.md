@@ -57,7 +57,52 @@ experts split across cards and private per-slot cells. Measured on the fork befo
 
 On paper the two layouts tie on round time (`dp-4` reads replicated dense weights and moves about 94 MB a card a round; four-way tensor reads every weight once and moves about 240 MB a card a round in reductions). What tensor buys is one pass a step whichever slots are busy, with no engine change, on the path this fork has served on two cards since September; what it costs is the pool above. Its round time at 36 sessions has never been measured on cards.
 
-The next number is four RTX PRO 6000 cards serving the real pack this way at 23 short sessions (and 1 and 36 for the scaling), per-session decode rate and tokens a step read as each leg ends: MTP depth 2, 3 and 4, then DFlash2. Near the goal: this is the serving layout. Short: the box's own phase timers say whether the time is weight reads (kernel work, which `dp-4` needs too) or reductions (where `dp-4` moves less).
+## Launch
+
+The launch is in this fork and needs nothing outside it. `scripts/glm53/serve.py` holds every server argument and
+environment setting of the layout; `scripts/glm53/rate.py` reads the number from the running server.
+
+```sh
+python3 scripts/glm53/serve.py --profile tensor-4 \
+    --server <build>/bin/llama-server \
+    --model <pack>/GLM-5.3-Flash-Uncensored-IQ3_XXS-00001-of-00003.gguf
+python3 scripts/glm53/rate.py --sessions 23
+```
+
+- `tensor-4` is `-sm tensor -ts 1,1,1,1 --kv-unified`, 23 slots on one pool of 6,029,312 tokens, the 4-bit latent
+  cache, MTP depth 2. `--slots`, `--context`, `--mtp-depth 1..4`, `--mtp-adaptive`, `--backend-sampling` and
+  `--dflash FILE --dflash-depth N` change one thing each; `--dry-run` prints the argv and environment as JSON.
+- The pack: `BoldingBuilds/orcarouter_GLM-5.3-Flash-Uncensored-GGUF` at revision
+  `1bc0afadd92f4ff9fc2b1281a95a7921b058d35d`, the three `IQ3_XXS/` shards in one directory (134.3 GB).
+- The engine: this fork with CUDA for the cards' compute capability, `120a` for RTX PRO 6000:
+  `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a -DGGML_CUDA_FA=ON
+  -DGGML_CUDA_GRAPHS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF` and
+  `cmake --build build --target llama-server`.
+- The DFlash2 draft: `Anbeeld/GLM-5.3-Flash-DFlash2-GGUF` at `f3569acb7f9cee95e66d24442d75536eb00ab842`,
+  `GLM-5.3-Flash-DFlash2-Q8_0.gguf`. Its context is as long as the target's, so it runs on a smaller pool until its
+  cache has a window.
+
+On vast.ai, rig rents the box, pulls the pack by its hashes and ships the engine build; the launch is still the two
+lines above.
+
+## The read (written before the box, Nov 9)
+
+Four RTX PRO 6000 cards, the real pack, `tensor-4`, 23 short sessions decoding at once, `rate.py` run as soon as
+`/health` answers. It moves the per-session rate at 23 sessions, which has no measurement on this layout.
+
+| Leg | Expected | From |
+| --- | --- | --- |
+| Load, 6,029,312-token pool | loads, a few GiB free a card | 8,352 bytes a token and the q8_0 load logs |
+| MTP depth 2, as served | 2.0-2.35 tokens a step greedy, fewer sampled; 26-37 ms a step, so 54-90 tok/s a session | the tables above |
+| MTP depth 3, 4, fixed depth | more tokens a step than depth 2 if a row is nearly free at 23 sessions | acceptance 0.47 / 0.38 alone |
+| Backend sampling on | a shorter step: 69 rows of 154,880 logits stay on the cards | `10d6bd57d`, two cards |
+| DFlash2, depth 7 | unknown: never run here, and trained on the original model | |
+| 1 and 36 sessions | 1: near `tensor-2`'s 155-174 tok/s; 36: a step about 12 % longer than at 23 | Oct 22 box; the 86 % / 95 % expert reads |
+
+Under 30 tok/s a session at depth 2, no drafter measured anywhere lands enough tokens to reach the 50 floor on that step
+(it would take 3.5 a step): the other legs are dropped, one leg runs with `LLAMA_TIME_DECODE=1` to split the step into
+weight reads and reductions, and the box is destroyed. At or over it, the legs run in the order above, each read as it
+ends, and the box is destroyed after the last.
 
 ## Before any work
 
