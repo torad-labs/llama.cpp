@@ -37,7 +37,7 @@ Rate a session = tokens landed a step / time a step, and 23 sessions against 36 
 | --- | --- | --- |
 | MTP depth 2 (served) | 2.0-2.35 | Oct 30 box, mean accepted length |
 | MTP depth 1 / 2 / 3 / 4 | 1.7 / 2.1 / 2.4 / 2.5 from acceptance 0.73 / 0.55 / 0.47 / 0.38 | `evidence.md`, single session, greedy; deeper lost alone, unmeasured with many sessions where rows are nearly free |
-| DFlash2 for GLM-5.3 Flash (block of 8: up to 7 drafts a pass; reads target layers 6, 15, 25, 34, 43) | not measured here | file in rig's packs since Oct 23, never run; cc-by-nc-nd-4.0; trained on the original model, not the uncensored pack |
+| DFlash2 for GLM-5.3 Flash (block of 8: up to 7 drafts a pass; reads target layers 6, 15, 25, 34, 43) | not measured on the pack | runs beside a four-rank tensor split on a 45-layer fixture of the pack's width and vocabulary (8 sessions, 7 drafts each, every step one pass); a random target accepts nothing, so its acceptance needs the real pack; cc-by-nc-nd-4.0; trained on the original model, not the uncensored pack |
 
 ## The layout being taken
 
@@ -79,8 +79,11 @@ python3 scripts/glm53/rate.py --sessions 23
   -DGGML_CUDA_GRAPHS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF` and
   `cmake --build build --target llama-server`.
 - The DFlash2 draft: `Anbeeld/GLM-5.3-Flash-DFlash2-GGUF` at `f3569acb7f9cee95e66d24442d75536eb00ab842`,
-  `GLM-5.3-Flash-DFlash2-Q8_0.gguf`. The draft declares a 2,048-token attention window; whether the engine sizes its
-  cache by that window or by the whole pool is read from its first load's log, and until then it runs on a smaller pool.
+  `GLM-5.3-Flash-DFlash2-Q8_0.gguf`. As published it holds neither token embeddings nor an output head and reads the
+  target's, which a tensor-split target keeps where no draft context can run: the server aborts at load.
+  `scripts/glm53/dflash_own_head.py --draft FILE --target <the three shards> --out FILE` writes the draft with its own
+  copies, and `--dflash` takes that file. Its cache is its own 2,048-token window a session plus one step, about 1 GiB
+  at 23 sessions whatever the pool holds.
 
 On vast.ai, rig rents the box, pulls the pack by its hashes and ships the engine build; the launch is still the two
 lines above.

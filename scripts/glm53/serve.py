@@ -51,7 +51,8 @@ def arguments(argv=None):
     parser.add_argument("--mtp-adaptive", type=float, default=0.18,
                         help="The engine's --spec-draft-mtp-adaptive cost: a draft token's share of a one-token round, "
                              "measured at 0.18 for one session on two cards; 0 drafts --mtp-depth every step")
-    parser.add_argument("--dflash", type=Path, help="tensor-4: a local DFlash draft GGUF that drafts in place of the MTP head, on the first card")
+    parser.add_argument("--dflash", type=Path, help="tensor-4: a local DFlash draft GGUF that drafts in place of the MTP head, on the first card; "
+                             "one that carries its own token embeddings and output head (dflash_own_head.py)")
     parser.add_argument("--dflash-depth", type=int, help="Tokens the DFlash draft drafts a step: its block size less the anchor row (required with --dflash)")
     parser.add_argument("--backend-sampling", action="store_true", help="tensor-4: sample on the cards (dp-4 always does)")
     parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
