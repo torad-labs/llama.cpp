@@ -100,8 +100,10 @@ Four RTX PRO 6000 cards, the real pack, `tensor-4`, 23 short sessions decoding a
 | 1 and 36 sessions | 1: near `tensor-2`'s 155-174 tok/s; 36: a step about 12 % longer than at 23 | Oct 22 box; the 86 % / 95 % expert reads |
 
 Under 30 tok/s a session at depth 2, no drafter measured anywhere lands enough tokens to reach the 50 floor on that step
-(it would take 3.5 a step): the other legs are dropped, one leg runs with `LLAMA_TIME_DECODE=1` to split the step into
-weight reads and reductions, and the box is destroyed. At or over it, the legs run in the order above, each read as it
+(it would take 3.5 a step): the other legs are dropped and the box is destroyed once three things are read from it,
+which say where that step goes: the step at 1 session against 23 (what a step costs before its rows), each card's
+utilization during the 23-session read (busy cards are weight reads, waiting cards are reductions or the host), and one
+leg with `LLAMA_TIME_DECODE=1` for the host's share. At or over it, the legs run in the order above, each read as it
 ends, and the box is destroyed after the last.
 
 ## Before any work
