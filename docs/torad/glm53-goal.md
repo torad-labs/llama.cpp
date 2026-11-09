@@ -7,7 +7,7 @@ Read this before starting any GLM-5.3 work, and check the work against it when i
 GLM-5.3 Flash, the BoldingBuilds IQ3_XXS pack, served by this fork on four RTX PRO 6000 cards for 36-40 concurrent agent sessions:
 
 - **50-70 decode tokens/s per session, with all of them decoding at once.**
-- Session histories that grow toward ~400K tokens. This is why the layout is `dp-4`: `tensor-2` holds about 1M cells per card pair, roughly 55K per session at 36 sessions.
+- Context: one shared pool of about 4.4M tokens under the layout below, about 120K a session at 36 with any one session able to pass 400K. `dp-4` holds 15.9M private cells (442K a slot, its caches on one card each instead of mirrored on four) and stays in the tree for the day every session must hold 400K at once; no engine on these cards has served that at speed.
 
 Per-session decode rate at N concurrent sessions is the number. Aggregate is N times it. A single-session rate, a kernel time or a trace share is not progress toward the goal until it moves that number.
 
@@ -17,16 +17,16 @@ Per-session decode rate at N concurrent sessions is the number. Aggregate is N t
 | --- | --- | --- |
 | One session, `dp-4` | 45-73 tok/s | Nov 4 profile; Nov 5 audit (71.2 uninstrumented) |
 | 2 / 4 / 8 / 40 sessions, `dp-4`, per session | 28 / 12-16 / 6 / 0.9 tok/s | Nov 3-4 (`glm53-dp.md`) |
-| 36 sessions, one pass a step, equal drafts | 121 ms a step, about 15 tok/s a session at ~1.8 tokens a step | `9ca2776d0` commit message |
-| Bandwidth floor, 36 sessions × 3 rows | about 24 ms a step on `dp-4` (about 30 GB of experts plus 14 GB of dense weights per card at 1.79 TB/s) | arithmetic, not measured |
+| 36 sessions, `dp-4`, one pass a step, equal drafts | 148 ms a round (121 ms the 108-row target pass, 21 ms a result-queue lock since removed), about 13 tok/s a session at ~1.9 tokens a round | Nov 5 box: `9ca2776d0`, `6384cd2ac` commit messages |
+| The fork's own model of an optimized `dp-4`, 40 sessions (not measured) | 30.6 ms a round: 98-119 tok/s a session if every draft lands, 65-79 with one of two, 47-57 with one of two and 70 % of rated memory bandwidth | `glm53-decode-pcie.md` |
 | Same model and cards, another engine (TensorFold, EXL3 4-bit experts, FP8 dense, DFlash2) | 70 tok/s per request at 16 concurrent (prose), 86 (code); 40 slots, shared 5.1M-token pool | mia-ai.net, measured Oct 4 |
 
-The gap is about 5x on time per step, before slot gaps.
+The measured round is about 5x the modeled one, before slot gaps. The goal sits where the model puts an engine running at 70-100 % of rated memory bandwidth with ordinary draft acceptance: the low end is within reach, the high end needs near-roofline kernels or more tokens landed a round.
 
 ## Known causes, each a number
 
 1. **Passes per step.** Every ubatch is a full weight read. Drafts of different lengths (fixed on main: `9ca2776d0`, `861d22f10`, `e18d70a0b`) and idle slots between busy ones (open: `split_equal`'s sequential split and `split_cache_view` need each card's busy streams consecutive; 8 passes a step measured on CPU once replies end at different times) multiply the step.
-2. **Time per pass.** 121 ms against a ~24 ms floor. Nov 4 trace: collectives 74 % of summed kernel time, cards idle 46-51 % of the step, hundreds of graph instantiations per request. Collective dispatch picks its transport by message size (≤128 KB peer packets, 128 KB-1 MB host-staged chunks, ≥1 MB copy path); a 36-session step's reductions sit at about 1.3 MB.
+2. **Time per pass.** 121 ms measured for the target pass against about 28 ms of modeled memory work. Nov 4 trace: collectives 74 % of summed kernel time, cards idle 46-51 % of the step, hundreds of graph instantiations per request. Collective dispatch picks its transport by message size (≤128 KB peer packets, 128 KB-1 MB host-staged chunks, ≥1 MB copy path); a 36-session step's reductions sit at about 1.3 MB.
 3. **Crashes at 4 and 12 sessions** (Nov 5). The split-state stack overflow has a fix on main (`ea2201d80`), not run on cards since.
 
 ## The layout being taken
@@ -45,7 +45,9 @@ experts split across cards and private per-slot cells. Measured on the fork befo
   and MTP depth 2, 36 slots, 20 of them ending early: 332 of 333 decode steps are one pass, no assert, replies identical
   to one card 36/36. The same server on `dp-4`'s private slots split 337 of 358 steps, mostly into 8 passes.
 
-The next number is four RTX PRO 6000 cards serving the real pack this way at 1, 8, 16 and 36 short sessions.
+On paper the two layouts tie on round time (`dp-4` reads replicated dense weights and moves about 94 MB a card a round; four-way tensor reads every weight once and moves about 240 MB a card a round in reductions). What tensor buys is one pass a step whichever slots are busy, with no engine change, on the path this fork has served on two cards since September; what it costs is the pool above. Its round time at 36 sessions has never been measured on cards.
+
+The next number is four RTX PRO 6000 cards serving the real pack this way at 1, 8, 16 and 36 short sessions, per-session decode rate read as each leg ends. Near the goal: this is the serving layout. Short: the box's own phase timers say whether the time is weight reads (kernel work, which `dp-4` needs too) or reductions (where `dp-4` moves less).
 
 ## Before any work
 
