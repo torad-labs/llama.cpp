@@ -1382,15 +1382,28 @@ size_t llama_kpool_views::view::emit_patches(
         };
         unique(dirty_cells);
         unique(dirty_pools);
-        for (uint32_t j : dirty_cells) {
-            put(j, &pos_at[j], 1);
-            put(pos_at.size() + j, &pblk[j], 1);
+        // Neighbours go in one write: a decode's cells and the pools they are in come as runs, and each write is a
+        // copy of its own to every device. LLAMA_KPOOL_PATCH_RUNS_LEGACY=1: a write a cell and a pool
+        static const bool runs_legacy = ggml_env_switch("LLAMA_KPOOL_PATCH_RUNS_LEGACY");
+        const auto run_end = [](const std::vector<uint32_t> & ids, size_t a) {
+            size_t b = a + 1;
+            while (!runs_legacy && b < ids.size() && ids[b] == ids[b - 1] + 1) { ++b; }
+            return b;
+        };
+        for (size_t a = 0, b; a < dirty_cells.size(); a = b) {
+            b = run_end(dirty_cells, a);
+            const uint32_t j = dirty_cells[a];
+            put(j, &pos_at[j], b - a);
+            put(pos_at.size() + j, &pblk[j], b - a);
         }
-        for (uint32_t p : dirty_pools) {
-            put(pool_offset + p*r, &slot[p*r], r);
-            const int32_t f = fill[p];
-            put(fill_offset + p, &f, 1);
-            put(reps_offset + p, &reps[p], 1);
+        std::vector<int32_t> wide_fill;
+        for (size_t a = 0, b; a < dirty_pools.size(); a = b) {
+            b = run_end(dirty_pools, a);
+            const uint32_t p = dirty_pools[a];
+            put(pool_offset + p*r, &slot[p*r], (b - a)*r);
+            wide_fill.assign(fill.begin() + p, fill.begin() + p + (b - a));
+            put(fill_offset + p, wide_fill.data(), wide_fill.size());
+            put(reps_offset + p, &reps[p], b - a);
         }
     }
     full_upload = false;
