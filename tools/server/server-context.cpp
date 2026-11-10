@@ -357,6 +357,9 @@ struct server_slot {
     // the chain's top-k alone, taken on the backend for the chain drawing on the CPU (see launch_slot_with_task)
     llama_sampler_ptr smpl_top_k;
 
+    // the context gives this slot's rows as the candidates its chain reads (llama_set_seq_candidates)
+    bool cand_rows = false;
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -415,6 +418,9 @@ struct server_slot {
         backend_sampler = false;
         smpl_top_k.reset();
 
+        llama_set_seq_candidates(ctx_tgt, id, false);
+        cand_rows = false;
+
         // clear alora start
         alora_invocation_start = -1;
 
@@ -430,6 +436,11 @@ struct server_slot {
             backend_sampler = false;
             smpl_top_k.reset();
             SLT_INF(*this, "%s", "grammar or reasoning budget constrains the next token, sampling on the CPU\n");
+        }
+        if (cand_rows && !common_sampler_backend_passive(smpl.get())) {
+            llama_set_seq_candidates(ctx_tgt, id, false);
+            cand_rows = false;
+            SLT_INF(*this, "%s", "grammar or reasoning budget constrains the next token, reading every logit\n");
         }
     }
 
@@ -968,6 +979,10 @@ public:
     bool lens_stop = false;
     size_t lens_dropped = 0;
     std::vector<int32_t>              pull_k;    // lens entry of each pull layer
+
+    // the candidates a row the context gives for the slots that read theirs so (launch_slot_with_task)
+    int32_t cand_k = 0;
+    static constexpr int32_t cand_k_max = 1024;
     std::unordered_map<int, pull_rec> pull_recs; // batch index -> record, for the current decode only
     std::unordered_map<int, pull_src> pull_srcs; // slot id -> its current task's prompt
 
@@ -1983,7 +1998,21 @@ private:
             const int32_t top_k   = common_sampler_backend_top_k(slot.smpl.get());
             const bool    lens_on = !params_base.lens_out.empty() && llama_n_lens_layers(ctx_tgt) > 0;
             const bool    pre_probs_in_k = !need_pre_sample_logits || task.params.sampling.n_probs <= top_k;
-            if (!slot.backend_sampler && top_k > 0 && pre_probs_in_k && pull_k.empty() && !lens_on &&
+
+            // or the context takes them for every slot's rows in one node, each device from its share of the vocab: the k
+            // the chain reads on the CPU, a penalty window before its top-k included (common_sampler_n_candidates), so
+            // no row is gathered or copied whole and no sampler graph is built a row. One k a context: the largest a
+            // slot has asked for. LLAMA_OUTPUT_CANDIDATES_LEGACY=1: off
+            const int32_t n_cand = common_output_candidates_legacy() ? 0 : common_sampler_n_candidates(slot.smpl.get());
+            slot.cand_rows = !slot.backend_sampler && n_cand > 0 && n_cand <= cand_k_max && !need_pre_sample_logits &&
+                pull_k.empty() && !lens_on && common_sampler_backend_passive(slot.smpl.get());
+            if (slot.cand_rows && n_cand > cand_k) {
+                cand_k = n_cand;
+                llama_set_output_candidates(ctx_tgt, cand_k);
+            }
+            llama_set_seq_candidates(ctx_tgt, slot.id, slot.cand_rows);
+
+            if (!slot.backend_sampler && !slot.cand_rows && top_k > 0 && pre_probs_in_k && pull_k.empty() && !lens_on &&
                     common_sampler_backend_passive(slot.smpl.get())) {
                 slot.smpl_top_k.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
                 if (need_pre_sample_logits) {

@@ -1126,6 +1126,12 @@ extern "C" {
     // Pointers borrow the context output storage and must not be kept across operations that change it.
     LLAMA_API struct llama_sampling_row llama_get_sampling_row_ith(struct llama_context * ctx, int32_t i);
 
+    // Read the output rows of a sequence as the k largest of their logits in place of the rows.
+    // llama_get_sampling_row_ith gives them as the row's candidates and sampled logits, the largest first and ties by
+    // token id, with logits NULL. k is one number a context and 0 turns it off; rows of other sequences stay whole.
+    LLAMA_API void llama_set_output_candidates(struct llama_context * ctx, int32_t k);
+    LLAMA_API void llama_set_seq_candidates(struct llama_context * ctx, llama_seq_id seq_id, bool enable);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

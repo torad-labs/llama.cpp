@@ -380,9 +380,13 @@ struct common_sampler {
             // as common_sampler_top_k_candidates sorts them, the chain draws from them as from the k the CPU takes (a
             // row the backend did not cut, its device lacking an op, stays as every token's)
             if (!top_k_prefilter_legacy() && sampled_logits_count < (uint32_t) n_vocab) {
-                std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                const auto before = [](const llama_token_data & a, const llama_token_data & b) {
                     return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
-                });
+                };
+                // a context's candidates come sorted (llama_set_output_candidates)
+                if (!std::is_sorted(cur.begin(), cur.end(), before)) {
+                    std::sort(cur.begin(), cur.end(), before);
+                }
                 cur_p = { cur.data(), cur.size(), -1, true };
                 return;
             }
@@ -800,6 +804,15 @@ int32_t common_sampler_backend_top_k(const struct common_sampler * gsmpl) {
     return gsmpl && !top_k_prefilter_legacy() ? gsmpl->top_k_first : 0;
 }
 
+int32_t common_sampler_n_candidates(const struct common_sampler * gsmpl) {
+    return gsmpl && !top_k_prefilter_legacy() ? gsmpl->n_candidates : 0;
+}
+
+bool common_output_candidates_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_OUTPUT_CANDIDATES_LEGACY");
+    return legacy;
+}
+
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
     if (!gsmpl) {
         return;
@@ -1072,9 +1085,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         // the rows after this one were sampled, or cut to their top k, on the backend without the constraint this token
         // just switched on (a lazy grammar's trigger, the reasoning budget forcing): end here with a valid sample as the
         // last token
-        if (!common_sampler_backend_passive(gsmpl) && (llama_get_sampled_token_ith(ctx, idxs[i + 1]) != LLAMA_TOKEN_NULL ||
-                                                       llama_get_sampled_logits_ith(ctx, idxs[i + 1]) != nullptr)) {
-            return result;
+        if (!common_sampler_backend_passive(gsmpl)) {
+            const auto next = llama_get_sampling_row_ith(ctx, idxs[i + 1]);
+            if (next.token != LLAMA_TOKEN_NULL || next.sampled_logits != nullptr) {
+                return result;
+            }
         }
     }
 
