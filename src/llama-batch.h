@@ -80,6 +80,15 @@ struct llama_ubatch {
     int32_t * idx = nullptr;
 };
 
+// with LLAMA_PROMPT_SHAPES=1 a prompt's ubatch has up to this many rows, a power of two above it, or a whole ubatch. It
+// is the context's graph_slot_max_tokens: the row count up to which a graph is kept whatever its shape
+constexpr uint32_t LLAMA_PROMPT_SHAPE_SMALL = 32;
+
+// the largest of those powers of two, whose graph a context keeps: LLAMA_PROMPT_SHAPE_ROWS (a power of two from 64,
+// 256 when unset), read when an allocator or a context is made. A graph kept has a buffer of its own on every device,
+// so this bounds what the prompts' graphs take
+uint32_t llama_prompt_shape_max();
+
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
 public:
@@ -164,6 +173,14 @@ private:
 
     // helper flag to quickly determine if there are any coupled sequences in the batch
     bool has_cpl = false;
+
+    // LLAMA_PROMPT_SHAPES=1, read when the allocator is made: a split_equal that is not sequential reads prompt rows
+    // apart from reply rows, and each prompt in ubatches of its own, of a few sizes, while no more than
+    // prompt_shape_sets sequence sets bring one (LLAMA_PROMPT_SHAPE_SETS, 2 when unset; see split_equal)
+    bool     prompt_shapes     = false;
+    uint32_t prompt_shape_max  = 0;
+    uint32_t prompt_shape_sets = 0;
+    uint32_t n_prompt_sets     = 0; // the sequence sets with a row that is not an output, counted by split_reset
 
     std::vector<pos_set_t> seq_pos; // seq_pos[s]: the set of positions in sequence s
     std::vector<seq_cpl_t> seq_cpl; // seq_cpl[s0][s1]: if sequence s0 is coupled to sequence s1

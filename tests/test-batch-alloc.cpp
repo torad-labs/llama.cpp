@@ -776,6 +776,170 @@ static void test_device_order(testing & t) {
     });
 }
 
+#ifndef _WIN32
+// LLAMA_PROMPT_SHAPES=1 (read when the allocator is made): split_equal gives a sequence's prompt rows a ubatch of their own
+static void test_prompt_shapes(testing & t) {
+    llama_vocab vocab;
+
+    // n_tokens[s] rows for each seq s: every row an output where reply[s], else only the last one
+    auto make_batch = [](batch_builder & bb, std::initializer_list<int> n_tokens, std::initializer_list<bool> reply) {
+        llama_seq_id s = 0;
+        auto is_reply = reply.begin();
+        for (int n : n_tokens) {
+            for (int i = 0; i < n; ++i) {
+                bb.add(i, {s}, *is_reply || i == n - 1);
+            }
+            ++s;
+            ++is_reply;
+        }
+        return bb.make();
+    };
+
+    t.test("without_the_switch_a_prompt_is_cut_at_the_replies", [&](testing & t) {
+        unsetenv("LLAMA_PROMPT_SHAPES");
+        batch_builder bb;
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(make_batch(bb, {3, 8, 3}, {true, false, true}), vocab, nullptr, bb.n_embd, 4, false));
+
+        llama_ubatch ub = ba.split_equal(64, false, 0);
+        t.assert_equal(9u, ub.n_tokens);
+        t.assert_equal(3u, ub.n_seqs);
+
+        ub = ba.split_equal(64, false, 0);
+        t.assert_equal(5u, ub.n_tokens);
+        t.assert_equal(1u, ub.n_seqs);
+    });
+
+    setenv("LLAMA_PROMPT_SHAPES", "1", 1);
+
+    t.test("replies_together_prompt_alone", [&](testing & t) {
+        batch_builder bb;
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(make_batch(bb, {3, 8, 3}, {true, false, true}), vocab, nullptr, bb.n_embd, 4, false));
+
+        llama_ubatch ub = ba.split_equal(64, false, 0);
+        t.assert_equal("the replies' rows", 6u, ub.n_tokens);
+        t.assert_equal(2u, ub.n_seqs);
+        t.assert_equal(3u, ub.n_seq_tokens);
+        t.assert_equal(0, ub.seq_id[0][0]);
+        t.assert_equal(2, ub.seq_id[3][0]);
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            t.assert_equal(1, (int) ub.output[i]);
+        }
+
+        ub = ba.split_equal(64, false, 0);
+        t.assert_equal("the prompt's rows, whole", 8u, ub.n_tokens);
+        t.assert_equal(1u, ub.n_seqs);
+        t.assert_equal(1, ub.seq_id[0][0]);
+        for (int i = 0; i < 8; ++i) {
+            t.assert_equal(i, ub.pos[i]);
+            t.assert_equal(i == 7 ? 1 : 0, (int) ub.output[i]);
+        }
+
+        t.assert_equal(14u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_equal(64, false, 0).n_tokens);
+    });
+
+    t.test("prompts_first_each_alone", [&](testing & t) {
+        batch_builder bb;
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(make_batch(bb, {4, 3, 4, 3}, {false, true, false, true}), vocab, nullptr, bb.n_embd, 4, false));
+
+        const uint32_t    n_tokens[] = {4, 6, 4};
+        const uint32_t    n_seqs[]   = {1, 2, 1};
+        const llama_seq_id first[]   = {0, 1, 2};
+        for (int u = 0; u < 3; ++u) {
+            const llama_ubatch ub = ba.split_equal(64, false, 0);
+            t.assert_equal(n_tokens[u], ub.n_tokens);
+            t.assert_equal(n_seqs[u], ub.n_seqs);
+            t.assert_equal(first[u], ub.seq_id[0][0]);
+        }
+
+        t.assert_equal(14u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_equal(64, false, 0).n_tokens);
+    });
+
+    t.test("a_prompt_longer_than_the_ubatch_keeps_its_tail", [&](testing & t) {
+        batch_builder bb;
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(make_batch(bb, {3, 5}, {true, false}), vocab, nullptr, bb.n_embd, 4, false));
+
+        llama_ubatch ub = ba.split_equal(4, false, 2);
+        t.assert_equal(3u, ub.n_tokens);
+        t.assert_equal(0, ub.seq_id[0][0]);
+
+        // what is left over a whole ubatch goes first, so the rows kept together are in the last one
+        ub = ba.split_equal(4, false, 2);
+        t.assert_equal(1u, ub.n_tokens);
+        t.assert_equal(1, ub.seq_id[0][0]);
+
+        ub = ba.split_equal(4, false, 2);
+        t.assert_equal(4u, ub.n_tokens);
+        t.assert_equal(1, ub.pos[0]);
+        t.assert_equal(1, (int) ub.output[3]);
+
+        t.assert_equal(8u, ba.get_n_used());
+    });
+
+    t.test("a_long_prompt_goes_in_a_few_sizes", [&](testing & t) {
+        batch_builder bb;
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(make_batch(bb, {3, 97, 3, 1624}, {true, false, true, false}), vocab, nullptr, bb.n_embd, 4, false));
+
+        // the replies, then each prompt: of what is left over whole ubatches, what leaves a multiple of 32, then the powers
+        // of two up to 256; then the whole ubatches (1,624 = 24 + 64 + 256 + 256 + 1,024)
+        const uint32_t     n_tokens[] = {6, 1, 32, 64, 24, 64, 256, 256, 1024};
+        const llama_seq_id first[]    = {0, 1, 1,  1,  3,  3,  3,   3,   3};
+        llama_pos pos[4] = {0, 0, 0, 0};
+        for (int u = 0; u < 9; ++u) {
+            const llama_ubatch ub = ba.split_equal(1024, false, 3);
+            t.assert_equal(n_tokens[u], ub.n_tokens);
+            t.assert_equal(u == 0 ? 2u : 1u, ub.n_seqs);
+            t.assert_equal(first[u], ub.seq_id[0][0]);
+            if (u > 0) {
+                const llama_seq_id seq = first[u];
+                for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+                    t.assert_equal(pos[seq]++, ub.pos[i]);
+                }
+            }
+        }
+
+        t.assert_equal(1727u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_equal(1024, false, 3).n_tokens);
+    });
+
+    t.test("more_prompts_than_the_bound_are_read_together", [&](testing & t) {
+        batch_builder bb;
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(make_batch(bb, {40, 3, 40, 40}, {false, true, false, false}), vocab, nullptr, bb.n_embd, 4, false));
+
+        // three prompts where two are read alone: together, and apart from the reply
+        llama_ubatch ub = ba.split_equal(128, false, 3);
+        t.assert_equal(120u, ub.n_tokens);
+        t.assert_equal(3u, ub.n_seqs);
+        t.assert_equal(40u, ub.n_seq_tokens);
+        t.assert_equal(0, ub.seq_id[0][0]);
+        t.assert_equal(2, ub.seq_id[40][0]);
+        t.assert_equal(3, ub.seq_id[80][0]);
+
+        ub = ba.split_equal(128, false, 3);
+        t.assert_equal(3u, ub.n_tokens);
+        t.assert_equal(1, ub.seq_id[0][0]);
+
+        t.assert_equal(123u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_equal(128, false, 3).n_tokens);
+    });
+
+    unsetenv("LLAMA_PROMPT_SHAPES");
+}
+#endif
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -796,6 +960,9 @@ int main(int argc, char ** argv) {
     t.test("keep_tail", test_keep_tail);
     t.test("mrope",     test_mrope);
     t.test("device_order", test_device_order);
+#ifndef _WIN32
+    t.test("prompt_shapes", test_prompt_shapes);
+#endif
 
     return t.summary();
 }

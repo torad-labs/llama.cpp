@@ -496,6 +496,12 @@ private:
     }();
     // LLAMA_GRAPH_ANY_SEQS=1, read when the context is made (llm_graph_params::any_seqs)
     const bool graph_any_seqs = ggml_env_switch("LLAMA_GRAPH_ANY_SEQS");
+    // LLAMA_PROMPT_SHAPES=1, read when the context is made: a ubatch of one sequence and a power of two of rows above
+    // graph_slot_max_tokens, up to llama_prompt_shape_max(), keeps its graph in a slot as well. These are the ubatches
+    // the batch allocator makes of a prompt's rows with the switch (llama_batch_allocr::split_equal), so a prompt read
+    // beside replies is replayed where every prompt of another length built a graph
+    const bool     graph_prompt_shapes    = ggml_env_switch("LLAMA_PROMPT_SHAPES");
+    const uint32_t graph_prompt_shape_max = llama_prompt_shape_max();
     uint32_t graph_slot_mtp_seq_tokens = 0;
     uint32_t graph_slot_max_rows = graph_slot_max_tokens;
     std::vector<size_t> graph_slot_buf_limit;
