@@ -207,7 +207,7 @@ public:
     // the cells a graph attends: the cache's used cells padded to 256, or, for a step of at least 256 rows whose pooled
     // indexer scores, to n_pad_prefill (LLAMA_KV_PAD_PREFILL), so a prompt read in equal steps builds its graph once every
     // n_pad_prefill cells instead of every step; in a pool that sequences share, a scoring step of any length is padded
-    // to at least n_pad_shared. n_pad_used, when given, receives the padding applied
+    // to at least n_pad_shared and a dense one to a power of two. n_pad_used, when given, receives the padding applied
     uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens = 0, uint32_t * n_pad_used = nullptr) const;
 
     // get views of the current state of the cache
@@ -316,6 +316,10 @@ private:
     // indexer; 0 for any other model, for a pool of one sequence, or with LLAMA_KV_PAD_SHARED_LEGACY=1 when the cache is
     // made
     uint32_t n_pad_shared = 0;
+
+    // a pool that sequences share is padded to a power of two while it reads densely (get_n_kv); false for a pool of one
+    // sequence or with LLAMA_KV_PAD_DENSE_LEGACY=1 when the cache is made
+    bool pad_dense_shared = false;
 
     // SWA
     const uint32_t n_swa = 0;

@@ -149,6 +149,16 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // Below the cells its indexer selects a pool reads densely and kept 256, so a pool that sequences share crossed it
+    // every few steps until it scored: on four RTX PRO 6000 (-sm tensor, 23 sessions of ~48 prompt tokens, Nov 10, 2026)
+    // two crossings in a session's first 18 steps, each a step that ran its graphs uncaptured (+47 ms) and one that
+    // captured them (+70 ms) on a 59 ms step. LLAMA_KV_PAD_DENSE_LEGACY=1: 256 while the pool reads densely
+    if (n_pad_shared > 0) {
+        const char * legacy = getenv("LLAMA_KV_PAD_DENSE_LEGACY");
+
+        pad_dense_shared = !legacy || atoi(legacy) != 1;
+    }
+
     const uint32_t n_layer = hparams.n_layer_all;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -1475,11 +1485,21 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens, ui
     // A prompt step of at least 256 rows whose pooled indexer scores at 256 (llama_kpool_needs_scoring) is padded to
     // n_pad_prefill: it scores there too, so whether it scores is unchanged, and its sparse attention reads only the cells
     // its top-k picks, so the empty cells it adds are never read. A step of any length in a pool that sequences share is
-    // padded to at least n_pad_shared on the same terms. One sequence's decode step, and a step that reads densely, keep 256
+    // padded to at least n_pad_shared on the same terms. One sequence's decode step, and a step that reads densely in a
+    // pool of its own, keep 256
     const bool scores = n_pad_prefill + n_pad_shared > 0 && result > hparams.indexer_top_k + hparams.indexer_kpool - 1;
     const uint32_t pad_scoring = std::max(n_tokens >= 256 ? n_pad_prefill : 0, n_pad_shared);
     if (scores && pad_scoring > pad) {
         pad    = pad_scoring;
+        result = padded(pad);
+    }
+
+    // a shared pool that reads densely: the next power of two that holds its cells and still reads densely
+    if (!scores && pad_dense_shared) {
+        const uint32_t n_dense = hparams.indexer_top_k + hparams.indexer_kpool - 1;
+        while (pad < result && 2*pad <= n_pad_shared && padded(2*pad) <= n_dense) {
+            pad *= 2;
+        }
         result = padded(pad);
     }
 
