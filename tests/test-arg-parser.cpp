@@ -305,6 +305,24 @@ static void test(void) {
         assert(common_base_params_to_speculative(mtp).n_ubatch == 32);
     }
 
+    // -sm tensor and -sm dp are how the target spans the cards: a draft model of its own loads whole, by layers, and a
+    // draft head inside the target (MTP) keeps the target's mode
+    for (const llama_split_mode mode : {LLAMA_SPLIT_MODE_TENSOR, LLAMA_SPLIT_MODE_DATA}) {
+        common_params target;
+        target.split_mode = mode;
+        assert(common_base_params_to_speculative(target).split_mode == mode);
+
+        target.speculative.draft.mparams.path = "draft.gguf";
+        assert(common_base_params_to_speculative(target).split_mode == LLAMA_SPLIT_MODE_LAYER);
+        assert(target.split_mode == mode);
+    }
+    {
+        common_params rows;
+        rows.split_mode = LLAMA_SPLIT_MODE_ROW;
+        rows.speculative.draft.mparams.path = "draft.gguf";
+        assert(common_base_params_to_speculative(rows).split_mode == LLAMA_SPLIT_MODE_ROW);
+    }
+
     // the draft's indexer cache takes the type -ctki names, as the target's does; without -ctki both stay f16
     {
         common_params named;

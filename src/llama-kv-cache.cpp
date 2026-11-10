@@ -121,6 +121,44 @@ llama_kv_cache::llama_kv_cache(
         n_pad_prefill = val > 0 ? GGML_PAD((uint32_t) std::min<long>(val, kv_size), n_pad_cur) : 0;
     }
 
+    // A pooled cache's views are made with it, so their switches (LLAMA_KPOOL_SHARED_VIEWS_LEGACY,
+    // LLAMA_KPOOL_PATCH_INPUT_LEGACY) are read here: made on their first use, they were read in the first decode, after
+    // a caller that set a switch for one context had put it back
+    if (hparams.indexer_kpool > 0) {
+        get_kpool_views();
+    }
+
+    // A pool that sequences share grows by every sequence's rows each step, and a graph holds only while its padded length
+    // does. One sequence drafting two tokens crosses 256 cells every ~115 steps; 23 of them in one pool cross it every 5
+    // (~50 cells a step), and each crossing builds every decode shape again and plans its memory: the target's, the MTP
+    // head's two proposals and its catch-up. On four RTX PRO 6000 (-sm tensor, 23 sessions, Nov 9, 2026) a graph was
+    // planned in 34 of 64 decodes, 8.7 ms each, and a session's target graph was reused in 41 of its ~61 steps; on one
+    // card the crossing step and the one after it took 76 ms more than a 31 ms step. Padded to 256 cells a sequence, the
+    // pool crosses as often a step as one sequence does; the next power of two, which GGML_PAD and the pool padding
+    // derived from it (llama_kpool_pool_pad) take. LLAMA_KV_PAD_SHARED_LEGACY=1: 256, whatever the pool holds
+    if (hparams.indexer_kpool > 0 && n_stream < n_seq_max) {
+        const char * legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
+
+        if (!legacy || atoi(legacy) != 1) {
+            const uint64_t a_sequence = std::max(n_pad, 256u);
+            uint64_t pad = a_sequence;
+            while (pad < std::min<uint64_t>(a_sequence*n_seq_max, kv_size)) {
+                pad *= 2;
+            }
+            n_pad_shared = (uint32_t) pad;
+        }
+    }
+
+    // Below the cells its indexer selects a pool reads densely and kept 256, so a pool that sequences share crossed it
+    // every few steps until it scored: on four RTX PRO 6000 (-sm tensor, 23 sessions of ~48 prompt tokens, Nov 10, 2026)
+    // two crossings in a session's first 18 steps, each a step that ran its graphs uncaptured (+47 ms) and one that
+    // captured them (+70 ms) on a 59 ms step. LLAMA_KV_PAD_DENSE_LEGACY=1: 256 while the pool reads densely
+    if (n_pad_shared > 0) {
+        const char * legacy = getenv("LLAMA_KV_PAD_DENSE_LEGACY");
+
+        pad_dense_shared = !legacy || atoi(legacy) != 1;
+    }
+
     const uint32_t n_layer = hparams.n_layer_all;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -487,9 +525,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // a speculative rollback removes the few cells placed last, just below the head: up to 1024 cells are found
         // walking backward from it, stopping at the last one, instead of scanning every cell of the cache
         static const bool scan_all = ggml_env_switch("LLAMA_KV_SEQ_RM_SCAN_LEGACY");
-        uint32_t n_rm = scan_all ? UINT32_MAX : cells.seq_pos_count(seq_id, p0, p1, 1024);
+        static constexpr uint32_t n_rollback_max = 1024;
+        uint32_t n_rm = scan_all ? UINT32_MAX : cells.seq_pos_count(seq_id, p0, p1, n_rollback_max);
 
-        if (n_rm <= 1024) {
+        if (n_rm <= n_rollback_max) {
             const auto visit = [&](uint32_t i) {
                 if (cells.pos_in(i, p0, p1) && cells.seq_has(i, seq_id)) {
                     --n_rm;
@@ -498,10 +537,23 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     }
                 }
             };
+            // In a pool that sequences share, the first sequence to roll back in a step lowers the head to its freed
+            // cell, and the cells the others placed in that step are then above it: walking down from the head missed
+            // them, went on to cell 0, and came back from the cache's last cell, every cell of the pool for each
+            // sequence each step (23 sessions, 131,072 cells: 15 % of the server's loop, 2.6 ms of a step's verify stage
+            // against a 11,776-cell pool's, Nov 9, 2026). The cells just above the head are read first, and no cell
+            // above the last one used is read at all. LLAMA_KV_SEQ_RM_HEAD_LEGACY=1: from the head down, then from the
+            // cache's end
+            static const bool head_legacy = ggml_env_switch("LLAMA_KV_SEQ_RM_HEAD_LEGACY");
+            const uint32_t top  = head_legacy ? cells.size() : std::max(head, cells.used_max_p1());
+            const uint32_t near = head_legacy ? head : (uint32_t) std::min<uint64_t>(top, uint64_t(head) + n_rollback_max);
+            for (uint32_t i = near; n_rm > 0 && i-- > head;) {
+                visit(i);
+            }
             for (uint32_t i = head; n_rm > 0 && i-- > 0;) {
                 visit(i);
             }
-            for (uint32_t i = cells.size(); n_rm > 0 && i-- > head;) {
+            for (uint32_t i = top; n_rm > 0 && i-- > near;) {
                 visit(i);
             }
         } else {
@@ -1432,9 +1484,22 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens, ui
 
     // A prompt step of at least 256 rows whose pooled indexer scores at 256 (llama_kpool_needs_scoring) is padded to
     // n_pad_prefill: it scores there too, so whether it scores is unchanged, and its sparse attention reads only the cells
-    // its top-k picks, so the empty cells it adds are never read. A decode step, and a step that reads densely, keep 256
-    if (n_pad_prefill > pad && n_tokens >= 256 && result > hparams.indexer_top_k + hparams.indexer_kpool - 1) {
-        pad    = n_pad_prefill;
+    // its top-k picks, so the empty cells it adds are never read. A step of any length in a pool that sequences share is
+    // padded to at least n_pad_shared on the same terms. One sequence's decode step, and a step that reads densely in a
+    // pool of its own, keep 256
+    const bool scores = n_pad_prefill + n_pad_shared > 0 && result > hparams.indexer_top_k + hparams.indexer_kpool - 1;
+    const uint32_t pad_scoring = std::max(n_tokens >= 256 ? n_pad_prefill : 0, n_pad_shared);
+    if (scores && pad_scoring > pad) {
+        pad    = pad_scoring;
+        result = padded(pad);
+    }
+
+    // a shared pool that reads densely: the next power of two that holds its cells and still reads densely
+    if (!scores && pad_dense_shared) {
+        const uint32_t n_dense = hparams.indexer_top_k + hparams.indexer_kpool - 1;
+        while (pad < result && 2*pad <= n_pad_shared && padded(2*pad) <= n_dense) {
+            pad *= 2;
+        }
         result = padded(pad);
     }
 

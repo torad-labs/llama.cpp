@@ -754,6 +754,45 @@ class ServingRecipeTest(unittest.TestCase):
             else:
                 self.assertEqual(self.serve.resolve_transport(args, legacy), explicit or legacy or 'internal')
 
+    def test_four_card_tensor_recipe_shares_one_pool_on_the_four_bit_cache(self):
+        args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "tensor-4"])
+        argv, env = self.serve.make_plan(args)
+        expected = {"-sm": "tensor", "-ts": "1,1,1,1", "-np": "23", "-c": "524288", "-b": "2048", "-ub": "2048",
+                    "--prompt-step": "1024", "--cache-type-k": "q4_0", "--cache-type-v": "q4_0", "-ctki": "q8_0",
+                    "--spec-type": "draft-mtp", "--spec-draft-n-max": "2", "--spec-draft-mtp-adaptive": "0.18"}
+        for flag, value in expected.items():
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertIn("--kv-unified", argv)
+        for flag in ("--backend-sampling", "-fit", "-cts", "-ubd", "--spec-draft-model"):
+            self.assertNotIn(flag, argv)
+        two = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))[1]
+        self.assertEqual(env, {**two, "CUDA_VISIBLE_DEVICES": "0,1,2,3"})
+
+    def test_four_card_tensor_recipe_takes_its_sessions_pool_and_drafter(self):
+        base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
+        for depth, adaptive in (("3", "0"), ("4", "0.18")):
+            argv, _ = self.serve.make_plan(self.serve.arguments(
+                base + ["--slots", "36", "--context", "294912", "--mtp-depth", depth, "--mtp-adaptive", adaptive,
+                        "--backend-sampling"]))
+            for flag, value in {"-np": "36", "-c": "294912", "--spec-draft-n-max": depth,
+                                "--spec-draft-mtp-adaptive": adaptive}.items():
+                self.assertEqual(argv[argv.index(flag) + 1], value)
+            self.assertIn("--backend-sampling", argv)
+        argv, _ = self.serve.make_plan(self.serve.arguments(base + ["--dflash", "/models/draft.gguf", "--dflash-depth", "7"]))
+        for flag, value in {"--spec-type": "draft-dflash", "--spec-draft-model": "/models/draft.gguf",
+                            "--spec-draft-n-max": "7", "--spec-draft-device": "CUDA0", "--spec-draft-ngl": "99"}.items():
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertFalse(any(arg.startswith("--spec-draft-mtp") for arg in argv))
+        for options in (base + ["--slots", "0"], base + ["--slots", "257"], base + ["--slots", "8", "--context", "7"],
+                        base + ["--dflash", "/models/draft.gguf"], base + ["--dflash-depth", "7"],
+                        base + ["--mtp-adaptive", "1.5"],
+                        ["--model", "/models/target.gguf", "--context", "294912"],
+                        ["--model", "/models/target.gguf", "--backend-sampling"],
+                        ["--model", "/models/target.gguf", "--dflash", "/models/draft.gguf", "--dflash-depth", "7"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--mtp-depth", "3"]):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.serve.make_plan(self.serve.arguments(options))
+
     def test_dp_slot_defaults_and_bounds_do_not_change_tensor_capacity(self):
         args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"])
         argv, _ = self.serve.make_plan(args)

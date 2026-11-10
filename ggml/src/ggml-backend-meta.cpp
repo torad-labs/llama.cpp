@@ -1397,6 +1397,23 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
             return ret;
         }
 
+        if (tensor->op == GGML_OP_TOP_K_CANDIDATES) {
+            auto ret = src_ss[0];
+            if (ret.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                GGML_ASSERT(ret.n_segments == 1 && ret.nr[0] == 1);
+                GGML_ASSERT(tensor->ne[1] == int64_t(n_bufs));
+                ret.axis = GGML_BACKEND_SPLIT_AXIS_1;
+                // Keep one part even on an empty rank: its kernel writes invalid records.
+                for (size_t j = 0; j < n_bufs; ++j) { ret.ne[j] = 1; }
+            } else if (ret.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                GGML_ASSERT(ret.n_segments == 1 && ret.nr[0] == 1);
+                ret.axis = GGML_BACKEND_SPLIT_AXIS_2;
+            } else {
+                GGML_ASSERT(ret.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            return ret;
+        }
+
         // A complete tensor on one device stays local even when a reshape removes its singleton split axis.
         if (!(tensor->flags & GGML_TENSOR_FLAG_META) && tensor->op != GGML_OP_MUL_MAT_ID && tensor->op != GGML_OP_PAD &&
                 (tensor->op != GGML_OP_SET_ROWS || src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED)) {
@@ -1902,6 +1919,12 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
         split_state_gather = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
     }
     int64_t gather_offset = 0;
+    ggml_backend_meta_split_state candidate_split = {};
+    if (tensor->op == GGML_OP_TOP_K_CANDIDATES) {
+        candidate_split = ggml_backend_meta_get_split_state(tensor->src[0], true);
+    }
+    const bool candidates = tensor->op == GGML_OP_TOP_K_CANDIDATES && candidate_split.axis == GGML_BACKEND_SPLIT_AXIS_0;
+    int64_t candidate_offset = 0;
     const bool scatter = tensor->op == GGML_OP_RESHAPE && (tensor->flags & GGML_TENSOR_FLAG_META);
     const bool stream_view = tensor->op == GGML_OP_VIEW && (tensor->flags & GGML_TENSOR_FLAG_META);
     const bool local_view = tensor->op == GGML_OP_VIEW && ggml_backend_meta_has_stream_view(tensor->src[0]);
@@ -1947,6 +1970,10 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
         t_ij->flags = tensor->flags;
         if (tensor->op == GGML_OP_GET_ROWS || tensor->op == GGML_OP_SET_ROWS) { t_ij->flags &= ~GGML_TENSOR_FLAG_META; }
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+        if (candidates) {
+            ggml_set_op_params_i32(t_ij, 0, int32_t(candidate_offset));
+            candidate_offset += candidate_split.ne[j];
+        }
         if (gather) {
             const int     axis  = split_state_gather.axis;
             const int64_t ne_j  = split_state_gather.ne[j];
@@ -2046,8 +2073,8 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
         simple_tensors.push_back(t_ij);
     }
 
-    // If one of the sources has a zero-sized slice, disable the computation (a gather pads it to zeros):
-    for (int i = 0; i < GGML_MAX_SRC && !gather; i++) {
+    // Empty sources skip computation, except gathers and candidates which must write padding.
+    for (int i = 0; i < GGML_MAX_SRC && !gather && !candidates; i++) {
         if (tensor->src[i] == nullptr || !ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
             continue;
         }
@@ -3152,7 +3179,6 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
                 GGML_ASSERT(start == chunk_size_full);
                 break;
             }
-            GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset % chunk_size_full == 0);
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;
@@ -3165,7 +3191,8 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
+                const size_t simple_offset = i_start * chunk_size_j;
+                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, simple_offset, chunk_size_j,
                     i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
@@ -3627,13 +3654,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }
+            // The node was never computed, so its buffer holds whatever was there before: a fill writes the zeros
+            // whatever that is, where scaling by zero keeps a NaN or an infinity (0.0f * NaN == NaN) and the sum then
+            // carries it to every rank. GGML_META_ZERO_SCALE_LEGACY=1 scales, as does a backend without the fill
+            static const bool zero_scale_legacy = ggml_env_switch("GGML_META_ZERO_SCALE_LEGACY");
             ggml_tensor * node_zero = get_node_aux(node);
-            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
+            node_zero->op = GGML_OP_FILL;
             node_zero->src[0] = node;
             ggml_set_op_params_f32(node_zero, 0, 0.0f);
             node_zero->data = node->data;
             node_zero->buffer = node->buffer;
             node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            if (zero_scale_legacy || (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16) || !ggml_is_contiguous(node) ||
+                    !ggml_backend_supports_op(bcj.backend, node_zero)) {
+                node_zero->op = GGML_OP_SCALE;
+                // said once, for a node of floats the fill was meant for: this rank's zeros are a scale, which keeps a
+                // NaN the buffer held
+                static std::atomic<bool> warned{false};
+                if (!zero_scale_legacy && (node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16) && !warned.exchange(true)) {
+                    GGML_LOG_WARN("%s: no fill for an uncomputed %s node of type %s on %s: zeroed by a scale, which keeps a NaN\n",
+                            __func__, ggml_op_name(node->op), ggml_type_name(node->type), ggml_backend_name(bcj.backend));
+                }
+            }
 
             step_cgraphs[j] = get_cgraph_aux();
             step_cgraphs[j]->nodes[0] = node_zero;

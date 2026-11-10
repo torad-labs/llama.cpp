@@ -387,6 +387,7 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
     cparams.logits_gather           = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+    cparams.n_logits_parts          = cparams.logits_gather ? std::max<int32_t>(1, (int32_t) model.get_split_state_ud.n_devices) : 1;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
@@ -1244,6 +1245,9 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        if ((size_t) j < cand.state.size() && cand.state[j] != candidates_info::ROW_WHOLE) {
+            throw std::runtime_error("the row was read as candidates");
+        }
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -1547,6 +1551,85 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+}
+
+void llama_context::set_output_candidates(int32_t k) {
+    cparams.n_out_candidates = std::max(0, std::min<int32_t>(k, model.vocab.n_tokens()));
+}
+
+void llama_context::set_seq_candidates(llama_seq_id seq_id, bool enable) {
+    if (enable) {
+        cand.seqs.insert(seq_id);
+    } else {
+        cand.seqs.erase(seq_id);
+    }
+}
+
+bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
+    if (cand.state.empty()) {
+        return false;
+    }
+
+    output_reorder();
+
+    int64_t j = -1;
+    try {
+        j = output_resolve_row(idx);
+    } catch (const std::exception &) {
+        return false;
+    }
+    if ((size_t) j >= cand.state.size() || cand.state[j] == candidates_info::ROW_WHOLE) {
+        return false;
+    }
+
+    float *       logits_row = cand.logits.data + j*cand.k;
+    llama_token * ids_row    = cand.ids.data    + j*cand.k;
+
+    if (cand.state[j] == candidates_info::ROW_RECORDS) {
+        // a record is a token id under its logit's bits. A key orders them as common_sampler_top_k_candidates orders a
+        // whole row, by the logit and then the id: the logit's bits in the order of its value (-0 as +0, a NaN below every
+        // number) over the id's complement
+        auto & keys = cand.keys;
+        keys.clear();
+
+        const int64_t * records = cand.records.data + j*cand.n_record;
+        for (uint32_t i = 0; i < cand.n_record; ++i) {
+            const uint64_t record = (uint64_t) records[i];
+            const uint32_t id     = (uint32_t) record;
+            if (id == UINT32_MAX) {
+                continue; // no token: a device with fewer than k
+            }
+            uint32_t bits = (uint32_t) (record >> 32);
+            if (bits == 0x80000000u) {
+                bits = 0;
+            }
+            const uint32_t rank = (bits & 0x7fffffffu) > 0x7f800000u ? 0 : (bits & 0x80000000u) ? ~bits : bits | 0x80000000u;
+            keys.push_back((uint64_t) rank << 32 | (UINT32_MAX - id));
+        }
+
+        if (keys.size() > cand.k) {
+            std::nth_element(keys.begin(), keys.begin() + cand.k, keys.end(), std::greater<uint64_t>());
+            keys.resize(cand.k);
+        }
+        std::sort(keys.begin(), keys.end(), std::greater<uint64_t>());
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const uint32_t rank = (uint32_t) (keys[i] >> 32);
+            const uint32_t bits = rank == 0 ? 0x7fc00000u : (rank & 0x80000000u) ? rank & 0x7fffffffu : ~rank;
+            ids_row[i] = (llama_token) (UINT32_MAX - (uint32_t) keys[i]);
+            memcpy(&logits_row[i], &bits, sizeof(bits));
+        }
+
+        cand.count[j] = (uint32_t) keys.size();
+        cand.state[j] = candidates_info::ROW_CUT;
+    }
+
+    row.sampled_logits   = logits_row;
+    row.candidates       = ids_row;
+    row.n_sampled_logits = cand.count[j];
+    row.n_candidates     = cand.count[j];
+
+    return true;
 }
 
 void llama_context::set_lens_layers(const int32_t * layers, int32_t n_layers) {
@@ -1942,6 +2025,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        res->inputs_lost();
         ret = status;
         return nullptr;
     }
@@ -2487,8 +2571,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
+        // candidates in place of the rows (llama_set_output_candidates): the rows are copied only when a sequence of
+        // the ubatch reads them whole
+        bool rows_whole = true;
+        if (ggml_tensor * t_cand = res->get_cand(); t_cand && n_outputs > 0) {
+            GGML_ASSERT(cand.records.has_data() && t_cand->ne[0] == cand.k && t_cand->ne[0]*t_cand->ne[1] == cand.n_record &&
+                    t_cand->ne[2] == n_outputs);
+
+            rows_whole = false;
+            uint32_t row = n_outputs_prev;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (!ubatch.output[i]) {
+                    continue;
+                }
+                const bool as_cand = cand.seqs.count(ubatch.seq_id[i][0]) > 0;
+                cand.state[row++] = as_cand ? candidates_info::ROW_RECORDS : candidates_info::ROW_WHOLE;
+                rows_whole |= !as_cand;
+            }
+
+            ggml_backend_t backend_cand = ggml_backend_sched_get_tensor_backend(sched_res, t_cand);
+            GGML_ASSERT(backend_cand != nullptr);
+            ggml_backend_tensor_get_async(backend_cand, t_cand, cand.records.data + (size_t) n_outputs_prev*cand.n_record, 0, ggml_nbytes(t_cand));
+        }
+
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && rows_whole && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_res, t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -2776,8 +2883,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         output_ids.resize(n_batch);
     }
 
+    // rows read as candidates: a row's records, and the k they are cut to
+    const size_t cand_k      = (size_t) std::max(0, cparams.n_out_candidates);
+    const size_t cand_record = cand_k * (size_t) cparams.n_logits_parts;
+    const size_t cand_bytes  = cand_k == 0 ? 0 :
+        sizeof(int64_t) + (cand_record*sizeof(int64_t) + cand_k*(sizeof(float) + sizeof(llama_token))) * n_outputs_max;
+
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
-    const size_t new_size  =
+    const size_t new_size  = cand_bytes +
         (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
         (lens.size) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
@@ -2880,6 +2993,32 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         sampling.candidates_count.clear();
     }
 
+    if (cand_k > 0) {
+        offset = GGML_PAD(offset, sizeof(int64_t));
+
+        cand.records = {(int64_t *) (base + offset), cand_record*n_outputs_max};
+        offset += cand.records.size * sizeof(int64_t);
+
+        cand.logits = {(float *) (base + offset), cand_k*n_outputs_max};
+        offset += cand.logits.size * sizeof(float);
+
+        cand.ids = {(llama_token *) (base + offset), cand_k*n_outputs_max};
+        offset += cand.ids.size * sizeof(llama_token);
+
+        cand.k        = (uint32_t) cand_k;
+        cand.n_record = (uint32_t) cand_record;
+        cand.count.assign(n_outputs_max, 0);
+        cand.state.assign(n_outputs_max, candidates_info::ROW_WHOLE);
+    } else {
+        cand.records = {nullptr, 0};
+        cand.logits  = {nullptr, 0};
+        cand.ids     = {nullptr, 0};
+        cand.k        = 0;
+        cand.n_record = 0;
+        cand.count.clear();
+        cand.state.clear();
+    }
+
     // set all ids as invalid (negative)
     std::fill(output_ids.begin(), output_ids.end(), -1);
 
@@ -2964,6 +3103,14 @@ void llama_context::output_reorder() {
                     }
                 }
             }
+        }
+
+        if (!cand.state.empty()) {
+            std::swap_ranges(cand.records.data + i0*cand.n_record, cand.records.data + (i0 + 1)*cand.n_record, cand.records.data + i1*cand.n_record);
+            std::swap_ranges(cand.logits.data + i0*cand.k, cand.logits.data + (i0 + 1)*cand.k, cand.logits.data + i1*cand.k);
+            std::swap_ranges(cand.ids.data + i0*cand.k, cand.ids.data + (i0 + 1)*cand.k, cand.ids.data + i1*cand.k);
+            std::swap(cand.count[i0], cand.count[i1]);
+            std::swap(cand.state[i0], cand.state[i1]);
         }
 
         if (!sampling.samplers.empty()) {
@@ -4840,10 +4987,8 @@ void llama_context::mtp_index_capture() {
     if (mtp_index.generation == draft->generation()) {
         if (mtp_index.backend && (cparams.n_seq_devices == 1 || ggml_backend_is_meta(mtp_index.backend)) &&
                 !ggml_env_switch("LLAMA_KPOOL_SELECTION_HOST_LEGACY")) {
-            for (size_t i = 0; i < mtp_index.seqs.size(); ++i) {
-                draft->capture_backend(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv,
-                        mtp_index.tensor, i, mtp_index.backend, cparams.n_seq_max, cparams.n_seq_devices);
-            }
+            draft->capture_backend_rows(mtp_index.seqs.data(), mtp_index.positions.data(), mtp_index.seqs.size(),
+                    mtp_index.n_kv, mtp_index.tensor, mtp_index.backend, cparams.n_seq_max, cparams.n_seq_devices);
         } else {
             const int64_t width = mtp_index.tensor->ne[0];
             std::vector<int32_t> rows(width*mtp_index.seqs.size());
@@ -4965,10 +5110,22 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
     return ctx->set_sampler(seq_id, smpl);
 }
 
+void llama_set_output_candidates(llama_context * ctx, int32_t k) {
+    ctx->set_output_candidates(k);
+}
+
+void llama_set_seq_candidates(llama_context * ctx, llama_seq_id seq_id, bool enable) {
+    ctx->set_seq_candidates(seq_id, enable);
+}
+
 llama_sampling_row llama_get_sampling_row_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     llama_sampling_row row = {};
+    row.token = LLAMA_TOKEN_NULL;
+    if (ctx->get_candidates_ith(i, row)) {
+        return row;
+    }
     row.token = ctx->get_sampled_token_ith(i);
     row.sampled_logits = ctx->get_sampled_logits_ith(i);
     row.sampled_probs = ctx->get_sampled_probs_ith(i);

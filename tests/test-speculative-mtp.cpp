@@ -1557,6 +1557,19 @@ static bool test_device_h_rows(llama_model * model) {
     return true;
 }
 
+// a row as its context gives it: whole, or the candidates it was cut to (each id, then its logit)
+static void append_row(llama_context * ctx, int32_t i, int32_t n_vocab, std::vector<float> & out) {
+    const auto row = llama_get_sampling_row_ith(ctx, i);
+    if (row.logits) {
+        out.insert(out.end(), row.logits, row.logits + n_vocab);
+        return;
+    }
+    for (uint32_t k = 0; k < row.n_candidates && row.sampled_logits; ++k) {
+        out.push_back((float) row.candidates[k]);
+        out.push_back(row.sampled_logits[k]);
+    }
+}
+
 static bool test_graph_shapes(llama_model * model) {
     for (int n_seq : {32, 33, 40}) {
         server_rig rig(model, 0, N_MAX, 0, 128, GGML_TYPE_F16, 128, true, false, n_seq);
@@ -1590,9 +1603,9 @@ static bool test_graph_shapes(llama_model * model) {
                 if (llama_decode(ctx, batch) != 0) { return finish(fail("concurrent MTP shape decode failed")); }
                 std::vector<float> actual;
                 for (int s = 0; s < active; ++s) {
-                    const auto * row = llama_get_logits_ith(ctx, (s + 1)*width - 1);
-                    actual.insert(actual.end(), row, row + rig.n_vocab);
+                    append_row(ctx, (s + 1)*width - 1, rig.n_vocab, actual);
                 }
+                if (actual.empty()) { return finish(fail("concurrent MTP shape decode gave no rows")); }
                 if (current == &ref) {
                     expected = std::move(actual);
                 } else {
@@ -1663,6 +1676,88 @@ static bool test_target_graph_shapes(llama_model * model) {
     }
     printf("DP MTP target: verifications of 33 and 40 sequences reuse their graphs past 32 rows\n");
     return true;
+}
+
+// Goal: a context that gives output rows as candidates (llama_set_output_candidates) gives, for each row of a sequence
+// set to read so, the k largest logits the host cuts from the whole row, in the same order, and leaves the rows of the
+// other sequences whole. Sequences are added last first, so the rows are reordered on the way out.
+static bool test_output_candidates(llama_model * model) {
+    const int n_seq = 6;
+    const int width = 3;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    auto params = llama_context_default_params();
+    params.n_ctx = n_seq*128;
+    params.n_seq_max = n_seq;
+    params.n_batch = 2048;
+    params.n_ubatch = 512;
+    params.n_outputs_max = n_seq*width;
+    params.n_outputs_max_per_seq = width;
+    params.n_threads = params.n_threads_batch = 4;
+    params.kv_unified = false;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context_ptr ctx(llama_init_from_model(model, params));
+    if (!ctx) { return fail("candidates context failed"); }
+
+    llama_batch batch = llama_batch_init(n_seq*width, 0, 1);
+    for (int s = n_seq - 1; s >= 0; --s) {
+        for (int p = 0; p < width; ++p) {
+            common_batch_add(batch, (s*5 + p) % n_vocab, p, {s}, true);
+        }
+    }
+    const auto finish = [&](bool result) {
+        llama_batch_free(batch);
+        return result;
+    };
+
+    if (llama_decode(ctx.get(), batch) != 0) { return finish(fail("candidates reference decode failed")); }
+    std::vector<float> whole;
+    for (int i = 0; i < batch.n_tokens; ++i) {
+        const float * row = llama_get_logits_ith(ctx.get(), i);
+        whole.insert(whole.end(), row, row + n_vocab);
+    }
+
+    for (int k : {1, 7, n_vocab/2, n_vocab + 5}) {
+        const uint32_t k_out = std::min(k, n_vocab);
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        llama_set_output_candidates(ctx.get(), k);
+        for (int s = 0; s < n_seq; ++s) { llama_set_seq_candidates(ctx.get(), s, s % 3 != 0); }
+        if (llama_decode(ctx.get(), batch) != 0) { return finish(fail("candidates decode failed")); }
+
+        std::vector<llama_token_data> expected;
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            const float * row_whole = whole.data() + (size_t) i*n_vocab;
+            const auto row = llama_get_sampling_row_ith(ctx.get(), i);
+            if (batch.seq_id[i][0] % 3 == 0) {
+                if (!row.logits || row.sampled_logits || memcmp(row.logits, row_whole, n_vocab*sizeof(float))) {
+                    return finish(fail("a sequence not set to read candidates did not get its row whole"));
+                }
+                continue;
+            }
+            common_sampler_top_k_candidates(row_whole, n_vocab, k_out, expected);
+            if (row.logits || row.token != LLAMA_TOKEN_NULL || row.n_candidates != k_out || row.n_sampled_logits != k_out) {
+                fprintf(stderr, "candidates: k %d row %d gave %u candidates\n", k, i, row.n_candidates);
+                return finish(fail("a candidate row has the wrong shape"));
+            }
+            for (uint32_t c = 0; c < k_out; ++c) {
+                if (row.candidates[c] != expected[c].id || memcmp(&row.sampled_logits[c], &expected[c].logit, sizeof(float))) {
+                    fprintf(stderr, "candidates: k %d row %d candidate %u is %d, the host's cut gives %d\n", k, i, c, row.candidates[c], expected[c].id);
+                    return finish(fail("a candidate row differs from the host's cut of the whole row"));
+                }
+            }
+        }
+    }
+
+    // off again: every row whole
+    llama_memory_clear(llama_get_memory(ctx.get()), true);
+    llama_set_output_candidates(ctx.get(), 0);
+    if (llama_decode(ctx.get(), batch) != 0) { return finish(fail("candidates off decode failed")); }
+    for (int i = 0; i < batch.n_tokens; ++i) {
+        const auto row = llama_get_sampling_row_ith(ctx.get(), i);
+        if (!row.logits || memcmp(row.logits, whole.data() + (size_t) i*n_vocab, n_vocab*sizeof(float))) {
+            return finish(fail("rows are not whole after candidates were turned off"));
+        }
+    }
+    return finish(true);
 }
 
 static bool test_sampler_graphs(llama_model * model) {
@@ -2096,7 +2191,7 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
     printf("DP MTP %zu ranks %s: 48 identical draft/verify rounds, %zu greedy matches, controlled 0/1/2 accepts %zu/%zu/%zu\n",
         devices.size(), q8_cache ? "Q8" : "default", greedy_accepted, forced_counts[0], forced_counts[1], forced_counts[2]);
     printf("DP MTP selection bank: %zu observed sequence reads; host control used none\n", dp.selection_reads);
-    return q8_cache || (test_graph_shapes(split.get()) && test_target_graph_shapes(split.get()));
+    return q8_cache || (test_graph_shapes(split.get()) && test_target_graph_shapes(split.get()) && test_output_candidates(split.get()));
 }
 
 // Goal: sequences that draft in the same round draft the same length, the deepest any of them chose (each still capped
@@ -2269,6 +2364,7 @@ int main(int argc, char ** argv) {
             { "sampler-reorder", test_sampler_reorder },
             { "prepared-weights", test_prepared_weights },
             { "graph-shapes", test_graph_shapes },
+            { "candidates", test_output_candidates },
             { "service-timing", test_service_timing },
             { "timed-driver", test_timed_driver },
             { "baseline",  test_baseline  },

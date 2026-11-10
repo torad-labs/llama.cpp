@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <numeric>
 #include <random>
 #include <string>
@@ -449,6 +450,43 @@ static void test_top_k_penalties_candidates_random() {
     }
 }
 
+// common_sampler_top_k_candidates keeps the k a sort of every token keeps, in its order: rows on a grid of logits, so
+// equal logits sit at the cut, at vocabularies that end inside a block of the scan, too short for the bar's blocks
+// and long enough for them, and at k from 1 to more than half the row, where the buffer never fills
+static void test_top_k_candidates_exact() {
+    std::mt19937 rng(20261109);
+    std::normal_distribution<float> normal(0.0f, 3.0f);
+    for (const int32_t n_vocab : { 12, 33, 600, 4096, 20011, 154880 }) {
+        for (const int32_t k : { 1, 5, 40, 296, 1024 }) {
+            if (k >= n_vocab) {
+                continue;
+            }
+            for (int trial = 0; trial < 20; ++trial) {
+                std::vector<float> logits(n_vocab);
+                for (float & logit : logits) {
+                    logit = trial % 2 ? normal(rng) : std::round(normal(rng) * 2.0f) / 2.0f;
+                }
+                // a row whose logits rise with the id passes every logit to the buffer, one that falls passes none
+                if (trial % 5 == 3) std::sort(logits.begin(), logits.end());
+                if (trial % 5 == 4) std::sort(logits.begin(), logits.end(), std::greater<float>());
+
+                std::vector<llama_token_data> want;
+                for (llama_token id = 0; id < n_vocab; ++id) {
+                    want.push_back(llama_token_data{id, logits[id], 0.0f});
+                }
+                std::sort(want.begin(), want.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                    return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+                });
+                want.resize(k);
+
+                std::vector<llama_token_data> got;
+                common_sampler_top_k_candidates(logits.data(), n_vocab, k, got);
+                GGML_ASSERT(same_draw(got, want));
+            }
+        }
+    }
+}
+
 int main(void) {
     ggml_time_init();
 
@@ -538,6 +576,7 @@ int main(void) {
     test_sampler_queue(10000, "mkp", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mpk", 100, 0.8f, 0.1f);
 
+    test_top_k_candidates_exact();
     test_top_k_penalties_candidates_boundary();
     test_top_k_penalties_candidates_random();
 

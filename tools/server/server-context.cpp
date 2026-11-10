@@ -231,6 +231,13 @@ static bool spec_prompt_copy_legacy() {
     return legacy;
 }
 
+// LLAMA_SPEC_PAD_LEGACY=1: each slot verifies only its own draft, so a step whose drafts differ in length is split
+// into several forward passes
+static bool pad_drafts_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_SPEC_PAD_LEGACY");
+    return legacy;
+}
+
 struct server_slot {
     int id;
 
@@ -251,6 +258,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    size_t spec_n_real = 0; // the drafter's tokens at the front of spec_draft; any after them are pads
 
     // the state buffers of a context checkpoint the slot dropped, which its next checkpoint takes: a state copied into
     // buffers of its size lands in pages already mapped, where a new buffer's pages are faulted in and zeroed first
@@ -349,6 +357,9 @@ struct server_slot {
     // the chain's top-k alone, taken on the backend for the chain drawing on the CPU (see launch_slot_with_task)
     llama_sampler_ptr smpl_top_k;
 
+    // the context gives this slot's rows as the candidates its chain reads (llama_set_seq_candidates)
+    bool cand_rows = false;
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -384,6 +395,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_n_real = 0;
             spec_i_batch.clear();
             spec_ckpt.clear();
             common_speculative_end(spec, id);
@@ -406,6 +418,9 @@ struct server_slot {
         backend_sampler = false;
         smpl_top_k.reset();
 
+        llama_set_seq_candidates(ctx_tgt, id, false);
+        cand_rows = false;
+
         // clear alora start
         alora_invocation_start = -1;
 
@@ -421,6 +436,11 @@ struct server_slot {
             backend_sampler = false;
             smpl_top_k.reset();
             SLT_INF(*this, "%s", "grammar or reasoning budget constrains the next token, sampling on the CPU\n");
+        }
+        if (cand_rows && !common_sampler_backend_passive(smpl.get())) {
+            llama_set_seq_candidates(ctx_tgt, id, false);
+            cand_rows = false;
+            SLT_INF(*this, "%s", "grammar or reasoning budget constrains the next token, reading every logit\n");
         }
     }
 
@@ -528,10 +548,13 @@ struct server_slot {
         return n_draft_max;
     }
 
-    // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
-    void handle_last_sampled_token(server_batch & batch) {
+    // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any.
+    // n_draft_rows > 0 pads a shorter draft with copies of its last token up to that many draft rows, so every slot of
+    // the step brings the same row count and the step stays one forward pass; a pad is verified like a draft token,
+    // so it lands only where the target samples that same token.
+    void handle_last_sampled_token(server_batch & batch, size_t n_draft_rows = 0) {
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
         if (!spec_draft.empty()) {
-            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
             const auto eog = std::find_if(spec_draft.begin(), spec_draft.end(), [&](llama_token token) {
                 return llama_vocab_is_eog(vocab, token);
             });
@@ -541,6 +564,20 @@ struct server_slot {
                 spec_draft.erase(eog, spec_draft.end());
                 spec_is_replay = false; // the replay's extra terminal sample is no longer a draft token
             }
+        }
+
+        spec_n_real = spec_draft.size();
+        if (n_draft_rows > spec_draft.size() && can_speculate() && !spec_is_replay && inp_embd.empty()) {
+            // an end-of-generation token is never evaluated as a draft (above): where the pad would be one (a request
+            // that ignores it and goes on), the first token that is not one stands in, rejected like any wrong draft
+            llama_token pad = spec_draft.empty() ? sampled : spec_draft.back();
+            if (llama_vocab_is_eog(vocab, pad)) {
+                pad = 0;
+                while (llama_vocab_is_eog(vocab, pad)) {
+                    ++pad;
+                }
+            }
+            spec_draft.resize(n_draft_rows, pad);
         }
 
         bool add_ok = true;
@@ -942,6 +979,10 @@ public:
     bool lens_stop = false;
     size_t lens_dropped = 0;
     std::vector<int32_t>              pull_k;    // lens entry of each pull layer
+
+    // the candidates a row the context gives for the slots that read theirs so (launch_slot_with_task)
+    int32_t cand_k = 0;
+    static constexpr int32_t cand_k_max = 1024;
     std::unordered_map<int, pull_rec> pull_recs; // batch index -> record, for the current decode only
     std::unordered_map<int, pull_src> pull_srcs; // slot id -> its current task's prompt
 
@@ -1958,7 +1999,21 @@ private:
             const int32_t top_k   = common_sampler_backend_top_k(slot.smpl.get());
             const bool    lens_on = !params_base.lens_out.empty() && llama_n_lens_layers(ctx_tgt) > 0;
             const bool    pre_probs_in_k = !need_pre_sample_logits || task.params.sampling.n_probs <= top_k;
-            if (!slot.backend_sampler && top_k > 0 && pre_probs_in_k && pull_k.empty() && !lens_on &&
+
+            // or the context takes them for every slot's rows in one node, each device from its share of the vocab: the k
+            // the chain reads on the CPU, a penalty window before its top-k included (common_sampler_n_candidates), so
+            // no row is gathered or copied whole and no sampler graph is built a row. One k a context: the largest a
+            // slot has asked for. LLAMA_OUTPUT_CANDIDATES_LEGACY=1: off
+            const int32_t n_cand = common_output_candidates_legacy() ? 0 : common_sampler_n_candidates(slot.smpl.get());
+            slot.cand_rows = !slot.backend_sampler && n_cand > 0 && n_cand <= cand_k_max && !need_pre_sample_logits &&
+                pull_k.empty() && !lens_on && common_sampler_backend_passive(slot.smpl.get());
+            if (slot.cand_rows && n_cand > cand_k) {
+                cand_k = n_cand;
+                llama_set_output_candidates(ctx_tgt, cand_k);
+            }
+            llama_set_seq_candidates(ctx_tgt, slot.id, slot.cand_rows);
+
+            if (!slot.backend_sampler && !slot.cand_rows && top_k > 0 && pre_probs_in_k && pull_k.empty() && !lens_on &&
                     common_sampler_backend_passive(slot.smpl.get())) {
                 slot.smpl_top_k.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
                 if (need_pre_sample_logits) {
@@ -3351,6 +3406,7 @@ private:
             SLT_WRN(slot, "shortening verification from %zu to %d tokens to fit the decode batch\n", slot.spec_i_batch.size(), end - off);
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - removed);
             slot.spec_draft.resize(end - off - 1);
+            slot.spec_n_real = std::min(slot.spec_n_real, slot.spec_draft.size());
             slot.spec_i_batch.resize(end - off);
             if (slot.spec_draft.empty()) {
                 slot.spec_i_batch.clear();
@@ -3709,9 +3765,24 @@ private:
             }
         });
 
-        // update the batch with the sampled/drafted tokens
+        // update the batch with the sampled/drafted tokens. The memory splits a batch into ubatches of equal rows per
+        // sequence and keeps a sequence's rollback rows together, and every ubatch is a whole forward pass: 23 slots
+        // whose drafts differ in length (a drafter that stops early, a block or copy drafter, a draft cut at an
+        // end-of-generation token) verify in about 20 passes, with a unified cache as with private streams. Shorter
+        // drafts are padded to the step's longest, within the rollback rows (no checkpoint is taken for a pad) and the
+        // slot's context; past the output limit, the accept step rolls pads back.
+        size_t n_draft_rows = 0;
+        if (spec && generating.size() > 1 && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL && !pad_drafts_legacy()) {
+            for (const auto * slot : generating) {
+                n_draft_rows = std::max(n_draft_rows, slot->spec_draft.size());
+            }
+            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                n_draft_rows = std::min<size_t>(n_draft_rows, llama_n_rs_seq(ctx_tgt));
+            }
+        }
         iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
+            const int n_slot_max = std::min(slot.n_ctx - slot.prompt.n_tokens() - 2, n_draft_per_slot);
+            slot.handle_last_sampled_token(batch, std::min<size_t>(n_draft_rows, (size_t) std::max(0, n_slot_max)));
         });
 
         // process in chunks of params.n_batch
@@ -4766,7 +4837,8 @@ private:
 
             const auto ids = std::move(slot.spec_draft);
 
-            size_t n_accepted = ids.size() - 1;
+            // a landed pad is a token the target sampled, kept in the reply, but not a draft: the stats count drafts
+            size_t n_accepted = std::min(ids.size() - 1, slot.spec_n_real);
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }

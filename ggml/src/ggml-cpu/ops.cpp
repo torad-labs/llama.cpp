@@ -8547,6 +8547,34 @@ void ggml_compute_forward_top_k(
     }
 }
 
+void ggml_compute_forward_top_k_candidates(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I64);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+    const int64_t ncols = src->ne[0];
+    const int64_t k = dst->ne[0];
+    const int64_t parts = dst->ne[1];
+    const int64_t count = std::min(k, ncols);
+    const int32_t offset = ggml_get_op_params_i32(dst, 0);
+    int32_t * tmp = count ? (int32_t *) params->wdata + (ncols + CACHE_LINE_SIZE_F32)*params->ith : nullptr;
+    for (int64_t row = params->ith; row < dst->ne[2]; row += params->nth) {
+        uint64_t * out = (uint64_t *) dst->data + row*parts*k;
+        std::fill(out, out + parts*k, uint64_t(UINT32_MAX));
+        if (count == 0) { continue; }
+        const float * values = (const float *) src->data + row*ncols;
+        for (int64_t i = 0; i < ncols; ++i) { tmp[i] = i; }
+        std::partial_sort(tmp, tmp + count, tmp + ncols, [values](int32_t a, int32_t b) {
+            if (std::isnan(values[a]) != std::isnan(values[b])) { return !std::isnan(values[a]); }
+            return values[a] > values[b] || (!(values[a] < values[b]) && a < b);
+        });
+        for (int64_t i = 0; i < count; ++i) {
+            uint32_t bits;
+            memcpy(&bits, values + tmp[i], sizeof(bits));
+            out[i] = (uint64_t(bits) << 32) | uint32_t(offset + tmp[i]);
+        }
+    }
+}
+
 // a bit-packed attention mask row (GGML_TYPE_I16): 16 KV cells per element, LSB first, bit set = attend
 static inline float ggml_kq_mask_bit(const uint16_t * row, int64_t i) {
     return (row[i >> 4] >> (i & 15)) & 1 ? 0.0f : -INFINITY;
@@ -12250,7 +12278,7 @@ void ggml_compute_forward_lightning_indexer(
             for (int ik = ir0; ik < ir1; ++ik) {
                 const int64_t i_row = r ? ((const int32_t *) ((const char *) r->data + s*r->nb[1]))[ik] : ik;
                 GGML_ASSERT(i_row >= 0 && i_row < nek2);
-                char * k_row = (char *) k->data + i_row*nbk2 + s*nbk3;
+                char * k_row = (char *) k->data + i_row*nbk2 + (nek3 == 1 ? 0 : s)*nbk3;
                 if (k_to_float) {
                     k_to_float(k_row, k_row_f32, n_embd);
                 } else {
@@ -12326,8 +12354,26 @@ static void ggml_compute_forward_kpool_indices(const ggml_compute_params * param
     }
 }
 
+// ggml_kpool_patch: dst is the table in place. The patches name different elements, so the threads share nothing
+static void ggml_compute_forward_kpool_patch(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * tables  = dst->src[0];
+    const auto * patches = dst->src[1];
+    GGML_ASSERT(dst->data == tables->data);
+    const auto * p = (const int32_t *) patches->data;
+    for (int64_t i = params->ith; i < patches->ne[1]; i += params->nth) {
+        const int64_t slot = p[3*i], element = p[3*i + 1];
+        if (slot < 0) { continue; }
+        GGML_ASSERT(slot < tables->ne[1] && element >= 0 && element < tables->ne[0]);
+        ((int32_t *) ((char *) tables->data + slot*tables->nb[1]))[element] = p[3*i + 2];
+    }
+}
+
 static void ggml_compute_forward_kpool_materialize(const ggml_compute_params * params, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
+    if (mode == GGML_KPOOL_MATERIALIZE_PATCH) {
+        ggml_compute_forward_kpool_patch(params, dst);
+        return;
+    }
     const int64_t capacity = ggml_get_op_params_i32(dst, 1), r = ggml_get_op_params_i32(dst, 2);
     const int64_t nk = ggml_get_op_params_i32(dst, 3), np = ggml_get_op_params_i32(dst, 4);
     const int64_t cap = capacity/r + 2;

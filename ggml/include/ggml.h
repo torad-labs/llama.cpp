@@ -599,6 +599,7 @@ extern "C" {
 
         GGML_OP_GLU,
         GGML_OP_FLASH_ATTN_EXT_SPARSE,
+        GGML_OP_TOP_K_CANDIDATES,
 
         GGML_OP_COUNT,
     };
@@ -2427,6 +2428,18 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // Unordered top-k candidates for contiguous F32 [vocabulary, rows].
+    // I64 [k, n_parts, rows]: low 32 bits are the global column ID, high 32 bits are the original F32 bits.
+    // Merge by value descending, then ID ascending; signed zeros tie and NaNs sort last.
+    // ID -1 pads unused records. Unsplit backends fill part 0; vocabulary-split Meta fills one part per device.
+    // Meta inputs must be mirrored, vocabulary-split or row-split. A vocabulary split requires n_parts == device count.
+    // k may exceed a shard's vocabulary size; extra slots are padded. No full-vocabulary gather is needed.
+    GGML_API struct ggml_tensor * ggml_top_k_candidates(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            int                   n_parts);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2797,6 +2810,7 @@ extern "C" {
         GGML_KPOOL_MATERIALIZE_CELLS = 4,
         GGML_KPOOL_MATERIALIZE_REPS  = 5,
         GGML_KPOOL_MATERIALIZE_BIAS  = 6,
+        GGML_KPOOL_MATERIALIZE_PATCH = 7, // ggml_kpool_patch: no map, the table itself with its changes written
     };
 
     // One sequence's resident I32 table: pos[kv_size], absolute pool[kv_size], slot[cap*kpool], fill[cap], reps[cap].
@@ -2814,6 +2828,14 @@ extern "C" {
             int64_t               n_pools,
             int64_t               n_dump,
             enum ggml_kpool_materialize_mode mode);
+
+    // A table's or a bank's changes, written where it is kept before its maps are made. The result is the table in place
+    // and takes its place as ggml_kpool_materialize's. patches: I32 [3,P] of slot, element of the slot's table, value.
+    // A slot of -1 is no change. The elements named by one evaluation's patches are all different.
+    GGML_API struct ggml_tensor * ggml_kpool_patch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * patches);
 
     // Selected: I32 [n_selected, n_rows, n_stream], with dump ids in [n_kv, n_kv+n_extra).
     // Tail: I32 [n_tail, n_rows, n_stream], physical cells or -1 padding. Result is sorted and unique, padded with -1.

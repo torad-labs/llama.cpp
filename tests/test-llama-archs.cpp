@@ -574,6 +574,32 @@ static bool test_glm_arch_alias(const size_t seed) {
     return ok;
 }
 
+// GLM-5.3 under -sm tensor over the given ranks (a device may repeat: one GPU twice splits as two GPUs do), against
+// one device under -sm layer: the same bar as the two-rank regression in test_glm_dp
+static int test_glm_tensor(const size_t seed, const std::vector<ggml_backend_dev_t> & ranks, bool q8_cache) {
+    GGML_ASSERT(!ranks.empty());
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true);
+    llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+    ms.add_kv(LLM_KV_EXPERT_USED_COUNT, uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(64));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(128));
+    ms.add_kv(LLM_KV_CONTEXT_LENGTH, uint32_t(256));
+    auto reference = get_model_and_ctx(gguf.get(), nullptr, seed, {ranks.front()}, LLAMA_SPLIT_MODE_LAYER, false, {}, false, q8_cache);
+    const auto tokens = get_tokens(128, 128, seed);
+    const auto expected = get_logits(reference.first.get(), reference.second.get(), tokens);
+    auto tensor = get_model_and_ctx(gguf.get(), nullptr, seed, ranks, LLAMA_SPLIT_MODE_TENSOR, false, {}, false, q8_cache);
+    if (!tensor.first || !tensor.second) {
+        fprintf(stderr, "GLM tensor %zu ranks, %s cache: the model or context did not load\n", ranks.size(), q8_cache ? "q8_0" : "default");
+        return 1;
+    }
+    const auto actual = get_logits(tensor.first.get(), tensor.second.get(), tokens);
+    size_t differ, tied;
+    const double kl = mean_kld(expected, actual, 128, differ, tied);
+    fprintf(stderr, "GLM tensor %zu ranks, %s cache: mean KL %.9g, %zu differing top tokens\n", ranks.size(), q8_cache ? "q8_0" : "default", kl, differ);
+    return !std::isfinite(kl) || kl > 1e-6 || differ != 0 ? 1 : 0;
+}
+
 static int test_glm_dp(const size_t seed, const std::vector<ggml_backend_dev_t> & devices, bool q8_cache = false, size_t selected_ranks = 0) {
     GGML_ASSERT(!devices.empty());
     const auto ranks_on = [&](size_t count) {
@@ -819,8 +845,14 @@ static bool test_glm_mtp_index(const size_t seed, const std::vector<ggml_backend
     };
     params.cb_eval_user_data = counts;
     llama_context_ptr ctx(llama_init_from_model(model, params));
-    params.cb_eval = nullptr;
-    params.cb_eval_user_data = nullptr;
+    // the reference builds its pool maps on the host (LLAMA_KPOOL_RESIDENT_LEGACY=1 around its decodes), so they are an
+    // input of its graphs: a decode that computes them took the resident tables, and compares them with themselves
+    int reference_maps = 0;
+    params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+        if (ask && std::string(t->name) == "kpool_pool_cells") ++*static_cast<int *>(data);
+        return false;
+    };
+    params.cb_eval_user_data = &reference_maps;
     llama_context_ptr reference(llama_init_from_model(model, params));
     if (!ctx || !reference || llama_mtp_draft_step(pair.second.get(), 0)) {
         return false;
@@ -835,6 +867,9 @@ static bool test_glm_mtp_index(const size_t seed, const std::vector<ggml_backend
         set_env("LLAMA_KPOOL_RESIDENT_LEGACY", "1");
         auto result = get_mtp_logits(model, reference.get(), input, hidden, pos);
         set_env("LLAMA_KPOOL_RESIDENT_LEGACY", old ? saved.c_str() : nullptr);
+        if (reference_maps != 0) {
+            throw std::runtime_error("the MTP reference made its pool maps on the device: LLAMA_KPOOL_RESIDENT_LEGACY was not read for its decode");
+        }
         return result;
     };
     reference_logits(tokens, 0);
@@ -1369,6 +1404,9 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
         const auto read = [&](const char * pad, bool mtp, bool unified, uint32_t n_ubatch) {
             fprintf(stderr, "GLM prefill reuse case: top_k=%u pad=%s mtp=%d unified=%d ubatch=%u\n", top_k, pad, mtp, unified, n_ubatch);
             set_env("LLAMA_KV_PAD_PREFILL", pad);
+            // the prefill padding alone: a pool that sequences share pads to 256 cells a sequence besides
+            // (test_glm_shared_pool_reuse)
+            set_env("LLAMA_KV_PAD_SHARED_LEGACY", "1");
             probe pr;
             llama_context_params params = llama_context_default_params();
             if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -1395,6 +1433,7 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
             params.cb_eval_user_data = &pr;
             llama_context_ptr ctx(llama_init_from_model(model, params));
             set_env("LLAMA_KV_PAD_PREFILL", nullptr);
+            set_env("LLAMA_KV_PAD_SHARED_LEGACY", nullptr);
             if (!ctx) throw std::runtime_error("prefill reuse: failed to create a context");
 
             const auto decode = [&](const std::vector<llama_token> & input, int begin, int end, llama_seq_id seq,
@@ -1498,6 +1537,180 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
                 if (!ok) return false;
             }
         }
+    }
+    return true;
+}
+
+// Sequences that share a pool decode on a graph that holds. 23 sessions of the served GLM-5.3 Flash, each verifying two
+// drafts a step (four RTX PRO 6000, -sm tensor, Nov 9, 2026), grew their pool ~50 cells a step and crossed its 256-cell
+// padding every 5 steps, where one sequence crosses it every ~115: each crossing built the target's graph and the MTP
+// head's again and planned their memory, in 34 of 64 decodes at 8.7 ms each, the cards 23-30% busy through a 150 ms step.
+// A pool that sequences share is padded to 256 cells a sequence, the next power of two, wherever its indexer scores, so
+// it crosses as often a step as one sequence does; LLAMA_KV_PAD_SHARED_LEGACY=1 keeps 256. The cells that adds are empty
+// and the sparse attention reads none of them: the logits are the 256-padded pool's, byte for byte on the CPU and to
+// test_glm_prefill_reuse's bar on a GPU, whose attention kernel can depend on the cache length.
+// The pool's maps are one stream a sequence, each from its sequence's view (llama_kpool_shared_streams), where they
+// packed every sequence's pools on one axis and were built from every cell; LLAMA_KPOOL_SHARED_VIEWS_LEGACY=1 packs
+// them. The logits are those of a cache a sequence (kv_unified off), byte for byte on the CPU. The packed maps' are
+// not: 28 of this test's 960 rows differ from a cache a sequence by up to 0.5% of the largest logit and 102 by a
+// rounding step (CPU, seed 1234, Nov 10, 2026), so they are held to the GPU's bar.
+// The streams' bank takes a decode's changes as one input its device writes before the maps are made (ggml_kpool_patch),
+// where each change was a write of its own; LLAMA_KPOOL_PATCH_INPUT_LEGACY=1 writes them. The logits are the same again.
+static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(8)); // the indexer scores from the first step
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int n_embd  = llama_model_n_embd(model);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const bool on_cpu = std::all_of(devs.begin(), devs.end(), [](ggml_backend_dev_t dev) {
+        return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    });
+
+    // 8 sequences read 16 tokens each, then decode 40 steps of 3 rows each (a sampled token and two drafts): 24 cells a
+    // step, from 128 cells to 1,088
+    const int n_seq    = 8;
+    const int n_prompt = 16;
+    const int n_rows   = 3;
+    const int n_steps  = 40;
+    const int n_pos    = n_prompt + n_steps*n_rows;
+    const auto tokens = get_tokens(n_seq*n_pos, n_vocab, seed);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 0.1f);
+    std::vector<float> hidden((size_t) n_seq*n_prompt*n_embd);
+    for (auto & value : hidden) value = normal(rng);
+
+    struct read_result {
+        std::vector<float> logits;     // every row of every step
+        int32_t            n_reused = 0;
+        std::set<int64_t>  n_kv;       // the cache lengths the steps' graphs read
+        bool               patched = false; // a step's graph wrote the bank's changes
+    };
+    struct seen_nodes {
+        std::set<int64_t> n_kv;
+        bool              patched = false;
+    };
+
+    const auto read = [&](bool legacy, bool mtp, bool packed = false, bool writes = false, bool unified = true) {
+        set_env("LLAMA_KV_PAD_SHARED_LEGACY", legacy ? "1" : nullptr);
+        set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", packed ? "1" : nullptr);
+        set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", writes ? "1" : nullptr);
+        seen_nodes seen;
+        std::set<int64_t> & n_kv = seen.n_kv;
+        llama_context_params params = llama_context_default_params();
+        if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx      = 8192;
+        params.n_batch    = 512;
+        params.n_ubatch   = 512;
+        params.n_seq_max  = n_seq;
+        params.kv_unified = unified;
+        params.n_threads  = params.n_threads_batch = 4;
+        params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            if (ask && std::string(t->name).rfind("kpool_cand_mask", 0) == 0) {
+                static_cast<seen_nodes *>(data)->n_kv.insert(t->ne[0]);
+            }
+            if (ask && std::string(t->name) == "kpool_resident_patched") {
+                static_cast<seen_nodes *>(data)->patched = true;
+            }
+            return false;
+        };
+        params.cb_eval_user_data = &seen;
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        set_env("LLAMA_KV_PAD_SHARED_LEGACY", nullptr);
+        set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", nullptr);
+        set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", nullptr);
+        if (!ctx) throw std::runtime_error("shared pool reuse: failed to create a context");
+
+        // positions [begin, end) of every sequence, a sequence's rows together
+        const auto decode = [&](int begin, int end) {
+            llama_batch batch = llama_batch_init(n_seq*(end - begin), 0, 1);
+            for (int seq = 0; seq < n_seq; ++seq) {
+                for (int pos = begin; pos < end; ++pos) {
+                    common_batch_add(batch, tokens[(size_t) seq*n_pos + pos], pos, {seq}, true);
+                }
+            }
+            if (mtp) batch.embd = hidden.data();
+            const int result = llama_decode(ctx.get(), batch);
+            batch.embd = nullptr;
+            llama_batch_free(batch);
+            if (result) throw std::runtime_error("shared pool reuse: decode failed");
+        };
+
+        read_result res;
+        decode(0, n_prompt);
+        n_kv.clear();
+        for (int step = 0; step < n_steps; ++step) {
+            decode(n_prompt + step*n_rows, n_prompt + (step + 1)*n_rows);
+            for (int i = 0; i < n_seq*n_rows; ++i) {
+                const float * row = llama_get_logits_ith(ctx.get(), i);
+                res.logits.insert(res.logits.end(), row, row + n_vocab);
+            }
+        }
+        res.n_reused = llama_perf_context(ctx.get()).n_reused;
+        res.n_kv     = n_kv;
+        res.patched  = seen.patched;
+        return res;
+    };
+
+    for (const bool mtp : {false, true}) {
+        const read_result legacy = read(true, mtp);
+        const read_result shared = read(false, mtp);
+        const read_result packed = read(false, mtp, true);
+        const read_result writes = read(false, mtp, false, true);
+        const read_result alone  = read(false, mtp, false, false, false);
+
+        // 256 cells a sequence: 2,048, which the 1,088 cells never cross, and their pools never cross a quarter of it. The
+        // first step builds its graph (another length than the prompt's, and in the main context each sequence's second
+        // step, off the recurrent state's zero row); every later step reuses it. Padded to 256, the pool crosses at
+        // steps 6, 17, 27 and 38 (272, 536, 776 and 1,040 cells), and each builds again
+        const int want_shared     = n_steps - 1;
+        const int want_legacy_max = want_shared - 4;
+        const std::set<int64_t> want_n_kv = { 2048 };
+        const int64_t want_n_kv_legacy = GGML_PAD(n_seq*n_pos, 256);
+
+        bool ok = true;
+        if (shared.n_reused != want_shared || legacy.n_reused > want_legacy_max) {
+            LOG_ERR("GLM shared pool reuse: mtp=%d: reused %d graphs padded to 256 a sequence (want %d), %d padded to 256 "
+                    "(want at most %d)\n", mtp, shared.n_reused, want_shared, legacy.n_reused, want_legacy_max);
+            ok = false;
+        }
+        if (shared.n_kv != want_n_kv || legacy.n_kv.empty() || *legacy.n_kv.rbegin() != want_n_kv_legacy) {
+            LOG_ERR("GLM shared pool reuse: mtp=%d: the steps read %zu cache lengths up to %lld padded to 256 a sequence "
+                    "(want 2048 alone), up to %lld padded to 256 (want %lld)\n", mtp, shared.n_kv.size(),
+                    shared.n_kv.empty() ? -1LL : (long long) *shared.n_kv.rbegin(),
+                    legacy.n_kv.empty() ? -1LL : (long long) *legacy.n_kv.rbegin(), (long long) want_n_kv_legacy);
+            ok = false;
+        }
+        if (!shared.patched || writes.patched || packed.patched) {
+            LOG_ERR("GLM shared pool reuse: mtp=%d: the bank's changes went with the graph: %d (want 1), %d with "
+                    "LLAMA_KPOOL_PATCH_INPUT_LEGACY=1 (want 0), %d with packed maps (want 0)\n", mtp, shared.patched,
+                    writes.patched, packed.patched);
+            ok = false;
+        }
+        for (const auto & other : { std::make_pair("padded to 256", &legacy), std::make_pair("with packed maps", &packed),
+                std::make_pair("whose bank is written a change a write", &writes),
+                std::make_pair("of a cache a sequence", &alone) }) {
+            const bool exact = on_cpu && other.second != &packed;
+            if (exact && other.second->logits != shared.logits) {
+                LOG_ERR("GLM shared pool reuse: mtp=%d: logits differ from the pool %s, nmse=%g\n", mtp, other.first,
+                        nmse(other.second->logits, shared.logits));
+                ok = false;
+            }
+            if (!exact) {
+                size_t n_top_differ = 0;
+                size_t n_top_tied   = 0;
+                const double kld = mean_kld(other.second->logits, shared.logits, n_vocab, n_top_differ, n_top_tied);
+                if (!(kld <= 1e-6) || n_top_differ > 0) {
+                    LOG_ERR("GLM shared pool reuse: mtp=%d: against the pool %s: mean KLD %g (at most 1e-6), %zu rows' top "
+                            "token differs, %zu tied rows' swapped, nmse=%g\n", mtp, other.first, kld, n_top_differ,
+                            n_top_tied, nmse(other.second->logits, shared.logits));
+                    ok = false;
+                }
+            }
+        }
+        if (!ok) return false;
     }
     return true;
 }
@@ -2840,6 +3053,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL prefill reuse\033[0m";
                         }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_shared_pool_reuse(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL shared pool reuse\033[0m";
+                        }
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_tok_embd_on_device(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL tok_embd on device\033[0m";
@@ -2909,6 +3126,7 @@ int main(int argc, char ** argv) {
     std::string out;
     std::string diagnostic_dir, diagnostic_device;
     std::string dp_device, prefill_device;
+    std::string tensor_device; // --glm-tensor-device CUDA0,CUDA1,CUDA0,CUDA1: one rank per name, repeats allowed
     bool glm_alias_only = false;
     bool glm_kpool_only = false;
     bool glm_nextn_only = false;
@@ -2930,6 +3148,11 @@ int main(int argc, char ** argv) {
             const bool prefill = strcmp(argv[i], "--glm-prefill-reuse-device") == 0;
             if (i + 1 == argc) return 1;
             (prefill ? prefill_device : dp_device) = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--glm-tensor-device") == 0) {
+            if (i + 1 == argc) return 1;
+            tensor_device = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--glm-prefix-diagnostics") == 0 || strcmp(argv[i], "--glm-prefix-device") == 0) {
@@ -2996,6 +3219,18 @@ int main(int argc, char ** argv) {
             ggml_backend_load_all();
             if (!test_glm_arch_alias(seed)) { return 1; }
             if (glm_alias_only) { return 0; }
+        }
+        if (!tensor_device.empty()) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> ranks;
+            for (const auto & name : string_split<std::string>(tensor_device, ',')) {
+                const auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) throw std::runtime_error("GLM tensor device is unavailable: " + name);
+                ranks.push_back(device);
+            }
+            const int plain = test_glm_tensor(seed, ranks, false);
+            const int quantized = test_glm_tensor(seed, ranks, true);
+            return plain || quantized;
         }
         if (!dp_device.empty() || !prefill_device.empty()) {
             ggml_backend_load_all();

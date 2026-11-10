@@ -664,12 +664,64 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
     return res;
 }
 
+// the switches that keep the pool maps off the device's resident tables. Read at each call, as the builder read them:
+// a caller sets LLAMA_KPOOL_RESIDENT_LEGACY around one context's decodes (test_glm_mtp_index's reference), and a value
+// kept from the first call left that context on the resident tables
+static bool kpool_resident_off() {
+    return ggml_env_switch("LLAMA_KPOOL_RESIDENT_LEGACY") ||
+        ggml_env_switch("LLAMA_KPOOL_INPUT_LEGACY") || ggml_env_switch("LLAMA_KPOOL_INPUT_CHECK") ||
+        ggml_env_switch("LLAMA_KPOOL_MASK_HOST_LEGACY");
+}
+
+bool llm_graph_input_kpool::shared_pool(const llama_cparams & cparams, const llama_kpool_views & views) {
+    return !views.packed_legacy && cparams.kv_unified && cparams.n_seq_max > 1 && cparams.n_seq_devices == 1;
+}
+
+bool llm_graph_input_kpool::shared_streams(
+        const llama_kv_cache_context * mctx_attn,
+        const llama_ubatch           & ubatch,
+        const llama_cparams          & cparams,
+        const llama_hparams          & hparams,
+        uint32_t                       kpool,
+        std::vector<llama_seq_id>    & seqs) {
+    seqs.clear();
+
+    if (kpool == 0 || kpool_resident_off() || mctx_attn->is_full() || ubatch.n_seqs_unq == 0) {
+        return false;
+    }
+
+    const auto * kv    = mctx_attn->get_kv();
+    auto       & views = kv->get_kpool_views();
+
+    if (!shared_pool(cparams, views) || views.bank_unsupported || !llama_kpool_shared_streams(kv->get_cells(ubatch.seq_id_unq[0]), ubatch, seqs)) {
+        seqs.clear();
+        return false;
+    }
+
+    const int64_t n_kv    = mctx_attn->get_n_kv();
+    const int64_t n_pools = llama_kpool_n_pools_ubatch([kv](llama_seq_id s) -> const llama_kv_cells & {
+        return kv->get_cells(s);
+    }, ubatch, n_kv, kpool, ubatch.n_seqs_unq, hparams.indexer_top_k, llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
+
+    views.reserve_views(cparams.n_seq_max);
+    views.begin();
+    for (const llama_seq_id seq : seqs) {
+        if (!views.serve(kv->get_cells(seq), seq, kpool, n_kv, n_pools)) {
+            seqs.clear();
+            return false;
+        }
+    }
+
+    return true;
+}
+
 llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
         const llama_kv_cache_context * mctx_attn,
         const llama_ubatch           & ubatch,
         const llama_cparams          & cparams,
         const llama_hparams          & hparams,
-        uint32_t                       kpool) {
+        uint32_t                       kpool,
+        bool                           shared) {
     llm_graph_input_kpool_dims dims;
 
     if (kpool == 0) {
@@ -678,7 +730,7 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
 
     dims.n_kv     = mctx_attn->get_n_kv();
     dims.n_tokens = ubatch.n_tokens;
-    dims.n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    dims.n_stream = cparams.kv_unified && !shared ? 1 : ubatch.n_seqs_unq;
     if (dims.n_stream < 1) {
         return dims;
     }
@@ -779,7 +831,13 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
     }
 
     draft = params.cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? mctx_hyb->get_mtp_index() : nullptr;
-    const auto dims = current_dims(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool);
+
+    // a unified pool's ubatch that can take a stream a sequence takes it, and one that no longer can leaves it
+    std::vector<llama_seq_id> seqs;
+    const bool shared_now = pool_cells != nullptr && shared_streams(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool, seqs);
+    if (shared_now != shared || (shared && seqs != resident_seqs)) return false;
+
+    const auto dims = current_dims(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool, shared);
     const bool reuse_selection = dims.scoring && !dims.rebuild && draft && draft->can_reuse(params.ubatch, dims.n_kv, kpool*dims.n_dump, kpool);
     if ((draft_top_k != nullptr) != reuse_selection) return false;
     if (!draft_rows.empty()) {
@@ -792,8 +850,8 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
     if (resident_table) {
         if (resident_seqs.empty()) {
             if (params.ubatch.n_seqs_unq != 1 || params.ubatch.seq_id_unq[0] != resident_seq) return false;
-        } else if (params.ubatch.n_seqs_unq != resident_seqs.size() ||
-                !std::equal(resident_seqs.begin(), resident_seqs.end(), params.ubatch.seq_id_unq)) {
+        } else if (!shared && (params.ubatch.n_seqs_unq != resident_seqs.size() ||
+                !std::equal(resident_seqs.begin(), resident_seqs.end(), params.ubatch.seq_id_unq))) {
             return false;
         }
         auto & views = mctx_attn->get_kv()->get_kpool_views();
@@ -1578,6 +1636,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_cand        = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1618,6 +1677,12 @@ void llm_graph_result::reset() {
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     for (auto & input : inputs) {
         input->set_input(ubatch);
+    }
+}
+
+void llm_graph_result::inputs_lost() {
+    for (auto & input : inputs) {
+        input->input_lost();
     }
 }
 
@@ -4190,6 +4255,21 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
     return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
 }
 
+// the buffer type the resident pool tables live in: the latent cache's, when every layer keeps it in one
+static ggml_backend_buffer_type_t kpool_resident_buft(const llama_kv_cache * kv) {
+    const auto layers = kv->get_layer_ids();
+    ggml_backend_buffer_type_t buft = layers.empty() ? nullptr :
+        ggml_backend_buffer_get_type(kv->get_k_storage(layers.front())->buffer);
+    for (auto layer : layers) {
+        if (ggml_backend_buffer_get_type(kv->get_k_storage(layer)->buffer) != buft) buft = nullptr;
+    }
+    if (buft && ggml_env_switch("LLAMA_KV_HOST")) {
+        // Keep hot selection metadata on the owning GPU when latent history lives in RAM.
+        buft = ggml_backend_dev_buffer_type(ggml_backend_buft_get_device(buft));
+    }
+    return buft;
+}
+
 llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         const llama_memory_hybrid_context * mctx_cur,
         ggml_tensor * kq_mask,
@@ -4214,8 +4294,38 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
     if (scoring) {
         const int64_t n_kv = mctx_attn->get_n_kv();
 
-        // must match build_attn_inp_kq_mask; get_n_stream() is the stream RANGE and is wrong
-        const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+        // the cache's streams: must match build_attn_inp_kq_mask; get_n_stream() is the stream RANGE and is wrong
+        const int64_t n_stream_kv = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+        const int64_t n_tps_kv    = ubatch.n_tokens/n_stream_kv;
+
+        // A unified pool's sequences take a stream each for the pool maps, out of the pool's bank, where the device makes
+        // the maps from it: packed on one pool axis they were built from every cell for each sequence (0.85 ms a decode at
+        // 8,192 cells and 6.38 ms at 131,072, 23 sequences on the Nov 9 fixture) and every row scored every sequence's pools
+        std::vector<llama_seq_id> shared_seqs;
+        bool shared = llm_graph_input_kpool::shared_streams(mctx_attn, ubatch, cparams, hparams, kpool, shared_seqs);
+        if (shared) {
+            const auto * kv   = mctx_attn->get_kv();
+            auto       * buft = kpool_resident_buft(kv);
+            bool supported = buft != nullptr;
+            if (supported) {
+                auto & views = kv->get_kpool_views();
+                const auto * v = views.serve(kv->get_cells(shared_seqs[0]), shared_seqs[0], kpool, n_kv, llama_kpool_n_pools(n_kv, kpool));
+                const auto bank = views.resident_bank(buft, v->resident_size(), cparams.n_seq_max, cparams.n_seq_devices);
+                auto * probe = ggml_kpool_materialize(ctx0, bank->tensor, ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 7, 1, 1),
+                        kv->get_size(), kpool, n_kv, 1, 0, GGML_KPOOL_MATERIALIZE_FACTS);
+                auto * device = ggml_backend_buft_get_device(buft);
+                if (!device && ggml_backend_buft_is_host(buft)) device = ggml_backend_get_device(backend_cpu);
+                supported = device && ggml_backend_dev_supports_op(device, probe);
+            }
+            if (!supported) {
+                // said once: the cache keeps the packed maps from here on, built from every cell at each decode
+                LLAMA_LOG_WARN("%s: the k-pool bank is not supported on this cache's device: a unified pool's sequences keep the packed pool maps\n", __func__);
+                kv->get_kpool_views().bank_unsupported = true;
+                shared = false;
+            }
+        }
+
+        const int64_t n_stream = shared ? ubatch.n_seqs_unq : n_stream_kv;
         const int64_t n_tps    = ubatch.n_tokens/n_stream;
 
         // pool maps are per SEQUENCE; sized on the ubatch, not n_seq_max (256 in llama-embedding)
@@ -4236,28 +4346,19 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
         const int64_t n_dump  = llama_kpool_select_k(n_pools, hparams.indexer_top_k, kpool);
 
-        GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
+        GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream_kv);
 
-        GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
+        GGML_ASSERT(kq_mask->ne[1] == n_tps_kv && "the pooled indexer needs an unpadded KQ mask");
 
-        // Canonical tables live with the cache, shared by graph slots. DP stores each sequence's table on its owner.
+        // Canonical tables live with the cache, shared by graph slots. DP stores each sequence's table on its owner, and a
+        // unified pool of several sequences keeps them in one bank: its resident maps come from the bank or not at all
         const llama_kpool_views::view * resident_view = nullptr;
-        if ((!mctx_attn->is_full() || !ggml_env_switch("LLAMA_KV_HOST")) &&
-                n_ps == 1 && (n_stream == 1 || cparams.n_seq_devices > 1) &&
-                !ggml_env_switch("LLAMA_KPOOL_RESIDENT_LEGACY") &&
-                !ggml_env_switch("LLAMA_KPOOL_INPUT_LEGACY") && !ggml_env_switch("LLAMA_KPOOL_INPUT_CHECK") &&
-                !ggml_env_switch("LLAMA_KPOOL_MASK_HOST_LEGACY")) {
+        ggml_tensor * resident_tensor = nullptr; // the view's table or the bank, after the decode's patches where it takes them
+        // the graph reserved at load takes the resident path as a decode does, so its buffers are a decode's
+        if ((!mctx_attn->is_full() || !ggml_env_switch("LLAMA_KV_HOST")) && n_ps == 1 && !kpool_resident_off() &&
+                (shared || (!llm_graph_input_kpool::shared_pool(cparams, mctx_attn->get_kv()->get_kpool_views()) && (n_stream == 1 || cparams.n_seq_devices > 1)))) {
             const auto * kv = mctx_attn->get_kv();
-            const auto layers = kv->get_layer_ids();
-            ggml_backend_buffer_type_t buft = layers.empty() ? nullptr :
-                ggml_backend_buffer_get_type(kv->get_k_storage(layers.front())->buffer);
-            for (auto layer : layers) {
-                if (ggml_backend_buffer_get_type(kv->get_k_storage(layer)->buffer) != buft) buft = nullptr;
-            }
-            if (buft && ggml_env_switch("LLAMA_KV_HOST")) {
-                // Keep hot selection metadata on the owning GPU when latent history lives in RAM.
-                buft = ggml_backend_dev_buffer_type(ggml_backend_buft_get_device(buft));
-            }
+            auto * buft = kpool_resident_buft(kv);
             if (buft) {
                 auto & views = kv->get_kpool_views();
                 if (cparams.n_seq_devices > 1) { views.reserve_views(cparams.n_seq_max); }
@@ -4266,13 +4367,18 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                     resident_view = views.serve(kv->get_cells(ubatch.seq_id_unq[s]), ubatch.seq_id_unq[s], kpool, n_kv, n_pools);
                     if (!resident_view) { break; }
                 }
+                GGML_ASSERT((resident_view || !shared) && "k-pool: a unified pool's streams need every sequence's view");
                 if (resident_view) {
-                    if (cparams.n_seq_devices > 1) {
-                        inp->resident_seqs.assign(ubatch.seq_id_unq, ubatch.seq_id_unq + ubatch.n_seqs_unq);
+                    if (cparams.n_seq_devices > 1 || shared) {
+                        inp->shared = shared;
+                        if (shared) { inp->resident_seqs = shared_seqs; }
+                        else { inp->resident_seqs.assign(ubatch.seq_id_unq, ubatch.seq_id_unq + ubatch.n_seqs_unq); }
                         inp->resident_table = views.resident_bank(buft, resident_view->resident_size(), cparams.n_seq_max, cparams.n_seq_devices);
                         inp->resident_rows = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 7, n_tps, n_stream);
                         const auto counts = ubatch.device_seqs(cparams.n_seq_devices);
-                        ggml_backend_meta_split_input(inp->resident_rows, 2, counts.data(), counts.size());
+                        if (cparams.n_seq_devices > 1) {
+                            ggml_backend_meta_split_input(inp->resident_rows, 2, counts.data(), counts.size());
+                        }
                     } else {
                         inp->resident_seq = ubatch.seq_id_unq[0];
                         inp->resident_table = resident_view->resident(buft);
@@ -4283,6 +4389,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                     auto * device = ggml_backend_buft_get_device(buft);
                     if (!device && ggml_backend_buft_is_host(buft)) device = ggml_backend_get_device(backend_cpu);
                     if (!device || !ggml_backend_dev_supports_op(device, probe)) {
+                        GGML_ASSERT(!shared && "k-pool: the bank was probed for a unified pool's streams");
                         inp->resident_table.reset();
                         inp->resident_seqs.clear();
                         inp->resident_rows = nullptr;
@@ -4290,12 +4397,31 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                     } else {
                         ggml_set_input(inp->resident_rows);
                         ggml_set_name(inp->resident_rows, "kpool_resident_rows");
+                        resident_tensor = inp->resident_table->tensor;
+                        // A unified pool's bank takes a decode's changes as one input, written on the device before
+                        // the maps are made (ggml_kpool_patch). As writes of their own they were 241 copies a decode to
+                        // every device at 23 sequences, and all of set_inputs: 0.57 to 0.62 ms a decode, 0.009 to 0.015
+                        // with the input, whatever the pool holds (fixture, two ranks, Nov 10, 2026). Room for a row put
+                        // and a row taken a token: each changes its pool's cells' two facts and the pool's slots, fill
+                        // and rep. What does not fit is still a write of its own, as a view's first upload is.
+                        // LLAMA_KPOOL_PATCH_INPUT_LEGACY=1: every change a write
+                        if (shared && !views.patch_writes_legacy) {
+                            auto * patches = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 3, 2*ubatch.n_tokens*(3*kpool + 2));
+                            auto * patched = ggml_kpool_patch(ctx0, resident_tensor, patches);
+                            if (ggml_backend_dev_supports_op(device, patched)) {
+                                ggml_set_input(patches);
+                                ggml_set_name(patches, "kpool_resident_patches");
+                                ggml_set_name(patched, "kpool_resident_patched");
+                                inp->resident_patches = patches;
+                                resident_tensor = patched;
+                            }
+                        }
                     }
                 }
             }
         }
         auto materialize = [&](enum ggml_kpool_materialize_mode mode) {
-            return ggml_kpool_materialize(ctx0, inp->resident_table->tensor, inp->resident_rows,
+            return ggml_kpool_materialize(ctx0, resident_tensor, inp->resident_rows,
                     mctx_attn->get_kv()->get_size(), kpool, n_kv, n_pools, n_dump, mode);
         };
 
@@ -4379,7 +4505,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 hparams.swa_type == LLAMA_SWA_TYPE_NONE && hparams.n_pos_per_embd() == 1 && !hparams.attn_soft_cap &&
                 (int64_t) hparams.indexer_kpool*n_dump + tail_bound <= GGML_KPOOL_INDICES_MAX &&
                 n_tps <= 65535 && n_stream <= 65535 &&
-                n_kv >= std::max<int64_t>(4096, std::min<int64_t>(n_tps, 8)*direct_bound)) {
+                n_kv >= std::max<int64_t>(4096, std::min<int64_t>(n_tps_kv, 8)*direct_bound)) {
             auto * tail = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, tail_bound, n_tps, n_stream);
             auto * selected = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool*n_dump, n_tps, n_stream);
             auto * probe = ggml_kpool_indices(ctx0, inp->mask_cells, inp->mask_rows, selected, tail,
@@ -4418,6 +4544,14 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 inp->draft_rows.push_back(row);
                 inp->draft_seqs.push_back(ubatch.seq_id[i][0]);
             }
+            // a round's rows are in one bank or in a store each; rows of both kinds are read back through the host
+            const bool banked = !inp->draft_rows.empty() && inp->draft_rows.front()->tensor->ne[1] > 1;
+            for (const auto & row : inp->draft_rows) {
+                if ((row->tensor->ne[1] > 1) != banked || (banked && row != inp->draft_rows.front())) {
+                    inp->draft_rows.clear();
+                    break;
+                }
+            }
             if (!inp->draft_rows.empty()) {
                 ggml_tensor * joined = nullptr;
                 if (cparams.n_seq_devices > 1) {
@@ -4428,6 +4562,12 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                     ggml_backend_meta_split_input(inp->draft_ids, 0, counts.data(), counts.size());
                     ggml_set_input(inp->draft_ids);
                     joined = ggml_backend_meta_get_rows_local(ctx0, bank->tensor, inp->draft_ids);
+                } else if (banked) {
+                    // one bank of every slot's row (llama_kpool_draft::capture_backend_rows): the rows by their slots
+                    const auto & bank = inp->draft_rows.front();
+                    inp->draft_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+                    ggml_set_input(inp->draft_ids);
+                    joined = ggml_get_rows(ctx0, bank->tensor, inp->draft_ids);
                 } else {
                     for (const auto & row : inp->draft_rows) {
                         auto * t = ggml_reshape_2d(ctx0, row->tensor, kpool*n_dump, 1);
@@ -4506,8 +4646,11 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     GGML_ASSERT(sel_mask->type == GGML_TYPE_F16 || sel_mask->type == GGML_TYPE_F32);
     GGML_ASSERT(sel_mask->type == cand_mask->type);
-    GGML_ASSERT(cand_mask->ne[0] == kq_mask->ne[0] && cand_mask->ne[1] == kq_mask->ne[1] &&
-                cand_mask->ne[3] == kq_mask->ne[3]);
+    // a unified pool's sequences have a stream each in the pool masks and one in the cache (llm_graph_input_kpool::shared):
+    // the same rows in the same order
+    const bool shared = cand_mask->ne[3] != kq_mask->ne[3];
+    GGML_ASSERT(cand_mask->ne[0] == kq_mask->ne[0] && cand_mask->ne[1]*cand_mask->ne[3] == kq_mask->ne[1]*kq_mask->ne[3] &&
+                (!shared || kq_mask->ne[3] == 1));
     GGML_ASSERT(sel_mask->ne[1] == cand_mask->ne[1] && sel_mask->ne[2] == cand_mask->ne[2] &&
                 sel_mask->ne[3] == cand_mask->ne[3]);
 
@@ -4531,6 +4674,9 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     if (direct) {
         sparse_indices = ggml_kpool_indices(ctx0, sel_mask->src[0], sel_mask->src[1], top_k, tail_cells,
             sel_mask->ne[0] - n_kv, llama_kpool_n_kv_max(top_k->ne[0], tail_cells->ne[0]));
+        if (shared) {
+            sparse_indices = ggml_reshape_4d(ctx0, sparse_indices, sparse_indices->ne[0], kq_mask->ne[1], 1, 1);
+        }
         // Index generation support does not imply support for the consuming attention kernel.
         auto * pq = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/k->ne[3], k->ne[3],
                 q->nb[1], q->nb[2], q->nb[3]/k->ne[3], 0);
@@ -4549,7 +4695,7 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         if (!direct) { sparse_indices = nullptr; }
     }
     if (ggml_env_switch("LLAMA_KV_HOST") && !direct &&
-            (!cparams.flash_attn || kq_b || n_kv >= std::max<int64_t>(4096, std::min<int64_t>(cand_mask->ne[1], 8)*direct_bound))) {
+            (!cparams.flash_attn || kq_b || n_kv >= std::max<int64_t>(4096, std::min<int64_t>(kq_mask->ne[1], 8)*direct_bound))) {
         throw std::runtime_error("host KV requires flash attention and direct sparse indices above the staging cutoff");
     }
     ggml_tensor * mask_top_k = nullptr;
@@ -4594,6 +4740,9 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         // sequence at or before its position (kpool_mask_row; test-kpool-input checks its zeros against the KQ mask's), so
         // adding the KQ mask changes nothing while that mask is 0 or -inf on those cells and -inf elsewhere. A window, ALiBi or
         // 2-D positions make it more than that, and it is added
+        if (shared) {
+            mask_top_k = ggml_reshape_4d(ctx0, mask_top_k, n_kv, kq_mask->ne[1], 1, 1);
+        }
         if (kq_add || hparams.use_alibi || hparams.swa_type != LLAMA_SWA_TYPE_NONE || hparams.n_pos_per_embd() != 1) {
             mask_top_k = ggml_add(ctx0, mask_top_k, kq_mask);
         }
@@ -4775,6 +4924,25 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+// llama_set_output_candidates: one node takes the k largest logits of every output row, and the host reads those in place
+// of the rows. -sm tensor: each device takes them from its share of the vocab, a part a device, so no row is gathered
+void llm_graph_context::build_candidates() const {
+    ggml_tensor * logits = res->t_logits;
+    if (cparams.n_out_candidates <= 0 || !samplers.empty() || !logits || n_outputs == 0) {
+        return;
+    }
+    if (logits->type != GGML_TYPE_F32 || logits->ne[2] != 1 || logits->ne[3] != 1 || !ggml_is_contiguous(logits)) {
+        return;
+    }
+
+    const int k = (int) std::min<int64_t>(cparams.n_out_candidates, logits->ne[0]);
+
+    res->t_cand = ggml_top_k_candidates(ctx0, logits, k, cparams.n_logits_parts);
+    cb(res->t_cand, "result_candidates", -1);
+
+    ggml_build_forward_expand(gf, res->t_cand);
 }
 
 void llm_graph_context::build_sampling() const {

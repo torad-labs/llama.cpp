@@ -424,24 +424,33 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * kbuf = mctx_idx->get_k(ctx0, il);
 
     const int64_t n_kv     = kbuf->ne[2];
-    const int64_t n_stream = kbuf->ne[3];
+    // the pool maps' streams: the cache's, or a stream a sequence over a unified pool's one (llm_graph_input_kpool::shared)
+    const int64_t n_stream = inp_kp->pool_bias->ne[2];
     const int64_t n_tps    = n_tokens/n_stream;
     const int64_t n_pools  = inp_kp->pool_bias->ne[0];
+
+    GGML_ASSERT(kbuf->ne[3] == n_stream || (inp_kp->shared && kbuf->ne[3] == 1));
 
     GGML_ASSERT(kbuf->ne[0] == d_idx && kbuf->ne[1] == 3 &&
             "the pooled indexer cache needs a key head, a gate head and a pooled head");
     GGML_ASSERT(kbuf->nb[1] == ggml_row_size(kbuf->type, d_idx) && "key, gate and pooled must be adjacent in a cell");
     GGML_ASSERT(n_tokens == n_tps*n_stream);
 
-    ggml_tensor * kg_rows = ggml_view_3d(ctx0, kbuf, 2*d_idx, n_kv, n_stream,
+    ggml_tensor * kg_rows = ggml_view_3d(ctx0, kbuf, 2*d_idx, n_kv, kbuf->ne[3],
             kbuf->nb[2], kbuf->nb[3], 0);
+
+    // a unified pool's streams write and read the one cache stream: their slots and reps as one stream's
+    ggml_tensor * new_pool_cells = inp_kp->new_pool_cells;
+    if (inp_kp->shared) {
+        new_pool_cells = ggml_reshape_2d(ctx0, new_pool_cells, new_pool_cells->ne[0]*n_stream, 1);
+    }
 
     ggml_tensor * ape = layer.indexer_comp_ape_transposed ? layer.indexer_comp_ape_transposed :
             ggml_cont(ctx0, ggml_transpose(ctx0, layer.indexer_comp_ape));
 
     // the write is by GLOBAL row while pool_reps is stream-local, so the read must not chain
     // off the write tensor; every chunk's write is expanded first and build order sequences them
-    llama_kpool_compress(ctx0, gf, kg_rows, inp_kp->new_pool_cells, inp_kp->new_pool_reps, ape, r,
+    llama_kpool_compress(ctx0, gf, kg_rows, new_pool_cells, inp_kp->new_pool_reps, ape, r,
             LLAMA_KPOOL_COMPRESS_CHUNK,
             [&](ggml_tensor * src, ggml_tensor * rows) {
                 return mctx_idx->cpy_k_part(ctx0, src, rows, il, d_idx, 2*d_idx);
@@ -456,10 +465,11 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
 
     // every pool's key, gathered into f32 rows (the unfused path, and the fused one under LLAMA_INDEXER_GATHER_LEGACY=1)
     const auto gather_pool_k = [&]() {
-        ggml_tensor * pooled_rd = ggml_view_3d(ctx0, kbuf, d_idx, n_kv, n_stream,
+        ggml_tensor * pooled_rd = ggml_view_3d(ctx0, kbuf, d_idx, n_kv, kbuf->ne[3],
                 kbuf->nb[2], kbuf->nb[3], 2*kbuf->nb[1]);
 
-        ggml_tensor * pool_k = ggml_get_rows(ctx0, pooled_rd, inp_kp->pool_reps);
+        ggml_tensor * pool_k = ggml_get_rows(ctx0, pooled_rd, inp_kp->shared ?
+                ggml_reshape_2d(ctx0, inp_kp->pool_reps, n_pools*n_stream, 1) : inp_kp->pool_reps);
         pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
         cb(pool_k, "indexer_pool_k", il);
         return pool_k;
@@ -485,7 +495,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         if (!gather_legacy) {
             // the pooled keys read where the cache holds them, pool p at cell pool_reps[p], scored in f32 like the
             // gathered rows (ggml_lightning_indexer_rows): no copy of every pool's key each token
-            ggml_tensor * pooled = ggml_view_4d(ctx0, kbuf, d_idx, 1, n_kv, n_stream,
+            ggml_tensor * pooled = ggml_view_4d(ctx0, kbuf, d_idx, 1, n_kv, kbuf->ne[3],
                     kbuf->nb[1], kbuf->nb[2], kbuf->nb[3], 2*kbuf->nb[1]);
 
             pool_score = ggml_lightning_indexer_rows(ctx0, iq, pooled, inp_kp->pool_reps, w, inp_kp->pool_bias_f16);

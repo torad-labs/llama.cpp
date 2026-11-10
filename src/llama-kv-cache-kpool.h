@@ -47,6 +47,11 @@ public:
     void capture(llama_seq_id seq, llama_pos pos, int64_t n_kv, const std::vector<int32_t> & cells);
     void capture_backend(llama_seq_id seq, llama_pos pos, int64_t n_kv, ggml_tensor * source, int64_t row,
             ggml_backend_t backend = nullptr, uint32_t slots = 1, uint32_t devices = 1);
+    // Every row of source at once, row i for seqs[i]. One device of sequences with several slots keeps the rows in one
+    // bank of [width, slots], and a run of rows whose sequences are neighbours is one copy: a store and a copy a
+    // sequence were 46 a step at 23 sequences. LLAMA_KPOOL_DRAFT_BANK_LEGACY=1: a store and a copy a sequence
+    void capture_backend_rows(const llama_seq_id * seqs, const llama_pos * positions, size_t n, int64_t n_kv,
+            ggml_tensor * source, ggml_backend_t backend, uint32_t slots, uint32_t devices);
     std::shared_ptr<llama_kpool_backend_tensor> backend_row(llama_seq_id seq) const;
     bool can_reuse(const llama_ubatch & ubatch, int64_t n_kv, int64_t width, uint32_t kpool) const;
     void copy(const llama_ubatch & ubatch, int32_t * dst) const;
@@ -104,6 +109,8 @@ public:
         size_t resident_size() const { return 2*pos_at.size() + slot.size() + 2*cap; }
         size_t emit_patches(const std::function<void(size_t, const int32_t *, size_t)> & write) const;
         void rebuild(const llama_kv_cells & c, llama_seq_id seq);
+        // what the device holds of the tables is not known: they go whole on the next emit_patches
+        void lose_upload() const { full_upload = true; dirty_cells.clear(); dirty_pools.clear(); }
 
         // false: the cells disagree with the tables (two cells at one position, a position off the tables); rebuild
         bool apply(const llama_kv_cells & c, llama_seq_id seq, const std::vector<uint32_t> & chg);
@@ -132,8 +139,17 @@ public:
 
     stats & get_stats() { return st; }
     void reserve_views(size_t count) { n_views_max = std::max(n_views_max, count); }
+
+    // the device cannot make the maps from a bank (ggml_kpool_materialize): a unified pool keeps its packed maps
+    bool bank_unsupported = false;
+    // LLAMA_KPOOL_SHARED_VIEWS_LEGACY=1, read when the cache is made: a unified pool keeps its packed maps
+    const bool packed_legacy = ggml_env_switch("LLAMA_KPOOL_SHARED_VIEWS_LEGACY");
+    // LLAMA_KPOOL_PATCH_INPUT_LEGACY=1, read when the cache is made: every change of the bank is a write of its own
+    const bool patch_writes_legacy = ggml_env_switch("LLAMA_KPOOL_PATCH_INPUT_LEGACY");
     std::shared_ptr<llama_kpool_backend_tensor> resident_bank(ggml_backend_buffer_type_t buft,
             int64_t count, uint32_t slots, uint32_t devices);
+    // a graph that carried the views' changes was not computed: every view goes whole on its next use
+    void resend() { for (auto & it : views) { it.second.lose_upload(); } }
 
 private:
     void sync(const llama_kv_cells & cells, uint32_t r);
@@ -199,6 +215,13 @@ int64_t llama_kpool_tail_max(const llama_kpool_cells_fn & cells_of, const llama_
 // the live cells a mask row may hold (ggml_flash_attn_ext_set_n_kv_max): n_top_k top-k cells and an n_tail tail, padded to 32
 // cells, a step of the CUDA kernel
 int64_t llama_kpool_n_kv_max(int64_t n_top_k, int64_t n_tail);
+
+// A unified pool holds every sequence in one stream, and its maps pack the sequences' pools on one axis: built from every
+// cell for each sequence, and every row scored against every sequence's pools. Its ubatch gives each sequence a stream of
+// its own instead (one pool map a sequence over the one cache stream, each served from its view) when every token names
+// one sequence, the sequences come as equal runs of rows and no cell holds two sequences.
+// seqs: each run's sequence, in row order
+bool llama_kpool_shared_streams(const llama_kv_cells & cells, const llama_ubatch & ubatch, std::vector<llama_seq_id> & seqs);
 
 // the maps of llama_kv_cache_set_input_kpool from a cells accessor. views == nullptr builds them from the cells
 // every call; else a sequence alone in its stream is served from its view, byte for byte the same maps.
@@ -287,15 +310,32 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    void input_lost() override;
+
     bool can_reuse(const llm_graph_params & params) override;
 
-    // gather the geometry the builder sizes the tensors with, for the check below
+    // gather the geometry the builder sizes the tensors with, for the check below; shared: a stream a sequence (shared_streams)
     static llm_graph_input_kpool_dims current_dims(
             const llama_kv_cache_context * mctx_attn,
             const llama_ubatch           & ubatch,
             const llama_cparams          & cparams,
             const llama_hparams          & hparams,
-            uint32_t                       kpool);
+            uint32_t                       kpool,
+            bool                           shared = false);
+
+    // The sequences of a unified pool's ubatch as streams of their own (llama_kpool_shared_streams), when each can be
+    // served from its view out of the pool's bank. seqs: the streams' sequences. false: the pool's packed maps, or one
+    // sequence's own table where the pool holds one sequence at most
+    static bool shared_streams(
+            const llama_kv_cache_context * mctx_attn,
+            const llama_ubatch           & ubatch,
+            const llama_cparams          & cparams,
+            const llama_hparams          & hparams,
+            uint32_t                       kpool,
+            std::vector<llama_seq_id>    & seqs);
+
+    // a unified pool of several sequences takes its resident maps from the bank alone: a view's changes go to one table
+    static bool shared_pool(const llama_cparams & cparams, const llama_kpool_views & views);
 
     // pure shape check, unit-testable without a memory context
     static bool shapes_match(const llm_graph_input_kpool_dims & dims, const llm_graph_input_kpool & inp);
@@ -324,6 +364,8 @@ public:
 
     // set at build time: re-emit every pool after a position mutation
     bool rebuild = false;
+    // the sequences the last set_input cleared of that mark: marked again if its graph did not run (input_lost)
+    std::vector<llama_seq_id> rebuilt_seqs;
 
     // set at build time: the most cells a row's tail holds (llama_kpool_tail_max), which sizes the sparse attention's
     // n_kv_max; set_input asserts no row is granted more
@@ -338,7 +380,10 @@ public:
     std::shared_ptr<llama_kpool_backend_tensor> resident_table;
     llama_seq_id resident_seq = -1;
     std::vector<llama_seq_id> resident_seqs; // bank users, in device/sequence order
+    bool shared = false; // the bank users are a unified pool's sequences, one stream each (llama_kpool_shared_streams)
     ggml_tensor * resident_rows = nullptr; // [6,Q] or [7,Q,streams], see ggml_kpool_materialize
+    ggml_tensor * resident_patches = nullptr; // I32 [3,P]: the bank's changes of the decode, see ggml_kpool_patch
+    uint64_t resident_patch_count = 0;
     uint64_t resident_upload_bytes = 0;
     uint64_t resident_upload_calls = 0;
     bool reuse_only = false;

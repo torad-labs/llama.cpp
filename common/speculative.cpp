@@ -1647,6 +1647,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
+    bool cand_rows = false; // the head's rows come as their 10 largest logits (llama_set_output_candidates)
 
     int32_t n_embd = 0;
 
@@ -1763,6 +1764,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
+            // a draft is the row's first candidate, so no draw decides it; with the default seed every reset of the chain,
+            // one a sequence a draft, asked the system's random device for a new one
+            sparams.seed     = 0;
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
@@ -1770,7 +1774,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
+        // one node takes the 10 largest logits of every row, each device from its share of the vocab: no row is gathered
+        // and no sampler graph is built a row. LLAMA_OUTPUT_CANDIDATES_LEGACY=1: a top-k chain a sequence
+        cand_rows = this->params.backend_sampling && !common_output_candidates_legacy();
+        if (cand_rows) {
+            llama_set_output_candidates(ctx_dft, 10);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                llama_set_seq_candidates(ctx_dft, seq_id, true);
+            }
+        } else if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1869,6 +1881,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (cand_rows && ctx_dft) {
+            llama_set_output_candidates(ctx_dft, 0);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) smpls.size(); ++seq_id) {
+                llama_set_seq_candidates(ctx_dft, seq_id, false);
+            }
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;
@@ -3170,6 +3188,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+        // -sm tensor and -sm dp describe how the target spans the cards. A draft model of its own is a small separate
+        // model, and none of the draft architectures has split-state rules: loaded with the target's mode, a DFlash
+        // draft aborts in its first decode (GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0))
+        if (result.split_mode == LLAMA_SPLIT_MODE_TENSOR || result.split_mode == LLAMA_SPLIT_MODE_DATA) {
+            result.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        }
 
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;

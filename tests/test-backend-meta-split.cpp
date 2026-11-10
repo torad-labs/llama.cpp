@@ -1123,6 +1123,161 @@ static bool test_sequence_axis(ggml_backend_dev_t gpu) {
     return ok;
 }
 
+static ggml_backend_meta_split_state split_candidate_logits(const ggml_tensor *, void * userdata) {
+    ggml_backend_meta_split_state state = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+    const auto & shards = *static_cast<const std::array<int64_t, 4> *>(userdata);
+    std::copy(shards.begin(), shards.end(), state.ne);
+    return state;
+}
+
+static bool test_candidates(ggml_backend_dev_t device, int vocab, int rows, int k, int split_axis,
+                            const std::array<int64_t, 4> & shards, bool benchmark = false) {
+    const int captured_before = captured;
+    ggml_backend_dev_t devs[] = {device, second_device(device), device, second_device(device)};
+    auto layout = shards;
+    ggml_backend_t backend = ggml_backend_dev_init(split_axis < 0 ? device :
+        ggml_backend_meta_device(devs, 4, split_candidate_logits, &layout), nullptr);
+    ggml_context * weights = ggml_init({ggml_tensor_overhead(), nullptr, true});
+    ggml_context * ctx = ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+    ggml_tensor * logits = ggml_new_tensor_2d(split_axis == 0 ? weights : ctx, GGML_TYPE_F32, vocab, rows);
+    ggml_set_input(logits);
+    ggml_backend_buffer_t buffer = nullptr;
+    if (split_axis == 0) {
+        buffer = ggml_backend_alloc_ctx_tensors(weights, backend);
+        GGML_ASSERT(buffer);
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    } else if (split_axis == 1) {
+        ggml_backend_meta_split_input(logits, split_axis, shards.data(), shards.size());
+    }
+    const int parts = split_axis == 0 || split_axis < 0 ? 4 : 1;
+    ggml_tensor * out = ggml_top_k_candidates(ctx, logits, k, parts);
+    ggml_set_output(out);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t backends[] = {backend, cpu};
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_backend_sched_set_tensor_backend(sched, logits, backend);
+    ggml_backend_sched_set_tensor_backend(sched, out, backend);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+    GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched, out) == backend);
+
+    std::vector<float> values(size_t(vocab)*rows);
+    std::vector<uint64_t> records(size_t(k)*parts*rows);
+    std::vector<int> expected(vocab);
+    bool ok = true;
+    for (int iteration = 0; iteration < 6; ++iteration) {
+        std::mt19937 rng(1234 + iteration);
+        for (size_t i = 0; i < values.size(); ++i) {
+            // Cross-shard ties, all-equal rows, signed zeros, infinities and NaNs.
+            const uint32_t mixed[] = {0x7fc00001u, 0xffc00001u, 0x80000000u, 0, 0x7f800000u, 0xff800000u, 0xbf800000u, 0x3f800000u};
+            const uint32_t bits = iteration == 4 ? (i % 2 ? 0x80000000u : 0) : mixed[i % 8];
+            if (iteration >= 4) { memcpy(&values[i], &bits, sizeof(bits)); }
+            else { values[i] = iteration == 3 ? 1.0f : float(int(rng() % 401) - 200); }
+        }
+        if (!values.empty() && iteration == 2) {
+            values[vocab/2] = INFINITY;
+            values.back() = -INFINITY;
+        }
+        ggml_backend_tensor_set_async(backend, logits, values.data(), 0, ggml_nbytes(logits));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+        for (int row = 0; row < rows; ++row) {
+            const size_t offset = size_t(row)*k*parts;
+            ggml_backend_tensor_get_async(backend, out, records.data() + offset, offset*sizeof(uint64_t),
+                                          size_t(k)*parts*sizeof(uint64_t));
+        }
+        ggml_backend_synchronize(backend);
+        for (int row = 0; row < rows; ++row) {
+            const float * src = values.data() + size_t(row)*vocab;
+            auto better = [&](int a, int b) {
+                if (std::isnan(src[a]) != std::isnan(src[b])) { return !std::isnan(src[a]); }
+                return src[a] > src[b] || (!(src[a] < src[b]) && a < b);
+            };
+            for (int i = 0; i < vocab; ++i) { expected[i] = i; }
+            std::sort(expected.begin(), expected.end(), better);
+            std::vector<int> actual;
+            int first = 0;
+            for (int part = 0; part < parts; ++part) {
+                const int width = split_axis == 0 ? shards[part] : (part == 0 ? vocab : 0);
+                std::vector<int> part_ids;
+                for (int c = 0; c < k; ++c) {
+                    const uint64_t record = records[(size_t(row)*parts + part)*k + c];
+                    const int32_t id = int32_t(uint32_t(record));
+                    if (id == -1) { continue; }
+                    if (id < first || id >= first + width) { ok = false; continue; }
+                    uint32_t bits;
+                    memcpy(&bits, &src[id], sizeof(bits));
+                    ok = ok && uint32_t(record >> 32) == bits;
+                    actual.push_back(id);
+                    part_ids.push_back(id);
+                }
+                std::sort(part_ids.begin(), part_ids.end(), better);
+                ok = ok && int(part_ids.size()) == std::min(k, width);
+                size_t pos = 0;
+                for (int id : expected) {
+                    if (id >= first && id < first + width && pos < part_ids.size()) {
+                        ok = ok && part_ids[pos++] == id;
+                    }
+                }
+                first += width;
+            }
+            std::sort(actual.begin(), actual.end(), better);
+            ok = ok && std::adjacent_find(actual.begin(), actual.end()) == actual.end();
+            const int winners = std::min(k, vocab);
+            ok = ok && actual.size() >= size_t(winners);
+            for (int i = 0; i < winners && i < int(actual.size()); ++i) { ok = ok && actual[i] == expected[i]; }
+        }
+    }
+    const int captures = captured - captured_before;
+    if (split_axis >= 0 && ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device), "ggml_backend_capture_end")) {
+        // Meta captures one graph per device, including empty row ranks.
+        ok = ok && captures == 4;
+    }
+    printf("%s candidates vocab=%d rows=%d k=%d axis=%d captures=%d\n", ok ? "ok  " : "FAIL", vocab, rows, k, split_axis, captures);
+    if (ok && benchmark) {
+        std::mt19937 rng(530);
+        for (auto & value : values) { value = float(int(rng() % 100001) - 50000)/1000.0f; }
+        ggml_backend_tensor_set(logits, values.data(), 0, ggml_nbytes(logits));
+        std::vector<int64_t> times;
+        for (int iteration = 0; iteration < 103; ++iteration) {
+            const int64_t start = ggml_time_us();
+            GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_synchronize(backend);
+            if (iteration >= 3) { times.push_back(ggml_time_us() - start); }
+        }
+        std::sort(times.begin(), times.end());
+        printf("candidates median: vocab=%d rows=%d k=%d axis=%d %lld us, %zu bytes readback\n",
+               vocab, rows, k, split_axis, (long long) times[times.size()/2], ggml_nbytes(out));
+    }
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(weights);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    return ok;
+}
+
+static bool test_candidates_all(ggml_backend_dev_t device) {
+    bool ok = true;
+    for (int k : {1, 10, 40, 296}) {
+        ok = test_candidates(device, 17, 3, k, -1, {}) && ok;
+        ok = test_candidates(device, 17, 3, k, 0, {1, 0, 2, 14}) && ok;
+        ok = test_candidates(device, 17, 3, k, 0, {0, 17, 0, 0}) && ok;
+        ok = test_candidates(device, 8193, 3, k, 0, {0, 8190, 2, 1}) && ok;
+        ok = test_candidates(device, 257, 8, k, 1, {1, 0, 2, 5}) && ok;
+    }
+    ok = test_candidates(device, 8193, 3, 296, -1, {}) && ok;
+    ok = test_candidates(device, 17001, 3, 5000, -1, {}) && ok;
+    for (int rows : {1, 23, 69}) {
+        for (int k : {40, 296}) {
+            ok = test_candidates(device, 154880, rows, k, -1, {}) && ok;
+            ok = test_candidates(device, 154880, rows, k, 0, {30000, 50000, 38720, 36160}) && ok;
+        }
+    }
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     // Isolate partition correctness from the optional BF16 collective round trip.
 #ifdef _WIN32
@@ -1139,6 +1294,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--permuted-read-cpu") == 0) {
         return test_permuted_reads(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--candidates-cpu") == 0) {
+        return test_candidates_all(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--host-layout-cpu") == 0) {
         return test_host_layout(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
@@ -1209,6 +1367,18 @@ int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--permuted-read") == 0) {
         return test_permuted_reads(gpu) ? 0 : 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--candidates") == 0) { return test_candidates_all(gpu) ? 0 : 1; }
+    if (argc == 2 && strcmp(argv[1], "--candidates-perf") == 0) {
+        bool ok = true;
+        for (int rows : {1, 23, 69}) {
+            for (int k : {40, 296}) {
+                ok = test_candidates(gpu, 38720, rows, k, -1, {}, true) && ok;
+                ok = test_candidates(gpu, 154880, rows, k, -1, {}, true) && ok;
+                ok = test_candidates(gpu, 154880, rows, k, 0, {38720, 38720, 38720, 38720}, true) && ok;
+            }
+        }
+        return ok ? 0 : 1;
+    }
     if (argc == 4 && strcmp(argv[1], "--tensor") == 0) {
         return test_tensor_mode(gpu, atoi(argv[2]), atoll(argv[3])) ? 0 : 1;
     }
@@ -1264,6 +1434,7 @@ int main(int argc, char ** argv) {
     ok = test_rows(gpu, false) && ok;
     ok = test_rows(gpu, true) && ok;
     ok = test_sequence_axis(gpu) && ok;
+    ok = test_candidates_all(gpu) && ok;
     ok = test_scatter_views(gpu) && ok;
     ok = test_host_layout(gpu) && ok;
     if (ggml_backend_dev_mapped_buffer_type(gpu)) {

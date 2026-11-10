@@ -1662,8 +1662,10 @@ static void run_draft_bank(std::vector<ggml_backend_dev_t> devs) {
     printf("draft bank: owner-local copies and graph reads, changing batches and widths\n");
 }
 
-static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devices) {
+// unified: the slots are the sequences of one pool, each a stream of its own in the maps (llama_kpool_shared_streams)
+static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devices, bool unified = false) {
     constexpr int64_t capacity = 256, r = 4, np = capacity/r + 2, nd = 2;
+    GGML_ASSERT(!unified || devices == 1);
     auto * cpu = resident_test_backend();
     std::vector<ggml_backend_dev_t> devs(devices, ggml_backend_get_device(cpu));
     auto * meta = ggml_backend_meta_device(devs.data(), devs.size(),
@@ -1672,7 +1674,7 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
         }, nullptr);
     auto * backend = ggml_backend_dev_init(meta, nullptr);
     const auto buft = ggml_backend_get_default_buffer_type(backend);
-    pool w(capacity, slots, false, rng);
+    pool w(capacity, slots, unified, rng);
     llama_kpool_views views;
     views.reserve_views(slots);
     const auto bank = views.resident_bank(buft, 2*capacity + np*(r + 2), slots, devices);
@@ -1686,6 +1688,10 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
         if (step%4 == 2) { w.cells_of(changed) = saved; }
         views.begin();
         bank->begin_upload(backend);
+        // a unified pool's changes go with the graph (ggml_kpool_patch) on three steps of four, and as writes on the
+        // fourth, the first among them, where every view goes whole
+        const bool as_patches = unified && step%4 != 0;
+        std::vector<int32_t> patches;
         std::vector<const llama_kpool_views::view *> current(slots);
         for (uint32_t s = 0; s < slots; ++s) {
             const auto * v = views.serve(w.cells_of(s), s, r, capacity, np);
@@ -1695,15 +1701,25 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
             int64_t slot = s/devices;
             for (uint32_t d = 0; d < s%devices; ++d) { slot += (slots + devices - 1 - d)/devices; }
             v->emit_patches([&](size_t off, const int32_t * data, size_t count) {
+                if (as_patches) {
+                    for (size_t i = 0; i < count; ++i) {
+                        patches.insert(patches.end(), {(int32_t) slot, (int32_t) (off + i), data[i]});
+                    }
+                    return;
+                }
                 bank->upload(slot*bank->tensor->ne[0] + off, data, count);
             });
         }
         bank->end_upload();
+        // patches of no change among them and after them, as a graph sized for more than a decode's changes has; a step
+        // that takes its rows back changes nothing, and its patches are those alone
+        for (size_t i = 0; i < patches.size(); i += 15) { patches.insert(patches.begin() + i, {-1, 0, 0}); }
+        patches.insert(patches.end(), {-1, 0, 0, -1, -1, -1});
         // Reverse the sequence order within each device; leave one device idle on alternating rounds.
         std::vector<llama_seq_id> seqs;
         std::vector<int64_t> counts(devices, 0);
         for (uint32_t d = 0; d < devices; ++d) {
-            if (step%2 && d == devices - 1) { continue; }
+            if (devices > 1 && step%2 && d == devices - 1) { continue; }
             for (int64_t s = slots - 1; s >= 0; --s) {
                 if (s%devices == d && current[s] && (s + step)%3 == 0) { seqs.push_back(s); ++counts[d]; }
             }
@@ -1720,6 +1736,48 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
                 nullptr, ref.pool_cells, nullptr, ref.pool_bias, nullptr, nullptr, ref.pool_reps,
                 ref.new_pool_cells, ref.new_pool_reps, streams.data(), capacity, false, ub, r,
                 ref.mask_cells, ref.mask_rows, ref.tail_cells);
+        if (unified && ns > 0) {
+            std::vector<llama_seq_id> runs;
+            CHECK(llama_kpool_shared_streams(w.cells_of(0), *ub, runs) && runs == seqs, "shared streams: step=%d", step);
+            // the pool's packed maps of the same ubatch: a row sees the same pools in the same order, with the same cells
+            // and rep, the same tail and the same facts of its sequence's cells
+            maps packed(capacity, 1, nr*ns, ns, r, true, false, false, nd, 0x5a, 0, true);
+            const int64_t np_packed = packed.pool_bias->ne[0];
+            llama_kpool_set_input([&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); }, nullptr,
+                    nullptr, packed.pool_cells, nullptr, packed.pool_bias, nullptr, nullptr, packed.pool_reps,
+                    packed.new_pool_cells, packed.new_pool_reps, streams.data(), capacity, false, ub, r,
+                    packed.mask_cells, packed.mask_rows, packed.tail_cells);
+            for (int64_t i = 0; i < nr*ns; ++i) {
+                const int64_t s = i/nr;
+                const auto * fp = (const int32_t *) packed.mask_rows->data + 4*i;
+                const auto * fs = (const int32_t *) ref.mask_rows->data + 4*i;
+                CHECK(fp[0] == fs[0] && fp[1] == s && fs[1] == 0 && fp[2] == fs[2] && fp[3] == fs[3],
+                        "packed/streams row facts: step=%d row=%d", step, (int) i);
+                CHECK(memcmp((const int32_t *) packed.mask_cells->data + s*2*capacity,
+                            (const int32_t *) ref.mask_cells->data + s*2*capacity, 2*capacity*sizeof(int32_t)) == 0,
+                        "packed/streams cell facts: step=%d row=%d", step, (int) i);
+                CHECK(memcmp((const int32_t *) packed.tail_cells->data + i*capacity,
+                            (const int32_t *) ref.tail_cells->data + i*capacity, capacity*sizeof(int32_t)) == 0,
+                        "packed/streams tail: step=%d row=%d", step, (int) i);
+                std::vector<int32_t> seen_packed, seen_streams;
+                for (int64_t p = 0; p < np_packed; ++p) {
+                    if (((const float *) packed.pool_bias->data)[i*np_packed + p] == 0.0f) {
+                        const auto * cells = (const int32_t *) packed.pool_cells->data + p*r;
+                        seen_packed.insert(seen_packed.end(), cells, cells + r);
+                        seen_packed.push_back(((const int32_t *) packed.pool_reps->data)[p]);
+                    }
+                }
+                for (int64_t p = 0; p < np; ++p) {
+                    if (((const float *) ref.pool_bias->data)[i*np + p] == 0.0f) {
+                        const auto * cells = (const int32_t *) ref.pool_cells->data + s*r*(np + nd) + p*r;
+                        seen_streams.insert(seen_streams.end(), cells, cells + r);
+                        seen_streams.push_back(((const int32_t *) ref.pool_reps->data)[s*np + p]);
+                    }
+                }
+                CHECK(seen_packed == seen_streams, "packed/streams pools: step=%d row=%d %zu/%zu", step, (int) i,
+                        seen_packed.size(), seen_streams.size());
+            }
+        }
         auto * ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
         auto * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 7, nr, ns);
         auto * visibility = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, nr, ns);
@@ -1728,7 +1786,10 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
         for (auto * t : {rows, visibility, selected, tail}) {
             ggml_backend_meta_split_input(t, 2, counts.data(), counts.size());
         }
+        auto * changes = as_patches ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, patches.size()/3) : nullptr;
         auto * input = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (changes) { ggml_backend_tensor_set(changes, patches.data(), 0, ggml_nbytes(changes)); }
+        auto * table = changes ? ggml_kpool_patch(ctx, bank->tensor, changes) : bank->tensor;
         std::vector<int32_t> params(7*nr*ns);
         for (int64_t s = 0; s < ns; ++s) {
             const auto seq = seqs[s];
@@ -1774,7 +1835,7 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
                 std::make_pair(GGML_KPOOL_MATERIALIZE_CELLS, ref.pool_cells),
                 std::make_pair(GGML_KPOOL_MATERIALIZE_REPS, ref.pool_reps),
                 std::make_pair(GGML_KPOOL_MATERIALIZE_BIAS, ref.pool_bias)}) {
-            auto * out = ggml_kpool_materialize(ctx, bank->tensor, rows, capacity, r, capacity, np, nd, pair.first);
+            auto * out = ggml_kpool_materialize(ctx, table, rows, capacity, r, capacity, np, nd, pair.first);
             ggml_set_output(out);
             ggml_build_forward_expand(graph, out);
             outputs.emplace_back(out, pair.second);
@@ -1801,6 +1862,107 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
     ggml_backend_free(backend);
 }
 
+// One device of sequences with several slots (a unified pool under a tensor split): a capture's rows go to one bank, a
+// copy a run of rows whose sequences are neighbours, and a graph reads them back by slot.
+// LLAMA_KPOOL_DRAFT_BANK_LEGACY=1: a store and a copy a sequence
+static void run_draft_bank_shared() {
+    constexpr uint32_t slots = 9;
+    std::vector<ggml_backend_dev_t> devs(2, ggml_backend_get_device(resident_test_backend()));
+    auto * meta = ggml_backend_meta_device(devs.data(), devs.size(),
+        [](const ggml_tensor *, void *) -> ggml_backend_meta_split_state {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }, nullptr);
+    auto * backend = ggml_backend_dev_init(meta, nullptr);
+    const auto buft = ggml_backend_get_default_buffer_type(backend);
+    static bool (*copy_async)(ggml_backend_t, ggml_backend_t, const ggml_tensor *, ggml_tensor *);
+    static size_t copy_calls, direct_copies;
+    copy_async = backend->iface.cpy_tensor_async;
+    const auto observe_copy = [](ggml_backend_t src_backend, ggml_backend_t dst_backend,
+            const ggml_tensor * src, ggml_tensor * dst) {
+        ++copy_calls;
+        const bool direct = copy_async(src_backend, dst_backend, src, dst);
+        direct_copies += direct;
+        return direct;
+    };
+    for (const bool legacy : {false, true}) {
+#ifdef _WIN32
+        _putenv_s("LLAMA_KPOOL_DRAFT_BANK_LEGACY", legacy ? "1" : "");
+#else
+        if (legacy) { setenv("LLAMA_KPOOL_DRAFT_BANK_LEGACY", "1", 1); } else { unsetenv("LLAMA_KPOOL_DRAFT_BANK_LEGACY"); }
+#endif
+        llama_kpool_draft draft;
+        for (int round = 0; round < 8; ++round) {
+            const int width = round < 4 ? 128 : 192;
+            // the slots in order with one in four out, so the rows come as runs of neighbours; every third round in
+            // falling order, where no row follows its neighbour
+            std::vector<llama_seq_id> seqs;
+            for (uint32_t s = 0; s < slots; ++s) {
+                if ((s + round)%4 != 0) { seqs.push_back(s); }
+            }
+            if (round%3 == 2) { std::reverse(seqs.begin(), seqs.end()); }
+            size_t runs = 1;
+            for (size_t i = 1; i < seqs.size(); ++i) { runs += seqs[i] != seqs[i - 1] + 1; }
+            const std::vector<llama_pos> positions(seqs.size(), 100);
+            auto * ctx = ggml_init({8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+            auto * source = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, seqs.size());
+            auto * input = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            std::vector<int32_t> expected(width*seqs.size());
+            for (size_t i = 0; i < seqs.size(); ++i) {
+                for (int k = 0; k < width; ++k) { expected[i*width + k] = 1000*seqs[i] + 100*round + k; }
+            }
+            ggml_backend_tensor_set(source, expected.data(), 0, ggml_nbytes(source));
+            draft.advance(0);
+            copy_calls = direct_copies = 0;
+            backend->iface.cpy_tensor_async = observe_copy;
+            draft.capture_backend_rows(seqs.data(), positions.data(), seqs.size(), 512, source, backend, slots, 1);
+            backend->iface.cpy_tensor_async = copy_async;
+            ggml_backend_synchronize(backend);
+            CHECK(copy_calls == (legacy ? seqs.size() : runs), "shared draft bank: %zu rows in %zu runs took %zu copies (legacy=%d)",
+                    seqs.size(), runs, copy_calls, legacy);
+            CHECK(direct_copies == copy_calls, "shared draft bank: %zu captures fell back to host staging", copy_calls - direct_copies);
+            ggml_backend_buffer_free(input);
+            ggml_free(ctx);
+            const auto bank = draft.backend_row(seqs.front());
+            CHECK(bank && bank->tensor->ne[1] == (legacy ? 1 : slots), "shared draft bank: the rows' store (legacy=%d)", legacy);
+            if (!bank) { break; }
+            draft.advance(1);
+            ubatch_data ud;
+            for (const auto seq : seqs) { ud.add(seq, 101); }
+            CHECK(draft.can_reuse(*ud.get(), 512, width, 4), "shared draft bank: the selection could not be reused");
+            std::vector<int32_t> copied(expected.size());
+            draft.copy(*ud.get(), copied.data());
+            CHECK(copied == expected, "shared draft bank: a copy read the wrong sequence's row (legacy=%d round=%d)", legacy, round);
+            if (!legacy) {
+                ctx = ggml_init({8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+                auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seqs.size());
+                input = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                ggml_backend_tensor_set(ids, seqs.data(), 0, ggml_nbytes(ids));
+                auto * selected = ggml_get_rows(ctx, bank->tensor, ids);
+                auto * graph = ggml_new_graph(ctx);
+                ggml_set_output(selected);
+                ggml_build_forward_expand(graph, selected);
+                auto * alloc = ggml_gallocr_new(buft);
+                CHECK(ggml_gallocr_alloc_graph(alloc, graph), "shared draft bank graph allocation");
+                CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "shared draft bank graph compute");
+                std::fill(copied.begin(), copied.end(), 0);
+                ggml_backend_tensor_get(selected, copied.data(), 0, ggml_nbytes(selected));
+                CHECK(copied == expected, "shared draft bank: the graph read the wrong sequence's row (round=%d)", round);
+                ggml_gallocr_free(alloc);
+                ggml_backend_buffer_free(input);
+                ggml_free(ctx);
+            }
+            draft.clear();
+        }
+    }
+#ifdef _WIN32
+    _putenv_s("LLAMA_KPOOL_DRAFT_BANK_LEGACY", "");
+#else
+    unsetenv("LLAMA_KPOOL_DRAFT_BANK_LEGACY");
+#endif
+    ggml_backend_free(backend);
+    printf("shared draft bank: a copy a run of neighbouring sequences, graph reads by slot\n");
+}
+
 int main(int argc, char ** argv) {
     if (argc != 1) {
         if (argc != 6 || strcmp(argv[1], "--draft-bank") != 0) {
@@ -1825,9 +1987,12 @@ int main(int argc, char ** argv) {
     run_resident_patches(rng);
     run_resident_bank(rng, 40, 4);
     run_resident_bank(rng, 41, 4);
+    run_resident_bank(rng, 5, 1, true);
+    run_resident_bank(rng, 6, 1, true);
     run_direct_indices(rng);
     run_draft_rounds(rng);
     run_draft_bank(std::vector<ggml_backend_dev_t>(4, ggml_backend_get_device(resident_test_backend())));
+    run_draft_bank_shared();
 
     run_shift_regroups();
     run_compress_chunks();

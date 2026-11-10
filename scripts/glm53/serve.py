@@ -17,6 +17,12 @@ TEMPLATE = ROOT / "models/templates/GLM-5.3-Flash.jinja"
 DRAFT_VOCAB = ROOT / "scripts/glm53/assets/mtp-draft-vocab-98304.i32"
 DEFAULT_MTP_DEPTH = "2"
 DP_SLOT_CONTEXT = 442368
+# tensor-4's sessions and shared pool: the pool measured to load beside 23 slots (48.6 GiB used a card). The
+# 6,029,312 tokens that 23 sessions of 262144 need fail in the graph reserve (docs/torad/glm53-goal.md, cause 3)
+POOL_SLOTS = 23
+POOL_CONTEXT = 524288
+# the engine's sequence limit (LLAMA_MAX_SEQ)
+MAX_SLOTS = 256
 # Inherited engine, profile and diagnostic overrides are removed before the exec; the server's own access controls stay.
 ENGINE_OVERRIDES = ("GGML_", "LLAMA_", "CUDA_", "NVIDIA_")
 SERVER_ACCESS_CONTROLS = frozenset({"LLAMA_API_KEY", "LLAMA_ARG_API_KEY_FILE",
@@ -35,13 +41,24 @@ def arguments(argv=None):
                         help="llama-server from this fork, with matching libraries beside it")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8102)
-    parser.add_argument("--profile", choices=["tensor-2", "dp-4"], default="tensor-2",
-                        help="Two-card tensor recipe or experimental four-card DP capacity recipe")
+    parser.add_argument("--profile", choices=["tensor-2", "tensor-4", "dp-4"], default="tensor-2",
+                        help="Two-card tensor recipe, four-card tensor recipe with one shared pool, or experimental "
+                             "four-card DP capacity recipe")
     parser.add_argument("--transport", choices=["internal", "internal-nccl-gather"], help="DP collective transport (default: internal)")
-    parser.add_argument("--slots", type=int, help="DP private caches of 442368 cells each: 1..40 resident, 1..256 host KV (default: 36)")
+    parser.add_argument("--slots", type=int, help="tensor-4: sessions sharing the pool, 1..256 (default: 23). "
+                        "DP private caches of 442368 cells each: 1..40 resident, 1..256 host KV (default: 36)")
+    parser.add_argument("--context", type=int, help="tensor-4: tokens in the shared pool (default: 524288)")
     parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
-    parser.add_argument("--mtp-depth", choices=["1", "2", "off"], default=DEFAULT_MTP_DEPTH)
+    parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
+                        help="Tokens the pack's own MTP head drafts a step; 3 and 4 on the tensor recipes")
+    parser.add_argument("--mtp-adaptive", type=float, default=0.18,
+                        help="The engine's --spec-draft-mtp-adaptive cost: a draft token's share of a one-token round, "
+                             "measured at 0.18 for one session on two cards; 0 drafts --mtp-depth every step")
+    parser.add_argument("--dflash", type=Path, help="tensor-4: a local DFlash draft GGUF that drafts in place of the MTP head, on the first card; "
+                             "one that carries its own token embeddings and output head (dflash_own_head.py)")
+    parser.add_argument("--dflash-depth", type=int, help="Tokens the DFlash draft drafts a step: its block size less the anchor row (required with --dflash)")
+    parser.add_argument("--backend-sampling", action="store_true", help="tensor-4: sample on the cards (dp-4 always does)")
     parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
     parser.add_argument("--diagnostic-ubatch", type=int, choices=[128, 512],
                         help="Explicit numerical-control microbatch for DP; it never changes the serving default")
@@ -62,6 +79,7 @@ def resolve_transport(args, legacy=None):
 
 def make_plan(args):
     dp = args.profile == "dp-4"
+    four = args.profile == "tensor-4"
     if not dp and args.transport is not None:
         raise ValueError("transport is supported only with --profile dp-4")
     if args.diagnostic_ubatch is not None and not dp:
@@ -70,10 +88,23 @@ def make_plan(args):
     prompt_step = args.prompt_step if args.prompt_step is not None else (512 if dp else 1024)
     if not 1 <= args.port <= 65535 or prompt_step < 0:
         raise ValueError("port must be 1..65535 and prompt-step must be nonnegative")
-    limit = 256 if args.kv_host else 40
-    if args.slots is not None and (not dp or not 1 <= args.slots <= limit):
-        raise ValueError(f"slots is supported only with --profile dp-4 and must be 1..{limit}")
-    slots = (36 if args.slots is None else args.slots) if dp else 3
+    limit = MAX_SLOTS if args.kv_host or four else 40
+    if args.slots is not None and (not (dp or four) or not 1 <= args.slots <= limit):
+        raise ValueError(f"slots is supported only with --profile tensor-4 or dp-4 and must be 1..{limit}")
+    slots = (36 if dp else POOL_SLOTS) if args.slots is None else args.slots
+    if not (dp or four):
+        slots = 3
+    context = POOL_CONTEXT if args.context is None else args.context
+    if args.context is not None and (not four or context < slots):
+        raise ValueError("context is supported only with --profile tensor-4 and holds at least one token a slot")
+    if dp and args.mtp_depth in ("3", "4"):
+        raise ValueError("dp-4 is measured at MTP depth 1 and 2")
+    if not 0 <= args.mtp_adaptive <= 1:
+        raise ValueError("mtp-adaptive is a share of a round, 0..1")
+    if (args.dflash or args.backend_sampling) and not four:
+        raise ValueError("dflash and backend-sampling are supported only with --profile tensor-4")
+    if (args.dflash is None) != (args.dflash_depth is None) or args.dflash_depth is not None and args.dflash_depth < 1:
+        raise ValueError("dflash and a positive dflash-depth are given together")
     if args.kv_host:
         if not dp or args.mtp_depth != "2":
             raise ValueError("host KV requires --profile dp-4 and --mtp-depth 2")
@@ -89,25 +120,34 @@ def make_plan(args):
     argv = [str(server), "-m", own_path(args.model)]
     if args.mmproj:
         argv += ["--mmproj", own_path(args.mmproj)]
-    argv += ["-ngl", "99", "-sm", "dp" if dp else "tensor", "-ts", "1,1,1,1" if dp else "1,1",
+    # tensor-4's latent cache is 4-bit: 288 bytes a row against 544; the indexer's keys stay q8_0, the one other
+    # type the engine takes for them
+    latent = "q4_0" if four else "q8_0"
+    argv += ["-ngl", "99", "-sm", "dp" if dp else "tensor", "-ts", "1,1,1,1" if dp or four else "1,1",
              "--jinja", "-fa", "on",
-             "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-ctki", "q8_0",
+             "--cache-type-k", latent, "--cache-type-v", latent, "-ctki", "q8_0",
              "-b", "2048", "-ub", str(diagnostic_ubatch) if dp else "2048", "--prompt-step", str(prompt_step),
              "--alias", "GLM-5.3-Flash-Uncensored-IQ3_XXS", "--chat-template-file", str(TEMPLATE)]
     if dp:
         argv += ["-fit", "off", "-cts", "q8_0", "--backend-sampling", "--prompt-chunk", "128"]
-    if args.mtp_depth != "off":
+    elif args.backend_sampling:
+        argv += ["--backend-sampling"]
+    if args.dflash:
+        # the draft is one small model reading the target's layer inputs: whole on the first card, never split four ways
+        argv += ["--spec-type", "draft-dflash", "--spec-draft-model", own_path(args.dflash),
+                 "--spec-draft-n-max", str(args.dflash_depth), "--spec-draft-device", "CUDA0", "--spec-draft-ngl", "99"]
+    elif args.mtp_depth != "off":
         argv += ["--spec-type", "draft-mtp", "--spec-draft-n-max", args.mtp_depth,
-                 "--spec-draft-mtp-vocab", str(DRAFT_VOCAB), "--spec-draft-mtp-adaptive", "0.18"]
+                 "--spec-draft-mtp-vocab", str(DRAFT_VOCAB), "--spec-draft-mtp-adaptive", f"{args.mtp_adaptive:g}"]
         if dp:
             argv += ["-ubd", str(diagnostic_ubatch), "-ctkd", "q8_0", "-ctvd", "q8_0"]
-    argv += ["-c", str(slots * DP_SLOT_CONTEXT) if dp else "524288", "-np", str(slots)]
+    argv += ["-c", str(slots * DP_SLOT_CONTEXT if dp else context if four else 524288), "-np", str(slots)]
     if not dp:
         argv += ["--kv-unified"]
     argv += ["--cache-ram", "32768", "--no-cache-idle-slots"]
     argv += ["--metrics", "--host", args.host, "--port", str(args.port), "--log-timestamps"]
     env = {
-        "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3" if dp else "0,1",
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3" if dp or four else "0,1",
         "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": args.transport or "internal",
         "LLAMA_INDEXER_Q8_QUERY": "1" if args.indexer_query == "q8" else "0",
         "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
@@ -200,7 +240,8 @@ def main(args):
         print(json.dumps({"argv": argv, "env": settings, "removed": removed_overrides(os.environ)}, indent=2))
         return 0
     for label, path in [("server", Path(argv[0])), ("model", args.model.expanduser()),
-                        ("mmproj", args.mmproj.expanduser() if args.mmproj else None)]:
+                        ("mmproj", args.mmproj.expanduser() if args.mmproj else None),
+                        ("dflash draft", args.dflash.expanduser() if args.dflash else None)]:
         if path is not None and not path.is_file():
             raise ValueError("missing local " + label + ": " + str(path))
     if not os.access(argv[0], os.X_OK):

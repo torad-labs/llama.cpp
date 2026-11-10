@@ -3983,6 +3983,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
+        case GGML_OP_TOP_K_CANDIDATES:
+            ggml_cuda_op_top_k_candidates(ctx, dst);
+            break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
             break;
@@ -9103,6 +9106,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_TOP_K_CANDIDATES: {
+            const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+            return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+        }
         case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
@@ -9151,6 +9159,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_KPOOL_MASK:
+            if (ggml_get_op_params_i32(op, 0) == GGML_KPOOL_MATERIALIZE_PATCH) {
+                return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && op->view_src != nullptr;
+            }
             if (ggml_get_op_params_i32(op, 0) >= GGML_KPOOL_MATERIALIZE_FACTS) {
                 return ggml_get_op_params_i32(op, 0) <= GGML_KPOOL_MATERIALIZE_BIAS &&
                     op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&

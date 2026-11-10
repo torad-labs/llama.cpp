@@ -127,6 +127,9 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // the graph the input was set for was not computed: what only that graph carried to the device is sent again
+    virtual void input_lost() {}
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -994,6 +997,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.n_out_candidates        == other.cparams.n_out_candidates        &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1017,6 +1021,7 @@ public:
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
+    ggml_tensor * get_cand()        const { return t_cand; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
@@ -1046,6 +1051,7 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+    void inputs_lost();
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
@@ -1067,6 +1073,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_cand        = nullptr; // each output row's largest logits (build_candidates)
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1589,6 +1596,7 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+    void build_candidates() const;
 
     //
     // dense (out)
