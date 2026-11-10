@@ -1529,7 +1529,11 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
 // test_glm_prefill_reuse's bar on a GPU, whose attention kernel can depend on the cache length.
 // The pool's maps are one stream a sequence, each from its sequence's view (llama_kpool_shared_streams), where they
 // packed every sequence's pools on one axis and were built from every cell; LLAMA_KPOOL_SHARED_VIEWS_LEGACY=1 packs
-// them. The logits are the packed maps', to the same bars.
+// them. The logits are those of a cache a sequence (kv_unified off), byte for byte on the CPU. The packed maps' are
+// not: 28 of this test's 960 rows differ from a cache a sequence by up to 0.5% of the largest logit and 102 by a
+// rounding step (CPU, seed 1234, Nov 10, 2026), so they are held to the GPU's bar.
+// The streams' bank takes a decode's changes as one input its device writes before the maps are made (ggml_kpool_patch),
+// where each change was a write of its own; LLAMA_KPOOL_PATCH_INPUT_LEGACY=1 writes them. The logits are the same again.
 static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
@@ -1539,7 +1543,7 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
     auto * model = pair.first.get();
     const int n_embd  = llama_model_n_embd(model);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    const bool exact = std::all_of(devs.begin(), devs.end(), [](ggml_backend_dev_t dev) {
+    const bool on_cpu = std::all_of(devs.begin(), devs.end(), [](ggml_backend_dev_t dev) {
         return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
     });
 
@@ -1560,30 +1564,41 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         std::vector<float> logits;     // every row of every step
         int32_t            n_reused = 0;
         std::set<int64_t>  n_kv;       // the cache lengths the steps' graphs read
+        bool               patched = false; // a step's graph wrote the bank's changes
+    };
+    struct seen_nodes {
+        std::set<int64_t> n_kv;
+        bool              patched = false;
     };
 
-    const auto read = [&](bool legacy, bool mtp, bool packed = false) {
+    const auto read = [&](bool legacy, bool mtp, bool packed = false, bool writes = false, bool unified = true) {
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", legacy ? "1" : nullptr);
         set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", packed ? "1" : nullptr);
-        std::set<int64_t> n_kv;
+        set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", writes ? "1" : nullptr);
+        seen_nodes seen;
+        std::set<int64_t> & n_kv = seen.n_kv;
         llama_context_params params = llama_context_default_params();
         if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         params.n_ctx      = 8192;
         params.n_batch    = 512;
         params.n_ubatch   = 512;
         params.n_seq_max  = n_seq;
-        params.kv_unified = true;
+        params.kv_unified = unified;
         params.n_threads  = params.n_threads_batch = 4;
         params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
             if (ask && std::string(t->name).rfind("kpool_cand_mask", 0) == 0) {
-                static_cast<std::set<int64_t> *>(data)->insert(t->ne[0]);
+                static_cast<seen_nodes *>(data)->n_kv.insert(t->ne[0]);
+            }
+            if (ask && std::string(t->name) == "kpool_resident_patched") {
+                static_cast<seen_nodes *>(data)->patched = true;
             }
             return false;
         };
-        params.cb_eval_user_data = &n_kv;
+        params.cb_eval_user_data = &seen;
         llama_context_ptr ctx(llama_init_from_model(model, params));
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", nullptr);
         set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", nullptr);
+        set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", nullptr);
         if (!ctx) throw std::runtime_error("shared pool reuse: failed to create a context");
 
         // positions [begin, end) of every sequence, a sequence's rows together
@@ -1613,6 +1628,7 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         }
         res.n_reused = llama_perf_context(ctx.get()).n_reused;
         res.n_kv     = n_kv;
+        res.patched  = seen.patched;
         return res;
     };
 
@@ -1620,6 +1636,8 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         const read_result legacy = read(true, mtp);
         const read_result shared = read(false, mtp);
         const read_result packed = read(false, mtp, true);
+        const read_result writes = read(false, mtp, false, true);
+        const read_result alone  = read(false, mtp, false, false, false);
 
         // 256 cells a sequence: 2,048, which the 1,088 cells never cross, and their pools never cross a quarter of it. The
         // first step builds its graph (another length than the prompt's, and in the main context each sequence's second
@@ -1643,7 +1661,16 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
                     legacy.n_kv.empty() ? -1LL : (long long) *legacy.n_kv.rbegin(), (long long) want_n_kv_legacy);
             ok = false;
         }
-        for (const auto & other : { std::make_pair("padded to 256", &legacy), std::make_pair("with packed maps", &packed) }) {
+        if (!shared.patched || writes.patched || packed.patched) {
+            LOG_ERR("GLM shared pool reuse: mtp=%d: the bank's changes went with the graph: %d (want 1), %d with "
+                    "LLAMA_KPOOL_PATCH_INPUT_LEGACY=1 (want 0), %d with packed maps (want 0)\n", mtp, shared.patched,
+                    writes.patched, packed.patched);
+            ok = false;
+        }
+        for (const auto & other : { std::make_pair("padded to 256", &legacy), std::make_pair("with packed maps", &packed),
+                std::make_pair("whose bank is written a change a write", &writes),
+                std::make_pair("of a cache a sequence", &alone) }) {
+            const bool exact = on_cpu && other.second != &packed;
             if (exact && other.second->logits != shared.logits) {
                 LOG_ERR("GLM shared pool reuse: mtp=%d: logits differ from the pool %s, nmse=%g\n", mtp, other.first,
                         nmse(other.second->logits, shared.logits));

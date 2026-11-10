@@ -12326,8 +12326,26 @@ static void ggml_compute_forward_kpool_indices(const ggml_compute_params * param
     }
 }
 
+// ggml_kpool_patch: dst is the table in place. The patches name different elements, so the threads share nothing
+static void ggml_compute_forward_kpool_patch(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * tables  = dst->src[0];
+    const auto * patches = dst->src[1];
+    GGML_ASSERT(dst->data == tables->data);
+    const auto * p = (const int32_t *) patches->data;
+    for (int64_t i = params->ith; i < patches->ne[1]; i += params->nth) {
+        const int64_t slot = p[3*i], element = p[3*i + 1];
+        if (slot < 0) { continue; }
+        GGML_ASSERT(slot < tables->ne[1] && element >= 0 && element < tables->ne[0]);
+        ((int32_t *) ((char *) tables->data + slot*tables->nb[1]))[element] = p[3*i + 2];
+    }
+}
+
 static void ggml_compute_forward_kpool_materialize(const ggml_compute_params * params, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
+    if (mode == GGML_KPOOL_MATERIALIZE_PATCH) {
+        ggml_compute_forward_kpool_patch(params, dst);
+        return;
+    }
     const int64_t capacity = ggml_get_op_params_i32(dst, 1), r = ggml_get_op_params_i32(dst, 2);
     const int64_t nk = ggml_get_op_params_i32(dst, 3), np = ggml_get_op_params_i32(dst, 4);
     const int64_t cap = capacity/r + 2;

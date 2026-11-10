@@ -1688,6 +1688,10 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
         if (step%4 == 2) { w.cells_of(changed) = saved; }
         views.begin();
         bank->begin_upload(backend);
+        // a unified pool's changes go with the graph (ggml_kpool_patch) on three steps of four, and as writes on the
+        // fourth, the first among them, where every view goes whole
+        const bool as_patches = unified && step%4 != 0;
+        std::vector<int32_t> patches;
         std::vector<const llama_kpool_views::view *> current(slots);
         for (uint32_t s = 0; s < slots; ++s) {
             const auto * v = views.serve(w.cells_of(s), s, r, capacity, np);
@@ -1697,10 +1701,20 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
             int64_t slot = s/devices;
             for (uint32_t d = 0; d < s%devices; ++d) { slot += (slots + devices - 1 - d)/devices; }
             v->emit_patches([&](size_t off, const int32_t * data, size_t count) {
+                if (as_patches) {
+                    for (size_t i = 0; i < count; ++i) {
+                        patches.insert(patches.end(), {(int32_t) slot, (int32_t) (off + i), data[i]});
+                    }
+                    return;
+                }
                 bank->upload(slot*bank->tensor->ne[0] + off, data, count);
             });
         }
         bank->end_upload();
+        // patches of no change among them and after them, as a graph sized for more than a decode's changes has; a step
+        // that takes its rows back changes nothing, and its patches are those alone
+        for (size_t i = 0; i < patches.size(); i += 15) { patches.insert(patches.begin() + i, {-1, 0, 0}); }
+        patches.insert(patches.end(), {-1, 0, 0, -1, -1, -1});
         // Reverse the sequence order within each device; leave one device idle on alternating rounds.
         std::vector<llama_seq_id> seqs;
         std::vector<int64_t> counts(devices, 0);
@@ -1772,7 +1786,10 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
         for (auto * t : {rows, visibility, selected, tail}) {
             ggml_backend_meta_split_input(t, 2, counts.data(), counts.size());
         }
+        auto * changes = as_patches ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, patches.size()/3) : nullptr;
         auto * input = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (changes) { ggml_backend_tensor_set(changes, patches.data(), 0, ggml_nbytes(changes)); }
+        auto * table = changes ? ggml_kpool_patch(ctx, bank->tensor, changes) : bank->tensor;
         std::vector<int32_t> params(7*nr*ns);
         for (int64_t s = 0; s < ns; ++s) {
             const auto seq = seqs[s];
@@ -1818,7 +1835,7 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
                 std::make_pair(GGML_KPOOL_MATERIALIZE_CELLS, ref.pool_cells),
                 std::make_pair(GGML_KPOOL_MATERIALIZE_REPS, ref.pool_reps),
                 std::make_pair(GGML_KPOOL_MATERIALIZE_BIAS, ref.pool_bias)}) {
-            auto * out = ggml_kpool_materialize(ctx, bank->tensor, rows, capacity, r, capacity, np, nd, pair.first);
+            auto * out = ggml_kpool_materialize(ctx, table, rows, capacity, r, capacity, np, nd, pair.first);
             ggml_set_output(out);
             ggml_build_forward_expand(graph, out);
             outputs.emplace_back(out, pair.second);

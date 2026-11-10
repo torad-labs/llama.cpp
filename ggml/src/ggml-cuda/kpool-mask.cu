@@ -264,7 +264,34 @@ static __global__ void k_kpool_materialize(const int32_t * table, const int32_t 
     }
 }
 
+// ggml_kpool_patch: a thread a patch, each to an element of its own
+static __global__ void k_kpool_patch(int32_t * table, const int32_t * patches, int64_t n,
+        int64_t table_size, int64_t table_stride, int n_tables) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n) { return; }
+    const int32_t slot = patches[3*i], element = patches[3*i + 1];
+    if (slot < 0) { return; }
+    if (slot >= n_tables || element < 0 || element >= table_size) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        __builtin_trap();
+#else
+        asm("trap;");
+#endif
+    }
+    table[slot*table_stride + element] = patches[3*i + 2];
+}
+
 void ggml_cuda_op_kpool_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) == GGML_KPOOL_MATERIALIZE_PATCH) {
+        const auto * table = dst->src[0];
+        const auto * patches = dst->src[1];
+        GGML_ASSERT(dst->data == table->data);
+        const int64_t n = patches->ne[1];
+        k_kpool_patch<<<(n + 255)/256, 256, 0, ctx.stream()>>>((int32_t *) table->data, (const int32_t *) patches->data, n,
+            table->ne[0], table->nb[1]/sizeof(int32_t), table->ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (ggml_get_op_params_i32(dst, 0) >= GGML_KPOOL_MATERIALIZE_FACTS) {
         const auto * rows = dst->src[1];
         const int64_t n = ggml_nelements(dst)/rows->ne[2];

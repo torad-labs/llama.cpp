@@ -1569,6 +1569,10 @@ int64_t llama_kv_cache_set_input_kpool(
     return n_tail;
 }
 
+void llm_graph_input_kpool::input_lost() {
+    if (resident_patches) { mctx_attn->get_kv()->get_kpool_views().resend(); }
+}
+
 llama_kpool_backend_tensor::llama_kpool_backend_tensor(ggml_backend_buffer_type_t buft, int64_t count, int64_t slots, uint32_t devices) {
     ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
     tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, count, slots);
@@ -1744,6 +1748,10 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
         auto * backend = ggml_backend_sched_get_tensor_backend(sched, resident_table->tensor);
         GGML_ASSERT(backend);
         resident_table->begin_upload(backend);
+        // the changes that fit the graph's patches go with them, in the one copy of the input; the rest are written
+        int32_t * patch = resident_patches ? (int32_t *) resident_patches->data : nullptr;
+        const int64_t n_patch_max = resident_patches ? resident_patches->ne[1] : 0;
+        int64_t n_patch = 0;
         const int64_t n_tps = ubatch->n_tokens/ubatch->n_seqs_unq;
         if (tail_cells) std::fill_n((int32_t *) tail_cells->data, ggml_nelements(tail_cells), -1);
         if (!reuse_only) std::fill_n((int32_t *) new_pool_cells->data, ggml_nelements(new_pool_cells), 0);
@@ -1765,6 +1773,14 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             GGML_ASSERT(bank_slot >= 0 && bank_slot < resident_table->tensor->ne[1]);
             const size_t table_offset = bank_slot*resident_table->tensor->ne[0];
             resident_upload_bytes += v->emit_patches([&](size_t off, const int32_t * data, size_t count) {
+                if (n_patch + (int64_t) count <= n_patch_max) {
+                    for (size_t i = 0; i < count; ++i, ++n_patch) {
+                        patch[3*n_patch + 0] = (int32_t) bank_slot;
+                        patch[3*n_patch + 1] = (int32_t) (off + i);
+                        patch[3*n_patch + 2] = data[i];
+                    }
+                    return;
+                }
                 resident_table->upload(table_offset + off, data, count);
                 ++resident_upload_calls;
             });
@@ -1816,6 +1832,8 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
                         n_new_max, kpool, shared_row, unused[s].any_rep_src);
             }
         }
+        resident_patch_count += n_patch;
+        for (; n_patch < n_patch_max; ++n_patch) { patch[3*n_patch] = -1; }
         resident_table->end_upload();
         if (rebuild) mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);
         return;

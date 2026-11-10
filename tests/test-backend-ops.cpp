@@ -9866,12 +9866,13 @@ struct test_kpool_materialize : public test_case {
     const bool empty;
     const bool direct;
     const int streams;
+    const bool patched; // the table takes changes first (ggml_kpool_patch), and the maps are made of what they leave
     const int64_t capacity = 512, r = 4, cap = capacity/r + 2, n_kv = 256, n_pools = 70, n_dump = 16;
 
-    test_kpool_materialize(int mode, int n_rows, bool empty, bool direct = false, int streams = 1)
-        : mode(mode), n_rows(n_rows), empty(empty), direct(direct), streams(streams) {}
+    test_kpool_materialize(int mode, int n_rows, bool empty, bool direct = false, int streams = 1, bool patched = false)
+        : mode(mode), n_rows(n_rows), empty(empty), direct(direct), streams(streams), patched(patched) {}
 
-    std::string vars() override { return VARS_TO_STR5(mode, n_rows, empty, direct, streams); }
+    std::string vars() override { return VARS_TO_STR6(mode, n_rows, empty, direct, streams, patched); }
     double max_nmse_err() override { return 0.0; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -9879,6 +9880,11 @@ struct test_kpool_materialize : public test_case {
         auto * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, streams == 1 ? 6 : 7, n_rows, streams);
         ggml_set_name(table, "resident_table");
         ggml_set_name(rows, "resident_rows");
+        if (patched) {
+            auto * patches = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, 301);
+            ggml_set_name(patches, "resident_patches");
+            table = ggml_kpool_patch(ctx, table, patches);
+        }
         auto * out = ggml_kpool_materialize(ctx, table, rows, capacity, r, n_kv, n_pools, n_dump,
                 (ggml_kpool_materialize_mode) mode);
         if (direct) {
@@ -9929,6 +9935,14 @@ struct test_kpool_materialize : public test_case {
                         const int32_t row[] = {q, 0, tail, vis};
                         std::copy_n(row, 4, data.data() + 4*i);
                     }
+                }
+            } else if (strcmp(t->name, "resident_patches") == 0) {
+                // an element is named once: the step and the table's size share no factor. Every third patch is none
+                const int64_t size = 2*capacity + cap*(r + 2), slots = streams == 1 ? 1 : streams + 1;
+                for (int64_t i = 0; i < t->ne[1]; ++i) {
+                    data[3*i + 0] = i%3 == 2 ? -1 : (int32_t) (i%slots);
+                    data[3*i + 1] = (int32_t) (i*37%size);
+                    data[3*i + 2] = (int32_t) (rng()%(capacity + 1)) - 1;
                 }
             } else if (strcmp(t->name, "selected") == 0 || strcmp(t->name, "tail") == 0) {
                 const bool top = strcmp(t->name, "selected") == 0;
@@ -13450,6 +13464,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 if (mode == GGML_KPOOL_MATERIALIZE_FACTS) {
                     test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty, true));
                     test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty, true, 3));
+                }
+                if (rows == 3) {
+                    test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty, false, 1, true));
+                    test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty, false, 3, true));
+                    if (mode == GGML_KPOOL_MATERIALIZE_FACTS) {
+                        test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty, true, 3, true));
+                    }
                 }
             }
         }

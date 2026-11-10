@@ -104,6 +104,8 @@ public:
         size_t resident_size() const { return 2*pos_at.size() + slot.size() + 2*cap; }
         size_t emit_patches(const std::function<void(size_t, const int32_t *, size_t)> & write) const;
         void rebuild(const llama_kv_cells & c, llama_seq_id seq);
+        // what the device holds of the tables is not known: they go whole on the next emit_patches
+        void lose_upload() const { full_upload = true; dirty_cells.clear(); dirty_pools.clear(); }
 
         // false: the cells disagree with the tables (two cells at one position, a position off the tables); rebuild
         bool apply(const llama_kv_cells & c, llama_seq_id seq, const std::vector<uint32_t> & chg);
@@ -137,8 +139,12 @@ public:
     bool bank_unsupported = false;
     // LLAMA_KPOOL_SHARED_VIEWS_LEGACY=1, read when the cache is made: a unified pool keeps its packed maps
     const bool packed_legacy = ggml_env_switch("LLAMA_KPOOL_SHARED_VIEWS_LEGACY");
+    // LLAMA_KPOOL_PATCH_INPUT_LEGACY=1, read when the cache is made: every change of the bank is a write of its own
+    const bool patch_writes_legacy = ggml_env_switch("LLAMA_KPOOL_PATCH_INPUT_LEGACY");
     std::shared_ptr<llama_kpool_backend_tensor> resident_bank(ggml_backend_buffer_type_t buft,
             int64_t count, uint32_t slots, uint32_t devices);
+    // a graph that carried the views' changes was not computed: every view goes whole on its next use
+    void resend() { for (auto & it : views) { it.second.lose_upload(); } }
 
 private:
     void sync(const llama_kv_cells & cells, uint32_t r);
@@ -299,6 +305,8 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    void input_lost() override;
+
     bool can_reuse(const llm_graph_params & params) override;
 
     // gather the geometry the builder sizes the tensors with, for the check below; shared: a stream a sequence (shared_streams)
@@ -367,6 +375,8 @@ public:
     std::vector<llama_seq_id> resident_seqs; // bank users, in device/sequence order
     bool shared = false; // the bank users are a unified pool's sequences, one stream each (llama_kpool_shared_streams)
     ggml_tensor * resident_rows = nullptr; // [6,Q] or [7,Q,streams], see ggml_kpool_materialize
+    ggml_tensor * resident_patches = nullptr; // I32 [3,P]: the bank's changes of the decode, see ggml_kpool_patch
+    uint64_t resident_patch_count = 0;
     uint64_t resident_upload_bytes = 0;
     uint64_t resident_upload_calls = 0;
     bool reuse_only = false;
