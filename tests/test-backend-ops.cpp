@@ -13786,6 +13786,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // PRO 6000's 128 MB L2, as the served 288 experts' 462 MB are
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 128, 8, true,  1024, 912, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 128, 8, false, 4096, 912, 1024));
+    // 23 sessions under -sm tensor on four cards: a card's quarter of a layer's routed experts (gate/up 4096 -> 512,
+    // down 512 -> 4096, all 288, 8 used) at the MTP head's 23 proposal rows and the target's 69 (23 sessions x an MTP-2
+    // verify's 3), in the pack's IQ3_XXS, its MTP block's Q8_0, and NVFP4. 69 rows read 86 % of a bank
+    for (int bs : {69, 23}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, true,   512, bs, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 4096, bs,  512));
+        }
+    }
     // glm5next's real non-expert shapes, at one row and at an MTP verify's width. The candidate 4-bit formats run
     // beside Q8_0 because the 8.9 GB of non-expert weight is 70 % of what a token reads, and a format that cuts bytes
     // 47 % while losing 30 % of achieved bandwidth is not a 47 % win. 4096 x 154880 is the output head, read every
