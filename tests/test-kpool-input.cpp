@@ -1862,6 +1862,107 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
     ggml_backend_free(backend);
 }
 
+// One device of sequences with several slots (a unified pool under a tensor split): a capture's rows go to one bank, a
+// copy a run of rows whose sequences are neighbours, and a graph reads them back by slot.
+// LLAMA_KPOOL_DRAFT_BANK_LEGACY=1: a store and a copy a sequence
+static void run_draft_bank_shared() {
+    constexpr uint32_t slots = 9;
+    std::vector<ggml_backend_dev_t> devs(2, ggml_backend_get_device(resident_test_backend()));
+    auto * meta = ggml_backend_meta_device(devs.data(), devs.size(),
+        [](const ggml_tensor *, void *) -> ggml_backend_meta_split_state {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }, nullptr);
+    auto * backend = ggml_backend_dev_init(meta, nullptr);
+    const auto buft = ggml_backend_get_default_buffer_type(backend);
+    static bool (*copy_async)(ggml_backend_t, ggml_backend_t, const ggml_tensor *, ggml_tensor *);
+    static size_t copy_calls, direct_copies;
+    copy_async = backend->iface.cpy_tensor_async;
+    const auto observe_copy = [](ggml_backend_t src_backend, ggml_backend_t dst_backend,
+            const ggml_tensor * src, ggml_tensor * dst) {
+        ++copy_calls;
+        const bool direct = copy_async(src_backend, dst_backend, src, dst);
+        direct_copies += direct;
+        return direct;
+    };
+    for (const bool legacy : {false, true}) {
+#ifdef _WIN32
+        _putenv_s("LLAMA_KPOOL_DRAFT_BANK_LEGACY", legacy ? "1" : "");
+#else
+        if (legacy) { setenv("LLAMA_KPOOL_DRAFT_BANK_LEGACY", "1", 1); } else { unsetenv("LLAMA_KPOOL_DRAFT_BANK_LEGACY"); }
+#endif
+        llama_kpool_draft draft;
+        for (int round = 0; round < 8; ++round) {
+            const int width = round < 4 ? 128 : 192;
+            // the slots in order with one in four out, so the rows come as runs of neighbours; every third round in
+            // falling order, where no row follows its neighbour
+            std::vector<llama_seq_id> seqs;
+            for (uint32_t s = 0; s < slots; ++s) {
+                if ((s + round)%4 != 0) { seqs.push_back(s); }
+            }
+            if (round%3 == 2) { std::reverse(seqs.begin(), seqs.end()); }
+            size_t runs = 1;
+            for (size_t i = 1; i < seqs.size(); ++i) { runs += seqs[i] != seqs[i - 1] + 1; }
+            const std::vector<llama_pos> positions(seqs.size(), 100);
+            auto * ctx = ggml_init({8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+            auto * source = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, seqs.size());
+            auto * input = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            std::vector<int32_t> expected(width*seqs.size());
+            for (size_t i = 0; i < seqs.size(); ++i) {
+                for (int k = 0; k < width; ++k) { expected[i*width + k] = 1000*seqs[i] + 100*round + k; }
+            }
+            ggml_backend_tensor_set(source, expected.data(), 0, ggml_nbytes(source));
+            draft.advance(0);
+            copy_calls = direct_copies = 0;
+            backend->iface.cpy_tensor_async = observe_copy;
+            draft.capture_backend_rows(seqs.data(), positions.data(), seqs.size(), 512, source, backend, slots, 1);
+            backend->iface.cpy_tensor_async = copy_async;
+            ggml_backend_synchronize(backend);
+            CHECK(copy_calls == (legacy ? seqs.size() : runs), "shared draft bank: %zu rows in %zu runs took %zu copies (legacy=%d)",
+                    seqs.size(), runs, copy_calls, legacy);
+            CHECK(direct_copies == copy_calls, "shared draft bank: %zu captures fell back to host staging", copy_calls - direct_copies);
+            ggml_backend_buffer_free(input);
+            ggml_free(ctx);
+            const auto bank = draft.backend_row(seqs.front());
+            CHECK(bank && bank->tensor->ne[1] == (legacy ? 1 : slots), "shared draft bank: the rows' store (legacy=%d)", legacy);
+            if (!bank) { break; }
+            draft.advance(1);
+            ubatch_data ud;
+            for (const auto seq : seqs) { ud.add(seq, 101); }
+            CHECK(draft.can_reuse(*ud.get(), 512, width, 4), "shared draft bank: the selection could not be reused");
+            std::vector<int32_t> copied(expected.size());
+            draft.copy(*ud.get(), copied.data());
+            CHECK(copied == expected, "shared draft bank: a copy read the wrong sequence's row (legacy=%d round=%d)", legacy, round);
+            if (!legacy) {
+                ctx = ggml_init({8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+                auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seqs.size());
+                input = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                ggml_backend_tensor_set(ids, seqs.data(), 0, ggml_nbytes(ids));
+                auto * selected = ggml_get_rows(ctx, bank->tensor, ids);
+                auto * graph = ggml_new_graph(ctx);
+                ggml_set_output(selected);
+                ggml_build_forward_expand(graph, selected);
+                auto * alloc = ggml_gallocr_new(buft);
+                CHECK(ggml_gallocr_alloc_graph(alloc, graph), "shared draft bank graph allocation");
+                CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "shared draft bank graph compute");
+                std::fill(copied.begin(), copied.end(), 0);
+                ggml_backend_tensor_get(selected, copied.data(), 0, ggml_nbytes(selected));
+                CHECK(copied == expected, "shared draft bank: the graph read the wrong sequence's row (round=%d)", round);
+                ggml_gallocr_free(alloc);
+                ggml_backend_buffer_free(input);
+                ggml_free(ctx);
+            }
+            draft.clear();
+        }
+    }
+#ifdef _WIN32
+    _putenv_s("LLAMA_KPOOL_DRAFT_BANK_LEGACY", "");
+#else
+    unsetenv("LLAMA_KPOOL_DRAFT_BANK_LEGACY");
+#endif
+    ggml_backend_free(backend);
+    printf("shared draft bank: a copy a run of neighbouring sequences, graph reads by slot\n");
+}
+
 int main(int argc, char ** argv) {
     if (argc != 1) {
         if (argc != 6 || strcmp(argv[1], "--draft-bank") != 0) {
@@ -1891,6 +1992,7 @@ int main(int argc, char ** argv) {
     run_direct_indices(rng);
     run_draft_rounds(rng);
     run_draft_bank(std::vector<ggml_backend_dev_t>(4, ggml_backend_get_device(resident_test_backend())));
+    run_draft_bank_shared();
 
     run_shift_regroups();
     run_compress_chunks();

@@ -4537,6 +4537,14 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 inp->draft_rows.push_back(row);
                 inp->draft_seqs.push_back(ubatch.seq_id[i][0]);
             }
+            // a round's rows are in one bank or in a store each; rows of both kinds are read back through the host
+            const bool banked = !inp->draft_rows.empty() && inp->draft_rows.front()->tensor->ne[1] > 1;
+            for (const auto & row : inp->draft_rows) {
+                if ((row->tensor->ne[1] > 1) != banked || (banked && row != inp->draft_rows.front())) {
+                    inp->draft_rows.clear();
+                    break;
+                }
+            }
             if (!inp->draft_rows.empty()) {
                 ggml_tensor * joined = nullptr;
                 if (cparams.n_seq_devices > 1) {
@@ -4547,6 +4555,12 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                     ggml_backend_meta_split_input(inp->draft_ids, 0, counts.data(), counts.size());
                     ggml_set_input(inp->draft_ids);
                     joined = ggml_backend_meta_get_rows_local(ctx0, bank->tensor, inp->draft_ids);
+                } else if (banked) {
+                    // one bank of every slot's row (llama_kpool_draft::capture_backend_rows): the rows by their slots
+                    const auto & bank = inp->draft_rows.front();
+                    inp->draft_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+                    ggml_set_input(inp->draft_ids);
+                    joined = ggml_get_rows(ctx0, bank->tensor, inp->draft_ids);
                 } else {
                     for (const auto & row : inp->draft_rows) {
                         auto * t = ggml_reshape_2d(ctx0, row->tensor, kpool*n_dump, 1);
