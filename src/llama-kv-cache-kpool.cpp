@@ -1570,7 +1570,11 @@ int64_t llama_kv_cache_set_input_kpool(
 }
 
 void llm_graph_input_kpool::input_lost() {
-    if (resident_patches) { mctx_attn->get_kv()->get_kpool_views().resend(); }
+    const auto * kv = mctx_attn->get_kv();
+    if (resident_patches) { kv->get_kpool_views().resend(); }
+    // the pools set_input said were re-emitted were not: their sequences are stale again
+    for (const llama_seq_id seq : rebuilt_seqs) { kv->set_kpool_dirty(seq); }
+    rebuilt_seqs.clear();
 }
 
 llama_kpool_backend_tensor::llama_kpool_backend_tensor(ggml_backend_buffer_type_t buft, int64_t count, int64_t slots, uint32_t devices) {
@@ -1747,6 +1751,8 @@ void llama_kpool_draft::copy(const llama_ubatch & ubatch, int32_t * dst) const {
 }
 
 void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
+    rebuilt_seqs.clear();
+
     // unconditional: the key/gate STORE runs on the dense path too, or cells below n_select
     // would have no indexer state when the first ubatch crosses it
     mctx_idx->set_input_k_idxs(k_idxs, ubatch);
@@ -1869,7 +1875,10 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
         resident_patch_count += n_patch;
         for (; n_patch < n_patch_max; ++n_patch) { patch[3*n_patch] = -1; }
         resident_table->end_upload();
-        if (rebuild) mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);
+        if (rebuild) {
+            mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);
+            rebuilt_seqs.assign(ubatch->seq_id_unq, ubatch->seq_id_unq + ubatch->n_seqs_unq);
+        }
         return;
     }
 
@@ -1904,5 +1913,6 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
     // sequences were re-emitted, so only theirs
     if (rebuild) {
         mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);
+        rebuilt_seqs.assign(ubatch->seq_id_unq, ubatch->seq_id_unq + ubatch->n_seqs_unq);
     }
 }

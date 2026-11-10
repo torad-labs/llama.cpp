@@ -364,6 +364,8 @@ public:
 
     // set at build time: re-emit every pool after a position mutation
     bool rebuild = false;
+    // the sequences the last set_input cleared of that mark: marked again if its graph did not run (input_lost)
+    std::vector<llama_seq_id> rebuilt_seqs;
 
     // set at build time: the most cells a row's tail holds (llama_kpool_tail_max), which sizes the sparse attention's
     // n_kv_max; set_input asserts no row is granted more
