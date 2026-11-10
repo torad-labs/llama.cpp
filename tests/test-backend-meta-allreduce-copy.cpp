@@ -81,6 +81,8 @@ static bool last_owner_slice  = false;
 static bool               last_chunked_seen = false;
 static unsigned long long last_chunked_peer = 0;
 static unsigned long long last_chunked_host = 0;
+static bool               last_split_seen = false; // and its reductions that went to owners and were gathered from them
+static unsigned long long last_split      = 0;
 static std::atomic<int> n_captures{0};
 static std::atomic<int> n_nccl_fallbacks{0};
 
@@ -103,6 +105,9 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/
     if (const char * chunked = strstr(text, "on the chunked kernel ")) {
         last_chunked_seen = sscanf(chunked, "on the chunked kernel %llu card to card, %llu through host memory",
                                    &last_chunked_peer, &last_chunked_host) == 2;
+    }
+    if (const char * split = strstr(text, "ggml_cuda_ar_pipeline_free: "); split && strstr(split, " split reductions")) {
+        last_split_seen = sscanf(split, "ggml_cuda_ar_pipeline_free: %llu split reductions", &last_split) == 1;
     }
     if (strstr(text, "ggml_backend_cuda_capture_end") && strstr(text, " nodes, ")) { ++n_captures; }
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
@@ -531,7 +536,24 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             }
             if (pair_comm) { free(pair_comm); }
             last_chunked_seen = false;
+            last_split_seen = false;
             free(comm);
+            // GGML_CUDA_AR_SPLIT_REDUCE=1: four ranks' reductions past the LL went to owners and were gathered from them
+            // where the cards map each other's memory and gather by owner slices, so every sum above was that route's;
+            // without the switch no reduction takes it
+            {
+                const bool split_on = ggml_env_switch("GGML_CUDA_AR_SPLIT_REDUCE");
+                const bool split_route = split_on && n >= 4 && strcmp(route.name, "owner chunked") == 0 && peer_active &&
+                    last_gather_peer && last_owner_slice;
+                const bool split_ok = last_split_seen && (!split_route || last_split > 0) && (split_on || last_split == 0);
+                if (!split_ok || split_route) {
+                    fprintf(split_ok ? stdout : stderr, "%s: %d ranks, %s, %s wire, %llu split reductions%s, %s\n",
+                            split_ok ? "ok" : "FAIL", n, route.name, bf16 ? "BF16" : "F32", last_split,
+                            last_split_seen ? "" : " (no count logged)",
+                            split_route ? "some expected" : split_on ? "any number allowed" : "none expected");
+                }
+                ok = ok && split_ok;
+            }
             // the pipeline's reductions on the chunked kernel moved card to card where its cards map each other's memory,
             // and through host memory where they do not
             const bool peer_chunked = strcmp(route.name, "peer chunked") == 0 && peer_active && last_gather_peer;
