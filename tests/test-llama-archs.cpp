@@ -1527,6 +1527,9 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
 // it crosses as often a step as one sequence does; LLAMA_KV_PAD_SHARED_LEGACY=1 keeps 256. The cells that adds are empty
 // and the sparse attention reads none of them: the logits are the 256-padded pool's, byte for byte on the CPU and to
 // test_glm_prefill_reuse's bar on a GPU, whose attention kernel can depend on the cache length.
+// The pool's maps are one stream a sequence, each from its sequence's view (llama_kpool_shared_streams), where they
+// packed every sequence's pools on one axis and were built from every cell; LLAMA_KPOOL_SHARED_VIEWS_LEGACY=1 packs
+// them. The logits are the packed maps', to the same bars.
 static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
@@ -1559,8 +1562,9 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         std::set<int64_t>  n_kv;       // the cache lengths the steps' graphs read
     };
 
-    const auto read = [&](bool legacy, bool mtp) {
+    const auto read = [&](bool legacy, bool mtp, bool packed = false) {
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", legacy ? "1" : nullptr);
+        set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", packed ? "1" : nullptr);
         std::set<int64_t> n_kv;
         llama_context_params params = llama_context_default_params();
         if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -1579,6 +1583,7 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         params.cb_eval_user_data = &n_kv;
         llama_context_ptr ctx(llama_init_from_model(model, params));
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", nullptr);
+        set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", nullptr);
         if (!ctx) throw std::runtime_error("shared pool reuse: failed to create a context");
 
         // positions [begin, end) of every sequence, a sequence's rows together
@@ -1614,6 +1619,7 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
     for (const bool mtp : {false, true}) {
         const read_result legacy = read(true, mtp);
         const read_result shared = read(false, mtp);
+        const read_result packed = read(false, mtp, true);
 
         // 256 cells a sequence: 2,048, which the 1,088 cells never cross, and their pools never cross a quarter of it. The
         // first step builds its graph (another length than the prompt's, and in the main context each sequence's second
@@ -1637,18 +1643,22 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
                     legacy.n_kv.empty() ? -1LL : (long long) *legacy.n_kv.rbegin(), (long long) want_n_kv_legacy);
             ok = false;
         }
-        if (exact && legacy.logits != shared.logits) {
-            LOG_ERR("GLM shared pool reuse: mtp=%d: logits differ, nmse=%g\n", mtp, nmse(legacy.logits, shared.logits));
-            ok = false;
-        }
-        if (!exact) {
-            size_t n_top_differ = 0;
-            size_t n_top_tied   = 0;
-            const double kld = mean_kld(legacy.logits, shared.logits, n_vocab, n_top_differ, n_top_tied);
-            if (!(kld <= 1e-6) || n_top_differ > 0) {
-                LOG_ERR("GLM shared pool reuse: mtp=%d: mean KLD %g (at most 1e-6), %zu rows' top token differs, %zu tied "
-                        "rows' swapped, nmse=%g\n", mtp, kld, n_top_differ, n_top_tied, nmse(legacy.logits, shared.logits));
+        for (const auto & other : { std::make_pair("padded to 256", &legacy), std::make_pair("with packed maps", &packed) }) {
+            if (exact && other.second->logits != shared.logits) {
+                LOG_ERR("GLM shared pool reuse: mtp=%d: logits differ from the pool %s, nmse=%g\n", mtp, other.first,
+                        nmse(other.second->logits, shared.logits));
                 ok = false;
+            }
+            if (!exact) {
+                size_t n_top_differ = 0;
+                size_t n_top_tied   = 0;
+                const double kld = mean_kld(other.second->logits, shared.logits, n_vocab, n_top_differ, n_top_tied);
+                if (!(kld <= 1e-6) || n_top_differ > 0) {
+                    LOG_ERR("GLM shared pool reuse: mtp=%d: against the pool %s: mean KLD %g (at most 1e-6), %zu rows' top "
+                            "token differs, %zu tied rows' swapped, nmse=%g\n", mtp, other.first, kld, n_top_differ,
+                            n_top_tied, nmse(other.second->logits, shared.logits));
+                    ok = false;
+                }
             }
         }
         if (!ok) return false;

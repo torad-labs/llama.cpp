@@ -1662,8 +1662,10 @@ static void run_draft_bank(std::vector<ggml_backend_dev_t> devs) {
     printf("draft bank: owner-local copies and graph reads, changing batches and widths\n");
 }
 
-static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devices) {
+// unified: the slots are the sequences of one pool, each a stream of its own in the maps (llama_kpool_shared_streams)
+static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devices, bool unified = false) {
     constexpr int64_t capacity = 256, r = 4, np = capacity/r + 2, nd = 2;
+    GGML_ASSERT(!unified || devices == 1);
     auto * cpu = resident_test_backend();
     std::vector<ggml_backend_dev_t> devs(devices, ggml_backend_get_device(cpu));
     auto * meta = ggml_backend_meta_device(devs.data(), devs.size(),
@@ -1672,7 +1674,7 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
         }, nullptr);
     auto * backend = ggml_backend_dev_init(meta, nullptr);
     const auto buft = ggml_backend_get_default_buffer_type(backend);
-    pool w(capacity, slots, false, rng);
+    pool w(capacity, slots, unified, rng);
     llama_kpool_views views;
     views.reserve_views(slots);
     const auto bank = views.resident_bank(buft, 2*capacity + np*(r + 2), slots, devices);
@@ -1703,7 +1705,7 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
         std::vector<llama_seq_id> seqs;
         std::vector<int64_t> counts(devices, 0);
         for (uint32_t d = 0; d < devices; ++d) {
-            if (step%2 && d == devices - 1) { continue; }
+            if (devices > 1 && step%2 && d == devices - 1) { continue; }
             for (int64_t s = slots - 1; s >= 0; --s) {
                 if (s%devices == d && current[s] && (s + step)%3 == 0) { seqs.push_back(s); ++counts[d]; }
             }
@@ -1720,6 +1722,48 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
                 nullptr, ref.pool_cells, nullptr, ref.pool_bias, nullptr, nullptr, ref.pool_reps,
                 ref.new_pool_cells, ref.new_pool_reps, streams.data(), capacity, false, ub, r,
                 ref.mask_cells, ref.mask_rows, ref.tail_cells);
+        if (unified && ns > 0) {
+            std::vector<llama_seq_id> runs;
+            CHECK(llama_kpool_shared_streams(w.cells_of(0), *ub, runs) && runs == seqs, "shared streams: step=%d", step);
+            // the pool's packed maps of the same ubatch: a row sees the same pools in the same order, with the same cells
+            // and rep, the same tail and the same facts of its sequence's cells
+            maps packed(capacity, 1, nr*ns, ns, r, true, false, false, nd, 0x5a, 0, true);
+            const int64_t np_packed = packed.pool_bias->ne[0];
+            llama_kpool_set_input([&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); }, nullptr,
+                    nullptr, packed.pool_cells, nullptr, packed.pool_bias, nullptr, nullptr, packed.pool_reps,
+                    packed.new_pool_cells, packed.new_pool_reps, streams.data(), capacity, false, ub, r,
+                    packed.mask_cells, packed.mask_rows, packed.tail_cells);
+            for (int64_t i = 0; i < nr*ns; ++i) {
+                const int64_t s = i/nr;
+                const auto * fp = (const int32_t *) packed.mask_rows->data + 4*i;
+                const auto * fs = (const int32_t *) ref.mask_rows->data + 4*i;
+                CHECK(fp[0] == fs[0] && fp[1] == s && fs[1] == 0 && fp[2] == fs[2] && fp[3] == fs[3],
+                        "packed/streams row facts: step=%d row=%d", step, (int) i);
+                CHECK(memcmp((const int32_t *) packed.mask_cells->data + s*2*capacity,
+                            (const int32_t *) ref.mask_cells->data + s*2*capacity, 2*capacity*sizeof(int32_t)) == 0,
+                        "packed/streams cell facts: step=%d row=%d", step, (int) i);
+                CHECK(memcmp((const int32_t *) packed.tail_cells->data + i*capacity,
+                            (const int32_t *) ref.tail_cells->data + i*capacity, capacity*sizeof(int32_t)) == 0,
+                        "packed/streams tail: step=%d row=%d", step, (int) i);
+                std::vector<int32_t> seen_packed, seen_streams;
+                for (int64_t p = 0; p < np_packed; ++p) {
+                    if (((const float *) packed.pool_bias->data)[i*np_packed + p] == 0.0f) {
+                        const auto * cells = (const int32_t *) packed.pool_cells->data + p*r;
+                        seen_packed.insert(seen_packed.end(), cells, cells + r);
+                        seen_packed.push_back(((const int32_t *) packed.pool_reps->data)[p]);
+                    }
+                }
+                for (int64_t p = 0; p < np; ++p) {
+                    if (((const float *) ref.pool_bias->data)[i*np + p] == 0.0f) {
+                        const auto * cells = (const int32_t *) ref.pool_cells->data + s*r*(np + nd) + p*r;
+                        seen_streams.insert(seen_streams.end(), cells, cells + r);
+                        seen_streams.push_back(((const int32_t *) ref.pool_reps->data)[s*np + p]);
+                    }
+                }
+                CHECK(seen_packed == seen_streams, "packed/streams pools: step=%d row=%d %zu/%zu", step, (int) i,
+                        seen_packed.size(), seen_streams.size());
+            }
+        }
         auto * ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
         auto * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 7, nr, ns);
         auto * visibility = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, nr, ns);
@@ -1825,6 +1869,8 @@ int main(int argc, char ** argv) {
     run_resident_patches(rng);
     run_resident_bank(rng, 40, 4);
     run_resident_bank(rng, 41, 4);
+    run_resident_bank(rng, 5, 1, true);
+    run_resident_bank(rng, 6, 1, true);
     run_direct_indices(rng);
     run_draft_rounds(rng);
     run_draft_bank(std::vector<ggml_backend_dev_t>(4, ggml_backend_get_device(resident_test_backend())));
