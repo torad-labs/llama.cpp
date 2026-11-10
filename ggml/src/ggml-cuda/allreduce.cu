@@ -918,6 +918,7 @@ struct ggml_cuda_ar_pipeline {
     uint64_t n_reduced_all;
     uint64_t n_chunked_peer;  // reductions on the chunked kernel that moved card to card, and through host memory
     uint64_t n_chunked_host;
+    uint64_t n_split;         // reductions that went to owners and were gathered from them (GGML_CUDA_AR_SPLIT_REDUCE)
     uint64_t call_count;
 
     // Per-device resources.
@@ -1467,6 +1468,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
                    (unsigned long long) p->n_reduced_owned, (unsigned long long) p->n_reduced_all);
     GGML_LOG_DEBUG("%s: on the chunked kernel %llu card to card, %llu through host memory\n", __func__,
                    (unsigned long long) p->n_chunked_peer, (unsigned long long) p->n_chunked_host);
+    GGML_LOG_DEBUG("%s: %llu split reductions, to owners and gathered from them\n", __func__, (unsigned long long) p->n_split);
 
     // Drain all in-flight kernels and copies before tearing down resources.
     for (int i = 0; i < p->n_devices; ++i) {
@@ -2076,6 +2078,11 @@ static bool ggml_cuda_ar_try_hc_post(ggml_cuda_ar_pipeline * p, ggml_backend_t *
     return true;
 }
 
+template <typename T_dst, typename T_wire>
+static void ggml_cuda_ar_launch_owner_reduce(
+        ggml_cuda_ar_pipeline * p, ggml_backend_t * backends, void * const * data, const bool * zero_first, int64_t ne,
+        const ggml_cuda_ar_owner_layout & owner);
+
 bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -2223,7 +2230,31 @@ bool ggml_cuda_ar_allreduce(
             zero_first[i] = !compute_flag[i] && !use_bf16;
         }
 
-        if (use_bf16) {
+        // GGML_CUDA_AR_SPLIT_REDUCE=1, four ranks or more that map each other's memory: each share goes to its elements'
+        // owner (a rank's contiguous part), the owners add the shares in rank order as below, and each owner's F32 sums
+        // go to its peers as they are, so the result is the one below. A rank then sends 4.5 bytes an element on a BF16
+        // wire where sending every peer its whole share is 6, for a second barrier. Off by default: with four ranks on
+        // one card, where no byte crosses PCIe, it read 46 us against 40 a reduction at 69 x 4,096 (RTX 5080, Nov 10,
+        // 2026), and it is not read on cards that reach each other over PCIe.
+        static const bool split_reduce = ggml_env_switch("GGML_CUDA_AR_SPLIT_REDUCE");
+        if (split_reduce && input_type == GGML_TYPE_F32 && n >= 4 && p->gather_peer && p->owner_slices &&
+                nbytes > std::max(p->p2p_max_bytes, p->ll_max_bytes)) {
+            p->n_split++;
+            ggml_cuda_ar_owner_layout owner = {};
+            owner.valid = true;
+            for (int i = 0; i < n; ++i) {
+                owner.begin[i] = ne*i/n;
+                owner.len[i]   = ne*(i + 1)/n - owner.begin[i];
+            }
+            if (use_bf16) {
+                ggml_cuda_ar_launch_owner_reduce<float, nv_bfloat16>(p, backends, data, zero_first, ne, owner);
+            } else {
+                ggml_cuda_ar_launch_owner_reduce<float, float>(p, backends, data, zero_first, ne, owner);
+            }
+            // the sums travel as their bits: rounded to the wire type they would not be the sums every rank adds below
+            const bool no_zero[GGML_CUDA_MAX_DEVICES] = {};
+            ggml_cuda_ar_launch_kernels<uint32_t, uint32_t>(p, backends, data, no_zero, ne, &owner);
+        } else if (use_bf16) {
             GGML_ASSERT(input_type == GGML_TYPE_F32);
             ggml_cuda_ar_launch_kernels<float, nv_bfloat16>(p, backends, data, zero_first, ne);
         } else {
