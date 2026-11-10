@@ -14,8 +14,13 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -124,7 +129,159 @@ static bool sampling_ties_legacy() {
     return legacy;
 }
 
+// LLAMA_TOP_K_HEAP_LEGACY=1: a row's k largest logits are kept in a heap, a pop and a push for each logit above its
+// worst (the behaviour before the buffer below). LLAMA_SAMPLING_TIES_LEGACY=1 keeps the heap too: its order among
+// equal logits is the heap's own
+static bool top_k_heap_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_TOP_K_HEAP_LEGACY");
+    return legacy;
+}
+
+// the largest of n logits, n a multiple of 16
+static float top_k_max_logit(const float * x, int32_t n) {
+#if defined(__SSE2__)
+    __m128 m0 = _mm_loadu_ps(x);
+    __m128 m1 = _mm_loadu_ps(x + 4);
+    __m128 m2 = _mm_loadu_ps(x + 8);
+    __m128 m3 = _mm_loadu_ps(x + 12);
+    for (int32_t i = 16; i < n; i += 16) {
+        m0 = _mm_max_ps(m0, _mm_loadu_ps(x + i));
+        m1 = _mm_max_ps(m1, _mm_loadu_ps(x + i + 4));
+        m2 = _mm_max_ps(m2, _mm_loadu_ps(x + i + 8));
+        m3 = _mm_max_ps(m3, _mm_loadu_ps(x + i + 12));
+    }
+    float m[4];
+    _mm_storeu_ps(m, _mm_max_ps(_mm_max_ps(m0, m1), _mm_max_ps(m2, m3)));
+    return std::max(std::max(m[0], m[1]), std::max(m[2], m[3]));
+#else
+    float m = x[0];
+    for (int32_t i = 1; i < n; ++i) {
+        m = std::max(m, x[i]);
+    }
+    return m;
+#endif
+}
+
+// The k largest by logit and then id, sorted. The logits above a bar wait in a buffer of 2k; a full buffer keeps its k
+// largest and raises the bar to the last of them, so a logit is then passed over only when k earlier ones, their ids
+// smaller, are at least as large. The bar starts at the k-th largest of the row's block maxima, the row split in
+// blocks n/2k wide: k blocks hold a logit at or above it, so no logit below it is among the k, and about 0.7 of the
+// buffer is at or above it when the large logits are spread over the ids. The k kept are the ones a sort of every
+// token keeps
+static void top_k_candidates_buffered(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
+    const auto before = [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+    };
+
+    constexpr int32_t block = 16;
+
+    const size_t keep = (size_t) k;
+    const size_t cap  = 2*keep;
+
+    out.resize(cap);
+
+    size_t n = 0;
+    float kth = 0.0f;
+
+    const auto cut = [&]() {
+        std::nth_element(out.begin(), out.begin() + (keep - 1), out.begin() + n, before);
+        n   = keep;
+        kth = out[keep - 1].logit;
+    };
+
+    const auto consider = [&](int32_t i) {
+        if (logits[i] > kth) {
+            out[n++] = llama_token_data{i, logits[i], 0.0f};
+            if (n == cap) {
+                cut();
+            }
+        }
+    };
+
+    // the logits from i on
+    const auto scan = [&](int32_t i) {
+        for (; i + block <= n_vocab; i += block) {
+#if defined(__SSE2__)
+            // the compiler leaves the block's test as sixteen scalar compares: four vector ones, and only the logits
+            // above the bar are looked at again
+            const __m128 bar = _mm_set1_ps(kth);
+            const __m128 a   = _mm_cmpgt_ps(_mm_loadu_ps(logits + i),      bar);
+            const __m128 b   = _mm_cmpgt_ps(_mm_loadu_ps(logits + i + 4),  bar);
+            const __m128 c   = _mm_cmpgt_ps(_mm_loadu_ps(logits + i + 8),  bar);
+            const __m128 d   = _mm_cmpgt_ps(_mm_loadu_ps(logits + i + 12), bar);
+            if (_mm_movemask_ps(_mm_or_ps(_mm_or_ps(a, b), _mm_or_ps(c, d)))) {
+                uint32_t above = (uint32_t) _mm_movemask_ps(a) | (uint32_t) _mm_movemask_ps(b) << 4 |
+                    (uint32_t) _mm_movemask_ps(c) << 8 | (uint32_t) _mm_movemask_ps(d) << 12;
+                for (; above; above &= above - 1) {
+                    consider(i + __builtin_ctz(above));
+                }
+            }
+#else
+            bool any = false;
+            for (int32_t j = 0; j < block; ++j) {
+                any |= logits[i + j] > kth;
+            }
+            if (any) {
+                for (int32_t j = 0; j < block; ++j) {
+                    consider(i + j);
+                }
+            }
+#endif
+        }
+        for (; i < n_vocab; ++i) {
+            consider(i);
+        }
+    };
+
+    const auto finish = [&]() {
+        if (n > keep) {
+            cut();
+        }
+        out.resize(n);
+        std::sort(out.begin(), out.end(), before);
+    };
+
+    const int32_t width = (int32_t) ((size_t) n_vocab/cap)/block*block;
+
+    if (width > 0) {
+        std::vector<float> tops((size_t) (n_vocab/width));
+        for (size_t b = 0; b < tops.size(); ++b) {
+            tops[b] = top_k_max_logit(logits + b*width, width);
+        }
+        std::nth_element(tops.begin(), tops.begin() + (keep - 1), tops.end(), std::greater<float>());
+
+        const float bar = tops[keep - 1];
+        if (bar > -INFINITY) {
+            // a logit at the bar passes
+            kth = std::nextafter(bar, -INFINITY);
+            scan(0);
+            // fewer than k only when a logit is not a number: the row is read again from its first logits
+            if (n >= keep) {
+                finish();
+                return;
+            }
+        }
+    }
+
+    // a row too short for blocks: the buffer starts as its first logits, whatever they are
+    const int32_t n_first = (int32_t) std::min<size_t>(cap, (size_t) n_vocab);
+    for (int32_t i = 0; i < n_first; ++i) {
+        out[i] = llama_token_data{i, logits[i], 0.0f};
+    }
+    n = (size_t) n_first;
+    if (n > keep) {
+        cut();
+        scan(n_first);
+    }
+    finish();
+}
+
 void common_sampler_top_k_candidates(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
+    if (!top_k_heap_legacy() && !sampling_ties_legacy()) {
+        top_k_candidates_buffered(logits, n_vocab, k, out);
+        return;
+    }
+
     // a heap whose front is the worst kept, by logit and then id as llama's candidate sorts order them: a later token,
     // its id larger than every kept one's, replaces the worst only when its logit is strictly larger
     const auto heap_cmp = [](const llama_token_data & a, const llama_token_data & b) {
