@@ -3482,9 +3482,6 @@ bool llama_context::nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int3
         }
     }
     if (n_queued_tokens) { synchronize(); }
-    st.wait_read(0);
-    st.wait_read(1);
-    if (st.copy_used[seq]) { st.wait_copy(); }
 
     ggml_backend_t backend = nullptr;
     for (const auto & candidate : backends) {
@@ -3494,6 +3491,27 @@ bool llama_context::nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int3
         }
     }
     if (!backend) { return false; }
+
+    // The copies run in the head's own order on the device, after the reads it has queued, and its next decode reads
+    // the kept rows after them. Waited for here, or queued on this context, they held the host's verification behind
+    // the catch-up the head had just been given: 5.5 % of a 23-session step's samples (fixture, Nov 10, 2026).
+    // LLAMA_MTP_KEEP_WAIT_LEGACY=1: this context copies, once the host has waited for the head's reads
+    static const bool wait_legacy = ggml_env_switch("LLAMA_MTP_KEEP_WAIT_LEGACY");
+    ggml_backend_t copy_backend = nullptr;
+    if (!wait_legacy && st.copy_done && st.reader && st.read_done[0] && st.read_done[1]) {
+        for (const auto & candidate : st.reader->backends) {
+            if (ggml_backend_get_device(candidate.get()) == st.dev) {
+                copy_backend = candidate.get();
+                break;
+            }
+        }
+    }
+    if (!copy_backend) {
+        st.wait_read(0);
+        st.wait_read(1);
+        copy_backend = backend;
+    }
+    if (st.copy_used[seq]) { st.wait_copy(); }
 
     auto * copy_ctx = st.copy_ctx[seq].get();
     ggml_reset(copy_ctx);
@@ -3512,14 +3530,14 @@ bool llama_context::nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int3
         i = end;
     }
     for (const auto & [src, dst] : copies) {
-        ggml_backend_tensor_copy_async(backend, backend, src, dst);
+        ggml_backend_tensor_copy_async(copy_backend, copy_backend, src, dst);
     }
     if (st.copy_done) {
-        ggml_backend_event_record(st.copy_done, backend);
+        ggml_backend_event_record(st.copy_done, copy_backend);
         st.copy_pending = true;
         st.copy_used[seq] = true;
     } else {
-        ggml_backend_synchronize(backend);
+        ggml_backend_synchronize(copy_backend);
     }
     return true;
 }
