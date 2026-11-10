@@ -127,6 +127,9 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // the graph the input was set for was not computed: what only that graph carried to the device is sent again
+    virtual void input_lost() {}
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -1045,6 +1048,7 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+    void inputs_lost();
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it

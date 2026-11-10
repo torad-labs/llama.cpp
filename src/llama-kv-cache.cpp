@@ -121,8 +121,9 @@ llama_kv_cache::llama_kv_cache(
         n_pad_prefill = val > 0 ? GGML_PAD((uint32_t) std::min<long>(val, kv_size), n_pad_cur) : 0;
     }
 
-    // A pooled cache's views are made with it, so their switch (LLAMA_KPOOL_SHARED_VIEWS_LEGACY) is read here: made on
-    // their first use, it was read in the first decode, after a caller that set it for one context had put it back
+    // A pooled cache's views are made with it, so their switches (LLAMA_KPOOL_SHARED_VIEWS_LEGACY,
+    // LLAMA_KPOOL_PATCH_INPUT_LEGACY) are read here: made on their first use, they were read in the first decode, after
+    // a caller that set a switch for one context had put it back
     if (hparams.indexer_kpool > 0) {
         get_kpool_views();
     }

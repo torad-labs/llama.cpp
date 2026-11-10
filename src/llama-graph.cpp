@@ -1677,6 +1677,12 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_result::inputs_lost() {
+    for (auto & input : inputs) {
+        input->input_lost();
+    }
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
@@ -4342,6 +4348,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         // Canonical tables live with the cache, shared by graph slots. DP stores each sequence's table on its owner, and a
         // unified pool of several sequences keeps them in one bank: its resident maps come from the bank or not at all
         const llama_kpool_views::view * resident_view = nullptr;
+        ggml_tensor * resident_tensor = nullptr; // the view's table or the bank, after the decode's patches where it takes them
         if (!mctx_attn->is_full() && n_ps == 1 && !kpool_resident_off() &&
                 (shared || (!llm_graph_input_kpool::shared_pool(cparams, mctx_attn->get_kv()->get_kpool_views()) && (n_stream == 1 || cparams.n_seq_devices > 1)))) {
             const auto * kv = mctx_attn->get_kv();
@@ -4384,12 +4391,31 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                     } else {
                         ggml_set_input(inp->resident_rows);
                         ggml_set_name(inp->resident_rows, "kpool_resident_rows");
+                        resident_tensor = inp->resident_table->tensor;
+                        // A unified pool's bank takes a decode's changes as one input, written on the device before
+                        // the maps are made (ggml_kpool_patch). As writes of their own they were 241 copies a decode to
+                        // every device at 23 sequences, and all of set_inputs: 0.57 to 0.62 ms a decode, 0.009 to 0.015
+                        // with the input, whatever the pool holds (fixture, two ranks, Nov 10, 2026). Room for a row put
+                        // and a row taken a token: each changes its pool's cells' two facts and the pool's slots, fill
+                        // and rep. What does not fit is still a write of its own, as a view's first upload is.
+                        // LLAMA_KPOOL_PATCH_INPUT_LEGACY=1: every change a write
+                        if (shared && !views.patch_writes_legacy) {
+                            auto * patches = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 3, 2*ubatch.n_tokens*(3*kpool + 2));
+                            auto * patched = ggml_kpool_patch(ctx0, resident_tensor, patches);
+                            if (ggml_backend_dev_supports_op(device, patched)) {
+                                ggml_set_input(patches);
+                                ggml_set_name(patches, "kpool_resident_patches");
+                                ggml_set_name(patched, "kpool_resident_patched");
+                                inp->resident_patches = patches;
+                                resident_tensor = patched;
+                            }
+                        }
                     }
                 }
             }
         }
         auto materialize = [&](enum ggml_kpool_materialize_mode mode) {
-            return ggml_kpool_materialize(ctx0, inp->resident_table->tensor, inp->resident_rows,
+            return ggml_kpool_materialize(ctx0, resident_tensor, inp->resident_rows,
                     mctx_attn->get_kv()->get_size(), kpool, n_kv, n_pools, n_dump, mode);
         };
 

@@ -6840,6 +6840,22 @@ struct ggml_tensor * ggml_kpool_materialize(
     return result;
 }
 
+struct ggml_tensor * ggml_kpool_patch(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * patches) {
+    GGML_ASSERT(table->type == GGML_TYPE_I32 && ggml_n_dims(table) <= 2 && ggml_is_contiguous(table));
+    GGML_ASSERT(table->ne[0] <= INT32_MAX && table->ne[1] <= INT32_MAX);
+    GGML_ASSERT(patches->type == GGML_TYPE_I32 && ggml_is_contiguous(patches));
+    GGML_ASSERT(patches->ne[0] == 3 && patches->ne[1] > 0 && patches->ne[2] == 1 && patches->ne[3] == 1);
+    struct ggml_tensor * result = ggml_view_tensor(ctx, table);
+    ggml_set_op_params_i32(result, 0, GGML_KPOOL_MATERIALIZE_PATCH);
+    result->op = GGML_OP_KPOOL_MASK;
+    result->src[0] = table;
+    result->src[1] = patches;
+    return result;
+}
+
 struct ggml_tensor * ggml_kpool_indices(
         struct ggml_context * ctx,
         struct ggml_tensor  * cells,
