@@ -1535,6 +1535,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
+    bool cand_rows = false; // the head's rows come as their 10 largest logits (llama_set_output_candidates)
 
     int32_t n_embd = 0;
 
@@ -1643,7 +1644,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
+        // one node takes the 10 largest logits of every row, each device from its share of the vocab: no row is gathered
+        // and no sampler graph is built a row. LLAMA_OUTPUT_CANDIDATES_LEGACY=1: a top-k chain a sequence
+        cand_rows = this->params.backend_sampling && !common_output_candidates_legacy();
+        if (cand_rows) {
+            llama_set_output_candidates(ctx_dft, 10);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                llama_set_seq_candidates(ctx_dft, seq_id, true);
+            }
+        } else if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1738,6 +1747,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (cand_rows && ctx_dft) {
+            llama_set_output_candidates(ctx_dft, 0);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) smpls.size(); ++seq_id) {
+                llama_set_seq_candidates(ctx_dft, seq_id, false);
+            }
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;

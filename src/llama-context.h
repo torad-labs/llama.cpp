@@ -13,6 +13,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -109,6 +110,9 @@ struct llama_context {
 
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
+
+    // a row read as candidates (llama_set_output_candidates): its k largest logits into row, false for a row read whole
+    bool get_candidates_ith(int32_t idx, llama_sampling_row & row);
 
     void attach_threadpool(
             ggml_threadpool_t threadpool,
@@ -269,6 +273,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    void set_output_candidates(int32_t k);
+    void set_seq_candidates(llama_seq_id seq_id, bool enable);
+
     // the MTP store (llama-ext.h): this context is the target, head its MTP head
     bool    nextn_bind(llama_context & head);
     int32_t nextn_store_rows() const;
@@ -391,6 +398,28 @@ private:
     };
 
     sampling_info sampling;
+
+    // output rows as their largest logits (llama_set_output_candidates): a decode reads the records
+    // ggml_top_k_candidates packed for a row, and the row's first reader cuts them to the k largest
+    struct candidates_info {
+        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_CUT };
+
+        buffer_view<int64_t>     records = {nullptr, 0}; // [n_outputs][n_record]
+        buffer_view<float>       logits  = {nullptr, 0}; // [n_outputs][k], the largest first
+        buffer_view<llama_token> ids     = {nullptr, 0}; // [n_outputs][k]
+
+        std::vector<uint32_t> count; // candidates of a cut row
+        std::vector<uint8_t>  state; // of each output row
+
+        uint32_t k        = 0;
+        uint32_t n_record = 0; // records a row: k a device that holds a share of the vocab
+
+        std::vector<uint64_t> keys; // scratch of a cut
+
+        std::set<llama_seq_id> seqs; // sequences whose rows are read as candidates
+    };
+
+    candidates_info cand;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
