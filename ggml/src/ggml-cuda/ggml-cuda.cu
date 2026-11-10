@@ -5792,7 +5792,6 @@ static void ggml_cuda_mul_mat_cublas_bf16_src1(ggml_backend_cuda_context & ctx, 
 static bool ggml_cuda_can_share_mmq_id(const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * clamp) {
     if (a->op != GGML_OP_MUL_MAT_ID || b->op != GGML_OP_MUL_MAT_ID ||
             a->src[1] != b->src[1] || a->src[2] != b->src[2] ||
-            ggml_get_op_params_i32(a, 2) <= 0 ||
             memcmp(a->op_params, b->op_params, sizeof(a->op_params)) != 0) {
         return false;
     }
@@ -5864,27 +5863,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(node, 2) > 0) {
-        for (const bool clamped : {false, true}) {
-            const bool matches = clamped
-                ? !ggml_env_switch("GGML_CUDA_GLU_LIMIT_FUSE_LEGACY") && ggml_cuda_can_fuse(cgraph, i, {GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_GLU}, {})
-                : ggml_cuda_can_fuse(cgraph, i, {GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU}, {});
-            if (!matches) { continue; }
-            ggml_tensor * glu = cgraph->nodes[i + (clamped ? 4 : 2)];
-            ggml_tensor * gate = clamped ? glu->src[0]->src[0] : glu->src[0];
-            ggml_tensor * up = clamped ? glu->src[1]->src[0] : glu->src[1];
-            if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID ||
-                    gate->src[1] != up->src[1] || gate->src[2] != up->src[2] ||
-                    ggml_get_op_params_i32(gate, 1) != ggml_get_op_params_i32(up, 1) ||
-                    ggml_get_op_params_i32(gate, 2) != ggml_get_op_params_i32(up, 2) ||
-                    !ggml_are_same_shape(gate->src[0], up->src[0]) ||
-                    !ggml_cuda_should_fuse_mul_mat_vec_q(up, true, gate->src[0])) { continue; }
-            ggml_cuda_mm_fusion_args_host fusion{};
-            fusion.gate = gate->src[0];
-            fusion.glu_op = ggml_get_glu_op(glu);
-            fusion.glu_limit = clamped ? ggml_cuda_glu_limit(glu->src[0], glu->src[1]) : 0.0f;
-            ggml_cuda_mul_mat_id_partition(*cuda_ctx, up, glu, &fusion);
-            return clamped ? 4 : 2;
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const bool partitioned = ggml_get_op_params_i32(node, 2) > 0;
+        if (partitioned) {
+            for (const bool clamped : {false, true}) {
+                const bool matches = clamped
+                    ? !ggml_env_switch("GGML_CUDA_GLU_LIMIT_FUSE_LEGACY") && ggml_cuda_can_fuse(cgraph, i, {GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_GLU}, {})
+                    : ggml_cuda_can_fuse(cgraph, i, {GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU}, {});
+                if (!matches) { continue; }
+                ggml_tensor * glu = cgraph->nodes[i + (clamped ? 4 : 2)];
+                ggml_tensor * gate = clamped ? glu->src[0]->src[0] : glu->src[0];
+                ggml_tensor * up = clamped ? glu->src[1]->src[0] : glu->src[1];
+                if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID ||
+                        gate->src[1] != up->src[1] || gate->src[2] != up->src[2] ||
+                        ggml_get_op_params_i32(gate, 1) != ggml_get_op_params_i32(up, 1) ||
+                        ggml_get_op_params_i32(gate, 2) != ggml_get_op_params_i32(up, 2) ||
+                        !ggml_are_same_shape(gate->src[0], up->src[0]) ||
+                        !ggml_cuda_should_fuse_mul_mat_vec_q(up, true, gate->src[0])) { continue; }
+                ggml_cuda_mm_fusion_args_host fusion{};
+                fusion.gate = gate->src[0];
+                fusion.glu_op = ggml_get_glu_op(glu);
+                fusion.glu_limit = clamped ? ggml_cuda_glu_limit(glu->src[0], glu->src[1]) : 0.0f;
+                ggml_cuda_mul_mat_id_partition(*cuda_ctx, up, glu, &fusion);
+                return clamped ? 4 : 2;
+            }
         }
         if (allow_mmq_pair && i + 1 < cgraph->n_nodes) {
             ggml_tensor * clamp = cgraph->nodes[i + 1]->op == GGML_OP_CLAMP ? cgraph->nodes[i + 1] : nullptr;
@@ -5896,12 +5898,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_can_fuse_subgraph(cgraph, i, count, ops, outputs, count) &&
                     ggml_cuda_can_share_mmq_id(node, cgraph->nodes[next], clamp)) {
                 // All scratch belongs to this pair and is released after both readers are enqueued.
-                ggml_cuda_mul_mat_id_partition(*cuda_ctx, node, node, nullptr, cgraph->nodes[next]);
+                ggml_tensor * paired = cgraph->nodes[next];
+                if (partitioned) {
+                    ggml_cuda_mul_mat_id_partition(*cuda_ctx, node, node, nullptr, paired);
+                } else {
+                    ggml_cuda_mul_mat_q_id_pair(*cuda_ctx, node->src[0], paired->src[0],
+                                               node->src[1], node->src[2], node, paired);
+                }
                 if (clamp) { ggml_cuda_op_clamp(*cuda_ctx, clamp); }
                 return next - i;
             }
         }
-        return 0;
+        if (partitioned) { return 0; }
     }
 
     // GB10 prefill: apply SWIGLU while quantizing the activation consumed by the

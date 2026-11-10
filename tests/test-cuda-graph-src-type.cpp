@@ -216,8 +216,10 @@ static bool test_parameter_updates(ggml_backend_t backend, graph_log & log) {
     return ok;
 }
 
-static bool test_moe_replay(ggml_backend_t backend, ggml_backend_t cpu, graph_log & log) {
-    constexpr int k = 256, rows = 264, local = 72, used = 8, first = 216, total = 288;
+static bool test_moe_replay(ggml_backend_t backend, ggml_backend_t cpu, graph_log & log, bool partitioned = true) {
+    constexpr int k = 256, rows = 264, used = 8, total = 288;
+    const int local = partitioned ? 72 : total;
+    const int first = partitioned ? 216 : 0;
     constexpr int graph_size = 32;
     ggml_backend_t backends[] = { backend, cpu };
     ggml_context * wctx[2];
@@ -248,7 +250,8 @@ static bool test_moe_replay(ggml_backend_t backend, ggml_backend_t cpu, graph_lo
 
     bool ok = true;
     bool replayed = false;
-    for (int64_t tokens : {36, 72, 108, 36}) {
+    const std::vector<int64_t> widths = partitioned ? std::vector<int64_t>{36, 72, 108, 36} : std::vector<int64_t>{23, 69, 23};
+    for (int64_t tokens : widths) {
         ggml_context * ctx[2];
         ggml_cgraph * graph[2];
         ggml_tensor * x[2];
@@ -262,11 +265,13 @@ static bool test_moe_replay(ggml_backend_t backend, ggml_backend_t cpu, graph_lo
             ids[b] = ggml_view_2d(ctx[b], ids_base, used, tokens, ids_base->nb[1], 0);
             ggml_tensor * gate = ggml_mul_mat_id(ctx[b], weights[b][0], x[b], ids[b]);
             ggml_tensor * up = ggml_mul_mat_id(ctx[b], weights[b][1], x[b], ids[b]);
-            ggml_mul_mat_id_set_expert_range(gate, first, total);
-            ggml_mul_mat_id_set_expert_range(up, first, total);
+            if (partitioned) {
+                ggml_mul_mat_id_set_expert_range(gate, first, total);
+                ggml_mul_mat_id_set_expert_range(up, first, total);
+            }
             outputs[b][0] = gate;
             outputs[b][1] = up;
-            if (tokens != 72) {
+            if (tokens != (partitioned ? 72 : 69)) {
                 gate = ggml_clamp(ctx[b], gate, -INFINITY, 7.0f);
                 up = ggml_clamp(ctx[b], up, -7.0f, 7.0f);
             }
@@ -320,8 +325,9 @@ static bool test_moe_replay(ggml_backend_t backend, ggml_backend_t cpu, graph_lo
         ggml_backend_buffer_free(wbuf[b]);
         ggml_free(wctx[b]);
     }
-    printf("  expert pair: changed inputs/routes, empty owners, tails and rebuilt metadata: %s (%s)\n",
-           ok ? "ok" : "FAILED", replayed ? "captured replay exercised" : "no CUDA replay");
+    printf("  expert pair (%s): changed inputs/routes, tails and rebuilt metadata: %s (%s)\n",
+           partitioned ? "partitioned" : "all experts", ok ? "ok" : "FAILED",
+           replayed ? "captured replay exercised" : "no CUDA replay");
     return ok;
 }
 
@@ -337,6 +343,7 @@ int main(int argc, char ** argv) {
     const bool moe_only = argc == 2 && strcmp(argv[1], "--moe") == 0;
     if (moe_cpu) {
         ok = test_moe_replay(cpu, cpu, log);
+        ok &= test_moe_replay(cpu, cpu, log, false);
         ggml_backend_free(cpu);
         ggml_log_set(nullptr, nullptr);
         return ok ? 0 : 1;
@@ -350,6 +357,7 @@ int main(int argc, char ** argv) {
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         printf("%s (%s):\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
         ok &= test_moe_replay(backend, cpu, log);
+        ok &= test_moe_replay(backend, cpu, log, false);
         bool replayed = false;
         if (!moe_only) {
             ok &= test_parameter_updates(backend, log);
