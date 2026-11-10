@@ -60,6 +60,9 @@ struct llama_context {
 
     void synchronize();
 
+    // every row r of each state tensor takes row rows[r] (llama_memory_recurrent::relocate_states)
+    void rs_relocate(const std::vector<ggml_tensor *> & states, const std::vector<int32_t> & rows);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -484,11 +487,30 @@ private:
         uint64_t               t_used = 0;
     };
     static constexpr uint32_t graph_slot_max_tokens = 32;
-    static constexpr size_t   graph_slots_max       = 3;
+    // 3, or LLAMA_GRAPH_SLOTS: with LLAMA_GRAPH_ANY_SEQS a graph serves every set of as many sequences, and a slot for
+    // each count of sequences keeps every decode a reuse (the meta backend then needs GGML_META_CAPTURE_GRAPHS of
+    // at least the slots and two more, to keep their captured evaluations)
+    const size_t graph_slots_max = [] {
+        const char * s = getenv("LLAMA_GRAPH_SLOTS");
+        return s != nullptr && atoi(s) >= 1 ? (size_t) atoi(s) : (size_t) 3;
+    }();
+    // LLAMA_GRAPH_ANY_SEQS=1, read when the context is made (llm_graph_params::any_seqs)
+    const bool graph_any_seqs = ggml_env_switch("LLAMA_GRAPH_ANY_SEQS");
     uint32_t graph_slot_mtp_seq_tokens = 0;
     uint32_t graph_slot_max_rows = graph_slot_max_tokens;
     std::vector<size_t> graph_slot_buf_limit;
     std::vector<graph_slot> graph_slots;
+
+    // the graphs that move recurrent states between cells (rs_relocate), by the number of rows each moves; each is made
+    // at its first use and computed again at each later one, with its scheduler
+    struct rs_reloc_graph {
+        ggml_context_ptr       ctx;
+        ggml_backend_sched_ptr sched;
+        ggml_cgraph *          gf  = nullptr;
+        ggml_tensor *          src = nullptr;
+        ggml_tensor *          dst = nullptr;
+    };
+    std::map<size_t, rs_reloc_graph> rs_reloc;
     uint64_t graph_clock = 0; // process_ubatch calls, the slots' use times
 
     // the scheduler that allocated the graph process_ubatch last computed: its outputs' backends are looked up there

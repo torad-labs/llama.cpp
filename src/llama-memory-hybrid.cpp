@@ -85,7 +85,10 @@ llama_memory_hybrid::llama_memory_hybrid(
             model, hparams_idx, type_idx, type_idx, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr);
-    }()) {}
+    }()) {
+    // with one attention stream for every sequence, nothing here is kept by the place of a sequence's recurrent cell
+    mem_recr->set_relocate(unified && ggml_env_switch("LLAMA_GRAPH_ANY_SEQS"));
+}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {

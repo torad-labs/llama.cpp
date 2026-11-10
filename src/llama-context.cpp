@@ -1063,6 +1063,75 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+void llama_context::rs_relocate(const std::vector<ggml_tensor *> & states, const std::vector<int32_t> & rows) {
+    // Only the rows that change are copied: each is read through one index into a tensor of the graph's and written
+    // through another, and all are read before any is written, so rows may trade places. There is one graph for each of
+    // a few row counts (a move is padded to its graph's count by repeating its first row), so the backends keep what
+    // they made for them (a tensor-split evaluation is replayed from its second use on) and a move of two cells does not
+    // copy every cell's state
+    std::vector<int32_t> src;
+    std::vector<int64_t> dst;
+    for (size_t r = 0; r < rows.size(); ++r) {
+        if (rows[r] != (int32_t) r) {
+            src.push_back(rows[r]);
+            dst.push_back((int64_t) r);
+        }
+    }
+    if (src.empty()) {
+        return;
+    }
+    const size_t n_moved = src.size();
+    size_t n_rows = rows.size();
+    for (const size_t count : { (size_t) 8, (size_t) 32 }) {
+        if (n_moved <= count && count < rows.size()) {
+            n_rows = count;
+            break;
+        }
+    }
+    src.resize(n_rows, src[0]);
+    dst.resize(n_rows, dst[0]);
+
+    auto & graph = rs_reloc[n_rows];
+    if (!graph.gf) {
+        const size_t n_nodes = 4*states.size() + 8;
+        const ggml_init_params params = {
+            /*.mem_size   =*/ n_nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(n_nodes, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        graph.ctx.reset(ggml_init(params));
+        ggml_context * ctx0 = graph.ctx.get();
+        graph.gf  = ggml_new_graph_custom(ctx0, n_nodes, false);
+        graph.src = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+        graph.dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_rows);
+        ggml_set_input(graph.src);
+        ggml_set_input(graph.dst);
+        ggml_set_name(graph.src, "rs_relocate_src");
+        ggml_set_name(graph.dst, "rs_relocate_dst");
+        for (ggml_tensor * state : states) {
+            GGML_ASSERT((size_t) state->ne[1] == rows.size());
+            ggml_tensor * moved = ggml_get_rows(ctx0, state, graph.src);
+            ggml_build_forward_expand(graph.gf, ggml_set_rows(ctx0, state, moved, graph.dst));
+        }
+        graph.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                n_nodes, false, cparams.op_offload));
+        if (!ggml_backend_sched_alloc_graph(graph.sched.get(), graph.gf)) {
+            throw std::runtime_error("failed to allocate the recurrent state relocation graph");
+        }
+    }
+    ggml_backend_tensor_set(graph.src, src.data(), 0, src.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(graph.dst, dst.data(), 0, dst.size()*sizeof(int64_t));
+    const ggml_status status = ggml_backend_sched_graph_compute_async(graph.sched.get(), graph.gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("failed to compute the recurrent state relocation graph");
+    }
+    static const bool trace = ggml_env_switch("GGML_GRAPH_TRACE");
+    if (trace) {
+        LLAMA_LOG_INFO("graph_trace layer=llama event=rs_relocate context=%p moved=%zu rows=%zu of=%zu states=%zu\n",
+            (void *) this, n_moved, n_rows, rows.size(), states.size());
+    }
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
@@ -3378,7 +3447,7 @@ llm_graph_params llama_context::graph_params(
     if (sched_gf == nullptr) {
         sched_gf = sched.get();
     }
-    return {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -3400,6 +3469,11 @@ llm_graph_params llama_context::graph_params(
             nextn_mode, nextn_store->t, &nextn_base, &nextn_src, nextn_store->n_batch, nextn_store->n_carry,
             nextn_store->n_devices, &nextn_store->owners, &nextn_store->carry, nextn_store->n_host },
     };
+    // the hybrid memory only: its inputs check what they hold of a set (tests/test-recurrent-state-rollback.cpp), and a
+    // cache that keeps a sequence's rows by its place (DeepSeek V4's) gave another set's logits with it
+    params.any_seqs = graph_any_seqs && cparams.kv_unified && cparams.n_seq_devices == 1 &&
+                      dynamic_cast<const llama_memory_hybrid *>(memory.get()) != nullptr;
+    return params;
 }
 
 bool llama_context::nextn_bind(llama_context & head, int32_t n_keep) {

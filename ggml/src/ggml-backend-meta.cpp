@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2790,7 +2791,12 @@ struct ggml_backend_meta_context {
             uint64_t              t_used = 0; // the evaluation it was last used by
             std::vector<uint64_t> fragments;
         };
-        static constexpr size_t n_graphs_max = 4; // scheduler graphs, not individual splits
+        // scheduler graphs kept, not individual splits: 4, or GGML_META_CAPTURE_GRAPHS (a context that retains a graph
+        // for each count of sequences, LLAMA_GRAPH_ANY_SEQS with LLAMA_GRAPH_SLOTS, needs one for each of them)
+        const size_t n_graphs_max = [] {
+            const char * s = getenv("GGML_META_CAPTURE_GRAPHS");
+            return s != nullptr && atoi(s) >= 2 ? (size_t) atoi(s) : (size_t) 4;
+        }();
         std::unordered_map<uint64_t, graph>      graphs;
         std::unordered_map<uint64_t, generation> generations;
         uint64_t                                 t_now = 0; // the evaluations so far, t_used's clock
@@ -2824,7 +2830,7 @@ struct ggml_backend_meta_context {
 
         auto generation = capture.generations.find(parent);
         if (generation == capture.generations.end()) {
-            if (capture.generations.size() == capture_state::n_graphs_max) {
+            if (capture.generations.size() >= capture.n_graphs_max) {
                 auto lru = capture.generations.begin();
                 for (auto it = capture.generations.begin(); it != capture.generations.end(); ++it) {
                     if (it->second.t_used < lru->second.t_used) {
@@ -2983,6 +2989,103 @@ struct ggml_backend_meta_context {
         launcher->launch_all(g.execs);
     }
 
+    // Runs a function for every device at once: the first device's on the calling thread, each other device's on a thread
+    // of its own. An evaluation that is not replayed queues each device's kernels step by step, and from one thread the
+    // devices wait on the host: a target decode of 5,897 nodes on four cards took 45 ms of queuing at 1 row and 79 ms at
+    // 66, where its replay takes 13 and 48 (Nov 10, 2026 box trace). run_all returns once every call returned, so what
+    // the calling thread queues next (the all-reduce) follows the step on every device. A thread waits for the next call
+    // in a short spin, as the steps of one evaluation follow each other within microseconds, then sleeps.
+    struct device_threads {
+        using fn_t = std::function<void(size_t)>;
+        std::vector<std::thread> threads;      // device j's is threads[j - 1]
+        std::mutex               mtx;
+        std::condition_variable  cv_start;
+        std::condition_variable  cv_done;
+        std::atomic<uint64_t>    n_started{0}; // calls started; each thread runs each of them once
+        std::atomic<int>         n_left{0};    // threads whose call has not returned
+        const fn_t *             fn   = nullptr;
+        bool                     stop = false;
+
+        explicit device_threads(size_t n_devices) {
+            for (size_t j = 1; j < n_devices; j++) {
+                threads.emplace_back([this, j] { run(j); });
+            }
+        }
+
+        ~device_threads() {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                stop = true;
+            }
+            cv_start.notify_all();
+            for (std::thread & t : threads) {
+                t.join();
+            }
+        }
+
+        void run(size_t j) {
+            uint64_t n_seen = 0;
+            while (true) {
+                for (int i = 0; i < 2000 && n_started.load() == n_seen; i++) {
+                    std::this_thread::yield();
+                }
+                if (n_started.load() == n_seen) {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv_start.wait(lock, [&] { return stop || n_started.load() != n_seen; });
+                    if (n_started.load() == n_seen) {
+                        return;
+                    }
+                }
+                // run_all waits for every thread, so a thread misses no call: the next one is n_seen + 1, and fn was set
+                // before n_started counted it
+                n_seen++;
+                (*fn)(j);
+                if (n_left.fetch_sub(1) == 1) {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    cv_done.notify_one();
+                }
+            }
+        }
+
+        void run_all(const fn_t & f) {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                fn = &f;
+                n_left.store((int) threads.size());
+                n_started.fetch_add(1);
+            }
+            cv_start.notify_all();
+            f(0);
+            for (int i = 0; i < 2000 && n_left.load() != 0; i++) {
+                std::this_thread::yield();
+            }
+            if (n_left.load() != 0) {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv_done.wait(lock, [&] { return n_left.load() == 0; });
+            }
+        }
+    };
+    std::unique_ptr<device_threads> step_threads; // made at the first evaluation that is not replayed
+
+    // f(j) for every device j: on the calling thread, in turn, or with GGML_META_STEP_THREADS=1 each on its device's
+    // thread. Off by default: two ranks on one card queue into one device context and gain nothing from two threads (an
+    // uncaptured target compute 23.2 ms against 23.7, RTX 5070 Ti). With a rank on each of two cards (RTX 5080 and
+    // RTX 5070 Ti) the compute after a build is 18.8 to 20.3 ms against 23.0 to 23.2 and the capturing evaluation 21.7 to
+    // 23.1 ms against 27.6 to 27.8, replays as before and the replies the same tokens (Nov 10, 2026). Not read on four.
+    void device_run(const device_threads::fn_t & f) {
+        static const bool threads = ggml_env_switch("GGML_META_STEP_THREADS");
+        if (!threads || backend_configs.size() < 2) {
+            for (size_t j = 0; j < backend_configs.size(); j++) {
+                f(j);
+            }
+            return;
+        }
+        if (!step_threads) {
+            step_threads = std::make_unique<device_threads>(backend_configs.size());
+        }
+        step_threads->run_all(f);
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -3037,6 +3140,7 @@ struct ggml_backend_meta_context {
 
     ~ggml_backend_meta_context() {
         launcher.reset();
+        step_threads.reset();
         for (auto & entry : capture.graphs) {
             capture_free(entry.second);
         }
@@ -3845,16 +3949,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     auto compute_steps = [&]() -> ggml_status {
-        for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                if (backend_ctx->graph_next != nullptr) {
-                    backend_ctx->graph_next(bcj.backend,
-                        i + 1 < backend_ctx->n_subgraphs ? bcj.cgraphs[i + 1].cgraph_main : nullptr);
+        // each device's subgraph of step i goes through device_run, which can queue it from the device's own thread; a
+        // step of a few nodes stays with the calling thread, where handing it over costs more than queuing it
+        const size_t step_threads_min_nodes = 8;
+        std::vector<ggml_status> step_status(n_backends, GGML_STATUS_SUCCESS);
+        size_t i = 0;
+        const std::function<void(size_t)> step = [&](size_t j) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            if (backend_ctx->graph_next != nullptr) {
+                backend_ctx->graph_next(bcj.backend,
+                    i + 1 < backend_ctx->n_subgraphs ? bcj.cgraphs[i + 1].cgraph_main : nullptr);
+            }
+            step_status[j] = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+        };
+        for (i = 0; i < backend_ctx->n_subgraphs; i++) {
+            if ((size_t) backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes >= step_threads_min_nodes) {
+                backend_ctx->device_run(step);
+            } else {
+                for (size_t j = 0; j < n_backends; j++) {
+                    step(j);
                 }
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
+            }
+            for (size_t j = 0; j < n_backends; j++) {
+                if (step_status[j] != GGML_STATUS_SUCCESS) {
+                    return step_status[j];
                 }
             }
 
@@ -3950,10 +4068,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 cap.begin(backend_ctx->backend_configs[j].backend);
             }
             const ggml_status status = compute_steps();
+            // each device ends its capture and makes its executable, on its own thread where device_run has them: in
+            // turn, four devices' executables of a target decode took 40 ms of host (Nov 10, 2026 box trace)
             std::vector<void *> execs(n_backends);
+            backend_ctx->device_run([&](size_t j) {
+                execs[j] = cap.end(backend_ctx->backend_configs[j].backend);
+            });
             bool captured = true;
             for (size_t j = 0; j < n_backends; j++) {
-                execs[j] = cap.end(backend_ctx->backend_configs[j].backend);
                 captured = captured && execs[j] != nullptr;
             }
             if (status == GGML_STATUS_SUCCESS && captured) {

@@ -6,6 +6,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -373,6 +374,176 @@ static bool test_short_verify_rollback(const common_params & params, llama_model
     return true;
 }
 
+// LLAMA_GRAPH_ANY_SEQS=1: a decode's graph is every set's of as many sequences, and a state the set displaces from its
+// cells is moved before the decode. Two contexts, one with the switch, decode the same batches of sets that change: a
+// sequence leaves and returns, another set of as many takes over, one starts beside running ones, one is rolled back
+// while another has its cell, one is displaced by a later ubatch of the decode it is then rolled back in, and one is
+// cleared and starts again. Every row's logits and every sequence's state must be the ones of the context without the
+// switch, and the switch must have reused graphs the other context built.
+static bool test_changed_sets(const common_params & params, llama_model * model, const int n_vocab) {
+#ifdef _WIN32
+    GGML_UNUSED(params);
+    GGML_UNUSED(model);
+    GGML_UNUSED(n_vocab);
+    fprintf(stderr, "%s : skipping on windows, which has no setenv\n", __func__);
+    return true;
+#else
+    constexpr uint32_t n_seqs = 4;
+    constexpr float    eps    = 1e-7f;
+
+    const auto make_ctx_sets = [&](bool any_seqs) {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = n_seqs;
+        cparams.n_rs_seq   = 2;
+        cparams.n_ctx      = 256;
+        cparams.n_batch    = 256;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = true;
+        // the switch is read when a context and its memory are made
+        if (any_seqs) {
+            setenv("LLAMA_GRAPH_ANY_SEQS", "1", 1);
+        } else {
+            unsetenv("LLAMA_GRAPH_ANY_SEQS");
+        }
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        unsetenv("LLAMA_GRAPH_ANY_SEQS");
+        return ctx;
+    };
+
+    llama_context * ctx_ref = make_ctx_sets(false);
+    llama_context * ctx_any = make_ctx_sets(true);
+    if (ctx_ref == nullptr || ctx_any == nullptr) {
+        fprintf(stderr, "%s : failed to init contexts\n", __func__);
+        return false;
+    }
+
+    const auto cleanup = [&]() {
+        llama_free(ctx_ref);
+        llama_free(ctx_any);
+    };
+
+    if (llama_n_rs_seq(ctx_any) < 2) {
+        fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+        cleanup();
+        return true;
+    }
+
+    const auto tok = [&](uint32_t seq, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*seq + 1) % (uint32_t) n_vocab);
+    };
+
+    std::vector<llama_pos> pos(n_seqs, 0);
+
+    // one decode in both contexts: counts[s] tokens of each sequence from where it stands, a logits row for each
+    const auto step = [&](const char * what, const std::vector<uint32_t> & counts) {
+        uint32_t n_rows = 0;
+        for (const uint32_t count : counts) {
+            n_rows += count;
+        }
+        llama_batch batch = llama_batch_init(n_rows, 0, 1);
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            for (uint32_t i = 0; i < counts[s]; ++i) {
+                common_batch_add(batch, tok(s, pos[s] + (llama_pos) i), pos[s] + (llama_pos) i, { (llama_seq_id) s }, true);
+            }
+            pos[s] += (llama_pos) counts[s];
+        }
+        const bool decoded = llama_decode(ctx_ref, batch) == 0 && llama_decode(ctx_any, batch) == 0;
+        llama_batch_free(batch);
+        if (!decoded) {
+            fprintf(stderr, "test_changed_sets : %s: decode failed\n", what);
+            return false;
+        }
+        for (uint32_t i = 0; i < n_rows; ++i) {
+            const float * l_ref = llama_get_logits_ith(ctx_ref, i);
+            const float * l_any = llama_get_logits_ith(ctx_any, i);
+            if (l_ref == nullptr || l_any == nullptr) {
+                fprintf(stderr, "test_changed_sets : %s: missing logits at row %u\n", what, i);
+                return false;
+            }
+            for (int t = 0; t < n_vocab; ++t) {
+                if (!(std::fabs(l_ref[t] - l_any[t]) <= eps)) {
+                    fprintf(stderr, "test_changed_sets : %s: logits differ at row %u, token %d (%g != %g)\n",
+                            what, i, t, (double) l_ref[t], (double) l_any[t]);
+                    return false;
+                }
+            }
+        }
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            if (pos[s] == 0) {
+                continue;
+            }
+            const float diff = recurrent_state_diff(ctx_any, ctx_ref, (llama_seq_id) s);
+            if (!(diff <= state_eps)) {
+                fprintf(stderr, "test_changed_sets : %s: seq %u state differs from the reference by %g\n",
+                        what, s, (double) diff);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const auto rollback = [&](uint32_t seq, uint32_t n_rows) {
+        pos[seq] -= (llama_pos) n_rows;
+        return llama_memory_seq_rm(llama_get_memory(ctx_ref), (llama_seq_id) seq, pos[seq], -1) &&
+               llama_memory_seq_rm(llama_get_memory(ctx_any), (llama_seq_id) seq, pos[seq], -1);
+    };
+
+    const auto clear = [&](uint32_t seq) {
+        pos[seq] = 0;
+        return llama_memory_seq_rm(llama_get_memory(ctx_ref), (llama_seq_id) seq, -1, -1) &&
+               llama_memory_seq_rm(llama_get_memory(ctx_any), (llama_seq_id) seq, -1, -1);
+    };
+
+    bool ok = true;
+    ok = ok && step("three sequences' prompts",                       {6, 6, 6, 0});
+    ok = ok && step("the same set",                                   {1, 1, 1, 0});
+    ok = ok && step("the same set again",                             {1, 1, 1, 0});
+    ok = ok && step("a middle sequence leaves",                       {1, 0, 1, 0});
+    ok = ok && step("the smaller set again",                          {1, 0, 1, 0});
+    ok = ok && step("another set of two",                             {0, 1, 1, 0});
+    ok = ok && step("a third set of two",                             {1, 1, 0, 0});
+    ok = ok && step("one alone",                                      {0, 0, 1, 0});
+    ok = ok && step("another alone",                                  {0, 1, 0, 0});
+    ok = ok && step("a sequence starts beside three",                 {3, 3, 3, 3});
+    ok = ok && rollback(2, 1);
+    ok = ok && step("its cell is taken while it is rolled back",      {1, 1, 0, 1});
+    ok = ok && step("the rolled back one replays",                    {0, 0, 2, 0});
+    ok = ok && step("all four",                                       {1, 1, 1, 1});
+    ok = ok && step("two ubatches, the later displacing the earlier", {3, 1, 3, 1});
+    ok = ok && rollback(0, 2);
+    ok = ok && rollback(2, 1);
+    ok = ok && step("the displaced ones replay",                      {2, 0, 1, 0});
+    ok = ok && step("another pair",                                   {0, 1, 0, 1});
+    ok = ok && clear(1);
+    ok = ok && step("a cleared sequence starts again beside another", {0, 3, 0, 3});
+    ok = ok && step("all four again",                                 {1, 1, 1, 1});
+    if (!ok) {
+        fprintf(stderr, "%s : the contexts differ, or a rollback or removal was refused\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    const int32_t n_reused_ref = llama_perf_context(ctx_ref).n_reused;
+    const int32_t n_reused_any = llama_perf_context(ctx_any).n_reused;
+    fprintf(stderr, "%s : graphs reused: %d without the switch, %d with it\n", __func__, n_reused_ref, n_reused_any);
+    cleanup();
+
+    // the switch is for the hybrid memory, which these architectures have. Another memory (DeepSeek V4's cache keeps a
+    // sequence's rows by its place) is left as it was: there the two contexts only have to agree
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    bool hybrid = false;
+    for (const char * name : { "glm5next", "qwen35", "qwen35moe", "nemotron_h", "nemotron_h_moe" }) {
+        hybrid = hybrid || std::strcmp(arch, name) == 0;
+    }
+    if (hybrid && n_reused_any <= n_reused_ref) {
+        fprintf(stderr, "%s : the switch reused no graph for another set of sequences\n", __func__);
+        return false;
+    }
+    return true;
+#endif
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -626,6 +797,10 @@ int main(int argc, char ** argv) {
     }
 
     if (!test_short_verify_rollback(params, model, n_vocab)) {
+        return 1;
+    }
+
+    if (!test_changed_sets(params, model, n_vocab)) {
         return 1;
     }
 

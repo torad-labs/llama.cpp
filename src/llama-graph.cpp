@@ -835,7 +835,13 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
     // a unified pool's ubatch that can take a stream a sequence takes it, and one that no longer can leaves it
     std::vector<llama_seq_id> seqs;
     const bool shared_now = pool_cells != nullptr && shared_streams(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool, seqs);
-    if (shared_now != shared || (shared && seqs != resident_seqs)) return false;
+    if (shared_now != shared) return false;
+    if (shared && seqs != resident_seqs) {
+        // the bank holds every sequence's table and the streams' rows are this ubatch's (set_input): with as many
+        // streams, the graph is another set's too
+        if (!params.any_seqs || seqs.size() != resident_seqs.size()) return false;
+        resident_seqs = seqs;
+    }
 
     const auto dims = current_dims(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool, shared);
     const bool reuse_selection = dims.scoring && !dims.rebuild && draft && draft->can_reuse(params.ubatch, dims.n_kv, kpool*dims.n_dump, kpool);
