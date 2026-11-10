@@ -122,6 +122,48 @@ int64_t llama_kpool_n_kv_max(int64_t n_top_k, int64_t n_tail) {
     return GGML_PAD(n_top_k + n_tail, 32);
 }
 
+bool llama_kpool_shared_streams(const llama_kv_cells & cells, const llama_ubatch & ubatch, std::vector<llama_seq_id> & seqs) {
+    seqs.clear();
+
+    const uint32_t n_seqs = ubatch.n_seqs_unq;
+
+    if (n_seqs == 0 || ubatch.n_tokens == 0 || ubatch.n_tokens % n_seqs != 0 || ubatch.seq_id == nullptr) {
+        return false;
+    }
+
+    const uint32_t n_tps = ubatch.n_tokens/n_seqs;
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        // a reserve ubatch names no sequence for its tokens
+        if (ubatch.seq_id[i] == nullptr || (ubatch.n_seq_id && ubatch.n_seq_id[i] != 1)) {
+            seqs.clear();
+            return false;
+        }
+
+        const llama_seq_id seq = ubatch.seq_id[i][0];
+
+        if (i % n_tps != 0 ? seq != seqs.back() : std::find(seqs.begin(), seqs.end(), seq) != seqs.end()) {
+            seqs.clear();
+            return false;
+        }
+        if (i % n_tps == 0) {
+            seqs.push_back(seq);
+        }
+    }
+
+    // a cell that holds two sequences would be in two streams' maps, and its pooled key written by both
+    uint64_t held = 0;
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        held += cells.seq_cell_count(s);
+    }
+    if (held != cells.get_used()) {
+        seqs.clear();
+        return false;
+    }
+
+    return true;
+}
+
 // sel_mask and cand_mask hold only 0.0f and -INFINITY, so f16 is exact here
 template <typename T> struct kpool_mask_of;
 
@@ -280,6 +322,12 @@ struct kpool_spare_cells {
     }
 };
 
+// a stream's write slots after its new pools: [n_new, n_new_max), and the members of a complete pool if it has one
+struct kpool_stream_unused {
+    int64_t         n_new       = 0;
+    const int32_t * any_rep_src = nullptr;
+};
+
 // where one stream's maps go: the tensors of llama_kpool_set_input, at this stream's first element
 struct kpool_stream_out {
     int32_t * pool_cells = nullptr;
@@ -306,7 +354,25 @@ struct kpool_stream_out {
 
     bool   mask_f16 = false;
     size_t mask_ts  = 0;
+
+    // set: the stream's unused write slots are left to the caller, which names them for every stream at once
+    kpool_stream_unused * unused = nullptr;
 };
+
+// the fixed row count means unused slots must name a safe destination: a spare cell each (their members stay cell 0)
+static void kpool_fill_unused(kpool_spare_cells & spare, int32_t * new_cells, int64_t * new_reps, int64_t n_new,
+        int64_t n_new_max, int64_t r, int64_t strm_row, const int32_t * any_rep_src) {
+    for (int64_t p = n_new; p < n_new_max; ++p) {
+        if (const int32_t cell = spare.take(); cell >= 0) {
+            new_reps[p] = strm_row + cell;
+        } else if (any_rep_src) {
+            std::copy(any_rep_src, any_rep_src + r, new_cells + p*r);
+            new_reps[p] = strm_row + any_rep_src[r - 1];
+        } else {
+            new_reps[p] = strm_row;
+        }
+    }
+}
 
 // Build one sequence's maps from its view; return the largest tail.
 // The caller initializes new_cells, padded mask rows, dump pools and sel_mask's dump columns.
@@ -493,20 +559,13 @@ static int64_t kpool_stream_from_view(
     // exactly one partition per row, or a query reads another sequence's pools
     GGML_ASSERT(n_done == o.n_tps && "every query must belong to a sequence of the ubatch");
 
-    if (o.new_reps) {
-        // the fixed row count means unused slots must name a safe destination: a spare cell each (their members stay cell 0)
+    if (o.new_reps && o.unused) {
+        o.unused->n_new       = n_new;
+        o.unused->any_rep_src = any_rep_src;
+    } else if (o.new_reps) {
         kpool_spare_cells spare = { cells, (llama_pos) r, o.new_reps, n_new, o.strm_row, {} };
 
-        for (int64_t p = n_new; p < o.n_new_max; ++p) {
-            if (const int32_t cell = spare.take(); cell >= 0) {
-                o.new_reps[p] = o.strm_row + cell;
-            } else if (any_rep_src) {
-                std::copy(any_rep_src, any_rep_src + r, o.new_cells + p*r);
-                o.new_reps[p] = o.strm_row + any_rep_src[r - 1];
-            } else {
-                o.new_reps[p] = o.strm_row;
-            }
-        }
+        kpool_fill_unused(spare, o.new_cells, o.new_reps, n_new, o.n_new_max, r, o.strm_row, any_rep_src);
     }
 
     return n_tail_max;
@@ -1323,15 +1382,28 @@ size_t llama_kpool_views::view::emit_patches(
         };
         unique(dirty_cells);
         unique(dirty_pools);
-        for (uint32_t j : dirty_cells) {
-            put(j, &pos_at[j], 1);
-            put(pos_at.size() + j, &pblk[j], 1);
+        // Neighbours go in one write: a decode's cells and the pools they are in come as runs, and each write is a
+        // copy of its own to every device. LLAMA_KPOOL_PATCH_RUNS_LEGACY=1: a write a cell and a pool
+        static const bool runs_legacy = ggml_env_switch("LLAMA_KPOOL_PATCH_RUNS_LEGACY");
+        const auto run_end = [](const std::vector<uint32_t> & ids, size_t a) {
+            size_t b = a + 1;
+            while (!runs_legacy && b < ids.size() && ids[b] == ids[b - 1] + 1) { ++b; }
+            return b;
+        };
+        for (size_t a = 0, b; a < dirty_cells.size(); a = b) {
+            b = run_end(dirty_cells, a);
+            const uint32_t j = dirty_cells[a];
+            put(j, &pos_at[j], b - a);
+            put(pos_at.size() + j, &pblk[j], b - a);
         }
-        for (uint32_t p : dirty_pools) {
-            put(pool_offset + p*r, &slot[p*r], r);
-            const int32_t f = fill[p];
-            put(fill_offset + p, &f, 1);
-            put(reps_offset + p, &reps[p], 1);
+        std::vector<int32_t> wide_fill;
+        for (size_t a = 0, b; a < dirty_pools.size(); a = b) {
+            b = run_end(dirty_pools, a);
+            const uint32_t p = dirty_pools[a];
+            put(pool_offset + p*r, &slot[p*r], (b - a)*r);
+            wide_fill.assign(fill.begin() + p, fill.begin() + p + (b - a));
+            put(fill_offset + p, wide_fill.data(), wide_fill.size());
+            put(reps_offset + p, &reps[p], b - a);
         }
     }
     full_upload = false;
@@ -1668,14 +1740,19 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
         const bool bank = !resident_seqs.empty();
         GGML_ASSERT(bank ? resident_seqs.size() == ubatch->n_seqs_unq :
                 ubatch->n_seqs_unq == 1 && ubatch->seq_id_unq[0] == resident_seq);
+        GGML_ASSERT(!shared || (bank && n_seq_devices == 1));
         auto * backend = ggml_backend_sched_get_tensor_backend(sched, resident_table->tensor);
         GGML_ASSERT(backend);
         resident_table->begin_upload(backend);
         const int64_t n_tps = ubatch->n_tokens/ubatch->n_seqs_unq;
         if (tail_cells) std::fill_n((int32_t *) tail_cells->data, ggml_nelements(tail_cells), -1);
         if (!reuse_only) std::fill_n((int32_t *) new_pool_cells->data, ggml_nelements(new_pool_cells), 0);
+        // a unified pool's streams write one cache stream: their unused slots are named together, below
+        std::vector<kpool_stream_unused> unused(shared && !reuse_only ? ubatch->n_seqs_unq : 0);
+        const int64_t shared_row = shared ? (int64_t) mctx_idx->get_strm(0)*mctx_idx->get_kv()->get_size() : 0;
         for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
-            const auto seq = ubatch->seq_id_unq[s];
+            // a unified pool's streams are its rows' runs, whatever the order of the sequences' ids
+            const auto seq = shared ? resident_seqs[s] : ubatch->seq_id_unq[s];
             GGML_ASSERT(!bank || resident_seqs[s] == seq);
             const auto & cells = mctx_attn->get_kv()->get_cells(seq);
             const auto * v = views.serve(cells, seq, kpool, mask_cells->ne[0], pool_bias->ne[0]);
@@ -1718,10 +1795,26 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
                 o.new_cells = (int32_t *) new_pool_cells->data + s*new_pool_cells->ne[0];
                 o.new_reps = (int64_t *) new_pool_reps->data + s*n_new_max;
                 o.n_new_max = n_new_max;
-                o.strm_row = (bank ? slot : (int64_t) mctx_idx->get_strm(s))*mctx_idx->get_kv()->get_size();
+                o.strm_row = shared ? shared_row : (bank ? slot : (int64_t) mctx_idx->get_strm(s))*mctx_idx->get_kv()->get_size();
+                o.unused = shared ? &unused[s] : nullptr;
             }
             const auto tail = kpool_stream_from_view(o, *v, cells, seq, ubatch, s, rebuild);
             GGML_ASSERT(tail <= n_tail);
+        }
+        if (!unused.empty()) {
+            // one spare cell a slot over every stream, so the rows of the one write stay different
+            auto * new_cells = (int32_t *) new_pool_cells->data;
+            auto * new_reps  = (int64_t *) new_pool_reps->data;
+            std::vector<int64_t> written;
+            for (size_t s = 0; s < unused.size(); ++s) {
+                written.insert(written.end(), new_reps + s*n_new_max, new_reps + s*n_new_max + unused[s].n_new);
+            }
+            kpool_spare_cells spare = { mctx_attn->get_kv()->get_cells(resident_seqs[0]), (llama_pos) kpool,
+                written.data(), (int64_t) written.size(), shared_row, {} };
+            for (size_t s = 0; s < unused.size(); ++s) {
+                kpool_fill_unused(spare, new_cells + s*new_pool_cells->ne[0], new_reps + s*n_new_max, unused[s].n_new,
+                        n_new_max, kpool, shared_row, unused[s].any_rep_src);
+            }
         }
         resident_table->end_upload();
         if (rebuild) mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);

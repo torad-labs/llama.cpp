@@ -6575,14 +6575,15 @@ struct ggml_tensor * ggml_lightning_indexer_rows(
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
     GGML_ASSERT(      k->ne[1] == 1);
     GGML_ASSERT(   mask->ne[0] == k_rows->ne[0]);
-    GGML_ASSERT( k_rows->ne[1] == k->ne[3] && k_rows->ne[2] == 1 && k_rows->ne[3] == 1);
+    GGML_ASSERT( k_rows->ne[1] == q->ne[3] && k_rows->ne[2] == 1 && k_rows->ne[3] == 1);
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
     GGML_ASSERT(   mask->ne[1] == q->ne[2]);
     GGML_ASSERT(      q->ne[2] == weights->ne[1]);
     GGML_ASSERT(weights->ne[2] == 1);
     GGML_ASSERT(   mask->ne[2] == 1);
-    GGML_ASSERT(      q->ne[3] == k->ne[3]);
-    GGML_ASSERT(      k->ne[3] == weights->ne[3]);
+    // one stream of k serves every stream of q: each stream's rows name its keys
+    GGML_ASSERT(      k->ne[3] == q->ne[3] || k->ne[3] == 1);
+    GGML_ASSERT(      q->ne[3] == weights->ne[3]);
     GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
 
     int64_t ne[4] = { k_rows->ne[0], q->ne[2], 1, q->ne[3] };

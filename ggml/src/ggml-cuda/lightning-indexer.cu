@@ -917,7 +917,7 @@ static __global__ void lightning_indexer_check(const float * quad, const float *
             n_stream, n_batch, n_kv,                                                        \
             nb1, nb2, nb3,                                                                  \
             nbq1, nbq2, nbq3,                                                               \
-            nbk1, nbk2, nbk3,                                                               \
+            nbk1, nbk2, nbk3s,                                                              \
             nbw1, nbw2, nbw3,                                                               \
             nbm1, nbm2, nbm3,                                                               \
             nem3                                                                            \
@@ -944,7 +944,7 @@ static constexpr int LIGHTNING_INDEXER_OCT_KEYS_PER_BLOCK = LIGHTNING_INDEXER_OC
                 n_stream, n_batch, n_kv,                                                         \
                 nb1, nb2, nb3,                                                                   \
                 nbq1, nbq2, nbq3,                                                                \
-                nbk1, nbk2, nbk3,                                                                \
+                nbk1, nbk2, nbk3s,                                                               \
                 nbw1, nbw2, nbw3,                                                                \
                 nbm1, nbm2, nbm3,                                                                \
                 nem3,                                                                            \
@@ -958,7 +958,7 @@ static constexpr int LIGHTNING_INDEXER_OCT_KEYS_PER_BLOCK = LIGHTNING_INDEXER_OC
                 n_stream, n_batch, n_kv,                                                         \
                 nb1, nb2, nb3,                                                                   \
                 nbq1, nbq2, nbq3,                                                                \
-                nbk1, nbk2, nbk3,                                                                \
+                nbk1, nbk2, nbk3s,                                                               \
                 nbw1, nbw2, nbw3,                                                                \
                 nbm1, nbm2, nbm3,                                                                \
                 nem3,                                                                            \
@@ -972,7 +972,7 @@ static constexpr int LIGHTNING_INDEXER_OCT_KEYS_PER_BLOCK = LIGHTNING_INDEXER_OC
                 n_stream, n_batch, n_kv,                                                         \
                 nb1, nb2, nb3,                                                                   \
                 nbq1, nbq2, nbq3,                                                                \
-                nbk1, nbk2, nbk3,                                                                \
+                nbk1, nbk2, nbk3s,                                                               \
                 nbw1, nbw2, nbw3,                                                                \
                 nbm1, nbm2, nbm3,                                                                \
                 nem3,                                                                            \
@@ -1025,6 +1025,10 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int n_stream = q->ne[3];
     const int n_kv     = dst->ne[0];
 
+    // one stream of k serves every stream of q (ggml_lightning_indexer_rows)
+    GGML_ASSERT(nek3 == n_stream || (nek3 == 1 && r != nullptr));
+    const size_t nbk3s = nek3 == 1 ? 0 : nbk3;
+
     const float *   q_d = (const float *)   q->data;
     const char  *   k_d = (const char  *)   k->data;
     const float *   w_d = (const float *)   w->data;
@@ -1075,7 +1079,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 n_batch, n_kv, kv_per_block,
                 nb1, nb3,
                 nbq1, nbq2, nbq3,
-                nbk2, nbk3,
+                nbk2, nbk3s,
                 nbw1, nbw3,
                 nbm1, nbm3,
                 nem3,

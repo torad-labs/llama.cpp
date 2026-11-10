@@ -12250,7 +12250,7 @@ void ggml_compute_forward_lightning_indexer(
             for (int ik = ir0; ik < ir1; ++ik) {
                 const int64_t i_row = r ? ((const int32_t *) ((const char *) r->data + s*r->nb[1]))[ik] : ik;
                 GGML_ASSERT(i_row >= 0 && i_row < nek2);
-                char * k_row = (char *) k->data + i_row*nbk2 + s*nbk3;
+                char * k_row = (char *) k->data + i_row*nbk2 + (nek3 == 1 ? 0 : s)*nbk3;
                 if (k_to_float) {
                     k_to_float(k_row, k_row_f32, n_embd);
                 } else {

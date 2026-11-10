@@ -3549,13 +3549,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }
+            // The node was never computed, so its buffer holds whatever was there before: a fill writes the zeros
+            // whatever that is, where scaling by zero keeps a NaN or an infinity (0.0f * NaN == NaN) and the sum then
+            // carries it to every rank. GGML_META_ZERO_SCALE_LEGACY=1 scales, as does a backend without the fill
+            static const bool zero_scale_legacy = ggml_env_switch("GGML_META_ZERO_SCALE_LEGACY");
             ggml_tensor * node_zero = get_node_aux(node);
-            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
+            node_zero->op = GGML_OP_FILL;
             node_zero->src[0] = node;
             ggml_set_op_params_f32(node_zero, 0, 0.0f);
             node_zero->data = node->data;
             node_zero->buffer = node->buffer;
             node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            if (zero_scale_legacy || (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16) || !ggml_is_contiguous(node) ||
+                    !ggml_backend_supports_op(bcj.backend, node_zero)) {
+                node_zero->op = GGML_OP_SCALE;
+            }
 
             step_cgraphs[j] = get_cgraph_aux();
             step_cgraphs[j]->nodes[0] = node_zero;
