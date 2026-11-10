@@ -1774,6 +1774,9 @@ struct test_case {
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
 
+        // Whole-graph cases must time their producers too, not repeated terminal ops.
+        if (run_whole_graph()) { n_runs = 1; }
+
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
@@ -8213,8 +8216,8 @@ struct test_moe_ffn_chain : public test_case {
 
 struct test_glm53_moe_routes : public test_moe_ffn_chain {
     const int overlap;
-    test_glm53_moe_routes(int64_t n, int overlap, int64_t k, int64_t ff, int first = 0, int total = 0)
-        : test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 72, 8, k, ff, n, 7.0f, first, total), overlap(overlap) {}
+    test_glm53_moe_routes(int64_t n, int overlap, int64_t k, int64_t ff, int first = 0, int total = 0, int experts = 72)
+        : test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, experts, 8, k, ff, n, 7.0f, first, total), overlap(overlap) {}
     std::string op_desc(ggml_tensor *) override { return "GLM53_MOE_ROUTES"; }
     std::string vars() override { return test_moe_ffn_chain::vars() + "," + VAR_TO_STR(overlap); }
     void initialize_tensors(ggml_context * ctx) override {
@@ -8263,21 +8266,24 @@ struct test_glm53_moe_prep : public test_glm53_moe_routes {
     const int routing;
     const int layout;
     const bool clamped;
+    const bool partitioned;
     std::vector<ggml_tensor *> order;
     std::vector<ggml_tensor *> outputs;
 
-    test_glm53_moe_prep(int64_t tokens, int routing, int layout, bool clamped)
-        : test_glm53_moe_routes(tokens, routing, 256, 264), routing(routing), layout(layout), clamped(clamped) {}
+    test_glm53_moe_prep(int64_t tokens, int routing, int layout, bool clamped,
+                       bool partitioned = true, int64_t k = 256, int64_t ff = 264)
+        : test_glm53_moe_routes(tokens, routing, k, ff, 0, 0, partitioned ? 72 : 288),
+          routing(routing), layout(layout), clamped(clamped), partitioned(partitioned) {}
 
     std::string op_desc(ggml_tensor *) override { return "GLM53_MOE_PREP"; }
     std::string vars() override {
-        return test_moe_ffn_chain::vars() + "," + VARS_TO_STR3(routing, layout, clamped);
+        return test_moe_ffn_chain::vars() + "," + VARS_TO_STR4(routing, layout, clamped, partitioned);
     }
     std::vector<ggml_tensor *> forward_first() override { return order; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int first = 72*((n_tokens + routing) % 4);
+        const int first = partitioned ? 72*((n_tokens + routing) % 4) : 0;
         ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
         ggml_tensor * ups = ggml_new_tensor_3d(ctx, layout == 4 ? GGML_TYPE_Q8_0 : type,
                                               n_embd, n_ff + (layout == 6), n_mats);
@@ -8296,7 +8302,7 @@ struct test_glm53_moe_prep : public test_glm53_moe_routes {
             ggml_view_3d(ctx, cur_base, n_embd, 1, n_tokens, cur_base->nb[1], 2*cur_base->nb[2], 0) : cur;
 
         ggml_tensor * gate = ggml_mul_mat_id(ctx, gates, cur, ids);
-        ggml_mul_mat_id_set_expert_range(gate, first, 288);
+        if (partitioned) { ggml_mul_mat_id_set_expert_range(gate, first, 288); }
         order.clear();
         if (layout == 7) {
             order.push_back(gate);
@@ -8304,7 +8310,9 @@ struct test_glm53_moe_prep : public test_glm53_moe_routes {
             order.push_back(cur_up);
         }
         ggml_tensor * up = ggml_mul_mat_id(ctx, ups, cur_up, ids_up);
-        ggml_mul_mat_id_set_expert_range(up, layout == 5 ? (first + 72) % 288 : first, 288);
+        if (partitioned || layout == 5) {
+            ggml_mul_mat_id_set_expert_range(up, partitioned && layout == 5 ? (first + 72) % 288 : first, 288);
+        }
         outputs = { gate, up };
         if (clamped) {
             gate = layout == 8 ? ggml_clamp_inplace(ctx, gate, -INFINITY, 7.0f) : ggml_clamp(ctx, gate, -INFINITY, 7.0f);
@@ -8319,7 +8327,7 @@ struct test_glm53_moe_prep : public test_glm53_moe_routes {
 
     void initialize_tensors(ggml_context * ctx) override {
         test_glm53_moe_routes::initialize_tensors(ctx);
-        const int first = 72*((n_tokens + routing) % 4);
+        const int first = partitioned ? 72*((n_tokens + routing) % 4) : 0;
         std::mt19937 rng(53073 + n_tokens*17 + routing);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type != GGML_TYPE_I32 || t->view_src) { continue; }
@@ -8334,6 +8342,11 @@ struct test_glm53_moe_prep : public test_glm53_moe_routes {
                     if (routing == 2) { id = (first + 72 + slot) % 288; }
                     if (routing == 3) {
                         id = slot == 0 ? first + 71 : (first + 72 + slot) % 288;
+                    }
+                    if (!partitioned) {
+                        if (routing == 1) { id = 287 - slot; }
+                        if (routing == 2) { id = (8*(token/3) + slot) % 288; }
+                        if (routing == 3) { id = slot == 0 ? 287 : (8*token + slot) % 287; }
                     }
                     data[token*t->ne[0] + slot] = id;
                 }
@@ -10761,6 +10774,17 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 }
 
 static void add_glm_moe_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    // Tensor-parallel experts keep all IDs and split the weight rows instead of expert ownership.
+    for (int64_t tokens : {23, 69}) {
+        for (int routing : {0, 1, 2, 3}) {
+            for (bool clamped : {false, true}) {
+                cases.emplace_back(new test_glm53_moe_prep(tokens, routing, 0, clamped, false));
+            }
+        }
+        for (int layout = 1; layout <= 8; ++layout) {
+            cases.emplace_back(new test_glm53_moe_prep(tokens, 0, layout, true, false));
+        }
+    }
     for (int64_t tokens : {17, 35, 36, 37, 71, 72, 73, 107, 108, 109}) {
         for (int routing : {0, 1, 2, 3}) {
             cases.emplace_back(new test_glm53_moe_prep(tokens, routing, 0, false));
@@ -10809,6 +10833,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
     add_glm_moe_cases(test_cases);
+    for (int64_t tokens : {23, 69}) {
+        for (int routing : {0, 1, 2}) {
+            test_cases.emplace_back(new test_glm53_moe_prep(tokens, routing, 0, true, false, 4096, 512));
+        }
+    }
     add_glm_kda_cases(test_cases);
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
@@ -13652,6 +13681,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
     add_glm_moe_cases(test_cases);
+    for (int64_t tokens : {23, 69}) {
+        for (int routing : {0, 1, 2}) {
+            test_cases.emplace_back(new test_glm53_moe_prep(tokens, routing, 0, true, false, 4096, 512));
+            test_cases.emplace_back(new test_glm53_moe_routes(tokens, routing, 4096, 512, 0, 0, 288));
+        }
+    }
     for (int k : {10, 40, 128, 296}) {
         for (int nrows : {1, 3, 23, 69}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {154880, nrows, 1, 1}, k));
