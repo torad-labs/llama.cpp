@@ -6,6 +6,8 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 
 from capacity import SLOT_CELLS, MLA_LAYERS, LATENT_ROW_BYTES, MIB
@@ -42,6 +44,7 @@ def arguments(argv=None):
     parser.add_argument("--profile", choices=["tensor-2", "tensor-4", "dp-4"], default="tensor-2",
                         help="Two-card tensor recipe, four-card tensor recipe with one shared pool, or experimental "
                              "four-card DP capacity recipe")
+    parser.add_argument("--transport", choices=["internal", "internal-nccl-gather"], help="DP collective transport (default: internal)")
     parser.add_argument("--slots", type=int, help="tensor-4: sessions sharing the pool, 1..256 (default: 23). "
                         "DP private caches of 442368 cells each: 1..40 resident, 1..256 host KV (default: 36)")
     parser.add_argument("--context", type=int, help="tensor-4: tokens in the shared pool (default: 524288)")
@@ -57,6 +60,8 @@ def arguments(argv=None):
     parser.add_argument("--dflash-depth", type=int, help="Tokens the DFlash draft drafts a step: its block size less the anchor row (required with --dflash)")
     parser.add_argument("--backend-sampling", action="store_true", help="tensor-4: sample on the cards (dp-4 always does)")
     parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
+    parser.add_argument("--diagnostic-ubatch", type=int, choices=[128, 512],
+                        help="Explicit numerical-control microbatch for DP; it never changes the serving default")
     parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP; 0 removes the cap")
     parser.add_argument("--trace-decode", action="store_true",
                         help="Opt-in host phase/batch markers, graph identity and CUDA NVTX; not an unprofiled speed run")
@@ -64,9 +69,22 @@ def arguments(argv=None):
     return parser.parse_args(argv)
 
 
+def resolve_transport(args, legacy=None):
+    if legacy is not None and legacy not in ("internal", "internal-nccl-gather"):
+        raise ValueError("unknown transport")
+    if args.transport is not None and legacy is not None and args.transport != legacy:
+        raise ValueError("conflicting transport choices")
+    return args.transport or legacy or "internal"
+
+
 def make_plan(args):
     dp = args.profile == "dp-4"
     four = args.profile == "tensor-4"
+    if not dp and args.transport is not None:
+        raise ValueError("transport is supported only with --profile dp-4")
+    if args.diagnostic_ubatch is not None and not dp:
+        raise ValueError("diagnostic-ubatch is supported only with --profile dp-4")
+    diagnostic_ubatch = args.diagnostic_ubatch if args.diagnostic_ubatch is not None else 512
     prompt_step = args.prompt_step if args.prompt_step is not None else (512 if dp else 1024)
     if not 1 <= args.port <= 65535 or prompt_step < 0:
         raise ValueError("port must be 1..65535 and prompt-step must be nonnegative")
@@ -108,10 +126,10 @@ def make_plan(args):
     argv += ["-ngl", "99", "-sm", "dp" if dp else "tensor", "-ts", "1,1,1,1" if dp or four else "1,1",
              "--jinja", "-fa", "on",
              "--cache-type-k", latent, "--cache-type-v", latent, "-ctki", "q8_0",
-             "-b", "2048", "-ub", "512" if dp else "2048", "--prompt-step", str(prompt_step),
+             "-b", "2048", "-ub", str(diagnostic_ubatch) if dp else "2048", "--prompt-step", str(prompt_step),
              "--alias", "GLM-5.3-Flash-Uncensored-IQ3_XXS", "--chat-template-file", str(TEMPLATE)]
     if dp:
-        argv += ["-fit", "off", "-cts", "q8_0", "--backend-sampling"]
+        argv += ["-fit", "off", "-cts", "q8_0", "--backend-sampling", "--prompt-chunk", "128"]
     elif args.backend_sampling:
         argv += ["--backend-sampling"]
     if args.dflash:
@@ -122,7 +140,7 @@ def make_plan(args):
         argv += ["--spec-type", "draft-mtp", "--spec-draft-n-max", args.mtp_depth,
                  "--spec-draft-mtp-vocab", str(DRAFT_VOCAB), "--spec-draft-mtp-adaptive", f"{args.mtp_adaptive:g}"]
         if dp:
-            argv += ["-ubd", "512", "-ctkd", "q8_0", "-ctvd", "q8_0"]
+            argv += ["-ubd", str(diagnostic_ubatch), "-ctkd", "q8_0", "-ctvd", "q8_0"]
     argv += ["-c", str(slots * DP_SLOT_CONTEXT if dp else context if four else 524288), "-np", str(slots)]
     if not dp:
         argv += ["--kv-unified"]
@@ -130,7 +148,7 @@ def make_plan(args):
     argv += ["--metrics", "--host", args.host, "--port", str(args.port), "--log-timestamps"]
     env = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3" if dp or four else "0,1",
-        "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": "internal",
+        "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": args.transport or "internal",
         "LLAMA_INDEXER_Q8_QUERY": "1" if args.indexer_query == "q8" else "0",
         "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
         "GGML_SCHED_DEBUG": "0",
@@ -189,6 +207,24 @@ def execution_environment(settings, inherited=None):
     return env
 
 
+def resolve_server_arguments(argv, settings):
+    if "--prompt-chunk" not in argv:
+        return argv
+    try:
+        help_run = subprocess.run([argv[0], "--help"], env=execution_environment(settings),
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("server --help timed out: " + argv[0]) from error
+    if help_run.returncode != 0:
+        raise ValueError(f"server --help failed with exit {help_run.returncode}: {argv[0]}")
+    options = help_run.stdout + "\n" + help_run.stderr
+    if re.search(r"(?m)^[ \t]*(?:-\S+[ \t]+)*--prompt-chunk(?=[ \t=,]|$)", options):
+        return argv
+    index = argv.index("--prompt-chunk")
+    print(f"{argv[0]} has no --prompt-chunk; keeping its original prompt scheduling", file=sys.stderr)
+    return argv[:index] + argv[index + 2:]
+
+
 def verify_assets():
     for path, expected in ASSET_SHA256.items():
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
@@ -199,6 +235,8 @@ def main(args):
     argv, settings = make_plan(args)
     verify_assets()
     if args.dry_run:
+        if Path(argv[0]).is_file():
+            argv = resolve_server_arguments(argv, settings)
         print(json.dumps({"argv": argv, "env": settings, "removed": removed_overrides(os.environ)}, indent=2))
         return 0
     for label, path in [("server", Path(argv[0])), ("model", args.model.expanduser()),
@@ -210,6 +248,7 @@ def main(args):
         raise ValueError("server is not executable: " + argv[0])
     if args.kv_host and available_memory_mib() < host_kv_mib(args.slots or 36) + 32768 + 8192:
         raise ValueError("insufficient available RAM for host KV, 32 GiB prompt cache and 8 GiB system reserve")
+    argv = resolve_server_arguments(argv, settings)
     os.execve(argv[0], argv, execution_environment(settings))
     return 0
 

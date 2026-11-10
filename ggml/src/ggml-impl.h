@@ -345,8 +345,8 @@ struct ggml_cgraph {
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;
 
-    // scheduler splits assigned to the same backend, including this one; 1 for an unscheduled graph
-    int n_backend_splits;
+    // The scheduler graph generation shared by its splits; 0 for an unscheduled graph.
+    uint64_t uid_parent;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)

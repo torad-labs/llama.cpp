@@ -7,10 +7,13 @@
 #include <functional>
 #include <vector>
 
-// Pure MTP policy and service-cycle observer. Timestamps are completed first-draft-step boundaries, in any common unit.
+// MTP policy and service-cycle observer. Boundaries precede a round's first draft step, in any common time unit.
 struct common_mtp_service {
     static constexpr int history = 5;
     std::array<std::array<double, history>, 2> samples = {};
+    std::array<std::array<double, history>, 2> rates = {};
+    std::vector<llama_seq_id> batch;
+    std::vector<int> batch_drafted, batch_verified, batch_accepted;
     std::array<int, 2> n_samples = {};
     std::array<int, 2> next = {};
     std::array<uint64_t, 2> last = {};
@@ -21,11 +24,17 @@ struct common_mtp_service {
 
     void invalidate();
     void boundary(llama_seq_id seq, int depth, int low_depth, int full_depth, double now);
+    void boundary(const std::vector<llama_seq_id> & seqs, int depth, int low_depth, int full_depth, double now);
+    bool complete() const;
+    int preferred_depth(int current) const;
     void drafted(llama_seq_id seq, int depth);
     void verify(llama_seq_id seq, int rows);
     void accept(llama_seq_id seq, int count, bool other = false);
     float relative_cost(float fallback) const;
 };
+
+// Tests can replace the MTP driver's clock; an empty callback restores the monotonic clock.
+void common_mtp_set_clock_for_testing(std::function<double()> clock);
 
 struct common_mtp_depth {
     static constexpr int32_t window = 8;
@@ -39,6 +48,10 @@ struct common_mtp_depth {
     void reset(int32_t n_max, int32_t n_min);
     int32_t n_draft(int32_t n_max, bool timed = false) const;
     void observe(int32_t n_max, float cost, int32_t n_accepted, float service_cut = -1);
+    void observe(int32_t n_max, float cost, const std::vector<int> & accepted, float service_cut = -1);
+
+private:
+    void observe(int32_t n_max, float cost, const int * accepted, size_t count, float service_cut);
 };
 
 struct common_speculative;

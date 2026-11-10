@@ -253,6 +253,8 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_weights_probe = {
 // before; each half holds a batch by batch index, then n_carry rows for the head's carry rows
 struct llama_nextn_store {
     ggml_context_ptr        ctx;
+    std::vector<ggml_context_ptr> copy_ctx;
+    std::vector<bool>             copy_used;
     ggml_backend_buffer_ptr buf;
     ggml_tensor *           t   = nullptr; // F32 [n_embd, 2*(n_batch + n_carry)], "mtp_h_store"
     ggml_backend_dev_t      dev = nullptr;
@@ -260,6 +262,8 @@ struct llama_nextn_store {
     int64_t  n_embd   = 0;
     int64_t  n_batch  = 0;
     int64_t  n_carry  = 0;
+    int64_t  n_host   = 0;
+    int32_t  n_keep   = 0;
     uint32_t n_devices = 1;
     std::vector<uint32_t> owners;
     std::vector<float> carry;
@@ -273,12 +277,28 @@ struct llama_nextn_store {
     bool                 read_pending[2] = { false, false };
     llama_context *      reader          = nullptr;
 
+    // One event covers all retained copies; each sequence keeps its own view arena.
+    ggml_backend_event_t copy_done    = nullptr;
+    bool                 copy_pending = false;
+
     int64_t base(int h) const { return h*(n_batch + n_carry); }
     int64_t row(int h, int64_t batch_row) const {
         GGML_ASSERT(batch_row >= 0 && batch_row < n_batch);
         const uint32_t owner = n_devices > 1 ? owners[h*n_batch + batch_row] : 0;
         GGML_ASSERT(owner < n_devices);
         return owner*2*(n_batch + n_carry) + base(h) + batch_row;
+    }
+
+    int32_t ref(llama_seq_id seq, int32_t i) const {
+        if (!n_keep || seq < -1 || seq >= n_host || i < 0 || i >= n_keep) { return 0; }
+        return -(int32_t) (n_host + 1 + (seq < 0 ? 0 : 1 + seq*n_keep + i));
+    }
+
+    int64_t kept(int32_t ref) const {
+        const int64_t c = -int64_t(ref) - 1;
+        if (!n_keep || c <= n_host || c >= n_carry) { return -1; }
+        const int64_t seq = (c - n_host - 1)/n_keep;
+        return (seq % n_devices)*2*(n_batch + n_carry) + n_batch + c;
     }
 
     void wait_read(int h) {
@@ -293,11 +313,32 @@ struct llama_nextn_store {
         }
     }
 
+    void wait_copy() {
+        if (!copy_pending) {
+            return;
+        }
+        ggml_backend_event_synchronize(copy_done);
+        copy_pending = false;
+        std::fill(copy_used.begin(), copy_used.end(), false);
+    }
+
+    void wait_copy(ggml_backend_t backend) const {
+        if (copy_pending) {
+            ggml_backend_event_wait(backend, copy_done);
+        }
+    }
+
     ~llama_nextn_store() {
+        wait_copy();
+        wait_read(0);
+        wait_read(1);
         for (auto * e : read_done) {
             if (e) {
                 ggml_backend_event_free(e);
             }
+        }
+        if (copy_done) {
+            ggml_backend_event_free(copy_done);
         }
     }
 };
@@ -2423,6 +2464,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     } nextn_guard{*this};
     if (nextn_store) {
         auto & st = *nextn_store;
+        if (st.copy_pending) {
+            ggml_backend_t backend = nullptr;
+            for (const auto & candidate : backends) {
+                if (ggml_backend_get_device(candidate.get()) == st.dev) {
+                    backend = candidate.get();
+                    break;
+                }
+            }
+            if (backend) {
+                st.wait_copy(backend);
+            } else {
+                st.wait_copy();
+            }
+        }
         if (nextn_is_target) {
             st.n_rows        = 0;
             embd_nextn_stale = false;
@@ -3343,11 +3398,11 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
         /*.nextn       =*/ nextn_mode == LLM_GRAPH_NEXTN_NONE ? llm_graph_nextn{} : llm_graph_nextn{
             nextn_mode, nextn_store->t, &nextn_base, &nextn_src, nextn_store->n_batch, nextn_store->n_carry,
-            nextn_store->n_devices, &nextn_store->owners, &nextn_store->carry },
+            nextn_store->n_devices, &nextn_store->owners, &nextn_store->carry, nextn_store->n_host },
     };
 }
 
-bool llama_context::nextn_bind(llama_context & head) {
+bool llama_context::nextn_bind(llama_context & head, int32_t n_keep) {
     const auto & hparams = model.hparams;
     if (&head.model != &model || model.arch != LLM_ARCH_GLM5NEXT || hparams.n_layer_nextn != 1 ||
             head.cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
@@ -3360,7 +3415,9 @@ bool llama_context::nextn_bind(llama_context & head) {
     st->dev     = model.dev_output();
     st->n_embd  = hparams.n_embd_out();
     st->n_batch = cparams.n_batch;
-    st->n_carry = std::max<int64_t>(1, cparams.n_seq_max);
+    st->n_host  = std::max<int64_t>(1, cparams.n_seq_max);
+    st->n_keep  = std::max(0, n_keep);
+    st->n_carry = st->n_host + (st->n_keep ? 1 + st->n_host*st->n_keep : 0);
     st->n_devices = model.n_seq_devices();
     st->owners.resize(2*st->n_batch, st->n_devices);
     if (const char * env = getenv("LLAMA_MTP_DEVICE_H_MIN_ROWS")) {
@@ -3368,6 +3425,7 @@ bool llama_context::nextn_bind(llama_context & head) {
         st->min_rows = std::max<uint32_t>(graph_slot_max_tokens + 1, (uint32_t) atoi(env));
     }
 
+    if (st->n_keep) { st->min_rows = 1; }
     ggml_init_params params = { ggml_tensor_overhead(), nullptr, /*.no_alloc =*/ true };
     st->ctx.reset(ggml_init(params));
     st->t = ggml_new_tensor_2d(st->ctx.get(), GGML_TYPE_F32, st->n_embd, st->n_devices*2*(st->n_batch + st->n_carry));
@@ -3382,6 +3440,15 @@ bool llama_context::nextn_bind(llama_context & head) {
         return false;
     }
     ggml_backend_buffer_clear(st->buf.get(), 0);
+    if (st->n_keep) {
+        st->copy_ctx.resize(st->n_host);
+        st->copy_used.resize(st->n_host, false);
+        for (auto & ctx : st->copy_ctx) {
+            ctx.reset(ggml_init({2*size_t(st->n_keep)*ggml_tensor_overhead(), nullptr, true}));
+            if (!ctx) { return false; }
+        }
+        st->copy_done = ggml_backend_event_new(st->dev);
+    }
     for (auto & e : st->read_done) {
         e = ggml_backend_event_new(st->dev);
     }
@@ -3404,6 +3471,86 @@ bool llama_context::nextn_bind(llama_context & head) {
     return true;
 }
 
+bool llama_context::nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int32_t n) {
+    if (!nextn_store || !nextn_is_target) { return false; }
+    auto & st = *nextn_store;
+    if (seq < 0 || seq >= st.n_host || n < 1 || n > st.n_keep || !st.n_rows) { return false; }
+    for (int32_t i = 0; i < n; ++i) {
+        if (rows[i] < 0 || rows[i] >= st.n_rows ||
+                (st.n_devices > 1 && st.owners[st.half*st.n_batch + rows[i]] != uint32_t(seq)%st.n_devices)) {
+            return false;
+        }
+    }
+    if (n_queued_tokens) { synchronize(); }
+    st.wait_read(0);
+    st.wait_read(1);
+    if (st.copy_used[seq]) { st.wait_copy(); }
+
+    ggml_backend_t backend = nullptr;
+    for (const auto & candidate : backends) {
+        if (ggml_backend_get_device(candidate.get()) == st.dev) {
+            backend = candidate.get();
+            break;
+        }
+    }
+    if (!backend) { return false; }
+
+    auto * copy_ctx = st.copy_ctx[seq].get();
+    ggml_reset(copy_ctx);
+    const size_t row = st.n_embd*sizeof(float);
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> copies;
+    copies.reserve(n);
+    for (int32_t i = 0; i < n; ) {
+        int32_t end = i + 1;
+        while (end < n && st.row(st.half, rows[end]) == st.row(st.half, rows[end - 1]) + 1) { ++end; }
+        auto * src = ggml_view_1d(copy_ctx, st.t, st.n_embd*(end - i), st.row(st.half, rows[i])*row);
+        auto * dst = ggml_view_1d(copy_ctx, st.t, st.n_embd*(end - i), st.kept(st.ref(seq, i))*row);
+        if (ggml_backend_view_init(src) != GGML_STATUS_SUCCESS || ggml_backend_view_init(dst) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        copies.emplace_back(src, dst);
+        i = end;
+    }
+    for (const auto & [src, dst] : copies) {
+        ggml_backend_tensor_copy_async(backend, backend, src, dst);
+    }
+    if (st.copy_done) {
+        ggml_backend_event_record(st.copy_done, backend);
+        st.copy_pending = true;
+        st.copy_used[seq] = true;
+    } else {
+        ggml_backend_synchronize(backend);
+    }
+    return true;
+}
+
+int32_t llama_context::nextn_kept_row(llama_seq_id seq, int32_t row) const {
+    return nextn_store && nextn_is_target ? nextn_store->ref(seq, row) : 0;
+}
+
+bool llama_context::nextn_kept_get(int32_t ref, float * dst) {
+    if (!nextn_store || !nextn_is_target || nextn_store->kept(ref) < 0) { return false; }
+    synchronize();
+    auto & st = *nextn_store;
+    st.wait_copy();
+    const size_t row = st.n_embd*sizeof(float);
+    ggml_backend_tensor_get(st.t, dst, st.kept(ref)*row, row);
+    ++n_nextn_to_host;
+    return true;
+}
+
+bool llama_context::nextn_kept_set(int32_t ref, const float * src) {
+    if (!nextn_store || !nextn_is_target || nextn_store->kept(ref) < 0) { return false; }
+    synchronize();
+    auto & st = *nextn_store;
+    st.wait_copy();
+    st.wait_read(0);
+    st.wait_read(1);
+    const size_t row = st.n_embd*sizeof(float);
+    ggml_backend_tensor_set(st.t, src, st.kept(ref)*row, row);
+    return true;
+}
+
 int32_t llama_context::nextn_store_rows() const {
     return nextn_store && nextn_is_target ? nextn_store->n_rows : 0;
 }
@@ -3411,7 +3558,7 @@ int32_t llama_context::nextn_store_rows() const {
 void llama_context::nextn_set_h_rows(const int32_t * src, int32_t n, const float * carry, int32_t n_carry) {
     GGML_ASSERT(nextn_store && !nextn_is_target && "llama_set_nextn_h_rows: the context is not a bound MTP head");
     auto & st = *nextn_store;
-    GGML_ASSERT(n_carry >= 0 && n_carry <= st.n_carry);
+    GGML_ASSERT(n_carry >= 0 && n_carry <= st.n_host);
     if (st.n_devices > 1) {
         st.carry.clear();
         if (n_carry > 0) { st.carry.assign(carry, carry + n_carry*st.n_embd); }
@@ -4908,11 +5055,27 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     return ctx->get_embeddings_nextn();
 }
 
-bool llama_set_nextn_source(llama_context * ctx_dft, llama_context * ctx_tgt) {
+bool llama_set_nextn_source(llama_context * ctx_dft, llama_context * ctx_tgt, int32_t n_keep) {
     if (ctx_dft == nullptr || ctx_tgt == nullptr || ctx_dft == ctx_tgt) {
         return false;
     }
-    return ctx_tgt->nextn_bind(*ctx_dft);
+    return ctx_tgt->nextn_bind(*ctx_dft, n_keep);
+}
+
+bool llama_nextn_keep_rows(llama_context * ctx, llama_seq_id seq, const int32_t * rows, int32_t n) {
+    return ctx->nextn_keep_rows(seq, rows, n);
+}
+
+int32_t llama_nextn_kept_row(const llama_context * ctx, llama_seq_id seq, int32_t row) {
+    return ctx->nextn_kept_row(seq, row);
+}
+
+bool llama_nextn_kept_get(llama_context * ctx, int32_t ref, float * dst) {
+    return ctx->nextn_kept_get(ref, dst);
+}
+
+bool llama_nextn_kept_set(llama_context * ctx, int32_t ref, const float * src) {
+    return ctx->nextn_kept_set(ref, src);
 }
 
 int32_t llama_get_nextn_store_rows(const llama_context * ctx_tgt) {

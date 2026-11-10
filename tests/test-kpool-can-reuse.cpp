@@ -173,7 +173,7 @@ static void test_host_kv_graph_transition() {
                 const bool scoring = llama_kpool_needs_scoring(cells, cells, h.indexer_top_k, h.indexer_kpool);
                 CHECK(scoring, "fresh prompt must enter sparse attention");
                 auto * input = graph.build_inp_kpool(&mctx, mask, scoring);
-                const bool direct = mode != 2 && (cells == 32768 || (cells == 8192 && tokens < 512));
+                const bool direct = mode == 1 && (cells == 32768 || (cells == 8192 && tokens < 512));
                 CHECK(bool(input->tail_cells) == direct,
                         "host storage changed attention selection: cells=%u tokens=%u host=%d flash=%d", cells, tokens, mode != 0, mode != 2);
                 if (mode == 2) { continue; }

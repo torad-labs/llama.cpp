@@ -326,6 +326,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
         // the link twice and reading it back at about 3.5 GB/s; its shares now go card to card, through the inboxes
         // the gathers use, and the receivers add the same bytes in the same order
         {"peer chunked", "0",       "16",      "0", false},
+        {"owner chunked", "0",      "16",      "0", false},
     };
     bool ok = true;
     for (bool bf16 : {false, true}) {
@@ -336,7 +337,8 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             set_env("GGML_CUDA_AR_COPY_THRESHOLD", route.copy);
             set_env("GGML_CUDA_AR_COPY_ONE_STREAM", route.one_stream ? "1" : "0");
             set_env("GGML_CUDA_AR_COPY_PEER", "1");
-            set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", strcmp(route.name, "owner-slice") == 0 ? "1" : "0");
+            const bool owner_requested = strcmp(route.name, "owner-slice") == 0 || strcmp(route.name, "owner chunked") == 0;
+            set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", owner_requested ? "1" : "0");
             const int before = n_pipelines;
             void * comm = init(backends.data(), backends.size());
             if (!comm || n_pipelines != before + 1 || n_nccl_fallbacks != 0) {
@@ -347,7 +349,6 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             }
             const bool peer_requested = route.p2p[0] != '0';
             const bool peer_active = last_p2p;
-            const bool owner_requested = strcmp(route.name, "owner-slice") == 0;
             if (last_one_stream != route.one_stream || (!peer_requested && (last_p2p || last_card_to_card)) ||
                     (peer_requested && require_p2p && (!last_p2p || !last_gather_peer ||
                         (route.copy[0] == '1' && !last_card_to_card) || (owner_requested && !last_owner_slice)))) {
@@ -368,7 +369,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                     return 1;
                 }
             }
-            std::vector<int64_t> sizes = {1, 3, 17, 4097, 131079, 512*4096 + 3};
+            std::vector<int64_t> sizes = {1, 3, 17, 4097, 131079, 23*4096, 69*4096 + 3, 512*4096 + 3};
             if (route.copy[0] == '1') {
                 sizes.push_back(32*1024*1024/(bf16 ? 2 : 4) + 3);
             }
@@ -633,17 +634,17 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
     bool ok = true;
     {
         benchmark_launcher runner(backends, launch);
-        for (const char * route : {"peer_ll", "host_ll", "peer_copy", "host_copy", "owner-slice"}) {
+        for (const char * route : {"peer_ll", "host_ll", "peer_copy", "host_copy", "owner-slice", "peer_chunked"}) {
             const char * only_route = getenv("GGML_TEST_COLLECTIVE_ROUTE");
             if (only_route != nullptr && strcmp(route, only_route) != 0) { continue; }
             const bool peer = strncmp(route, "peer", 4) == 0 || strcmp(route, "owner-slice") == 0;
             const bool copy = strstr(route, "copy") != nullptr;
             set_env("GGML_CUDA_AR_LL_MAX_BYTES", peer || copy ? "0" : "1048576");
-            set_env("GGML_CUDA_AR_P2P_MAX_BYTES", peer ? "1048576" : "0");
+            set_env("GGML_CUDA_AR_P2P_MAX_BYTES", strcmp(route, "peer_chunked") == 0 ? "16" : peer ? "1048576" : "0");
             set_env("GGML_CUDA_AR_COPY_THRESHOLD", copy ? "1" : "0");
             set_env("GGML_CUDA_AR_COPY_PEER", peer ? "1" : "0");
             set_env("GGML_CUDA_AR_COPY_ONE_STREAM", "0");
-            set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", strcmp(route, "owner-slice") == 0 ? "1" : "0");
+            set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", strcmp(route, "owner-slice") == 0 || strcmp(route, "peer_chunked") == 0 ? "1" : "0");
             for (bool bf16 : {false, true}) {
                 set_env("GGML_CUDA_AR_BF16_THRESHOLD", bf16 ? "1" : "0");
                 void * comm = init(backends.data(), backends.size());
@@ -659,7 +660,7 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                     fprintf(stderr, "FAIL: owner-slice-peer protocol was not selected\n");
                     return 1;
                 }
-                for (int rows : {1, 4, 8, 40, 65, 108, 128, 512, 513}) {
+                for (int rows : {1, 4, 8, 23, 40, 65, 69, 108, 128, 512, 513}) {
                     const char * only_rows = getenv("GGML_TEST_COLLECTIVE_ROWS");
                     if (only_rows != nullptr && rows != atoi(only_rows)) { continue; }
                     for (int operation : {0, 1, 2}) { // reset only, reduce, gather

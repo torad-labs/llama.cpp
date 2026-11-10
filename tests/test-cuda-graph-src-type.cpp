@@ -12,6 +12,8 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -180,7 +182,150 @@ static bool test_retype(ggml_backend_t backend, ggml_backend_t cpu, graph_log & 
     return ok;
 }
 
-int main(void) {
+// Repeated parameter changes must preserve the caller's scalar result through capture and replay.
+// The real-Nsight companion check also requires every update's source graph/node IDs to stay valid.
+static bool test_parameter_updates(ggml_backend_t backend, graph_log & log) {
+    constexpr size_t n = 256;
+    std::mt19937 rng(53074);
+    const auto input = random_values(rng, n);
+    std::vector<float> output(n);
+    auto * ctx = new_ctx(2);
+    auto * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    auto * y = ggml_scale(ctx, x, 1.0f);
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer);
+    ggml_backend_tensor_set(x, input.data(), 0, n*sizeof(float));
+    bool ok = true;
+    bool armed = false;
+    for (int step = 0; step < 24; ++step) {
+        const float scale = float(int(rng()%33) - 16)/8.0f;
+        memcpy(y->op_params, &scale, sizeof(scale));
+        for (int run = 0; run < 3; ++run) {
+            compute(backend, graph, log, armed);
+            ggml_backend_tensor_get(y, output.data(), 0, n*sizeof(float));
+            for (size_t i = 0; i < n; ++i) {
+                ok &= output[i] == input[i]*scale;
+            }
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    printf("  generated scalar parameter updates: %s\n", ok ? "ok" : "FAILED");
+    return ok;
+}
+
+static bool test_moe_replay(ggml_backend_t backend, ggml_backend_t cpu, graph_log & log) {
+    constexpr int k = 256, rows = 264, local = 72, used = 8, first = 216, total = 288;
+    constexpr int graph_size = 32;
+    ggml_backend_t backends[] = { backend, cpu };
+    ggml_context * wctx[2];
+    ggml_backend_buffer_t wbuf[2];
+    ggml_tensor * weights[2][2];
+    ggml_gallocr_t alloc[2];
+    std::vector<uint8_t> meta[2];
+    std::mt19937 rng(53073);
+    for (int b = 0; b < 2; ++b) {
+        wctx[b] = new_ctx(2);
+        for (int w = 0; w < 2; ++w) {
+            weights[b][w] = ggml_new_tensor_3d(wctx[b], GGML_TYPE_Q8_0, k, rows, local);
+        }
+        wbuf[b] = ggml_backend_alloc_ctx_tensors(wctx[b], backends[b]);
+        GGML_ASSERT(wbuf[b]);
+        ggml_backend_buffer_set_usage(wbuf[b], GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        alloc[b] = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backends[b]));
+        meta[b].resize(ggml_tensor_overhead()*16 + ggml_graph_overhead_custom(graph_size, false));
+    }
+    for (int w = 0; w < 2; ++w) {
+        const auto values = random_values(rng, k*rows*local);
+        std::vector<uint8_t> quantized(ggml_nbytes(weights[0][w]));
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, values.data(), quantized.data(), 0, rows*local, k, nullptr);
+        for (int b = 0; b < 2; ++b) {
+            ggml_backend_tensor_set(weights[b][w], quantized.data(), 0, quantized.size());
+        }
+    }
+
+    bool ok = true;
+    bool replayed = false;
+    for (int64_t tokens : {36, 72, 108, 36}) {
+        ggml_context * ctx[2];
+        ggml_cgraph * graph[2];
+        ggml_tensor * x[2];
+        ggml_tensor * ids[2];
+        ggml_tensor * outputs[2][3];
+        for (int b = 0; b < 2; ++b) {
+            ggml_init_params params = { meta[b].size(), meta[b].data(), true };
+            ctx[b] = ggml_init(params);
+            x[b] = ggml_new_tensor_3d(ctx[b], GGML_TYPE_F32, k, 1, tokens);
+            ggml_tensor * ids_base = ggml_new_tensor_2d(ctx[b], GGML_TYPE_I32, used + 3, tokens);
+            ids[b] = ggml_view_2d(ctx[b], ids_base, used, tokens, ids_base->nb[1], 0);
+            ggml_tensor * gate = ggml_mul_mat_id(ctx[b], weights[b][0], x[b], ids[b]);
+            ggml_tensor * up = ggml_mul_mat_id(ctx[b], weights[b][1], x[b], ids[b]);
+            ggml_mul_mat_id_set_expert_range(gate, first, total);
+            ggml_mul_mat_id_set_expert_range(up, first, total);
+            outputs[b][0] = gate;
+            outputs[b][1] = up;
+            if (tokens != 72) {
+                gate = ggml_clamp(ctx[b], gate, -INFINITY, 7.0f);
+                up = ggml_clamp(ctx[b], up, -7.0f, 7.0f);
+            }
+            outputs[b][2] = ggml_swiglu_split(ctx[b], gate, up);
+            graph[b] = ggml_new_graph_custom(ctx[b], graph_size, false);
+            ggml_build_forward_expand(graph[b], outputs[b][2]);
+            for (auto * out : outputs[b]) { ggml_set_output(out); }
+            GGML_ASSERT(ggml_gallocr_alloc_graph(alloc[b], graph[b]));
+        }
+        bool armed = false;
+        for (int run = 0; run < 5; ++run) {
+            auto xv = random_values(rng, k*tokens);
+            std::vector<int32_t> routes((used + 3)*tokens);
+            for (int64_t t = 0; t < tokens; ++t) {
+                for (int s = 0; s < used + 3; ++s) {
+                    int id = (17*t + 37*s + run) % total;
+                    if (run == 1) { id = first + local - 1 - s; }
+                    if (run == 2) { id = s; }
+                    if (run == 3) { id = s == 0 ? first + local - 1 : s; }
+                    if (run == 4) { id = first + (13*t + s) % local; }
+                    routes[t*(used + 3) + s] = id;
+                }
+            }
+            for (int b = 0; b < 2; ++b) {
+                ggml_backend_tensor_set(x[b], xv.data(), 0, xv.size()*sizeof(float));
+                ggml_backend_tensor_set(ids[b]->view_src, routes.data(), 0, routes.size()*sizeof(int32_t));
+            }
+            compute(backend, graph[0], log, armed);
+            replayed |= run >= 2 && armed;
+            GGML_ASSERT(ggml_backend_graph_compute(cpu, graph[1]) == GGML_STATUS_SUCCESS);
+            for (int o = 0; o < 3; ++o) {
+                std::vector<float> actual(rows*used*tokens), expected(actual.size());
+                ggml_backend_tensor_get(outputs[0][o], actual.data(), 0, actual.size()*sizeof(float));
+                ggml_backend_tensor_get(outputs[1][o], expected.data(), 0, expected.size()*sizeof(float));
+                double error = 0.0, norm = 0.0;
+                for (size_t j = 0; j < actual.size(); ++j) {
+                    const int slot = (j/rows) % used;
+                    const int token = j/(rows*used);
+                    const int expert = routes[token*(used + 3) + slot];
+                    if (!std::isfinite(actual[j]) || (expert < first && actual[j] != 0.0f)) { ok = false; }
+                    error += double(actual[j] - expected[j])*(actual[j] - expected[j]);
+                    norm += double(expected[j])*expected[j];
+                }
+                if (error/std::max(norm, 1e-30) > (o == 2 ? 5e-3 : 5e-4)) { ok = false; }
+            }
+        }
+        for (int b = 0; b < 2; ++b) { ggml_free(ctx[b]); }
+    }
+    for (int b = 0; b < 2; ++b) {
+        ggml_gallocr_free(alloc[b]);
+        ggml_backend_buffer_free(wbuf[b]);
+        ggml_free(wctx[b]);
+    }
+    printf("  expert pair: changed inputs/routes, empty owners, tails and rebuilt metadata: %s (%s)\n",
+           ok ? "ok" : "FAILED", replayed ? "captured replay exercised" : "no CUDA replay");
+    return ok;
+}
+
+int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
     graph_log log;
@@ -188,6 +333,14 @@ int main(void) {
 
     ggml_backend_t cpu = ggml_backend_cpu_init();
     bool ok = true;
+    const bool moe_cpu = argc == 2 && strcmp(argv[1], "--moe-cpu") == 0;
+    const bool moe_only = argc == 2 && strcmp(argv[1], "--moe") == 0;
+    if (moe_cpu) {
+        ok = test_moe_replay(cpu, cpu, log);
+        ggml_backend_free(cpu);
+        ggml_log_set(nullptr, nullptr);
+        return ok ? 0 : 1;
+    }
     int n_tested = 0;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -196,11 +349,15 @@ int main(void) {
         }
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         printf("%s (%s):\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+        ok &= test_moe_replay(backend, cpu, log);
         bool replayed = false;
-        for (int64_t m : { 1, 8 }) {
-            ok &= test_retype(backend, cpu, log, m, replayed);
+        if (!moe_only) {
+            ok &= test_parameter_updates(backend, log);
+            for (int64_t m : { 1, 8 }) {
+                ok &= test_retype(backend, cpu, log, m, replayed);
+            }
         }
-        if (!replayed) {
+        if (!moe_only && !replayed) {
             printf("  no graph was replayed before the retype: this device does not exercise the stale-replay path\n");
         }
         ggml_backend_free(backend);

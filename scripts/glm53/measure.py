@@ -17,9 +17,11 @@ from pathlib import Path
 import re
 import signal
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
+from typing import Any
 import urllib.error
 import urllib.request
 
@@ -79,6 +81,104 @@ def validate_response(response, tokens, prompt_tokens=None):
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False, default=str) + "\n")
+
+
+def artifact_digest(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as artifact:
+        for chunk in iter(lambda: artifact.read(16 * 1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def nsys_version(nsys='nsys', timeout: float = 30) -> dict[str, Any]:
+    result: dict[str, Any] = dict(command=[nsys, '--version'], exit=None, stdout='', stderr='')
+    try:
+        run = subprocess.run(result['command'], capture_output=True, text=True, timeout=timeout)
+        result.update(exit=run.returncode, stdout=run.stdout, stderr=run.stderr)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result['error'] = f'{type(exc).__name__}: {exc}'
+    version = next((line.strip() for line in result['stdout'].splitlines() if line.strip()), None)
+    if version is not None:
+        result['version'] = version
+    return result
+
+
+def nsys_export_path(output):
+    return output.with_name(output.name + '-export.sqlite')
+
+
+def export_nsys_capture(output, devices, request, deadline, nsys='nsys'):
+    """Export one raw report and verify an attributed CUDA decode window without replacing its artifacts."""
+    from decode_trace import capture_readiness
+    report = output.with_name(output.name + '.nsys-rep')
+    sqlite = nsys_export_path(output)
+    result: dict[str, Any] = dict(report=str(report), sqlite=str(sqlite), launch_sha256=request.get('launch_sha256'),
+                  capture_verified=False, report_present=report.is_file() and report.stat().st_size > 0)
+    if not result['report_present']:
+        result['failure'] = 'missing_raw_report'
+    elif sqlite.exists():
+        result['failure'] = 'sqlite_output_exists'
+    elif time.time() >= deadline:
+        result['failure'] = 'export_deadline_reached'
+    else:
+        exporter = nsys_version(nsys, timeout=min(30, max(0.001, deadline-time.time())))
+        captured = request.get('capture_nsys') or {}
+        compatibility = dict(capture_version=captured.get('version'), exporter_version=exporter.get('version'),
+                             state='unknown')
+        if exporter.get('exit') != 0:
+            compatibility['state'] = 'exporter_unavailable'
+            result['failure'] = 'exporter_unavailable'
+        elif compatibility['capture_version'] == compatibility['exporter_version']:
+            compatibility['state'] = 'exact-version'
+        elif compatibility['capture_version']:
+            compatibility['state'] = 'version_mismatch'
+            result['failure'] = 'exporter_version_mismatch'
+        else:
+            compatibility['state'] = 'capture_version_missing'
+            result['failure'] = 'capture_version_missing'
+        exporter['compatibility'] = compatibility
+        result['exporter'] = exporter
+        if 'failure' not in result:
+            command = [nsys, 'export', '--type', 'sqlite', '--output', str(sqlite), str(report)]
+            try:
+                exported = subprocess.run(command, capture_output=True, text=True,
+                                          timeout=min(180, max(0.001, deadline-time.time())))
+                result['export'] = dict(argv=command, exit=exported.returncode,
+                                        stdout=exported.stdout, stderr=exported.stderr)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                result['export_error'] = f'{type(exc).__name__}: {exc}'
+            if result.get('export', {}).get('exit') != 0:
+                result.setdefault('failure', 'sqlite_export_failed')
+            elif not sqlite.is_file() or sqlite.stat().st_size == 0:
+                result['failure'] = 'missing_sqlite_export'
+            else:
+                try:
+                    with sqlite3.connect(sqlite.resolve().as_uri() + '?mode=ro', uri=True) as db:
+                        result['readiness'] = capture_readiness(db, devices, expected_sequences=request.get('active_sessions'))
+                except (OSError, sqlite3.Error, ValueError) as exc:
+                    result['validation_error'] = f'{type(exc).__name__}: {exc}'
+                else:
+                    result['capture_verified'] = result['readiness']['usable'] is True
+                    if not result['capture_verified']:
+                        result['failure'] = 'capture_not_ready'
+    if result['report_present']:
+        result['report_sha256'] = artifact_digest(report)
+    if sqlite.is_file() and sqlite.stat().st_size:
+        result['sqlite_sha256'] = artifact_digest(sqlite)
+    write_json(output.with_name(output.name + '-export.json'), result)
+    return result
+
+
+def shutdown_nsys_session(session, kill_signal=signal.SIGKILL):
+    command = ['nsys', 'shutdown', '--session=' + session, '--kill=' + str(int(kill_signal))]
+    result: dict[str, Any] = dict(argv=command, exit=None)
+    try:
+        stopped = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        result.update(exit=stopped.returncode, stdout=stopped.stdout, stderr=stopped.stderr)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        result['error'] = f'{type(error).__name__}: {error}'
+    return result
 
 
 def finish_nsys_capture(process, session, output, deadline):
@@ -302,7 +402,7 @@ class ServingLeg:
             message = f"request {path} failed: {meta['error']}; record {record.relative_to(self.out)}"
             if isinstance(exc, ValueError):
                 raise ValueError(message) from exc
-            if isinstance(exc, OSError):
+            if isinstance(exc, (OSError, http.client.IncompleteRead)):
                 raise OSError(message) from exc
             raise RuntimeError(message) from exc
         finally:

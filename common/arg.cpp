@@ -1742,6 +1742,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PROMPT_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prompt-chunk"}, "N",
+        string_format("prefer at least N text tokens per admitted prompt, rotating pending prompts instead of dividing "
+            "a step into thin slices; prompt-step, short tails and checkpoints still bound the chunk "
+            "(default: %d, 0 = share across all pending slots)", params.n_prompt_chunk),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prompt-chunk must be non-negative");
+            }
+            params.n_prompt_chunk = value;
+        }
+    ).set_env("LLAMA_ARG_PROMPT_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

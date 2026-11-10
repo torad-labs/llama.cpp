@@ -95,11 +95,15 @@ static size_t ggml_cuda_mmq_q8_buffer_size(
         ggml_type type, bool fallback, int cc,
         int64_t ne10_padded, int64_t ne11, int64_t ne12, int64_t ne13);
 
-void ggml_cuda_mul_mat_q(
+static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst, const ggml_tensor * gate,
         const ggml_tensor * norm_weight, const ggml_tensor * norm_scale,
-        void * external_q8, bool quantize_external, const float * external_norm_scale) {
+        void * external_q8, bool quantize_external, const float * external_norm_scale,
+        const ggml_tensor * paired_src0 = nullptr, ggml_tensor * paired_dst = nullptr) {
+    GGML_ASSERT((paired_src0 == nullptr) == (paired_dst == nullptr));
+    GGML_ASSERT(!paired_src0 || (ids && !gate && !norm_weight && !external_q8 &&
+                ggml_are_same_layout(src0, paired_src0) && ggml_are_same_layout(dst, paired_dst)));
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -126,16 +130,20 @@ void ggml_cuda_mul_mat_q(
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
-    // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-        const size_t size_data  = ggml_nbytes(src0);
-        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
-        if (size_alloc > size_data) {
-            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
-            GGML_ASSERT(!src0->view_src);
-            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+    // If a weight is a temporary compute buffer, clear any potential padding.
+    const auto clear_padding = [&](const ggml_tensor * weight) {
+        if (ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(weight);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(weight->buffer, weight);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(weight));
+                GGML_ASSERT(!weight->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) weight->data + size_data, 0, size_alloc - size_data, stream));
+            }
         }
-    }
+    };
+    clear_padding(src0);
+    if (paired_src0) { clear_padding(paired_src0); }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
@@ -303,7 +311,28 @@ void ggml_cuda_mul_mat_q(
 
     args.q8_layout = ggml_cuda_q8_layout_of(src0);
     args.n_experts_total = ggml_get_op_params_i32(dst, 2);
+    if (paired_src0) {
+        args.paired_x = (const char *) paired_src0->data;
+        args.paired_dst = (float *) paired_dst->data;
+        args.paired_q8_layout = ggml_cuda_q8_layout_of(paired_src0);
+    }
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst, const ggml_tensor * gate,
+        const ggml_tensor * norm_weight, const ggml_tensor * norm_scale,
+        void * external_q8, bool quantize_external, const float * external_norm_scale) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, gate, norm_weight, norm_scale,
+                            external_q8, quantize_external, external_norm_scale);
+}
+
+void ggml_cuda_mul_mat_q_id_pair(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0_a, const ggml_tensor * src0_b,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst_a, ggml_tensor * dst_b) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0_a, src1, ids, dst_a, nullptr, nullptr, nullptr,
+                            nullptr, true, nullptr, src0_b, dst_b);
 }
 
 bool ggml_cuda_mmq_moe_tiles_legacy() {

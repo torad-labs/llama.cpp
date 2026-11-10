@@ -8152,9 +8152,12 @@ struct test_moe_ffn_chain : public test_case {
     const int64_t   n_ff;
     const int64_t   n_tokens;
     const float     glu_limit;
+    const int       expert_first;
+    const int       expert_total;
 
     std::string vars() override {
-        return VARS_TO_STR7(type, n_mats, n_used, n_embd, n_ff, n_tokens, glu_limit);
+        return VARS_TO_STR7(type, n_mats, n_used, n_embd, n_ff, n_tokens, glu_limit) +
+            (expert_total ? "," + VARS_TO_STR2(expert_first, expert_total) : "");
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8169,9 +8172,9 @@ struct test_moe_ffn_chain : public test_case {
     }
 
     test_moe_ffn_chain(ggml_type type, int n_mats, int n_used, int64_t n_embd, int64_t n_ff, int64_t n_tokens,
-                       float glu_limit)
+                       float glu_limit, int expert_first = 0, int expert_total = 0)
         : type(type), n_mats(n_mats), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens),
-          glu_limit(glu_limit) {
+          glu_limit(glu_limit), expert_first(expert_first), expert_total(expert_total) {
         GGML_ASSERT(n_used <= n_mats);
     }
 
@@ -8188,12 +8191,17 @@ struct test_moe_ffn_chain : public test_case {
 
         ggml_tensor * gate = ggml_mul_mat_id(ctx, gates, cur, ids);
         ggml_tensor * up   = ggml_mul_mat_id(ctx, ups, cur, ids);
+        if (expert_total) {
+            ggml_mul_mat_id_set_expert_range(gate, expert_first, expert_total);
+            ggml_mul_mat_id_set_expert_range(up, expert_first, expert_total);
+        }
         if (glu_limit > 0.0f) {
             gate = ggml_clamp(ctx, gate, -INFINITY, glu_limit);
             up   = ggml_clamp(ctx, up, -glu_limit, glu_limit);
         }
         ggml_tensor * act = ggml_swiglu_split(ctx, gate, up);
         ggml_tensor * out = ggml_mul_mat_id(ctx, downs, act, ids);
+        if (expert_total) { ggml_mul_mat_id_set_expert_range(out, expert_first, expert_total); }
         ggml_set_name(out, "out");
         return out;
     }
@@ -8205,8 +8213,8 @@ struct test_moe_ffn_chain : public test_case {
 
 struct test_glm53_moe_routes : public test_moe_ffn_chain {
     const int overlap;
-    test_glm53_moe_routes(int64_t n, int overlap, int64_t k, int64_t ff)
-        : test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 72, 8, k, ff, n, 7.0f), overlap(overlap) {}
+    test_glm53_moe_routes(int64_t n, int overlap, int64_t k, int64_t ff, int first = 0, int total = 0)
+        : test_moe_ffn_chain(GGML_TYPE_IQ3_XXS, 72, 8, k, ff, n, 7.0f, first, total), overlap(overlap) {}
     std::string op_desc(ggml_tensor *) override { return "GLM53_MOE_ROUTES"; }
     std::string vars() override { return test_moe_ffn_chain::vars() + "," + VAR_TO_STR(overlap); }
     void initialize_tensors(ggml_context * ctx) override {
@@ -8242,10 +8250,95 @@ struct test_glm53_moe_routes : public test_moe_ffn_chain {
                     // Unique IDs within a token, with generated rotations;
                     // either no overlap, all overlap, or groups of three.
                     const int group = overlap == 0 ? token : overlap == 1 ? 0 : token/3;
-                    ids[token*n_mats + slot] = (slot + 8*group + 17) % n_mats;
+                    ids[token*n_mats + slot] = (slot + 8*group + 17) % (expert_total ? expert_total : n_mats);
                 }
             }
             ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(ids[0]));
+        }
+    }
+};
+
+// Gate/up preparation must preserve each projection, including padded routes and empty expert owners.
+struct test_glm53_moe_prep : public test_glm53_moe_routes {
+    const int routing;
+    const int layout;
+    const bool clamped;
+    std::vector<ggml_tensor *> order;
+    std::vector<ggml_tensor *> outputs;
+
+    test_glm53_moe_prep(int64_t tokens, int routing, int layout, bool clamped)
+        : test_glm53_moe_routes(tokens, routing, 256, 264), routing(routing), layout(layout), clamped(clamped) {}
+
+    std::string op_desc(ggml_tensor *) override { return "GLM53_MOE_PREP"; }
+    std::string vars() override {
+        return test_moe_ffn_chain::vars() + "," + VARS_TO_STR3(routing, layout, clamped);
+    }
+    std::vector<ggml_tensor *> forward_first() override { return order; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int first = 72*((n_tokens + routing) % 4);
+        ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * ups = ggml_new_tensor_3d(ctx, layout == 4 ? GGML_TYPE_Q8_0 : type,
+                                              n_embd, n_ff + (layout == 6), n_mats);
+        if (layout == 6) {
+            ups = ggml_view_3d(ctx, ups, n_embd, n_ff, n_mats, ups->nb[1], ups->nb[2], 0);
+        }
+        ggml_tensor * ids_base = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens*(layout == 3 ? 2 : 1));
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_base, n_used, n_tokens, ids_base->nb[1], 0);
+        ggml_tensor * ids_up = layout == 3 ?
+            ggml_view_2d(ctx, ids_base, n_used, n_tokens, 2*ids_base->nb[1], 0) : ids;
+        ggml_tensor * cur_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd + (layout == 1 ? 3 : 0),
+                                                   1, n_tokens*(layout == 2 ? 2 : 1) + 1);
+        ggml_tensor * cur = ggml_view_3d(ctx, cur_base, n_embd, 1, n_tokens,
+                                         cur_base->nb[1], cur_base->nb[2], layout == 1 ? sizeof(float) : 0);
+        ggml_tensor * cur_up = layout == 2 ?
+            ggml_view_3d(ctx, cur_base, n_embd, 1, n_tokens, cur_base->nb[1], 2*cur_base->nb[2], 0) : cur;
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gates, cur, ids);
+        ggml_mul_mat_id_set_expert_range(gate, first, 288);
+        order.clear();
+        if (layout == 7) {
+            order.push_back(gate);
+            cur_up = ggml_scale_inplace(ctx, cur, -0.5f);
+            order.push_back(cur_up);
+        }
+        ggml_tensor * up = ggml_mul_mat_id(ctx, ups, cur_up, ids_up);
+        ggml_mul_mat_id_set_expert_range(up, layout == 5 ? (first + 72) % 288 : first, 288);
+        outputs = { gate, up };
+        if (clamped) {
+            gate = layout == 8 ? ggml_clamp_inplace(ctx, gate, -INFINITY, 7.0f) : ggml_clamp(ctx, gate, -INFINITY, 7.0f);
+            up = layout == 8 ? ggml_clamp_inplace(ctx, up, -7.0f, 7.0f) : ggml_clamp(ctx, up, -7.0f, 7.0f);
+            outputs.push_back(gate);
+            outputs.push_back(up);
+        }
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        outputs.push_back(out);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_glm53_moe_routes::initialize_tensors(ctx);
+        const int first = 72*((n_tokens + routing) % 4);
+        std::mt19937 rng(53073 + n_tokens*17 + routing);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || t->view_src) { continue; }
+            std::vector<int32_t> data(ggml_nelements(t));
+            std::vector<int32_t> pool(288);
+            std::iota(pool.begin(), pool.end(), 0);
+            for (int64_t token = 0; token < t->ne[1]; ++token) {
+                std::shuffle(pool.begin(), pool.end(), rng);
+                for (int slot = 0; slot < t->ne[0]; ++slot) {
+                    int id = pool[slot];
+                    if (routing == 1) { id = first + 71 - slot % 72; }
+                    if (routing == 2) { id = (first + 72 + slot) % 288; }
+                    if (routing == 3) {
+                        id = slot == 0 ? first + 71 : (first + 72 + slot) % 288;
+                    }
+                    data[token*t->ne[0] + slot] = id;
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
         }
     }
 };
@@ -10668,8 +10761,31 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 }
 
 static void add_glm_moe_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (int64_t tokens : {17, 35, 36, 37, 71, 72, 73, 107, 108, 109}) {
+        for (int routing : {0, 1, 2, 3}) {
+            cases.emplace_back(new test_glm53_moe_prep(tokens, routing, 0, false));
+            cases.emplace_back(new test_glm53_moe_prep(tokens, routing, 0, true));
+        }
+    }
+    for (int layout = 1; layout <= 8; ++layout) {
+        cases.emplace_back(new test_glm53_moe_prep(36, 0, layout, true));
+    }
+    for (int64_t tokens : {36, 72, 108}) {
+        for (int routing : {0, 1, 2}) {
+            cases.emplace_back(new test_glm53_moe_routes(tokens, routing, 256, 256, routing == 1 ? 0 : 216, 288));
+        }
+    }
+    // Expert tails around the 8- and 16-column boundaries, including a partial weight-row tile.
+    for (int64_t tail : {0, 1, 7, 8, 9, 15, 16, 17}) {
+        for (bool broadcast : {false, true}) {
+            for (int64_t rows : {256, 288}) {
+                cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, broadcast, 112 + tail,
+                    216, 288, 8, 72, rows, 256, false, 1));
+            }
+        }
+    }
     // One expert shard at 36-session decode and MTP verification widths, with spread and concentrated routing.
-    for (int64_t tokens : {36, 108}) {
+    for (int64_t tokens : {36, 72, 108}) {
         for (int routing : {0, 1}) {
             cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, tokens, 216, 288, 8, 72,
                 2048, 4096, false, routing));
@@ -10679,10 +10795,21 @@ static void add_glm_moe_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     }
 }
 
+static void add_glm_kda_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    // One rank of the 36-session workload: raw KDA gates and Q8 recurrent snapshots.
+    for (int64_t sequences : {1, 9}) {
+        for (int64_t tokens : {1, 2, 3}) {
+            cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,
+                64, 128, tokens, sequences, 3, 1, true, GGML_TYPE_Q8_0, 0, 0, -1, true));
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
     add_glm_moe_cases(test_cases);
+    add_glm_kda_cases(test_cases);
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
         for (int64_t tokens : {1, 17, 40}) {
@@ -12530,6 +12657,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k, true));
         }
     }
+    for (int k : {10, 40, 128, 296}) {
+        for (int nrows : {1, 3, 23, 69}) {
+            for (bool ties : {false, true}) {
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {154880, nrows, 1, 1}, k, ties));
+            }
+        }
+    }
     // the GLM-5.3 DSA indexer: 512 of a context's pools, at the radix path's three row widths
     for (int64_t cols : {3520, 16384, 109020}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 3, 1, 1}, 512));
@@ -13518,6 +13652,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
     add_glm_moe_cases(test_cases);
+    for (int k : {10, 40, 128, 296}) {
+        for (int nrows : {1, 3, 23, 69}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {154880, nrows, 1, 1}, k));
+        }
+    }
 
     // GLM-5.3 Flash's KDA conv-state concat (24576 channels) on one data-parallel rank of 36 sessions over four: 9
     // sequences of a decode row or an MTP verify's 3, one plane each, and one sequence's for comparison

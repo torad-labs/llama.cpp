@@ -143,13 +143,19 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 // for the store itself. Once the store is in place, binding reserves both contexts' graphs again with it, and like a
 // context's first reserve that throws std::runtime_error when the devices cannot hold them; neither context is usable
 // after such a throw, so a caller short of memory fails as it would at context creation.
-LLAMA_API bool    llama_set_nextn_source(struct llama_context * ctx_dft, struct llama_context * ctx_tgt);
+LLAMA_API bool    llama_set_nextn_source(struct llama_context * ctx_dft, struct llama_context * ctx_tgt, int32_t n_keep = 0);
+
+// Optional sequence-owned rows, separate from the two reusable batch halves. A retained binding stores short batches too.
+LLAMA_API bool    llama_nextn_keep_rows(struct llama_context * ctx_tgt, llama_seq_id seq, const int32_t * rows, int32_t n);
+LLAMA_API int32_t llama_nextn_kept_row(const struct llama_context * ctx_tgt, llama_seq_id seq, int32_t row);
+LLAMA_API bool    llama_nextn_kept_get(struct llama_context * ctx_tgt, int32_t ref, float * dst);
+LLAMA_API bool    llama_nextn_kept_set(struct llama_context * ctx_tgt, int32_t ref, const float * src);
 
 // the rows the target's last decode left in the store: its batch's row count, or 0 when it did not write the store
 LLAMA_API int32_t llama_get_nextn_store_rows(const struct llama_context * ctx_tgt);
 
 // for the head's next decode, of a batch without embd: per batch row, the target batch row whose hidden row it reads,
-// or -(c + 1) for carry row c (n_carry rows of n_embd floats in carry, at most the target's n_seq_max)
+// or -(c + 1) for host carry row c, or an owned reference from llama_nextn_kept_row (seq -1 gives zeros).
 LLAMA_API void    llama_set_nextn_h_rows(struct llama_context * ctx_dft, const int32_t * src, int32_t n,
                                          const float * carry, int32_t n_carry);
 

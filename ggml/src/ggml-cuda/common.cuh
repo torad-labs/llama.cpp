@@ -1345,11 +1345,16 @@ struct ggml_cuda_graph {
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
+        if (instance_source != nullptr && instance_source != graph) {
+            CUDA_CHECK(cudaGraphDestroy(instance_source));
+        }
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
     }
     cudaGraph_t graph = nullptr;
+    // CUPTI update callbacks can refer to the original instantiation's nodes after many updates.
+    cudaGraph_t instance_source = nullptr;
     cudaGraphExec_t instance = nullptr;
     size_t num_nodes = 0; // the captured graph's: its executable holds device memory for each (cuda_graph_make_room)
     std::vector<cudaGraphNode_t> nodes;

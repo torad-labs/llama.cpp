@@ -277,7 +277,11 @@ public:
     void set_seq_candidates(llama_seq_id seq_id, bool enable);
 
     // the MTP store (llama-ext.h): this context is the target, head its MTP head
-    bool    nextn_bind(llama_context & head);
+    bool    nextn_bind(llama_context & head, int32_t n_keep);
+    bool    nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int32_t n);
+    int32_t nextn_kept_row(llama_seq_id seq, int32_t row) const;
+    bool    nextn_kept_get(int32_t ref, float * dst);
+    bool    nextn_kept_set(int32_t ref, const float * src);
     int32_t nextn_store_rows() const;
     void    nextn_set_h_rows(const int32_t * src, int32_t n, const float * carry, int32_t n_carry);
     bool    nextn_get_rows(const int32_t * rows, int32_t n, float * dst);

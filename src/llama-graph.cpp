@@ -175,14 +175,15 @@ void llm_graph_input_nextn::set_input(const llama_ubatch * ubatch) {
     for (int64_t i = 0; i < n_tokens; ++i) {
         GGML_ASSERT((size_t) ubatch->idx[i] < nextn.src->size());
         const int32_t s = (*nextn.src)[ubatch->idx[i]];
-        GGML_ASSERT(s < nextn.n_batch && -s <= nextn.n_carry);
-        data[i] = (int32_t) (s >= 0 ? base + s : base + nextn.n_batch - s - 1);
+        GGML_ASSERT(s < nextn.n_batch && -int64_t(s) <= nextn.n_carry);
+        const bool owned = s < 0 && -int64_t(s) - 1 >= nextn.n_host;
+        data[i] = (int32_t) (s >= 0 ? base + s : (owned ? 0 : base) + nextn.n_batch - s - 1);
         if (nextn.n_devices > 1) {
             const uint32_t owner = ubatch->seq_id[i][0] % nextn.n_devices;
             if (s >= 0) {
                 const int64_t half = base/(nextn.n_batch + nextn.n_carry);
                 GGML_ASSERT(nextn.owners->at(half*nextn.n_batch + s) == owner);
-            } else {
+            } else if (!owned) {
                 const int64_t n_embd = nextn.store->ne[0];
                 const int64_t carry_row = -int64_t(s) - 1;
                 GGML_ASSERT(nextn.carry && (carry_row + 1)*n_embd <= (int64_t) nextn.carry->size());
@@ -4353,7 +4354,8 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         // unified pool of several sequences keeps them in one bank: its resident maps come from the bank or not at all
         const llama_kpool_views::view * resident_view = nullptr;
         ggml_tensor * resident_tensor = nullptr; // the view's table or the bank, after the decode's patches where it takes them
-        if (!mctx_attn->is_full() && n_ps == 1 && !kpool_resident_off() &&
+        // the graph reserved at load takes the resident path as a decode does, so its buffers are a decode's
+        if ((!mctx_attn->is_full() || !ggml_env_switch("LLAMA_KV_HOST")) && n_ps == 1 && !kpool_resident_off() &&
                 (shared || (!llm_graph_input_kpool::shared_pool(cparams, mctx_attn->get_kv()->get_kpool_views()) && (n_stream == 1 || cparams.n_seq_devices > 1)))) {
             const auto * kv = mctx_attn->get_kv();
             auto * buft = kpool_resident_buft(kv);
@@ -4513,7 +4515,8 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 const auto buft = ggml_backend_buffer_get_type(mctx_attn->get_kv()->get_k_storage(layer)->buffer);
                 auto * device = ggml_backend_buft_get_device(buft);
                 if (!device && ggml_backend_buft_is_host(buft)) device = ggml_backend_get_device(backend_cpu);
-                supported &= device && ggml_backend_dev_supports_op(device, probe);
+                supported &= device && (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+                    ggml_env_switch("LLAMA_KV_HOST")) && ggml_backend_dev_supports_op(device, probe);
             }
             if (supported) {
                 inp->tail_cells = tail;
@@ -4657,24 +4660,46 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     GGML_ASSERT(sel_mask->ne[0] >= n_kv);
 
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
     static const bool kq_add = ggml_env_switch("LLAMA_KPOOL_KQ_ADD_LEGACY");
-    const bool direct = tail_cells && cparams.flash_attn && !kq_b && !kq_add && !hparams.use_alibi &&
+    bool direct = tail_cells && cparams.flash_attn && !kq_b && !kq_add && !hparams.use_alibi &&
         hparams.swa_type == LLAMA_SWA_TYPE_NONE && hparams.n_pos_per_embd() == 1 && !hparams.attn_soft_cap &&
         sel_mask->op == GGML_OP_KPOOL_MASK;
     // Keep the resident kernel for short contexts; full-row staging stays below the direct-index cutoff.
     const int64_t direct_bound = llama_kpool_n_kv_max(top_k->ne[0], std::max<int64_t>(1, n_tail));
-    if (ggml_env_switch("LLAMA_KV_HOST") && !direct &&
-            (!cparams.flash_attn || kq_b || n_kv >= std::max<int64_t>(4096, std::min<int64_t>(kq_mask->ne[1], 8)*direct_bound))) {
-        throw std::runtime_error("host KV requires flash attention and direct sparse indices above the staging cutoff");
-    }
     ggml_tensor * sparse_indices = nullptr;
-    ggml_tensor * mask_top_k = nullptr;
     if (direct) {
         sparse_indices = ggml_kpool_indices(ctx0, sel_mask->src[0], sel_mask->src[1], top_k, tail_cells,
             sel_mask->ne[0] - n_kv, llama_kpool_n_kv_max(top_k->ne[0], tail_cells->ne[0]));
         if (shared) {
             sparse_indices = ggml_reshape_4d(ctx0, sparse_indices, sparse_indices->ne[0], kq_mask->ne[1], 1, 1);
         }
+        // Index generation support does not imply support for the consuming attention kernel.
+        auto * pq = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/k->ne[3], k->ne[3],
+                q->nb[1], q->nb[2], q->nb[3]/k->ne[3], 0);
+        pq = ggml_permute(ctx0, pq, 0, 2, 1, 3);
+        auto * pk = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        auto * pv = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        if (v->nb[1] > v->nb[2]) { pv = ggml_transpose(ctx0, pv); }
+        if (pk->type == GGML_TYPE_F32) { pk = ggml_cast(ctx0, pk, GGML_TYPE_F16); }
+        if (pv->type == GGML_TYPE_F32) { pv = ggml_cast(ctx0, pv, GGML_TYPE_F16); }
+        auto * probe = ggml_flash_attn_ext_sparse(ctx0, pq, pk, pv, sparse_indices, kq_scale);
+        ggml_flash_attn_ext_set_prec(probe, GGML_PREC_F32);
+        const auto buft = ggml_backend_buffer_get_type(mctx_cur->get_kv()->get_k_storage(il)->buffer);
+        auto * device = ggml_backend_buft_get_device(buft);
+        if (!device && ggml_backend_buft_is_host(buft)) { device = ggml_backend_get_device(backend_cpu); }
+        direct = device && ggml_backend_dev_supports_op(device, probe);
+        if (!direct) { sparse_indices = nullptr; }
+    }
+    if (ggml_env_switch("LLAMA_KV_HOST") && !direct &&
+            (!cparams.flash_attn || kq_b || n_kv >= std::max<int64_t>(4096, std::min<int64_t>(kq_mask->ne[1], 8)*direct_bound))) {
+        throw std::runtime_error("host KV requires flash attention and direct sparse indices above the staging cutoff");
+    }
+    ggml_tensor * mask_top_k = nullptr;
+    if (direct) {
         cb(sparse_indices, "kpool_indices", il);
     } else {
         // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy. Built on the device, the copy
@@ -4723,10 +4748,6 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         }
         cb(mask_top_k, "kpool_kq_mask", il);
     }
-
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     // a row's live cells: its top_k pools' cells (top_k->ne[0] = r*select_k) and its tail, positions [(q + 1)/r*r, q]
     // (kpool_mask_row), at most r - 1 cells unless a sequence holds two cells at one position (an rm + add before the first

@@ -17,7 +17,7 @@ def serving_window_seconds(profiled):
     return 360 if profiled else 240
 
 
-def profile_evidence(requested, running, record):
+def profile_evidence(requested, running, record, workload=None):
     result = dict(capture_verified=False)
     if not requested:
         return result | dict(state="not_requested")
@@ -28,9 +28,25 @@ def profile_evidence(requested, running, record):
     start = record.get("start", {})
     if start.get("exit") is not None and start["exit"] != 0:
         return result | dict(state="start_failed", exit=start["exit"])
-    if start.get("exit") == 0 and (record.get("finalize") or {}).get("report_present") is True:
-        return result | dict(state="exported_unverified")
-    return result | dict(state="invalid", reason="missing_export")
+    if start.get("exit") != 0 or (record.get("finalize") or {}).get("report_present") is not True:
+        return result | dict(state="invalid", reason="missing_export")
+    request = record.get("request") or {}
+    capture = record.get("capture") or {}
+    readiness = capture.get("readiness") or {}
+    window = readiness.get("gpu_window")
+    launch = request.get("launch_sha256")
+    if (not isinstance(launch, str) or not launch
+            or request.get("active_sessions") != 36 or capture.get("capture_verified") is not True
+            or capture.get("launch_sha256") != launch or readiness.get("usable") is not True
+            or readiness.get("expected_sequences") != 36 or readiness.get("actual_sequences") != 36
+            or not isinstance(window, dict) or not all(type(window.get(key)) is int and window[key] > 0
+                                                  for key in ("start_ns", "end_ns", "duration_ns", "kernel_count"))
+            or window["end_ns"] <= window["start_ns"]):
+        return result | dict(state="invalid", reason="unverified_gpu_capture")
+    if workload is not None and workload.get("launch_sha256") != launch:
+        return result | dict(state="invalid", reason="launch_identity_mismatch")
+    return dict(state="usable", capture_verified=True, gpu_window=window,
+                report=capture.get("report"), sqlite=capture.get("sqlite"))
 
 
 def matrix_succeeded(report):
@@ -42,12 +58,20 @@ def matrix_succeeded(report):
             return False
         expected = specification[2] + specification[3]
         rows = server.get("runs", [])
+        profile_requested = len(specification) > 4 and bool((specification[4] or {}).get("profile"))
         if not expected or len(rows) != len(expected):
             return False
-        for (active, context), row in zip(expected, rows):
+        for ordinal, ((active, context), row) in enumerate(zip(expected, rows)):
+            requested_tokens = (specification[4] or {}).get("tokens") if len(specification) > 4 else None
+            if (requested_tokens is not None and ordinal < len(specification[2])
+                    and row.get("decode_tokens") != requested_tokens):
+                return False
+            profile = row.get("profile", {})
+            expected_state = "usable" if profile_requested else "not_requested"
             if (row.get("skipped") or row.get("error") or row.get("exit") != 0 or row.get("passed") is not True
                     or (row.get("active"), row.get("context")) != (active, context)
-                    or row.get("profile", {}).get("state") not in ("not_requested", "exported_unverified", "usable")):
+                    or profile.get("state") != expected_state
+                    or profile_requested and profile.get("capture_verified") is not True):
                 return False
     return True
 

@@ -18,6 +18,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,13 @@
 #include <memory>
 #include <random>
 #include <vector>
+
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define TEST_HAS_NVTX 1
+#else
+#define TEST_HAS_NVTX 0
+#endif
 
 static constexpr int64_t n_embd  = 2048;
 static constexpr int64_t n_ff    = 4096;
@@ -50,12 +58,14 @@ static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, v
 
 struct log_counts {
     int executables  = 0; // ggml_backend_cuda_capture_end made one
+    int evicted_executables = 0;
     int hc_fused = 0;
     int not_captured = 0; // the meta backend refused a capture
     size_t p2p_bytes = 0;
     bool p2p_reported = false;
     bool p2p_unsupported = false;
     bool p2p_failed = false;
+    bool capture_details = false;
 };
 
 static void log_cb(ggml_log_level level, const char * text, void * user_data) {
@@ -63,6 +73,10 @@ static void log_cb(ggml_log_level level, const char * text, void * user_data) {
     if (strstr(text, "captured LL collective + HC_POST") != nullptr) { counts->hc_fused++; }
     if (strstr(text, "ggml_backend_cuda_capture_end") != nullptr && strstr(text, " nodes, ") != nullptr) {
         counts->executables++;
+    }
+    if (strstr(text, "layer=meta event=evict") != nullptr) {
+        const char * size = strstr(text, "executables=");
+        if (size) { counts->evicted_executables += atoi(size + strlen("executables=")); }
     }
     if (strstr(text, "not captured") != nullptr) {
         counts->not_captured++;
@@ -75,7 +89,9 @@ static void log_cb(ggml_log_level level, const char * text, void * user_data) {
     counts->p2p_unsupported |= unsupported;
     const bool error = level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR;
     counts->p2p_failed |= error && strstr(text, "ggml_cuda_ar_p2p_init") != nullptr;
-    if (error || p2p != nullptr || unsupported) {
+    const bool capture_detail = strstr(text, "layer=meta ") || strstr(text, "layer=cuda_outer ") ||
+        strstr(text, "ggml_backend_cuda_capture_end");
+    if (error || p2p != nullptr || unsupported || (counts->capture_details && capture_detail)) {
         fputs(text, stderr);
     }
 }
@@ -260,11 +276,16 @@ static bool check_collective_hint_scope(const std::vector<ggml_backend_dev_t> & 
 }
 
 // CPU bridges split each identity chain into multiple meta graphs that must survive together in the capture cache.
-static bool check_split_capture(std::vector<ggml_backend_dev_t> gpus, int n_fragments) {
+static bool check_split_capture(std::vector<ggml_backend_dev_t> gpus, int n_fragments, bool stress = false, bool transition = false) {
     constexpr int width = 128;
     constexpr int n_graphs = 5;
+    std::vector<int> fragments(n_graphs, n_fragments);
+    if (transition) {
+        std::fill(fragments.begin() + 1, fragments.end(), 1);
+    }
     int n_devices = (int) gpus.size();
     log_counts counts;
+    counts.capture_details = stress;
     ggml_log_set(log_cb, &counts);
     ggml_backend_dev_t meta = ggml_backend_meta_device(gpus.data(), n_devices, split_by_name, (void *) &n_devices);
     ggml_backend_t backend = ggml_backend_dev_init(meta, nullptr);
@@ -292,47 +313,85 @@ static bool check_split_capture(std::vector<ggml_backend_dev_t> gpus, int n_frag
     ggml_backend_sched_t scheds[n_graphs];
     bool ok = true;
     for (int slot = 0; slot < n_graphs; ++slot) {
-        contexts[slot] = ggml_init({(4*n_fragments + 1)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        // One large graph and small companions exercise capture residency without loading model weights.
+        const int depth = stress && slot == 0 ? 4 : 1;
+        const int extra_ops = stress && slot == 0 ? 512 : 0;
+        const int graph_nodes = (4*depth + extra_ops)*fragments[slot];
+        const int graph_size = std::max(GGML_DEFAULT_GRAPH_SIZE, graph_nodes + 16);
+        contexts[slot] = ggml_init({(graph_nodes + 1)*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false), nullptr, true});
         auto * ctx = contexts[slot];
-        scheds[slot] = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
-        inputs[slot] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, slot + 1);
+        scheds[slot] = ggml_backend_sched_new(backends, nullptr, 2, graph_size, false, true);
+        inputs[slot] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, stress ? 108 : slot + 1);
         ggml_set_input(inputs[slot]);
         ggml_tensor * cur = inputs[slot];
-        for (int fragment = 0; fragment < n_fragments; ++fragment) {
-            ggml_tensor * residual = cur;
-            cur = ggml_mul_mat(ctx, up, cur);
-            ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
-            cur = ggml_mul_mat(ctx, down, cur);
-            ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
-            cur = ggml_add(ctx, cur, residual);
-            ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
-            cur = ggml_scale(ctx, cur, 0.5f);
-            ggml_backend_sched_set_tensor_backend(scheds[slot], cur, fragment + 1 < n_fragments ? cpu : backend);
+        for (int fragment = 0; fragment < fragments[slot]; ++fragment) {
+            for (int op = 0; op < extra_ops; ++op) {
+                cur = ggml_scale(ctx, cur, -1.0f);
+                ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
+            }
+            for (int layer = 0; layer < depth; ++layer) {
+                ggml_tensor * residual = cur;
+                cur = ggml_mul_mat(ctx, up, cur);
+                ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
+                cur = ggml_mul_mat(ctx, down, cur);
+                ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
+                cur = ggml_add(ctx, cur, residual);
+                ggml_backend_sched_set_tensor_backend(scheds[slot], cur, backend);
+                cur = ggml_scale(ctx, cur, 0.5f);
+                const bool bridge = layer + 1 == depth && fragment + 1 < fragments[slot];
+                ggml_backend_sched_set_tensor_backend(scheds[slot], cur, bridge ? cpu : backend);
+            }
         }
         outputs[slot] = cur;
         ggml_set_output(cur);
-        graphs[slot] = ggml_new_graph(ctx);
+        graphs[slot] = ggml_new_graph_custom(ctx, graph_size, false);
         ggml_build_forward_expand(graphs[slot], cur);
         GGML_ASSERT(ggml_backend_sched_alloc_graph(scheds[slot], graphs[slot]));
         const int splits = ggml_backend_sched_get_n_splits(scheds[slot]);
-        if (splits != 2*n_fragments - 1) {
+        if (splits != 2*fragments[slot] - 1) {
             fprintf(stderr, "FAIL %d fragments: scheduler made %d splits, expected %d\n",
-                n_fragments, splits, 2*n_fragments - 1);
+                fragments[slot], splits, 2*fragments[slot] - 1);
             ok = false;
         }
     }
 
+    const auto memory = [&](const char * phase) {
+        if (!stress) { return; }
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(gpus[0], &free_bytes, &total_bytes);
+        printf("split_memory phase=%s free_bytes=%zu total_bytes=%zu\n", phase, free_bytes, total_bytes);
+        fflush(stdout);
+    };
+    memory("allocated");
     const bool legacy = ggml_env_switch("GGML_META_CAPTURE_LEGACY");
     int n_eval = 0;
-    auto run = [&](int slot, int expected_captures) {
+    int expected_fragments = 0;
+    int last_expected_captures = 0;
+    auto run = [&](int slot, int expected_captures, const char * phase) {
         std::vector<float> input(ggml_nelements(inputs[slot]));
         ++n_eval;
         for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int((i + 7*n_eval)%31) - 15)/16.0f; }
         ggml_backend_tensor_set(inputs[slot], input.data(), 0, ggml_nbytes(inputs[slot]));
+        char label[96];
+        snprintf(label, sizeof(label), "meta-split phase=%s slot=%d", phase, slot);
+#if TEST_HAS_NVTX
+        if (stress) { nvtxRangePushA(label); }
+#endif
+        const int64_t start = ggml_time_us();
         const bool computed = ggml_backend_sched_graph_compute(scheds[slot], graphs[slot]) == GGML_STATUS_SUCCESS;
         std::vector<float> output(input.size());
         ggml_backend_tensor_get(outputs[slot], output.data(), 0, ggml_nbytes(outputs[slot]));
-        const int expected = legacy ? 0 : expected_captures*n_fragments*n_devices;
+        const int64_t elapsed = ggml_time_us() - start;
+#if TEST_HAS_NVTX
+        if (stress) { nvtxRangePop(); }
+#endif
+        if (stress) {
+            printf("split_eval phase=%s slot=%d host_us=%lld\n", phase, slot, (long long) elapsed);
+            fflush(stdout);
+        }
+        expected_fragments += (expected_captures - last_expected_captures)*fragments[slot];
+        last_expected_captures = expected_captures;
+        const int expected = legacy ? 0 : expected_fragments*n_devices;
         const bool passed = computed && output == input && counts.executables == expected && counts.not_captured == 0;
         if (!passed) {
             fprintf(stderr, "FAIL %d fragments, slot %d: identity=%d, executables=%d (expected %d), refused=%d\n",
@@ -340,17 +399,40 @@ static bool check_split_capture(std::vector<ggml_backend_dev_t> gpus, int n_frag
         }
         ok = ok && passed;
     };
-    for (int slot = 0; slot < 4; ++slot) { run(slot, 0); }
-    for (int slot = 0; slot < 4; ++slot) { run(slot, slot + 1); }
+    for (int slot = 0; slot < 4; ++slot) { run(slot, 0, "warmup"); }
+    memory("warmup");
+    for (int slot = 0; slot < 4; ++slot) { run(slot, slot + 1, "capture"); }
+    memory("captured");
     std::mt19937 rng(17);
-    for (int i = 0; i < 24; ++i) { run(rng()%4, 4); }
-    for (int slot = 0; slot < 4; ++slot) { run(slot, 4); } // slot 0 is now the oldest
-    run(4, 4);
-    run(4, 5);
-    run(4, 5);
-    run(0, 5);
-    run(0, 6);
-    run(0, 6);
+    for (int i = 0; i < 24; ++i) { run(rng()%4, 4, "replay"); }
+    for (int slot = 0; slot < 4; ++slot) { run(slot, 4, "replay"); } // slot 0 is now the oldest
+    memory("steady");
+    run(4, 4, "evict");
+    // Four newer logical graphs must retire the old wide graph, not retain its
+    // executables under a historical 4*max_fragments budget.
+    if (transition && !legacy && ggml_env_switch("GGML_GRAPH_TRACE") &&
+            counts.evicted_executables != fragments[0]*n_devices) {
+        fprintf(stderr, "FAIL wide-to-narrow: retired %d executables, expected %d\n",
+                counts.evicted_executables, fragments[0]*n_devices);
+        ok = false;
+    }
+    run(4, 5, "capture");
+    run(4, 5, "replay");
+    run(0, 5, "evict");
+    run(0, 6, "capture");
+    run(0, 6, "replay");
+    memory("recaptured");
+    if (stress) {
+        for (int cycle = 0; cycle < 15; ++cycle) {
+            const int slot = (cycle + 1)%n_graphs;
+            run(slot, 6 + cycle, "churn-warmup");
+            run(slot, 7 + cycle, "churn-capture");
+            run(slot, 7 + cycle, "churn-replay");
+            char phase[32];
+            snprintf(phase, sizeof(phase), "churn-%d", cycle);
+            memory(phase);
+        }
+    }
 
     for (int slot = 0; slot < n_graphs; ++slot) {
         ggml_backend_sched_free(scheds[slot]);
@@ -366,12 +448,14 @@ static bool check_split_capture(std::vector<ggml_backend_dev_t> gpus, int n_frag
 }
 
 int main(int argc, char ** argv) {
+    const bool transition = argc == 2 && strcmp(argv[1], "--split-transition") == 0;
+    const bool stress = argc == 2 && strcmp(argv[1], "--split-stress") == 0;
     const bool split_only = argc == 2 && strcmp(argv[1], "--split-capture") == 0;
     const bool logical = argc == 3 && strcmp(argv[1], "--logical") == 0;
     const bool physical = argc == 3 && strcmp(argv[1], "--devices") == 0;
-    const int n_devices = logical || physical ? atoi(argv[2]) : 2;
-    if ((argc != 1 && !logical && !physical && !split_only) || n_devices < 2 || n_devices > 4) {
-        fprintf(stderr, "usage: %s [--devices 2|3|4 | --logical 2|3|4 | --split-capture]\n", argv[0]);
+    const int n_devices = logical || physical ? atoi(argv[2]) : stress ? 4 : 2;
+    if ((argc != 1 && !logical && !physical && !split_only && !stress && !transition) || n_devices < 2 || n_devices > 4) {
+        fprintf(stderr, "usage: %s [--devices 2|3|4 | --logical 2|3|4 | --split-capture | --split-stress | --split-transition]\n", argv[0]);
         return 1;
     }
     std::vector<ggml_backend_dev_t> gpus;
@@ -393,6 +477,8 @@ int main(int argc, char ** argv) {
         gpus.push_back(gpus[rank % n_physical]);
     }
     printf("meta backend over %d ranks on %zu physical GPUs\n", n_devices, n_physical);
+    if (transition) { return check_split_capture(gpus, 11, false, true) ? 0 : 1; }
+    if (stress) { return check_split_capture(gpus, 11, true) ? 0 : 1; }
     bool split_ok = true;
     for (int fragments : {5, 11}) { split_ok = check_split_capture(gpus, fragments) && split_ok; }
     if (split_only) { return split_ok ? 0 : 1; }

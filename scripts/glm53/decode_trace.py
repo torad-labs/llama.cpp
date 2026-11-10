@@ -28,17 +28,25 @@ TABLES = {
 }
 
 
-def capture_readiness(db, devices):
-    """Reject startup/probe exports without model phase markers and kernels from the same process on every card."""
+def capture_readiness(db, devices, *, expected_sequences=None):
+    """Require phase-correlated CUDA kernels for one decode window; host spans never provide its duration."""
     expected = set(devices)
     if not expected or any(type(d) is not int or d < 0 for d in expected):
         raise ValueError('expected devices must be nonnegative device IDs')
+    if expected_sequences is not None and (type(expected_sequences) is not int or expected_sequences < 1):
+        raise ValueError('expected sequences must be a positive integer')
     required = {
-        'CUPTI_ACTIVITY_KIND_KERNEL': {'start', 'end', 'deviceId', 'globalPid'},
+        'CUPTI_ACTIVITY_KIND_KERNEL': {'start', 'end', 'deviceId', 'globalPid', 'correlationId'},
+        'CUPTI_ACTIVITY_KIND_RUNTIME': {'start', 'end', 'globalTid', 'correlationId'},
         'NVTX_EVENTS': {'start', 'end', 'globalTid', 'text', 'textId'},
     }
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    result = dict(usable=False, expected_devices=sorted(expected), kernel_counts={}, phase_markers=0,
+    if "DIAGNOSTIC_EVENT" in tables:
+        required["DIAGNOSTIC_EVENT"] = {"severity", "text", "globalPid"}
+    result: dict[str, Any] = dict(usable=False, expected_devices=sorted(expected),
+                  expected_sequences=expected_sequences, actual_sequences=None, actual_rows=None,
+                  kernel_counts={str(device): 0 for device in sorted(expected)}, phase_markers=0,
+                  processes={}, gpu_window=None, profiler_diagnostics=[],
                   missing_tables=sorted(set(required)-tables), missing_columns={},
                   note='Capture integrity only; does not qualify model correctness, throughput or capacity.')
     for table, fields in required.items():
@@ -48,25 +56,76 @@ def capture_readiness(db, devices):
                 result['missing_columns'][table] = sorted(fields-available)
     if result['missing_tables'] or result['missing_columns']:
         return result
+    blocked_processes = set()
+    if "DIAGNOSTIC_EVENT" in tables:
+        for severity, message, pid, count in db.execute(
+                "SELECT severity,text,globalPid,COUNT(*) FROM DIAGNOSTIC_EVENT WHERE severity>=2 "
+                "GROUP BY severity,text,globalPid"):
+            text = (message or "").lower()
+            blocking = severity >= 3 or ("cuda driver" in text and "not supported" in text) or any(
+                warning in text for warning in ("not all cuda events", "not all nvtx events"))
+            result["profiler_diagnostics"].append(dict(
+                severity=severity, text=message, global_pid=pid, count=count, blocking=blocking))
+            if blocking:
+                blocked_processes.add(pid)
     strings = dict(db.execute('SELECT id,value FROM StringIds')) if 'StringIds' in tables else {}
-    processes = {}
+    phases, batches = [], []
     for start, end, tid, label, label_id in db.execute('SELECT start,end,globalTid,text,textId FROM NVTX_EVENTS'):
         fields = parse_marker(label or strings.get(label_id, ''))
-        if fields and fields['stage'] in ('proposal', 'target_eval', 'catchup') and tid is not None and start is not None:
+        if not fields or tid is None or start is None:
+            continue
+        if fields['stage'] == 'batch':
+            batches.append(dict(start=start, tid=tid, **fields))
+        elif fields['stage'] == 'target_eval' and end is not None and end > start:
             result['phase_markers'] += 1
-            pid = (int(tid) >> 24) << 24
-            processes[pid] = min(start, processes.get(pid, start))
-    # Startup work and separate preflight processes cannot supply missing decode devices.
-    # GPU work may finish after a host scope, so this is only a lower bound, not phase attribution.
-    by_process = {}
-    for pid, first_phase in processes.items():
-        by_process[pid] = dict(db.execute('SELECT deviceId,COUNT(*) FROM CUPTI_ACTIVITY_KIND_KERNEL '
-                                         'WHERE globalPid=? AND start>=? AND end>start GROUP BY deviceId',
-                                         (pid, first_phase)))
-    result['processes'] = {str(pid): {str(d): n for d, n in counts.items()} for pid, counts in by_process.items()}
-    for device in expected:
-        result['kernel_counts'][str(device)] = sum(counts.get(device, 0) for counts in by_process.values())
-    result['usable'] = any(expected <= set(counts) for counts in by_process.values())
+            phases.append(dict(start=start, end=end, tid=tid, pid=(int(tid) >> 24) << 24, rows=fields.get('rows')))
+    for phase in phases:
+        # A surviving kernel window cannot establish integrity when the collector reports
+        # unsupported tracing or lost events for that process (or for the whole session).
+        if blocked_processes.intersection((None, 0, phase['pid'])):
+            continue
+        cohort = [batch for batch in batches
+                  if batch['tid'] == phase['tid'] and phase['start'] <= batch['start'] <= phase['end']]
+        if not cohort or any(type(batch.get('sequence')) is not int or batch['sequence'] < 0
+                             or type(batch.get('rows')) is not int or batch['rows'] < 1
+                             or batch.get('prompt_rows') != 0 for batch in cohort):
+            continue
+        sequences = {batch['sequence'] for batch in cohort}
+        if (len(sequences) != len(cohort) or sum(batch['rows'] for batch in cohort) != phase['rows']
+                or expected_sequences is not None and len(sequences) != expected_sequences):
+            continue
+        result['actual_sequences'] = len(sequences)
+        result['actual_rows'] = phase['rows']
+        result['sequence_ids'] = sorted(sequences)
+        # GPU launches can run on worker threads in the same process.
+        launches = [row for row in db.execute(
+            'SELECT start,end,globalTid,correlationId FROM CUPTI_ACTIVITY_KIND_RUNTIME '
+            'WHERE (globalTid >> 24)=? AND start>=? AND end<=? AND end>start AND correlationId IS NOT NULL',
+            (phase['pid'] >> 24, phase['start'], phase['end']))]
+        launch_starts = {row[3]: row[0] for row in launches}
+        correlations = set(launch_starts)
+        if not correlations:
+            continue
+        placeholders = ','.join('?' for _ in correlations)
+        kernels = [row for row in db.execute(
+            'SELECT start,end,deviceId,globalPid,correlationId FROM CUPTI_ACTIVITY_KIND_KERNEL '
+            f'WHERE globalPid=? AND correlationId IN ({placeholders}) AND end>start',
+            (phase['pid'], *correlations)) if row[0] >= launch_starts[row[4]]]
+        by_device = {device: [row for row in kernels if row[2] == device] for device in expected}
+        result['processes'][str(phase['pid'])] = {str(device): len(rows) for device, rows in by_device.items()}
+        for device, rows in by_device.items():
+            result['kernel_counts'][str(device)] += len(rows)
+        if not all(by_device.values()):
+            continue
+        gpu_events = [row for rows in by_device.values() for row in rows]
+        start = min(row[0] for row in gpu_events)
+        end = max(row[1] for row in gpu_events)
+        if end <= start:
+            continue
+        result['actual_rows'] = phase['rows']
+        result['gpu_window'] = dict(start_ns=start, end_ns=end, duration_ns=end-start, kernel_count=len(gpu_events))
+        result['usable'] = True
+        return result
     return result
 
 

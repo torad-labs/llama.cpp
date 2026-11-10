@@ -1,6 +1,7 @@
 """Run an explicit serving plan on an already approved box; no rental or download.
 One server at a time, guarded at 4096 MiB free per card. Completion markers request teardown, never certify success."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -82,15 +83,17 @@ class Server:
         self.minimum = [None]*4
         params = ['--profile', 'dp-4', '--slots', str(SLOTS), '--mtp-depth', depth, '--port', str(PORT),
                   '--model', str(MODEL), '--server', str(self.binary/'llama-server')] + ((extra or {}).get('serve') or [])
-        command, settings = serve.make_plan(serve.arguments(params))
+        args = serve.arguments(params)
+        if (extra or {}).get('profile'):
+            args.trace_decode = True
+        args.transport = serve.resolve_transport(args, (extra or {}).get('allreduce'))
+        command, settings = serve.make_plan(args)
         settings['CUDA_VISIBLE_DEVICES'] = ','.join(CARD_UUIDS)
-        collective = (extra or {}).get('allreduce', 'internal')
-        if collective not in ('internal', 'internal-nccl-gather'):
-            raise ValueError('serving qualification preserves internal numeric reductions')
-        settings['GGML_CUDA_ALLREDUCE'] = collective
-        command = command + ((extra or {}).get('args') or [])
+        command = serve.resolve_server_arguments(command, settings) + ((extra or {}).get('args') or [])
         # A profiled server runs under an Nsight session whose collection starts only in the decode window (workload).
         self.session = self.label if (extra or {}).get('profile') else None
+        self.nsys_shutdown = None
+        self.shutdown_lock = threading.Lock()
         if self.session:
             command = ['nsys', 'launch', '--session-new='+self.session, '--wait=all', '--trace=cuda,nvtx',
                        '--cuda-graph-trace=node', '--cuda-flush-interval=1000'] + command
@@ -104,6 +107,14 @@ class Server:
         self.guard.start()
 
     def kill(self, sig=signal.SIGTERM):
+        if self.session:
+            from measure import shutdown_nsys_session
+            with self.shutdown_lock:
+                if self.nsys_shutdown is None:
+                    self.nsys_shutdown = shutdown_nsys_session(self.session)
+                    write(self.folder/'nsys-shutdown.json', self.nsys_shutdown)
+                    if self.nsys_shutdown.get('exit') != 0:
+                        self.failure = self.failure or 'profiler_shutdown_failed'
         if self.proc.poll() is None:
             try:
                 os.killpg(self.proc.pid, sig)
@@ -197,11 +208,15 @@ def processing_slots():
 
 
 def profile_decode(server, name, active, cancelled, window=4.0):
-    """Capture `window` seconds of steady decode: after the prefill group, once every session is generating."""
-    from measure import finish_nsys_capture
-    record = dict(name=name)
+    """Capture one verified GPU decode window after all requested sessions are processing."""
+    from measure import export_nsys_capture, finish_nsys_capture, nsys_version
     output = server.folder/f'{name}-decode'
+    record = dict(name=name, request=dict(active_sessions=active, expected_devices=list(range(len(CARD_UUIDS))),
+                  device_uuids=CARD_UUIDS, launch_sha256=hashlib.sha256((server.folder/'launch.json').read_bytes()).hexdigest(),
+                  window_seconds=window, capture_nsys=nsys_version()))
     try:
+        if active != SLOTS:
+            raise RuntimeError('profile_requires_36_active_sessions')
         end = min(a.deadline, time.time()+300)
         while not (out/name/'warmup.json').exists() and time.time() < end and server.proc.poll() is None and not cancelled.is_set():
             cancelled.wait(0.2)
@@ -224,7 +239,9 @@ def profile_decode(server, name, active, cancelled, window=4.0):
         if r.returncode == 0:
             cancelled.wait(min(window, max(0, a.deadline-time.time())))
             record['stop_epoch'] = time.time()
-            record['finalize'] = finish_nsys_capture(server.proc, server.session, output, min(a.deadline, time.time()+240))
+            export_deadline = min(a.deadline, time.time()+240)
+            record['finalize'] = finish_nsys_capture(server.proc, server.session, output, export_deadline)
+            record['capture'] = export_nsys_capture(output, record['request']['expected_devices'], record['request'], export_deadline)
     except Exception as exc:
         record['error_kind'] = type(exc).__name__
         record['error'] = str(exc)
@@ -262,13 +279,14 @@ def workload(server, active, context, tokens=256):
     result = json.loads(path.read_text()) if path.exists() else {}
     profile_path = server.folder/f'{name}-profile.json'
     profile_record = json.loads(profile_path.read_text()) if profile_path.exists() and not (capture and capture.is_alive()) else None
-    evidence = profile_evidence(bool(server.session), bool(capture and capture.is_alive()), profile_record)
+    evidence = profile_evidence(bool(server.session), bool(capture and capture.is_alive()), profile_record, result)
     row = dict(name=name, active=active, context=context, exit=r.returncode, passed=r.returncode == 0 and result.get('passed') is True,
         profile=evidence,
         error=result.get('error'), per_stream_tps=result.get('median_stream_tokens_per_second'),
         aggregate_tps=(result.get('common_decode') or {}).get('tokens_per_second'),
         wall_tps=(result.get('wall') or {}).get('tokens_per_second'),
         initial_prompt_tokens=result.get('initial_prompt_tokens'), decode_prompt_tokens=result.get('decode_prompt_tokens'),
+        decode_tokens=result.get('decode_tokens'),
         warmup_seconds=result.get('warmup_seconds'), warmup_generated_tokens=result.get('warmup_generated_tokens'),
         drafted=result.get('draft_n'), accepted=result.get('draft_n_accepted'), minimum_free_mib=list(server.minimum))
     if server.failure or server.proc.poll() is not None:
@@ -299,7 +317,10 @@ try:
         try:
             server.ready()
             entry.update(ready_seconds=server.ready_seconds, short_ok=server.short_ok)
-            legs = [(active, context, 256, 0) for active, context in short]
+            tokens = (extra or {}).get("tokens", 256)
+            if type(tokens) is not int or tokens < 1:
+                raise ValueError("decode token count must be a positive integer")
+            legs = [(active, context, tokens, 0) for active, context in short]
             legs += [(active, context, 128, 1500) for active, context in long]
             for active, context, tokens, reserve in legs:
                 if a.deadline - time.time() < reserve:
@@ -307,7 +328,8 @@ try:
                     continue
                 row = workload(server, active, context, tokens=tokens)
                 entry['runs'].append(row)
-                if not row['passed'] or row['profile']['state'] in ('start_failed', 'invalid'):
+                expected_profile = 'usable' if server.session else 'not_requested'
+                if not row['passed'] or row['profile']['state'] != expected_profile:
                     raise RuntimeError(f'{row["name"]} failed; see workload summary and profile state')
         except Exception as exc:
             entry['error'] = f'{type(exc).__name__}: {exc}'
