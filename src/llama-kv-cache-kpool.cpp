@@ -1677,6 +1677,40 @@ void llama_kpool_draft::capture_backend(llama_seq_id seq, llama_pos pos, int64_t
     rows[seq] = {pos, step, n_kv, {}, store, offset};
 }
 
+void llama_kpool_draft::capture_backend_rows(const llama_seq_id * seqs, const llama_pos * positions, size_t n, int64_t n_kv,
+        ggml_tensor * source, ggml_backend_t backend, uint32_t slots, uint32_t devices) {
+    if (devices > 1 || slots == 1 || ggml_env_switch("LLAMA_KPOOL_DRAFT_BANK_LEGACY")) {
+        for (size_t i = 0; i < n; ++i) {
+            capture_backend(seqs[i], positions[i], n_kv, source, i, backend, slots, devices);
+        }
+        return;
+    }
+    if (!active()) return;
+    GGML_ASSERT(source->type == GGML_TYPE_I32 && ggml_is_contiguous(source) && (int64_t) n <= ggml_nrows(source));
+    const int64_t width = source->ne[0];
+    const auto buft = ggml_backend_buffer_get_type(source->buffer);
+    if (!bank || bank->tensor->ne[0] != width || bank->tensor->ne[1] != slots || ggml_backend_buffer_get_type(bank->buffer) != buft) {
+        bank = std::make_shared<llama_kpool_backend_tensor>(buft, width, slots);
+    }
+    ggml_context * ctx = ggml_init({2*n*ggml_tensor_overhead(), nullptr, true});
+    for (size_t a = 0, b; a < n; a = b) {
+        b = a + 1;
+        while (b < n && seqs[b] == seqs[b - 1] + 1) { ++b; }
+        GGML_ASSERT(seqs[a] >= 0 && uint32_t(seqs[b - 1]) < slots);
+        auto * rows_dst = ggml_view_1d(ctx, bank->tensor, width*(b - a), seqs[a]*width*sizeof(int32_t));
+        auto * rows_src = ggml_view_1d(ctx, source, width*(b - a), a*width*sizeof(int32_t));
+        GGML_ASSERT(ggml_backend_view_init(rows_dst) == GGML_STATUS_SUCCESS);
+        GGML_ASSERT(ggml_backend_view_init(rows_src) == GGML_STATUS_SUCCESS);
+        // Copy before the source graph can reset, ordered on its producing backend.
+        if (backend) ggml_backend_tensor_copy_async(backend, backend, rows_src, rows_dst);
+        else ggml_backend_tensor_copy(rows_src, rows_dst);
+        for (size_t i = a; i < b; ++i) {
+            rows[seqs[i]] = {positions[i], step, n_kv, {}, bank, size_t(seqs[i])*width};
+        }
+    }
+    ggml_free(ctx);
+}
+
 std::shared_ptr<llama_kpool_backend_tensor> llama_kpool_draft::backend_row(llama_seq_id seq) const {
     const auto it = rows.find(seq);
     return it == rows.end() ? nullptr : it->second.backend;

@@ -47,6 +47,11 @@ public:
     void capture(llama_seq_id seq, llama_pos pos, int64_t n_kv, const std::vector<int32_t> & cells);
     void capture_backend(llama_seq_id seq, llama_pos pos, int64_t n_kv, ggml_tensor * source, int64_t row,
             ggml_backend_t backend = nullptr, uint32_t slots = 1, uint32_t devices = 1);
+    // Every row of source at once, row i for seqs[i]. One device of sequences with several slots keeps the rows in one
+    // bank of [width, slots], and a run of rows whose sequences are neighbours is one copy: a store and a copy a
+    // sequence were 46 a step at 23 sequences. LLAMA_KPOOL_DRAFT_BANK_LEGACY=1: a store and a copy a sequence
+    void capture_backend_rows(const llama_seq_id * seqs, const llama_pos * positions, size_t n, int64_t n_kv,
+            ggml_tensor * source, ggml_backend_t backend, uint32_t slots, uint32_t devices);
     std::shared_ptr<llama_kpool_backend_tensor> backend_row(llama_seq_id seq) const;
     bool can_reuse(const llama_ubatch & ubatch, int64_t n_kv, int64_t width, uint32_t kpool) const;
     void copy(const llama_ubatch & ubatch, int32_t * dst) const;
