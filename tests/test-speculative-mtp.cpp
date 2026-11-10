@@ -1790,14 +1790,8 @@ static bool test_prepared_weights(llama_model *) {
             if (layer.ssm_q_conv && !layer.ssm_qkv_conv) { return fail("KDA convolution weights were not prepared"); }
             if (layer.indexer_comp_ape && !layer.indexer_comp_ape_transposed) { return fail("indexer APE was not prepared"); }
         }
-        // The shared pool keeps its 256-cell padding here. Open defect, not this check's subject: at four CPU ranks a
-        // tensor-split context whose cache length is padded well past its used cells returns NaN logits, with the
-        // prefill padding (a 300-token read in 512-row steps, as on main since Nov 1) as with the shared pool's (three
-        // sequences, 1,024 cells, a 150-token read in 64-row steps). Two CPU ranks, one, and four ranks on a GPU do not
-        set_env("LLAMA_KV_PAD_SHARED_LEGACY", "1");
         server_rig ref(legacy.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, mode == LLAMA_SPLIT_MODE_DATA);
         server_rig packed(prepared.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, mode == LLAMA_SPLIT_MODE_DATA);
-        set_env("LLAMA_KV_PAD_SHARED_LEGACY", nullptr);
         std::mt19937 rng_ref(5), rng_packed(5);
         for (llama_seq_id s = 0; s < N_SEQ; ++s) {
             ref.request(s, rng_ref, 150 + 17*s);
