@@ -1954,7 +1954,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     };
     const bool mtp_shape = graph_slot_mtp_seq_tokens > 0 && ubatch.equal_seqs() &&
         ubatch.n_seq_tokens <= graph_slot_mtp_seq_tokens && ubatch.n_tokens <= graph_slot_max_rows;
-    const bool use_slots = !graph_reuse_disable && (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape) && sampling_can_retain();
+    const bool prompt_shape = graph_prompt_shapes && ubatch.n_seqs == 1 && ubatch.n_tokens > graph_slot_max_tokens &&
+        ubatch.n_tokens <= graph_prompt_shape_max && (ubatch.n_tokens & (ubatch.n_tokens - 1)) == 0;
+    const bool use_slots = !graph_reuse_disable && (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape || prompt_shape) &&
+        sampling_can_retain();
 
     bool reuse = !graph_reuse_disable && res->can_reuse(gparams);
     for (size_t i = 0; !reuse && use_slots && i < graph_slots.size(); ++i) {
@@ -2016,12 +2019,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             sched_gf = sched.get();
             t_used = nullptr;
             gparams = graph_params(res, ubatch, mctx, gtype);
-            LLAMA_LOG_WARN("%s: MTP shape with %u rows uses the main scheduler (graph slot memory limit)\n", __func__, ubatch.n_tokens);
+            LLAMA_LOG_WARN("%s: %s shape with %u rows uses the main scheduler (graph slot memory limit)\n", __func__,
+                    prompt_shape ? "prompt" : "MTP", ubatch.n_tokens);
         };
 
+        // a prompt shape is not held to the slots' size: there are as many as powers of two up to
+        // graph_prompt_shape_max, with and without the prompt's last row
         ggml_backend_sched_ptr measure;
         const auto retained_sched = sched_gf;
-        if (t_used && ubatch.n_tokens > graph_slot_max_tokens) {
+        if (t_used && ubatch.n_tokens > graph_slot_max_tokens && !prompt_shape) {
             // A size-only reserve changes allocator state without allocating its buffers.
             measure.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                     sched_max_nodes, false, cparams.op_offload));
@@ -2073,10 +2079,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 owners += (owners.empty() ? "" : ",") + std::to_string(rows);
             }
         }
-        LLAMA_LOG_INFO("graph_trace layer=llama event=%s context=%p result=%p uid=%llu phase=%s rows=%u outputs=%u owners=%s slots=%zu slots_allowed=%d nodes=%d\n",
+        // a built graph's buffer, the largest of its backends' (a meta backend's is a device's): what a retained graph holds
+        double buf_mib = 0.0;
+        if (!reuse) {
+            for (ggml_backend_t backend : backend_ptrs) {
+                buf_mib = std::max(buf_mib, ggml_backend_sched_get_buffer_size(sched_res, backend)/1048576.0);
+            }
+        }
+        LLAMA_LOG_INFO("graph_trace layer=llama event=%s context=%p result=%p uid=%llu phase=%s rows=%u seqs=%u outputs=%u owners=%s slots=%zu slots_allowed=%d nodes=%d buf_mib=%.1f\n",
             reuse ? "reuse" : "build", (void *) this, (void *) res, (unsigned long long) gf->uid,
-            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft" : "target", ubatch.n_tokens, gparams.n_outputs,
-            owners.empty() ? "none" : owners.c_str(), graph_slots.size(), (int) use_slots, ggml_graph_n_nodes(gf));
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft" : "target", ubatch.n_tokens, ubatch.n_seqs, gparams.n_outputs,
+            owners.empty() ? "none" : owners.c_str(), graph_slots.size(), (int) use_slots, ggml_graph_n_nodes(gf), buf_mib);
     }
 
     // set the input data for the input tensors

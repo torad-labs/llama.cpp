@@ -544,6 +544,173 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
 #endif
 }
 
+// LLAMA_PROMPT_SHAPES=1 changes which rows a decode's ubatches hold (a prompt's rows apart from the replies', in a few
+// sizes), never what a sequence reads: its logits and its states are those of a context without the switch, with the
+// switch alone and beside LLAMA_GRAPH_ANY_SEQS=1, and a rollback after a prompt read that way is as valid. The same
+// rows in other ubatches are other sums, so the bounds are not the 1e-7 and 1e-6 of a context that cuts its batches
+// the same way: over 136 generated models the logits differed by up to 1.2e-7 and a state, carried over 131 rows cut
+// elsewhere, by up to 1.2e-6 (one model; 6.2e-7 on the others). The bounds are 100 times that.
+static bool test_prompt_shapes(const common_params & params, llama_model * model, const int n_vocab) {
+#ifdef _WIN32
+    GGML_UNUSED(params);
+    GGML_UNUSED(model);
+    GGML_UNUSED(n_vocab);
+    fprintf(stderr, "%s : skipping on windows, which has no setenv\n", __func__);
+    return true;
+#else
+    constexpr uint32_t n_seqs = 4;
+    constexpr float    eps          = 1e-4f;
+    constexpr float    eps_state    = 1e-4f;
+    float              max_logits   = 0.0f;
+    float              max_state    = 0.0f;
+
+    const auto make_ctx_shapes = [&](bool shapes, bool any_seqs) {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = n_seqs;
+        cparams.n_rs_seq   = 2;
+        cparams.n_ctx      = 1024;
+        cparams.n_batch    = 512;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = true;
+        // the switches are read when a context, its memory and its batch allocator are made
+        if (shapes) {
+            setenv("LLAMA_PROMPT_SHAPES", "1", 1);
+        }
+        if (any_seqs) {
+            setenv("LLAMA_GRAPH_ANY_SEQS", "1", 1);
+        }
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        unsetenv("LLAMA_PROMPT_SHAPES");
+        unsetenv("LLAMA_GRAPH_ANY_SEQS");
+        return ctx;
+    };
+
+    llama_context * ctx_ref = make_ctx_shapes(false, false);
+    std::vector<llama_context *> ctxs = { make_ctx_shapes(true, false), make_ctx_shapes(true, true) };
+    const auto cleanup = [&]() {
+        llama_free(ctx_ref);
+        for (llama_context * ctx : ctxs) {
+            llama_free(ctx);
+        }
+    };
+    if (ctx_ref == nullptr || ctxs[0] == nullptr || ctxs[1] == nullptr) {
+        fprintf(stderr, "%s : failed to init contexts\n", __func__);
+        cleanup();
+        return false;
+    }
+    if (llama_n_rs_seq(ctx_ref) < 2) {
+        fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+        cleanup();
+        return true;
+    }
+
+    const auto tok = [&](uint32_t seq, llama_pos pos) {
+        return (llama_token) ((11*(uint32_t) pos + 37*seq + 5) % (uint32_t) n_vocab);
+    };
+
+    std::vector<llama_pos> pos(n_seqs, 0);
+
+    // one decode in every context: counts[s] rows of each sequence from where it stands. A sequence of reply[s] has a
+    // logits row for each (a reply and its drafts), another only for its last row (a prompt)
+    const auto step = [&](const char * what, const std::vector<uint32_t> & counts, const std::vector<bool> & reply) {
+        uint32_t n_rows = 0;
+        for (const uint32_t count : counts) {
+            n_rows += count;
+        }
+        llama_batch batch = llama_batch_init(n_rows, 0, 1);
+        std::vector<int32_t> out_rows;
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            for (uint32_t i = 0; i < counts[s]; ++i) {
+                const bool output = reply[s] || i + 1 == counts[s];
+                if (output) {
+                    out_rows.push_back(batch.n_tokens);
+                }
+                common_batch_add(batch, tok(s, pos[s] + (llama_pos) i), pos[s] + (llama_pos) i, { (llama_seq_id) s }, output);
+            }
+            pos[s] += (llama_pos) counts[s];
+        }
+        bool decoded = llama_decode(ctx_ref, batch) == 0;
+        for (llama_context * ctx : ctxs) {
+            decoded = decoded && llama_decode(ctx, batch) == 0;
+        }
+        llama_batch_free(batch);
+        if (!decoded) {
+            fprintf(stderr, "test_prompt_shapes : %s: decode failed\n", what);
+            return false;
+        }
+        for (size_t c = 0; c < ctxs.size(); ++c) {
+            for (const int32_t i : out_rows) {
+                const float * l_ref = llama_get_logits_ith(ctx_ref, i);
+                const float * l_ctx = llama_get_logits_ith(ctxs[c], i);
+                if (l_ref == nullptr || l_ctx == nullptr) {
+                    fprintf(stderr, "test_prompt_shapes : %s: context %zu: missing logits at row %d\n", what, c, i);
+                    return false;
+                }
+                for (int t = 0; t < n_vocab; ++t) {
+                    max_logits = std::max(max_logits, std::fabs(l_ref[t] - l_ctx[t]));
+                    if (!(std::fabs(l_ref[t] - l_ctx[t]) <= eps)) {
+                        fprintf(stderr, "test_prompt_shapes : %s: context %zu: logits differ at row %d, token %d (%g != %g)\n",
+                                what, c, i, t, (double) l_ref[t], (double) l_ctx[t]);
+                        return false;
+                    }
+                }
+            }
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                if (pos[s] == 0) {
+                    continue;
+                }
+                const float diff = recurrent_state_diff(ctxs[c], ctx_ref, (llama_seq_id) s);
+                max_state = std::max(max_state, diff);
+                if (!(diff <= eps_state)) {
+                    fprintf(stderr, "test_prompt_shapes : %s: context %zu: seq %u state differs from the reference by %g\n",
+                            what, c, s, (double) diff);
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    const auto rollback = [&](uint32_t seq, uint32_t n_rows) {
+        pos[seq] -= (llama_pos) n_rows;
+        bool removed = llama_memory_seq_rm(llama_get_memory(ctx_ref), (llama_seq_id) seq, pos[seq], -1);
+        if (!removed) {
+            fprintf(stderr, "test_prompt_shapes : the reference refused the rollback of seq %u to %d\n", seq, pos[seq]);
+        }
+        for (size_t c = 0; c < ctxs.size(); ++c) {
+            if (!llama_memory_seq_rm(llama_get_memory(ctxs[c]), (llama_seq_id) seq, pos[seq], -1)) {
+                fprintf(stderr, "test_prompt_shapes : context %zu refused the rollback of seq %u to %d\n", c, seq, pos[seq]);
+                removed = false;
+            }
+        }
+        return removed;
+    };
+
+    bool ok = true;
+    ok = ok && step("two prompts",                                {70, 9, 0, 0},   {false, false, false, false});
+    ok = ok && step("their replies",                              {3, 3, 0, 0},    {true, true, false, false});
+    ok = ok && step("a prompt beside two replies",                {3, 3, 45, 0},   {true, true, false, false});
+    ok = ok && step("a prompt of one row beside three replies",   {3, 3, 3, 1},    {true, true, true, false});
+    ok = ok && step("a long prompt between replies",              {3, 100, 3, 3},  {true, false, true, true});
+    ok = ok && step("two prompts beside two replies",             {3, 33, 3, 131}, {true, false, true, false});
+    ok = ok && step("three prompts, read together, beside a reply", {40, 3, 50, 70}, {false, true, false, false});
+    ok = ok && step("all reply",                                  {3, 3, 3, 3},    {true, true, true, true});
+    ok = ok && rollback(1, 2);
+    ok = ok && rollback(3, 1);
+    ok = ok && step("the rolled back ones replay beside a prompt", {64, 2, 0, 1},  {false, true, false, true});
+    ok = ok && step("a prompt as short as its ubatch's kept tail", {3, 3, 3, 3},   {true, false, true, true});
+    ok = ok && rollback(1, 2);
+    ok = ok && step("its rollback replays",                       {3, 2, 3, 3},    {true, true, true, true});
+    if (!ok) {
+        fprintf(stderr, "%s : the contexts differ, or a rollback was refused\n", __func__);
+    }
+    fprintf(stderr, "%s : against a context without the switch, logits max diff %g, state max diff %g\n", __func__,
+            (double) max_logits, (double) max_state);
+    cleanup();
+    return ok;
+#endif
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -801,6 +968,9 @@ int main(int argc, char ** argv) {
     }
 
     if (!test_changed_sets(params, model, n_vocab)) {
+        return 1;
+    }
+    if (!test_prompt_shapes(params, model, n_vocab)) {
         return 1;
     }
 
