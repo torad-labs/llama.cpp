@@ -12657,6 +12657,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k, true));
         }
     }
+    for (int k : {10, 40, 128, 296}) {
+        for (int nrows : {1, 3, 23, 69}) {
+            for (bool ties : {false, true}) {
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {154880, nrows, 1, 1}, k, ties));
+            }
+        }
+    }
     // the GLM-5.3 DSA indexer: 512 of a context's pools, at the radix path's three row widths
     for (int64_t cols : {3520, 16384, 109020}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 3, 1, 1}, 512));
@@ -13645,6 +13652,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
     add_glm_moe_cases(test_cases);
+    for (int k : {10, 40, 128, 296}) {
+        for (int nrows : {1, 3, 23, 69}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {154880, nrows, 1, 1}, k));
+        }
+    }
 
     // GLM-5.3 Flash's KDA conv-state concat (24576 channels) on one data-parallel rank of 36 sessions over four: 9
     // sequences of a decode row or an MTP verify's 3, one plane each, and one sequence's for comparison
