@@ -91,6 +91,22 @@ public:
     // first zero-ed state
     int32_t rs_z = -1;
 
+    // LLAMA_GRAPH_ANY_SEQS=1 (set_relocate): the batch's sequences take the cells from the first on, whichever set
+    // they are, and a state another sequence keeps in one of those cells is moved by a pass of its own before the
+    // decode (relocate_states, llama_context::rs_relocate). The decode's graph then reads and writes cells 0 to n_seqs - 1
+    // and copies no other state, so it is the same graph for every set of that many sequences: as find_slot gathers the
+    // set at its lowest cell and has the first decode's graph copy the displaced states, a changed set built two graphs
+    // (112, 99 and 128 ms for its first three target decodes of 66 rows on four cards, where a replay is 48; Nov 10, 2026)
+    bool relocate = false;
+    bool relocate_pending = false; // find_slot left a state to move
+
+    // asked for, before the first batch, by a memory that keeps nothing else by the place of a sequence's cell (the
+    // hybrid memory)
+    void set_relocate(bool value);
+
+    // moves the states find_slot left to move, and leaves the batch's cells as the decode's graph expects them
+    void relocate_states(uint32_t n_seqs);
+
     // zero the rs_z row of every non-f32 S tensor on the host (see llm_graph_context::build_rs)
     void zero_rs_z();
 

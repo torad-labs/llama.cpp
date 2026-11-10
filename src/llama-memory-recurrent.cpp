@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-batch.h"
+#include "llama-context.h"
 #include "llama-model.h"
 
 #include <algorithm>
@@ -168,6 +169,21 @@ llama_memory_recurrent::llama_memory_recurrent(
 // state type (f16, bf16, a block type) has no in-graph scale op, so its row is zeroed here, before the
 // graph runs. All-zero bytes are an exact zero for f16, bf16 and every block type (scale 0, quants 0).
 void llama_memory_recurrent::zero_rs_z() {
+    if (relocate) {
+        // every state type's row is zeroed here: the decode's graph takes no row to zero (get_rs_z), so it is the same
+        // graph with a new sequence in the batch as without one. No state is read from the row (find_slot)
+        if (rs_z < 0) {
+            return;
+        }
+        if (owner_context) { llama_synchronize(owner_context); }
+        for (const auto & layers : {r_l, s_l}) {
+            for (ggml_tensor * tensor : layers) {
+                if (!tensor) { continue; }
+                ggml_backend_tensor_memset(tensor, 0, (size_t) rs_z*tensor->nb[1], tensor->nb[1]);
+            }
+        }
+        return;
+    }
     if (n_seq_devices > 1) {
         if (!zero_cells.empty() && owner_context) { llama_synchronize(owner_context); }
         for (const auto & layers : {r_l, s_l}) {
@@ -615,6 +631,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
+    relocate_pending = false;
+
     if (n_seq_devices > 1) {
         GGML_ASSERT(ubatch.equal_seqs() && n_seqs > 0);
         zero_cells.clear();
@@ -760,6 +778,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (max < seq_meta.tail) { max = seq_meta.tail; }
     }
 
+    // relocate: the set is gathered at the first cell, and what it displaces lies up to the highest cell it held
+    if (relocate) {
+        min = 0;
+        max = std::max<int32_t>(max, (int32_t) n_seqs - 1);
+    }
+
     // gather and re-order
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const uint32_t i = s*n_seq_tokens;
@@ -842,11 +866,83 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     // allow getting the range of used cells, from head to head + n
     head = min;
     n    = max - min + 1;
+
+    // relocate: only a state another sequence keeps past the set's cells has to move (a state of the set is read from
+    // the cell it was in and written to the cell it takes); with none, the decode's graph has the set's cells alone
+    if (relocate) {
+        for (int i = (int) n_seqs; i <= max; ++i) {
+            relocate_pending = relocate_pending || (!cells[i].is_empty() && cells[i].src0 != i);
+        }
+        if (!relocate_pending) {
+            n = n_seqs;
+        }
+    }
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
 
     // sanity check
     return n >= n_seqs;
+}
+
+void llama_memory_recurrent::set_relocate(bool value) {
+    // f32 states only: a row is moved through an f32 tensor of the graph's, which a block type would not survive bit
+    // for bit
+    bool f32 = true;
+    for (const auto & layers : {r_l, s_l}) {
+        for (const ggml_tensor * tensor : layers) {
+            f32 = f32 && (tensor == nullptr || tensor->type == GGML_TYPE_F32);
+        }
+    }
+    relocate = value && n_seq_devices == 1 && f32;
+}
+
+void llama_memory_recurrent::relocate_states(uint32_t n_seqs) {
+    if (!relocate_pending) {
+        return;
+    }
+    relocate_pending = false;
+    GGML_ASSERT(owner_context != nullptr && head == 0 && n > n_seqs && n <= size);
+
+    // The row each row takes its state from, every other row its own. A cell of the batch takes its sequence's state,
+    // at the snapshot of a pending rollback, which this takes as s_copy does: the decode writes its snapshots anew. A
+    // cell another sequence keeps takes that sequence's state and its snapshots, each in its group, so a rollback it has
+    // pending or is asked for later (a verify's, when a second ubatch of the same decode displaced it) reads its own
+    const uint32_t n_groups = 1 + n_rs_seq;
+    std::vector<int32_t> rows(size*n_groups);
+    for (uint32_t r = 0; r < rows.size(); ++r) {
+        rows[r] = r;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        if (cells[i].is_empty()) {
+            continue;
+        }
+        if (i < n_seqs) {
+            const llama_seq_id seq = *cells[i].seq_id.begin();
+            rows[i] = (int32_t) (rs_idx[seq]*size) + cells[i].src0;
+            rs_idx[seq] = 0;
+        } else {
+            for (uint32_t g = 0; g < n_groups; ++g) {
+                rows[g*size + i] = (int32_t) (g*size) + cells[i].src0;
+            }
+        }
+    }
+
+    std::vector<ggml_tensor *> states;
+    for (const auto & layers : {r_l, s_l}) {
+        for (ggml_tensor * tensor : layers) {
+            if (tensor) { states.push_back(tensor); }
+        }
+    }
+    // a context whose layers keep no state here (the MTP head's) has cells and nothing to move
+    if (!states.empty()) {
+        llama_synchronize(owner_context);
+        owner_context->rs_relocate(states, rows);
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        cells[i].src0 = i;
+    }
+    n = n_seqs;
 }
 
 bool llama_memory_recurrent::get_can_shift() const {
@@ -1410,6 +1506,7 @@ bool llama_memory_recurrent_context::apply() {
 
     mem->find_slot(ubatch);
     mem->zero_rs_z();
+    mem->relocate_states(ubatch.n_seqs);
 
     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
         mem->rs_reach[ubatch.seq_id_unq[s]] = std::min(mem->n_rs_seq, ubatch.n_seq_tokens - 1);
@@ -1437,7 +1534,8 @@ uint32_t llama_memory_recurrent_context::get_head() const {
 }
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
-    return is_full ? 0 : mem->rs_z;
+    // relocate: the row is zeroed before the decode (zero_rs_z), not by its graph
+    return is_full ? 0 : mem->relocate ? -1 : mem->rs_z;
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {

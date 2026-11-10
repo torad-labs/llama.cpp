@@ -915,6 +915,13 @@ struct llm_graph_params {
 
     llm_graph_nextn nextn;
 
+    // LLAMA_GRAPH_ANY_SEQS=1 with one stream for every sequence (a unified cache on one device a sequence): a graph
+    // built for one set of sequences is computed for any other set of as many, each input checking what it holds of the
+    // set (the recurrent states' cells: llama_memory_recurrent's relocate; the pooled keys' streams:
+    // llm_graph_input_kpool). As a decode's graph was held to its set, every session that started or ended a reply had
+    // the next decodes build their graph again: no decode of a pass's last 25 steps was replayed on the Nov 10, 2026 box
+    bool any_seqs = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other, const char ** reason = nullptr) const {
@@ -934,7 +941,7 @@ struct llm_graph_params {
 
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences
-        if (can_reuse_ubatch && ubatch.equal_seqs()) {
+        if (can_reuse_ubatch && ubatch.equal_seqs() && !(any_seqs && other.any_seqs)) {
             if (!ubatch.data) {
                 // if the old ubatch does not own it's data, then we cannot guarantee that it is still alive, and
                 //   therefore we cannot perform the sequence id check. normally should never happen
