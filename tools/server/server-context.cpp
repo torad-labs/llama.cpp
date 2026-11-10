@@ -1003,6 +1003,7 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
     size_t prompt_cursor = 0;
+    server_prompt_scheduler prompt_scheduler;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -3297,6 +3298,39 @@ private:
 
     int32_t prepare_batch_view(int32_t off, int32_t n_max) {
         int32_t end = std::min(batch.size(), off + n_max);
+        if (params_base.n_prompt_chunk > 0) {
+            const bool is_prompt = batch.tokens[off].is_prompt;
+            for (int32_t i = off + 1; i < end; ++i) {
+                if (batch.tokens[i].is_prompt != is_prompt) {
+                    end = i;
+                    break;
+                }
+            }
+            if (is_prompt && slots[batch.tokens[off].id_slot].can_split()) {
+                // Do not spread a physical batch across every pending sequence. Keep whole,
+                // equally sized prompt chunks together; a short tail gets its own view.
+                const int32_t ubatch = llama_n_ubatch(ctx_tgt);
+                const int32_t chunk = std::min(params_base.n_prompt_chunk, ubatch);
+                end = std::min(end, off + ubatch / chunk * chunk);
+                int32_t first_end = off + 1;
+                while (first_end < end && batch.tokens[first_end].id_slot == batch.tokens[off].id_slot) {
+                    ++first_end;
+                }
+                const int32_t width = first_end - off;
+                for (int32_t i = first_end; i < end;) {
+                    int32_t next = i + 1;
+                    while (next < batch.size() && batch.tokens[next].is_prompt &&
+                            batch.tokens[next].id_slot == batch.tokens[i].id_slot) {
+                        ++next;
+                    }
+                    if (next > end || next - i != width) {
+                        end = i;
+                        break;
+                    }
+                    i = next;
+                }
+            }
+        }
         for (auto & slot : slots) {
             if (slot.spec_i_batch.empty()) {
                 continue;
@@ -3706,7 +3740,16 @@ private:
                     prompting.push_back(&slot);
                 }
             }
-            if (!slots.empty()) {
+            if (params_base.n_prompt_chunk > 0) {
+                std::vector<llama_seq_id> ids;
+                for (const auto * slot : prompting) {
+                    ids.push_back(slot->id);
+                }
+                ids = prompt_scheduler.order(std::move(ids), llama_model_n_seq_devices(model_tgt));
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    prompting[i] = &slots[ids[i]];
+                }
+            } else if (!slots.empty()) {
                 prompt_cursor = (prompt_cursor + 1) % slots.size();
             }
             size_t n_pending = prompting.size();
@@ -3716,7 +3759,11 @@ private:
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
-                const int32_t n_share = (std::max(0, n_batch_prompt - batch.size()) + n_left - 1) / n_left;
+                int32_t n_share = (std::max(0, n_batch_prompt - batch.size()) + n_left - 1) / n_left;
+                if (params_base.n_prompt_chunk > 0) {
+                    const int32_t chunk = std::min(params_base.n_prompt_chunk, n_ubatch);
+                    n_share = std::max(chunk, n_share / chunk * chunk);
+                }
 
                 if (!slot.is_processing()) {
                     return;
@@ -3735,6 +3782,16 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    if (slot.can_split() && params_base.n_prompt_chunk > 0) {
+                        const int32_t available = n_batch_prompt - batch.size();
+                        const int32_t chunk = std::min({ params_base.n_prompt_chunk, n_ubatch,
+                                                       n_batch_prompt - n_generated });
+                        const int32_t remaining = slot.task->n_tokens() -
+                            (slot.state == SLOT_STATE_PROCESSING_PROMPT ? slot.prompt.n_tokens() : 0);
+                        if (available < chunk && remaining > available) {
+                            return; // a short tail may fit; a long read waits for a useful chunk next round
+                        }
+                    }
                     const int32_t n_fill = slot.can_split() ? std::min(n_batch_prompt, batch.size() + n_share) : n_batch;
 
                     // this step's prompt tokens are already --prompt-step beside a reply: the read goes on next step
@@ -4229,6 +4286,9 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+                    if (params_base.n_prompt_chunk > 0 && n_tokens_cur > 0) {
+                        prompt_scheduler.admitted(slot.id);
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 

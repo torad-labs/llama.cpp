@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <numeric>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -37,6 +38,20 @@
 static bool mtp_pending_h_legacy() {
     static const bool legacy = ggml_env_switch("LLAMA_MTP_PENDING_H_LEGACY");
     return legacy;
+}
+
+static std::function<double()> & mtp_clock_for_testing() {
+    static std::function<double()> clock;
+    return clock;
+}
+
+static double mtp_now() {
+    const auto & clock = mtp_clock_for_testing();
+    return clock ? clock() : (double) ggml_time_us();
+}
+
+void common_mtp_set_clock_for_testing(std::function<double()> clock) {
+    mtp_clock_for_testing() = std::move(clock);
 }
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
@@ -1423,6 +1438,7 @@ void common_mtp_service::invalidate() {
 }
 
 void common_mtp_service::boundary(llama_seq_id seq, int depth, int low_depth, int full_depth, double now) {
+    if (!batch.empty()) { invalidate(); }
     if (seq < 0 || !std::isfinite(now) || now <= 0 || low_depth < 1 || low_depth >= full_depth || (depth != low_depth && depth != full_depth)) {
         invalidate();
         return;
@@ -1449,7 +1465,73 @@ void common_mtp_service::boundary(llama_seq_id seq, int depth, int low_depth, in
     accepted = -1;
 }
 
+void common_mtp_service::boundary(const std::vector<llama_seq_id> & seqs, int depth, int low_depth, int full_depth, double now) {
+    if (seqs.size() == 1) {
+        if (!batch.empty()) { invalidate(); }
+        boundary(seqs.front(), depth, low_depth, full_depth, now);
+        return;
+    }
+    if (seqs.empty() || seqs.front() < 0 || !std::is_sorted(seqs.begin(), seqs.end()) ||
+            std::adjacent_find(seqs.begin(), seqs.end()) != seqs.end() || !std::isfinite(now) || now <= 0 ||
+            low_depth < 1 || low_depth >= full_depth || (depth != low_depth && depth != full_depth)) {
+        invalidate();
+        return;
+    }
+    if (owner >= 0) {
+        const double elapsed = now - start;
+        if (batch != seqs || low != low_depth || full != full_depth || !complete() || elapsed <= 0 || !std::isfinite(elapsed)) {
+            invalidate();
+        } else {
+            const int which = chosen == low ? 0 : 1;
+            const double delivered = batch.size() + std::accumulate(batch_accepted.begin(), batch_accepted.end(), 0.0);
+            samples[which][next[which]] = elapsed;
+            rates[which][next[which]] = delivered / elapsed;
+            next[which] = (next[which] + 1) % history;
+            n_samples[which] = std::min(history, n_samples[which] + 1);
+            last[which] = serial;
+        }
+    }
+    ++serial;
+    batch = seqs;
+    batch_drafted.assign(batch.size(), 0);
+    batch_verified.assign(batch.size(), 0);
+    batch_accepted.assign(batch.size(), -1);
+    owner = batch.front();
+    chosen = depth;
+    low = low_depth;
+    full = full_depth;
+    start = now;
+}
+
+bool common_mtp_service::complete() const {
+    if (owner < 0) { return false; }
+    if (batch.empty()) { return realized == chosen && verified == 1 && accepted >= 0; }
+    for (size_t i = 0; i < batch.size(); ++i) {
+        if (batch_drafted[i] != chosen || batch_verified[i] != 1 || batch_accepted[i] < 0) { return false; }
+    }
+    return true;
+}
+
+int common_mtp_service::preferred_depth(int current) const {
+    double rate[2];
+    for (int i = 0; i < 2; ++i) {
+        if (n_samples[i] < 3 || serial - last[i] > 4*common_mtp_depth::window) { return current; }
+        auto sorted = rates[i];
+        std::sort(sorted.begin(), sorted.begin() + n_samples[i]);
+        rate[i] = sorted[n_samples[i] / 2];
+    }
+    if (rate[1] > rate[0]*(1.0 + common_mtp_depth::band)) { return full; }
+    if (rate[1] < rate[0]*(1.0 - common_mtp_depth::band)) { return low; }
+    return current;
+}
+
 void common_mtp_service::drafted(llama_seq_id seq, int depth) {
+    if (!batch.empty()) {
+        const auto it = std::find(batch.begin(), batch.end(), seq);
+        if (it == batch.end() || depth != chosen || batch_drafted[it - batch.begin()] != 0) { invalidate(); return; }
+        batch_drafted[it - batch.begin()] = depth;
+        return;
+    }
     if (owner != seq || depth != chosen) {
         invalidate();
         return;
@@ -1458,12 +1540,27 @@ void common_mtp_service::drafted(llama_seq_id seq, int depth) {
 }
 
 void common_mtp_service::verify(llama_seq_id seq, int rows) {
+    if (!batch.empty()) {
+        const auto it = std::find(batch.begin(), batch.end(), seq);
+        if (it == batch.end()) { invalidate(); return; }
+        const size_t i = it - batch.begin();
+        if (batch_drafted[i] != chosen || rows != chosen + 1 || ++batch_verified[i] != 1 || batch_accepted[i] >= 0) { invalidate(); }
+        return;
+    }
     if (owner != seq || realized != chosen || rows != chosen + 1 || ++verified != 1 || accepted >= 0) {
         invalidate();
     }
 }
 
 void common_mtp_service::accept(llama_seq_id seq, int count, bool other) {
+    if (!batch.empty()) {
+        const auto it = std::find(batch.begin(), batch.end(), seq);
+        if (it == batch.end()) { invalidate(); return; }
+        const size_t i = it - batch.begin();
+        if (other || batch_verified[i] != 1 || count < 0 || count > batch_drafted[i] || batch_accepted[i] >= 0) { invalidate(); return; }
+        batch_accepted[i] = count;
+        return;
+    }
     if (other || owner != seq || verified != 1 || count < 0 || count > realized || accepted >= 0) {
         invalidate();
         return;
@@ -1503,15 +1600,30 @@ int32_t common_mtp_depth::n_draft(int32_t n_max, bool timed) const {
 }
 
 void common_mtp_depth::observe(int32_t n_max, float cost, int32_t n_accepted, float service_cut) {
-    first_sum = keep*first_sum + (n_accepted > 0 ? 1.0f : 0.0f);
+    observe(n_max, cost, &n_accepted, 1, service_cut);
+}
+
+void common_mtp_depth::observe(int32_t n_max, float cost, const std::vector<int> & accepted, float service_cut) {
+    observe(n_max, cost, accepted.data(), accepted.size(), service_cut);
+}
+
+void common_mtp_depth::observe(int32_t n_max, float cost, const int * accepted, size_t count, float service_cut) {
+    if (!count) { return; }
+    const float weight = 1.0f / count;
+    first_sum = keep*first_sum;
+    for (size_t i = 0; i < count; ++i) { first_sum += accepted[i] > 0 ? weight : 0.0f; }
     first_w   = keep*first_w   + 1.0f;
     extra_sum *= keep;
     low_sum   *= keep;
     extra_w   *= keep;
-    if (n_drafted == n_max && n_accepted > 0) {
-        extra_sum += (float) (n_accepted - 1);
-        low_sum   += (float) (std::min(n_accepted, low) - 1);
-        extra_w   += 1.0f;
+    if (n_drafted == n_max) {
+        for (size_t i = 0; i < count; ++i) {
+            const int n = accepted[i];
+            if (n <= 0) { continue; }
+            extra_sum += weight * (n - 1);
+            low_sum   += weight * (std::min(n, low) - 1);
+            extra_w   += weight;
+        }
     }
     if (++rounds % window != 0) return;
     const float p1   = first_sum / first_w;
@@ -1555,7 +1667,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
-    std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    mutable std::vector<std::vector<float>> pending_h; // lazy host checkpoint/fallback rows
+    std::vector<int32_t> pending_ref;
+    std::vector<uint8_t> verify_device;
     // the position p of the row pending_h holds (-1: none); a batch whose first row is not at p + 1 (a new prompt at
     // position 0, or one resumed past a cached prefix) pairs its first token with a zero row, as the first prompt does
     std::vector<llama_pos> pending_pos;          // [n_seq]
@@ -1576,20 +1690,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    // LLAMA_MTP_DEVICE_H=1: a target batch the target left in its MTP store (llama_set_nextn_source) is read there by the
-    // head, row k from the target's row k - 1 and a sequence's first row from its carry, and only the kept rows reach the
-    // host; any other batch takes the host path
+    // LLAMA_MTP_DEVICE_H=1: target batches and sequence-owned carry/verification rows stay in the backend store.
+    // Host rows are materialized only for checkpoints or unsupported target batches.
     bool                 device_h = false;
     std::vector<int32_t> device_src;
     std::vector<float>   device_carry;
     std::vector<int32_t> device_rows;
-    std::vector<float>   device_kept;
 
     std::vector<common_mtp_depth> depth; // per seq, with --spec-draft-mtp-adaptive
     std::vector<int32_t>          n_draft_max;
-    common_mtp_service service; // one pending cycle for the isolated ordinary-head workload
-    llama_pos service_pos = -1;
+    common_mtp_service service;
+    common_mtp_depth batch_depth;
+    std::vector<llama_seq_id> batch_accept_members;
+    std::vector<int> batch_accept;
+    int32_t batch_accept_depth = 0;
+    std::vector<llama_pos> service_pos;
     bool timing = false;
+
+    void clear_batch_accept() {
+        batch_accept_members.clear();
+        batch_accept.clear();
+        batch_accept_depth = 0;
+    }
+
+    void invalidate_batch_accept(llama_seq_id seq) {
+        const auto it = std::find(batch_accept_members.begin(), batch_accept_members.end(), seq);
+        // A finished result survives its slot being released; an unrelated slot never owned this round.
+        if (it != batch_accept_members.end() && batch_accept[it - batch_accept_members.begin()] < 0) {
+            clear_batch_accept();
+        }
+    }
 
     // the token the head reads at an image or audio row, where the target read an embedding (LLAMA_TOKEN_NULL: such
     // rows stay out of the head, as for models whose media rows share positions under M-RoPE)
@@ -1667,7 +1797,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         {
             const char * env = getenv("LLAMA_MTP_DEVICE_H");
             device_h = env && atoi(env) != 0 && n_mtp_layers == 1 && !is_mem_shared && !chain_heads && !decode_only &&
-                llama_set_nextn_source(ctx_dft, ctx_tgt);
+                llama_set_nextn_source(ctx_dft, ctx_tgt, common_speculative_n_max(&params) + 3);
             if (env && atoi(env) != 0) {
                 SPC_INF("- the head reads the target's hidden rows %s\n", device_h ? "in device memory" : "through the host (no store)");
             }
@@ -1705,6 +1835,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         pending_pos.assign(n_seq, -1);
+        pending_ref.assign(n_seq, 0);
+        verify_device.assign(n_seq, 0);
         zero_h.assign(n_embd, 0.0f);
         verify_pos.assign(n_seq, -1);
 
@@ -1722,6 +1854,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             d.reset(this->params.n_max, this->params.n_min);
         }
         n_draft_max.assign(n_seq, this->params.n_max);
+        service_pos.assign(n_seq, -1);
+        batch_depth.reset(this->params.n_max, this->params.n_min);
         if (this->params.n_min > this->params.n_max) {
             SPC_WRN("MTP drafting is disabled: --spec-draft-n-min = %d exceeds the effective maximum draft depth = %d\n", this->params.n_min, this->params.n_max);
         } else if (this->params.mtp_adaptive > 0.0f) {
@@ -1755,6 +1889,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         service.invalidate();
+        invalidate_batch_accept(seq_id);
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1779,19 +1914,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // the h row to pair with a sequence's token at pos: the kept row when it is the one right before, else a zero row
     const float * h_before(llama_seq_id seq_id, llama_pos pos) const {
-        return mtp_pending_h_legacy() || pending_pos[seq_id] + 1 == pos ? pending_h[seq_id].data() : zero_h.data();
+        if (!mtp_pending_h_legacy() && pending_pos[seq_id] + 1 != pos) { return zero_h.data(); }
+        if (pending_ref[seq_id]) {
+            GGML_ASSERT(llama_nextn_kept_get(params.ctx_tgt, pending_ref[seq_id], pending_h[seq_id].data()));
+        }
+        return pending_h[seq_id].data();
     }
 
     bool process(const llama_batch & batch_in) override {
         if (service.owner >= 0) {
-            bool ordinary = batch_in.token != nullptr && batch_in.n_tokens > 0 &&
-                std::count(generating.begin(), generating.end(), uint8_t(1)) == 1;
+            const auto members = service.batch.empty() ? std::vector<llama_seq_id>{service.owner} : service.batch;
+            std::vector<int> rows(n_seq, 0);
+            bool ordinary = batch_in.token != nullptr && batch_in.n_tokens > 0;
             for (int k = 0; ordinary && k < batch_in.n_tokens; ++k) {
-                ordinary = batch_in.n_seq_id[k] == 1 && batch_in.seq_id[k][0] == service.owner &&
-                    batch_in.pos[k] == service_pos + k && batch_in.logits && batch_in.logits[k];
+                const llama_seq_id seq = batch_in.seq_id[k][0];
+                ordinary = batch_in.n_seq_id[k] == 1 && std::find(members.begin(), members.end(), seq) != members.end() &&
+                    batch_in.logits && batch_in.logits[k] && batch_in.pos[k] == service_pos[seq] + rows[seq]++;
             }
-            if (ordinary) service.verify(service.owner, batch_in.n_tokens);
-            else service.invalidate();
+            if (ordinary) {
+                for (llama_seq_id seq : members) {
+                    service.verify(seq, rows[seq]);
+                    if (service.owner < 0) { break; }
+                }
+            } else { service.invalidate(); }
         }
         if (batch_in.n_tokens <= 0) {
             return true;
@@ -1873,9 +2018,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
                 }
-                const float * h = h_before(seq_id, batch_in.pos[i_batch_beg[seq_id]]);
-                device_src[i_batch_beg[seq_id]] = -(++n_carry);
-                device_carry.insert(device_carry.end(), h, h + n_embd);
+                const bool adjacent = mtp_pending_h_legacy() || pending_pos[seq_id] + 1 == batch_in.pos[i_batch_beg[seq_id]];
+                if (adjacent && pending_ref[seq_id]) {
+                    device_src[i_batch_beg[seq_id]] = pending_ref[seq_id];
+                } else if (!adjacent || pending_pos[seq_id] < 0) {
+                    device_src[i_batch_beg[seq_id]] = llama_nextn_kept_row(ctx_tgt, -1, 0);
+                } else {
+                    const float * h = h_before(seq_id, batch_in.pos[i_batch_beg[seq_id]]);
+                    device_src[i_batch_beg[seq_id]] = -(++n_carry);
+                    device_carry.insert(device_carry.end(), h, h + n_embd);
+                }
             }
             llama_set_nextn_h_rows(ctx_dft, device_src.data(), n_tokens, device_carry.data(), n_carry);
             } else {
@@ -1952,34 +2104,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        // the target's rows are dense in batch order: one read of the base, one copy per sequence. On the device path only
-        // the kept rows come back: each sequence's first n_keep rows, then its last
+        // Keep each sequence's verification prefix and last row independently of the reusable target batch halves.
         const float * h_tgt = nullptr;
         if (device) {
             device_rows.clear();
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_end[seq_id] < 0) {
-                    continue;
-                }
-                const int32_t n_keep = std::min(i_batch_end[seq_id] - i_batch_beg[seq_id] + 1, verify_h_keep);
-                for (int32_t i = 0; i < n_keep; ++i) {
-                    device_rows.push_back(i_batch_beg[seq_id] + i);
-                }
-                if (n_keep < i_batch_end[seq_id] - i_batch_beg[seq_id] + 1) {
-                    device_rows.push_back(i_batch_end[seq_id]);
-                }
-            }
-            device_kept.resize(device_rows.size() * n_embd);
-            if (!llama_get_embeddings_nextn_rows(ctx_tgt, device_rows.data(), (int32_t) device_rows.size(), device_kept.data())) {
-                SPC_ERR("%s: the target's kept rows could not be read\n", __func__);
-                service.invalidate();
-                return false;
-            }
+            device_rows.reserve(n_tokens);
         } else {
             h_tgt = llama_get_embeddings_nextn(ctx_tgt);
         }
 
-        size_t i_kept = 0;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -1987,13 +2120,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             const int32_t n_keep = std::min(n_rows, verify_h_keep);
-            const float * h_beg  = device ? device_kept.data() + i_kept * n_embd : h_tgt + (size_t) i_batch_beg[seq_id] * n_embd;
-            const float * h_end  = device ? h_beg + (size_t) std::min(n_keep, n_rows - 1) * n_embd : h_tgt + (size_t) i_batch_end[seq_id] * n_embd;
-            i_kept += n_keep + (n_keep < n_rows ? 1 : 0);
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].assign(h_beg, h_beg + (size_t) n_keep * n_embd);
-
-            std::memcpy(pending_h[seq_id].data(), h_end, row_bytes);
+            verify_device[seq_id] = device;
+            if (device) {
+                const size_t row_begin = device_rows.size();
+                for (int32_t i = 0; i < n_keep; ++i) {
+                    device_rows.push_back(i_batch_beg[seq_id] + i);
+                }
+                if (n_keep < n_rows) {
+                    device_rows.push_back(i_batch_end[seq_id]);
+                }
+                const int32_t count = (int32_t) (device_rows.size() - row_begin);
+                if (!llama_nextn_keep_rows(ctx_tgt, seq_id, device_rows.data() + row_begin, count)) {
+                    service.invalidate();
+                    return false;
+                }
+                pending_ref[seq_id] = llama_nextn_kept_row(ctx_tgt, seq_id, count - 1);
+                verify_h[seq_id].clear();
+            } else {
+                const float * h_beg = h_tgt + (size_t) i_batch_beg[seq_id] * n_embd;
+                verify_h[seq_id].assign(h_beg, h_beg + (size_t) n_keep * n_embd);
+                std::memcpy(pending_h[seq_id].data(), h_tgt + (size_t) i_batch_end[seq_id] * n_embd, row_bytes);
+                pending_ref[seq_id] = 0;
+            }
             pending_pos[seq_id] = batch_in.pos[i_batch_end[seq_id]];
             verify_pos[seq_id]  = batch_in.pos[i_batch_beg[seq_id]];
 
@@ -2009,14 +2158,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
+        clear_batch_accept();
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
         std::vector<float> chain_p(n_seq, 1.0f); // product of the chain's top-1 probabilities so far
-        const bool isolated = timing && std::count(generating.begin(), generating.end(), uint8_t(1)) == 1 &&
-            std::count_if(dparams.begin(), dparams.end(), [](const common_speculative_draft_params & dp) { return dp.drafting; }) == 1;
-        if (!isolated) service.invalidate();
+        std::vector<llama_seq_id> members;
+        for (llama_seq_id seq = 0; seq < (llama_seq_id) n_seq; ++seq) {
+            if (dparams[seq].drafting) { members.push_back(seq); }
+        }
+        const bool isolated = timing && members.size() == 1 &&
+            std::count(generating.begin(), generating.end(), uint8_t(1)) == 1 && generating[members.front()];
+        const bool concurrent = params.mtp_adaptive > 0.0f && members.size() > 1 && !is_mem_shared && !chain_heads && !decode_only;
+        const bool measured = timing && std::count(generating.begin(), generating.end(), uint8_t(1)) == (int) members.size() &&
+            std::all_of(members.begin(), members.end(), [&](llama_seq_id seq) { return generating[seq]; });
+        if ((!isolated && !concurrent) || (concurrent && (!measured || service.batch != members))) { service.invalidate(); }
+        if (concurrent && measured && batch_depth.rounds % common_mtp_depth::window == 0) {
+            batch_depth.depth = service.preferred_depth(batch_depth.depth);
+        }
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -2033,7 +2193,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_draft_max[seq_id] = params.mtp_adaptive > 0.0f ? depth[seq_id].n_draft(params.n_max, isolated && generating[seq_id]) : params.n_max;
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
-            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+            if (!device_h) {
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+            }
 
             i_last[seq_id] = batch.n_tokens - 1;
 
@@ -2042,18 +2204,39 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        // Sequences drafting together draft the deepest length any of them chose. The target's rollback split keeps
-        // each sequence's rows in one ubatch and takes equal rows per sequence, so one shorter draft splits the
-        // verification into a pass per sequence (36 passes and 4.2 s, where 36 equal drafts verify in one 121 ms pass
-        // on four PCIe cards). Each sequence still learns its own depth from its own acceptance, used when it drafts
-        // alone, and its own output limit still truncates it.
-        if (params.mtp_adaptive > 0.0f && n_drafting > 1) {
-            int32_t n_round = 0;
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (drafting[seq_id]) n_round = std::max(n_round, n_draft_max[seq_id]);
+        // A concurrent round has one policy and one probe cadence, independent of individual session phases.
+        if (concurrent) {
+            int32_t n_round = batch_depth.n_draft(params.n_max, measured && batch_depth.rounds >= common_mtp_depth::window);
+            for (llama_seq_id seq : members) {
+                if (dparams[seq].n_max > 0) { n_round = std::min(n_round, dparams[seq].n_max); }
             }
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (drafting[seq_id]) n_draft_max[seq_id] = n_round;
+            for (llama_seq_id seq : members) { n_draft_max[seq] = n_round; }
+        } else if (params.mtp_adaptive > 0.0f && n_drafting > 1) {
+            int32_t n_round = 0;
+            for (llama_seq_id seq : members) { n_round = std::max(n_round, n_draft_max[seq]); }
+            for (llama_seq_id seq : members) { n_draft_max[seq] = n_round; }
+        }
+
+        if (isolated) {
+            const llama_seq_id seq = members.front();
+            const int chosen = n_draft_max[seq];
+            if (params.n_min <= chosen && (dparams[seq].n_max <= 0 || dparams[seq].n_max >= chosen)) {
+                service.boundary(seq, chosen, depth[seq].low, params.n_max, mtp_now());
+                service_pos[seq] = dparams[seq].n_past;
+            } else {
+                service.invalidate();
+            }
+        } else if (concurrent) {
+            const int chosen = n_draft_max[members.front()];
+            bool complete = params.n_min <= chosen;
+            for (llama_seq_id seq : members) {
+                complete = complete && (dparams[seq].n_max <= 0 || dparams[seq].n_max >= chosen);
+                service_pos[seq] = dparams[seq].n_past;
+            }
+            if (complete) {
+                service.boundary(members, chosen, batch_depth.low, params.n_max, mtp_now());
+            } else {
+                service.invalidate();
             }
         }
 
@@ -2083,7 +2266,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_decode_trace::range trace_proposal([&] {
                     return "stage=proposal proposal=" + std::to_string(i + 1) + " rows=" + std::to_string(batch.n_tokens);
                 });
+                float * embd = batch.embd;
+                if (device_h && i == 0) {
+                    device_src.clear();
+                    device_carry.clear();
+                    int32_t n_carry = 0;
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        if (!drafting[seq_id]) { continue; }
+                        if (pending_ref[seq_id]) {
+                            device_src.push_back(pending_ref[seq_id]);
+                        } else if (pending_pos[seq_id] < 0) {
+                            device_src.push_back(llama_nextn_kept_row(params.ctx_tgt, -1, 0));
+                        } else {
+                            device_src.push_back(-(++n_carry));
+                            device_carry.insert(device_carry.end(), pending_h[seq_id].begin(), pending_h[seq_id].end());
+                        }
+                    }
+                    llama_set_nextn_h_rows(ctx_dft, device_src.data(), batch.n_tokens, device_carry.data(), n_carry);
+                    batch.embd = nullptr;
+                }
                 ret = llama_decode(ctx_dft, batch);
+                batch.embd = embd;
             }
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
@@ -2104,16 +2307,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                if (i == 0 && isolated && generating[seq_id]) {
-                    const int chosen = n_draft_max[seq_id];
-                    if (params.n_min <= chosen && (dparams[seq_id].n_max <= 0 || dparams[seq_id].n_max >= chosen)) {
-                        // Sampling completed this step. The next boundary includes target verification and catch-up.
-                        service.boundary(seq_id, chosen, depth[seq_id].low, params.n_max, (double) ggml_time_us());
-                        service_pos = dparams[seq_id].n_past;
-                    } else {
-                        service.invalidate();
-                    }
-                }
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -2218,6 +2411,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             depth[seq_id].n_verified = 0;
             if (service.owner >= 0) service.drafted(seq_id, depth[seq_id].n_drafted);
         }
+        if (concurrent) {
+            const int chosen = n_draft_max[members.front()];
+            bool complete = params.n_min <= chosen;
+            for (llama_seq_id seq : members) {
+                complete = complete && depth[seq].n_drafted == chosen;
+            }
+            if (complete) {
+                batch_accept_members = members;
+                batch_accept.assign(members.size(), -1);
+                batch_accept_depth = chosen;
+            }
+        }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
@@ -2229,10 +2434,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // a round counts once its draft is verified once: a checkpoint replay verifies it twice, and another
         // drafter's round is not this head's
         auto & d = depth[seq_id];
-        if (service.owner >= 0) service.accept(seq_id, n_accepted, is_other);
+        if (service.owner >= 0) {
+            service.accept(seq_id, n_accepted, is_other);
+        }
+        const auto batch_it = std::find(batch_accept_members.begin(), batch_accept_members.end(), seq_id);
+        if (batch_it != batch_accept_members.end()) {
+            const size_t i = batch_it - batch_accept_members.begin();
+            if (is_other || d.n_drafted != batch_accept_depth || d.n_verified != 1 || n_accepted > d.n_drafted || batch_accept[i] >= 0) {
+                clear_batch_accept();
+            } else {
+                batch_accept[i] = n_accepted;
+                if (std::all_of(batch_accept.begin(), batch_accept.end(), [](int n) { return n >= 0; })) {
+                    batch_depth.n_drafted = batch_accept_depth;
+                    batch_depth.observe(params.n_max, params.mtp_adaptive, batch_accept);
+                    clear_batch_accept();
+                }
+            }
+        }
         if (params.mtp_adaptive > 0.0f && !is_other && d.n_drafted > 0 && d.n_verified == 1) {
             const float prior = (params.n_max - d.low)*params.mtp_adaptive / (1.0f + (d.low - 1)*params.mtp_adaptive);
-            const float cut = service.owner == seq_id ? service.relative_cost(prior) : -1.0f;
+            const float cut = service.batch.empty() && service.owner == seq_id ? service.relative_cost(prior) : -1.0f;
             d.observe(params.n_max, params.mtp_adaptive, std::min<int32_t>(n_accepted, d.n_drafted), cut);
         }
         d.n_drafted  = 0;
@@ -2244,15 +2465,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
-        if ((size_t) (i_h + 1) * n_embd > verify_h[seq_id].size()) {
+        if (i_h >= verify_h_keep || (!verify_device[seq_id] && (size_t) (i_h + 1) * n_embd > verify_h[seq_id].size())) {
             // past every row a verification can accept: keep no row rather than a wrong one
             SPC_WRN("seq_id %d: accepted row %d of a %d-row batch was not kept\n", (int) seq_id, i_h, n_rows);
             pending_pos[seq_id] = -1;
+            pending_ref[seq_id] = 0;
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
             service.invalidate();
             return;
         }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        pending_ref[seq_id] = verify_device[seq_id] ? llama_nextn_kept_row(params.ctx_tgt, seq_id, i_h) : 0;
+        if (!verify_device[seq_id]) {
+            std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        }
         pending_pos[seq_id] = verify_pos[seq_id] + i_h;
     }
 
@@ -2266,6 +2492,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const llama_pos pos = pending_pos[seq_id];
+        if (pending_ref[seq_id] && !llama_nextn_kept_get(params.ctx_tgt, pending_ref[seq_id], pending_h[seq_id].data())) {
+            return false;
+        }
 
         data.resize(sizeof(llama_pos) + (size_t) n_embd * sizeof(float));
         std::memcpy(data.data(),                     &pos,                       sizeof(llama_pos));
@@ -2275,26 +2504,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         service.invalidate();
+        invalidate_batch_accept(seq_id);
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+        if (!data.empty() && data.size() != sizeof(llama_pos) + (size_t) n_embd * sizeof(float)) { return; }
+        verify_h_rows[seq_id] = 0;
+        verify_device[seq_id] = 0;
+        depth[seq_id].n_drafted = depth[seq_id].n_verified = 0;
+        pending_ref[seq_id] = 0;
         if (data.empty()) {
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
             pending_pos[seq_id] = -1;
             return;
         }
-        if (data.size() != sizeof(llama_pos) + (size_t) n_embd * sizeof(float)) {
-            return;
-        }
-
         llama_pos pos = -1;
         std::memcpy(&pos, data.data(), sizeof(llama_pos));
 
         pending_pos[seq_id] = pos;
         std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd * sizeof(float));
+        if (device_h && pos >= 0) {
+            pending_ref[seq_id] = llama_nextn_kept_row(params.ctx_tgt, seq_id, verify_h_keep);
+            GGML_ASSERT(llama_nextn_kept_set(params.ctx_tgt, pending_ref[seq_id], pending_h[seq_id].data()));
+        }
     }
 
     void end(llama_seq_id seq_id) override {
         service.invalidate();
+        invalidate_batch_accept(seq_id);
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             generating[seq_id] = 0;
             depth[seq_id].reset(params.n_max, params.n_min);

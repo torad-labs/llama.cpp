@@ -30,13 +30,15 @@ constexpr int64_t S_v      = 128;
 constexpr int64_t H        = 2;
 constexpr int64_t D        = S_v * S_v * H;
 constexpr int64_t mem_size = 8;
-constexpr int64_t cells[]  = { 5, 1, 6 }; // each sequence's cell: rows are not the sequences' order nor contiguous
+constexpr int64_t cells[]  = { 5, 1, 6, 10, 0, 9, 3, 11, 7 }; // each sequence's cell: rows are not the sequences' order nor contiguous
 
 struct shape {
     int64_t n_tokens;
     int64_t n_seqs;
     int64_t K;
     bool    raw;
+    int64_t n_heads = H;
+    int64_t cache_rows = mem_size;
 };
 
 struct inputs {
@@ -52,6 +54,7 @@ struct result {
     std::vector<std::vector<uint8_t>> conts;
     std::vector<std::vector<uint8_t>> snapshots;
     bool                              ok = false;
+    double                            compute_us = 0.0;
 };
 
 std::vector<float> uniform(std::mt19937 & rng, size_t n, float lo, float hi) {
@@ -62,6 +65,7 @@ std::vector<float> uniform(std::mt19937 & rng, size_t n, float lo, float hi) {
 }
 
 inputs make_inputs(const shape & s) {
+    const int64_t H = s.n_heads, D = S_v*S_v*H, mem_size = s.cache_rows;
     std::mt19937 rng(1000 + 100*s.n_tokens + 10*s.n_seqs + s.K);
     inputs in;
     const size_t n_qk = S_v * H * s.n_tokens * s.n_seqs;
@@ -85,8 +89,9 @@ inputs make_inputs(const shape & s) {
 }
 
 result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool conts_as_outputs,
-        snapshot_read read = snapshot_read::none) {
+        snapshot_read read = snapshot_read::none, bool normalize = true, int repeats = 1) {
     result r;
+    const int64_t H = s.n_heads, D = S_v*S_v*H, mem_size = s.cache_rows;
     const int64_t n_written = std::min(s.n_tokens, s.K);
 
     ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), nullptr, true };
@@ -103,8 +108,8 @@ result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool 
     std::vector<ggml_tensor *> rows(n_written);
     for (auto & t : rows) t = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, s.n_seqs);
 
-    ggml_tensor * qn  = ggml_l2_norm(ctx, q, 1e-6f);
-    ggml_tensor * kn  = ggml_l2_norm(ctx, k, 1e-6f);
+    ggml_tensor * qn  = normalize ? ggml_l2_norm(ctx, q, 1e-6f) : q;
+    ggml_tensor * kn  = normalize ? ggml_l2_norm(ctx, k, 1e-6f) : k;
     ggml_tensor * gdn = ggml_gated_delta_net(ctx, qn, kn, v, g, beta, state, s.K);
     if (s.raw) {
         ggml_gated_delta_net_set_raw_kda_gates(gdn, a, -5.0f);
@@ -163,7 +168,22 @@ result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool 
         ggml_backend_tensor_set(conts[slot], sentinel.data(), 0, sentinel.size());
     }
 
-    if (ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS) {
+    const int warmup = repeats > 1 ? 3 : 0;
+    int64_t start = 0;
+    bool computed = true;
+    for (int i = 0; i < warmup + repeats; ++i) {
+        if (i == warmup) {
+            ggml_backend_synchronize(backend);
+            start = ggml_time_us();
+        }
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            computed = false;
+            break;
+        }
+    }
+    if (computed) {
+        ggml_backend_synchronize(backend);
+        r.compute_us = double(ggml_time_us() - start) / repeats;
         r.cache.resize(ggml_nbytes(cache));
         ggml_backend_tensor_get(cache, r.cache.data(), 0, r.cache.size());
         r.attn.resize(attn_bytes);
@@ -183,9 +203,10 @@ result compute(ggml_backend_t backend, const shape & s, const inputs & in, bool 
     return r;
 }
 
-bool run(ggml_backend_t backend, const shape & s) {
+bool run(ggml_backend_t backend, const shape & s, bool perf = false) {
+    const int64_t D = S_v*S_v*s.n_heads;
     const inputs in   = make_inputs(s);
-    const result fused = compute(backend, s, in, false);
+    const result fused = compute(backend, s, in, false, snapshot_read::none, true, perf ? 10000 : 1);
     const result kept  = compute(backend, s, in, true);
     printf("  n_tokens %lld, n_seqs %lld, K %lld, %s gates: ", (long long) s.n_tokens, (long long) s.n_seqs,
             (long long) s.K, s.raw ? "raw" : "activated");
@@ -221,12 +242,103 @@ bool run(ggml_backend_t backend, const shape & s) {
     }
     if (!readers_ok) { return false; }
     printf("OK, cache bytes and all requested snapshot readers are preserved\n");
+    if (perf) {
+        uint64_t hash = UINT64_C(14695981039346656037);
+        for (const auto * data : { &fused.cache, &fused.attn }) {
+            for (uint8_t byte : *data) { hash = (hash ^ byte) * UINT64_C(1099511628211); }
+        }
+        printf("  perf heads=%lld sequences=%lld tokens=%lld us=%.3f output=%016llx\n",
+            (long long) s.n_heads, (long long) s.n_seqs, (long long) s.n_tokens,
+            fused.compute_us, (unsigned long long) hash);
+    }
+    return true;
+}
+
+static inputs first_token_inputs(const inputs & full, bool raw) {
+    inputs one = make_inputs({1, 1, 1, raw});
+    const size_t n_qkv = S_v * H;
+    one.q.assign(full.q.begin(), full.q.begin() + n_qkv);
+    one.k.assign(full.k.begin(), full.k.begin() + n_qkv);
+    one.v.assign(full.v.begin(), full.v.begin() + n_qkv);
+    one.g.assign(full.g.begin(), full.g.begin() + n_qkv);
+    one.beta.assign(full.beta.begin(), full.beta.begin() + H);
+    one.state = full.state;
+    one.a = full.a;
+    return one;
+}
+
+static bool run_prefix_invariance(ggml_backend_t backend) {
+    for (const bool raw : {false, true}) {
+        const shape batch_shape = {4, 1, 4, raw};
+        const shape serial_shape = {1, 1, 1, raw};
+        const inputs batch_input = make_inputs(batch_shape);
+        const inputs serial_input = first_token_inputs(batch_input, raw);
+        const result batch = compute(backend, batch_shape, batch_input, false, snapshot_read::output, false);
+        const result serial = compute(backend, serial_shape, serial_input, false, snapshot_read::output, false);
+        if (!batch.ok || !serial.ok || batch.snapshots.size() != 4 || serial.snapshots.size() != 1) {
+            printf("  batch/serial prefix, %s gates: FAILED, a compute did not return all snapshots\n", raw ? "raw" : "activated");
+            return false;
+        }
+        if (batch.snapshots[3] != serial.snapshots[0]) {
+            printf("  batch/serial prefix, %s gates: FAILED, first-token recurrent state differs\n", raw ? "raw" : "activated");
+            return false;
+        }
+        printf("  batch/serial prefix, %s gates: OK\n", raw ? "raw" : "activated");
+    }
+    return true;
+}
+
+static std::vector<uint8_t> compute_f32_projection(ggml_backend_t backend, int64_t n_tokens,
+        const std::vector<float> & weight, const std::vector<float> & input) {
+    constexpr int64_t n_embd = 512;
+    ggml_init_params params = { ggml_tensor_overhead()*4 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_embd);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+    ggml_mul_mat_set_hint(y, GGML_HINT_MUL_MAT_FORCE_MMF);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+
+    std::vector<uint8_t> output;
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buffer != nullptr) {
+        ggml_backend_tensor_set(w, weight.data(), 0, ggml_nbytes(w));
+        ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+        if (ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS) {
+            output.resize(ggml_nbytes(y));
+            ggml_backend_tensor_get(y, output.data(), 0, output.size());
+        }
+        ggml_backend_buffer_free(buffer);
+    }
+    ggml_free(ctx);
+    return output;
+}
+
+static bool run_projection_prefix_invariance(ggml_backend_t backend) {
+    constexpr int64_t n_embd = 512;
+    std::mt19937 rng(1108);
+    const std::vector<float> weight = uniform(rng, n_embd*n_embd, -1.0f, 1.0f);
+    const std::vector<float> batch_input = uniform(rng, n_embd*4, -1.0f, 1.0f);
+    const std::vector<float> serial_input(batch_input.begin(), batch_input.begin() + n_embd);
+    const std::vector<uint8_t> batch = compute_f32_projection(backend, 4, weight, batch_input);
+    const std::vector<uint8_t> serial = compute_f32_projection(backend, 1, weight, serial_input);
+    if (batch.size() != 4*serial.size() || serial.empty() || memcmp(batch.data(), serial.data(), serial.size()) != 0) {
+        printf("  batch/serial F32 KDA projection: FAILED, first-token projection differs\n");
+        return false;
+    }
+    printf("  batch/serial F32 KDA projection: OK\n");
     return true;
 }
 
 } // namespace
 
-int main(void) {
+int main(int argc, char ** argv) {
+    const bool perf = argc == 2 && strcmp(argv[1], "--perf") == 0;
+    if (argc > 1 && !perf) {
+        fprintf(stderr, "usage: %s [--perf]\n", argv[0]);
+        return 1;
+    }
     ggml_backend_load_all();
     bool ok = true;
     int n_tested = 0;
@@ -237,12 +349,24 @@ int main(void) {
         }
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         printf("%s (%s):\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+        if (perf) {
+            for (int64_t sequences : {1, 9}) {
+                for (int64_t tokens : {1, 2, 3}) {
+                    ok = run(backend, {tokens, sequences, 3, true, 64, 12}, true) && ok;
+                }
+            }
+            ggml_backend_free(backend);
+            n_tested++;
+            continue;
+        }
         // an MTP depth-2 verify (3 rows, 3 slots), a one-row decode, a verify shorter than the slots, one sequence an
         // owner (four sessions on four cards), and the activated gates
         for (const shape s : { shape{3, 3, 3, true}, shape{1, 3, 3, true}, shape{2, 3, 3, true}, shape{3, 1, 3, true},
                                shape{3, 3, 3, false} }) {
             ok = run(backend, s) && ok;
         }
+        ok = run_projection_prefix_invariance(backend) && ok;
+        ok = run_prefix_invariance(backend) && ok;
         ggml_backend_free(backend);
         n_tested++;
     }

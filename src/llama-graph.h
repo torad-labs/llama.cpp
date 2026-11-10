@@ -217,6 +217,7 @@ struct llm_graph_nextn {
     uint32_t n_devices = 1;
     std::vector<uint32_t> * owners = nullptr; // original batch row's owner, for both halves
     const std::vector<float> * carry = nullptr;
+    int64_t n_host = 0; // carry rows below this are host inputs; higher rows are sequence-owned
 };
 
 // the store row of each ubatch row: where the target writes it, or where the head reads its hidden row

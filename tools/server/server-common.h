@@ -8,12 +8,14 @@
 
 #include "json.h"
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cinttypes>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -36,6 +38,34 @@ using json = common_json;
 #define SRV_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
 using raw_buffer = std::vector<uint8_t>;
+
+// Fair admission order for useful prompt chunks, interleaved across sequence owners.
+struct server_prompt_scheduler {
+    std::map<llama_seq_id, uint64_t> last_served;
+    uint64_t clock = 0;
+
+    std::vector<llama_seq_id> order(std::vector<llama_seq_id> pending, uint32_t n_owners) {
+        for (auto id : pending) {
+            last_served.emplace(id, 0);
+        }
+        std::stable_sort(pending.begin(), pending.end(), [&](llama_seq_id a, llama_seq_id b) {
+            return last_served[a] < last_served[b];
+        });
+        std::map<llama_seq_id, uint32_t> rank;
+        std::vector<uint32_t> counts(n_owners, 0);
+        for (auto id : pending) {
+            rank[id] = counts[id % n_owners]++;
+        }
+        std::stable_sort(pending.begin(), pending.end(), [&](llama_seq_id a, llama_seq_id b) {
+            return rank[a] < rank[b];
+        });
+        return pending;
+    }
+
+    void admitted(llama_seq_id id) {
+        last_served[id] = ++clock;
+    }
+};
 
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {

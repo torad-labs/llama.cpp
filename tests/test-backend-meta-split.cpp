@@ -96,6 +96,46 @@ static ggml_backend_meta_split_state split_columns(const ggml_tensor * tensor, v
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
 
+static bool test_permuted_reads(ggml_backend_dev_t device) {
+    ggml_backend_dev_t devices[] = {device, second_device(device)};
+    ggml_backend_dev_t meta = ggml_backend_meta_device(devices, 2, split_columns, nullptr);
+    std::mt19937 rng(1109);
+    for (int sample = 0; sample < 12; ++sample) {
+        const int64_t columns = 1 + rng()%17, heads = 1 + rng()%7;
+        const int64_t tokens = 1 + rng()%9, groups = 1 + rng()%3;
+        std::array<int, 4> axes = {0, 1, 2, 3};
+        do {
+            ggml_context * ctx = ggml_init({4*ggml_tensor_overhead(), nullptr, true});
+            ggml_tensor * base = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, columns, heads, tokens, groups);
+            ggml_set_name(base, "q_heads");
+            ggml_tensor * view = ggml_permute(ctx, base, axes[0], axes[1], axes[2], axes[3]);
+            ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(meta));
+            GGML_ASSERT(buffer);
+            std::vector<uint8_t> data(ggml_nbytes(base));
+            for (auto & value : data) { value = uint8_t(rng()); }
+            ggml_backend_tensor_set(base, data.data(), 0, data.size());
+            bool ok = true;
+            for (int range = 0; range < 4; ++range) {
+                const size_t offset = range == 0 ? 0 : rng()%data.size();
+                const size_t size = range == 0 ? data.size() : 1 + rng()%(data.size() - offset);
+                std::vector<uint8_t> actual(size + 2, 0xa5);
+                ggml_backend_tensor_get(view, actual.data() + 1, offset, size);
+                ok = ok && actual.front() == 0xa5 && actual.back() == 0xa5 &&
+                     std::equal(actual.begin() + 1, actual.end() - 1, data.begin() + offset);
+            }
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+            if (!ok) {
+                printf("FAIL permuted split read: sample=%d axes=%d%d%d%d\n",
+                        sample, axes[0], axes[1], axes[2], axes[3]);
+                return false;
+            }
+        } while (std::next_permutation(axes.begin(), axes.end()));
+    }
+    printf("ok   generated permuted split reads preserve byte ranges\n");
+    return true;
+}
+
 static bool test_rows(ggml_backend_dev_t gpu, bool explicit_layout) {
     std::array<int64_t, 4> rows = {1, 0, 2, 5};
     ggml_backend_dev_t devs[4] = {gpu, second_device(gpu), gpu, second_device(gpu)};
@@ -1097,6 +1137,9 @@ int main(int argc, char ** argv) {
     if (argc == 2 && (strcmp(argv[1], "--split-cache-cpu") == 0 || strcmp(argv[1], "--split-cycle-cpu") == 0)) {
         return split_test_stack_limit() && test_split_cache(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), strcmp(argv[1], "--split-cycle-cpu") == 0) ? 0 : 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--permuted-read-cpu") == 0) {
+        return test_permuted_reads(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--host-layout-cpu") == 0) {
         return test_host_layout(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
     }
@@ -1162,6 +1205,9 @@ int main(int argc, char ** argv) {
             ok = test_owned_cache_rows(gpu, type, true) && test_stream_view(gpu, type, false, true) && test_stream_view(gpu, type, true, true) && ok;
         }
         return ok ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--permuted-read") == 0) {
+        return test_permuted_reads(gpu) ? 0 : 1;
     }
     if (argc == 4 && strcmp(argv[1], "--tensor") == 0) {
         return test_tensor_mode(gpu, atoi(argv[2]), atoll(argv[3])) ? 0 : 1;

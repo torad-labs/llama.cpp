@@ -2378,6 +2378,61 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     }
 }
 
+static bool ggml_backend_meta_dense_layout(const ggml_tensor * tensor) {
+    if (ggml_blck_size(tensor->type) != 1) { return false; }
+    int axes[] = {0, 1, 2, 3};
+    std::sort(axes, axes + GGML_MAX_DIMS, [&](int a, int b) { return tensor->nb[a] < tensor->nb[b]; });
+    size_t bytes = ggml_type_size(tensor->type);
+    for (int axis : axes) {
+        if (tensor->ne[axis] > 1 && tensor->nb[axis] != bytes) { return false; }
+        bytes *= tensor->ne[axis];
+    }
+    return bytes == ggml_nbytes(tensor);
+}
+
+// A dense permutation keeps physical byte order, not logical axis order.
+// Reassemble the rank chunks in that order, including partial byte ranges.
+static bool ggml_backend_meta_get_dense(const ggml_tensor * tensor, const ggml_backend_meta_split_state & split,
+        size_t n_bufs, void * data, size_t offset, size_t size) {
+    if (split.axis < 0 || split.axis >= GGML_MAX_DIMS || split.n_segments != 1 || split.nr[0] != 1 ||
+            !ggml_backend_meta_dense_layout(tensor)) { return false; }
+    GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
+    if (!size) { return true; }
+    const bool single = tensor->ne[split.axis] == 1;
+    const size_t chunk = single ? ggml_nbytes(tensor) : tensor->nb[split.axis]*tensor->ne[split.axis];
+    std::vector<size_t> chunks(n_bufs);
+    size_t total = 0;
+    for (size_t rank = 0; rank < n_bufs; ++rank) {
+        const ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, rank);
+        if (ggml_is_empty(simple)) { continue; }
+        GGML_ASSERT(ggml_backend_meta_dense_layout(simple));
+        chunks[rank] = single ? ggml_nbytes(simple) : simple->nb[split.axis]*simple->ne[split.axis];
+        total += chunks[rank];
+    }
+    GGML_ASSERT(total == chunk && chunk > 0);
+    size_t rank_start = 0;
+    for (size_t rank = 0; rank < n_bufs; ++rank) {
+        const size_t local_chunk = chunks[rank];
+        if (!local_chunk) { continue; }
+        const ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, rank);
+        if (offset % chunk == 0 && size % chunk == 0) {
+            ggml_backend_tensor_get_2d(simple, (char *) data + rank_start, offset/chunk*local_chunk,
+                    local_chunk, size/chunk, local_chunk, chunk);
+        } else {
+            for (size_t row = offset/chunk; row <= (offset + size - 1)/chunk; ++row) {
+                const size_t start = row*chunk + rank_start;
+                const size_t begin = std::max(offset, start), end = std::min(offset + size, start + local_chunk);
+                if (end > begin) {
+                    ggml_backend_tensor_get(simple, (char *) data + begin - offset,
+                            row*local_chunk + begin - start, end - begin);
+                }
+            }
+        }
+        rank_start += local_chunk;
+    }
+    return true;
+}
+
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -2385,6 +2440,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             [&](size_t rank, size_t local, size_t dst, size_t bytes) {
                 ggml_backend_tensor_get(ggml_backend_meta_buffer_simple_tensor(tensor, rank), (char *) data + dst, local, bytes);
             })) { return; }
+    if (ggml_backend_meta_get_dense(tensor, split_state, n_bufs, data, offset, size)) { return; }
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
@@ -2697,16 +2753,20 @@ struct ggml_backend_meta_context {
 
         struct graph {
             uint64_t            uid     = 0;     // the cgraph
+            uint64_t            parent  = 0;     // its scheduler graph generation
             int                 n_nodes = 0;
             int                 n_evals = 0;     // its evaluations so far
             bool                refused = false; // it cannot be captured
             std::vector<void *> execs;           // its graphs, one a device, once captured
-            uint64_t            t_used  = 0;     // the evaluation it was last used by
+        };
+        struct generation {
+            uint64_t              t_used = 0; // the evaluation it was last used by
+            std::vector<uint64_t> fragments;
         };
         static constexpr size_t n_graphs_max = 4; // scheduler graphs, not individual splits
-        size_t                  n_splits_max = 1;
-        std::vector<graph>      graphs;
-        uint64_t                t_now = 0; // the evaluations so far, t_used's clock
+        std::unordered_map<uint64_t, graph>      graphs;
+        std::unordered_map<uint64_t, generation> generations;
+        uint64_t                                 t_now = 0; // the evaluations so far, t_used's clock
 
         bool available() const {
             return allreduce_capturable != nullptr && graph_capturable != nullptr && begin != nullptr && end != nullptr &&
@@ -2722,37 +2782,55 @@ struct ggml_backend_meta_context {
     }
 
     // the state of the cgraph of this uid, new if it has none
-    capture_state::graph & capture_graph(uint64_t uid, int n_nodes, int n_backend_splits) {
-        // Keep all fragments of the active graph slots, including their first evaluations before capture.
-        capture.n_splits_max = std::max(capture.n_splits_max, (size_t) std::max(1, n_backend_splits));
+    capture_state::graph & capture_graph(uint64_t uid, int n_nodes, uint64_t parent) {
+        parent = parent ? parent : uid;
         capture.t_now++;
-        for (capture_state::graph & g : capture.graphs) {
-            if (g.uid == uid) {
-                g.t_used = capture.t_now;
-                return g;
-            }
+
+        auto fragment = capture.graphs.find(uid);
+        if (fragment != capture.graphs.end()) {
+            GGML_ASSERT(fragment->second.parent == parent);
+            auto generation = capture.generations.find(parent);
+            GGML_ASSERT(generation != capture.generations.end());
+            generation->second.t_used = capture.t_now;
+            return fragment->second;
         }
-        if (capture.graphs.size() < capture_state::n_graphs_max*capture.n_splits_max) {
-            capture.graphs.emplace_back();
-        } else {
-            capture_state::graph & lru = *std::min_element(capture.graphs.begin(), capture.graphs.end(),
-                [](const capture_state::graph & a, const capture_state::graph & b) { return a.t_used < b.t_used; });
-            if (trace_graphs) {
-                GGML_LOG_INFO("graph_trace layer=meta event=evict context=%p uid=%llu reason=lru next_uid=%llu nodes=%d executables=%zu\n",
-                    (void *) this, (unsigned long long) lru.uid, (unsigned long long) uid, lru.n_nodes, lru.execs.size());
+
+        auto generation = capture.generations.find(parent);
+        if (generation == capture.generations.end()) {
+            if (capture.generations.size() == capture_state::n_graphs_max) {
+                auto lru = capture.generations.begin();
+                for (auto it = capture.generations.begin(); it != capture.generations.end(); ++it) {
+                    if (it->second.t_used < lru->second.t_used) {
+                        lru = it;
+                    }
+                }
+                for (uint64_t retired_uid : lru->second.fragments) {
+                    auto retired = capture.graphs.find(retired_uid);
+                    GGML_ASSERT(retired != capture.graphs.end());
+                    if (trace_graphs) {
+                        GGML_LOG_INFO("graph_trace layer=meta event=evict context=%p uid=%llu reason=lru next_uid=%llu nodes=%d executables=%zu\n",
+                            (void *) this, (unsigned long long) retired->second.uid, (unsigned long long) uid,
+                            retired->second.n_nodes, retired->second.execs.size());
+                    }
+                    capture_free(retired->second);
+                    capture.graphs.erase(retired);
+                }
+                capture.generations.erase(lru);
             }
-            capture_free(lru);
-            std::swap(lru, capture.graphs.back());
-            capture.graphs.back() = {};
+            generation = capture.generations.emplace(parent, capture_state::generation{}).first;
         }
-        capture.graphs.back().uid    = uid;
-        capture.graphs.back().n_nodes = n_nodes;
-        capture.graphs.back().t_used = capture.t_now;
+
+        generation->second.t_used = capture.t_now;
+        fragment = capture.graphs.emplace(uid, capture_state::graph{}).first;
+        fragment->second.uid     = uid;
+        fragment->second.parent  = parent;
+        fragment->second.n_nodes = n_nodes;
+        generation->second.fragments.push_back(uid);
         if (trace_graphs) {
             GGML_LOG_INFO("graph_trace layer=meta event=miss context=%p uid=%llu nodes=%d entries=%zu\n",
                 (void *) this, (unsigned long long) uid, n_nodes, capture.graphs.size());
         }
-        return capture.graphs.back();
+        return fragment->second;
     }
 
     // Launches a replay on every device. The calling thread launches the devices in turn; at the start of each replay it
@@ -2932,8 +3010,8 @@ struct ggml_backend_meta_context {
 
     ~ggml_backend_meta_context() {
         launcher.reset();
-        for (capture_state::graph & g : capture.graphs) {
-            capture_free(g);
+        for (auto & entry : capture.graphs) {
+            capture_free(entry.second);
         }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
@@ -3132,7 +3210,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_backend_meta_context::capture_state & cap = backend_ctx->capture;
     ggml_backend_meta_context::capture_state::graph * cg = nullptr;
     if (!capture_legacy && n_backends > 1 && cgraph->uid != 0 && cap.available()) {
-        cg = &backend_ctx->capture_graph(cgraph->uid, cgraph->n_nodes, cgraph->n_backend_splits);
+        cg = &backend_ctx->capture_graph(cgraph->uid, cgraph->n_nodes, cgraph->uid_parent);
         if (!cg->execs.empty()) {
             if (backend_ctx->trace_graphs) {
                 GGML_LOG_INFO("graph_trace layer=meta event=replay context=%p uid=%llu ranks=%zu nodes=%d\n",

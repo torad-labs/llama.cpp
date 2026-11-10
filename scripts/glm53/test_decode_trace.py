@@ -1,5 +1,6 @@
 """Goal: recover real scheduling evidence without changing its identity or clock."""
 import json
+import os
 import contextlib
 import sqlite3
 import tempfile
@@ -17,26 +18,181 @@ import decode_lab
 import test_decode_lab as fixtures
 
 
+def decoded_capture_database(rows=36, batch_markers=True):
+    db = sqlite3.connect(':memory:')
+    db.executescript(f'''
+        CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,deviceId INTEGER,globalPid INTEGER,correlationId INTEGER);
+        CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME(start INTEGER,end INTEGER,globalTid INTEGER,correlationId INTEGER);
+        CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,globalTid INTEGER,text TEXT,textId INTEGER);
+        INSERT INTO NVTX_EVENTS VALUES (100,200,16777217,'glm53.v1 stage=target_eval rows={rows}',NULL);
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (120,121,16777217,7);
+    ''')
+    for device in range(4):
+        db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (130,160,?,16777216,7)', (device,))
+    if batch_markers:
+        add_decode_batch_markers(db, rows)
+    return db
+
+
+def add_decode_batch_markers(db, count):
+    for sequence in range(count):
+        label = f'glm53.v1 stage=batch sequence={sequence} rows=1 prompt_rows=0'
+        db.execute('INSERT INTO NVTX_EVENTS VALUES (105,NULL,16777217,?,NULL)', (label,))
+
+
+def write_decoded_capture_sqlite(path):
+    with contextlib.closing(decoded_capture_database()) as source:
+        source.commit()
+        with sqlite3.connect(path) as target:
+            source.backup(target)
+
+
 class TraceRecoveryTest(unittest.TestCase):
-    def test_capture_requires_workload_markers_and_kernels_on_every_expected_device(self):
-        db = sqlite3.connect(':memory:')
-        db.executescript('''
-            CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,deviceId INTEGER,globalPid INTEGER);
-            CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,globalTid INTEGER,text TEXT,textId INTEGER);
-            CREATE TABLE StringIds(id INTEGER,value TEXT);
-            INSERT INTO StringIds VALUES (1,'glm53.v1 stage=target_eval rows=36');
-            INSERT INTO NVTX_EVENTS VALUES (1,90,16777217,NULL,1);
-        ''')
-        for device in range(4):
-            db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10,100,?,16777216)',(device,))
-        self.assertTrue(decode_trace.capture_readiness(db, range(4))['usable'])
-        db.execute('DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE deviceId=3')
-        self.assertFalse(decode_trace.capture_readiness(db, range(4))['usable'])
-        # An unrelated preflight kernel on device 3 does not complete the model's capture.
-        db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10,100,3,33554432)')
-        self.assertFalse(decode_trace.capture_readiness(db, range(4))['usable'])
-        db.execute('DELETE FROM NVTX_EVENTS')
-        self.assertFalse(decode_trace.capture_readiness(db, range(4))['usable'])
+    def test_real_cuda_graph_updates_remain_traceable(self):
+        binary = os.environ.get("GLM53_PROFILE_GRAPH_BINARY")
+        if not binary:
+            self.skipTest("set GLM53_PROFILE_GRAPH_BINARY and GLM53_PROFILE_TEST_OUTPUT for the GPU/Nsight integration")
+        output = Path(os.environ["GLM53_PROFILE_TEST_OUTPUT"]).resolve()
+        output.mkdir(parents=True, exist_ok=False)
+        capture = output / "graph-updates"
+        env = {key: os.environ[key] for key in ("PATH", "HOME", "LD_LIBRARY_PATH",
+               "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER") if key in os.environ}
+        with (output / "profile.log").open("x") as log:
+            run = subprocess.run(["nsys", "profile", "--trace=cuda,nvtx", "--cuda-graph-trace=node",
+                                  "--sample=none", "--cpuctxsw=none", "--output=" + str(capture), binary],
+                                 env=env, stdout=log, stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(run.returncode, 0, "graph numerical check or profiling failed; see profile.log")
+        with (output / "export.log").open("x") as log:
+            exported = subprocess.run(["nsys", "export", "--type", "sqlite", "--output",
+                                       str(capture) + ".sqlite", str(capture) + ".nsys-rep"],
+                                      env=env, stdout=log, stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(exported.returncode, 0, "see export.log")
+        with contextlib.closing(sqlite3.connect(str(capture) + ".sqlite")) as db:
+            self.assertGreater(db.execute("SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_KERNEL").fetchone()[0], 0)
+            errors = db.execute("SELECT text,COUNT(*) FROM DIAGNOSTIC_EVENT WHERE severity>=3 GROUP BY text").fetchall()
+        self.assertEqual(errors, [], "actual graph updates must remain traceable without collector errors")
+
+    def test_decode_window_follows_same_process_worker_launches(self):
+        rng = random.Random(59921522)
+        for trial in range(24):
+            with self.subTest(trial=trial), contextlib.closing(decoded_capture_database()) as db:
+                pid = (rng.randrange(1, 65536) << 24) | (rng.randrange(2) << 48)
+                main_tid = pid + 1
+                db.execute('UPDATE NVTX_EVENTS SET globalTid=?', (main_tid,))
+                db.execute('DELETE FROM CUPTI_ACTIVITY_KIND_RUNTIME')
+                db.execute('DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL')
+                correlations = rng.sample(range(10, 10000), 4)
+                intervals = []
+                for device, correlation in enumerate(correlations):
+                    tid = main_tid if device == trial % 5 else pid + rng.randrange(2, 100000)
+                    launch = rng.randrange(110, 125)
+                    start, end = rng.randrange(130, 150), rng.randrange(160, 240)
+                    intervals.append((start, end))
+                    db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?,?,?,?)',
+                               (launch, launch + 1, tid, correlation))
+                    db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?)',
+                               (start, end, device, pid, correlation))
+                result = decode_trace.capture_readiness(db, range(4), expected_sequences=36)
+                self.assertTrue(result['usable'], result)
+                self.assertEqual(result['actual_sequences'], 36)
+                start, end = min(x[0] for x in intervals), max(x[1] for x in intervals)
+                self.assertEqual(result['gpu_window'], dict(start_ns=start, end_ns=end,
+                                                           duration_ns=end-start, kernel_count=4))
+                correlation = correlations[rng.randrange(4)]
+                invalid_updates = [
+                    ('UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET globalTid=? WHERE correlationId=?',
+                     (main_tid + (1 << 24), correlation)),
+                    ('UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET start=90,end=91 WHERE correlationId=?', (correlation,)),
+                    ('UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET start=201,end=202 WHERE correlationId=?', (correlation,)),
+                    ('UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET start=190,end=201 WHERE correlationId=?', (correlation,)),
+                    ('UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET end=start WHERE correlationId=?', (correlation,)),
+                    ('DELETE FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE correlationId=?', (correlation,)),
+                    ('UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET start=105 WHERE correlationId=?', (correlation,)),
+                    ('UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET globalPid=? WHERE correlationId=?', (pid + (1 << 24), correlation)),
+                    ('UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET end=start WHERE correlationId=?', (correlation,)),
+                ]
+                for sql, params in invalid_updates:
+                    with self.subTest(sql=sql):
+                        db.execute('SAVEPOINT invalid_launch')
+                        db.execute(sql, params)
+                        self.assertFalse(decode_trace.capture_readiness(db, range(4), expected_sequences=36)['usable'])
+                        db.execute('ROLLBACK TO invalid_launch')
+                        db.execute('RELEASE invalid_launch')
+
+    def test_capture_counts_decoding_sequences_not_tensor_rows(self):
+        rng = random.Random(2408)
+        for widths in ([2] * 36, [3] * 36, [1] * 36,
+                       [rng.randrange(1, 4) for _ in range(36)]):
+            with self.subTest(widths=widths):
+                db = decoded_capture_database(rows=sum(widths), batch_markers=False)
+                identities = rng.sample(range(400), 36)
+                for sequence, width in zip(identities, widths):
+                    label = f'glm53.v1 stage=batch sequence={sequence} rows={width} prompt_rows=0 position_min=528 position_max={527 + width}'
+                    db.execute('INSERT INTO NVTX_EVENTS VALUES (105,NULL,16777217,?,NULL)', (label,))
+                result = decode_trace.capture_readiness(db, range(4), expected_sequences=36)
+                self.assertTrue(result['usable'], result)
+                self.assertEqual(result['actual_sequences'], 36)
+                self.assertEqual(result['actual_rows'], sum(widths))
+                db.close()
+
+    def test_capture_rejects_profiler_failures_for_the_measured_process(self):
+        rng = random.Random(9134)
+        diagnostics = [
+            (3, "GetGraphId returned CUPTI_ERROR_INVALID_PARAMETER"),
+            (2, "Installed CUDA driver version (13.4) is not supported by this build of Nsight Systems."),
+            (2, "Not all CUDA events might have been collected."),
+            (2, "Not all NVTX events might have been collected."),
+        ]
+        for _ in range(24):
+            severity, message = rng.choice(diagnostics)
+            pid = rng.choice([16777216, 33554432, None])
+            with self.subTest(severity=severity, message=message, pid=pid):
+                with contextlib.closing(decoded_capture_database()) as db:
+                    db.execute("CREATE TABLE DIAGNOSTIC_EVENT(timestamp INTEGER,severity INTEGER,text TEXT,globalPid INTEGER)")
+                    db.execute("INSERT INTO DIAGNOSTIC_EVENT VALUES (?,?,?,?)",
+                               (rng.randrange(-1000, 1000), severity, message, pid))
+                    result = decode_trace.capture_readiness(db, range(4), expected_sequences=36)
+                    self.assertEqual(result["usable"], pid == 33554432, result)
+
+    def test_capture_rejects_unproved_or_prefill_cohorts(self):
+        for case in ('missing', 'duplicate', 'prefill', 'outside-phase', 'wrong-thread', 'incomplete-rows'):
+            with self.subTest(case=case):
+                db = decoded_capture_database(batch_markers=False)
+                if case != 'missing':
+                    for sequence in range(36):
+                        identity = 0 if case == 'duplicate' else sequence
+                        prompt = 1 if case == 'prefill' and sequence == 0 else 0
+                        at = 90 if case == 'outside-phase' else 105
+                        tid = 16777218 if case == 'wrong-thread' else 16777217
+                        if case == 'incomplete-rows' and sequence == 0:
+                            continue
+                        label = f'glm53.v1 stage=batch sequence={identity} rows=1 prompt_rows={prompt}'
+                        db.execute('INSERT INTO NVTX_EVENTS VALUES (?,NULL,?,?,NULL)', (at, tid, label))
+                self.assertFalse(decode_trace.capture_readiness(db, range(4), expected_sequences=36)['usable'])
+                db.close()
+
+    def test_capture_requires_an_actual_36_session_gpu_decode_window(self):
+        db = decoded_capture_database()
+        result = decode_trace.capture_readiness(db, range(4), expected_sequences=36)
+        self.assertTrue(result['usable'])
+        self.assertEqual(result['actual_rows'], 36)
+        self.assertEqual(result['gpu_window'], {'start_ns': 130, 'end_ns': 160, 'duration_ns': 30, 'kernel_count': 4})
+        self.assertNotIn('host_start_ns', result['gpu_window'])
+        for name in ('wrong-active-count', 'wrong-device', 'wrong-process', 'wrong-launch-time'):
+            with self.subTest(name=name):
+                probe = decoded_capture_database()
+                if name == 'wrong-active-count':
+                    probe.execute("UPDATE NVTX_EVENTS SET text='glm53.v1 stage=target_eval rows=35'")
+                elif name == 'wrong-device':
+                    probe.execute('UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET deviceId=4 WHERE deviceId=3')
+                elif name == 'wrong-process':
+                    probe.execute('UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET globalPid=33554432 WHERE deviceId=3')
+                else:
+                    probe.execute('UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET start=90')
+                failed = decode_trace.capture_readiness(probe, range(4), expected_sequences=36)
+                self.assertFalse(failed['usable'])
+                self.assertIsNone(failed['gpu_window'])
+                probe.close()
         db.close()
 
     def test_runtime_only_export_is_not_a_model_capture(self):
@@ -50,17 +206,20 @@ class TraceRecoveryTest(unittest.TestCase):
     def test_startup_kernels_do_not_fill_a_missing_decode_device(self):
         db = sqlite3.connect(':memory:')
         db.executescript('''
-            CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,deviceId INTEGER,globalPid INTEGER);
+            CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,deviceId INTEGER,globalPid INTEGER,correlationId INTEGER);
+            CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME(start INTEGER,end INTEGER,globalTid INTEGER,correlationId INTEGER);
             CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,globalTid INTEGER,text TEXT,textId INTEGER);
             INSERT INTO NVTX_EVENTS VALUES (100,190,16777217,'glm53.v1 stage=target_eval rows=36',NULL);
+            INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (110,111,16777217,7);
         ''')
+        add_decode_batch_markers(db, 36)
         for device in range(4):
-            db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10,90,?,16777216)', (device,))
+            db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10,90,?,16777216,7)', (device,))
         for device in range(3):
-            db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (110,200,?,16777216)', (device,))
-        self.assertFalse(decode_trace.capture_readiness(db, range(4))['usable'])
-        db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (110,200,3,16777216)')
-        self.assertTrue(decode_trace.capture_readiness(db, range(4))['usable'])
+            db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (120,200,?,16777216,7)', (device,))
+        self.assertFalse(decode_trace.capture_readiness(db, range(4), expected_sequences=36)['usable'])
+        db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (120,200,3,16777216,7)')
+        self.assertTrue(decode_trace.capture_readiness(db, range(4), expected_sequences=36)['usable'])
         db.close()
 
     def test_aborted_application_can_finish_export_before_profiler_cleanup(self):
@@ -95,6 +254,48 @@ class TraceRecoveryTest(unittest.TestCase):
             self.assertFalse(result['report_present'])
             self.assertFalse(result['capture_verified'])
             self.assertTrue(result['deadline_reached'])
+
+    def test_export_retains_raw_report_versions_and_verified_gpu_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'decode'
+            report = output.with_name(output.name + '.nsys-rep')
+            report.write_bytes(b'raw-nsys-report')
+            sqlite = output.with_name(output.name + '-export.sqlite')
+            request = {'active_sessions': 36, 'launch_sha256': 'launch',
+                       'capture_nsys': {'exit': 0, 'version': 'NVIDIA Nsight Systems version 2026.1.3'}}
+            def run(argv, **kwargs):
+                if argv[1:] == ['--version']:
+                    return subprocess.CompletedProcess(argv, 0, 'NVIDIA Nsight Systems version 2026.1.3\n', '')
+                self.assertEqual(argv[:4], ['nsys', 'export', '--type', 'sqlite'])
+                write_decoded_capture_sqlite(sqlite)
+                return subprocess.CompletedProcess(argv, 0, 'exported', '')
+            with patch.object(measure.subprocess, 'run', side_effect=run):
+                result = measure.export_nsys_capture(output, range(4), request, time.time() + 10)
+            self.assertTrue(result['capture_verified'])
+            self.assertEqual(result['launch_sha256'], 'launch')
+            self.assertEqual(result['readiness']['gpu_window']['duration_ns'], 30)
+            self.assertEqual(result['exporter']['compatibility']['state'], 'exact-version')
+            self.assertEqual(Path(result['report']).read_bytes(), b'raw-nsys-report')
+            self.assertTrue(Path(result['sqlite']).is_file())
+            receipt = json.loads(output.with_name(output.name + '-export.json').read_text())
+            self.assertEqual(receipt['export']['stdout'], 'exported')
+
+    def test_export_failure_keeps_the_raw_report_and_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'decode'
+            report = output.with_name(output.name + '.nsys-rep')
+            report.write_bytes(b'raw-nsys-report')
+            request = {'active_sessions': 36, 'launch_sha256': 'launch',
+                       'capture_nsys': {'exit': 0, 'version': 'NVIDIA Nsight Systems version 2026.1.3'}}
+            with patch.object(measure.subprocess, 'run', side_effect=[
+                    subprocess.CompletedProcess([], 0, 'NVIDIA Nsight Systems version 2026.1.3\n', ''),
+                    subprocess.CompletedProcess([], 7, '', 'cannot export')]):
+                result = measure.export_nsys_capture(output, range(4), request, time.time() + 10)
+            self.assertFalse(result['capture_verified'])
+            self.assertEqual(result['failure'], 'sqlite_export_failed')
+            self.assertEqual(report.read_bytes(), b'raw-nsys-report')
+            receipt = json.loads(output.with_name(output.name + '-export.json').read_text())
+            self.assertEqual(receipt['export']['stderr'], 'cannot export')
 
     def test_generated_marker_metadata_round_trips_but_free_text_never_does(self):
         rng=random.Random(53)

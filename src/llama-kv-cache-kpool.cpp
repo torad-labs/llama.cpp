@@ -1662,6 +1662,10 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
         return;
     }
 
+    // A layer may reject direct attention after index generation was accepted. If every layer
+    // falls back to a mask, the scheduler does not allocate this unused optional input.
+    auto * tail_input = tail_cells && tail_cells->data ? tail_cells : nullptr;
+
     if (resident_table) {
         auto & views = mctx_attn->get_kv()->get_kpool_views();
         views.begin();
@@ -1672,7 +1676,7 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(backend);
         resident_table->begin_upload(backend);
         const int64_t n_tps = ubatch->n_tokens/ubatch->n_seqs_unq;
-        if (tail_cells) std::fill_n((int32_t *) tail_cells->data, ggml_nelements(tail_cells), -1);
+        if (tail_input) std::fill_n((int32_t *) tail_input->data, ggml_nelements(tail_input), -1);
         if (!reuse_only) std::fill_n((int32_t *) new_pool_cells->data, ggml_nelements(new_pool_cells), 0);
         for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
             const auto seq = ubatch->seq_id_unq[s];
@@ -1708,8 +1712,8 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             }
             kpool_stream_out o;
             o.mask_rows = (int32_t *) mask_rows->data + s*n_tps*4;
-            o.tail_cells = tail_cells ? (int32_t *) tail_cells->data + s*n_tps*tail_cells->ne[0] : nullptr;
-            o.n_tail = tail_cells ? tail_cells->ne[0] : 0;
+            o.tail_cells = tail_input ? (int32_t *) tail_input->data + s*n_tps*tail_input->ne[0] : nullptr;
+            o.n_tail = tail_input ? tail_input->ne[0] : 0;
             o.n_kv = mask_cells->ne[0];
             o.n_pools = pool_bias->ne[0];
             o.n_tps = n_tps;
@@ -1750,7 +1754,7 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             strm_of.empty() ? nullptr : strm_of.data(),
             pool_reps ? (int64_t) mctx_idx->get_kv()->get_size() : 0,
             rebuild,
-            ubatch, kpool, mask_cells, mask_rows, tail_cells);
+            ubatch, kpool, mask_cells, mask_rows, tail_input);
 
     // the sparse attention's n_kv_max counts n_tail tail cells a row: a row granted more would lose cells to its compaction
     GGML_ASSERT(n_tail_set <= n_tail && "k-pool: a row's tail holds more cells than the graph's sparse bound");

@@ -13,6 +13,7 @@
 #include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 #include "../src/llama-memory-hybrid.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include <cstdlib>
 
@@ -1365,14 +1366,15 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
         };
 
         // seq 0 reads n_read tokens in 256-row steps, after n_before tokens of seq 1 when unified; then one token decodes
-        const auto read = [&](const char * pad, bool mtp, bool unified) {
+        const auto read = [&](const char * pad, bool mtp, bool unified, uint32_t n_ubatch) {
+            fprintf(stderr, "GLM prefill reuse case: top_k=%u pad=%s mtp=%d unified=%d ubatch=%u\n", top_k, pad, mtp, unified, n_ubatch);
             set_env("LLAMA_KV_PAD_PREFILL", pad);
             probe pr;
             llama_context_params params = llama_context_default_params();
             if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             params.n_ctx      = 8192;
             params.n_batch    = n_read;
-            params.n_ubatch   = 256;
+            params.n_ubatch   = n_ubatch;
             params.n_seq_max  = unified ? 2 : 1;
             params.kv_unified = unified;
             params.n_threads  = params.n_threads_batch = 4;
@@ -1380,6 +1382,10 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
                 auto * p = static_cast<probe *>(data);
                 if (ask && p->decoding && std::string(t->name).rfind("kpool_cand_mask", 0) == 0) {
                     p->n_kv = t->ne[0];
+                }
+                if (ask && p->decoding && t->op == GGML_OP_KPOOL_MASK &&
+                        ggml_get_op_params_i32(t, 0) == GGML_KPOOL_MASK_INDICES) {
+                    p->n_kv = t->src[4] ? ggml_get_op_params_i32(t, 3) : t->src[0]->ne[0];
                 }
                 if (ask && !p->decoding && std::string(t->name).rfind("indexer_top_k_pools", 0) == 0) {
                     ++p->n_scored;
@@ -1423,8 +1429,10 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
 
         for (const bool mtp : {false, true}) {
             for (const bool unified : {false, true}) {
-                const read_result fine   = read("0", mtp, unified);
-                const read_result coarse = read("1024", mtp, unified);
+                const read_result fine    = read("0", mtp, unified, 256);
+                const read_result coarse  = read("1024", mtp, unified, 256);
+                const read_result chunked = read("0", mtp, unified, 128);
+                const read_result wide    = read("0", mtp, unified, 512);
 
                 // Padded to 256, every step's cache is a step longer: nothing is reused. Padded to 1,024, a graph is built
                 // when the cache crosses a multiple of 1,024 cells, or seq 0's positions a multiple of 256 pools (seq 1's
@@ -1464,6 +1472,11 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
                         LOG_WRN("GLM prefill reuse: top_k=%u mtp=%d unified=%d: %zu tied rows' top token swapped, mean KLD "
                                 "%g, nmse=%g\n", top_k, mtp, unified, n_top_tied, kld, nmse(fine.logits, coarse.logits));
                     }
+                }
+                if (exact && chunked.logits != wide.logits) {
+                    LOG_ERR("GLM prefill chunk invariance: top_k=%u mtp=%d unified=%d: 128-row and 512-row chunks differ, "
+                            "nmse=%g\n", top_k, mtp, unified, nmse(chunked.logits, wide.logits));
+                    ok = false;
                 }
                 if (fine.n_reused != want_fine || coarse.n_reused != want_coarse) {
                     LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: reused %d graphs padded to 256 (want %d), "
@@ -1560,8 +1573,8 @@ static bool test_glm_tok_embd_on_device(const size_t seed, const std::vector<ggm
 // compute buffer grow on its own: a bound context's buffer grows only on a step where the unbound one's grows too (the
 // engine's own growth after its first reserve, which the store doesn't change). A batch under 64 rows keeps the host
 // path.
-static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        llama_split_mode split_mode, const std::vector<float> & tensor_split, bool q8_cache) {
+static bool test_glm_nextn_store_run(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split, bool q8_cache, bool retained) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
     if (split_mode == LLAMA_SPLIT_MODE_DATA) {
         llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
@@ -1602,7 +1615,7 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
 
     llama_context_ptr tgt_host = make(false), head_host = make(true);
     llama_context_ptr tgt_dev  = make(false), head_dev  = make(true);
-    if (!llama_set_nextn_source(head_dev.get(), tgt_dev.get())) {
+    if (!llama_set_nextn_source(head_dev.get(), tgt_dev.get(), retained ? 4 : 0)) {
         LOG_ERR("GLM nextn store: the target and its MTP head would not bind\n");
         return false;
     }
@@ -1614,6 +1627,20 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
 
     llama_pos n_past[2] = { 0, 0 };
     std::vector<float> kept[2] = { std::vector<float>(n_embd, 0.0f), std::vector<float>(n_embd, 0.0f) };
+    std::vector<float> retained_rows[2];
+    std::mt19937 retain_rng(seed ^ 0x15a3u);
+    const auto retained_equal = [&]() {
+        for (llama_seq_id s = 0; s < 2; ++s) {
+            for (size_t row = 0; row < retained_rows[s].size()/n_embd; ++row) {
+                std::vector<float> actual(n_embd);
+                if (!llama_nextn_kept_get(tgt_dev.get(), llama_nextn_kept_row(tgt_dev.get(), s, row), actual.data()) ||
+                        std::memcmp(actual.data(), retained_rows[s].data() + row*n_embd, n_embd*sizeof(float))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
     int n_tok = 0;
 
     // one prefill step: each part a sequence's next rows, the last row of each an output
@@ -1634,7 +1661,7 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
             return false;
         };
         if (llama_decode(tgt_host.get(), batch) || llama_decode(tgt_dev.get(), batch)) return fail("a target decode failed");
-        const bool device = n >= 64;
+        const bool device = retained || n >= 64;
         if (llama_get_nextn_store_rows(tgt_dev.get()) != (device ? n : 0) || llama_get_nextn_store_rows(tgt_host.get()) != 0) {
             LOG_ERR("GLM nextn store: the store holds %d rows, the unbound target's %d\n",
                     llama_get_nextn_store_rows(tgt_dev.get()), llama_get_nextn_store_rows(tgt_host.get()));
@@ -1690,7 +1717,7 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
                 const bool head_row = i == first[j];
                 std::memcpy(hidden.data() + (size_t) i*n_embd, head_row ? kept[s].data() : h_host + (size_t) (i - 1)*n_embd,
                             n_embd*sizeof(float));
-                src[i] = head_row ? -(int32_t) (carry.size()/n_embd + 1) : i - 1;
+                src[i] = head_row ? (retained ? llama_nextn_kept_row(tgt_dev.get(), n_past[s] ? s : -1, 0) : -(int32_t) (carry.size()/n_embd + 1)) : i - 1;
                 if (head_row) carry.insert(carry.end(), kept[s].begin(), kept[s].end());
             }
         }
@@ -1698,7 +1725,7 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
         batch.embd = hidden.data();
         int rc = llama_decode(head_host.get(), batch);
         if (device) {
-            llama_set_nextn_h_rows(head_dev.get(), src.data(), n, carry.data(), (int32_t) (carry.size()/n_embd));
+            llama_set_nextn_h_rows(head_dev.get(), src.data(), n, carry.data(), retained ? 0 : (int32_t) (carry.size()/n_embd));
             batch.embd = nullptr;
         }
         rc = rc || llama_decode(head_dev.get(), batch);
@@ -1713,10 +1740,26 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
                                      "the head's logits on the host path differ once bound");
             }
         }
+        if (!retained_equal()) return fail("a retained row changed across target and head consumption");
         for (size_t j = 0; j < parts.size(); ++j) {
             const llama_seq_id s = parts[j].first;
             const float * last = h_host + (size_t) (first[j] + parts[j].second - 1)*n_embd;
             kept[s].assign(last, last + n_embd);
+            if (retained) {
+                const int32_t row = first[j] + parts[j].second - 1;
+                std::vector<int32_t> rows = {row};
+                const size_t count = 1 + retain_rng()%std::min(4, parts[j].second);
+                while (rows.size() < count) rows.push_back(first[j] + retain_rng()%parts[j].second);
+                retained_rows[s].resize(count*n_embd);
+                for (size_t i = 0; i < count; ++i) {
+                    std::memcpy(retained_rows[s].data() + i*n_embd, h_host + size_t(rows[i])*n_embd, n_embd*sizeof(float));
+                }
+                const int64_t before = llama_get_nextn_rows_to_host(tgt_dev.get());
+                if (!llama_nextn_keep_rows(tgt_dev.get(), s, rows.data(), rows.size())) return fail("sequence rows could not be retained");
+                if (llama_get_nextn_rows_to_host(tgt_dev.get()) != before) return fail("retaining rows copied them to host");
+                const int32_t invalid[] = {row, n};
+                if (llama_nextn_keep_rows(tgt_dev.get(), s, invalid, 2)) return fail("invalid retained rows were accepted");
+            }
             n_past[s] += parts[j].second;
         }
         llama_batch_free(batch);
@@ -1762,7 +1805,34 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
 
     // two sequences' prompts, the longer first (the equal split interleaves them); one sequence's on the other half of
     // the store; two short steps on the host path; then the first half again
-    return step({{0, 180}, {1, 120}}) && step({{1, 100}}) && step({{0, 3}, {1, 3}}) && step({{0, 200}});
+    if (!step({{0, 180}, {1, 120}}) || !step({{1, 100}}) || !step({{0, 3}, {1, 3}}) || !step({{0, 200}})) {
+        return false;
+    }
+    if (!retained) {
+        return true;
+    }
+
+    // Churn short and paired requests after the store has reached its steady shape. Each retained row has its own
+    // sequence slot, so the bound contexts must keep their resource footprint fixed while both owners replace rows.
+    std::mt19937 churn(seed ^ 0x5a17u);
+    for (int i = 0; i < 24; ++i) {
+        std::vector<std::pair<llama_seq_id, int>> parts;
+        if (churn() & 1) {
+            parts = {{0, 3}, {1, 3}};
+        } else {
+            parts = {{(llama_seq_id) (churn() & 1), 3}};
+        }
+        if (!step(parts)) {
+            return false;
+        }
+    }
+    return retained_equal();
+}
+
+static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split, bool q8_cache) {
+    return test_glm_nextn_store_run(seed, devs, split_mode, tensor_split, q8_cache, false) &&
+           test_glm_nextn_store_run(seed, devs, split_mode, tensor_split, q8_cache, true);
 }
 
 // A speculative prefix must have the same recurrent state and continuation as
@@ -2037,6 +2107,26 @@ static void write_glm_diagnostic(const std::string & directory, const std::strin
 }
 
 
+struct glm_tensor_capture {
+    std::map<std::string, std::vector<uint8_t>> values;
+
+    static bool callback(ggml_tensor * tensor, bool ask, void * user_data) {
+        auto * capture = static_cast<glm_tensor_capture *>(user_data);
+        const std::string name(tensor->name);
+        const bool wanted = name == "kda_qkv-1" || name == "kda_conv-1" || name == "kda_qk_norm-1" ||
+                            name == "kda_gate-1" || name == "kda_beta-1";
+        if (ask) {
+            return wanted;
+        }
+        if (wanted) {
+            auto & bytes = capture->values[name];
+            bytes.resize(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+        }
+        return true;
+    }
+};
+
 struct glm_round_evidence {
     std::string directory;
     size_t seed;
@@ -2127,6 +2217,29 @@ struct glm_round_evidence {
         return correction_passed;
     }
 };
+
+static void add_glm_tensor_capture(glm_round_evidence & evidence, const glm_tensor_capture & actual,
+        const glm_tensor_capture & reference) {
+    std::ostringstream report;
+    for (const char * name : {"kda_qkv-1", "kda_conv-1", "kda_qk_norm-1", "kda_gate-1", "kda_beta-1"}) {
+        const auto it_actual = actual.values.find(name);
+        const auto it_reference = reference.values.find(name);
+        if (it_actual == actual.values.end() || it_reference == reference.values.end()) {
+            report << name << "=not-captured\n";
+            continue;
+        }
+        evidence.add(std::string("actual-") + name + ".f32", it_actual->second);
+        evidence.add(std::string("reference-") + name + ".f32", it_reference->second);
+        const auto & batch = it_actual->second;
+        const auto & serial = it_reference->second;
+        size_t first = 0;
+        while (first < serial.size() && first < batch.size() && batch[first] == serial[first]) ++first;
+        report << name << ": batch_bytes=" << batch.size() << " serial_bytes=" << serial.size()
+               << " first_different_byte=" << (first == serial.size() && batch.size() >= serial.size() ? -1 : (int64_t) first) << "\n";
+    }
+    const auto text = report.str();
+    evidence.add("batch-input-report.txt", text.data(), text.size());
+}
 
 static int test_glm_capture_failures() {
     int failed = 0, checked = 0;
@@ -2239,8 +2352,17 @@ static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggm
         params.kv_unified = unified;
         if (split_mode == LLAMA_SPLIT_MODE_DATA) { params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; }
         if (q8_cache) { params.type_k = params.type_v = params.type_s = params.type_idx = GGML_TYPE_Q8_0; }
-        llama_context_ptr actual(llama_init_from_model(model, params));
-        llama_context_ptr reference(llama_init_from_model(partition ? unsplit.first.get() : model, params));
+        glm_tensor_capture actual_tensors, reference_tensors;
+        auto actual_params = params;
+        auto reference_params = params;
+        if (diagnostics) {
+            actual_params.cb_eval = glm_tensor_capture::callback;
+            actual_params.cb_eval_user_data = &actual_tensors;
+            reference_params.cb_eval = glm_tensor_capture::callback;
+            reference_params.cb_eval_user_data = &reference_tensors;
+        }
+        llama_context_ptr actual(llama_init_from_model(model, actual_params));
+        llama_context_ptr reference(llama_init_from_model(partition ? unsplit.first.get() : model, reference_params));
         if (!actual || !reference) return false;
         std::vector<llama_pos> positions(3, 0);
         const auto decode = [&](llama_context * ctx, int seq, int pos, const std::vector<llama_token> & input, int n) {
@@ -2276,8 +2398,15 @@ static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggm
                     evidence.add("input.i32", input.data(), input.size()*sizeof(llama_token));
                 }
                 // DP checks the same rollback on an unsplit model; the CPU test checks the kept-prefix oracle.
+                if (diagnostics) {
+                    actual_tensors.values.clear();
+                    reference_tensors.values.clear();
+                }
                 if (!decode(actual.get(), seq, pos, input, width) ||
                     !decode(reference.get(), seq, pos, input, partition ? width : keep)) return false;
+                if (diagnostics) {
+                    add_glm_tensor_capture(evidence, actual_tensors, reference_tensors);
+                }
                 if (diagnostics) {
                     evidence.snapshot("snapshot-selected.bin", [&] { return glm_snapshot(actual.get(), seq, width-keep, pos+keep-1); });
                     if (keep < width) evidence.snapshot("snapshot-late.bin", [&] { return glm_snapshot(actual.get(), seq, width-keep-1, pos+keep); });
@@ -2779,11 +2908,16 @@ int main(int argc, char ** argv) {
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
     std::string diagnostic_dir, diagnostic_device;
-    std::string dp_device;
+    std::string dp_device, prefill_device;
     bool glm_alias_only = false;
     bool glm_kpool_only = false;
+    bool glm_nextn_only = false;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--glm-nextn-store-only") == 0) {
+            glm_nextn_only = true;
+            continue;
+        }
         if (strcmp(argv[i], "--glm-kpool-only") == 0) {
             glm_kpool_only = true;
             continue;
@@ -2792,9 +2926,10 @@ int main(int argc, char ** argv) {
             glm_alias_only = true;
             continue;
         }
-        if (strcmp(argv[i], "--glm-dp-device") == 0) {
+        if (strcmp(argv[i], "--glm-dp-device") == 0 || strcmp(argv[i], "--glm-prefill-reuse-device") == 0) {
+            const bool prefill = strcmp(argv[i], "--glm-prefill-reuse-device") == 0;
             if (i + 1 == argc) return 1;
-            dp_device = argv[++i];
+            (prefill ? prefill_device : dp_device) = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--glm-prefix-diagnostics") == 0 || strcmp(argv[i], "--glm-prefix-device") == 0) {
@@ -2840,6 +2975,18 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (glm_nextn_only) {
+            ggml_backend_load_all();
+            const auto device = ggml_backend_dev_by_name(dp_device.empty() ? "CPU" : dp_device.c_str());
+            if (!device) { throw std::runtime_error("NextN store device is unavailable"); }
+            for (bool q8 : {false, true}) {
+                for (size_t count : {1u, 2u, 4u}) {
+                    const std::vector<ggml_backend_dev_t> ranks(count, device);
+                    if (!test_glm_nextn_store(seed, ranks, count == 1 ? LLAMA_SPLIT_MODE_LAYER : LLAMA_SPLIT_MODE_DATA, {}, q8)) { return 1; }
+                }
+            }
+            return 0;
+        }
         if (glm_kpool_only) {
             ggml_backend_load_all();
             return test_glm_mtp_index(seed, {}, LLAMA_SPLIT_MODE_LAYER, {}) &&
@@ -2850,13 +2997,16 @@ int main(int argc, char ** argv) {
             if (!test_glm_arch_alias(seed)) { return 1; }
             if (glm_alias_only) { return 0; }
         }
-        if (!dp_device.empty()) {
+        if (!dp_device.empty() || !prefill_device.empty()) {
             ggml_backend_load_all();
             std::vector<ggml_backend_dev_t> devices;
-            for (const auto & name : string_split<std::string>(dp_device, ',')) {
+            for (const auto & name : string_split<std::string>(prefill_device.empty() ? dp_device : prefill_device, ',')) {
                 const auto device = ggml_backend_dev_by_name(name.c_str());
                 if (!device) throw std::runtime_error("GLM DP device is unavailable: " + name);
                 devices.push_back(device);
+            }
+            if (!prefill_device.empty()) {
+                return test_glm_prefill_reuse(seed, devices, LLAMA_SPLIT_MODE_TENSOR, {}) ? 0 : 1;
             }
             const int plain = test_glm_dp(seed, devices);
             const int quantized = test_glm_dp(seed, devices, true);

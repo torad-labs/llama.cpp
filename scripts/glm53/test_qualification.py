@@ -7,6 +7,7 @@ import itertools
 import json
 import re
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,28 +19,56 @@ from qualification import (BASELINE_COMMIT, device_cases, check_run_identity, ch
 
 
 class QualificationTest(unittest.TestCase):
-    def test_collection_status_cannot_hide_missing_or_failed_profile(self):
+    def test_requested_profile_requires_verified_36_session_gpu_evidence(self):
         import qualification
+        valid = {
+            "start": {"exit": 0},
+            "finalize": {"report_present": True},
+            "request": {"active_sessions": 36, "launch_sha256": "launch"},
+            "capture": {
+                "capture_verified": True,
+                "launch_sha256": "launch",
+                "readiness": {
+                    "usable": True, "expected_sequences": 36, "actual_sequences": 36, "actual_rows": 108,
+                    "gpu_window": {"start_ns": 130, "end_ns": 160, "duration_ns": 30, "kernel_count": 4},
+                },
+            },
+        }
+        self.assertEqual(qualification.profile_evidence(True, False, valid, {"launch_sha256": "launch"})["state"], "usable")
         cases = [
-            (False, False, None, "not_requested"),
-            (True, True, None, "invalid"),
-            (True, False, None, "invalid"),
-            (True, False, {"start": {"exit": 7}}, "start_failed"),
-            (True, False, {"start": {"exit": 0}, "finalize": {"report_present": False}}, "invalid"),
-            (True, False, {"start": {"exit": 0}, "finalize": {"report_present": True}}, "exported_unverified"),
+            (False, False, None, None, "not_requested"),
+            (True, True, None, None, "invalid"),
+            (True, False, None, None, "invalid"),
+            (True, False, {"start": {"exit": 7}}, None, "start_failed"),
+            (True, False, {"start": {"exit": 0}, "finalize": {"report_present": False}}, None, "invalid"),
+            (True, False, {"start": {"exit": 0}, "finalize": {"report_present": True}}, None, "invalid"),
+            (True, False, valid | {"request": {"active_sessions": 36}, "capture": valid["capture"] | {"launch_sha256": None}}, None, "invalid"),
+            (True, False, valid | {"capture": valid["capture"] | {"capture_verified": False}}, {"launch_sha256": "launch"}, "invalid"),
+            (True, False, valid | {"capture": valid["capture"] | {"launch_sha256": "other"}}, {"launch_sha256": "launch"}, "invalid"),
+            (True, False, valid | {"capture": valid["capture"] | {"readiness": valid["capture"]["readiness"] | {"gpu_window": None}}}, {"launch_sha256": "launch"}, "invalid"),
         ]
-        for requested, running, record, expected in cases:
+        for requested, running, record, workload, expected in cases:
             with self.subTest(expected=expected, record=record):
-                result = qualification.profile_evidence(requested, running, record)
+                result = qualification.profile_evidence(requested, running, record, workload)
                 self.assertEqual(result["state"], expected)
-                self.assertFalse(result["capture_verified"])
+                self.assertEqual(result["capture_verified"], expected == "usable")
 
-    def test_matrix_success_requires_every_planned_leg_and_quality_check(self):
+    def test_matrix_success_requires_every_planned_leg_and_verified_requested_profile(self):
         import qualification
         good = dict(plan=[["B","2",[[36,512]],[]]], servers=[
             dict(short_ok=True, runs=[dict(active=36, context=512, exit=0, passed=True,
                                            profile={"state": "not_requested"})])])
         self.assertTrue(qualification.matrix_succeeded(good))
+        profiled = copy.deepcopy(good)
+        profiled["plan"][0].append({"profile": True})
+        profiled["servers"][0]["runs"][0]["profile"] = {"state": "usable", "capture_verified": True}
+        self.assertTrue(qualification.matrix_succeeded(profiled))
+        budgeted = copy.deepcopy(profiled)
+        budgeted["plan"][0][4]["tokens"] = 1024
+        budgeted["servers"][0]["runs"][0]["decode_tokens"] = 256
+        self.assertFalse(qualification.matrix_succeeded(budgeted))
+        budgeted["servers"][0]["runs"][0]["decode_tokens"] = 1024
+        self.assertTrue(qualification.matrix_succeeded(budgeted))
         variants = [dict(plan=good["plan"], servers=[]), dict(plan=[], servers=[])]
         for scope, key, value in (("server","short_ok",False), ("server","error","failed"),
                                   ("server","guard","memory_reserve"), ("run","exit",1),
@@ -50,6 +79,10 @@ class QualificationTest(unittest.TestCase):
             if scope == "run":
                 target = target["runs"][0]
             target[key] = value
+            variants.append(bad)
+        for state in ("exported_unverified", "invalid", "not_requested"):
+            bad = copy.deepcopy(profiled)
+            bad["servers"][0]["runs"][0]["profile"] = {"state": state, "capture_verified": False}
             variants.append(bad)
         bad = copy.deepcopy(good)
         bad["servers"][0]["runs"] = []
@@ -82,12 +115,40 @@ class QualificationTest(unittest.TestCase):
     def test_profile_controller_uses_the_same_six_minute_reserve_as_preparation(self):
         self.exercise_controller_failure(True, 480)
 
-    def exercise_controller_failure(self, profiled, seconds_left):
+    def test_controller_launch_receipt_omits_options_unsupported_by_the_baseline(self):
+        self.exercise_controller_failure(False, 300, prompt_chunk=False)
+
+    def exercise_controller_failure(self, profiled, seconds_left, prompt_chunk=True):
         import runpy
         import subprocess
         import time
         from types import SimpleNamespace
         original_popen = subprocess.Popen
+        original_run = subprocess.run
+        import os
+        original_killpg = os.killpg
+        detached = []
+        sessions = []
+
+        def reap(child):
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+        sentinel = original_popen([sys.executable, '-I', '-c', 'import signal; signal.pause()']) if profiled else None
+        if sentinel is not None:
+            self.addCleanup(reap, sentinel)
+
+        def run(command, **kwargs):
+            if command[0] == 'nsys':
+                if command[1] == 'shutdown':
+                    self.assertIn('--session=' + sessions[0], command)
+                    kill_signal = int(next(arg.split('=', 1)[1] for arg in command if arg.startswith('--kill=')))
+                    for child in detached:
+                        original_killpg(child.pid, kill_signal)
+                        child.wait(timeout=1)
+                return subprocess.CompletedProcess(command, 0, 'fixture Nsight version\n', '')
+            return original_run(command, **kwargs)
 
         class ServerProcess:
             pid = 12345
@@ -99,7 +160,16 @@ class QualificationTest(unittest.TestCase):
                 return 0
 
         def launch(command, **kwargs):
-            if any(Path(arg).name == "llama-server" for arg in command):
+            if any(Path(arg).name == "llama-server" for arg in command) and "--help" not in command:
+                if profiled:
+                    child = original_popen([sys.executable, '-I', '-c',
+                        "import signal; signal.signal(signal.SIGINT,signal.SIG_IGN); signal.signal(signal.SIGTERM,signal.SIG_IGN); print('ready',flush=True); signal.pause()"],
+                        start_new_session=True, stdout=subprocess.PIPE, text=True)
+                    self.assertEqual(child.stdout.readline().strip(), 'ready')
+                    child.stdout.close()
+                    detached.append(child)
+                    self.addCleanup(reap, child)
+                    sessions.append(next(arg.split('=', 1)[1] for arg in command if arg.startswith('--session-new=')))
                 return ServerProcess()
             return original_popen(command, **kwargs)
 
@@ -119,6 +189,10 @@ class QualificationTest(unittest.TestCase):
                 selected=[dict(index=i,uuid=f"GPU-fixture-{i}") for i in range(4)])))
             (root/"engines/B/bin").mkdir(parents=True)
             (root/"engines/B/SOURCE").write_text("a"*40)
+            server = root/"engines/B/bin/llama-server"
+            server.write_text(f"#!{sys.executable}\nprint(" +
+                              repr("--prompt-step N\n" + ("--prompt-chunk N" if prompt_chunk else "")) + ")\n")
+            server.chmod(0o755)
             (root/"scripts/glm53").mkdir(parents=True)
             (root/"scripts/glm53/workload.py").write_text(
                 "import json,pathlib,sys\n"
@@ -135,6 +209,7 @@ class QualificationTest(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "path", sys.path.copy()), \
                     mock.patch.dict(sys.modules, {"engines": engine}), \
                     mock.patch("subprocess.Popen", side_effect=launch), \
+                    mock.patch("subprocess.run", side_effect=run), \
                     mock.patch("subprocess.check_output", return_value=memory), \
                     mock.patch("urllib.request.urlopen", side_effect=response), mock.patch("os.killpg"), \
                     contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit_:
@@ -147,6 +222,14 @@ class QualificationTest(unittest.TestCase):
             self.assertFalse(row["passed"])
             self.assertEqual(row["profile"]["state"], "invalid" if profiled else "not_requested")
             self.assertTrue((root/"results/gpu-work-complete-failed-leg").exists())
+            launch_record = json.loads((root/"results/failed-leg-00-B-mtp2-fixture/launch.json").read_text())
+            self.assertEqual("--prompt-chunk" in launch_record["argv"], prompt_chunk)
+            if profiled:
+                self.assertTrue(detached)
+                self.assertTrue(all(child.poll() is not None for child in detached), 'profile cleanup left its detached application alive')
+                self.assertIsNone(sentinel.poll(), 'profile cleanup touched a process outside its session')
+            for flag in ("LLAMA_DECODE_TRACE", "GGML_CUDA_NVTX", "GGML_GRAPH_TRACE", "LLAMA_TIME_DECODE"):
+                self.assertEqual(launch_record["env"].get(flag), "1" if profiled else None)
 
     def test_retained_files_are_verified_without_replacement(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -412,6 +495,167 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(wrong[:3], [])
 
 
+class ControlPreparationTest(unittest.TestCase):
+    def test_quality_plan_isolates_engine_query_and_chunk_changes(self):
+        import control_matrix
+        plan = control_matrix.prepare()
+        jobs = plan.get("quality_jobs", [])
+        self.assertTrue(jobs, "The plan must execute distributions, not just declare a KL threshold.")
+        expected = {
+            ("engine-f32", "C", "f32", 512, "B", "f32", 512),
+            ("engine-q8", "C", "q8", 512, "B", "q8", 512),
+            ("chunk-f32", "C", "f32", 128, "C", "f32", 512),
+            ("chunk-q8", "C", "q8", 128, "C", "q8", 512),
+            ("query-512", "C", "q8", 512, "C", "f32", 512),
+            ("query-128", "C", "q8", 128, "C", "f32", 128),
+        }
+        for context in (2048, 4096, 16384):
+            selected = [job for job in jobs if job["context"] == context]
+            references = {job["id"]: job for job in selected if job["action"] == "reference"}
+            actual = set()
+            for job in selected:
+                if job["action"] != "compare":
+                    continue
+                ref = references[job["reference_id"]]
+                self.assertLess(selected.index(ref), selected.index(job))
+                actual.add((job["comparison"], job["engine"], job["query"], job["ubatch"],
+                            ref["engine"], ref["query"], ref["ubatch"]))
+            self.assertEqual(actual, expected)
+
+    def test_quality_cli_runs_every_control_and_retains_numerical_failures(self):
+        import os
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "results").mkdir()
+            (root / "results/selected-gpus.json").write_text(json.dumps({
+                "selected": [{"uuid": f"GPU-fixture-{i}"} for i in range(4)]}))
+            (root / "model").mkdir()
+            (root / "model/GLM-5.3-Flash-Uncensored-IQ3_XXS-00001-of-00003.gguf").write_bytes(b"public fixture")
+            corpus = b"Public numerical-control fixture.\n"
+            (root / "public-corpus.txt").write_bytes(corpus)
+            monitors = root / "monitor"
+            monitors.mkdir()
+            (monitors / "free-mib").write_text("8192")
+            smi = monitors / "nvidia-smi"
+            smi.write_text("#!/usr/bin/env python3\nfrom pathlib import Path\n"
+                           "free=Path(__file__).with_name('free-mib').read_text()\n"
+                           "for i in range(4): print(f'GPU-fixture-{i}, {free}')\n")
+            smi.chmod(0o755)
+            environment = dict(os.environ, PATH=str(monitors) + os.pathsep + os.environ["PATH"])
+            for engine in ("B", "C"):
+                folder = root / "engines" / engine
+                (folder / "bin").mkdir(parents=True)
+                source = ("24c77a0b5c8dcb3352e8027cd7e34367bdaeec13+dirty-sha256:"
+                          "098fcb005ad4b0575ece6786e1da219d49c5b337a6e72a06404c0635b0014510") if engine == "B" else "fixture-C"
+                (folder / "SOURCE").write_text(source)
+                binary = folder / "bin/llama-perplexity"
+                binary.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json,os,sys,signal,threading\n"
+                    "from pathlib import Path\n"
+                    "monitor=Path(__file__).resolve().parents[3]/'monitor'\n"
+                    "if (monitor/'drop').exists() and not (monitor/'attempted').exists():\n"
+                    " (monitor/'attempted').touch(); (monitor/'free-mib').write_text('4095')\n"
+                    " def stopped(*args):\n"
+                    "  (monitor/'terminated').touch(); sys.exit(2)\n"
+                    " signal.signal(signal.SIGTERM,stopped); threading.Event().wait(5)\n"
+                    "a=sys.argv; ref=Path(a[a.index('--kl-divergence-base')+1])\n"
+                    "if '--kl-divergence' not in a:\n"
+                    " ref.write_text(json.dumps({'query':os.environ['LLAMA_INDEXER_Q8_QUERY'],'ubatch':a[a.index('-ub')+1]}))\n"
+                    "else:\n"
+                    " assert ref.is_file() and ref.stat().st_size\n"
+                    " bad=os.environ['LLAMA_INDEXER_Q8_QUERY']=='1' and a[a.index('-ub')+1]=='128'\n"
+                    " print('Mean KLD:',0.016772 if bad else 0.0)\n"
+                    " print('Same top p:',95.797 if bad else 100.0)\n")
+                binary.chmod(0o755)
+            out = root / "results/quality"
+            run = subprocess.run([
+                sys.executable, "-I", str(Path(__file__).with_name("control_matrix.py")),
+                "--execute-quality", "--root", str(root), "--deadline", str(time.time() + 60),
+                "--corpus-sha256", hashlib.sha256(corpus).hexdigest(), "--output", str(out),
+            ], capture_output=True, text=True, timeout=70, env=environment)
+            self.assertTrue((out / "quality.json").is_file(), run.stderr)
+            report = json.loads((out / "quality.json").read_text())
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertTrue(report["completed"], report)
+            self.assertFalse(report["passed"])
+            self.assertEqual(len(report["runs"]), len(report["plan"]))
+            comparisons = [row for row in report["runs"] if row["action"] == "compare"]
+            self.assertEqual(len(comparisons), 18)
+            self.assertEqual(sum(not row["quality"]["passed"] for row in comparisons), 6)
+            self.assertEqual({row["comparison"] for row in comparisons}, {
+                "engine-f32", "engine-q8", "chunk-f32", "chunk-q8", "query-512", "query-128"})
+            for row in report["runs"]:
+                self.assertEqual(row["exit"], 0)
+                self.assertTrue((out / row["log"]).is_file())
+                if row["action"] == "reference":
+                    self.assertTrue((out / row["distribution"]).is_file())
+            baseline_source = (root / "engines/B/SOURCE").read_text()
+            for case in ("wrong-source", "unbounded-deadline", "reserve-at-start", "reserve-during-work"):
+                with self.subTest(case=case):
+                    (monitors / "free-mib").write_text("4095" if case == "reserve-at-start" else "8192")
+                    if case == "reserve-during-work":
+                        (monitors / "drop").touch()
+                    (root / "engines/B/SOURCE").write_text("different-engine" if case == "wrong-source" else baseline_source)
+                    rejected_out = root / "results" / case
+                    rejected = subprocess.run([
+                        sys.executable, "-I", str(Path(__file__).with_name("control_matrix.py")),
+                        "--execute-quality", "--root", str(root),
+                        "--deadline", "nan" if case == "unbounded-deadline" else str(time.time() + 60),
+                        "--corpus-sha256", hashlib.sha256(corpus).hexdigest(), "--output", str(rejected_out),
+                    ], capture_output=True, text=True, timeout=70, env=environment)
+                    self.assertEqual(rejected.returncode, 1, rejected.stderr)
+                    refusal = json.loads((rejected_out / "quality.json").read_text())
+                    self.assertFalse(refusal["completed"])
+                    if case == "reserve-during-work":
+                        self.assertEqual(len(refusal["runs"]), 1)
+                        self.assertFalse(refusal["runs"][0]["passed"])
+                        self.assertTrue((monitors / "terminated").is_file())
+                    else:
+                        self.assertEqual(refusal["runs"], [])
+
+    def test_serving_controls_keep_the_measured_recipe_and_use_abba(self):
+        import control_matrix
+        plan = control_matrix.prepare()
+        self.assertEqual(plan["source_identity"]["baseline"], {
+            "engine": "B", "commit": "24c77a0b5c8dcb3352e8027cd7e34367bdaeec13",
+            "patch_sha256": "098fcb005ad4b0575ece6786e1da219d49c5b337a6e72a06404c0635b0014510",
+            "source_record": "engines/B/SOURCE",
+        })
+        self.assertEqual(plan["serving_baseline"]["mtp_depth"], "2")
+        self.assertEqual(plan["serving_baseline"]["indexer_query"], "q8")
+        self.assertEqual(plan["serving_baseline"]["ubatch"], 512)
+        self.assertEqual(plan["quality_contract"], {"meanKld_abs_max": 1e-6, "sameTopP_min": 99.99})
+        entries = plan["server_matrix_plan"]
+        self.assertEqual(sum(bool(entry[4].get("profile")) for entry in entries), 1)
+        for depth in ("off", "1", "2"):
+            group = [entry for entry in entries if entry[1] == depth and not entry[4].get("profile")]
+            self.assertEqual([entry[0] for entry in group], ["B", "C", "C", "B"])
+            for entry in group:
+                self.assertEqual(entry[2], [[36, 512], [36, 8192]])
+                self.assertNotIn("--diagnostic-ubatch", entry[4]["serve"])
+                self.assertEqual(entry[4]["serve"], ["--transport", "internal-nccl-gather", "--indexer-query", "q8"])
+        self.assertEqual(plan["profile_capture"]["active_sessions"], 36)
+        self.assertTrue(plan["profile_capture"]["profile_requested"])
+        self.assertEqual(plan["profile_capture"]["timing"], "gpu-cupti-only")
+
+    def test_control_cli_writes_a_checked_server_matrix_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "control-plan.json"
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name("control_matrix.py")),
+                                     "--output", str(output), "--root", "/rental", "--deadline", "1234.5"],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(output.read_text())
+            command = plan["execution"]["command"]
+            self.assertEqual(command[command.index("--root") + 1], "/rental")
+            self.assertEqual(float(command[command.index("--deadline") + 1]), 1234.5)
+            self.assertEqual(json.loads(command[command.index("--plan") + 1]), plan["server_matrix_plan"])
+            self.assertEqual(command[1], "/rental/scripts/glm53/server_matrix.py")
+            self.assertEqual(plan["execution"]["quality_command"][2], "/rental/scripts/glm53/control_matrix.py")
+
+
 class ServingRecipeTest(unittest.TestCase):
     def setUp(self):
         import serve
@@ -439,6 +683,8 @@ class ServingRecipeTest(unittest.TestCase):
             "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
             "LD_LIBRARY_PATH": str(self.serve.ROOT / "build/bin")})
         self.assertNotIn("--glm53-profile", argv)
+        with self.assertRaisesRegex(ValueError, "transport"):
+            self.serve.make_plan(self.serve.arguments(["--model", "/model.gguf", "--transport", "internal-nccl-gather"]))
 
     def test_dp_capacity_recipe_keeps_each_slots_cache_on_one_owner(self):
         for slots in (1, 4, 36, 40):
@@ -447,6 +693,8 @@ class ServingRecipeTest(unittest.TestCase):
                     args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4",
                                                  "--slots", str(slots), "--mtp-depth", depth])
                     argv, env = self.serve.make_plan(args)
+                    self.assertIn("--prompt-chunk", argv)
+                    self.assertEqual(argv[argv.index("--prompt-chunk") + 1], "128")
                     expected = {"-sm": "dp", "-ts": "1,1,1,1", "-fit": "off", "-np": str(slots),
                                 "-c": str(slots * 442368), "-b": "2048", "-ub": "512", "--prompt-step": "512",
                                 "--cache-type-k": "q8_0", "--cache-type-v": "q8_0", "-ctki": "q8_0", "-cts": "q8_0"}
@@ -477,6 +725,35 @@ class ServingRecipeTest(unittest.TestCase):
                     else:
                         self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], depth)
 
+    def test_dp_transport_selection_scrubs_inherited_overrides(self):
+        for slots, transport, inherited_transport in itertools.product((1, 36, 40),
+                ('internal', 'internal-nccl-gather'), ('internal', 'internal-nccl-gather', 'nccl')):
+            with self.subTest(slots=slots, transport=transport, inherited=inherited_transport):
+                args = self.serve.arguments(['--model', '/model.gguf', '--profile', 'dp-4', '--slots', str(slots),
+                                             '--transport', transport, '--dry-run'])
+                _, settings = self.serve.make_plan(args)
+                env = self.serve.execution_environment(settings, {'GGML_CUDA_ALLREDUCE': inherited_transport,
+                                                                  'GGML_CUDA_Q8_TMA': '1', 'PATH': '/bin'})
+                self.assertEqual(env['GGML_CUDA_ALLREDUCE'], transport)
+                self.assertNotIn('GGML_CUDA_Q8_TMA', env)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.serve.main(args)
+                self.assertEqual(json.loads(output.getvalue())['env']['GGML_CUDA_ALLREDUCE'], transport)
+
+    def test_qualification_legacy_transport_cannot_override_explicit_choice(self):
+        for explicit, legacy in itertools.product((None, 'internal', 'internal-nccl-gather'),
+                                                   (None, 'internal', 'internal-nccl-gather')):
+            options = ['--model', '/model.gguf', '--profile', 'dp-4']
+            if explicit:
+                options += ['--transport', explicit]
+            args = self.serve.arguments(options)
+            if explicit and legacy and explicit != legacy:
+                with self.assertRaisesRegex(ValueError, 'transport'):
+                    self.serve.resolve_transport(args, legacy)
+            else:
+                self.assertEqual(self.serve.resolve_transport(args, legacy), explicit or legacy or 'internal')
+
     def test_dp_slot_defaults_and_bounds_do_not_change_tensor_capacity(self):
         args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"])
         argv, _ = self.serve.make_plan(args)
@@ -503,6 +780,15 @@ class ServingRecipeTest(unittest.TestCase):
                 self.assertFalse(any(arg.startswith("--spec-") for arg in argv))
             else:
                 self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], depth)
+
+    def test_diagnostic_microbatch_is_explicit_and_does_not_change_the_serving_baseline(self):
+        baseline, _ = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"]))
+        self.assertEqual(baseline[baseline.index("-ub") + 1], "512")
+        for ubatch in (128, 512):
+            with self.subTest(ubatch=ubatch):
+                diagnostic, _ = self.serve.make_plan(self.serve.arguments([
+                    "--model", "/models/target.gguf", "--profile", "dp-4", "--diagnostic-ubatch", str(ubatch)]))
+                self.assertEqual(diagnostic[diagnostic.index("-ub") + 1], str(ubatch))
 
     def test_host_capacity_requires_mtp_and_a_sufficient_ram_budget(self):
         base = ["--model", "/model.gguf", "--profile", "dp-4", "--kv-host", "--slots", "72"]

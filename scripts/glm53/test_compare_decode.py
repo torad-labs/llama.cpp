@@ -24,6 +24,61 @@ def step(identity, device, duration, deps=(), **extra) -> dict[str, Any]:
 
 
 class PreparationTest(unittest.TestCase):
+    def test_launcher_runs_legacy_and_current_engines_with_matching_dry_run_arguments(self):
+        rng = random.Random(53)
+        for supported in (False, True):
+            for spelling in ("--prompt-chunk", "-pc, --prompt-chunk", "--prompt-chunk-extra"):
+                enabled = supported and spelling != "--prompt-chunk-extra"
+                with self.subTest(supported=enabled, spelling=spelling), tempfile.TemporaryDirectory() as tmp:
+                    folder = Path(tmp)
+                    model = folder / "model.gguf"
+                    model.touch()
+                    server = folder / "llama-server"
+                    help_text = "  --prompt-step N\n" + (
+                        " " * rng.randrange(1, 8) + spelling + " N\n" if supported else ""
+                    )
+                    server.write_text(
+                        f"#!{sys.executable}\n"
+                        "import json,sys\n"
+                        f"if '--help' in sys.argv: print({help_text!r}); sys.exit(0)\n"
+                        f"if '--prompt-chunk' in sys.argv and not {enabled!r}: sys.exit(2)\n"
+                        "print(json.dumps(sys.argv))\n"
+                    )
+                    server.chmod(0o755)
+                    command = [sys.executable, str(ROOT / "scripts/glm53/serve.py"),
+                               "--model", str(model), "--server", str(server), "--profile", "dp-4"]
+                    actual = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(actual.returncode, 0, actual.stderr)
+                    argv = json.loads(actual.stdout)
+                    self.assertEqual("--prompt-chunk" in argv, enabled)
+                    if enabled:
+                        self.assertEqual(argv[argv.index("--prompt-chunk") + 1], "128")
+                    for flag, value in (("--prompt-step", "512"), ("-np", "36"), ("-c", "15925248")):
+                        self.assertEqual(argv[argv.index(flag) + 1], value)
+                    planned = subprocess.run(command + ["--dry-run"], capture_output=True, text=True, timeout=30)
+                    self.assertEqual(planned.returncode, 0, planned.stderr)
+                    self.assertEqual(json.loads(planned.stdout)["argv"], argv)
+
+    def test_launcher_refuses_failed_capability_detection_without_starting_the_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            model = folder / "model.gguf"
+            model.touch()
+            marker = folder / "started"
+            server = folder / "llama-server"
+            server.write_text(
+                f"#!{sys.executable}\nimport pathlib,sys\n"
+                "if '--help' in sys.argv: sys.exit(7)\n"
+                f"pathlib.Path({str(marker)!r}).touch()\n"
+            )
+            server.chmod(0o755)
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/glm53/serve.py"),
+                "--model", str(model), "--server", str(server), "--profile", "dp-4"],
+                capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(marker.exists())
+            self.assertIn("help", result.stderr)
+
     def test_one_session_is_still_four_gpus_and_uses_real_launcher(self):
         case = comparison.prepare_case(model='/tmp/not-loaded.gguf', server='/tmp/not-executed-server')
         self.assertEqual(case['workload']['active_sessions'], 1)
@@ -38,6 +93,13 @@ class PreparationTest(unittest.TestCase):
         self.assertEqual(case['resolved_launch']['argv'], argv)
         self.assertEqual(case['resolved_launch']['env'], env)
         self.assertFalse(case['gpu_validated'])
+        for transport in ('internal', 'internal-nccl-gather'):
+            with self.subTest(transport=transport):
+                case = comparison.prepare_case(model='/tmp/not-loaded.gguf', transport=transport)
+                self.assertEqual(case['configuration']['transport_requested'], transport)
+                self.assertIsNone(case['configuration']['transport_actual'])
+                self.assertEqual(case['resolved_launch']['env']['GGML_CUDA_ALLREDUCE'], transport)
+                self.assertIn(transport, case['launcher']['options'])
 
     def test_active_load_does_not_change_the_serving_configuration(self):
         bindings = dict(model='/tmp/not-loaded.gguf', server='/tmp/not-executed-server')
@@ -147,6 +209,25 @@ class MatchedWorkTest(unittest.TestCase):
         self.assertEqual(result['recorded_cycle_ns'], 500)
         self.assertFalse(result['gpu_validated'])
         self.assertEqual(result['evidence'], 'synthetic-fixture')
+        self.assertEqual(result['transport']['recorded']['requested'], 'internal')
+        self.assertIsNone(result['transport']['recorded']['actual'])
+
+    def test_captured_comparison_requires_actual_requested_transport(self):
+        ideal, recorded = self.journals()
+        ideal['evidence'], recorded['evidence'] = 'source-model', 'captured'
+        for actual in (None, 'internal'):
+            recorded['case']['configuration'].update(transport_requested='internal-nccl-gather', transport_actual=actual)
+            result = comparison.compare_journals(ideal, recorded)
+            self.assertFalse(result['comparable'])
+            self.assertIsNone(result['speedup'])
+            self.assertTrue(any('transport' in gap.lower() for gap in result['gaps']))
+        recorded['case']['configuration']['transport_actual'] = 'internal-nccl-gather'
+        self.assertTrue(comparison.compare_journals(ideal, recorded)['comparable'])
+        ideal['evidence'] = 'captured'
+        result = comparison.compare_journals(ideal, recorded)
+        self.assertFalse(result['comparable'])
+        self.assertIsNone(result['speedup'])
+        self.assertTrue(any('transport' in gap.lower() for gap in result['gaps']))
 
     def test_workload_missing_steps_or_memory_only_model_cannot_claim_full_comparison(self):
         ideal,recorded = self.journals()

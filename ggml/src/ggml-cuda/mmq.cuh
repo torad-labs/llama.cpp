@@ -962,7 +962,7 @@ static __device__ __forceinline__ void mmq_prefetch_x_l2(
 // staged rows and the grid. A step stages its y and dequantizes its staged rows into the x tile, then, past the
 // barrier, stages the next step's rows while it computes; its last barrier leaves every buffer free for the next tile
 // a block runs.
-template <ggml_type type, int J, bool fallback, bool fixup>
+template <ggml_type type, int J, bool fallback, bool fixup, int J_ids = J>
 static __device__ __forceinline__ void mul_mat_q_process_tile_staged(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -970,6 +970,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_staged(
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const int l2_pf) {
     static_assert(type == GGML_TYPE_IQ3_XXS, "only IQ3_XXS is staged");
+    static_assert(J_ids >= J, "retain the caller's row indices");
 
     constexpr int              warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int              nthreads    = ggml_cuda_mmq_get_nthreads(type, J, fallback);
@@ -989,7 +990,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_staged(
     static_assert(J*MMQ_TILE_Y_K*int(sizeof(int)) % 16 == 0, "y's half is whole 16-byte copies");
 
     extern __shared__ int data_mul_mat_q[];
-    int      * tile_y0  = data_mul_mat_q + J;
+    int      * tile_y0  = data_mul_mat_q + J_ids;
     int      * tile_y1  = tile_y0 + tile_y_stride;
     int      * tile_x   = tile_y1 + tile_y_stride;
     char     * x_staged = (char *) (tile_x + I*sram_stride);
@@ -1067,6 +1068,17 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const ggml_cuda_q8_layout q8_layout) {
 
     if constexpr (mmq_iq3_xxs_staged(type)) {
+        if constexpr (J == 16 && !fixup &&
+                ggml_cuda_mmq_get_I(type, 8, fallback) == ggml_cuda_mmq_get_I(type, J, fallback) &&
+                ggml_cuda_mmq_get_nthreads(type, 8, fallback) == ggml_cuda_mmq_get_nthreads(type, J, fallback)) {
+            // Keep full tiles wide; compute short tails without their unused columns. Fixup keeps its original layout.
+            if (tile_y_max_j < 8) {
+                mul_mat_q_process_tile_staged<type, 8, fallback, false, J>(
+                    x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
+                    tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, l2_pf);
+                return;
+            }
+        }
         mul_mat_q_process_tile_staged<type, J, fallback, fixup>(
             x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, l2_pf);
@@ -1688,6 +1700,9 @@ struct mmq_args {
     int64_t ncols_max;
     ggml_cuda_q8_layout q8_layout = {};
     int64_t n_experts_total = 0;
+    const char * paired_x = nullptr;
+    float * paired_dst = nullptr;
+    ggml_cuda_q8_layout paired_q8_layout = {};
 };
 
 // MUL_MAT_ID picks its tile width for the columns an expert gets on average and launches only the experts' non-empty
@@ -1788,52 +1803,56 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, moe_tiles.ptr, args.dst, nullptr, args.y_scale,
+    const auto launch_one = [&](const char * x, float * dst, const ggml_cuda_q8_layout & q8_layout) {
+        if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+            mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                (x, args.y, args.ids_dst, args.expert_bounds, moe_tiles.ptr, dst, nullptr, args.y_scale,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 ntx_fd, ggml_cuda_mmq_l2_prefetch(), q8_layout);
+            return;
+        }
+
+        // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
+        // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
+        const int ntiles_dst = int(ntx) * nty * ntzw;
+        const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+        const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
+        const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+
+        GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+
+        const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+
+        ggml_cuda_pool & pool = ctx.pool(id);
+        ggml_cuda_pool_alloc<float> tmp_fixup(pool);
+        if (fixup_needed) {
+            tmp_fixup.alloc(block_nums_stream_k.x * config.J*config.I);
+        }
+
+        const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
+        const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
+
+        mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+            (x, args.y, args.ids_dst, args.expert_bounds, moe_tiles.ptr, dst, tmp_fixup.ptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, ggml_cuda_mmq_l2_prefetch(), args.q8_layout);
-        return;
-    }
+             ntx_fd, ggml_cuda_mmq_l2_prefetch(), q8_layout);
 
-    // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
-    // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
-    const int ntiles_dst = int(ntx) * nty * ntzw;
-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+        if (!fixup_needed) {
+            return;
+        }
 
-    GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
-
-    const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
-
-    ggml_cuda_pool & pool = ctx.pool(id);
-    ggml_cuda_pool_alloc<float> tmp_fixup(pool);
-    if (fixup_needed) {
-        tmp_fixup.alloc(block_nums_stream_k.x * config.J*config.I);
-    }
-
-    const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
-    const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
-
-    mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, args.y, args.ids_dst, args.expert_bounds, moe_tiles.ptr, args.dst, tmp_fixup.ptr, args.y_scale,
-         blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-         channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-         sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, ggml_cuda_mmq_l2_prefetch(), args.q8_layout);
-
-    if (!fixup_needed) {
-        return;
-    }
-
-    CUDA_CHECK(cudaGetLastError());
-    mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
-        (args.ids_dst, args.expert_bounds, moe_tiles.ptr, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
-         args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd);
+        CUDA_CHECK(cudaGetLastError());
+        mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
+            (args.ids_dst, args.expert_bounds, moe_tiles.ptr, dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+             args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+             ntx_fd);
+    };
+    launch_one(args.x, args.dst, args.q8_layout);
+    if (args.paired_x) { launch_one(args.paired_x, args.paired_dst, args.paired_q8_layout); }
 }
 
 template <ggml_type type, bool fallback>
@@ -1973,6 +1992,10 @@ void ggml_cuda_mul_mat_q(
         const ggml_tensor * norm_weight = nullptr, const ggml_tensor * norm_scale = nullptr,
         void * external_q8 = nullptr, bool quantize_external = true,
         const float * external_norm_scale = nullptr);
+
+void ggml_cuda_mul_mat_q_id_pair(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0_a, const ggml_tensor * src0_b,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst_a, ggml_tensor * dst_b);
 
 size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor * src1);
 

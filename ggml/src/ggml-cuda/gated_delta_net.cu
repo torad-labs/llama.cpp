@@ -39,7 +39,17 @@ static __device__ __forceinline__ void gdn_store_state(void * dst, const int64_t
             GGML_UNUSED_VARS(dst, e, v);
             NO_DEVICE_CODE;
         } else {
-            const float amax = warp_reduce_max<warp_size>(fabsf(v));
+            float amax;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+            // Non-negative float bits have the same order as their values. Preserve fmaxf's NaN handling.
+            const uint32_t max_bits = __reduce_max_sync(0xffffffff, __float_as_uint(fabsf(v)));
+            amax = __uint_as_float(max_bits);
+            if (max_bits > 0x7f800000u) {
+                amax = warp_reduce_max<warp_size>(fabsf(v));
+            }
+#else
+            amax = warp_reduce_max<warp_size>(fabsf(v));
+#endif
             const float d    = amax / ((1 << 7) - 1);
             const float id   = d ? 1.0f/d : 0.0f;
             block_q8_0 * b   = (block_q8_0 *) dst + e / QK8_0;

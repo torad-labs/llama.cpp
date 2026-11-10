@@ -106,6 +106,7 @@ class ServingStandIn(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"data: " + json.dumps(response).encode() + b"\n\n")
                 return
             elif case in ("stream-deadline", "stream-deadline-stall", "stream-deadline-framing") and payload.get("stream"):
+                self.server.stream_deadline_barrier.wait()
                 self.send_response(200)
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
@@ -245,12 +246,17 @@ class ServingEvidence(unittest.TestCase):
         self.args.sessions = [2]
         self.args.prompt_tokens = [512]
         self.args.tokens = 64
-        self.args.deadline = time.time() + 0.9
+        started = []
+        def arm_deadline():
+            # This tests reads after HTTP 200, not process startup or prompt construction.
+            started.append(time.monotonic())
+            self.args.deadline = time.time() + 0.9
+        self.server.stream_deadline_barrier = threading.Barrier(2, action=arm_deadline, timeout=5)
         leg = ServingLeg(self.args)
-        started = time.monotonic()
         with self.assertRaises(OSError):
             leg.run()
-        self.assertLess(time.monotonic() - started, 1.4)
+        self.assertEqual(len(started), 1)
+        self.assertLess(time.monotonic() - started[0], 1.4)
         records = [row for row in self.capture_records(leg) if row["request"].get("stream")]
         self.assertEqual({row["request"]["id_slot"] for row in records}, {0, 1})
         for record in records:

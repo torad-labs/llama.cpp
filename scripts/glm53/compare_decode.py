@@ -20,7 +20,7 @@ IDENTITY = ('cycle', 'phase', 'layer', 'operation', 'device', 'work')
 
 
 def prepare_case(*, active=1, context=400000, slots=None, model=None, server=None,
-                 mmproj=None, kv='resident', host_budget_mib=None, trace_decode=False):
+                 mmproj=None, kv='resident', host_budget_mib=None, trace_decode=False, transport='internal'):
     slots = 40 if slots is None else slots
     if type(active) is not int or type(slots) is not int or not 1 <= active <= slots <= 40:
         raise ValueError('active sessions must be 1..reserved slots, with at most 40 slots')
@@ -31,7 +31,9 @@ def prepare_case(*, active=1, context=400000, slots=None, model=None, server=Non
     unresolved = ['model'] if model is None else []
     if kv == 'host' and host_budget_mib is None:
         unresolved.append('host_budget_mib')
-    options = ['--profile', 'dp-4', '--slots', str(slots), '--mtp-depth', '2']
+    if transport not in ('internal', 'internal-nccl-gather'):
+        raise ValueError('unknown transport')
+    options = ['--profile', 'dp-4', '--slots', str(slots), '--mtp-depth', '2', '--transport', transport]
     if kv == 'host':
         # Minimum requirement is not a measurement of available RAM.
         budget = serve.host_kv_mib(slots) if host_budget_mib is None else host_budget_mib
@@ -65,7 +67,7 @@ def prepare_case(*, active=1, context=400000, slots=None, model=None, server=Non
             cache_k=option('--cache-type-k'), cache_v=option('--cache-type-v'),
             indexer_cache=option('-ctki'), recurrent_state=option('-cts'),
             indexer_query=env['LLAMA_INDEXER_Q8_QUERY'], projector_loaded=mmproj is not None,
-            transport='current', cache_only_catchup=False,
+            transport_requested=env['GGML_CUDA_ALLREDUCE'], transport_actual=None, cache_only_catchup=False,
             minimum_host_kv_mib=serve.host_kv_mib(slots) if kv=='host' else 0),
         model=dict(repository='BoldingBuilds/orcarouter_GLM-5.3-Flash-Uncensored-GGUF',
                    revision=pack['model_revision'], quantization=pack['quantization'],
@@ -162,6 +164,11 @@ def compare_journals(ideal, recorded):
     differences = {key:dict(ideal=configs[0].get(key), recorded=configs[1].get(key))
                    for key in sorted(set(configs[0])|set(configs[1]))
                    if configs[0].get(key) != configs[1].get(key)}
+    for name, journal, config in zip(('ideal', 'recorded'), (ideal, recorded), configs):
+        if journal['evidence'] == 'captured':
+            if (config.get('transport_requested') not in ('internal', 'internal-nccl-gather')
+                    or config.get('transport_actual') != config.get('transport_requested')):
+                gaps.append(name + ': captured transport is unknown or differs from the requested transport')
     if ideal.get('cost_coverage') != 'complete':
         gaps.append('Ideal model is not a complete execution-cost model')
     for journal in (ideal,recorded):
@@ -198,7 +205,10 @@ def compare_journals(ideal, recorded):
     comparable = not gaps
     synthetic = any(j['evidence']=='synthetic-fixture' for j in (ideal,recorded))
     return dict(schema='glm53-matched-comparison-v1', comparable=comparable, gaps=gaps,
-                configuration_differences=differences, pairs=pairs, ideal_schedule=plan,
+                configuration_differences=differences,
+                transport={name: dict(requested=config.get('transport_requested'), actual=config.get('transport_actual'))
+                           for name, config in zip(('ideal', 'recorded'), configs)},
+                pairs=pairs, ideal_schedule=plan,
                 ideal_cycle_ns=plan['makespan_ns'], recorded_cycle_ns=total,
                 speedup=total/plan['makespan_ns'] if comparable and plan['makespan_ns'] else None,
                 evidence='synthetic-fixture' if synthetic else 'captured-vs-source-model',
@@ -252,6 +262,7 @@ def main():
     prep.add_argument('--kv',choices=('resident','host'),default='resident')
     prep.add_argument('--host-budget-mib',type=float)
     prep.add_argument('--trace-decode',action='store_true')
+    prep.add_argument('--transport',choices=('internal','internal-nccl-gather'),default='internal')
     prep.add_argument('--output',required=True,type=Path)
     compare=sub.add_parser('compare')
     compare.add_argument('--ideal',required=True,type=Path)

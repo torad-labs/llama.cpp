@@ -6,7 +6,8 @@
 // from the acceptance of its own MTP drafts in the current request. It drafts the full depth while the extra tokens the
 // positions past the first are expected to land, relative to a one-token round, exceed (n_max - 1) * COST. Shapes stay
 // stable: a sequence's depth holds for windows of 8 of its rounds, the first window of a request is full depth, and a
-// one-token window ends in one full-depth probe. Another sequence's rounds, an earlier request on the same slot, and a
+// one-token window ends in one full-depth probe. Concurrent batches use one pooled policy and probe cadence, not the maximum of individual choices.
+// Another sequence's isolated rounds, an earlier request on the same slot, and a
 // round verified twice (a checkpoint replay) never move it. Without the flag every round drafts n_max, as before.
 // With --spec-draft-n-min m the low depth is max(1, m), capped at n_max, before the request's output limit shortens a draft.
 // Full depth is kept while the tokens past the low depth pay for their added time; at m == n_max the depth stays n_max, and m > n_max disables drafting.
@@ -14,7 +15,7 @@
 // The head's kept hidden row stays the target row that a verification accepted, however the batch is laid out.
 // A request with an image keeps drafting: the head takes the image's rows, so its cells stay consecutive with the target's.
 // With LLAMA_MTP_DEVICE_H=1 the head reads a long target batch's hidden rows where the target left them, in device memory:
-// the same drafts, kept rows and target logits as the host path, byte for byte, and only the kept rows reach the host.
+// the same drafts, kept rows and target logits as the host path, byte for byte. Retained rows reach the host only when serialized.
 
 #include "common.h"
 #include "log.h"
@@ -185,11 +186,13 @@ struct server_rig {
     std::vector<bool> selection_seqs;
     // with count_passes: the target graphs computed so far, one per ubatch the batch was split into
     int target_passes = 0;
+    std::function<void()> on_draft_eval;
 
     server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0,
                ggml_type type_idx = GGML_TYPE_F16, int32_t n_ubatch_tgt = 512,
                bool private_streams = false, bool q8_cache = false, int32_t n_seq = N_SEQ,
-               bool observe_selections = false, bool count_passes = false) : n_max(n_max) {
+               bool observe_selections = false, bool count_passes = false, std::function<void()> on_draft_eval = {})
+        : n_max(n_max), on_draft_eval(std::move(on_draft_eval)) {
         seqs.resize(n_seq);
         selection_seqs.resize(n_seq);
         params.n_ctx      = 8192;
@@ -232,10 +235,12 @@ struct server_rig {
             throw std::runtime_error("failed to create the target context");
         }
         common_params params_dft = common_base_params_to_speculative(params);
-        if (observe_selections) {
+        if (observe_selections || this->on_draft_eval) {
             params_dft.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
                 auto & rig = *static_cast<server_rig *>(data);
-                if (!ask || t->op != GGML_OP_GET_ROWS || !rig.init) { return false; }
+                if (!ask) { return false; }
+                if (rig.on_draft_eval) { rig.on_draft_eval(); }
+                if (t->op != GGML_OP_GET_ROWS || !rig.init) { return false; }
                 auto * draft = static_cast<llama_memory_hybrid *>(llama_get_memory(rig.init->context()))->get_mtp_index();
                 for (size_t seq = 0; seq < rig.seqs.size(); ++seq) {
                     const auto bank = draft->backend_row(seq);
@@ -426,7 +431,7 @@ static bool fail(const char * what) {
     return false;
 }
 
-// Synthetic completion boundaries exercise the same observer and policy as the MTP driver.
+// Synthetic round-start boundaries exercise the same observer and policy as the MTP driver.
 static bool test_service_timing(llama_model *) {
     common_mtp_service service;
     const auto round = [&](int seq, int chosen, double now, int accepted) {
@@ -481,6 +486,49 @@ static bool test_service_timing(llama_model *) {
     for (int i = 1; i < 40; ++i) round(0, 1, 1000000 + i*100, 1);
     if (service.relative_cost(0.18f) != 0.18f) return fail("stale full-depth samples did not fall back to the prior");
 
+    std::vector<llama_seq_id> members(36);
+    std::iota(members.begin(), members.end(), 0);
+    std::mt19937 rng(73);
+    const auto batch_round = [&](int chosen, double now, int accepted) {
+        service.boundary(members, chosen, 1, 2, now);
+        for (llama_seq_id seq : members) {
+            service.drafted(seq, chosen);
+            service.verify(seq, chosen + 1);
+        }
+        auto order = members;
+        std::shuffle(order.begin(), order.end(), rng);
+        for (llama_seq_id seq : order) { service.accept(seq, accepted); }
+    };
+    for (double full_time : {105.0, 180.0}) {
+        service.invalidate();
+        double now = 100;
+        int previous = 0;
+        for (int i = 0; i < 16; ++i) {
+            now += previous == 2 ? full_time : 100;
+            const int chosen = i % 2 ? 2 : 1;
+            batch_round(chosen, now, chosen);
+            previous = chosen;
+        }
+        if (service.preferred_depth(2) != (full_time < 150 ? 2 : 1)) return fail("batch depth ignored delivered tokens per full service cycle");
+    }
+    for (int kind = 0; kind < 7; ++kind) {
+        service.invalidate();
+        batch_round(2, 100, 1);
+        if (kind == 0) service.verify(17, 3);
+        if (kind == 1) service.drafted(17, 1);
+        if (kind == 2) service.accept(17, 1, true);
+        if (kind == 3) service.verify(36, 3);
+        if (kind == 4) service.invalidate();
+        if (kind == 5) {
+            service.boundary(members, 2, 1, 2, 200);
+            for (llama_seq_id seq : members) { service.drafted(seq, 2); service.verify(seq, 3); }
+            for (llama_seq_id seq = 0; seq < 35; ++seq) { service.accept(seq, 1); }
+        }
+        auto changed = members;
+        if (kind == 6) changed.pop_back();
+        service.boundary(changed, 1, 1, 2, 300);
+        if (service.n_samples[0] || service.n_samples[1]) return fail("contaminated or incomplete batch service became a timing sample");
+    }
     common_mtp_depth fixed;
     fixed.reset(2, 0);
     for (int i = 0; i < WINDOW; ++i) {
@@ -539,6 +587,12 @@ static void set_env(const char * name, const char * value) {
 
 // Three available slots with one active request still qualify. The cold full policy probes low on its eighth round.
 static bool test_timed_driver(llama_model * model) {
+    double cadence_clock = 100;
+    struct reset_mtp_clock {
+        ~reset_mtp_clock() { common_mtp_set_clock_for_testing({}); }
+    } reset_clock;
+    // Probe cadence must not depend on scheduler jitter in the real model fixture.
+    common_mtp_set_clock_for_testing([&] { return cadence_clock += 100; });
     set_env("LLAMA_MTP_TIMING_LEGACY", nullptr);
     server_rig rig(model, 0.18f);
     set_env("LLAMA_MTP_TIMING_LEGACY", "1");
@@ -549,6 +603,106 @@ static bool test_timed_driver(llama_model * model) {
         if (len != (round == WINDOW - 1 ? 1 : N_MAX)) return fail("an isolated active slot did not make a low timing probe");
         rig.verify({0});
         rig.accept(0, len, rng);
+    }
+    set_env("LLAMA_MTP_TIMING_LEGACY", nullptr);
+    server_rig concurrent(model, 0.18f);
+    set_env("LLAMA_MTP_TIMING_LEGACY", "1");
+    for (llama_seq_id s = 0; s < N_SEQ; ++s) concurrent.request(s, rng, 7 + s);
+    for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+        for (int round = 0; round < WINDOW + s; ++round) {
+            concurrent.draft({s});
+            concurrent.verify({s});
+            concurrent.accept(s, 0, rng);
+        }
+    }
+    for (int round = 0; round < 3*WINDOW; ++round) {
+        const auto lengths = concurrent.draft({0, 1, 2});
+        const int expected = round < WINDOW || round % WINDOW == WINDOW - 1 ? N_MAX : 1;
+        for (const auto & entry : lengths) {
+            if (entry.second != expected) return fail("batch misses did not share one depth and probe cadence");
+        }
+        concurrent.verify({2, 0, 1});
+        for (llama_seq_id s : {1, 2, 0}) concurrent.accept(s, 0, rng);
+    }
+    // Identical acceptance must keep a cheap full draft and reject an expensive one. Charge
+    // the first draft evaluation itself, so starting the interval after it credits the wrong
+    // depth at probe transitions. The real target/head/accept path runs with only the clock faked.
+    for (const int full_cost : {12 + (int) (rng() % 8), 200 + (int) (rng() % 100)}) {
+        double now = 100;
+        int draft_cost = 0;
+        bool measure_draft = false, in_draft = false;
+        common_mtp_set_clock_for_testing([&] { return now; });
+        set_env("LLAMA_MTP_TIMING_LEGACY", nullptr);
+        server_rig boundary(model, 0.18f, N_MAX, 0, 0, GGML_TYPE_F16, 512, false, false, N_SEQ, false, false, [&] {
+            if (measure_draft && !in_draft) {
+                in_draft = true;
+                now += draft_cost;
+            }
+        });
+        set_env("LLAMA_MTP_TIMING_LEGACY", "1");
+        std::vector<llama_seq_id> all = {0, 1, 2};
+        for (llama_seq_id s : all) boundary.request(s, rng, 7 + s);
+        for (int round = 0; round <= 5*WINDOW; ++round) {
+            const bool probe = round >= WINDOW && round % WINDOW == WINDOW - 1;
+            const int expected = probe || (round == 5*WINDOW && full_cost > 100) ? 1 : N_MAX;
+            draft_cost = expected == N_MAX ? full_cost : 10;
+            in_draft = false;
+            measure_draft = true;
+            const auto lengths = boundary.draft(all);
+            measure_draft = false;
+            if (!in_draft) return fail("the timing regression did not enter the draft evaluation");
+            for (const auto & entry : lengths) {
+                if (entry.second != expected) return fail("concurrent depth did not credit the first draft step to its own round");
+            }
+            std::shuffle(all.begin(), all.end(), rng);
+            boundary.verify(all);
+            for (llama_seq_id s : all) boundary.accept(s, lengths.at(s), rng);
+            now += 20; // verification, acceptance and catch-up cost
+        }
+        common_mtp_set_clock_for_testing({});
+    }
+    // Request lifecycle events may invalidate timing, but only invalidate an acceptance round when
+    // they replace a member whose result is still outstanding. The server starts newly-prefilled
+    // slots before accepting drafts, and may release an accepted slot before accepting its peers.
+    for (llama_seq_id spare = 0; spare < N_SEQ; ++spare) {
+        set_env("LLAMA_MTP_TIMING_LEGACY", nullptr);
+        server_rig mixed(model, 0.18f);
+        set_env("LLAMA_MTP_TIMING_LEGACY", "1");
+        std::vector<llama_seq_id> members;
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            if (s != spare) { members.push_back(s); mixed.request(s, rng, 7 + s); }
+        }
+        for (int round = 0; round <= WINDOW; ++round) {
+            const auto lengths = mixed.draft(members);
+            const int expected = round == WINDOW ? 1 : N_MAX;
+            for (const auto & entry : lengths) {
+                if (entry.second != expected) return fail("mixed prompt verification discarded valid batch acceptance");
+            }
+            std::vector<std::pair<llama_seq_id, llama_tokens>> rows;
+            for (llama_seq_id s : members) {
+                llama_tokens verification = {mixed.seqs[s].id_last};
+                verification.insert(verification.end(), mixed.seqs[s].draft.begin(), mixed.seqs[s].draft.end());
+                rows.emplace_back(s, verification);
+            }
+            const auto prompt = mixed.tokens(rng, 1 + rng() % 4);
+            rows.emplace_back(spare, prompt);
+            std::shuffle(rows.begin(), rows.end(), rng);
+            mixed.decode(rows);
+            common_speculative_begin(mixed.spec.get(), spare, prompt);
+            common_speculative_end(mixed.spec.get(), spare);
+            common_speculative_set_state(mixed.spec.get(), spare, {});
+            std::shuffle(members.begin(), members.end(), rng);
+            mixed.accept(members.front(), 0, rng);
+            if (round % 2 == 0) {
+                common_speculative_end(mixed.spec.get(), members.front());
+                common_speculative_begin(mixed.spec.get(), members.front(), mixed.seqs[members.front()].prompt);
+            } else {
+                std::vector<uint8_t> state;
+                if (!common_speculative_get_state(mixed.spec.get(), members.front(), state)) return fail("accepted slot lost its state");
+                common_speculative_set_state(mixed.spec.get(), members.front(), state);
+            }
+            mixed.accept(members.back(), 0, rng);
+        }
     }
     // A truncated draft, replay and state restore retain the existing acceptance and kept-row contracts.
     rig.seqs[0].draft.clear();
@@ -756,7 +910,9 @@ static bool test_adaptive(llama_model * model) {
 // a round the target verifies twice (a checkpoint replay) is not an observation: a sequence whose every round is
 // replayed keeps the full depth however little lands
 static bool test_replay(llama_model * model) {
+    set_env("LLAMA_MTP_DEVICE_H", "1");
     server_rig rig(model, 0.18f);
+    set_env("LLAMA_MTP_DEVICE_H", nullptr);
     std::mt19937 rng(3);
     rig.request(0, rng, 11);
     for (int round = 0; round < 4*WINDOW; ++round) {
@@ -775,6 +931,17 @@ static bool test_replay(llama_model * model) {
         rig.accept(0, 0, rng);
     }
     if (str(len) != std::string(WINDOW, '0' + N_MAX) + "11111112") return fail("rounds verified once did not move the depth");
+    server_rig concurrent(model, 0.18f);
+    for (llama_seq_id s = 0; s < N_SEQ; ++s) concurrent.request(s, rng, 7 + s);
+    for (int round = 0; round < 2*WINDOW; ++round) {
+        const auto lengths = concurrent.draft({0, 1, 2});
+        for (const auto & entry : lengths) {
+            if (entry.second != N_MAX) return fail("replayed batches trained the concurrent policy");
+        }
+        concurrent.verify({2, 0, 1});
+        concurrent.verify({1, 2, 0});
+        for (llama_seq_id s : {2, 1, 0}) concurrent.accept(s, 0, rng);
+    }
     return true;
 }
 
@@ -999,7 +1166,9 @@ static bool test_n_min(llama_model * model) {
 // longer than any draft, and verification-length runs; with the adaptive depth on and off
 static bool test_kept_row(llama_model * model) {
     for (const float adaptive : {0.0f, 0.18f}) {
+        set_env("LLAMA_MTP_DEVICE_H", adaptive > 0.0f ? "1" : nullptr);
         server_rig rig(model, adaptive);
+        set_env("LLAMA_MTP_DEVICE_H", nullptr);
         std::mt19937 rng(adaptive > 0.0f ? 11 : 12);
         const int n_embd = llama_model_n_embd_out(llama_get_model(rig.tgt.get()));
         auto check = [&](llama_seq_id s, llama_pos pos, const float * h) {
@@ -1038,6 +1207,19 @@ static bool test_kept_row(llama_model * model) {
                 }
             }
             for (const auto & r : rows) {
+                if (rng() % 5 == 0) {
+                    std::vector<uint8_t> state;
+                    common_speculative_get_state(rig.spec.get(), r.first, state);
+                    common_speculative_set_state(rig.spec.get(), r.first, {});
+                    common_speculative_accept(rig.spec.get(), r.first, 0);
+                    std::vector<uint8_t> cleared;
+                    if (common_speculative_get_state(rig.spec.get(), r.first, cleared)) return fail("accept resurrected a cleared verification");
+                    common_speculative_set_state(rig.spec.get(), r.first, state);
+                    common_speculative_accept(rig.spec.get(), r.first, 0);
+                    std::vector<uint8_t> restored;
+                    if (!common_speculative_get_state(rig.spec.get(), r.first, restored) || restored != state) return fail("accept replaced a restored row with stale verification");
+                    continue;
+                }
                 if (rng() % 2) continue;
                 const int n_rows = (int) r.second.size();
                 const int n = rng() % (std::min(n_rows - 1, N_MAX + 1) + 1);
@@ -1211,7 +1393,7 @@ static bool test_device_h(llama_model * model) {
     std::mt19937 rng_h(5), rng_d(5);
 
     const auto same = [&](const char * what, int n_rows) {
-        const int want = n_rows >= 64 ? n_rows : 0;
+        const int want = n_rows;
         const int got  = llama_get_nextn_store_rows(dev.tgt.get());
         if (got != want || llama_get_nextn_store_rows(host.tgt.get()) != 0) {
             fprintf(stderr, "%s: %d rows, the store holds %d (want %d), the host rig's %d (want 0)\n", what, n_rows, got,
@@ -1287,7 +1469,14 @@ static bool test_device_h(llama_model * model) {
     }
 
     const acceptance acc[N_SEQ] = { {1.0f, 1.0f}, {1.0f, 0.0f}, {0.5f, 0.5f} };
-    for (int round = 0; round < 2*WINDOW; ++round) {
+    for (int round = 0; round < 3*WINDOW; ++round) {
+        if (round >= 2*WINDOW) {
+            const llama_seq_id replaced = rng_h() % N_SEQ;
+            rng_d();
+            host.request(replaced, rng_h, 3 + round);
+            dev.request(replaced, rng_d, 3 + round);
+            if (!same("a replacement", 3 + round)) return false;
+        }
         host.draft({0, 1, 2});
         dev.draft({0, 1, 2});
         for (llama_seq_id s = 0; s < N_SEQ; ++s) {
@@ -1301,7 +1490,9 @@ static bool test_device_h(llama_model * model) {
             }
         }
         host.verify({2, 0, 1});
+        const int64_t before = llama_get_nextn_rows_to_host(dev.tgt.get());
         dev.verify({2, 0, 1});
+        if (llama_get_nextn_rows_to_host(dev.tgt.get()) != before) return fail("ordinary verification materialized hidden rows");
         int n_rows = 0;
         for (llama_seq_id s = 0; s < N_SEQ; ++s) n_rows += 1 + (int) host.seqs[s].draft.size();
         if (!same("a verification", n_rows)) return false;
@@ -1332,16 +1523,16 @@ static bool test_device_h_rows(llama_model * model) {
     };
     const int64_t n_host = read(host, [&] { host.decode(prompts); });
     const int64_t n_dev  = read(dev,  [&] { dev.decode(prompts); });
-    if (n_host != 200 || n_dev > N_SEQ*(N_MAX + 3)) {
-        fprintf(stderr, "a 200-row batch: the host rig read %lld rows (want 200), the device rig %lld (want at most %d)\n",
-                (long long) n_host, (long long) n_dev, N_SEQ*(N_MAX + 3));
+    if (n_host != 200 || n_dev != 0) {
+        fprintf(stderr, "a 200-row batch: the host rig read %lld rows (want 200), the device rig %lld (want 0)\n",
+                (long long) n_host, (long long) n_dev);
         return fail("the device rig's target read more than the kept rows back to the host");
     }
     const std::vector<std::pair<llama_seq_id, llama_tokens>> mixed = {
         { 0, host.tokens(rng, 60) }, { 1, host.tokens(rng, 2) }, { 2, host.tokens(rng, 4) } };
     const int64_t mixed_host = read(host, [&] { host.decode(mixed); });
     const int64_t mixed_dev = read(dev, [&] { dev.decode(mixed); });
-    if (mixed_host != 66 || mixed_dev != N_MAX + 3 + 2 + 4) return fail("a fully kept sequence read its last hidden row twice");
+    if (mixed_host != 66 || mixed_dev != 0) return fail("retaining hidden rows copied them to the host");
     for (llama_seq_id seq = 0; seq < N_SEQ; ++seq) {
         std::vector<uint8_t> a, b;
         if (!common_speculative_get_state(host.spec.get(), seq, a) ||
@@ -1358,10 +1549,10 @@ static bool test_device_h_rows(llama_model * model) {
     }
     const int64_t v_host = read(host, [&] { host.verify({0}); });
     const int64_t v_dev  = read(dev,  [&] { dev.verify({0}); });
-    if (v_host != 1 + N_MAX || v_dev != 1 + N_MAX) {
+    if (v_host != 1 + N_MAX || v_dev != 0) {
         fprintf(stderr, "a %d-row verification: the host rig read %lld rows, the device rig %lld\n", 1 + N_MAX,
                 (long long) v_host, (long long) v_dev);
-        return fail("a verification did not read its rows back to the host");
+        return fail("ordinary verification did not retain its rows on the backend");
     }
     return true;
 }
@@ -1916,31 +2107,43 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
 // the same sessions was one 121 ms pass on four RTX PRO 6000 cards). A sequence that drafts alone keeps its own depth.
 static bool test_dp_uniform_width(const std::vector<ggml_backend_dev_t> & devices) {
     auto split = glm_model(1234, devices, LLAMA_SPLIT_MODE_DATA);
-    constexpr int n_seq = 8;
-    server_rig rig(split.get(), 0.18f, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, false, n_seq, false, true);
+    constexpr int n_seq = 36;
+    set_env("LLAMA_MTP_TIMING_LEGACY", "1");
+    set_env("LLAMA_MTP_DEVICE_H", "1");
+    server_rig rig(split.get(), 0.18f, N_MAX, 0, 32, GGML_TYPE_F16, 128, true, false, n_seq, false, true);
+    set_env("LLAMA_MTP_DEVICE_H", nullptr);
     std::vector<llama_seq_id> all(n_seq);
     std::iota(all.begin(), all.end(), 0);
     std::mt19937 rng(7);
     for (const llama_seq_id s : all) rig.request(s, rng, 9 + 3*s);
-    // even sequences land every draft and odd ones none: drafting alone, an odd one drops to one token after a window
-    const acceptance land = {1.0f, 1.0f}, miss = {0.0f, 0.0f};
+    // Individual probe phases must not become batch-wide probes.
+    for (const llama_seq_id s : all) {
+        for (int round = 0; round < WINDOW + s % WINDOW; ++round) {
+            rig.draft({s});
+            rig.verify({s});
+            rig.accept(s, 0, rng);
+        }
+    }
     for (int round = 0; round < 3*WINDOW; ++round) {
         const auto len = rig.draft(all);
+        const int expected = round < WINDOW || round % WINDOW == WINDOW - 1 ? N_MAX : 1;
         for (const llama_seq_id s : all) {
-            if (len.at(s) != N_MAX) {
-                fprintf(stderr, "round %d: sequence %d drafted %d, the round's depth is %d\n", round, s, len.at(s), N_MAX);
-                return fail("a sequence drafting with others did not draft the round's depth");
+            if (len.at(s) != expected) {
+                fprintf(stderr, "round %d: sequence %d drafted %d, the round's depth is %d\n", round, s, len.at(s), expected);
+                return fail("staggered session probes overrode the batch depth");
             }
         }
         rig.target_passes = 0;
+        const int64_t before = llama_get_nextn_rows_to_host(rig.tgt.get());
         rig.verify(all);
+        if (llama_get_nextn_rows_to_host(rig.tgt.get()) != before) return fail("DP verification copied retained hidden rows to host");
         if (rig.target_passes != 1) {
             fprintf(stderr, "round %d: %d target passes for %d rows\n", round, rig.target_passes, n_seq*(N_MAX + 1));
             return fail("a data-parallel verification of equal drafts was not one target pass");
         }
-        for (const llama_seq_id s : all) rig.accept(s, (s % 2 ? miss : land)(len.at(s), rng), rng);
+        for (const llama_seq_id s : all) rig.accept(s, 0, rng);
     }
-    // sequences that all chose one token draft one token together: the round's depth is the deepest chosen, not the maximum
+    // Changing the active set retains equal widths and does not revive individual probe phases.
     std::vector<llama_seq_id> odd;
     for (const llama_seq_id s : all) if (s % 2) odd.push_back(s);
     for (const auto & [s, n] : rig.draft(odd)) {
@@ -1959,8 +2162,11 @@ static bool test_dp_uniform_width(const std::vector<ggml_backend_dev_t> & device
 // that takes 0.12 s, in the last round of most sessions. A sequence that drafts alone keeps its limit.
 static bool test_dp_output_limit(const std::vector<ggml_backend_dev_t> & devices) {
     auto split = glm_model(1234, devices, LLAMA_SPLIT_MODE_DATA);
-    constexpr int n_seq = 8;
-    server_rig rig(split.get(), 0.18f, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, false, n_seq, false, true);
+    constexpr int n_seq = 36;
+    set_env("LLAMA_MTP_TIMING_LEGACY", "1");
+    set_env("LLAMA_MTP_DEVICE_H", "1");
+    server_rig rig(split.get(), 0.18f, N_MAX, 0, 32, GGML_TYPE_F16, 128, true, false, n_seq, false, true);
+    set_env("LLAMA_MTP_DEVICE_H", nullptr);
     std::vector<llama_seq_id> all(n_seq);
     std::iota(all.begin(), all.end(), 0);
     std::mt19937 rng(11);
@@ -1977,7 +2183,9 @@ static bool test_dp_output_limit(const std::vector<ggml_backend_dev_t> & devices
             }
         }
         rig.target_passes = 0;
+        const int64_t before = llama_get_nextn_rows_to_host(rig.tgt.get());
         rig.verify(all);
+        if (llama_get_nextn_rows_to_host(rig.tgt.get()) != before) return fail("DP verification copied retained hidden rows to host");
         if (rig.target_passes != 1) {
             fprintf(stderr, "round %d: %d target passes for %d rows\n", round, rig.target_passes, n_seq*(N_MAX + 1));
             return fail("a data-parallel verification with sequences near their output limits was not one target pass");

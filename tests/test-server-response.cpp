@@ -12,6 +12,8 @@
 #include <chrono>
 #include <cstdio>
 #include <thread>
+#include <random>
+#include <set>
 #include <vector>
 
 namespace {
@@ -177,10 +179,50 @@ bool test_broadcast() {
     return true;
 }
 
+// Generated sparse arrivals: each owner's oldest readers get a turn, even if another
+// owner has only one late-numbered slot. No reader may wait forever behind that slot.
+bool test_prompt_admission_fairness() {
+    std::mt19937 rng(53);
+    for (int trial = 0; trial < 64; ++trial) {
+        const uint32_t owners = 2 + rng() % 3;
+        std::vector<llama_seq_id> pending;
+        for (llama_seq_id id = 0; id < 40; ++id) {
+            if (id % owners == 0 || rng() % 5 == 0) {
+                pending.push_back(id);
+            }
+        }
+        server_prompt_scheduler scheduler;
+        std::set<llama_seq_id> seen;
+        for (size_t round = 0; round < pending.size(); ++round) {
+            auto order = scheduler.order(pending, owners);
+            if (std::set<llama_seq_id>(order.begin(), order.end()) !=
+                    std::set<llama_seq_id>(pending.begin(), pending.end()) || order.size() != pending.size()) {
+                return fail("prompt admission lost or duplicated a pending slot");
+            }
+            std::set<uint32_t> active_owners;
+            for (auto id : pending) { active_owners.insert(id % owners); }
+            std::set<uint32_t> admitted_owners;
+            for (size_t i = 0; i < active_owners.size(); ++i) {
+                admitted_owners.insert(order[i] % owners);
+                seen.insert(order[i]);
+                scheduler.admitted(order[i]);
+            }
+            if (admitted_owners != active_owners) {
+                return fail("prompt admission gave one owner a second turn before another got one");
+            }
+        }
+        if (seen.size() != pending.size()) {
+            return fail("a sparse owner starved another owner's prompt");
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
     bool ok = true;
+    ok = test_prompt_admission_fairness() && ok;
     ok = test_reader_of_several_tasks() && ok;
     ok = test_dropped_results() && ok;
     ok = test_broadcast() && ok;
