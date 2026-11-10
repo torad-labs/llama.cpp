@@ -663,12 +663,13 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
     return res;
 }
 
-// the switches that keep the pool maps off the device's resident tables
+// the switches that keep the pool maps off the device's resident tables. Read at each call, as the builder read them:
+// a caller sets LLAMA_KPOOL_RESIDENT_LEGACY around one context's decodes (test_glm_mtp_index's reference), and a value
+// kept from the first call left that context on the resident tables
 static bool kpool_resident_off() {
-    static const bool off = ggml_env_switch("LLAMA_KPOOL_RESIDENT_LEGACY") ||
+    return ggml_env_switch("LLAMA_KPOOL_RESIDENT_LEGACY") ||
         ggml_env_switch("LLAMA_KPOOL_INPUT_LEGACY") || ggml_env_switch("LLAMA_KPOOL_INPUT_CHECK") ||
         ggml_env_switch("LLAMA_KPOOL_MASK_HOST_LEGACY");
-    return off;
 }
 
 bool llm_graph_input_kpool::shared_pool(const llama_cparams & cparams, const llama_kpool_views & views) {
@@ -4315,6 +4316,8 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 supported = device && ggml_backend_dev_supports_op(device, probe);
             }
             if (!supported) {
+                // said once: the cache keeps the packed maps from here on, built from every cell at each decode
+                LLAMA_LOG_WARN("%s: the k-pool bank is not supported on this cache's device: a unified pool's sequences keep the packed pool maps\n", __func__);
                 kv->get_kpool_views().bank_unsupported = true;
                 shared = false;
             }

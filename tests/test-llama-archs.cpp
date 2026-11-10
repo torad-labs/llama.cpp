@@ -844,8 +844,14 @@ static bool test_glm_mtp_index(const size_t seed, const std::vector<ggml_backend
     };
     params.cb_eval_user_data = counts;
     llama_context_ptr ctx(llama_init_from_model(model, params));
-    params.cb_eval = nullptr;
-    params.cb_eval_user_data = nullptr;
+    // the reference builds its pool maps on the host (LLAMA_KPOOL_RESIDENT_LEGACY=1 around its decodes), so they are an
+    // input of its graphs: a decode that computes them took the resident tables, and compares them with themselves
+    int reference_maps = 0;
+    params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+        if (ask && std::string(t->name) == "kpool_pool_cells") ++*static_cast<int *>(data);
+        return false;
+    };
+    params.cb_eval_user_data = &reference_maps;
     llama_context_ptr reference(llama_init_from_model(model, params));
     if (!ctx || !reference || llama_mtp_draft_step(pair.second.get(), 0)) {
         return false;
@@ -860,6 +866,9 @@ static bool test_glm_mtp_index(const size_t seed, const std::vector<ggml_backend
         set_env("LLAMA_KPOOL_RESIDENT_LEGACY", "1");
         auto result = get_mtp_logits(model, reference.get(), input, hidden, pos);
         set_env("LLAMA_KPOOL_RESIDENT_LEGACY", old ? saved.c_str() : nullptr);
+        if (reference_maps != 0) {
+            throw std::runtime_error("the MTP reference made its pool maps on the device: LLAMA_KPOOL_RESIDENT_LEGACY was not read for its decode");
+        }
         return result;
     };
     reference_logits(tokens, 0);
