@@ -121,6 +121,27 @@ llama_kv_cache::llama_kv_cache(
         n_pad_prefill = val > 0 ? GGML_PAD((uint32_t) std::min<long>(val, kv_size), n_pad_cur) : 0;
     }
 
+    // A pool that sequences share grows by every sequence's rows each step, and a graph holds only while its padded length
+    // does. One sequence drafting two tokens crosses 256 cells every ~115 steps; 23 of them in one pool cross it every 5
+    // (~50 cells a step), and each crossing builds every decode shape again and plans its memory: the target's, the MTP
+    // head's two proposals and its catch-up. On four RTX PRO 6000 (-sm tensor, 23 sessions, Nov 9, 2026) a graph was
+    // planned in 34 of 64 decodes, 8.7 ms each, and a session's target graph was reused in 41 of its ~61 steps; on one
+    // card the crossing step and the one after it took 76 ms more than a 31 ms step. Padded to 256 cells a sequence, the
+    // pool crosses as often a step as one sequence does; the next power of two, which GGML_PAD and the pool padding
+    // derived from it (llama_kpool_pool_pad) take. LLAMA_KV_PAD_SHARED_LEGACY=1: 256, whatever the pool holds
+    if (hparams.indexer_kpool > 0 && n_stream < n_seq_max) {
+        const char * legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
+
+        if (!legacy || atoi(legacy) != 1) {
+            const uint64_t a_sequence = std::max(n_pad, 256u);
+            uint64_t pad = a_sequence;
+            while (pad < std::min<uint64_t>(a_sequence*n_seq_max, kv_size)) {
+                pad *= 2;
+            }
+            n_pad_shared = (uint32_t) pad;
+        }
+    }
+
     const uint32_t n_layer = hparams.n_layer_all;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -1432,9 +1453,12 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens, ui
 
     // A prompt step of at least 256 rows whose pooled indexer scores at 256 (llama_kpool_needs_scoring) is padded to
     // n_pad_prefill: it scores there too, so whether it scores is unchanged, and its sparse attention reads only the cells
-    // its top-k picks, so the empty cells it adds are never read. A decode step, and a step that reads densely, keep 256
-    if (n_pad_prefill > pad && n_tokens >= 256 && result > hparams.indexer_top_k + hparams.indexer_kpool - 1) {
-        pad    = n_pad_prefill;
+    // its top-k picks, so the empty cells it adds are never read. A step of any length in a pool that sequences share is
+    // padded to at least n_pad_shared on the same terms. One sequence's decode step, and a step that reads densely, keep 256
+    const bool scores = n_pad_prefill + n_pad_shared > 0 && result > hparams.indexer_top_k + hparams.indexer_kpool - 1;
+    const uint32_t pad_scoring = std::max(n_tokens >= 256 ? n_pad_prefill : 0, n_pad_shared);
+    if (scores && pad_scoring > pad) {
+        pad    = pad_scoring;
         result = padded(pad);
     }
 
