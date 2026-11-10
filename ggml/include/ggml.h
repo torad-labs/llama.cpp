@@ -598,6 +598,7 @@ extern "C" {
 
         GGML_OP_GLU,
         GGML_OP_FLASH_ATTN_EXT_SPARSE,
+        GGML_OP_TOP_K_CANDIDATES,
 
         GGML_OP_COUNT,
     };
@@ -2425,6 +2426,18 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // Unordered top-k candidates for contiguous F32 [vocabulary, rows].
+    // I64 [k, n_parts, rows]: low 32 bits are the global column ID, high 32 bits are the original F32 bits.
+    // Merge by value descending, then ID ascending; signed zeros tie and NaNs sort last.
+    // ID -1 pads unused records. Unsplit backends fill part 0; vocabulary-split Meta fills one part per device.
+    // Meta inputs must be mirrored, vocabulary-split or row-split. A vocabulary split requires n_parts == device count.
+    // k may exceed a shard's vocabulary size; extra slots are padded. No full-vocabulary gather is needed.
+    GGML_API struct ggml_tensor * ggml_top_k_candidates(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            int                   n_parts);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

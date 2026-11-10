@@ -1117,9 +1117,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
     "FLASH_ATTN_EXT_SPARSE",
+    "TOP_K_CANDIDATES",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,9 +1236,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
     "flash_attn_ext_sparse(x)",
+    "top_k_candidates(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5435,6 +5437,24 @@ struct ggml_tensor * ggml_top_k(
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
 
+    return result;
+}
+
+// ggml_top_k_candidates
+
+struct ggml_tensor * ggml_top_k_candidates(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k,
+        int                   n_parts) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1 && a->ne[0] <= INT32_MAX);
+    GGML_ASSERT(k > 0 && n_parts > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, k, n_parts, a->ne[1]);
+    result->op     = GGML_OP_TOP_K_CANDIDATES;
+    result->src[0] = a;
+    ggml_set_op_params_i32(result, 0, 0); // global column offset, set by the Meta backend
     return result;
 }
 

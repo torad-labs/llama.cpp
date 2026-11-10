@@ -8547,6 +8547,34 @@ void ggml_compute_forward_top_k(
     }
 }
 
+void ggml_compute_forward_top_k_candidates(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I64);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+    const int64_t ncols = src->ne[0];
+    const int64_t k = dst->ne[0];
+    const int64_t parts = dst->ne[1];
+    const int64_t count = std::min(k, ncols);
+    const int32_t offset = ggml_get_op_params_i32(dst, 0);
+    int32_t * tmp = count ? (int32_t *) params->wdata + (ncols + CACHE_LINE_SIZE_F32)*params->ith : nullptr;
+    for (int64_t row = params->ith; row < dst->ne[2]; row += params->nth) {
+        uint64_t * out = (uint64_t *) dst->data + row*parts*k;
+        std::fill(out, out + parts*k, uint64_t(UINT32_MAX));
+        if (count == 0) { continue; }
+        const float * values = (const float *) src->data + row*ncols;
+        for (int64_t i = 0; i < ncols; ++i) { tmp[i] = i; }
+        std::partial_sort(tmp, tmp + count, tmp + ncols, [values](int32_t a, int32_t b) {
+            if (std::isnan(values[a]) != std::isnan(values[b])) { return !std::isnan(values[a]); }
+            return values[a] > values[b] || (!(values[a] < values[b]) && a < b);
+        });
+        for (int64_t i = 0; i < count; ++i) {
+            uint32_t bits;
+            memcpy(&bits, values + tmp[i], sizeof(bits));
+            out[i] = (uint64_t(bits) << 32) | uint32_t(offset + tmp[i]);
+        }
+    }
+}
+
 // a bit-packed attention mask row (GGML_TYPE_I16): 16 KV cells per element, LSB first, bit set = attend
 static inline float ggml_kq_mask_bit(const uint16_t * row, int64_t i) {
     return (row[i >> 4] >> (i & 15)) & 1 ? 0.0f : -INFINITY;
