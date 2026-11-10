@@ -848,9 +848,16 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
     if ((draft_top_k != nullptr) != reuse_selection) return false;
     if (!draft_rows.empty()) {
         if (draft_rows.size() != params.ubatch.n_tokens) return false;
+        // one bank's rows are read by their slots, which set_input takes from the ubatch (draft_ids): the graph is then
+        // another set's too, while every sequence's selection is in that bank
+        const bool any_seqs = params.any_seqs && draft_ids != nullptr;
         for (uint32_t i = 0; i < params.ubatch.n_tokens; ++i) {
-            if (draft_seqs[i] != params.ubatch.seq_id[i][0] ||
-                    draft_rows[i] != draft->backend_row(draft_seqs[i])) return false;
+            const llama_seq_id seq = params.ubatch.seq_id[i][0];
+            if (draft_rows[i] != draft->backend_row(seq)) return false;
+            if (draft_seqs[i] != seq) {
+                if (!any_seqs) return false;
+                draft_seqs[i] = seq;
+            }
         }
     }
     if (resident_table) {
