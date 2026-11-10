@@ -4316,6 +4316,8 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 supported = device && ggml_backend_dev_supports_op(device, probe);
             }
             if (!supported) {
+                // said once: the cache keeps the packed maps from here on, built from every cell at each decode
+                LLAMA_LOG_WARN("%s: the k-pool bank is not supported on this cache's device: a unified pool's sequences keep the packed pool maps\n", __func__);
                 kv->get_kpool_views().bank_unsupported = true;
                 shared = false;
             }

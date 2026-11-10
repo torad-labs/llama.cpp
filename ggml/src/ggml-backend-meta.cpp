@@ -3563,6 +3563,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (zero_scale_legacy || (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16) || !ggml_is_contiguous(node) ||
                     !ggml_backend_supports_op(bcj.backend, node_zero)) {
                 node_zero->op = GGML_OP_SCALE;
+                // said once, for a node of floats the fill was meant for: this rank's zeros are a scale, which keeps a
+                // NaN the buffer held
+                static std::atomic<bool> warned{false};
+                if (!zero_scale_legacy && (node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16) && !warned.exchange(true)) {
+                    GGML_LOG_WARN("%s: no fill for an uncomputed %s node of type %s on %s: zeroed by a scale, which keeps a NaN\n",
+                            __func__, ggml_op_name(node->op), ggml_type_name(node->type), ggml_backend_name(bcj.backend));
+                }
             }
 
             step_cgraphs[j] = get_cgraph_aux();
