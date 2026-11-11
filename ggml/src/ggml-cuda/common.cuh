@@ -1888,19 +1888,24 @@ struct ggml_cuda_fattn_kv_live_context {
 // CONCAT(state, transposed new inputs) -> the rollback snapshots' CPYs into the cache, and the SSM_CONV reading the
 // CONCAT. The graph evaluator skips the GET_ROWS, the CONCAT and the CPYs (ggml_cuda_try_ssm_conv_state_update) and
 // records the chain here under the SSM_CONV, whose kernel then reads the sequence's state row out of the cache and the
-// new inputs out of their projection, and writes the snapshots itself.
+// new inputs out of their projection, and writes the snapshots itself. A snapshot's destination is its CPY's: the
+// sequences' rows one after another, (d_conv - 1) * channels floats each.
 #define GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS  8
 #define GGML_CUDA_SSM_CONV_UPDATE_D_CONV  4 // the kernel width it is built for (Qwen3-Next, Qwen3.5)
 #define GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T 8 // new tokens per step it holds in registers
 #define GGML_CUDA_SSM_CONV_UPDATE_THREADS 128 // channels per block, and so the head width the L2 fold takes
 #define GGML_CUDA_SSM_CONV_AB_MAX_ROWS    4   // alpha/beta rows a block of the fold computes (ggml_cuda_try_ssm_conv_ab)
+#define GGML_CUDA_SSM_CONV_UPDATE_MAX_SEQS  32 // sequences the kernel for more than one takes: a warp each in a block
+#define GGML_CUDA_SSM_CONV_UPDATE_SEQS_N_T  4  // new tokens per step that kernel holds in registers
 
 struct ggml_cuda_ssm_conv_state_update {
     const float *   cache      = nullptr; // conv cache rows, f32
-    const int32_t * ids        = nullptr; // the sequence's state row, ids[0]
+    const int32_t * ids        = nullptr; // each sequence's state row, ids[s]
     int64_t         row_stride = 0;       // between cache rows, in floats
-    const float *   x          = nullptr; // the new tokens' inputs, [channels, n_t]
+    const float *   x          = nullptr; // the new tokens' inputs, [channels, n_t, n_seqs]
     int64_t         x_stride   = 0;       // between tokens, in floats
+    int             n_seqs       = 1;     // sequences; more than one runs ssm_conv_state_update_seqs_f32
+    int64_t         x_seq_stride = 0;     // between sequences' inputs, in floats
     int             n_snapshots = 0;
     float *         snapshot_dst[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // a snapshot CPY's cache row
     int             snapshot_col[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // the CONCAT column its window starts at
