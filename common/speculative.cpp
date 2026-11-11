@@ -2348,8 +2348,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                // add drafted token for each sequence: the head's top token, or what the sequence's own chain draws from
+                // the head's candidates when it is coupled, which the target's draw of the position then repeats
+                // wherever the head's logits are near the target's (the thresholds below stay on the head's top token)
+                llama_token id = cur_p->data[0].id;
+                if (dparams[seq_id].smpl) {
+                    const llama_tokens & proposed = *dparams[seq_id].result;
+                    const llama_token    coupled  = common_sampler_sample_coupled(dparams[seq_id].smpl,
+                            cur_p->data, cur_p->size, proposed.data(), proposed.size());
+                    if (coupled != LLAMA_TOKEN_NULL) {
+                        id = coupled;
+                    }
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {

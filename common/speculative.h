@@ -128,6 +128,11 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // the sequence's own sampler, or nullptr. With a coupled chain (common_params_sampling::coupled) the MTP drafter
+    // proposes each token as that chain would draw it from the head's candidates (common_sampler_sample_coupled), with
+    // the noise the target then draws the position with; otherwise the head's top token
+    struct common_sampler * smpl = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

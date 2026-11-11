@@ -487,10 +487,189 @@ static void test_top_k_candidates_exact() {
     }
 }
 
+// a served chain: a repeat penalty over 256 tokens, top-k 40, top-p 0.95, min-p 0.05, temperature 1 and the draw
+static llama_sampler * coupled_chain(int32_t n_vocab, uint32_t seed, bool coupled = true, float xtc_p = -1.0f) {
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_penalties(n_vocab, 256, 1.1f, 0.0f, 0.0f));
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(40));
+    llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.95f, 1));
+    llama_sampler_chain_add(chain, llama_sampler_init_min_p(0.05f, 1));
+    if (xtc_p >= 0.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_xtc(xtc_p, 0.1f, 1, seed));
+    }
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(1.0f));
+    llama_sampler_chain_add(chain, coupled ? llama_sampler_init_dist_coupled(seed) : llama_sampler_init_dist(seed));
+    return chain;
+}
+
+static llama_token draw_from(llama_sampler * smpl, const std::vector<float> & logits, std::vector<llama_token_data> & cur) {
+    cur.clear();
+    for (llama_token id = 0; id < (llama_token) logits.size(); ++id) {
+        cur.push_back(llama_token_data{id, logits[id], 0.0f});
+    }
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(smpl, &cur_p);
+    GGML_ASSERT(cur_p.selected >= 0);
+    return cur_p.data[cur_p.selected].id;
+}
+
+// llama_sampler_init_dist_coupled: its draws follow the distribution; a copy of the chain draws the same token from the
+// same logits and, from logits near them, the chain's token far more often than those logits' top token is it; a clone
+// and a copy carry the sample's index; and the chain tells when a copy can stand in for it
+static void test_dist_coupled() {
+    std::vector<llama_token_data> cur;
+
+    {
+        const std::vector<float> logits = { 2.0f, 1.0f, 0.0f, -1.0f, -30.0f };
+        double sum = 0.0;
+        for (const float l : logits) {
+            sum += exp((double) l);
+        }
+        llama_sampler *  smpl = llama_sampler_init_dist_coupled(1234);
+        const int        n    = 200000;
+        std::vector<int> count(logits.size(), 0);
+        for (int i = 0; i < n; ++i) {
+            const llama_token id = draw_from(smpl, logits, cur);
+            count[id]++;
+            llama_sampler_accept(smpl, id);
+        }
+        for (size_t t = 0; t < logits.size(); ++t) {
+            // one standard deviation of a share is at most 0.0011 at this n
+            GGML_ASSERT(fabs((double) count[t] / n - exp((double) logits[t]) / sum) < 0.005);
+        }
+        llama_sampler_free(smpl);
+    }
+
+    // a common offset changes nothing: the noise is not rounded away by logits far from 0
+    for (const float offset : { 0.0f, 1e20f, -1e20f }) {
+        const std::vector<float> logits(3, offset);
+        llama_sampler *  smpl = llama_sampler_init_dist_coupled(1234);
+        const int        n    = 30000;
+        std::vector<int> count(logits.size(), 0);
+        for (int i = 0; i < n; ++i) {
+            const llama_token id = draw_from(smpl, logits, cur);
+            count[id]++;
+            llama_sampler_accept(smpl, id);
+        }
+        for (size_t t = 0; t < logits.size(); ++t) {
+            // one standard deviation of a share is 0.0027 at this n
+            GGML_ASSERT(fabs((double) count[t] / n - 1.0 / 3.0) < 0.012);
+        }
+        llama_sampler_free(smpl);
+    }
+
+    // a draw made again before the accept is independent of the first, as a grammar's resample needs: weights 2, 4 and
+    // 1 under top-k 2, the token of weight 4 rejected and the draw made again over the other two. The token of weight 1
+    // then comes at (4/6)(1/3) = 2/9; with the first draw's noise it would come at 2/7
+    {
+        const std::vector<float> all   = { logf(2.0f), logf(4.0f), logf(1.0f) };
+        const std::vector<float> valid = { logf(2.0f), -INFINITY, logf(1.0f) };
+        llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(2));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist_coupled(4321));
+        GGML_ASSERT(llama_sampler_chain_coupled(chain));
+        llama_sampler * ahead = llama_sampler_clone(chain);
+        const int n = 100000;
+        int last = 0, foretold = 0;
+        for (int i = 0; i < n; ++i) {
+            const llama_token first = draw_from(chain, all, cur);
+            foretold += draw_from(ahead, all, cur) == first;
+            const llama_token id = first == 1 ? draw_from(chain, valid, cur) : first;
+            GGML_ASSERT(id != 1);
+            last += id == 2;
+            llama_sampler_accept(chain, id);
+            llama_sampler_accept(ahead, id);
+        }
+        printf("coupled draws made again: the token of weight 1 at %.4f (2/9 = 0.2222, 2/7 = 0.2857), the first draw foretold %d of %d\n",
+                (double) last / n, foretold, n);
+        // one standard deviation is 0.0013 at this n
+        GGML_ASSERT(fabs((double) last / n - 2.0 / 9.0) < 0.006);
+        GGML_ASSERT(foretold == n);
+        llama_sampler_free(ahead);
+        llama_sampler_free(chain);
+    }
+
+    const int32_t n_vocab = 64;
+    std::mt19937  rng(7);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    std::vector<float> p(n_vocab), q(n_vocab);
+
+    llama_sampler * target = coupled_chain(n_vocab, 99);
+    GGML_ASSERT(llama_sampler_chain_coupled(target));
+    {
+        // a drafter draws once a token, so each of the two has its own copy
+        llama_sampler * drafter      = llama_sampler_clone(target);
+        llama_sampler * drafter_near = llama_sampler_clone(target);
+        GGML_ASSERT(llama_sampler_chain_coupled(drafter));
+        const int n = 20000;
+        int same = 0, near = 0, top = 0;
+        for (int i = 0; i < n; ++i) {
+            for (int t = 0; t < n_vocab; ++t) {
+                p[t] = 3.0f * gauss(rng);
+                q[t] = p[t] + 0.5f * gauss(rng);
+            }
+            const llama_token d_same = draw_from(drafter, p, cur);
+            const llama_token d_near = draw_from(drafter_near, q, cur);
+            const llama_token d_top  = (llama_token) (std::max_element(q.begin(), q.end()) - q.begin());
+            const llama_token x      = draw_from(target, p, cur);
+            same += d_same == x;
+            near += d_near == x;
+            top  += d_top == x;
+            llama_sampler_accept(target, x);
+            llama_sampler_accept(drafter, x);
+            llama_sampler_accept(drafter_near, x);
+        }
+        printf("coupled draws: %d of %d from the same logits, %d from logits 0.5 away, the top token of those %d\n", same, n, near, top);
+        GGML_ASSERT(same == n);
+        GGML_ASSERT(near > top + n / 20);
+        llama_sampler_free(drafter);
+        llama_sampler_free(drafter_near);
+    }
+    {
+        llama_sampler * clone = llama_sampler_clone(target);
+        llama_sampler * copy  = coupled_chain(n_vocab, 99);
+        llama_sampler_copy(target, copy);
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < 1000; ++i) {
+            llama_sampler_copy(target, copy);
+        }
+        printf("coupled chain copy: %.2f us\n", (ggml_time_us() - t0) / 1000.0);
+        for (int i = 0; i < 64; ++i) {
+            for (int t = 0; t < n_vocab; ++t) {
+                p[t] = 3.0f * gauss(rng);
+            }
+            const llama_token x = draw_from(target, p, cur);
+            GGML_ASSERT(draw_from(clone, p, cur) == x && draw_from(copy, p, cur) == x);
+            llama_sampler_accept(target, x);
+            llama_sampler_accept(clone, x);
+            llama_sampler_accept(copy, x);
+        }
+        llama_sampler_free(clone);
+        llama_sampler_free(copy);
+    }
+    llama_sampler_free(target);
+
+    // not coupled: the generator's dist sampler, XTC drawing from its own generator, a chain that does not end in the draw
+    llama_sampler * plain  = coupled_chain(n_vocab, 99, false);
+    llama_sampler * xtc    = coupled_chain(n_vocab, 99, true, 0.5f);
+    llama_sampler * xtc0   = coupled_chain(n_vocab, 99, true, 0.0f);
+    llama_sampler * behind = coupled_chain(n_vocab, 99);
+    llama_sampler_chain_add(behind, llama_sampler_init_top_k(1));
+    llama_sampler * bare   = llama_sampler_init_dist_coupled(99);
+    GGML_ASSERT(!llama_sampler_chain_coupled(plain) && !llama_sampler_chain_coupled(xtc) && llama_sampler_chain_coupled(xtc0) &&
+                !llama_sampler_chain_coupled(behind) && !llama_sampler_chain_coupled(bare) && !llama_sampler_chain_coupled(nullptr));
+    llama_sampler_free(plain);
+    llama_sampler_free(xtc);
+    llama_sampler_free(xtc0);
+    llama_sampler_free(behind);
+    llama_sampler_free(bare);
+}
+
 int main(void) {
     ggml_time_init();
 
     test_dist_singleton_rng();
+    test_dist_coupled();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

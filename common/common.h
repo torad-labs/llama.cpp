@@ -295,6 +295,11 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    // the chain's dist sampler draws by noise keyed to the sample's index (llama_sampler_init_dist_coupled), so a
+    // drafter can propose the token the sampler will draw (common_sampler_sample_coupled). The distribution is the
+    // same; a fixed seed's tokens are not. LLAMA_SPEC_COUPLED=1 sets it for every sampler
+    bool coupled = false;
+
     // print the parameters into a string
     std::string print() const;
 };

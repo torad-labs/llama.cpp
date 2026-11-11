@@ -3702,6 +3702,7 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .smpl     = */ slot.smpl.get(),
                         };
 
                         drafting.push_back(&slot);
