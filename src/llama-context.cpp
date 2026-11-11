@@ -67,6 +67,16 @@ static bool llama_time_decode() {
     return enabled;
 }
 
+// Marks a context's outputs as pending when a decode or an encode returns, wherever it returns and whatever it
+// synchronized on the way: llama_context::synchronize_outputs waits for them once.
+struct llama_outputs_pending_guard {
+    bool & pending;
+
+    ~llama_outputs_pending_guard() {
+        pending = true;
+    }
+};
+
 // An RAII accumulator. Nested phases are fine: each one charges only its own bracket, and DECODE_TOTAL is the
 // denominator the others are read against, so whatever they do not account for is named rather than assumed.
 struct llama_decode_phase_timer {
@@ -1121,6 +1131,7 @@ void llama_context::rs_relocate(const std::vector<ggml_tensor *> & states, const
     }
     ggml_backend_tensor_set(graph.src, src.data(), 0, src.size()*sizeof(int32_t));
     ggml_backend_tensor_set(graph.dst, dst.data(), 0, dst.size()*sizeof(int64_t));
+    outputs_pending = true;
     const ggml_status status = ggml_backend_sched_graph_compute_async(graph.sched.get(), graph.gf);
     if (status != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("failed to compute the recurrent state relocation graph");
@@ -1138,6 +1149,7 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    outputs_pending = false;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1164,6 +1176,17 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+}
+
+// An accessor of a decode's outputs waits for the decode, once. Each call used to synchronize every backend: on the
+// tensor split's four cards a cudaStreamSynchronize a card for every row a sampler read, about 505 a step of 23
+// sessions with nothing queued (four RTX PRO 6000, Nov 11, 2026).
+// LLAMA_OUTPUT_SYNC_LEGACY=1: every call synchronizes.
+void llama_context::synchronize_outputs() {
+    static const bool legacy = ggml_env_switch("LLAMA_OUTPUT_SYNC_LEGACY");
+    if (outputs_pending || legacy) {
+        synchronize();
+    }
 }
 
 const llama_model & llama_context::get_model() const {
@@ -2147,6 +2170,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    llama_outputs_pending_guard pending{outputs_pending};
+
     mtp_index.tensor = nullptr;
     nextn_order.clear();
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
@@ -2389,6 +2414,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch & batch_inp) {
     llama_decode_phase_timer t_decode(LLAMA_DECODE_PHASE_DECODE_TOTAL);
+    llama_outputs_pending_guard pending{outputs_pending};
 
     // An unconsumed selection from an earlier decode is not a draft step.
     mtp_index.tensor = nullptr;
@@ -3759,6 +3785,7 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    outputs_pending = true;
     auto status = ggml_backend_sched_graph_compute_async(sched_gf ? sched_gf : sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -5026,13 +5053,13 @@ void llama_synchronize(llama_context * ctx) {
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     float * res = nullptr;
 
@@ -5046,19 +5073,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -5082,7 +5109,7 @@ int32_t llama_lens_layer(const llama_context * ctx, int32_t k) {
 }
 
 float * llama_get_lens_ith(llama_context * ctx, int32_t k, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
     return ctx->get_lens_ith(k, i);
 }
 
@@ -5095,7 +5122,7 @@ int32_t llama_n_lens_channels(const llama_context * ctx) {
 }
 
 float * llama_get_lens_channel_ith(llama_context * ctx, int32_t k, enum llama_lens_channel channel, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
     return ctx->get_lens_channel_ith(k, (int32_t) channel, i);
 }
 
@@ -5176,7 +5203,7 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_nextn();
 }
@@ -5221,13 +5248,13 @@ int64_t llama_get_nextn_rows_to_host(const llama_context * ctx_tgt) {
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -5245,7 +5272,7 @@ void llama_set_seq_candidates(llama_context * ctx, llama_seq_id seq_id, bool ena
 }
 
 llama_sampling_row llama_get_sampling_row_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     llama_sampling_row row = {};
     row.token = LLAMA_TOKEN_NULL;
@@ -5266,43 +5293,43 @@ llama_sampling_row llama_get_sampling_row_ith(llama_context * ctx, int32_t i) {
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
