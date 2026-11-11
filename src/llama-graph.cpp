@@ -4123,9 +4123,18 @@ ggml_tensor * llm_graph_context::build_rs(
 
     inp->rs_z_baked |= s->type == GGML_TYPE_F32;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    ggml_tensor * rows = build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+    // The memory keeps each sequence of the batch reading its state from the cell it is written to, or from one the
+    // decode writes nothing to (llama_memory_recurrent::relocate_disjoint), whichever rows the ids name at a later
+    // decode of this graph: the layer that writes the states may read them itself, a sequence at a time. The CUDA
+    // backend then reads each row in the recurrent kernel and makes no copy of the batch's states (0.9 ms of a
+    // 69-row target decode's 34 KDA layers on four RTX PRO 6000 S, Nov 11, 2026).
+    if (kv_state->rows_disjoint() && rows->op == GGML_OP_GET_ROWS) {
+        rows->flags |= GGML_TENSOR_FLAG_ROWS_DISJOINT;
+    }
+    return rows;
 }
 
 ggml_tensor * llm_graph_context::build_rs_cache_view(

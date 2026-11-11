@@ -4526,9 +4526,12 @@ static bool ggml_cuda_gdn_cache_type_fusable(ggml_type type) {
 
 // GET_ROWS(cache, ids) -> [RESHAPE] -> GATED_DELTA_NET src[5], build_rs's recurrent-state gather: skip the GET_ROWS and
 // register the gather for the GDN node, whose kernel then reads each sequence's cache row ids[seq] itself (f32, or q8_0
-// dequantized as it loads) instead of the temp, which the allocator still reserved. One sequence only: with several, a
-// sequence's source row can be another's destination (a copied sequence), which the GET_ROWS read before any write and
-// the kernel's blocks would race on; with one, the block that reads a region is the only one that writes it, after.
+// dequantized as it loads) instead of the temp, which the allocator still reserved. One sequence, or several where the
+// GET_ROWS carries GGML_TENSOR_FLAG_ROWS_DISJOINT: with several, a sequence's source row can be another's destination
+// (a copied sequence, a set in another order), which the GET_ROWS read before any write and the kernel's blocks would
+// race on; with one, or with the flag's promise that no sequence is read from a row another is stored to, the block
+// that reads a region is the only one that writes it, after (llama.cpp's recurrent memory keeps the promise under
+// LLAMA_GRAPH_ANY_SEQS=1, llama_memory_recurrent::relocate_disjoint; LLAMA_RS_GATHER_LEGACY=1 there leaves the flag off).
 // Declined when anything else reads the temp, when a node between the two writes the cache (build_rs's extra-states
 // copy relocates rows there; the GET_ROWS read them before it, the kernel would read after), when a node up to the GDN
 // was allocated over ids (freed after the GET_ROWS if it was their last reader), and when the GDN takes the chunked
@@ -4542,8 +4545,10 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
     }
 
     const ggml_tensor * gr = cgraph->nodes[node_idx];
+    // several sequences only where the graph's builder says none is read from a row another's state is stored to
+    const bool disjoint = (gr->flags & GGML_TENSOR_FLAG_ROWS_DISJOINT) != 0;
     if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-            !ggml_is_contiguous(gr) || gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1) {
+            !ggml_is_contiguous(gr) || (gr->ne[1] != 1 && !disjoint) || gr->ne[2] != 1 || gr->ne[3] != 1) {
         return false;
     }
     const ggml_tensor * cache = gr->src[0];

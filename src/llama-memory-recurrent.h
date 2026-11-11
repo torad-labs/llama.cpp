@@ -99,6 +99,11 @@ public:
     // (112, 99 and 128 ms for its first three target decodes of 66 rows on four cards, where a replay is 48; Nov 10, 2026)
     bool relocate = false;
     bool relocate_pending = false; // find_slot left a state to move
+    // With relocate, unless LLAMA_RS_GATHER_LEGACY=1 (read by set_relocate): a state of the batch that lies in a cell
+    // another sequence of the batch is written to is moved before the decode as well. Every sequence of the batch then
+    // reads its state from the cell it is written to, or from one the decode writes nothing to, and the decode's graph
+    // may read a state as late as it writes the others' (GGML_TENSOR_FLAG_ROWS_DISJOINT, llm_graph_context::build_rs).
+    bool relocate_disjoint = false;
 
     // asked for, before the first batch, by a memory that keeps nothing else by the place of a sequence's cell (the
     // hybrid memory)
@@ -197,6 +202,8 @@ public:
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
+    // whether no sequence of the batch reads its state from a cell another one is written to (relocate_disjoint)
+    bool     rows_disjoint() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;

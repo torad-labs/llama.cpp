@@ -665,6 +665,10 @@ extern "C" {
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
         GGML_TENSOR_FLAG_META    = 32, // ...has an explicit meta backend layout
+        GGML_TENSOR_FLAG_ROWS_DISJOINT = 64, // ...is a GET_ROWS of sequences' states, one a row of the result, in a graph
+                                             // that stores no sequence's new state to a row another sequence is read
+                                             // from: a backend may read each sequence's row where it computes that
+                                             // sequence, beside the stores of the others
     };
 
     enum ggml_tri_type {
