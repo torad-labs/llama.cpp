@@ -18,6 +18,11 @@ void ggml_cuda_op_add_rms_norm_scale_fused(
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
 
+// What ggml_cuda_op_rms_norm_fused launches for nrows contiguous rows of ncols floats and a one-row mul, from pointers:
+// for a fused kernel's check of its own values against this one's.
+void ggml_cuda_rms_norm_mul_rows(const float * x, const float * mul, float * dst, int ncols, int nrows, float eps,
+        cudaStream_t stream);
+
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,

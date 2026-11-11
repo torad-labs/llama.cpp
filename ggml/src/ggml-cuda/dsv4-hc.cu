@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "norm.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -104,6 +105,33 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
+// a token's pre weight of one stream from its mix (m), as ggml_dsv4_hc_weights makes it
+static __device__ __forceinline__ float dsv4_hc_pre_weight(const float m, const float scale_pre, const float base,
+        const float eps) {
+    const float pre = m * scale_pre + base;
+    return 1.0f/(1.0f + expf(-pre)) + eps;
+}
+
+// one token's weights of ggml_dsv4_hc_weights, pre, post and comb, from its mixes (m) into d
+static __device__ __forceinline__ void dsv4_hc_weights_token(const float * m, const float * scale, const float * base,
+        float * d, const int64_t sm0, const int64_t ss0, const int64_t sb0, const int64_t sd0, const float eps,
+        const int32_t n_iter) {
+    const float scale_pre  = scale[0*ss0];
+    const float scale_post = scale[1*ss0];
+    for (int h = 0; h < DSV4_HC; ++h) {
+        const float post = m[(DSV4_HC + h)*sm0] * scale_post + base[(DSV4_HC + h)*sb0];
+        d[h*sd0]             = dsv4_hc_pre_weight(m[h*sm0], scale_pre, base[h*sb0], eps);
+        d[(DSV4_HC + h)*sd0] = 2.0f/(1.0f + expf(-post));
+    }
+
+    float comb[DSV4_HC*DSV4_HC];
+    dsv4_hc_comb_token(comb, m, sm0, base, sb0, scale[2*ss0], eps, n_iter);
+
+    for (int idx = 0; idx < DSV4_HC*DSV4_HC; ++idx) {
+        d[(2*DSV4_HC + idx)*sd0] = comb[idx];
+    }
+}
+
 // one thread per token: the pre, post and comb weights of ggml_dsv4_hc_weights
 static __global__ void dsv4_hc_weights_f32(
         const float * mixes,
@@ -128,24 +156,7 @@ static __global__ void dsv4_hc_weights_f32(
 
     ggml_cuda_pdl_sync();
 
-    const float * m = mixes + it*sm1;
-    float       * d = dst   + it*sd1;
-
-    const float scale_pre  = scale[0*ss0];
-    const float scale_post = scale[1*ss0];
-    for (int h = 0; h < DSV4_HC; ++h) {
-        const float pre  = m[h*sm0]             * scale_pre  + base[h*sb0];
-        const float post = m[(DSV4_HC + h)*sm0] * scale_post + base[(DSV4_HC + h)*sb0];
-        d[h*sd0]             = 1.0f/(1.0f + expf(-pre)) + eps;
-        d[(DSV4_HC + h)*sd0] = 2.0f/(1.0f + expf(-post));
-    }
-
-    float comb[DSV4_HC*DSV4_HC];
-    dsv4_hc_comb_token(comb, m, sm0, base, sb0, scale[2*ss0], eps, n_iter);
-
-    for (int idx = 0; idx < DSV4_HC*DSV4_HC; ++idx) {
-        d[(2*DSV4_HC + idx)*sd0] = comb[idx];
-    }
+    dsv4_hc_weights_token(mixes + it*sm1, scale, base, dst + it*sd1, sm0, ss0, sb0, sd0, eps, n_iter);
 }
 
 static __global__ void dsv4_hc_pre_f32(
@@ -1690,4 +1701,257 @@ void ggml_cuda_op_dsv4_hc_weights(ggml_backend_cuda_context & ctx, ggml_tensor *
             nbb0 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
             eps, n_iter);
+}
+
+// The back of a hyper-connection site where a GEMM made the mixes (more tokens than the Gram front takes):
+// DSV4_HC_WEIGHTS, DSV4_HC_PRE on its pre weights and the sublayer's RMS_NORM and MUL, three launches that each read what
+// the one before wrote, in one. A block a token mixes the four streams by the pre weights it makes from the token's
+// mixes (dsv4_hc_pre_weight, the weights' own expression), thread t the columns t + 1024*q as rms_norm_f32<1024> gives
+// them to its threads: it sums the mix's squares in that order and reduces them as that kernel does, so the scale and
+// every output are the three launches' bit for bit. The blocks past n_tokens are dsv4_hc_weights_f32's, a thread a
+// token, and write the weights the POST after the sublayer reads; no block of a token reads them.
+template <int NQ>
+static __global__ void __launch_bounds__(DSV4_HC_POST_ROW_THREADS) dsv4_hc_back_rows_f32(
+        const float * mixes,
+        const float * scale,
+        const float * base,
+        const float * x,
+        const float * norm_w,
+        float * weights,
+        float * dst,
+        const int     n_tokens,
+        const int64_t sm0,
+        const int64_t sm1,
+        const int64_t ss0,
+        const int64_t sb0,
+        const int64_t sx1,
+        const int64_t sx2,
+        const int64_t sw0,
+        const int64_t sw1,
+        const int64_t sd1,
+        const float   eps_hc,
+        const int32_t n_iter,
+        const int     ncols,
+        const float   eps_norm) {
+    ggml_cuda_pdl_lc();
+    const int tid = threadIdx.x;
+
+    if ((int) blockIdx.x >= n_tokens) {
+        const int64_t it = (int64_t) ((int) blockIdx.x - n_tokens)*DSV4_HC_POST_ROW_THREADS + tid;
+        if (it >= n_tokens) {
+            return;
+        }
+        ggml_cuda_pdl_sync();
+        dsv4_hc_weights_token(mixes + it*sm1, scale, base, weights + it*sw1, sm0, ss0, sb0, sw0, eps_hc, n_iter);
+        return;
+    }
+
+    const int64_t it = blockIdx.x;
+    mixes += it*sm1;
+    x     += it*sx2 + tid;
+    dst   += it*sd1 + tid;
+    norm_w += tid;
+
+    ggml_cuda_pdl_sync();
+
+    const float scale_pre = scale[0*ss0];
+    float w[DSV4_HC];
+#pragma unroll
+    for (int h = 0; h < DSV4_HC; ++h) {
+        w[h] = dsv4_hc_pre_weight(mixes[h*sm0], scale_pre, base[h*sb0], eps_hc);
+    }
+
+    // dsv4_hc_pre_f32's sum, a stream at a time
+    float v[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        const int i0 = q*DSV4_HC_POST_ROW_THREADS;
+        // the products and sums in the order dsv4_hc_pre_f32's loop compiles to, which the compiler does not keep for
+        // an unrolled sum of two products
+        float sum = __fmul_rn(x[i0], w[0]);
+#pragma unroll
+        for (int h = 1; h < DSV4_HC; ++h) {
+            sum = __fmaf_rn(x[i0 + h*sx1], w[h], sum);
+        }
+        v[q] = sum;
+    }
+
+    // and rms_norm_f32's, a square fused onto the running sum from zero
+    float tmp = 0.0f;
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        tmp = __fmaf_rn(v[q], v[q], tmp);
+    }
+
+    __shared__ float s_sum[32];
+    tmp = block_reduce<block_reduce_method::SUM, DSV4_HC_POST_ROW_THREADS>(tmp, s_sum);
+
+    // ncols at run time, as rms_norm_f32 divides by it
+    const float mean = tmp / ncols;
+    const float rms  = rsqrtf(mean + eps_norm);
+
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        const int i0 = q*DSV4_HC_POST_ROW_THREADS;
+        dst[i0] = rms * v[q] * norm_w[i0];
+    }
+}
+
+// GGML_CUDA_HC_BACK_CHECK=1: the one launch's weights and normed mix (one) against the three launches' (two), bit for
+// bit; a block a token
+static __global__ void dsv4_hc_back_check_bits(const float * w_one, const float * w_two, const float * d_one,
+        const float * d_two, const int64_t n_embd, const int64_t sw0, const int64_t sw1, const int64_t sd1) {
+    const int it = blockIdx.x;
+    for (int64_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        const uint32_t a = __float_as_uint(d_one[it*sd1 + i]);
+        const uint32_t b = __float_as_uint(d_two[it*n_embd + i]);
+        if (a != b) {
+            printf("hc back check: token %d element %lld is %08x from the one launch, %08x from the three\n",
+                    it, (long long) i, a, b);
+            __trap();
+        }
+    }
+    if (threadIdx.x < DSV4_HC_MIX) {
+        const uint32_t a = __float_as_uint(w_one[it*sw1 + threadIdx.x*sw0]);
+        const uint32_t b = __float_as_uint(w_two[it*DSV4_HC_MIX + threadIdx.x]);
+        if (a != b) {
+            printf("hc back check: token %d weight %d is %08x from the one launch, %08x from the three\n",
+                    it, (int) threadIdx.x, a, b);
+            __trap();
+        }
+    }
+}
+
+bool ggml_cuda_dsv4_hc_back_fused_supported(const ggml_tensor * weights, const ggml_tensor * pre,
+        const ggml_tensor * rms, const ggml_tensor * mul) {
+    const ggml_tensor * mixes  = weights->src[0];
+    const ggml_tensor * scale  = weights->src[1];
+    const ggml_tensor * base   = weights->src[2];
+    const ggml_tensor * x      = pre->src[0];
+    const ggml_tensor * pre_w  = pre->src[1];
+    const ggml_tensor * norm_w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[2];
+
+    const bool shapes_ok = x->ne[1] == DSV4_HC && x->ne[3] == 1 && mixes->ne[0] == DSV4_HC_MIX &&
+        mixes->ne[1] == n_tokens && ggml_nrows(mixes) == n_tokens && weights->ne[0] == DSV4_HC_MIX &&
+        weights->ne[1] == n_tokens && ggml_nrows(weights) == n_tokens && scale->ne[0] >= 3 &&
+        base->ne[0] == DSV4_HC_MIX && pre->ne[0] == n_embd && pre->ne[1] == n_tokens && ggml_nrows(pre) == n_tokens &&
+        rms->ne[0] == n_embd && ggml_nrows(rms) == n_tokens && norm_w->ne[0] == n_embd && ggml_nrows(norm_w) == 1 &&
+        mul->ne[0] == n_embd && ggml_nrows(mul) == n_tokens && n_tokens <= INT32_MAX - DSV4_HC_POST_ROW_THREADS;
+    // the streams along n_embd a float apart, a block's 1024 threads over NQ of them; the pre weights the first DSV4_HC
+    // of each token's weights; the normed mix as rms_norm_f32 writes it, a row a token
+    const bool layout_ok = x->nb[0] == sizeof(float) && n_embd % DSV4_HC_POST_ROW_THREADS == 0 &&
+        n_embd <= DSV4_HC_POST_ROW_MAX_NQ*DSV4_HC_POST_ROW_THREADS &&
+        pre_w->view_src == weights && pre_w->view_offs == 0 && pre_w->nb[0] == weights->nb[0] &&
+        pre_w->nb[1] == weights->nb[1] && ggml_is_contiguous(pre) && ggml_is_contiguous(rms) &&
+        ggml_is_contiguous(mul) && ggml_is_contiguous(norm_w);
+    const bool types_ok = x->type == GGML_TYPE_F32 && mixes->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
+        base->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && pre->type == GGML_TYPE_F32 &&
+        rms->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && norm_w->type == GGML_TYPE_F32;
+    if (!shapes_ok || !layout_ok || !types_ok) {
+        return false;
+    }
+    // The kernel's blocks write the weights and the normed mix while its other blocks still read every input, where each
+    // of the three launches had read its inputs before the next wrote. So neither output may lie over the other or over
+    // any input. The fusion's memory check does not say so: it takes the weights' view, an intermediate of the three, as
+    // never written (the allocator may place the normed mix over weights nothing reads after pre: a test, a model's last
+    // site), and it skips every leaf, which the allocator reuses after its last reader like any tensor when the leaf is
+    // a graph's input and not a model's weight (a normed mix placed over leaf mixes or scale, or written in place over
+    // the norm's weight).
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlaps(mul, weights)) {
+        return false;
+    }
+    for (const ggml_tensor * out : { weights, mul }) {
+        for (const ggml_tensor * in : { mixes, scale, base, x, norm_w }) {
+            if (overlaps(out, in)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_op_dsv4_hc_back_fused(ggml_backend_cuda_context & ctx, ggml_tensor * weights, const ggml_tensor * pre,
+        const ggml_tensor * rms, ggml_tensor * mul) {
+    GGML_ASSERT(ggml_cuda_dsv4_hc_back_fused_supported(weights, pre, rms, mul));
+
+    const ggml_tensor * mixes  = weights->src[0];
+    const ggml_tensor * scale  = weights->src[1];
+    const ggml_tensor * base   = weights->src[2];
+    const ggml_tensor * x      = pre->src[0];
+    const ggml_tensor * norm_w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+
+    const int64_t n_embd   = x->ne[0];
+    const int     n_tokens = x->ne[2];
+    const float   eps_hc   = ggml_get_op_params_f32(weights, 0);
+    const int32_t n_iter   = ggml_get_op_params_i32(weights, 1);
+    const float   eps_norm = ggml_get_op_params_f32(rms, 0);
+    GGML_ASSERT(eps_norm >= 0.0f);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t sm0 = mixes->nb[0] / sizeof(float);
+    const int64_t sm1 = mixes->nb[1] / sizeof(float);
+    const int64_t ss0 = scale->nb[0] / sizeof(float);
+    const int64_t sb0 = base->nb[0] / sizeof(float);
+    const int64_t sx1 = x->nb[1] / sizeof(float);
+    const int64_t sx2 = x->nb[2] / sizeof(float);
+    const int64_t sw0 = weights->nb[0] / sizeof(float);
+    const int64_t sw1 = weights->nb[1] / sizeof(float);
+    const int64_t sd1 = mul->nb[1] / sizeof(float);
+
+    // a block a token, then the weights' blocks, 1024 tokens each
+    const int n_blocks = n_tokens + (n_tokens + DSV4_HC_POST_ROW_THREADS - 1) / DSV4_HC_POST_ROW_THREADS;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3(n_blocks, 1, 1), dim3(DSV4_HC_POST_ROW_THREADS, 1, 1), 0, stream);
+
+    auto launch = [&](auto kernel) {
+        ggml_cuda_kernel_launch(kernel, launch_params,
+                (const float *) mixes->data, (const float *) scale->data, (const float *) base->data,
+                (const float *) x->data, (const float *) norm_w->data, (float *) weights->data, (float *) mul->data,
+                n_tokens, sm0, sm1, ss0, sb0, sx1, sx2, sw0, sw1, sd1, eps_hc, n_iter, (int) n_embd, eps_norm);
+    };
+
+    switch (n_embd / DSV4_HC_POST_ROW_THREADS) {
+        case 1: launch(dsv4_hc_back_rows_f32<1>); break;
+        case 2: launch(dsv4_hc_back_rows_f32<2>); break;
+        case 3: launch(dsv4_hc_back_rows_f32<3>); break;
+        case 4: launch(dsv4_hc_back_rows_f32<4>); break;
+        case 5: launch(dsv4_hc_back_rows_f32<5>); break;
+        case 6: launch(dsv4_hc_back_rows_f32<6>); break;
+        case 7: launch(dsv4_hc_back_rows_f32<7>); break;
+        case 8: launch(dsv4_hc_back_rows_f32<8>); break;
+        default: GGML_ABORT("dsv4_hc_back_rows_f32 does not run this site");
+    }
+
+    static const bool check = ggml_env_switch("GGML_CUDA_HC_BACK_CHECK");
+    if (!check) {
+        return;
+    }
+
+    // the three launches into scratch, from the same inputs: the launch above wrote none of them
+    // (ggml_cuda_dsv4_hc_back_fused_supported keeps both outputs off every input)
+    ggml_cuda_pool_alloc<float> w_two(ctx.pool(), (size_t) n_tokens*DSV4_HC_MIX);
+    ggml_cuda_pool_alloc<float> p_two(ctx.pool(), (size_t) n_tokens*n_embd);
+    ggml_cuda_pool_alloc<float> d_two(ctx.pool(), (size_t) n_tokens*n_embd);
+
+    ggml_cuda_kernel_launch(dsv4_hc_weights_f32,
+            ggml_cuda_kernel_launch_params(dim3((n_tokens + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream),
+            (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, w_two.get(),
+            (int64_t) n_tokens, sm0, sm1, ss0, sb0, (int64_t) 1, (int64_t) DSV4_HC_MIX, eps_hc, n_iter);
+    ggml_cuda_kernel_launch(dsv4_hc_pre_f32,
+            ggml_cuda_kernel_launch_params(dim3((n_embd*n_tokens + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream),
+            (const float *) x->data, (const float *) w_two.get(), p_two.get(), n_embd, (int64_t) DSV4_HC,
+            (int64_t) n_tokens, (int64_t) 1, sx1, sx2, (int64_t) 1, (int64_t) DSV4_HC_MIX, (int64_t) 1, n_embd);
+    ggml_cuda_rms_norm_mul_rows(p_two.get(), (const float *) norm_w->data, d_two.get(), n_embd, n_tokens, eps_norm,
+            stream);
+    dsv4_hc_back_check_bits<<<dim3(n_tokens, 1, 1), 256, 0, stream>>>(
+            (const float *) weights->data, w_two.get(), (const float *) mul->data, d_two.get(), n_embd, sw0, sw1, sd1);
 }
