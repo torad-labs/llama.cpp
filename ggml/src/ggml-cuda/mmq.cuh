@@ -1548,14 +1548,14 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, l2_pf, q8_layout);
 }
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, bool fallback, int column_splits = 0>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds,
         const int32_t * __restrict__ moe_tiles, float * __restrict__ dst,
         float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
-        const int stride_sample_dst, const uint3 ntx) {
+        const int stride_sample_dst, const uint3 ntx, const int stream_k_blocks) {
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -1563,16 +1563,23 @@ static __global__ void mul_mat_q_stream_k_fixup(
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
 
-    float sum[J / nwarps] = {0.0f};
+    constexpr int col_groups = column_splits > 0 ? column_splits : 1;
+    constexpr int col_step   = nwarps*col_groups;
+    const int col_offset = column_splits > 0 ? int(blockIdx.z)*nwarps : 0;
+
+    float sum[(J + col_step - 1) / col_step] = {0.0f};
     const int i = blockIdx.y*warp_size + threadIdx.x;
 
     const int nty = (nrows_x + I - 1) / I;
+    const int ntiles = nsamples_y.z*nchannels_y.z*ntx.z*nty;
 
-    const int bidx0 = blockIdx.x;
+    // A compact block names a tile. Recover the compute block that finished it.
+    const int bidx0 = column_splits > 0 ?
+        (int64_t(blockIdx.x + 1)*stream_k_blocks + ntiles - 1) / ntiles - 1 : blockIdx.x;
 
     // kbc == k block continuous, current index in continuous ijk space.
-    int kbc0      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
-    int kbc0_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+    int kbc0      = int64_t(bidx0)    *(ntiles*blocks_per_ne00.z) / stream_k_blocks;
+    int kbc0_stop = int64_t(bidx0 + 1)*(ntiles*blocks_per_ne00.z) / stream_k_blocks;
 
     kbc0      -= fastmodulo(kbc0,      blocks_per_ne00) % blocks_per_iter;
     kbc0_stop -= fastmodulo(kbc0_stop, blocks_per_ne00) % blocks_per_iter;
@@ -1591,7 +1598,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
     while(true) {
-        int kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+        int kbc = int64_t(bidx)*(ntiles*blocks_per_ne00.z) / stream_k_blocks;
         kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
 
         if (kbc == kbc_stop) { // Did not have any data.
@@ -1604,10 +1611,12 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += nwarps) {
-            const int j = j0 + threadIdx.y;
+        for (int j0 = 0; j0 < J; j0 += col_step) {
+            const int j = j0 + col_offset + threadIdx.y;
 
-            sum[j0/nwarps] += tmp_last_tile[bidx*(J*I) + j*I + i];
+            if (j < J) {
+                sum[j0/col_step] += tmp_last_tile[bidx*(J*I) + j*I + i];
+            }
         }
 
         // If this block started in a previous tile we are done and don't need to combine additional partial results.
@@ -1644,14 +1653,14 @@ static __global__ void mul_mat_q_stream_k_fixup(
         }
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += nwarps) {
-            const int j = j0 + threadIdx.y;
+        for (int j0 = 0; j0 < J; j0 += col_step) {
+            const int j = j0 + col_offset + threadIdx.y;
 
-            if (j > j_max) {
+            if (j >= J || j > j_max) {
                 return;
             }
 
-            dst[j*stride_col_dst + i] += sum[j0/nwarps];
+            dst[j*stride_col_dst + i] += sum[j0/col_step];
         }
         return;
     }
@@ -1680,14 +1689,14 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += nwarps) {
-        const int j = j0 + threadIdx.y;
+    for (int j0 = 0; j0 < J; j0 += col_step) {
+        const int j = j0 + col_offset + threadIdx.y;
 
-        if (j > j_max) {
+        if (j >= J || j > j_max) {
             return;
         }
 
-        dst[ids_dst_shared[j]*stride_col_dst + i] += sum[j0/nwarps];
+        dst[ids_dst_shared[j]*stride_col_dst + i] += sum[j0/col_step];
     }
 }
 
@@ -1709,6 +1718,7 @@ struct mmq_args {
 // column tiles (ggml_cuda_mmq_moe_tiles). GGML_CUDA_MMQ_MOE_TILES_LEGACY restores the width for n_tokens columns and a
 // grid of ceil(n_tokens/J) column tiles for every expert.
 bool ggml_cuda_mmq_moe_tiles_legacy();
+bool ggml_cuda_mmq_fixup_compact_legacy();
 
 // Writes the tile list mmq_moe_tile reads for width J: each expert in order, one entry for each column tile its
 // columns (expert_bounds) fill, then -1 up to ntiles_max.
@@ -1823,7 +1833,10 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
         GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
-        const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+        const bool compact_q8 = type == GGML_TYPE_Q8_0 && !args.ids_dst &&
+            GGML_CUDA_CC_IS_NVIDIA(cc) && !ggml_cuda_mmq_fixup_compact_legacy();
+        const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0 &&
+            !(compact_q8 && args.ncols_x <= config.K_vram);
 
         ggml_cuda_pool & pool = ctx.pool(id);
         ggml_cuda_pool_alloc<float> tmp_fixup(pool);
@@ -1831,7 +1844,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             tmp_fixup.alloc(block_nums_stream_k.x * config.J*config.I);
         }
 
-        const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
+        dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
         const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
         mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
@@ -1846,10 +1859,28 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         }
 
         CUDA_CHECK(cudaGetLastError());
-        mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
+        auto fixup = mul_mat_q_stream_k_fixup<type, J, fallback>;
+        if constexpr (type == GGML_TYPE_Q8_0) {
+            if (compact_q8 && ntiles_dst < int(block_nums_stream_k.x)) {
+                int splits = 1;
+                const int row_blocks = ntiles_dst*block_nums_fixup.y;
+                while (splits < 8 && row_blocks*(2*splits) <= nsm && (2*splits)*int(block_dims_fixup.y) <= J) {
+                    splits *= 2;
+                }
+                block_nums_fixup.x = ntiles_dst;
+                block_nums_fixup.z = splits;
+                switch (splits) {
+                    case 1: fixup = mul_mat_q_stream_k_fixup<type, J, fallback, 1>; break;
+                    case 2: fixup = mul_mat_q_stream_k_fixup<type, J, fallback, 2>; break;
+                    case 4: fixup = mul_mat_q_stream_k_fixup<type, J, fallback, 4>; break;
+                    case 8: fixup = mul_mat_q_stream_k_fixup<type, J, fallback, 8>; break;
+                }
+            }
+        }
+        fixup<<<block_nums_fixup, block_dims_fixup, 0, stream>>>
             (args.ids_dst, args.expert_bounds, moe_tiles.ptr, dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
              args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, block_nums_stream_k.x);
     };
     launch_one(args.x, args.dst, args.q8_layout);
     if (args.paired_x) { launch_one(args.paired_x, args.paired_dst, args.paired_q8_layout); }

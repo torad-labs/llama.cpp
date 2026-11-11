@@ -340,6 +340,11 @@ bool ggml_cuda_mmq_moe_tiles_legacy() {
     return legacy;
 }
 
+bool ggml_cuda_mmq_fixup_compact_legacy() {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_MMQ_FIXUP_COMPACT_LEGACY");
+    return legacy;
+}
+
 int ggml_cuda_mmq_l2_prefetch() {
     static const int pf = [] {
         const char * s = getenv("GGML_CUDA_MMQ_L2_PF");
