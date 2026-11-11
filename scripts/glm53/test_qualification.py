@@ -766,7 +766,13 @@ class ServingRecipeTest(unittest.TestCase):
         for flag in ("--backend-sampling", "-fit", "-cts", "-ubd", "--spec-draft-model"):
             self.assertNotIn(flag, argv)
         two = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))[1]
-        self.assertEqual(env, {**two, "CUDA_VISIBLE_DEVICES": "0,1,2,3"})
+        self.assertNotIn("LLAMA_SPEC_COUPLED", two)
+        self.assertEqual(env, {**two, "CUDA_VISIBLE_DEVICES": "0,1,2,3", "LLAMA_SPEC_COUPLED": "1"})
+        # the coupled draws are the MTP head's: neither without a draft nor with the DFlash one
+        for options in (["--mtp-depth", "off"], ["--dflash", "/models/dflash.gguf", "--dflash-depth", "15"]):
+            other = self.serve.make_plan(self.serve.arguments(
+                ["--model", "/models/target.gguf", "--profile", "tensor-4"] + options))[1]
+            self.assertEqual(other, {**two, "CUDA_VISIBLE_DEVICES": "0,1,2,3"})
 
     def test_four_card_tensor_recipe_takes_its_sessions_pool_and_drafter(self):
         base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]

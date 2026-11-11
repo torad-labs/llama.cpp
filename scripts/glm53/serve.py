@@ -160,6 +160,11 @@ def make_plan(args):
                     "GGML_CUDA_GRAPH_IDLE_MS": "0"})
     if not dp:
         env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
+    if four and not args.dflash and args.mtp_depth != "off":
+        # The MTP head proposes with the session's own sampler and the noise the target will draw with. A reply's
+        # tokens are samples of the same distribution, though a seed's reply is another than without it. Four RTX PRO
+        # 6000, 23 sessions (Nov 11, 2026): 2.17 to 2.21 tokens a step against 2.02 to 2.07.
+        env["LLAMA_SPEC_COUPLED"] = "1"
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
     if args.trace_decode:
