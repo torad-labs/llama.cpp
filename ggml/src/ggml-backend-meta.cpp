@@ -3068,11 +3068,13 @@ struct ggml_backend_meta_context {
     std::unique_ptr<device_threads> step_threads; // made at the first evaluation that is not replayed
 
     // f(j) for every device j, each on its device's thread; with GGML_META_STEP_THREADS_LEGACY=1 on the calling
-    // thread, in turn. Four RTX PRO 6000, 23 sessions (Nov 11, 2026): 36.3 and 37.2 tok/s a session against 31.9 and
-    // 31.6 in turn, the evaluations that are not replayed (a third of a read's steps) 77 ms against 103, replays as
-    // before. A rank on each of two cards (RTX 5080 and RTX 5070 Ti): the compute after a build 18.8 to 20.3 ms against
-    // 23.0 to 23.2, the capturing evaluation 21.7 to 23.1 against 27.6 to 27.8. Two ranks on one card queue into one
-    // device context and gain nothing (23.2 ms against 23.7, RTX 5070 Ti).
+    // thread, in turn. Four RTX PRO 6000, 23 sessions, the reductions on the copy engines, so that no evaluation is
+    // captured whole and every step queues its subgraphs, a quarter of them kernel by kernel (Nov 11, 2026): 36.3
+    // and 37.2 tok/s a session against 31.9 and 31.6 in turn; the steps of under 69 rows 77 ms against 103, the
+    // 69-row step 49.8 against 50.6. A rank on each of two cards (RTX 5080 and RTX 5070 Ti): the compute after a
+    // build 18.8 to 20.3 ms against 23.0 to 23.2, the capturing evaluation 21.7 to 23.1 against 27.6 to 27.8, replays
+    // of a whole evaluation as before. Two ranks on one card queue into one device context and gain nothing (23.2 ms
+    // against 23.7, RTX 5070 Ti).
     void device_run(const device_threads::fn_t & f) {
         static const bool legacy = ggml_env_switch("GGML_META_STEP_THREADS_LEGACY");
         if (legacy || backend_configs.size() < 2) {
