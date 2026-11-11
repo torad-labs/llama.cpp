@@ -254,6 +254,25 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), {n_embd}, flags);
             layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), {n_embd, n_vocab}, flags | TENSOR_NOT_REQUIRED);
             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), {n_embd, n_vocab}, flags | TENSOR_NOT_REQUIRED);
+
+            if (mtp_flags & TENSOR_SKIP) {
+                // The head's weights are skipped, and the model's generic pass takes a weight's ".scale" and
+                // ".input_scale" only beside a loaded weight, so the head's scales would be tensors of the file that
+                // nobody took: a pack whose head carries them could not be loaded without the head (llama-perplexity,
+                // any tool that takes no --spec-type). Skip them as the weights are.
+                const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+                for (const char * suffix : { "scale", "input_scale" }) {
+                    for (const llm_tensor t : { LLM_TENSOR_ATTN_Q, LLM_TENSOR_ATTN_K, LLM_TENSOR_ATTN_V, LLM_TENSOR_ATTN_OUT,
+                                                LLM_TENSOR_SSM_BETA, LLM_TENSOR_FFN_GATE, LLM_TENSOR_FFN_UP, LLM_TENSOR_FFN_DOWN,
+                                                LLM_TENSOR_FFN_GATE_SHEXP, LLM_TENSOR_FFN_UP_SHEXP, LLM_TENSOR_FFN_DOWN_SHEXP,
+                                                LLM_TENSOR_NEXTN_EH_PROJ, LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD }) {
+                        create_tensor(tn(t, suffix, il), {1}, skip);
+                    }
+                    for (const llm_tensor t : { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_DOWN_EXPS }) {
+                        create_tensor(tn(t, suffix, il), {n_expert}, skip);
+                    }
+                }
+            }
         }
     }
 }
