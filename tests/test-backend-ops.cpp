@@ -10796,6 +10796,14 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
         cases.emplace_back(new test_mul_mat_group({2048, 2048, 2048}, n, 4096, GGML_TYPE_Q8_0));
         cases.emplace_back(new test_mul_mat_group({1536, 512, 128}, n, 4096, GGML_TYPE_Q8_0));
     }
+    for (int64_t n : {23, 69}) {
+        for (int64_t m : {512, 2048, 4096}) {
+            cases.emplace_back(new test_mul_mat_group({m}, n, 4096, GGML_TYPE_Q8_0));
+        }
+    }
+    for (int64_t k : {128, 256, 512, 1536}) {
+        cases.emplace_back(new test_mul_mat_group({512, 4096}, 69, k, GGML_TYPE_Q8_0));
+    }
     for (int64_t n : {9, 23, 69}) {
         for (int64_t m : {24576, 49152, 98304}) {
             cases.emplace_back(new test_glm_q8_head(m, n));
