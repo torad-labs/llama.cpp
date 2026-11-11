@@ -44,7 +44,7 @@ Four RTX PRO 6000 Server Edition (two EPYC 9555, every card under its own host b
 | 23 | reductions through host memory | 33.0, 31.7 | 2.07, 2.05 | 62.8, 64.7 | 50.1 / 57.3 | 43.8 |
 | 23 | `LLAMA_GRAPH_ANY_SEQS=1 LLAMA_GRAPH_SLOTS=64 GGML_META_CAPTURE_GRAPHS=68` | 31.9, 31.6 | 2.05, 2.04 | 64.3, 64.6 | 50.6 / 57.2 | 44.0 |
 | 23 | a thread a device queues each step (`GGML_META_STEP_THREADS=1`) | 36.3, 37.2 | 2.02, 2.03 | 55.5, 54.7 | 49.8 / 54.6 | 43.6 |
-| 23 | `LLAMA_SPEC_COUPLED=1` as well | 39.7, 38.0 | 2.17 | 54.7, 57.1 | 50.7 / 55.8 | 44.0 |
+| 23 | `LLAMA_SPEC_COUPLED=1` as well (the profile's setting since `912129b1f`) | 39.7, 38.0 | 2.17 | 54.7, 57.1 | 50.7 / 55.8 | 44.0 |
 | 23 | the same at MTP depth 3 (92 rows) | 37.7, 36.5 | 2.36, 2.30 | 62.5, 63.1 | 56.7 / 69.1 | 48.0 |
 | 16 | as two rows above | 48.4, 49.2 | 2.21 | 45.6, 45.0 | | |
 | 12 | | 52.9, 56.2 | 2.17, 2.22 | 41.1, 39.6 | | |
@@ -140,8 +140,10 @@ python3 scripts/glm53/rate.py --sessions 23
 ```
 
 - `tensor-4` is `-sm tensor -ts 1,1,1,1 --kv-unified`, 23 slots on one pool of 524,288 tokens (the pool measured to
-  load), the 4-bit latent cache, MTP depth 2. `--slots`, `--context`, `--mtp-depth 1..4`, `--mtp-adaptive`, `--backend-sampling` and
-  `--dflash FILE --dflash-depth N` change one thing each; `--dry-run` prints the argv and environment as JSON.
+  load), the 4-bit latent cache, MTP depth 2 with the head's coupled draws (`LLAMA_SPEC_COUPLED=1`: the same
+  distribution of replies, another reply for a given seed). `--slots`, `--context`, `--mtp-depth 1..4`, `--mtp-adaptive`,
+  `--backend-sampling` and `--dflash FILE --dflash-depth N` change one thing each; `--dry-run` prints the argv and
+  environment as JSON.
 - The pack: `BoldingBuilds/orcarouter_GLM-5.3-Flash-Uncensored-GGUF` at revision
   `1bc0afadd92f4ff9fc2b1281a95a7921b058d35d`, the three `IQ3_XXS/` shards in one directory (134.3 GB).
 - The engine: this fork with CUDA for the cards' compute capability, `120a` for RTX PRO 6000:
