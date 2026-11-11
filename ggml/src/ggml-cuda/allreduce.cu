@@ -7,6 +7,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -826,6 +827,13 @@ static constexpr size_t GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT = 16 * 1024; // 16 KB
 // Largest wire size the LL kernel reduces card to card by default; GGML_CUDA_AR_P2P_MAX_BYTES overrides (0 disables).
 static constexpr size_t GGML_CUDA_AR_P2P_MAX_BYTES_DEFAULT = 128 * 1024; // 128 KB
 
+// ggml_cuda_ar_peer_store_times: the packets a card stores in a round (512 KB), the rounds of each kind, and the
+// percentage of the pinned-host stores' time from which stores into a peer's memory are slow
+// (GGML_CUDA_AR_PEER_SLOW_PERCENT overrides).
+static constexpr int      GGML_CUDA_AR_PEER_PROBE_PACKETS        = 64 * 1024;
+static constexpr int      GGML_CUDA_AR_PEER_PROBE_ROUNDS         = 6;
+static constexpr uint64_t GGML_CUDA_AR_PEER_SLOW_PERCENT_DEFAULT = 250;
+
 // Copy-engine path: largest tensor accepted on this path; sets host_large /
 // dev_tmp allocation size.
 static constexpr size_t GGML_CUDA_AR_COPY_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
@@ -967,6 +975,12 @@ struct ggml_cuda_ar_pipeline {
     // finished (ggml_cuda_ar_kernel).
     int *                    counter[GGML_CUDA_MAX_DEVICES];
 };
+
+// Whether the environment gives a value for name.
+static bool ggml_cuda_ar_env_given(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && value[0] != '\0';
+}
 
 static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) {
     const char * value = getenv(name);
@@ -1241,6 +1255,48 @@ static bool ggml_cuda_ar_p2p_init(ggml_cuda_ar_pipeline * p) {
     return true;
 }
 
+// Times the probe kernel's stores from every card at once, into the next rank's memory (peer_us) and into the card's
+// own pinned host staging (host_us): the fastest of GGML_CUDA_AR_PEER_PROBE_ROUNDS rounds of each, a round's time
+// taken from the first launch to the last card's end. False when a launch or an allocation fails, with nothing timed.
+static bool ggml_cuda_ar_peer_store_times(ggml_cuda_ar_pipeline * p, double & peer_us, double & host_us) {
+    const int    n         = p->n_devices;
+    const int    n_packets = GGML_CUDA_AR_PEER_PROBE_PACKETS;
+    const size_t bytes     = (size_t) n_packets * sizeof(uint2);
+    GGML_ASSERT(bytes <= (size_t) GGML_CUDA_AR_POOL_SIZE * p->buf_bytes);
+
+    ggml_cuda_ar_peer_mem scratch[GGML_CUDA_MAX_DEVICES] = {};
+    bool ok = true;
+    for (int i = 0; ok && i < n; ++i) {
+        ok = ggml_cuda_ar_peer_alloc(p, i, bytes, scratch[i]);
+    }
+    double best[2] = { std::numeric_limits<double>::max(), std::numeric_limits<double>::max() };
+    for (int round = 0; ok && round < 2*GGML_CUDA_AR_PEER_PROBE_ROUNDS; ++round) {
+        const int  kind  = round % 2; // 0: the next rank's memory, 1: pinned host memory
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; ok && i < n; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            uint2 * to = kind == 0 ? scratch[(i + 1) % n].as<uint2>() : reinterpret_cast<uint2 *>(p->host_buf[i].dev);
+            ggml_cuda_ar_p2p_probe_kernel<<<1, GGML_CUDA_AR_LL_THREADS, 0, p->streams[i]>>>(to, n_packets, 0u);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            ok = cudaStreamSynchronize(p->streams[i]) == cudaSuccess && ok;
+        }
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        best[kind] = std::min(best[kind], us);
+    }
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_ar_peer_free(p, i, scratch[i]);
+        if (p->host_buf[i].host != nullptr) {
+            memset(p->host_buf[i].host, 0, bytes);
+        }
+    }
+    peer_us = best[0];
+    host_us = best[1];
+    return ok;
+}
+
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices) {
 
     if (n_devices < 2 || n_devices > GGML_CUDA_MAX_DEVICES) {
@@ -1399,6 +1455,48 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // Card to card: where the cards map each other's memory (ggml_cuda_ar_p2p_init) and a card's stores into its
+    // peer's memory keep up with its stores into pinned host memory. Where they do not, every route whose kernels store
+    // into a peer (the LL card to card, the chunked kernel's inboxes, owner slices) is the slow one: four RTX PRO 6000
+    // with every pair under its own host bridge reduce 69 x 4,096 on a BF16 wire in 877 us through the inboxes against
+    // 89 on the copy engines through host staging, where four with the pairs under one bridge read 105 against 109,
+    // and 23 sessions ran at 15.8 tok/s against 31.7 to 33.0 (Nov 11, 2026). There the pipeline goes as that read
+    // did: nothing card to card, no host LL, every reduction on the copy engines. A limit given in the environment is
+    // kept, GGML_CUDA_AR_P2P_MAX_BYTES given skips the timing, and so does GGML_CUDA_AR_PEER_PROBE_LEGACY=1.
+    if (p->p2p_max_bytes > 0 && !ggml_cuda_ar_p2p_init(p)) {
+        for (size_t i = 0; i < n_devices; ++i) {
+            ggml_cuda_ar_p2p_free(p, i);
+        }
+        p->p2p_max_bytes = 0;
+    }
+    if (p->p2p_max_bytes > 0 && !ggml_cuda_ar_env_given("GGML_CUDA_AR_P2P_MAX_BYTES") &&
+            !ggml_env_switch("GGML_CUDA_AR_PEER_PROBE_LEGACY")) {
+        const uint64_t slow_percent = ggml_cuda_ar_env_u64("GGML_CUDA_AR_PEER_SLOW_PERCENT", GGML_CUDA_AR_PEER_SLOW_PERCENT_DEFAULT);
+        double peer_us = 0.0;
+        double host_us = 0.0;
+        if (!ggml_cuda_ar_peer_store_times(p, peer_us, host_us)) {
+            GGML_LOG_WARN("%s: the card to card stores could not be timed; card to card as the mapping allows\n", __func__);
+        } else if (peer_us*100.0 >= host_us*(double) slow_percent) {
+            GGML_LOG_WARN("%s: %d KB from every card at once take %.0f us into a peer's memory and %.0f us into pinned host "
+                          "memory: reductions stage through host memory on the copy engines\n",
+                          __func__, (int) (GGML_CUDA_AR_PEER_PROBE_PACKETS*sizeof(uint2) >> 10), peer_us, host_us);
+            for (size_t i = 0; i < n_devices; ++i) {
+                ggml_cuda_ar_p2p_free(p, i);
+            }
+            p->p2p_max_bytes = 0;
+            if (!ggml_cuda_ar_env_given("GGML_CUDA_AR_LL_MAX_BYTES")) {
+                p->ll_max_bytes = 0;
+            }
+            if (!ggml_cuda_ar_env_given("GGML_CUDA_AR_COPY_THRESHOLD")) {
+                p->copy_threshold = 1;
+            }
+        } else {
+            GGML_LOG_INFO("%s: %d KB from every card at once take %.0f us into a peer's memory and %.0f us into pinned host "
+                          "memory: card to card\n",
+                          __func__, (int) (GGML_CUDA_AR_PEER_PROBE_PACKETS*sizeof(uint2) >> 10), peer_us, host_us);
+        }
+    }
+
     // LL packets: zero, so no slot holds a call's token before the call writes it.
     const size_t ll_total = (size_t) GGML_CUDA_AR_POOL_SIZE * ggml_cuda_ar_ll_slot_packets(p) * sizeof(uint2);
     for (size_t i = 0; ll_total > 0 && i < n_devices; ++i) {
@@ -1408,13 +1506,6 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
-    }
-
-    if (p->p2p_max_bytes > 0 && !ggml_cuda_ar_p2p_init(p)) {
-        for (size_t i = 0; i < n_devices; ++i) {
-            ggml_cuda_ar_p2p_free(p, i);
-        }
-        p->p2p_max_bytes = 0;
     }
 
     // Copy-engine path: device scratch sized for the largest piece copy_impl

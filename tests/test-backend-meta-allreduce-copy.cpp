@@ -77,6 +77,8 @@ static bool last_one_stream   = false; // the last one's copy-engine receives ru
 static bool last_card_to_card = false; // the last one's copy-engine receives come card to card
 static bool last_p2p          = false; // the last one's cards map each other's memory: its LL card-to-card limit is above 0
 static bool last_gather_peer  = false;
+static bool last_peer_slow    = false; // the last one timed its stores into a peer's memory and took host staging for them
+static bool next_peer_slow    = false;
 static bool last_owner_slice  = false;
 // from the last pipeline freed: its reductions on the chunked kernel that moved card to card and through host memory
 static bool               last_chunked_seen = false;
@@ -92,8 +94,13 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/
     if (strstr(text, "owner-slice-peer") != nullptr) {
         last_owner_slice = true;
     }
+    if (strstr(text, "reductions stage through host memory on the copy engines") != nullptr) {
+        next_peer_slow = true;
+    }
     if (strstr(text, "initialized AllReduce pipeline") != nullptr) {
         n_pipelines++;
+        last_peer_slow = next_peer_slow;
+        next_peer_slow = false;
         last_one_stream   = strstr(text, "receives after the sends") != nullptr;
         last_card_to_card = strstr(text, "receives card to card") != nullptr;
         last_gather_peer = strstr(text, "large gather card to card") != nullptr;
@@ -976,6 +983,8 @@ int main(int argc, char ** argv) {
 
     ggml_log_set(log_cb, nullptr);
     set_env("GGML_CUDA_ALLREDUCE", backend_name);
+    // the direct, benchmark and gather modes read the routes they name, whatever a timing of this host's links says
+    set_env("GGML_CUDA_AR_PEER_PROBE_LEGACY", direct || benchmark || gather_graph ? "1" : nullptr);
     set_env("GGML_CUDA_AR_COPY_THRESHOLD", nullptr);
     set_env("GGML_CUDA_AR_COPY_CHUNK_BYTES", nullptr);
     if (gather_graph) {
@@ -1033,30 +1042,35 @@ int main(int argc, char ** argv) {
         const char * bf16_threshold; // GGML_CUDA_AR_BF16_THRESHOLD, nullptr for the default
         bool         one_stream;     // GGML_CUDA_AR_COPY_ONE_STREAM=1
         bool         card_to_card;   // GGML_CUDA_AR_COPY_PEER left to its default; 0 otherwise
+        const char * slow_percent;   // GGML_CUDA_AR_PEER_SLOW_PERCENT, nullptr for the default
         bool         q8;             // GGML_CUDA_AR_WIRE_Q8=1
     };
     // each wire's passes after the sends and card to card follow its pass beside them, whose outputs they must equal
     const pass passes[] = {
-        {"BF16 wire, beside the sends", nullptr, false, false, false},
-        {"BF16 wire, after the sends",  nullptr, true,  false, false},
-        {"BF16 wire, card to card",     nullptr, false, true,  false},
-        {"F32 wire, beside the sends",  "0",     false, false, false},
-        {"F32 wire, after the sends",   "0",     true,  false, false},
-        {"F32 wire, card to card",      "0",     false, true,  false},
+        {"BF16 wire, beside the sends", nullptr, false, false, nullptr, false},
+        {"BF16 wire, after the sends",  nullptr, true,  false, nullptr, false},
+        {"BF16 wire, card to card",     nullptr, false, true,  nullptr, false},
+        // every store into a peer's memory counts as slow: the pipeline leaves the cards' mappings for host staging
+        {"BF16 wire, peers timed slow", nullptr, false, true,  "0",     false},
+        {"F32 wire, beside the sends",  "0",     false, false, nullptr, false},
+        {"F32 wire, after the sends",   "0",     true,  false, nullptr, false},
+        {"F32 wire, card to card",      "0",     false, true,  nullptr, false},
         // the Q8 wire carries each share to the nearest 1/127 of its block's largest magnitude: farther from the CPU's
         // sums than the BF16 wire (an NMSE of 1.1e-5 here against 1.2e-6), and the same on every route
-        {"Q8 wire, beside the sends",   nullptr, false, false, true},
-        {"Q8 wire, after the sends",    nullptr, true,  false, true},
-        {"Q8 wire, card to card",       nullptr, false, true,  true},
+        {"Q8 wire, beside the sends",   nullptr, false, false, nullptr, true},
+        {"Q8 wire, after the sends",    nullptr, true,  false, nullptr, true},
+        {"Q8 wire, card to card",       nullptr, false, true,  nullptr, true},
     };
 
     bool ok = true;
+    bool can_map = false; // a pass at the defaults found the cards mapping each other's memory
     std::vector<std::vector<float>> beside(n_evals); // the last pass beside the sends, its outputs
     ggml_backend_dev_t meta = ggml_backend_meta_device(gpus.data(), 2, split_by_name, nullptr);
     for (const pass & ps : passes) {
         set_env("GGML_CUDA_AR_BF16_THRESHOLD", ps.bf16_threshold);
         set_env("GGML_CUDA_AR_COPY_ONE_STREAM", ps.one_stream ? "1" : nullptr);
         set_env("GGML_CUDA_AR_COPY_PEER", ps.card_to_card ? nullptr : "0");
+        set_env("GGML_CUDA_AR_PEER_SLOW_PERCENT", ps.slow_percent);
         set_env("GGML_CUDA_AR_WIRE_Q8", ps.q8 ? "1" : nullptr);
 
         const int n_pipelines_before = n_pipelines;
@@ -1092,13 +1106,18 @@ int main(int argc, char ** argv) {
         }
         // card to card wherever the cards map each other's memory and the pass leaves the switch on, and nowhere else
         const bool want_card_to_card = ps.card_to_card && last_p2p;
+        // timed slow: where the cards map each other's memory the pipeline says so and keeps none of the mappings
+        const bool want_slow = ps.slow_percent != nullptr && can_map;
         const bool ok_pipeline = n_pipelines == n_pipelines_before + 1 && last_one_stream == ps.one_stream &&
-            last_card_to_card == want_card_to_card;
+            last_card_to_card == want_card_to_card && last_peer_slow == want_slow && !(want_slow && (last_p2p || last_gather_peer));
+        if (ps.card_to_card && ps.slow_percent == nullptr) {
+            can_map = can_map || last_p2p;
+        }
         printf("%s %s: %d internal AllReduce pipeline initialized (1 expected), receives %s (%s expected)%s\n",
                ok_pipeline ? "ok  " : "FAIL", ps.name, n_pipelines - n_pipelines_before,
                last_card_to_card ? "card to card" : last_one_stream ? "after the sends" : "beside the sends",
                want_card_to_card ? "card to card" : ps.one_stream ? "after the sends" : "beside the sends",
-               ps.card_to_card && !last_p2p ? ", the cards cannot map each other's memory" : "");
+               want_slow ? ", stores into a peer timed slow" : ps.card_to_card && !last_p2p ? ", the cards cannot map each other's memory" : "");
         ok = ok && ok_pipeline;
         ggml_backend_free(backend);
         ggml_backend_free(cpu);
