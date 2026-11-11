@@ -2464,6 +2464,73 @@ static bool test_dp_output_limit(const std::vector<ggml_backend_dev_t> & devices
     return true;
 }
 
+// common_sampler_sample_coupled: what a drafter proposes for the next three positions from given candidates is what the
+// sampler's chain then draws from the same candidates as it accepts them one by one. The second position's candidates
+// lead with the token proposed for the first, which was not in the window: the repeat penalty must count it, as the
+// target's chain will have accepted it. The proposals leave the sampler as it was, and a chain that is not coupled
+// gives none.
+static bool test_coupled(llama_model * model) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    common_params_sampling sp;
+    sp.seed           = 77;
+    sp.temp           = 1.0f;
+    sp.penalty_repeat = 1.1f;
+    sp.penalty_last_n = 64;
+    {
+        common_sampler * plain = common_sampler_init(model, sp);
+        const llama_token_data one[] = { { 5, 1.0f, 0.0f } };
+        const bool none = common_sampler_sample_coupled(plain, one, 1, nullptr, 0) == LLAMA_TOKEN_NULL;
+        common_sampler_free(plain);
+        if (!none) { return fail("a sampler whose chain is not coupled proposed a draft token"); }
+    }
+    sp.coupled = true;
+    common_sampler * smpl = common_sampler_init(model, sp);
+    if (!llama_sampler_chain_coupled(common_sampler_get(smpl))) {
+        common_sampler_free(smpl);
+        return fail("common_params_sampling::coupled did not build a coupled chain");
+    }
+    std::mt19937 rng(5);
+    std::uniform_int_distribution<llama_token> any(3, n_vocab - 1);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    for (int i = 0; i < 16; ++i) { common_sampler_accept(smpl, any(rng), false); }
+
+    const auto draw = [&](const std::vector<llama_token_data> & cands) {
+        std::vector<llama_token_data> cur = cands;
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(common_sampler_get(smpl), &cur_p);
+        return cur_p.data[cur_p.selected].id;
+    };
+    bool ok = true;
+    for (int round = 0; ok && round < 400; ++round) {
+        std::vector<llama_token_data> cands[3];
+        llama_token proposed[3];
+        for (int j = 0; j < 3; ++j) {
+            for (int k = 0; k < 10; ++k) {
+                llama_token id = any(rng);
+                while (std::any_of(cands[j].begin(), cands[j].end(), [id](const llama_token_data & c) { return c.id == id; })) { id = any(rng); }
+                cands[j].push_back({ id, 6.0f + gauss(rng), 0.0f });
+            }
+            if (j == 1) {
+                // the first proposal again, a little ahead of the others: behind them once the penalty counts it
+                cands[1][0] = { proposed[0], 8.0f, 0.0f };
+                cands[1][1].logit = 7.8f;
+            }
+            proposed[j] = common_sampler_sample_coupled(smpl, cands[j].data(), cands[j].size(), proposed, j);
+            ok = ok && proposed[j] != LLAMA_TOKEN_NULL;
+        }
+        for (int j = 0; ok && j < 3; ++j) {
+            const llama_token id = draw(cands[j]);
+            if (id != proposed[j]) {
+                fprintf(stderr, "round %d, position %d: proposed %d, the chain drew %d\n", round, j, proposed[j], id);
+                ok = false;
+            }
+            common_sampler_accept(smpl, id, true);
+        }
+    }
+    common_sampler_free(smpl);
+    return ok ? true : fail("a coupled proposal is not the token the sampler's chain then drew from the same candidates");
+}
+
 int main(int argc, char ** argv) {
     common_init();
     common_log_set_verbosity_thold(LOG_LEVEL_WARN);
@@ -2513,6 +2580,7 @@ int main(int argc, char ** argv) {
         set_env("LLAMA_MTP_TIMING_LEGACY", "1");
         auto model = glm_model(1234);
         const std::pair<const char *, std::function<bool(llama_model *)>> tests[] = {
+            { "coupled", test_coupled },
             { "sampler-reserve", test_sampler_reserve },
             { "sampler-graphs", test_sampler_graphs },
             { "sampler-reorder", test_sampler_reorder },

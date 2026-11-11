@@ -72,6 +72,15 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// A drafter's token as this sampler's chain would draw it from the drafter's candidates (any order): the chain's
+// penalties, cuts and temperature over them, then the coupled dist sampler's noise for the sample that follows the
+// tokens the drafter proposed before it this round (proposed, accepted into a copy of the chain). The target draws
+// with the same noise, so the two agree wherever the drafter's logits are near the target's. The sampler's own state is
+// untouched, and the grammar and the reasoning budget take no part. LLAMA_TOKEN_NULL when the chain is not coupled
+// (llama_sampler_chain_coupled; common_params_sampling::coupled) or the chain leaves no candidate.
+llama_token common_sampler_sample_coupled(struct common_sampler * gsmpl, const llama_token_data * cands, size_t n_cands,
+        const llama_token * proposed, size_t n_proposed);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match

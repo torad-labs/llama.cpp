@@ -347,8 +347,16 @@ struct common_sampler {
     // that only lower logits, their window too (sampler_top_k_first)
     int32_t n_candidates = 0;
 
+    // common_sampler_sample_coupled's copy of the chain, the tokens a drafter proposed that the copy has accepted since
+    // it was made, and the drafter's candidates. An accept, a reset or a copy into this sampler voids the copy
+    struct llama_sampler *        chain_ahead = nullptr;
+    bool                          ahead_valid = false;
+    llama_tokens                  ahead       = {};
+    std::vector<llama_token_data> cur_ahead   = {};
+
     void reset() {
         prev.clear();
+        ahead_valid = false;
 
         llama_sampler_reset(chain);
     }
@@ -436,6 +444,17 @@ std::string common_params_sampling::print() const {
 static bool backend_passive_legacy() {
     static const bool legacy = ggml_env_switch("LLAMA_SAMPLING_BACKEND_PASSIVE_LEGACY");
     return legacy;
+}
+// opt-in: every sampler's dist draws by keyed noise, and the MTP drafter proposes with the target's chain
+static bool sampler_coupled() {
+    static const bool coupled = [] {
+        const bool on = ggml_env_switch("LLAMA_SPEC_COUPLED");
+        if (on) {
+            LOG_INF("sampling: LLAMA_SPEC_COUPLED: the dist sampler draws by keyed noise, which an MTP drafter proposes with\n");
+        }
+        return on;
+    }();
+    return coupled;
 }
 
 // LLAMA_SAMPLING_TOP_K_FIRST_LEGACY=1: the chain always starts from every token's logit (the behaviour before
@@ -714,7 +733,8 @@ struct common_sampler * common_sampler_init(
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
             // default: sample from distribution
-            samplers.push_back(llama_sampler_init_dist(params.seed));
+            samplers.push_back(params.coupled || sampler_coupled() ? llama_sampler_init_dist_coupled(params.seed)
+                                                                   : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
@@ -771,6 +791,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
+    llama_sampler_free(gsmpl->chain_ahead);
 
     delete gsmpl;
 }
@@ -845,6 +866,7 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     llama_sampler_accept(gsmpl->chain, token);
 
     gsmpl->prev.push_back(token);
+    gsmpl->ahead_valid = false;
 }
 
 void common_sampler_reset(struct common_sampler * gsmpl) {
@@ -905,6 +927,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p        = src->cur_p;
     dst->cur_p.data   = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us   = src->t_total_us;
+    dst->ahead_valid  = false;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -1054,6 +1077,44 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     id = cur_p.data[cur_p.selected].id;
 
     return id;
+}
+
+llama_token common_sampler_sample_coupled(struct common_sampler * gsmpl, const llama_token_data * cands, size_t n_cands,
+        const llama_token * proposed, size_t n_proposed) {
+    if (!gsmpl || n_cands == 0 || !llama_sampler_chain_coupled(gsmpl->chain)) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    const auto tm = gsmpl->tm();
+
+    llama_sampler * chain = gsmpl->chain;
+    if (n_proposed > 0) {
+        // the tokens proposed before this one are history when the target samples it: a copy of the chain accepts them,
+        // made again unless what it accepted since the chain last changed is the start of these
+        auto & ahead = gsmpl->ahead;
+        if (!gsmpl->ahead_valid || ahead.size() > n_proposed || !std::equal(ahead.begin(), ahead.end(), proposed)) {
+            if (gsmpl->chain_ahead == nullptr) {
+                gsmpl->chain_ahead = llama_sampler_clone(gsmpl->chain);
+            } else {
+                llama_sampler_copy(gsmpl->chain, gsmpl->chain_ahead);
+            }
+            gsmpl->ahead_valid = true;
+            ahead.clear();
+        }
+        while (ahead.size() < n_proposed) {
+            llama_sampler_accept(gsmpl->chain_ahead, proposed[ahead.size()]);
+            ahead.push_back(proposed[ahead.size()]);
+        }
+        chain = gsmpl->chain_ahead;
+    }
+
+    auto & cur = gsmpl->cur_ahead;
+    cur.assign(cands, cands + n_cands);
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+
+    llama_sampler_apply(chain, &cur_p);
+
+    return cur_p.selected < 0 ? LLAMA_TOKEN_NULL : cur_p.data[cur_p.selected].id;
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first,

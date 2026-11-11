@@ -1168,6 +1168,14 @@ struct llama_sampler_dist : public llama_sampler_backend {
     // inputs for the current sampling graph
     std::vector<ggml_tensor *> inp_uniforms;
 
+    // llama_sampler_init_dist_coupled: the token is the argmax of logit + Gumbel noise, a sample of the same
+    // distribution, with the noise keyed by (seed_cur, n_accept, token id) instead of drawn from rng. A copy of the
+    // chain holds the same noise, so a drafter that applies one to its own logits (and accepts what it proposes into
+    // it) picks, where its logits are near these, the token this sampler will pick; a greedy draft lands with the
+    // probability of its token only.
+    bool     coupled  = false;
+    uint64_t n_accept = 0; // tokens accepted since the last reset: the sample's index
+
     void copy_state(const llama_sampler_dist & src) {
         // note: inp_uniforms and backend_transactional belong to the current sampling graph
         seed_cur                  = src.seed_cur;
@@ -1175,8 +1183,21 @@ struct llama_sampler_dist : public llama_sampler_backend {
         rng_backend               = src.rng_backend;
         n_backend_draws_generated = src.n_backend_draws_generated;
         n_backend_draws_committed = src.n_backend_draws_committed;
+        n_accept                  = src.n_accept;
     }
 };
+
+// Gumbel(0, 1) noise of a token at a sample: two rounds of splitmix64's finalizer over the key, 53 bits to (0, 1)
+static double llama_sampler_dist_gumbel(uint32_t seed, uint64_t index, llama_token id) {
+    const auto mix = [](uint64_t z) {
+        z ^= z >> 30; z *= 0xBF58476D1CE4E5B9ull;
+        z ^= z >> 27; z *= 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    };
+    const uint64_t z = mix(mix(((uint64_t) seed << 32 | (uint32_t) id) + 0x9E3779B97F4A7C15ull) ^ (index * 0xD1B54A32D192ED03ull));
+    const double   u = ((double) (z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    return -std::log(-std::log(u));
+}
 
 static const char * llama_sampler_dist_name(const struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
@@ -1217,6 +1238,22 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
         float p = expf(cur_p->data[i].logit - max_l);
         cur_p->data[i].p = p;
         sum_cum += p;
+    }
+
+    if (ctx->coupled) {
+        // Gumbel-max over the tokens the chain left: a token it removed (-inf) never wins
+        double best = -INFINITY;
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            if (cur_p->data[i].p > 0.0f) {
+                const double score = (double) cur_p->data[i].logit + llama_sampler_dist_gumbel(ctx->seed_cur, ctx->n_accept, cur_p->data[i].id);
+                if (score > best) {
+                    best            = score;
+                    cur_p->selected = i;
+                }
+            }
+            cur_p->data[i].p /= sum_cum;
+        }
+        return;
     }
 
 #if 1
@@ -1265,11 +1302,12 @@ static void llama_sampler_dist_reset(struct llama_sampler * smpl) {
     ctx->rng_backend = ctx->rng;
     ctx->n_backend_draws_generated = 0;
     ctx->n_backend_draws_committed = 0;
+    ctx->n_accept = 0;
 }
 
 static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const llama_sampler_dist *) smpl->ctx;
-    auto * result = llama_sampler_init_dist(ctx->seed);
+    auto * result = ctx->coupled ? llama_sampler_init_dist_coupled(ctx->seed) : llama_sampler_init_dist(ctx->seed);
 
     // copy the state
     {
@@ -1281,6 +1319,7 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
         result_ctx->rng_backend               = ctx->rng_backend;
         result_ctx->n_backend_draws_generated = ctx->n_backend_draws_generated;
         result_ctx->n_backend_draws_committed = ctx->n_backend_draws_committed;
+        result_ctx->n_accept                  = ctx->n_accept;
     }
 
     return result;
@@ -1296,7 +1335,8 @@ static bool llama_sampler_dist_backend_init(
         uint32_t                     n_outputs_max_per_seq) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
-    const bool res = llama_sampler_backend_support(smpl, buft);
+    // the backend's draw is by a uniform and the cumulative sum: a coupled sampler stays on the host
+    const bool res = !sctx->coupled && llama_sampler_backend_support(smpl, buft);
 
     sctx->init(res);
     sctx->backend_transactional = n_outputs_max_per_seq > 1;
@@ -1410,6 +1450,8 @@ static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token t
 
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
+    ++sctx->n_accept;
+
     if (!sctx->backend_transactional ||
             sctx->n_backend_draws_committed >= sctx->n_backend_draws_generated) {
         return;
@@ -1451,6 +1493,12 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .inp_uniforms              = */ {},
         }
     );
+}
+
+struct llama_sampler * llama_sampler_init_dist_coupled(uint32_t seed) {
+    auto * result = llama_sampler_init_dist(seed);
+    ((llama_sampler_dist *) result->ctx)->coupled = true;
+    return result;
 }
 
 static void llama_sampler_penalties_backend_begin(llama_sampler * sampler);
@@ -4323,6 +4371,35 @@ struct llama_sampler * llama_sampler_init_logit_bias(
             /* .inp_logit_idxs = */ nullptr,
         }
     );
+}
+
+// coupled draws
+
+// the chain ends in a coupled dist sampler, and every sampler before it runs on the host and leaves its own state alone
+// in apply: applying the chain to another model's logits then changes nothing the next sample reads
+bool llama_sampler_chain_coupled(const struct llama_sampler * chain) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const auto * p = (const llama_sampler_chain *) chain->ctx;
+    if (p->samplers.empty() || p->samplers.back().ptr->iface != &llama_sampler_dist_i ||
+            !((const llama_sampler_dist *) p->samplers.back().ptr->ctx)->coupled) {
+        return false;
+    }
+    // llama_sampler_empty_i: what an init returns for parameters that change nothing (a temperature of 1, a top-p of 1,
+    // XTC at probability 0). Not here: XTC, mirostat and adaptive-p, which draw or keep state in apply
+    static const llama_sampler_i * const stateless[] = {
+        &llama_sampler_empty_i, &llama_sampler_logit_bias_i, &llama_sampler_penalties_i, &llama_sampler_dry_i,
+        &llama_sampler_top_n_sigma_i, &llama_sampler_top_k_i, &llama_sampler_typical_i, &llama_sampler_top_p_i,
+        &llama_sampler_min_p_i, &llama_sampler_temp_i, &llama_sampler_temp_ext_i,
+    };
+    for (size_t i = 0; i + 1 < p->samplers.size(); ++i) {
+        const auto & s = p->samplers[i];
+        if (s.is_backend || std::find(std::begin(stateless), std::end(stateless), s.ptr->iface) == std::end(stateless)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // infill
