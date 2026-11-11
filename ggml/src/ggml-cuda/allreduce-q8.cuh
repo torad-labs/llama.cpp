@@ -58,14 +58,13 @@ static __global__ void ggml_cuda_ar_quantize_q8_kernel(
         for (int offset = 16; offset > 0; offset /= 2) {
             amax_bits = max(amax_bits, __shfl_xor_sync(0xffffffffu, amax_bits, offset));
         }
-        // This experimental wire accepts finite inputs; do not silently quantize NaN or infinity.
-        if (amax_bits >= 0x7f800000u) {
-            asm volatile("trap;");
-        }
-
         float d = 0.0f;
         int q = 0;
-        if (amax_bits != 0) {
+        if (amax_bits >= 0x7f800000u) {
+            // Mark the block invalid without trapping. Padded q lanes stay zero.
+            d = __uint_as_float(0x7fc00000u);
+            q = i < ne ? 1 : 0;
+        } else if (amax_bits != 0) {
             d = ggml_cuda_ar_q8_div_rn(__uint_as_float(amax_bits), 127.0f);
             uint32_t d_bits = __float_as_uint(d);
             uint32_t max_bits = __float_as_uint(ggml_cuda_ar_q8_mul_rn(d, 127.0f));
@@ -108,8 +107,9 @@ static __global__ void ggml_cuda_ar_reduce_q8_kernel(
     }
 }
 
-// Finite F32 inputs. Scale is RN(maxabs/127), with the two finite-range corrections above;
+// Finite blocks: scale is RN(maxabs/127), with the two finite-range corrections above;
 // q is nearest-even(RN(x/d)), clamped to [-127,127]. Zero blocks and padded lanes have q=0.
+// Any active NaN or infinity marks its block with a quiet-NaN scale and q=1 on valid lanes.
 static inline void ggml_cuda_ar_quantize_q8(
         const float * src, ggml_cuda_ar_q8_block * wire, const int64_t ne, const bool active, cudaStream_t stream) {
     GGML_ASSERT(ne > 0 && wire != nullptr && (!active || src != nullptr));
