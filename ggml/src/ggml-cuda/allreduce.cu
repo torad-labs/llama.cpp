@@ -907,6 +907,7 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_bytes;   // bytes per device in host_large[] / dev_tmp[]
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
+    bool     copy_tail_legacy; // GGML_CUDA_AR_COPY_TAIL_LEGACY: a payload's remainder is a chunk of its own, however short
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
     size_t   ll_max_bytes;   // wire bytes up to which the host LL path reduces; 0 disables this path
     size_t   p2p_max_bytes;  // wire bytes up to which the LL kernel reduces card to card; 0 when off or unavailable
@@ -1033,13 +1034,26 @@ static size_t ggml_cuda_ar_p2p_slot_packets(const ggml_cuda_ar_pipeline * p) {
 }
 
 // Per-AR copy-engine chunk size: env-var override if set, else heuristic
-// (clamp(nbytes/4, HEURISTIC_MIN, HEURISTIC_MAX)).
+// (clamp(nbytes/4, HEURISTIC_MIN, HEURISTIC_MAX)), the payload then cut into
+// as many equal chunks as it holds of those, to the nearest, each a whole
+// number of 4 KB: a remainder under half a chunk rides with the chunks before
+// it.  69 x 4,096 on a BF16 wire is 565,248 bytes, which the clamp alone sent
+// as 524,288 and 40,960: the tail and its event on the sender, and one more
+// copy and wait a peer on each receiver, about 7 us of a reduction's 72 with
+// no kernel on a card (four RTX PRO 6000 S, Nov 11, 2026).  A chunk is at most
+// half again the clamp's.  GGML_CUDA_AR_COPY_TAIL_LEGACY=1: the clamp alone.
 static size_t ggml_cuda_ar_chunk_bytes(const ggml_cuda_ar_pipeline * p, size_t nbytes) {
     if (p->copy_chunk_bytes > 0) {
         return p->copy_chunk_bytes;
     }
-    return std::min(GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MAX,
-                    std::max(GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MIN, nbytes / 4));
+    const size_t chunk = std::min(GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MAX,
+                                  std::max(GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MIN, nbytes / 4));
+    if (p->copy_tail_legacy || nbytes <= chunk) {
+        return chunk;
+    }
+    const size_t chunks = (nbytes + chunk / 2) / chunk;
+    const size_t page   = 4096;
+    return ((nbytes + chunks - 1) / chunks + page - 1) / page * page;
 }
 
 static void ggml_cuda_ar_wait_for_compute(
@@ -1263,6 +1277,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                       __func__, p->copy_chunk_bytes, GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
         p->copy_chunk_bytes = GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN;
     }
+    p->copy_tail_legacy = ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_TAIL_LEGACY", 0) != 0;
     // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.

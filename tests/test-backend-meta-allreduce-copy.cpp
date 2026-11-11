@@ -317,12 +317,16 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
         const char * p2p;
         const char * copy;
         bool one_stream;
+        bool tail_legacy; // GGML_CUDA_AR_COPY_TAIL_LEGACY=1: a payload's remainder as a chunk of its own
     };
     const route routes[] = {
         {"host LL",      "1048576", "0",       "0", false},
         {"host chunked", "0",       "0",       "0", false},
         {"peer LL",      "0",       "1048576", "0", false},
         {"host copy",    "0",       "0",       "1", false},
+        // the copy engines' chunks as they were cut before the payload was cut into equal ones: 69*4096 + 3 on the BF16
+        // wire is a chunk and a tail of 40,966 bytes here and one chunk on every other copy route
+        {"host copy tails", "0",    "0",       "1", false, true},
         {"host serial",  "0",       "0",       "1", true},
         {"peer copy",    "0",       "1048576", "1", false},
         {"owner-slice",  "0",       "1048576", "0", false},
@@ -341,6 +345,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             set_env("GGML_CUDA_AR_P2P_MAX_BYTES", route.p2p);
             set_env("GGML_CUDA_AR_COPY_THRESHOLD", route.copy);
             set_env("GGML_CUDA_AR_COPY_ONE_STREAM", route.one_stream ? "1" : "0");
+            set_env("GGML_CUDA_AR_COPY_TAIL_LEGACY", route.tail_legacy ? "1" : nullptr);
             set_env("GGML_CUDA_AR_COPY_PEER", "1");
             const bool owner_requested = strcmp(route.name, "owner-slice") == 0 || strcmp(route.name, "owner chunked") == 0;
             set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", owner_requested ? "1" : "0");
