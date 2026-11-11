@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -2317,6 +2318,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // whole prefix at the next head. dropped sequences are simply not re-added.
             common_batch_clear(batch);
 
+            // traced: the proposal's range above ends when the head's decode returns, and its compute is awaited by the
+            // first row's sampling below. This range holds that wait and the rows' sampling, and the mark after the
+            // first row parts the two
+            std::optional<common_decode_trace::range> trace_sample;
+            trace_sample.emplace([&] {
+                return "stage=proposal_sample proposal=" + std::to_string(i + 1) + " rows=" + std::to_string(n_drafting);
+            });
+            bool sampled_first = false;
+
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {
                     continue;
@@ -2325,6 +2335,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                if (!sampled_first && common_decode_trace::enabled()) {
+                    common_decode_trace::mark("stage=proposal_sampled proposal=" + std::to_string(i + 1));
+                }
+                sampled_first = true;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -2400,6 +2414,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 i_last[seq_id] = batch.n_tokens - 1;
             }
+            trace_sample.reset();
 
             if (batch.n_tokens == 0) {
                 break;
