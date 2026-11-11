@@ -279,11 +279,115 @@ static void check_reserve() {
             llama_kpool_n_pools(n_kv, 4, 1));
 }
 
+// with a limit of cells a sequence (LLAMA_KV_SEQ_CELLS) the reserve takes that sequence's pools, not the cache's: never
+// fewer than a step of a sequence inside the limit is given at any padding up to the widest, and the cache's without one
+static void check_reserve_limit() {
+    const uint32_t n_kv    = 131072;
+    const uint32_t whole   = llama_kpool_n_pools(n_kv, 4, 1);
+    const uint32_t pad_max = 2048;
+
+    CHECK(llama_kpool_n_pools_reserve(n_kv, 4, 1, TOP_K, pad_max, 0) == whole, "no limit keeps the cache's %u pools", whole);
+    CHECK(llama_kpool_n_pools_reserve(n_kv, 4, 1, TOP_K, pad_max, n_kv) == whole, "a limit of the whole cache keeps its %u pools", whole);
+    CHECK(llama_kpool_n_pools_reserve(n_kv, 4, 1, TOP_K, pad_max, 8*n_kv) == whole, "a limit over the cache keeps its %u pools", whole);
+    CHECK(llama_kpool_n_pools_reserve(n_kv, 4, 1, TOP_K, 64, 256) >= TOP_K/4, "a small limit keeps the %u pools the selection takes", TOP_K/4);
+
+    for (const uint32_t limit : { 4096u, 16384u, 65536u }) {
+        const uint32_t n_res = llama_kpool_n_pools_reserve(n_kv, 4, 1, TOP_K, pad_max, limit);
+
+        CHECK(n_res < whole && n_res <= (limit - 1)/4 + 1 + pad_max + 2,
+                "a limit of %u cells reserves %u pools: its run is %u, the cache's %u", limit, n_res, (limit - 1)/4 + 1, whole);
+
+        // the reserve's ubatch names every sequence in one stream: still one sequence's run, and two pools a sequence
+        const uint32_t n_res_23 = llama_kpool_n_pools_reserve(n_kv, 4, 23, TOP_K, pad_max, limit);
+
+        CHECK(n_res_23 == std::min(llama_kpool_n_pools(n_kv, 4, 23), n_res + 2*22),
+                "a limit of %u cells reserves %u pools for 23 sequences of a stream, %u for one", limit, n_res_23, n_res);
+
+        // a sequence that fills the limit, its last 1,024 tokens the step, beside another conversation
+        std::mt19937 rng(3);
+        pool w(n_kv, 2, true, rng);
+        w.append(1, 20000);
+        w.append(0, limit - 1024);
+
+        ubatch_data ud;
+        for (const llama_pos p : w.append(0, 1024)) {
+            ud.add(0, p);
+        }
+        const llama_ubatch * ub = ud.get();
+
+        const llama_kpool_cells_fn cells_of = [&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); };
+
+        for (const uint32_t pad : { 64u, 256u, 1024u, 2048u }) {
+            const uint32_t n_own = llama_kpool_n_pools_ubatch(cells_of, *ub, n_kv, 4, 1, TOP_K, pad);
+
+            CHECK(n_own <= n_res, "a sequence of %u cells is given %u pools at a padding of %u, over the %u reserved",
+                    limit, n_own, pad, n_res);
+        }
+    }
+
+    // What the limit's reserve does not hold (llama_kpool_n_pools_reserve): the same sequences are inside it with a stream
+    // each and outside it packed in one, and a sequence with a hole spans more than the cells it holds
+    const uint32_t limit = 4096;
+    const uint32_t n_res = llama_kpool_n_pools_reserve(n_kv, 4, 4, TOP_K, pad_max, limit);
+
+    {
+        // four sequences of the limit's length: a stream each, as a shared pool's step takes them, and the packed maps a
+        // cell two sequences share (seq_cp) sends the whole cache to
+        std::mt19937 rng(5);
+        pool w(n_kv, 4, true, rng);
+        ubatch_data ud;
+
+        for (llama_seq_id s = 0; s < 4; ++s) {
+            w.append(s, limit - 8);
+        }
+        for (llama_seq_id s = 0; s < 4; ++s) {
+            for (const llama_pos p : w.append(s, 8)) {
+                ud.add(s, p);
+            }
+        }
+        const llama_ubatch * ub = ud.get();
+
+        const llama_kpool_cells_fn cells_of = [&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); };
+
+        const uint32_t n_each   = llama_kpool_n_pools_ubatch(cells_of, *ub, n_kv, 4, 4, TOP_K, pad_max);
+        const uint32_t n_packed = llama_kpool_n_pools_ubatch(cells_of, *ub, n_kv, 4, 1, TOP_K, pad_max);
+
+        CHECK(n_each <= n_res, "four sequences of %u cells, a stream each, take %u pools, over the %u reserved", limit, n_each, n_res);
+        CHECK(n_packed > n_res && n_packed >= 4*(limit/4),
+                "four sequences of %u cells packed in one stream take %u pools: every run, past the %u reserved", limit, n_packed, n_res);
+    }
+
+    {
+        // 4,096 cells at positions 0..1,023 and 13,312..16,383: a range out of the middle, then consecutive appends
+        std::mt19937 rng(7);
+        pool w(n_kv, 1, true, rng);
+        ubatch_data ud;
+
+        w.append(0, 13312 + 1024);
+        w.rollback(0, 1024, 13312);
+
+        for (const llama_pos p : w.append(0, 2048)) {
+            ud.add(0, p);
+        }
+        const llama_ubatch * ub = ud.get();
+
+        const llama_kpool_cells_fn cells_of = [&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); };
+
+        const uint32_t n_cells = w.cells_of(0).get_used();
+        const uint32_t n_hole  = llama_kpool_n_pools_ubatch(cells_of, *ub, n_kv, 4, 1, TOP_K, pad_max);
+
+        CHECK(n_cells == limit, "the sequence with a hole holds %u cells, not the limit's %u", n_cells, limit);
+        CHECK(n_hole > n_res && n_hole >= 16384/4,
+                "a sequence of %u cells that spans 16,384 positions takes %u pools: its span's, past the %u reserved", n_cells, n_hole, n_res);
+    }
+}
+
 int main() {
     std::mt19937 rng(20261029);
 
     check_neighbour();
     check_reserve();
+    check_reserve_limit();
 
     for (int round = 0; round < 400; ++round) {
         const config cfg = {

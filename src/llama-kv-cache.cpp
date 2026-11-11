@@ -1464,6 +1464,10 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+uint32_t llama_kv_cache::get_n_pad_max() const {
+    return std::max({ std::max(n_pad, 256u), n_pad_prefill, n_pad_shared });
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens, uint32_t * n_pad_used) const {
     const auto padded = [&](uint32_t pad) {
         uint32_t result = 0;

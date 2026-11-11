@@ -177,6 +177,17 @@ using llama_kpool_cells_fn = std::function<const llama_kv_cells &(llama_seq_id)>
 uint32_t llama_kpool_n_pools_ubatch(const llama_kpool_cells_fn & cells_of, const llama_ubatch & ubatch, uint32_t n_kv,
         uint32_t kpool, uint32_t n_stream, uint32_t indexer_top_k, uint32_t pool_pad = 64);
 
+// the pools the graph reserved at load holds: the whole cache's (llama_kpool_n_pools), the worst case, or, under a limit
+// of seq_cells positions a sequence (LLAMA_KV_SEQ_CELLS), those of the steps a server's slots make: each sequence of the
+// ubatch in a stream of its own, its positions spanning seq_cells at most, with the widest padding a step takes
+// (pool_pad_max) on top. That is not a worst case. The packed maps hold every sequence's runs in one stream (cells two
+// sequences share after a seq_cp, rows not grouped by sequence, LLAMA_KPOOL_SHARED_VIEWS_LEGACY, a device without the
+// bank), and a sequence with a hole in its positions spans more than the cells it holds: such a step's graph can be
+// larger than the reserve and is then allocated when it comes. Never more than the whole cache's and never so few that
+// select_k changes
+uint32_t llama_kpool_n_pools_reserve(uint32_t n_kv, uint32_t kpool, uint32_t n_ps, uint32_t indexer_top_k,
+        uint32_t pool_pad_max, uint32_t seq_cells);
+
 // the pools a step's own runs are padded to: 64, or as many pools as the cells a prompt step's cache length is padded to
 // (llama_kv_cache::get_n_kv), so its pool count changes when its cache length does and its graph is reused between
 uint32_t llama_kpool_pool_pad(uint32_t n_pad_kv, uint32_t kpool);

@@ -789,7 +789,16 @@ class ServingRecipeTest(unittest.TestCase):
                             "--spec-draft-n-max": "7", "--spec-draft-device": "CUDA0", "--spec-draft-ngl": "99"}.items():
             self.assertEqual(argv[argv.index(flag) + 1], value)
         self.assertFalse(any(arg.startswith("--spec-draft-mtp") for arg in argv))
+        # a session's limit is the engine's own switch, set only when asked for
+        self.assertNotIn("LLAMA_KV_SEQ_CELLS", self.serve.make_plan(self.serve.arguments(base))[1])
+        argv, env = self.serve.make_plan(self.serve.arguments(base + ["--context", "3014656", "--slot-context", "262144"]))
+        self.assertEqual(argv[argv.index("-c") + 1], "3014656")
+        self.assertEqual(env["LLAMA_KV_SEQ_CELLS"], "262144")
         for options in (base + ["--slots", "0"], base + ["--slots", "257"], base + ["--slots", "8", "--context", "7"],
+                        base + ["--slot-context", "255"], base + ["--slot-context", "524288"],
+                        base + ["--context", "294912", "--slot-context", "294912"],
+                        ["--model", "/models/target.gguf", "--slot-context", "262144"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--slot-context", "262144"],
                         base + ["--dflash", "/models/draft.gguf"], base + ["--dflash-depth", "7"],
                         base + ["--mtp-adaptive", "1.5"],
                         ["--model", "/models/target.gguf", "--context", "294912"],

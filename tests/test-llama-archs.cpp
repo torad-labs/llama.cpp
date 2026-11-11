@@ -1564,6 +1564,11 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
 // row counts are others, the prompt stays one decode.
 // The streams' bank takes a decode's changes as one input its device writes before the maps are made (ggml_kpool_patch),
 // where each change was a write of its own; LLAMA_KPOOL_PATCH_INPUT_LEGACY=1 writes them. The logits are the same again.
+// LLAMA_KV_SEQ_CELLS=N sizes the graph reserved at load for sequences of N positions, a stream each, where it held the
+// whole pool's pools for one sequence. Inside the limit a step is the unlimited pool's: the same logits and reuses. A
+// sequence that passes it scores more pools by as many rows as the reserve holds, so its graph is allocated when it
+// comes, and the logits are the unlimited pool's again. LLAMA_KV_PAD_PREFILL=256 goes with it here: at its default of
+// 8,192 cells the widest padding is this 8,192-cell pool's pools and the reserve stays the pool's.
 static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
@@ -1603,10 +1608,13 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         bool              patched = false;
     };
 
-    const auto read = [&](bool legacy, bool mtp, bool packed = false, bool writes = false, bool unified = true) {
+    const auto read = [&](bool legacy, bool mtp, bool packed = false, bool writes = false, bool unified = true,
+            const char * seq_cells = nullptr) {
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", legacy ? "1" : nullptr);
         set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", packed ? "1" : nullptr);
         set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", writes ? "1" : nullptr);
+        set_env("LLAMA_KV_SEQ_CELLS", seq_cells);
+        set_env("LLAMA_KV_PAD_PREFILL", seq_cells ? "256" : nullptr);
         seen_nodes seen;
         std::set<int64_t> & n_kv = seen.n_kv;
         llama_context_params params = llama_context_default_params();
@@ -1631,7 +1639,12 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", nullptr);
         set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", nullptr);
         set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", nullptr);
+        set_env("LLAMA_KV_SEQ_CELLS", nullptr);
+        set_env("LLAMA_KV_PAD_PREFILL", nullptr);
         if (!ctx) throw std::runtime_error("shared pool reuse: failed to create a context");
+        if (seq_cells && llama_n_ctx_seq(ctx.get()) != (uint32_t) atoi(seq_cells)) {
+            throw std::runtime_error("shared pool reuse: the limit of a sequence's cells was not taken");
+        }
 
         // positions [begin, end) of every sequence, a sequence's rows together
         const auto decode = [&](int begin, int end) {
@@ -1667,12 +1680,62 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         return res;
     };
 
+    // one sequence of the pool reads 2,560 positions, 512 rows a decode: every row's logits. Under a limit of 256 its
+    // last decodes score 1,026 pools where the reserve holds 592 (a run of 64, the widest padding's 512, 2 a sequence)
+    const int n_long      = 2560;
+    const int n_long_rows = 512;
+    const auto tokens_long = get_tokens(n_long, n_vocab, seed + 2);
+    std::vector<float> hidden_long((size_t) n_long_rows*n_embd);
+    for (auto & value : hidden_long) value = normal(rng);
+
+    const auto read_long = [&](bool mtp, const char * seq_cells) {
+        set_env("LLAMA_KV_SEQ_CELLS", seq_cells);
+        set_env("LLAMA_KV_PAD_PREFILL", "256");
+        llama_context_params params = llama_context_default_params();
+        if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx      = 8192;
+        params.n_batch    = n_long_rows;
+        params.n_ubatch   = n_long_rows;
+        params.n_seq_max  = n_seq;
+        params.kv_unified = true;
+        params.n_threads  = params.n_threads_batch = 4;
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        set_env("LLAMA_KV_SEQ_CELLS", nullptr);
+        set_env("LLAMA_KV_PAD_PREFILL", nullptr);
+        if (!ctx) throw std::runtime_error("shared pool reuse: failed to create a context");
+        if (llama_n_ctx_seq(ctx.get()) != (seq_cells ? (uint32_t) atoi(seq_cells) : params.n_ctx)) {
+            throw std::runtime_error("shared pool reuse: the limit of a sequence's cells was not taken");
+        }
+
+        std::vector<float> logits;
+        for (int begin = 0; begin < n_long; begin += n_long_rows) {
+            llama_batch batch = llama_batch_init(n_long_rows, 0, 1);
+            for (int pos = begin; pos < begin + n_long_rows; ++pos) {
+                common_batch_add(batch, tokens_long[pos], pos, {0}, true);
+            }
+            if (mtp) batch.embd = hidden_long.data();
+            const int result = llama_decode(ctx.get(), batch);
+            batch.embd = nullptr;
+            llama_batch_free(batch);
+            if (result) throw std::runtime_error("shared pool reuse: decode of the long sequence failed");
+            for (int i = 0; i < n_long_rows; ++i) {
+                const float * row = llama_get_logits_ith(ctx.get(), i);
+                logits.insert(logits.end(), row, row + n_vocab);
+            }
+        }
+        return logits;
+    };
+
     for (const bool mtp : {false, true}) {
         const read_result legacy = read(true, mtp);
         const read_result shared = read(false, mtp);
         const read_result packed = read(false, mtp, true);
         const read_result writes = read(false, mtp, false, true);
         const read_result alone  = read(false, mtp, false, false, false);
+        const read_result limit  = read(false, mtp, false, false, true, "256");
+
+        const std::vector<float> long_whole = read_long(mtp, nullptr);
+        const std::vector<float> long_limit = read_long(mtp, "256");
 
         // 256 cells a sequence: 2,048, which the 1,088 cells never cross, and their pools never cross a quarter of it. The
         // first step builds its graph (another length than the prompt's decodes); every later step reuses it. The
@@ -1696,6 +1759,16 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
                     legacy.n_kv.empty() ? -1LL : (long long) *legacy.n_kv.rbegin(), (long long) want_n_kv_legacy);
             ok = false;
         }
+        if (limit.n_reused != shared.n_reused || limit.n_kv != shared.n_kv) {
+            LOG_ERR("GLM shared pool reuse: mtp=%d: under LLAMA_KV_SEQ_CELLS=256 the steps reused %d graphs (want %d) over "
+                    "%zu cache lengths (want %zu)\n", mtp, limit.n_reused, shared.n_reused, limit.n_kv.size(), shared.n_kv.size());
+            ok = false;
+        }
+        if (on_cpu ? long_limit != long_whole : !(nmse(long_limit, long_whole) <= 1e-6)) {
+            LOG_ERR("GLM shared pool reuse: mtp=%d: a sequence past LLAMA_KV_SEQ_CELLS=256 differs from the unlimited "
+                    "pool's, nmse=%g\n", mtp, nmse(long_limit, long_whole));
+            ok = false;
+        }
         if (!shared.patched || writes.patched || packed.patched) {
             LOG_ERR("GLM shared pool reuse: mtp=%d: the bank's changes went with the graph: %d (want 1), %d with "
                     "LLAMA_KPOOL_PATCH_INPUT_LEGACY=1 (want 0), %d with packed maps (want 0)\n", mtp, shared.patched,
@@ -1704,7 +1777,8 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         }
         for (const auto & other : { std::make_pair("padded to 256", &legacy), std::make_pair("with packed maps", &packed),
                 std::make_pair("whose bank is written a change a write", &writes),
-                std::make_pair("of a cache a sequence", &alone) }) {
+                std::make_pair("of a cache a sequence", &alone),
+                std::make_pair("under LLAMA_KV_SEQ_CELLS=256", &limit) }) {
             const bool exact = on_cpu && other.second != &packed;
             if (exact && other.second->logits != shared.logits) {
                 LOG_ERR("GLM shared pool reuse: mtp=%d: logits differ from the pool %s, nmse=%g\n", mtp, other.first,

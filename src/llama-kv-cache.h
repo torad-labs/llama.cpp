@@ -210,6 +210,9 @@ public:
     // to at least n_pad_shared and a dense one to a power of two. n_pad_used, when given, receives the padding applied
     uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens = 0, uint32_t * n_pad_used = nullptr) const;
 
+    // the widest padding get_n_kv applies to a step of this cache
+    uint32_t get_n_pad_max() const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
