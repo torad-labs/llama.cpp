@@ -10855,6 +10855,10 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 
 static void add_glm_moe_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     // Tensor-parallel experts keep all IDs and split the weight rows instead of expert ownership.
+    for (int64_t tokens : {9, 23, 69}) {
+        cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 288, 8, true, 512, tokens, 4096));
+        cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 288, 8, false, 4096, tokens, 512));
+    }
     for (int64_t tokens : {23, 69}) {
         for (int routing : {0, 1, 2, 3}) {
             for (bool clamped : {false, true}) {

@@ -1,4 +1,7 @@
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_blackwell(ggml_type type, int J, bool fallback) {
+    CASE(GGML_TYPE_Q8_0, 128, 3, 64,  8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q8_0, 128, 3, 64,  8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+
     // Smaller staged expert tiles target three blocks per SM with the same work per thread.
     CASE(GGML_TYPE_IQ3_XXS, 128, 3, 64,  8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
     CASE(GGML_TYPE_IQ3_XXS, 128, 3, 64, 16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
@@ -43,7 +46,7 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
 }
 
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_gb10(ggml_type type, int J, bool fallback) {
-    if (type == GGML_TYPE_IQ3_XXS) {
+    if (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q8_0) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
