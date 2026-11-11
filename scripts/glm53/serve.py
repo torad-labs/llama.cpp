@@ -48,6 +48,9 @@ def arguments(argv=None):
     parser.add_argument("--slots", type=int, help="tensor-4: sessions sharing the pool, 1..256 (default: 23). "
                         "DP private caches of 442368 cells each: 1..40 resident, 1..256 host KV (default: 36)")
     parser.add_argument("--context", type=int, help="tensor-4: tokens in the shared pool (default: 524288)")
+    parser.add_argument("--slot-context", type=int, help="tensor-4: tokens one session holds of the pool at most. The graph "
+                        "reserved at load is then sized for sessions of that many, so a larger --context loads "
+                        "(default: a session may take the whole pool)")
     parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
@@ -97,6 +100,8 @@ def make_plan(args):
     context = POOL_CONTEXT if args.context is None else args.context
     if args.context is not None and (not four or context < slots):
         raise ValueError("context is supported only with --profile tensor-4 and holds at least one token a slot")
+    if args.slot_context is not None and (not four or not 256 <= args.slot_context < context):
+        raise ValueError("slot-context is supported only with --profile tensor-4, from 256 tokens to under the context")
     if dp and args.mtp_depth in ("3", "4"):
         raise ValueError("dp-4 is measured at MTP depth 1 and 2")
     if not 0 <= args.mtp_adaptive <= 1:
@@ -165,6 +170,11 @@ def make_plan(args):
         # tokens are samples of the same distribution, though a seed's reply is another than without it. Four RTX PRO
         # 6000, 23 sessions (Nov 11, 2026): 2.17 to 2.21 tokens a step against 2.02 to 2.07.
         env["LLAMA_SPEC_COUPLED"] = "1"
+    if args.slot_context is not None:
+        # A session ends at slot-context tokens, and the load-time reserve holds a pooled indexer's scores for sessions
+        # of that many, not for one that took every cell: 10 bytes a pool a row, the term that kept the pool for 23
+        # sessions of 262144 from loading (docs/torad/glm53-goal.md, cause 3). The engine rounds it up to 256
+        env["LLAMA_KV_SEQ_CELLS"] = str(args.slot_context)
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
     if args.trace_decode:
