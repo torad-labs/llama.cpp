@@ -758,7 +758,8 @@ class ServingRecipeTest(unittest.TestCase):
         args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "tensor-4"])
         argv, env = self.serve.make_plan(args)
         expected = {"-sm": "tensor", "-ts": "1,1,1,1", "-np": "23", "-c": "524288", "-b": "2048", "-ub": "2048",
-                    "--prompt-step": "1024", "--cache-type-k": "q4_0", "--cache-type-v": "q4_0", "-ctki": "q8_0",
+                    "--prompt-step": "1024", "--prompt-chunk": "128",
+                    "--cache-type-k": "q4_0", "--cache-type-v": "q4_0", "-ctki": "q8_0",
                     "--spec-type": "draft-mtp", "--spec-draft-n-max": "2", "--spec-draft-mtp-adaptive": "0.18"}
         for flag, value in expected.items():
             self.assertEqual(argv[argv.index(flag) + 1], value)
@@ -767,12 +768,25 @@ class ServingRecipeTest(unittest.TestCase):
             self.assertNotIn(flag, argv)
         two = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))[1]
         self.assertNotIn("LLAMA_SPEC_COUPLED", two)
-        self.assertEqual(env, {**two, "CUDA_VISIBLE_DEVICES": "0,1,2,3", "LLAMA_SPEC_COUPLED": "1"})
+        # what the four cards serve with and the two do not: the reductions on the copy engines through host memory in
+        # 8-bit blocks, graphs kept by shape, CUDA executables held between turns
+        wire = {"GGML_CUDA_AR_WIRE_Q8": "1"}
+        four = {"GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0", "GGML_CUDA_AR_COPY_THRESHOLD": "1",
+                "GGML_CUDA_AR_COPY_PEER": "0", "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0",
+                "LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": "128", "GGML_META_CAPTURE_GRAPHS": "132",
+                "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000", "CUDA_VISIBLE_DEVICES": "0,1,2,3"}
+        for key in list(four) + list(wire):
+            if key != "CUDA_VISIBLE_DEVICES":
+                self.assertNotIn(key, two)
+        self.assertEqual(env, {**two, **four, **wire, "LLAMA_SPEC_COUPLED": "1"})
+        bf16 = self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--profile", "tensor-4", "--reduction-wire", "bf16"]))[1]
+        self.assertEqual(bf16, {**two, **four, "LLAMA_SPEC_COUPLED": "1"})
         # the coupled draws are the MTP head's: neither without a draft nor with the DFlash one
         for options in (["--mtp-depth", "off"], ["--dflash", "/models/dflash.gguf", "--dflash-depth", "15"]):
             other = self.serve.make_plan(self.serve.arguments(
                 ["--model", "/models/target.gguf", "--profile", "tensor-4"] + options))[1]
-            self.assertEqual(other, {**two, "CUDA_VISIBLE_DEVICES": "0,1,2,3"})
+            self.assertEqual(other, {**two, **four, **wire})
 
     def test_four_card_tensor_recipe_takes_its_sessions_pool_and_drafter(self):
         base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
@@ -803,6 +817,8 @@ class ServingRecipeTest(unittest.TestCase):
                         base + ["--mtp-adaptive", "1.5"],
                         ["--model", "/models/target.gguf", "--context", "294912"],
                         ["--model", "/models/target.gguf", "--backend-sampling"],
+                        ["--model", "/models/target.gguf", "--reduction-wire", "q8"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--reduction-wire", "bf16"],
                         ["--model", "/models/target.gguf", "--dflash", "/models/draft.gguf", "--dflash-depth", "7"],
                         ["--model", "/models/target.gguf", "--profile", "dp-4", "--mtp-depth", "3"]):
             with self.subTest(options=options), self.assertRaises(ValueError):
