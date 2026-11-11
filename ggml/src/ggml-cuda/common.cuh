@@ -24,6 +24,7 @@
 #include "ggml-common.h"
 
 #include <array>
+#include <atomic>
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -1657,6 +1658,73 @@ struct ggml_cuda_route_stats {
     }
 };
 
+// GGML_CUDA_MMQ_ROUTE_LOG=N (default off): how the columns of each routed-expert MMQ launch fell over its experts, as
+// the device ran it, a captured graph's replays among them. A one-block launch beside the tile list's
+// (ggml_cuda_mmq_moe_route_record) appends a record on the device, up to N a backend context; past N it only counts.
+// The context writes them when it is freed, as lines of JSON to the file GGML_CUDA_MMQ_ROUTE_LOG_FILE names (appended
+// to, so every context of the process lands in it) or, without one, to the log at info level: an MMQ_ROUTE_SITE line
+// for each launch site, named by its weights as the host queued it (the name carries the layer and the operation; a
+// paired site's one record stands for both of its products, which run as a kernel each on the same tiles), an MMQ_ROUTE
+// line a record in the order the device ran them, and an MMQ_ROUTE_END line with the records it ran and kept. ctx
+// numbers the contexts of the process, which several logical ranks on one card share a device with, and eval the graph
+// evaluations of the context (ggml_cuda_mmq_route_evaluation, one launch at the head of each, replays included): the
+// records of one eval are one evaluation's, and under the tensor split a decode is many evaluations. A site's
+// experts_total is 0 where the context's launch has every expert and every column (the tensor split slices an expert's
+// width, not the experts) and the experts of all ranks where each rank holds some of them (the data split), so that a
+// launch's columns are the sum over the ranks. Made before a graph evaluation, never inside a capture, like the
+// counters above. A diagnostic: it adds launches to every evaluation and every routed MMQ, so its legs give no rate.
+struct ggml_cuda_mmq_route_log {
+    struct record {
+        uint32_t site;   // index into sites
+        uint32_t eval;   // the context's graph evaluation the launch ran in
+        uint32_t cols;   // columns over all of the launch's experts
+        uint32_t used;   // U: experts with a column or more
+        uint32_t tiles8; // T8: the sum over the experts of ceil(columns/8)
+        uint32_t tiles;  // the launch's live column tiles, the sum of ceil(columns/J)
+        uint32_t j;      // J, the launch's tile width
+    };
+    struct site {
+        std::string name;
+        int         type;           // the weights' ggml_type
+        int         n_expert;       // the experts this context holds
+        int         n_expert_total; // the experts of all ranks where the ranks hold different experts, or 0: this
+                                    // context's launch has every expert and every column
+        bool        paired;         // two weights of the same routing prepared as one (gate and up): one record, both
+                                    // products, each on these tiles
+    };
+    unsigned int *    head     = nullptr; // on the device: [0] the records its launches tried to append, [1] evaluations begun
+    record *          records  = nullptr; // on the device
+    uint32_t          capacity = 0;
+    int               ctx      = -1;      // the context's number in the process
+    std::vector<site> sites;
+
+    void ensure() {
+        static const uint32_t n = [] {
+            const char * s = getenv("GGML_CUDA_MMQ_ROUTE_LOG");
+            return s ? (uint32_t) std::min<long long>(std::max<long long>(0, atoll(s)), 1 << 26) : 0u;
+        }();
+        if (n > 0 && records == nullptr) {
+            static std::atomic<int> n_ctx{0};
+            CUDA_CHECK(cudaMalloc(&head, 2*sizeof(*head)));
+            CUDA_CHECK(cudaMemset(head, 0, 2*sizeof(*head)));
+            CUDA_CHECK(cudaMalloc(&records, n*sizeof(*records)));
+            capacity = n;
+            ctx      = n_ctx.fetch_add(1);
+        }
+    }
+
+    uint32_t site_of(const char * name, int type, int n_expert, int n_expert_total, bool paired) {
+        for (size_t i = 0; i < sites.size(); ++i) {
+            if (sites[i].type == type && sites[i].n_expert == n_expert && sites[i].n_expert_total == n_expert_total &&
+                    sites[i].paired == paired && sites[i].name == name) {
+                return (uint32_t) i;
+            }
+        }
+        sites.push_back({name, type, n_expert, n_expert_total, paired});
+        return (uint32_t) sites.size() - 1;
+    }
+};
+
 // The word a launch that keeps DRAM busy bumps as its reads start (the routed experts' ring, mmvq-moe.cu), and the paced
 // L2 issuer beside the stream watches: past a change it requests no more (ggml_cuda_l2_issue), where it would take DRAM
 // from that launch for bytes a later kernel reads. Only its changes mean anything. Made before a graph evaluation, never
@@ -2279,6 +2347,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_ssm_conv_ab_slots ssm_conv_ab_slots;
     ggml_cuda_hc_front_tickets hc_front_tickets;
     ggml_cuda_route_stats route_stats;
+    ggml_cuda_mmq_route_log mmq_route_log;
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
