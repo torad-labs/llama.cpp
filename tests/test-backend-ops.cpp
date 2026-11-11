@@ -11094,6 +11094,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 257, 20, true, true, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 4096, 64, 20, false, true, true));
+    // past 16 tokens CUDA runs the weights, the pre and the sublayer's norm in one launch, a block of 1,024 threads a
+    // token (ggml_cuda_op_dsv4_hc_back_fused), as the 17, 64 and 257 tokens above do: here 23 sessions' 69 rows, the
+    // widest n_embd it takes (8192) and the first it leaves to the three launches (9216), and 1,100 tokens, whose
+    // weights take a second block
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 69, 20, false, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 4096, 69, 20, true, true, false));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 8192, 20, 20, false, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 9216, 20, 20, false, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 1024, 1100, 4, false, false, true));
     // the front's mix read by quantized MUL_MATs: its q8_1 copy written by the front on CUDA and read where the readers
     // run on mul_mat_vec_q (not Q4_K's at 8 tokens on Blackwell, which run on MMQ); at 256 (not a multiple of 512) and at
     // 12 tokens (past mul_mat_vec_q's columns) the readers quantize it

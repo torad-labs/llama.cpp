@@ -36,6 +36,16 @@ void ggml_cuda_op_dsv4_hc_post_pre_fused(ggml_backend_cuda_context & ctx, ggml_t
         const ggml_tensor * rms_flat, const ggml_tensor * mm, ggml_tensor * weights, const ggml_tensor * pre,
         const ggml_tensor * rms, ggml_tensor * mul);
 
+// The back of a site whose mixes a GEMM made, three nodes in one kernel: DSV4_HC_WEIGHTS (weights), DSV4_HC_PRE (pre) on
+// its pre weights' view, and the RMS_NORM (rms) and MUL (mul) of the sublayer's norm; it writes weights and mul, the
+// values the three launches write, bit for bit. Supported where the streams are F32 and a float apart along n_embd,
+// n_embd a multiple of 1024 up to 8192, and the normed mix does not lie over the weights.
+// GGML_CUDA_HC_BACK_CHECK=1 also runs the three launches into scratch and traps on any bit that differs.
+bool ggml_cuda_dsv4_hc_back_fused_supported(const ggml_tensor * weights, const ggml_tensor * pre,
+        const ggml_tensor * rms, const ggml_tensor * mul);
+void ggml_cuda_op_dsv4_hc_back_fused(ggml_backend_cuda_context & ctx, ggml_tensor * weights, const ggml_tensor * pre,
+        const ggml_tensor * rms, ggml_tensor * mul);
+
 // Whether node is a front's mul, the sublayer's normed mix: the fused front writes its q8_1 copy beside it when the
 // evaluation holds one for it (ggml_cuda_mmvq_shared_q8_1::produce) and n_embd is a multiple of MATRIX_ROW_PADDING,
 // not under GGML_CUDA_HC_PRE_GRAM_LEGACY. Where the front does not run fused, its readers quantize it themselves.

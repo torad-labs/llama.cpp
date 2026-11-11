@@ -875,6 +875,19 @@ void ggml_cuda_op_add_rms_norm_scale_fused(
     }
 }
 
+void ggml_cuda_rms_norm_mul_rows(const float * x, const float * mul, float * dst, const int ncols, const int nrows,
+        const float eps, cudaStream_t stream) {
+    const int64_t n = (int64_t) ncols*nrows;
+    rms_norm_mul_f32_cuda(x, mul, nullptr, dst,
+                          ncols, nrows, 1, 1,
+                          /*s00*/ ncols, n, n,
+                          /*mul_s00*/ ncols, ncols, ncols,
+                          ncols, 1, 1, 1,
+                          /*add_s00*/ 0, 0, 0,
+                          0, 0, 0, 0,
+                          eps, stream);
+}
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;

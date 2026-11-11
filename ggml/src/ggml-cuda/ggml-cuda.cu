@@ -7285,6 +7285,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // The back of a hyper-connection site at more tokens than the front above takes, where a GEMM made the mixes:
+    // DSV4_HC_WEIGHTS, DSV4_HC_PRE on its pre weights' view, and the RMS_NORM and MUL of the sublayer's norm in one
+    // launch (ggml_cuda_op_dsv4_hc_back_fused), where they were three that each read what the one before wrote: 90 sites
+    // of a 69-row decode of GLM-5.3. The values are the three launches', bit for bit.
+    // GGML_CUDA_HC_BACK_LEGACY=1 runs the nodes as before.
+    static const bool hc_back_legacy = ggml_env_switch("GGML_CUDA_HC_BACK_LEGACY");
+    if (!hc_back_legacy && node->op == GGML_OP_DSV4_HC_WEIGHTS && cuda_ctx->curr_stream_no == 0 &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        // the next node after j that is neither a view nor a no-op, or -1
+        auto next = [&](int j) {
+            if (j < 0) {
+                return -1;
+            }
+            for (++j; j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+            }
+            return j < cgraph->n_nodes ? j : -1;
+        };
+        const int i_pre = next(i);
+        const int i_rms = next(i_pre);
+        const int i_mul = next(i_rms);
+        if (i_mul >= 0) {
+            ggml_tensor * pre = cgraph->nodes[i_pre];
+            ggml_tensor * rms = cgraph->nodes[i_rms];
+            ggml_tensor * mul = cgraph->nodes[i_mul];
+            const ggml_op ops[]  = { GGML_OP_DSV4_HC_WEIGHTS, GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            const int     idxs[] = { i, i_pre, i_rms, i_mul };
+            const int     outs[] = { i, i_mul };
+            if (pre->op == GGML_OP_DSV4_HC_PRE && pre->src[1]->view_src == node && rms->op == GGML_OP_RMS_NORM &&
+                    rms->src[0] == pre && mul->op == GGML_OP_MUL && (mul->src[0] == rms) != (mul->src[1] == rms) &&
+                    ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, outs, 2) &&
+                    ggml_cuda_dsv4_hc_back_fused_supported(node, pre, rms, mul) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, i_mul - i + 1, outs, 2)) {
+                ggml_cuda_op_dsv4_hc_back_fused(*cuda_ctx, node, pre, rms, mul);
+                return i_mul - i;
+            }
+        }
+    }
+
     // A weightless RMS_NORM read only by a MUL_MAT that runs on mul_mat_vec_f (the hyper-connection mixes of DeepSeek V4
     // and GLM-5.3, hc_fn times the normalized streams): the matvec reads the norm's input and scales its dot products by
     // the norm's scale, one per column, so the normalized copy is neither written nor read.
