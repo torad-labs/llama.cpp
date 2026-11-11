@@ -391,6 +391,129 @@ static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_
     }
 }
 
+// The fused conv-state update for 2 to GGML_CUDA_SSM_CONV_UPDATE_MAX_SEQS sequences. A block is one group of
+// GGML_CUDA_SSM_CONV_UPDATE_THREADS channels and every sequence: a warp a sequence, a lane holding the group's channels
+// lane, lane + 32, lane + 64 and lane + 96. The ids are device data, and one sequence's state row may be the row another
+// sequence's snapshot writes (the graph gathers every row before any CPY), so every thread of the block reads its
+// state, the block meets at one barrier, and only then are snapshots written: a channel's bytes of every cache row
+// are read and written by its block alone. An output placed exactly on the inputs is read by its own thread before
+// that thread writes it. The joint q/k L2_NORM of the leading u.l2_heads groups needs no shared memory: a lane's four
+// channels are the four columns l2_norm_f32's lane sums, in its order, before the same warp reduction.
+// The two hints before the dependency wait bring the block's state columns and weights into L2 under the kernels
+// before this one (ggml_cuda_prefetch_l2: no result depends on them).
+template <bool apply_silu, int d_conv, int max_n_t>
+__launch_bounds__(GGML_CUDA_SSM_CONV_UPDATE_MAX_SEQS * WARP_SIZE)
+static __global__ void ssm_conv_state_update_seqs_f32(const ggml_cuda_ssm_conv_state_update u, const float * w,
+                                                      const int w_stride, float * dst, const int dst_stride,
+                                                      const int64_t dst_seq_stride, const int64_t snapshot_seq_stride,
+                                                      const int n_t, const bool state_prefetch, const bool w_prefetch) {
+    ggml_cuda_pdl_lc();
+    constexpr int width = GGML_CUDA_SSM_CONV_UPDATE_THREADS;
+    constexpr int cols  = width / WARP_SIZE; // channels a thread
+    const int s    = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int c0   = blockIdx.x * width + lane;
+
+    if (state_prefetch && lane == 0) {
+        ggml_cuda_prefetch_l2(u.cache + (int64_t) u.ids[s] * u.row_stride + (int64_t) blockIdx.x * width * (d_conv - 1),
+                              (int64_t) width * (d_conv - 1) * sizeof(float));
+    }
+    // the block's weights lie in one tensor: a group never straddles two of the three (the launcher checks the widths)
+    if (w_prefetch && threadIdx.x == 0) {
+        ggml_cuda_prefetch_l2(ssm_conv_w_row(u, w, w_stride, blockIdx.x * width), (int64_t) width * w_stride * sizeof(float));
+    }
+    ggml_cuda_pdl_sync();
+
+    const float * state = u.cache + (int64_t) u.ids[s] * u.row_stride;
+    float         st[cols][d_conv - 1];
+#pragma unroll
+    for (int q = 0; q < cols; ++q) {
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            st[q][j] = state[(int64_t) (c0 + q * WARP_SIZE) * (d_conv - 1) + j];
+        }
+    }
+    // every sequence's state of these channels is read: the snapshots may now overwrite any of their rows
+    __syncthreads();
+
+    const float * xs = u.x + (int64_t) s * u.x_seq_stride;
+    float *       ys = dst + (int64_t) s * dst_seq_stride;
+    float         y[cols][max_n_t];
+#pragma unroll
+    for (int q = 0; q < cols; ++q) {
+        const int c = c0 + q * WARP_SIZE;
+        float     x[d_conv - 1 + max_n_t];
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            x[j] = st[q][j];
+        }
+#pragma unroll
+        for (int t = 0; t < max_n_t; ++t) {
+            if (t < n_t) {
+                x[d_conv - 1 + t] = xs[t * u.x_stride + c];
+            }
+        }
+        const float * w_row = ssm_conv_w_row(u, w, w_stride, c);
+        float         wc[d_conv];
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            wc[j] = w_row[j];
+        }
+
+        // the same sum as ssm_conv_f32, including its zero bias (it turns a -0.0f sum into +0.0f)
+        const float b = 0.0f;
+#pragma unroll
+        for (int t = 0; t < max_n_t; ++t) {
+            if (t < n_t) {
+                float sumf = 0.0f;
+#pragma unroll
+                for (int j = 0; j < d_conv; ++j) {
+                    sumf += x[t + j] * wc[j];
+                }
+                sumf += b;
+                y[q][t] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+                ys[t * dst_stride + c] = y[q][t];
+            }
+        }
+
+        for (int k = 0; k < u.n_snapshots; ++k) {
+            float *   out = u.snapshot_dst[k] + (int64_t) s * snapshot_seq_stride + (int64_t) c * (d_conv - 1);
+            const int col = u.snapshot_col[k];
+            // a compile-time index per candidate column keeps x in registers
+#pragma unroll
+            for (int i = 0; i <= max_n_t; ++i) {
+                if (i == col) {
+#pragma unroll
+                    for (int j = 0; j < d_conv - 1; ++j) {
+                        out[j] = x[i + j];
+                    }
+                }
+            }
+        }
+    }
+
+    if ((int) blockIdx.x < u.l2_heads) { // uniform across the block
+#pragma unroll
+        for (int t = 0; t < max_n_t; ++t) {
+            if (t < n_t) {
+                float tmp = 0.0f;
+#pragma unroll
+                for (int q = 0; q < cols; ++q) {
+                    const float xi = y[q][t];
+                    tmp += xi * xi;
+                }
+                tmp = warp_reduce_sum(tmp);
+                const float scale = rsqrtf(fmaxf(tmp, u.l2_eps * u.l2_eps));
+                float *     out   = u.l2_dst + (((int64_t) s * n_t + t) * u.l2_heads + blockIdx.x) * width + lane;
+#pragma unroll
+                for (int q = 0; q < cols; ++q) {
+                    out[q * WARP_SIZE] = scale * y[q][t];
+                }
+            }
+        }
+    }
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
@@ -467,6 +590,36 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     // the chain ggml_cuda_try_ssm_conv_state_update matched: src0 (the CONCAT) was never written, the kernel builds it
     if (const ggml_cuda_ssm_conv_state_update * u = ctx.ssm_conv_updates().find(dst)) {
         constexpr int threads = GGML_CUDA_SSM_CONV_UPDATE_THREADS;
+        if (u->n_seqs > 1) {
+            GGML_ASSERT(!fuse_bias && nc == GGML_CUDA_SSM_CONV_UPDATE_D_CONV && n_s == u->n_seqs &&
+                        n_s <= GGML_CUDA_SSM_CONV_UPDATE_MAX_SEQS && nr % threads == 0 &&
+                        n_t <= GGML_CUDA_SSM_CONV_UPDATE_SEQS_N_T);
+            const ggml_cuda_kernel_launch_params launch_params(dim3(nr / threads), dim3(n_s * WARP_SIZE), 0, stream);
+            const int     w_stride            = src1->nb[1] / sizeof(float);
+            const int     dst_stride          = out->nb[1] / sizeof(float);
+            const int64_t dst_seq_stride      = out->nb[2] / sizeof(float);
+            const int64_t snapshot_seq_stride = (nc - 1) * nr;
+            // the one-sequence kernel's two switches: no hint for the state, none for the weights
+            static const bool state_prefetch = !ggml_env_switch("GGML_CUDA_SSM_CONV_STATE_PREFETCH_LEGACY");
+            static const bool w_hint         = !ggml_env_switch("GGML_CUDA_SSM_CONV_PREWAIT_LEGACY");
+            const bool        w_prefetch     = w_hint && u->w_seg_channels % threads == 0;
+            ggml_cuda_ssm_conv_state_update us = *u;
+            if (fuse_silu) {
+                // as below: the L2_NORM runs here only with the SILU fused, and only then is it skipped
+                if (const ggml_tensor * l2 = ctx.ssm_conv_updates().l2_norm_of(dst)) {
+                    ctx.ssm_conv_updates().skipped.insert(l2);
+                }
+                ggml_cuda_kernel_launch(ssm_conv_state_update_seqs_f32<true, GGML_CUDA_SSM_CONV_UPDATE_D_CONV, GGML_CUDA_SSM_CONV_UPDATE_SEQS_N_T>,
+                                        launch_params, us, src1_d, w_stride, dst_d, dst_stride, dst_seq_stride,
+                                        snapshot_seq_stride, (int) n_t, state_prefetch, w_prefetch);
+            } else {
+                us.l2_heads = 0;
+                ggml_cuda_kernel_launch(ssm_conv_state_update_seqs_f32<false, GGML_CUDA_SSM_CONV_UPDATE_D_CONV, GGML_CUDA_SSM_CONV_UPDATE_SEQS_N_T>,
+                                        launch_params, us, src1_d, w_stride, dst_d, dst_stride, dst_seq_stride,
+                                        snapshot_seq_stride, (int) n_t, state_prefetch, w_prefetch);
+            }
+            return;
+        }
         GGML_ASSERT(!fuse_bias && nc == GGML_CUDA_SSM_CONV_UPDATE_D_CONV && n_s == 1 && nr % threads == 0 &&
                     n_t <= GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T);
         const int nsm = ggml_cuda_info().devices[ctx.device].nsm;

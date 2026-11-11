@@ -4820,15 +4820,26 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
 
     const ggml_tensor * gr = cgraph->nodes[node_idx];
     if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-            !ggml_is_contiguous(gr) || gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1 ||
+            !ggml_is_contiguous(gr) || gr->ne[1] < 1 || gr->ne[2] != 1 || gr->ne[3] != 1 ||
             ggml_node_get_use_count(cgraph, node_idx) != 1) {
         return false;
     }
+    // More than one sequence: a kernel of its own (ssm_conv_state_update_seqs_f32), a warp a sequence and up to
+    // GGML_CUDA_SSM_CONV_UPDATE_SEQS_N_T new tokens, with no alpha/beta fold. At 23 sequences of 3 rows the chain was 7
+    // launches a KDA layer: the gather, the CONCAT, three snapshot CPYs, the conv and the q/k L2_NORM.
+    // GGML_CUDA_SSM_CONV_SEQS_LEGACY=1 keeps the chain there.
+    static const bool seqs_legacy = ggml_env_switch("GGML_CUDA_SSM_CONV_SEQS_LEGACY");
+    const int64_t     n_seqs      = gr->ne[1];
+    if (n_seqs > 1 && (seqs_legacy || n_seqs > GGML_CUDA_SSM_CONV_UPDATE_MAX_SEQS ||
+            ggml_cuda_info().devices[ctx.device].warp_size != WARP_SIZE)) {
+        return false;
+    }
+    const int64_t max_n_t = n_seqs > 1 ? GGML_CUDA_SSM_CONV_UPDATE_SEQS_N_T : GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T;
     const ggml_tensor * cache = gr->src[0];
     const ggml_tensor * ids   = gr->src[1];
     if (cache->type != GGML_TYPE_F32 || cache->data == nullptr || cache->ne[0] != gr->ne[0] ||
             cache->nb[0] != sizeof(float) || cache->nb[1] % sizeof(float) != 0 || ids->type != GGML_TYPE_I32 ||
-            ids->data == nullptr || !ggml_is_contiguous(ids) || ggml_nelements(ids) != 1) {
+            ids->data == nullptr || !ggml_is_contiguous(ids) || ggml_nelements(ids) != n_seqs) {
         return false;
     }
     const ggml_tensor * cache_base = cache->view_src ? cache->view_src : cache;
@@ -4863,15 +4874,16 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
             if (n->op == GGML_OP_CONCAT && n->src[0] == state) {
                 const ggml_tensor * xt = n->src[1];
                 if (ggml_get_op_params_i32(n, 0) != 0 || n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) ||
-                        (n->flags & GGML_TENSOR_FLAG_OUTPUT) || n->ne[2] != 1 || n->ne[3] != 1 ||
-                        state->ne[0] != d_conv - 1 || state->ne[1] != n->ne[1] || xt->op != GGML_OP_TRANSPOSE) {
+                        (n->flags & GGML_TENSOR_FLAG_OUTPUT) || n->ne[2] != n_seqs || n->ne[3] != 1 ||
+                        state->ne[0] != d_conv - 1 || state->ne[1] != n->ne[1] || state->ne[2] != n_seqs ||
+                        xt->op != GGML_OP_TRANSPOSE) {
                     return false;
                 }
                 x = xt->src[0];
                 const int64_t n_t = n->ne[0] - (d_conv - 1);
                 if (x->type != GGML_TYPE_F32 || x->data == nullptr || x->nb[0] != sizeof(float) ||
-                        x->nb[1] % sizeof(float) != 0 || x->ne[0] != n->ne[1] || x->ne[1] != n_t || x->ne[2] != 1 ||
-                        x->ne[3] != 1 || n_t < 1 || n_t > GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T ||
+                        x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0 || x->ne[0] != n->ne[1] ||
+                        x->ne[1] != n_t || x->ne[2] != n_seqs || x->ne[3] != 1 || n_t < 1 || n_t > max_n_t ||
                         n->ne[1] % GGML_CUDA_SSM_CONV_UPDATE_THREADS != 0) {
                     return false;
                 }
@@ -4891,11 +4903,26 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 }
                 if (src_idx == concat_idx || ggml_node_get_use_count(cgraph, src_idx) != 1 ||
                         cpys.size() == GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS || src->view_offs % sizeof(float) != 0 ||
-                        src->ne[0] != d_conv - 1 || src->ne[1] != concat->ne[1] || src->ne[2] != 1 ||
-                        src->nb[1] != concat->nb[1] || col + (d_conv - 1) > (size_t) concat->ne[0] ||
+                        src->ne[0] != d_conv - 1 || src->ne[1] != concat->ne[1] || src->ne[2] != n_seqs ||
+                        src->nb[1] != concat->nb[1] || src->nb[2] != concat->nb[2] ||
+                        col + (d_conv - 1) > (size_t) concat->ne[0] ||
                         !touches_cache(dst) || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
                         !ggml_is_contiguous(dst) || ggml_nelements(dst) != ggml_nelements(src)) {
                     return false;
+                }
+                // A destination is whole rows of the cache: a thread reads and writes its own channels of a row, so a
+                // snapshot landing on a gathered row is written after that row was read. At more than one sequence
+                // the rows are packed, as the kernel steps a sequence's destination, and no two destinations share a
+                // row: a warp writes a sequence's rows, and the CPYs' order would be lost between warps.
+                const ptrdiff_t dst_off = (const char *) dst->data - (const char *) cache->data;
+                if (dst_off % (ptrdiff_t) cache->nb[1] != 0 ||
+                        (n_seqs > 1 && cache->nb[1] != cache->ne[0] * sizeof(float))) {
+                    return false;
+                }
+                for (const ggml_tensor * c : cpys) {
+                    if (n_seqs > 1 && ggml_cuda_ranges_overlap(c->src[1], dst)) {
+                        return false;
+                    }
                 }
                 u.snapshot_dst[cpys.size()] = (float *) dst->data;
                 u.snapshot_col[cpys.size()] = (int) col;
@@ -4906,7 +4933,7 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 const ggml_tensor * w = n->src[1];
                 // the SSM_CONV reads the CONCAT; the snapshot VIEWs the rest of its readers, no other
                 if (w->type != GGML_TYPE_F32 || w->ne[0] != d_conv || w->nb[0] != sizeof(float) ||
-                        w->nb[1] % sizeof(float) != 0 || n->type != GGML_TYPE_F32 || n->ne[2] != 1 ||
+                        w->nb[1] % sizeof(float) != 0 || n->type != GGML_TYPE_F32 || n->ne[2] != n_seqs ||
                         ggml_node_get_use_count(cgraph, j) != 1 || j + 1 >= cgraph->n_nodes ||
                         cgraph->nodes[j + 1]->op != GGML_OP_UNARY ||
                         ggml_get_unary_op(cgraph->nodes[j + 1]) != GGML_UNARY_OP_SILU ||
@@ -4918,7 +4945,8 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 // other overlap would have a thread overwrite another's inputs, and none may touch ids
                 const ggml_tensor * outs[] = { n, cgraph->nodes[j + 1] };
                 for (const ggml_tensor * out : outs) {
-                    if ((ggml_cuda_ranges_overlap(out, x) && !(out->data == x->data && out->nb[1] == x->nb[1])) ||
+                    if ((ggml_cuda_ranges_overlap(out, x) &&
+                            !(out->data == x->data && out->nb[1] == x->nb[1] && out->nb[2] == x->nb[2])) ||
                             ggml_cuda_ranges_overlap(out, ids)) {
                         return false;
                     }
@@ -4936,6 +4964,8 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 u.row_stride  = cache->nb[1] / sizeof(float);
                 u.x           = (const float *) x->data;
                 u.x_stride    = x->nb[1] / sizeof(float);
+                u.n_seqs       = (int) n_seqs;
+                u.x_seq_stride = x->nb[2] / sizeof(float);
                 u.n_snapshots = (int) cpys.size();
 
                 // Qwen3.5's joint q/k L2_NORM, the first node after the SILU that is not a view: a view of the leading
@@ -4955,7 +4985,8 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                     const bool ok = qk->op == GGML_OP_VIEW && qk->view_src == silu && qk->view_offs == 0 &&
                             qk->ne[0] == width && qk->nb[1] == width * sizeof(float) && qk->nb[2] == silu->nb[1] &&
                             qk->ne[1] * width <= concat->ne[1] && qk->ne[2] == concat->ne[0] - (d_conv - 1) &&
-                            qk->ne[3] == 1 && l2->type == GGML_TYPE_F32 && ggml_is_contiguous(l2) &&
+                            qk->ne[3] == n_seqs && (n_seqs == 1 || qk->nb[3] == silu->nb[2]) &&
+                            l2->type == GGML_TYPE_F32 && ggml_is_contiguous(l2) &&
                             !(l2->flags & GGML_TENSOR_FLAG_OUTPUT) && !ggml_cuda_ranges_overlap(l2, x) &&
                             !ggml_cuda_ranges_overlap(l2, ids) && !ggml_cuda_ranges_overlap(l2, n) &&
                             !ggml_cuda_ranges_overlap(l2, silu);
@@ -4967,7 +4998,9 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                     }
                 }
 
-                ggml_cuda_try_ssm_conv_ab(ctx, cgraph, j, concat, x, ids, ctx.ssm_conv_updates().l2_norm_of(n), u);
+                if (n_seqs == 1) {
+                    ggml_cuda_try_ssm_conv_ab(ctx, cgraph, j, concat, x, ids, ctx.ssm_conv_updates().l2_norm_of(n), u);
+                }
 
                 auto & reg = ctx.ssm_conv_updates();
                 reg.updates.emplace(n, u);
