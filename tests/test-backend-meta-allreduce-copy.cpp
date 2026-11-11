@@ -250,11 +250,22 @@ static constexpr int64_t q8_block_bytes = 36;
 // falls short of a, one down where d*127 is infinite. An element is d times its count of steps, the nearest integer to
 // x/d, ties to even, within +-127, so a count of zero gives +0. Each division and product is one F32 operation, none
 // merged with another, as the kernels keep theirs. False where an element lands more than half a step from the share's.
+// A block that holds a NaN or an infinity crosses as NaN in every element, and is not held to the half step.
+static bool not_finite(float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    return (bits & 0x7fffffffu) >= 0x7f800000u;
+}
+
 static bool q8_wire_values(std::vector<float> & x) {
     bool ok = true;
     const int64_t ne = (int64_t) x.size();
     for (int64_t begin = 0; begin < ne; begin += q8_block_elems) {
         const int64_t end = std::min(ne, begin + q8_block_elems);
+        if (std::any_of(x.begin() + begin, x.begin() + end, not_finite)) {
+            std::fill(x.begin() + begin, x.begin() + end, NAN);
+            continue;
+        }
         float a = 0.0f;
         for (int64_t j = begin; j < end; ++j) { a = std::max(a, fabsf(x[j])); }
         volatile float d_rounded = a/127.0f;
@@ -279,6 +290,24 @@ static bool q8_wire_values(std::vector<float> & x) {
         }
     }
     return ok;
+}
+
+// Bit for bit, but a NaN equals any NaN: the host's sum keeps an operand's NaN and a card's gives its own.
+static bool same_values(const std::vector<float> & a, const std::vector<float> & b) {
+    if (memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0) {
+        return true;
+    }
+    const auto is_nan = [](float v) {
+        uint32_t bits;
+        memcpy(&bits, &v, sizeof(bits));
+        return (bits & 0x7fffffffu) > 0x7f800000u;
+    };
+    for (size_t j = 0; j < a.size(); ++j) {
+        if (memcmp(&a[j], &b[j], sizeof(float)) != 0 && !(is_nan(a[j]) && is_nan(b[j]))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Several gathers in one graph, followed by replay with new data, exercise the shared parity ring across captures.
@@ -459,10 +488,16 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                 // and cancel; one of zeros on every other rank; one with its range in a single element; one of whole
                 // counts of the smallest subnormal, whose step rounds to zero before it is raised; one across the
                 // smallest normal, whose step is subnormal; and one where a rank holds the largest finite value and no
-                // other rank adds to it.
-                const auto value_q8 = [](int rank, int64_t j, int iteration) {
+                // other rank adds to it. In iterations 1 and 3 one block in three starts with a NaN or an infinity on
+                // one rank, the vector's last block among them at some sizes: the block's sum is NaN on every rank and
+                // the blocks beside it are as without it. Iteration 3 leaves one rank out, with what it holds.
+                const auto value_q8 = [n](int rank, int64_t j, int iteration) {
                     if (iteration == 6 && rank >= 2) { return 0.0f; }
                     const int64_t block = j/q8_block_elems;
+                    if ((iteration == 1 || iteration == 3) && block % 3 == 0 && j % q8_block_elems == 0 &&
+                            rank == (int) (block/3 % n)) {
+                        return block/3 % 2 == 0 ? NAN : block/3 % 4 == 1 ? INFINITY : -INFINITY;
+                    }
                     const int     k     = (int) ((j*13 + rank*7 + iteration) % 41) - 20;
                     const float   v     = ldexpf((float) k / 7.0f, (int) ((block + rank) % 9) - 4);
                     switch ((block + iteration) % 8) {
@@ -482,8 +517,9 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                         tensors[rank]->flags = active ? GGML_TENSOR_FLAG_COMPUTE : 0;
                         if (q8) {
                             for (int64_t j = 0; j < ne; ++j) {
+                                // a rank left out holds NaNs and infinities too, and none of it reaches the sum
                                 const float v = value_q8(rank, j, iteration);
-                                input[j] = active ? v : 12345.0f;
+                                input[j] = active ? v : j % 5 == 0 ? NAN : j % 5 == 1 ? INFINITY : 12345.0f;
                                 share[j] = active ? v : 0.0f;
                             }
                             if (!q8_wire_values(share)) {
@@ -513,12 +549,12 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                     for (auto backend : backends) { ggml_backend_synchronize(backend); }
                     for (int rank = 0; rank < n && ran; ++rank) {
                         ggml_backend_tensor_get(tensors[rank], output.data(), 0, output.size()*sizeof(float));
-                        const bool same = memcmp(output.data(), expected.data(), output.size()*sizeof(float)) == 0;
+                        const bool same = same_values(output, expected);
                         if (!same) { fprintf(stderr, "FAIL: %s %s ne=%lld iteration=%d rank=%d vs ordered sum\n",
                                              route.name, wire_name, (long long) ne, iteration, rank); }
                         case_ok = case_ok && same;
                         if (rank == 0) { first = output; }
-                        else { case_ok = case_ok && memcmp(first.data(), output.data(), output.size()*sizeof(float)) == 0; }
+                        else { case_ok = case_ok && same_values(first, output); }
                     }
                     if (iteration == 6) {
                         // The same two contributions plus zero-valued ranks must retain the two-device result.
