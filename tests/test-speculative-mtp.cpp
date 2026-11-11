@@ -1760,6 +1760,148 @@ static bool test_output_candidates(llama_model * model) {
     return finish(true);
 }
 
+static bool test_packed_candidates(const std::vector<ggml_backend_dev_t> & devices = {}) {
+    constexpr int n_seq = 6;
+    constexpr int n_seq_max = 8;
+    constexpr int width = 2;
+    for (int n_hot : {7, 63}) {
+        auto model = glm_model(1234, devices, devices.empty() ? LLAMA_SPLIT_MODE_LAYER : LLAMA_SPLIT_MODE_TENSOR);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        std::vector<llama_token> hot(n_vocab);
+        std::iota(hot.begin(), hot.end(), 0);
+        std::mt19937 rng(1729);
+        std::shuffle(hot.begin(), hot.end(), rng);
+        hot.resize(n_hot);
+        std::sort(hot.begin(), hot.end());
+        if (!llama_model_set_draft_vocab(model.get(), hot.data(), hot.size())) {
+            return fail("packed candidates vocabulary failed");
+        }
+        // Equal finite logits and all-NaN hot logits must still rank the cold -infinity tokens correctly.
+        if (n_hot == 7) {
+            std::vector<float> weights(ggml_nelements(model->output_draft), 0.0f);
+            ggml_backend_tensor_set(model->output_draft, weights.data(), 0, weights.size()*sizeof(float));
+        }
+        for (uint32_t n_ubatch : {4u, 32u}) {
+            auto params = llama_context_default_params();
+            params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            params.n_ctx = n_seq_max*128;
+            params.n_seq_max = n_seq_max;
+            params.n_batch = 32;
+            params.n_ubatch = n_ubatch;
+            params.n_outputs_max = n_seq*width;
+            params.n_outputs_max_per_seq = width;
+            params.n_threads = params.n_threads_batch = 4;
+            params.kv_unified = false;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            llama_context_ptr reference(llama_init_from_model(model.get(), params));
+            llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+            if (!reference || !ctx) { return fail("packed candidates context failed"); }
+            for (int k : {1, 10, n_vocab + 5, 0}) {
+                llama_set_output_candidates(ctx.get(), k);
+                for (int round = 0; round < 5; ++round) {
+                    llama_batch batch = llama_batch_init(n_seq*width, 0, 1);
+                    std::vector<float> hidden(n_seq*width*llama_model_n_embd(model.get()));
+                    for (auto & h : hidden) {
+                        h = round == 4 ? std::numeric_limits<float>::quiet_NaN() : float(int(rng()%101) - 50)/100;
+                    }
+                    for (int i = 0; i < n_seq; ++i) {
+                        const int s = (n_seq - 1 - i + round) % n_seq_max;
+                        const bool eligible = k > 0 && round != 2 && (round != 1 || s % 2 != 0);
+                        llama_set_seq_candidates(ctx.get(), s, eligible);
+                        for (int p = 0; p < width; ++p) {
+                            common_batch_add(batch, (s*7 + p + round) % n_vocab, p, {s}, true);
+                        }
+                    }
+                    batch.embd = hidden.data();
+                    const auto finish = [&](bool result) {
+                        batch.embd = nullptr;
+                        llama_batch_free(batch);
+                        return result;
+                    };
+                    llama_memory_clear(llama_get_memory(reference.get()), true);
+                    llama_memory_clear(llama_get_memory(ctx.get()), true);
+                    if (llama_decode(reference.get(), batch) || llama_decode(ctx.get(), batch)) {
+                        return finish(fail("packed candidates decode failed"));
+                    }
+                    // Read in reverse order, then again, to cover both record merging and cached cuts.
+                    for (int pass = 0; pass < 2; ++pass) {
+                        for (int i = batch.n_tokens - 1; i >= 0; --i) {
+                            const float * whole = llama_get_logits_ith(reference.get(), i);
+                            const auto row = llama_get_sampling_row_ith(ctx.get(), i);
+                            const int s = batch.seq_id[i][0];
+                            const bool eligible = k > 0 && round != 2 && (round != 1 || s % 2 != 0);
+                            if (!eligible) {
+                                if (!row.logits || memcmp(row.logits, whole, n_vocab*sizeof(float))) {
+                                    return finish(fail("packed candidates lost a whole row"));
+                                }
+                                continue;
+                            }
+                            std::vector<llama_token_data> expected;
+                            for (llama_token id = 0; id < n_vocab; ++id) {
+                                const float value = std::isnan(whole[id]) ? std::numeric_limits<float>::quiet_NaN() :
+                                                    whole[id] == 0.0f ? 0.0f : whole[id];
+                                expected.push_back({id, value, 0.0f});
+                            }
+                            std::sort(expected.begin(), expected.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                                if (std::isnan(a.logit) != std::isnan(b.logit)) { return !std::isnan(a.logit); }
+                                return a.logit > b.logit || (!(a.logit < b.logit) && a.id < b.id);
+                            });
+                            expected.resize(std::min(k, n_vocab));
+                            if (row.logits || row.token != LLAMA_TOKEN_NULL || row.n_candidates != expected.size() ||
+                                    row.n_sampled_logits != expected.size()) {
+                                return finish(fail("packed candidate row has the wrong shape"));
+                            }
+                            for (size_t c = 0; c < expected.size(); ++c) {
+                                if (row.candidates[c] != expected[c].id ||
+                                        memcmp(&row.sampled_logits[c], &expected[c].logit, sizeof(float))) {
+                                    fprintf(stderr, "packed: hot=%d ubatch=%u k=%d round=%d row=%d candidate=%zu got=%d/%g expected=%d/%g\n",
+                                            n_hot, n_ubatch, k, round, i, c, row.candidates[c], row.sampled_logits[c],
+                                            expected[c].id, expected[c].logit);
+                                    return finish(fail("packed candidates differ from the whole-row cut"));
+                                }
+                            }
+                        }
+                    }
+                    finish(true);
+                }
+            }
+
+            std::vector<llama_sampler_ptr> samplers[2];
+            std::vector<llama_sampler_seq_config> configs[2];
+            llama_context_ptr sampled[2];
+            for (int side = 0; side < 2; ++side) {
+                for (int s = 0; s < n_seq; ++s) {
+                    samplers[side].emplace_back(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                    llama_sampler_chain_add(samplers[side].back().get(), llama_sampler_init_greedy());
+                    configs[side].push_back({s, samplers[side].back().get()});
+                }
+                params.samplers = configs[side].data();
+                params.n_samplers = configs[side].size();
+                sampled[side].reset(llama_init_from_model(model.get(), params));
+                if (!sampled[side]) { return fail("packed sampler context failed"); }
+                llama_set_output_candidates(sampled[side].get(), side ? 10 : 0);
+                for (int s = 0; s < n_seq; ++s) { llama_set_seq_candidates(sampled[side].get(), s, true); }
+            }
+            llama_batch batch = llama_batch_init(n_seq, 0, 1);
+            std::vector<float> hidden(n_seq*llama_model_n_embd(model.get()), 0.1f);
+            for (int s = n_seq - 1; s >= 0; --s) {
+                common_batch_add(batch, s*7, 0, {s}, true);
+            }
+            batch.embd = hidden.data();
+            bool ok = llama_decode(sampled[0].get(), batch) == 0 && llama_decode(sampled[1].get(), batch) == 0;
+            for (int i = 0; ok && i < n_seq; ++i) {
+                const auto expected = llama_get_sampling_row_ith(sampled[0].get(), i);
+                const auto actual = llama_get_sampling_row_ith(sampled[1].get(), i);
+                ok = expected.token != LLAMA_TOKEN_NULL && actual.token == expected.token;
+            }
+            batch.embd = nullptr;
+            llama_batch_free(batch);
+            if (!ok) { return fail("packed candidates changed backend sampling"); }
+        }
+    }
+    return true;
+}
+
 static bool test_sampler_graphs(llama_model * model) {
     constexpr int n_seq = 4;
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -2330,6 +2472,18 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
     try {
+        if (argc == 3 && strcmp(argv[1], "--packed-device") == 0) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> devices;
+            for (const auto & name : string_split(argv[2], ",")) {
+                auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) { throw std::runtime_error("unknown packed candidates device " + name); }
+                devices.push_back(device);
+            }
+            ok = test_packed_candidates(devices);
+            llama_backend_free();
+            return ok ? 0 : 1;
+        }
         if (argc == 3 && strcmp(argv[1], "--dp-device") == 0) {
             ggml_backend_load_all();
             std::vector<ggml_backend_dev_t> devices;
@@ -2354,7 +2508,7 @@ int main(int argc, char ** argv) {
             return ok ? 0 : 1;
         }
         const std::string requested = argc == 3 && strcmp(argv[1], "--test") == 0 ? argv[2] : "";
-        if (argc != 1 && requested.empty()) { throw std::runtime_error("usage: test-speculative-mtp [--dp-device CPU|CUDA0,CUDA1,... | --test NAME]"); }
+        if (argc != 1 && requested.empty()) { throw std::runtime_error("usage: test-speculative-mtp [--dp-device CPU|CUDA0,CUDA1,... | --packed-device CPU|CUDA0,CUDA1,... | --test NAME]"); }
         // These model histories assert the fixed-cost policy; synthetic tests cover measured service costs.
         set_env("LLAMA_MTP_TIMING_LEGACY", "1");
         auto model = glm_model(1234);
@@ -2365,6 +2519,7 @@ int main(int argc, char ** argv) {
             { "prepared-weights", test_prepared_weights },
             { "graph-shapes", test_graph_shapes },
             { "candidates", test_output_candidates },
+            { "packed-candidates", [](llama_model *) { return test_packed_candidates(); } },
             { "service-timing", test_service_timing },
             { "timed-driver", test_timed_driver },
             { "baseline",  test_baseline  },
