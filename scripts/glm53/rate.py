@@ -40,8 +40,10 @@ def session(args, index, barrier):
     messages = [{"role": "system", "content": "You are a software engineering assistant."},
                 {"role": "user", "content": f"Session {index}. {task} Be thorough and complete."}]
     prompt = post(args.url, "/apply-template", {"messages": messages}, args.timeout)["prompt"]
-    body = {"prompt": prompt, "n_predict": args.tokens, "cache_prompt": False, "seed": 530 + index,
-            "temperature": 0.0 if args.greedy else 1.0, "top_p": 0.95, "repeat_penalty": 1.1, "repeat_last_n": 256}
+    body = {"prompt": prompt, "n_predict": args.tokens, "cache_prompt": False, "seed": 530 + index}
+    if not args.server_sampling:
+        body.update({"temperature": 0.0 if args.greedy else 1.0, "top_p": 0.95, "repeat_penalty": 1.1,
+                     "repeat_last_n": 256})
     barrier.wait(timeout=args.timeout)
     return post(args.url, "/completion", body, args.timeout)["timings"]
 
@@ -70,6 +72,10 @@ def main():
     parser.add_argument("--sessions", type=int, nargs="+", default=[23], help="Session counts, each read in turn")
     parser.add_argument("--tokens", type=int, default=256, help="Tokens each session decodes")
     parser.add_argument("--greedy", action="store_true", help="Temperature 0 in place of temperature 1, top-p 0.95")
+    parser.add_argument("--server-sampling", action="store_true",
+                        help="Send no sampling fields: the server's own sampling, what a client that sets none "
+                             "(Claude Code) is served with; the other reads send temperature 1, top-p 0.95 and a "
+                             "repeat penalty of 1.1 over 256 tokens")
     parser.add_argument("--timeout", type=float, default=600)
     args = parser.parse_args()
     for sessions in args.sessions:
