@@ -5772,6 +5772,28 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// The packed Q8 draft head, with persistent weights as in the model.
+struct test_glm_q8_head : public test_mul_mat {
+    test_glm_q8_head(int64_t rows, int64_t columns)
+        : test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, rows, columns, 4096, {1, 1}, {1, 1}) {}
+
+    bool use_weight_context() override { return true; }
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override { return "GLM_Q8_HEAD"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, nullptr); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx_weights ? ctx_weights : ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, k, n);
+        ggml_set_name(a, "output_draft.weight");
+        ggml_set_name(b, "head_input");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "head_logits");
+        return out;
+    }
+};
+
 // MUL_MAT on PQ2_0 blocks written directly (init_tensor_pq2_raw): every code, block scales over two decades
 struct test_mul_mat_pq2_raw : public test_mul_mat {
     test_mul_mat_pq2_raw(int64_t m, int64_t n, int64_t k)
@@ -8435,20 +8457,22 @@ struct test_moe_weighted_sum : public test_case {
 // (GGML_CUDA_PQ2_MMA_GROUP_LEGACY=1: one launch each). Every matrix's output is checked, and the row counts put partial
 // tiles inside the launch's tile sequence, where a tile read or written against the wrong matrix shows.
 struct test_mul_mat_group : public test_case {
+    const ggml_type type;
     const std::vector<int64_t> rows; // each matrix's
     const int64_t n;                 // columns
     const int64_t k;
 
     std::vector<ggml_tensor *> mms;
 
-    test_mul_mat_group(std::vector<int64_t> rows, int64_t n, int64_t k) : rows(std::move(rows)), n(n), k(k) {}
+    test_mul_mat_group(std::vector<int64_t> rows, int64_t n, int64_t k, ggml_type type = GGML_TYPE_PQ2_0)
+        : type(type), rows(std::move(rows)), n(n), k(k) {}
 
     std::string vars() override {
         std::string r;
         for (size_t i = 0; i < rows.size(); ++i) {
             r += (i > 0 ? "," : "") + std::to_string(rows[i]);
         }
-        return "rows=[" + r + "]," + VARS_TO_STR2(n, k);
+        return "rows=[" + r + "]," + VARS_TO_STR3(n, k, type);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8465,7 +8489,7 @@ struct test_mul_mat_group : public test_case {
         ggml_set_name(x, "x");
         mms.clear();
         for (size_t i = 0; i < rows.size(); ++i) {
-            ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_PQ2_0, k, rows[i]);
+            ggml_tensor * w  = ggml_new_tensor_2d(ctx, type, k, rows[i]);
             ggml_tensor * mm = ggml_mul_mat(ctx, w, x);
             ggml_format_name(mm, "mm%zu", i);
             mms.push_back(mm);
@@ -10755,9 +10779,31 @@ static const ggml_type other_types[] = {
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    // Shared preparation must keep mixed row tails, strided inputs and in-place updates independent.
+    for (int64_t n : {9, 23, 24, 48, 69}) {
+        for (int64_t k : {256, 4096}) {
+            cases.emplace_back(new test_mul_mat_group({64, 128, 256}, n, k, GGML_TYPE_Q8_0));
+            cases.emplace_back(new test_mul_mat_group({128, 64, 256}, n, k, GGML_TYPE_Q8_0));
+            for (bool overwrite : {false, true}) {
+                for (bool strided : {false, true}) {
+                    cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_Q8_0, n, k, overwrite, strided, false));
+                }
+            }
+        }
+    }
+    for (int64_t n : {23, 69}) {
+        cases.emplace_back(new test_mul_mat_group({2048, 2048}, n, 4096, GGML_TYPE_Q8_0));
+        cases.emplace_back(new test_mul_mat_group({2048, 2048, 2048}, n, 4096, GGML_TYPE_Q8_0));
+        cases.emplace_back(new test_mul_mat_group({1536, 512, 128}, n, 4096, GGML_TYPE_Q8_0));
+    }
+    for (int64_t n : {9, 23, 69}) {
+        for (int64_t m : {24576, 49152, 98304}) {
+            cases.emplace_back(new test_glm_q8_head(m, n));
+        }
+    }
     // Decode, draft and one/two/three-slot n_max=2 verification. Include the
     // M=9 MMQ boundary, 36-session MTP verification and full/trimmed vocabulary shards, not just M=1.
-    for (int64_t n : {1, 2, 3, 6, 9, 27}) {
+    for (int64_t n : {1, 2, 3, 6, 9, 23, 27}) {
         for (int64_t m : {512, 1536, 2048, 4096, 8192, 16384, 32768, 77440}) {
             cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 4096, {1, 1}, {1, 1}));
         }

@@ -5883,6 +5883,75 @@ static bool ggml_cuda_can_share_mmq_id(const ggml_tensor * a, const ggml_tensor 
     return !overlaps(a, b) && (!clamp || !overlaps(b, clamp));
 }
 
+static int ggml_cuda_try_share_mmq_q8(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_MMQ_SHARED_Q8_LEGACY");
+    const ggml_tensor * first = cgraph->nodes[i];
+    if (legacy || first->op != GGML_OP_MUL_MAT || !first->src[1] || ctx.curr_stream_no != 0 ||
+            !ctx.stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_tensor * x = first->src[1];
+    const auto eligible = [&](const ggml_tensor * mm) {
+        if (mm->op != GGML_OP_MUL_MAT || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                mm->src[1] != x || !mm->src[0] || ggml_get_op_params_i32(mm, 1) != 0 ||
+                mm->src[0]->type != GGML_TYPE_Q8_0 || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(mm->src[0]) || !ggml_is_contiguous(x) || !ggml_is_contiguous(mm) ||
+                ggml_cuda_should_use_mmvq(GGML_TYPE_Q8_0, cc, x->ne[1]) ||
+                !ggml_cuda_should_use_mmq(GGML_TYPE_Q8_0, cc, x->ne[1], 0)) {
+            return false;
+        }
+        const ggml_tensor * tensors[] = { mm->src[0], x, mm };
+        for (const ggml_tensor * t : tensors) {
+            if (!t->data || !t->buffer || !ggml_backend_buffer_is_cuda(t->buffer)) {
+                return false;
+            }
+        }
+        const ggml_tensor * w = mm->src[0];
+        return !(w->view_src && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                 ggml_backend_buffer_get_alloc_size(w->buffer, w) != ggml_nbytes(w));
+    };
+
+    constexpr int max_readers = 3;
+    const ggml_op ops[max_readers] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+    const int outputs[max_readers] = { i, i + 1, i + 2 };
+    int count = 0;
+    size_t q8_bytes = 0;
+    while (count < max_readers && i + count < cgraph->n_nodes && eligible(cgraph->nodes[i + count])) {
+        const ggml_tensor * mm = cgraph->nodes[i + count++];
+        // Row-tail kernels can need different padding for the same input.
+        q8_bytes = std::max(q8_bytes, ggml_cuda_mul_mat_q_q8_size(mm->src[0], x));
+    }
+    if (count < 2 || !ggml_can_fuse_subgraph(cgraph, i, count, ops, outputs, count)) {
+        return 0;
+    }
+
+    const auto overlaps = [](const ggml_tensor * dst, const ggml_tensor * src) {
+        const uintptr_t d = (uintptr_t) dst->data;
+        const uintptr_t s = (uintptr_t) src->data;
+        const size_t dn = ggml_nbytes(dst);
+        const size_t sn = ggml_backend_buffer_get_alloc_size(src->buffer, src);
+        return d <= s ? s - d < dn : d - s < sn;
+    };
+    for (int a = 0; a < count; ++a) {
+        const ggml_tensor * dst = cgraph->nodes[i + a];
+        if (overlaps(dst, x)) { return 0; }
+        for (int b = 0; b < count; ++b) {
+            const ggml_tensor * other = cgraph->nodes[i + b];
+            if (overlaps(dst, other->src[0]) || (a != b && overlaps(dst, other))) { return 0; }
+        }
+    }
+
+    // Scratch lives through every reader's enqueue; the MMQ arithmetic is unchanged.
+    ggml_cuda_pool_alloc<char> q8(ctx.pool(), q8_bytes);
+    for (int j = 0; j < count; ++j) {
+        ggml_tensor * mm = cgraph->nodes[i + j];
+        ggml_cuda_mul_mat_q(ctx, mm->src[0], x, nullptr, mm, nullptr, nullptr, nullptr, q8.get(), j == 0);
+    }
+    return count - 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, bool allow_mmq_pair) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5943,6 +6012,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
         if (partitioned) { return 0; }
+    }
+
+    if (allow_mmq_pair) {
+        const int skipped = ggml_cuda_try_share_mmq_q8(*cuda_ctx, cgraph, i);
+        if (skipped) { return skipped; }
     }
 
     // GB10 prefill: apply SWIGLU while quantizing the activation consumed by the
