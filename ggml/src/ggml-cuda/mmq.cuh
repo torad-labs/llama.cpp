@@ -249,7 +249,7 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         }
         return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
     }
-    if (cc == GGML_CUDA_CC_DGX_SPARK) {
+    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return ggml_cuda_mmq_get_config_gb10(type, J, fallback);
     }
     if (blackwell_mma_available(cc)) {
