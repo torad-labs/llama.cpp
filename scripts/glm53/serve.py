@@ -63,6 +63,9 @@ def arguments(argv=None):
     parser.add_argument("--dflash-depth", type=int, help="Tokens the DFlash draft drafts a step: its block size less the anchor row (required with --dflash)")
     parser.add_argument("--backend-sampling", action="store_true", help="tensor-4: sample on the cards (dp-4 always does)")
     parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
+    parser.add_argument("--reduction-wire", choices=["q8", "bf16"],
+                        help="tensor-4: what a card's share of a reduction crosses to the others as (default: q8, 8-bit "
+                             "blocks; bf16 is the engine's own)")
     parser.add_argument("--diagnostic-ubatch", type=int, choices=[128, 512],
                         help="Explicit numerical-control microbatch for DP; it never changes the serving default")
     parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP; 0 removes the cap")
@@ -106,8 +109,8 @@ def make_plan(args):
         raise ValueError("dp-4 is measured at MTP depth 1 and 2")
     if not 0 <= args.mtp_adaptive <= 1:
         raise ValueError("mtp-adaptive is a share of a round, 0..1")
-    if (args.dflash or args.backend_sampling) and not four:
-        raise ValueError("dflash and backend-sampling are supported only with --profile tensor-4")
+    if (args.dflash or args.backend_sampling or args.reduction_wire) and not four:
+        raise ValueError("dflash, backend-sampling and reduction-wire are supported only with --profile tensor-4")
     if (args.dflash is None) != (args.dflash_depth is None) or args.dflash_depth is not None and args.dflash_depth < 1:
         raise ValueError("dflash and a positive dflash-depth are given together")
     if args.kv_host:
@@ -137,6 +140,12 @@ def make_plan(args):
         argv += ["-fit", "off", "-cts", "q8_0", "--backend-sampling", "--prompt-chunk", "128"]
     elif args.backend_sampling:
         argv += ["--backend-sampling"]
+    if four:
+        # Prompts are read in whole chunks, in an eval of their own after the step's replies: one forward pass of the
+        # model, where prompt tokens shared out beside the replies are two or more. Fixture, 23 sessions of Claude
+        # Code's sizes (Nov 11, 2026): every prompt-carrying eval is one pass and the run takes 80.2 s, against 2.3
+        # passes an eval and 84.2 s with equal shares and no chunk.
+        argv += ["--prompt-chunk", "128"]
     if args.dflash:
         # the draft is one small model reading the target's layer inputs: whole on the first card, never split four ways
         argv += ["--spec-type", "draft-dflash", "--spec-draft-model", own_path(args.dflash),
@@ -165,6 +174,24 @@ def make_plan(args):
                     "GGML_CUDA_GRAPH_IDLE_MS": "0"})
     if not dp:
         env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
+    if four:
+        # The cards' reductions go through the copy engines and host memory. On two of the three four-card hosts read
+        # (Nov 11, 2026) the engine's own routes, whose kernels store into a peer's memory, ran the server at 15.8 and
+        # 13.4 to 14.7 tok/s a session where this route ran it at 33.0 and 42.8; on the third (Nov 10) a reduction took
+        # 105 us on the engine's route and 109 on this one.
+        env.update({"GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0", "GGML_CUDA_AR_COPY_THRESHOLD": "1",
+                    "GGML_CUDA_AR_COPY_PEER": "0", "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0"})
+        # A share crosses in 8-bit blocks, 36 bytes to 32 elements where the BF16 wire takes 64: a 69-row target decode
+        # is 40.2 ms against 42.5, a session 45.7 tok/s against 42.8. Against an F32 wire's logits on the pack (8,192
+        # tokens) the mean KLD is 0.0141 where the BF16 wire's is 0.0145. A block that holds a NaN or an infinity
+        # crosses as NaN in all 32 elements, where the BF16 wire carries the one.
+        if args.reduction_wire != "bf16":
+            env["GGML_CUDA_AR_WIRE_Q8"] = "1"
+        # A graph is kept by its shape whichever sessions are in it, 128 a context, and a CUDA executable is not given
+        # back while the server idles between turns: the steps sessions end in are built once, not every pass. A card
+        # that fills gives the graphs used least recently back (LLAMA_GRAPH_DEVICE_RESERVE_MIB).
+        env.update({"LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": "128", "GGML_META_CAPTURE_GRAPHS": "132",
+                    "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000"})
     if four and not args.dflash and args.mtp_depth != "off":
         # The MTP head proposes with the session's own sampler and the noise the target will draw with. A reply's
         # tokens are samples of the same distribution, though a seed's reply is another than without it. Four RTX PRO
