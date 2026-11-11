@@ -936,6 +936,13 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            // a buffer type used again later shares this buffer: a failed allocation below returns before those entries
+            // are pointed at the new one, and they must not keep the freed one
+            for (int k = i + 1; k < galloc->n_buffers; k++) {
+                if (galloc->buffers[k] == galloc->buffers[i]) {
+                    galloc->buffers[k] = NULL;
+                }
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
@@ -1015,6 +1022,17 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    // a reserve that could not allocate a buffer wrote its plan and left no buffer: a graph the plan fits (the same
+    // one, tried again once memory was given back) would be placed in none
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == NULL) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: buffer %d was not allocated\n", __func__, i);
+#endif
+            return true;
+        }
+    }
+
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);

@@ -2654,9 +2654,17 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     std::vector<ggml_backend_buffer_t> bufs;
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
-        GGML_ASSERT(bufs.back() != nullptr);
-        max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size);
+        if (buf == nullptr) {
+            // a device with no room: nothing is kept and the caller sees the failure a simple buffer type gives it (a
+            // graph allocator fails its reserve, and a context gives retained graphs back before it tries again)
+            for (ggml_backend_buffer_t made : bufs) {
+                ggml_backend_buffer_free(made);
+            }
+            return nullptr;
+        }
+        bufs.push_back(buf);
+        max_size = std::max(max_size, ggml_backend_buffer_get_size(buf));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, bufs);
 
@@ -2776,6 +2784,7 @@ struct ggml_backend_meta_context {
         ggml_backend_graph_capturable_t          graph_capturable     = nullptr;
         ggml_backend_capture_begin_t             begin                = nullptr;
         ggml_backend_capture_end_t               end                  = nullptr;
+        ggml_backend_capture_no_memory_t         no_memory            = nullptr; // null: a capture is never put off
         ggml_backend_capture_launch_t            launch               = nullptr;
         ggml_backend_capture_free_t              free                 = nullptr;
 
@@ -3135,6 +3144,8 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_capturable");
             capture.begin  = (ggml_backend_capture_begin_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_begin");
             capture.end    = (ggml_backend_capture_end_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_end");
+            capture.no_memory = (ggml_backend_capture_no_memory_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_no_memory");
             capture.launch = (ggml_backend_capture_launch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_launch");
             capture.free   = (ggml_backend_capture_free_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_free");
             graph_next     = (ggml_backend_graph_next_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_next");
@@ -4061,9 +4072,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     if (cg != nullptr && !cg->refused && ++cg->n_evals == 2) {
-        const int step = uncapturable_step();
+        // A device with no room for the capture's executable (ggml_backend_capture_no_memory_t): the capture is put off
+        // to the cgraph's next evaluation, and this one runs the steps.
+        bool no_memory = false;
+        for (size_t j = 0; cap.no_memory != nullptr && !no_memory && j < n_backends; j++) {
+            no_memory = cap.no_memory(backend_ctx->backend_configs[j].backend);
+        }
+        const int step = no_memory ? -1 : uncapturable_step();
         cg->refused = step >= 0;
-        if (cg->refused) {
+        if (no_memory) {
+            cg->n_evals = 1;
+            if (backend_ctx->trace_graphs) {
+                GGML_LOG_INFO("graph_trace layer=meta event=defer context=%p uid=%llu reason=no_memory\n",
+                    (void *) backend_ctx, (unsigned long long) cgraph->uid);
+            }
+        } else if (cg->refused) {
             GGML_LOG_DEBUG("%s: %s: graph %llu not captured: step %d of %zu cannot be\n",
                 __func__, backend_ctx->name.c_str(), (unsigned long long) cgraph->uid, step, backend_ctx->n_subgraphs);
         } else {
