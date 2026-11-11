@@ -769,37 +769,62 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
         };
 
-        // keep the longest prefix of seqs that satisfy the constraint, to preserve sequential seq ids
-        uint32_t n_keep = 0;
-        while (n_keep < n_seqs) {
-            const uint32_t remaining = n_remaining(n_keep);
+        const auto satisfies = [&](uint32_t s) {
+            const uint32_t remaining = n_remaining(s);
 
-            if (remaining != 0 && remaining < n_keep_tail) {
+            return remaining == 0 || remaining >= n_keep_tail;
+        };
+
+        // A sequential split keeps the longest prefix of seqs that satisfy the constraint, to preserve sequential seq
+        // ids. A non-sequential one has no order to preserve and keeps every seq that satisfies it: with the prefix,
+        // seqs one row longer than those before them were each cut off and read alone, a ubatch a seq (a prompt step of
+        // 1,024 rows shared 47, 46 among 22 seqs: 14 ubatches where 3 hold it). LLAMA_BATCH_KEEP_TAIL_LEGACY=1: the
+        // prefix in both
+        static const bool keep_tail_legacy = ggml_env_switch("LLAMA_BATCH_KEEP_TAIL_LEGACY");
+        const bool prefix = sequential || keep_tail_legacy;
+
+        std::vector<uint32_t> keep;
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            if (satisfies(s)) {
+                keep.push_back(s);
+            } else if (prefix) {
                 break;
             }
-
-            n_keep++;
         }
 
-        // all seqs violate the constraint - resolve the first one directly and emit it alone
-        if (n_keep == 0) {
-            auto & idxs = idxs_per_seq[0];
+        // all seqs violate the constraint - resolve the first one directly, and with it, in a non-sequential split, the
+        // seqs that have as many tokens left as it has: they end in the same rows
+        if (keep.empty()) {
+            const uint32_t n_left = n_remaining(0);
+            const size_t   n_rows = idxs_per_seq[0].size() + n_left;
 
-            const auto & seq_idxs = seq_set_map[cur_seq_set[0]];
+            keep.push_back(0);
 
-            if (idxs.size() + n_remaining(0) <= n_ubatch) {
-                // extend the seq to completion
-                while (n_remaining(0) > 0) {
-                    const int32_t idx = seq_idxs[cur_idx[0]];
+            if (n_rows <= n_ubatch) {
+                for (uint32_t s = 1; s < n_seqs && !prefix; ++s) {
+                    if (n_remaining(s) == n_left && (keep.size() + 1)*n_rows <= n_ubatch) {
+                        keep.push_back(s);
+                    }
+                }
 
-                    idxs.push_back(idx);
+                // extend the seqs to completion
+                for (const uint32_t s : keep) {
+                    const auto & seq_idxs = seq_set_map[cur_seq_set[s]];
 
-                    used[idx] = true;
-                    ++n_used;
+                    while (n_remaining(s) > 0) {
+                        const int32_t idx = seq_idxs[cur_idx[s]];
 
-                    ++cur_idx[0];
+                        idxs_per_seq[s].push_back(idx);
+
+                        used[idx] = true;
+                        ++n_used;
+
+                        ++cur_idx[s];
+                    }
                 }
             } else {
+                auto & idxs = idxs_per_seq[0];
+
                 // truncate the seq so that at least n_keep_tail tokens remain
                 while (n_remaining(0) < n_keep_tail) {
                     used[idxs.back()] = false;
@@ -810,19 +835,27 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                     --cur_idx[0];
                 }
             }
-
-            n_keep = 1;
         }
 
         // return the tokens of the deferred seqs back to the pool
-        for (uint32_t s = n_keep; s < n_seqs; ++s) {
+        std::vector<idx_vec_t> idxs_kept;
+        idxs_kept.reserve(keep.size());
+
+        for (uint32_t s = 0, k = 0; s < n_seqs; ++s) {
+            if (k < keep.size() && keep[k] == s) {
+                idxs_kept.push_back(std::move(idxs_per_seq[s]));
+                ++k;
+                continue;
+            }
+
             for (const int32_t idx : idxs_per_seq[s]) {
                 used[idx] = false;
                 --n_used;
             }
         }
 
-        n_seqs = n_keep;
+        idxs_per_seq = std::move(idxs_kept);
+        n_seqs       = keep.size();
     }
 
     // concat the per-sequence-set lists

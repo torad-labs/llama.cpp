@@ -585,6 +585,78 @@ static void test_keep_tail(testing & t) {
         t.assert_equal(1, ub.seq_id[0][0]);
         t.assert_equal(7u, ba.get_n_used());
     });
+
+    t.test("non_sequential_keeps_every_seq_that_satisfies", [&](testing & t) {
+        batch_builder bb;
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(make_batch(bb, {2, 3, 2}), vocab, nullptr, bb.n_embd, 8, false));
+
+        // expansion stops at 2 tokens per seq: seqs 0 and 2 complete, seq 1 would be left 1 < n_keep_tail. With no
+        // order of seq ids to preserve, seq 2 is not deferred with it
+        llama_ubatch ub = ba.split_equal(8, false, 2);
+        t.assert_equal(4u, ub.n_tokens);
+        t.assert_equal(2u, ub.n_seqs);
+        t.assert_equal(0, ub.seq_id[0][0]);
+        t.assert_equal(2, ub.seq_id[2][0]);
+
+        ub = ba.split_equal(8, false, 2);
+        t.assert_equal("the deferred seq comes back whole", 3u, ub.n_tokens);
+        t.assert_equal(1, ub.seq_id[0][0]);
+
+        t.assert_equal(7u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_equal(8, false, 2).n_tokens);
+    });
+
+    t.test("completes_seqs_with_the_same_remainder_together", [&](testing & t) {
+        batch_builder bb;
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(make_batch(bb, {3, 3, 3}), vocab, nullptr, bb.n_embd, 6, false));
+
+        // expansion stops at 2 tokens per seq, leaving each 1 < n_keep_tail: seq 0 is completed, and seq 1 with it,
+        // which ends in the same rows; a third would pass n_ubatch
+        llama_ubatch ub = ba.split_equal(6, false, 2);
+        t.assert_equal(6u, ub.n_tokens);
+        t.assert_equal(2u, ub.n_seqs);
+        t.assert_equal(3u, ub.n_seq_tokens);
+        t.assert_equal(0, ub.seq_id[0][0]);
+        t.assert_equal(1, ub.seq_id[3][0]);
+
+        ub = ba.split_equal(6, false, 2);
+        t.assert_equal(3u, ub.n_tokens);
+        t.assert_equal(2, ub.seq_id[0][0]);
+
+        t.assert_equal(9u, ba.get_n_used());
+    });
+
+    t.test("a_prompt_step_shared_unevenly_takes_a_ubatch_a_length", [&](testing & t) {
+        batch_builder bb;
+
+        // a step of 1,024 prompt rows shared among 22 seqs as the server shares it, 47 to the first twelve and 46 to
+        // the rest, beside one seq that replies with 3 rows (four RTX PRO 6000, Nov 11, 2026: 14 ubatches)
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(make_batch(bb, {47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47,
+                                              46, 46, 46, 46, 3, 46, 46, 46, 46, 46, 46}),
+                              vocab, nullptr, bb.n_embd, 32, false));
+
+        llama_ubatch ub = ba.split_equal(2048, false, 3);
+        t.assert_equal("every seq's first rows, at the reply's length", 69u, ub.n_tokens);
+        t.assert_equal(23u, ub.n_seqs);
+
+        ub = ba.split_equal(2048, false, 3);
+        t.assert_equal("the ten seqs that end together", 430u, ub.n_tokens);
+        t.assert_equal(10u, ub.n_seqs);
+        t.assert_equal(12, ub.seq_id[0][0]);
+
+        ub = ba.split_equal(2048, false, 3);
+        t.assert_equal("the twelve one row longer", 528u, ub.n_tokens);
+        t.assert_equal(12u, ub.n_seqs);
+        t.assert_equal(0, ub.seq_id[0][0]);
+
+        t.assert_equal(1027u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_equal(2048, false, 3).n_tokens);
+    });
 }
 
 static void test_mrope(testing & t) {
