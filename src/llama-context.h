@@ -409,7 +409,7 @@ private:
     // output rows as their largest logits (llama_set_output_candidates): a decode reads the records
     // ggml_top_k_candidates packed for a row, and the row's first reader cuts them to the k largest
     struct candidates_info {
-        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_CUT };
+        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_DRAFT_RECORDS, ROW_CUT };
 
         buffer_view<int64_t>     records = {nullptr, 0}; // [n_outputs][n_record]
         buffer_view<float>       logits  = {nullptr, 0}; // [n_outputs][k], the largest first

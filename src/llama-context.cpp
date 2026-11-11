@@ -1654,7 +1654,8 @@ bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
     float *       logits_row = cand.logits.data + j*cand.k;
     llama_token * ids_row    = cand.ids.data    + j*cand.k;
 
-    if (cand.state[j] == candidates_info::ROW_RECORDS) {
+    if (cand.state[j] == candidates_info::ROW_RECORDS || cand.state[j] == candidates_info::ROW_DRAFT_RECORDS) {
+        const bool draft = cand.state[j] == candidates_info::ROW_DRAFT_RECORDS;
         // a record is a token id under its logit's bits. A key orders them as common_sampler_top_k_candidates orders a
         // whole row, by the logit and then the id: the logit's bits in the order of its value (-0 as +0, a NaN below every
         // number) over the id's complement
@@ -1664,9 +1665,13 @@ bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
         const int64_t * records = cand.records.data + j*cand.n_record;
         for (uint32_t i = 0; i < cand.n_record; ++i) {
             const uint64_t record = (uint64_t) records[i];
-            const uint32_t id     = (uint32_t) record;
+            uint32_t id = (uint32_t) record;
             if (id == UINT32_MAX) {
                 continue; // no token: a device with fewer than k
+            }
+            if (draft) {
+                GGML_ASSERT(id < model.output_draft_tokens.size());
+                id = model.output_draft_tokens[id];
             }
             uint32_t bits = (uint32_t) (record >> 32);
             if (bits == 0x80000000u) {
@@ -1674,6 +1679,13 @@ bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
             }
             const uint32_t rank = (bits & 0x7fffffffu) > 0x7f800000u ? 0 : (bits & 0x80000000u) ? ~bits : bits | 0x80000000u;
             keys.push_back((uint64_t) rank << 32 | (UINT32_MAX - id));
+        }
+
+        if (draft) {
+            // Cold tokens rank above hot NaNs and tie hot -infinity by global ID. At most k can survive.
+            for (size_t i = 0; i < std::min<size_t>(cand.k, model.output_draft_cold.size()); ++i) {
+                keys.push_back((uint64_t) 0x007fffffu << 32 | (UINT32_MAX - model.output_draft_cold[i]));
+            }
         }
 
         if (keys.size() > cand.k) {
@@ -2667,7 +2679,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     continue;
                 }
                 const bool as_cand = cand.seqs.count(ubatch.seq_id[i][0]) > 0;
-                cand.state[row++] = as_cand ? candidates_info::ROW_RECORDS : candidates_info::ROW_WHOLE;
+                cand.state[row++] = !as_cand ? candidates_info::ROW_WHOLE :
+                    res->t_logits_draft ? candidates_info::ROW_DRAFT_RECORDS : candidates_info::ROW_RECORDS;
                 rows_whole |= !as_cand;
             }
 
@@ -3486,6 +3499,14 @@ llm_graph_params llama_context::graph_params(
     // cache that keeps a sequence's rows by its place (DeepSeek V4's) gave another set's logits with it
     params.any_seqs = graph_any_seqs && cparams.kv_unified && cparams.n_seq_devices == 1 &&
                       dynamic_cast<const llama_memory_hybrid *>(memory.get()) != nullptr;
+    params.candidates_only = model.arch == LLM_ARCH_GLM5NEXT && model.output_draft &&
+                             cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.n_out_candidates > 0 &&
+                             sampling.samplers.empty() && n_outputs > 0 && ubatch.output && ubatch.seq_id;
+    for (uint32_t i = 0; params.candidates_only && i < ubatch.n_tokens; ++i) {
+        if (ubatch.output[i] && cand.seqs.count(ubatch.seq_id[i][0]) == 0) {
+            params.candidates_only = false;
+        }
+    }
     return params;
 }
 

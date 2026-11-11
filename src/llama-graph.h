@@ -921,6 +921,7 @@ struct llm_graph_params {
     // llm_graph_input_kpool). As a decode's graph was held to its set, every session that started or ended a reply had
     // the next decodes build their graph again: no decode of a pass's last 25 steps was replayed on the Nov 10, 2026 box
     bool any_seqs = false;
+    bool candidates_only = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1005,6 +1006,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             cparams.n_out_candidates        == other.cparams.n_out_candidates        &&
+            candidates_only                 == other.candidates_only                 &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1081,6 +1083,7 @@ public:
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_cand        = nullptr; // each output row's largest logits (build_candidates)
+    ggml_tensor * t_logits_draft = nullptr; // packed vocabulary, before gather/scatter; candidate records use hot ordinals
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm

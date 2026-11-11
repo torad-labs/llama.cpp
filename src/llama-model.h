@@ -625,6 +625,8 @@ struct llama_model {
     struct ggml_tensor * output_draft     = nullptr;
     struct ggml_tensor * output_draft_s   = nullptr;
     struct ggml_tensor * output_draft_ids = nullptr;
+    std::vector<llama_token> output_draft_tokens;
+    std::vector<llama_token> output_draft_cold;
 
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;

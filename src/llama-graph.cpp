@@ -1650,6 +1650,7 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
     t_cand        = nullptr;
+    t_logits_draft = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -4942,7 +4943,7 @@ void llm_graph_context::build_pooling(
 // llama_set_output_candidates: one node takes the k largest logits of every output row, and the host reads those in place
 // of the rows. -sm tensor: each device takes them from its share of the vocab, a part a device, so no row is gathered
 void llm_graph_context::build_candidates() const {
-    ggml_tensor * logits = res->t_logits;
+    ggml_tensor * logits = res->t_logits_draft ? res->t_logits_draft : res->t_logits;
     if (cparams.n_out_candidates <= 0 || !samplers.empty() || !logits || n_outputs == 0) {
         return;
     }
@@ -4950,7 +4951,8 @@ void llm_graph_context::build_candidates() const {
         return;
     }
 
-    const int k = (int) std::min<int64_t>(cparams.n_out_candidates, logits->ne[0]);
+    const int k = res->t_logits_draft ? cparams.n_out_candidates :
+        (int) std::min<int64_t>(cparams.n_out_candidates, logits->ne[0]);
 
     res->t_cand = ggml_top_k_candidates(ctx0, logits, k, cparams.n_logits_parts);
     cb(res->t_cand, "result_candidates", -1);

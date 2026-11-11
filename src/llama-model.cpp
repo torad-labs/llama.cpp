@@ -3297,6 +3297,14 @@ void llama_model::set_draft_vocab(const llama_token * ids, size_t n_ids) {
         const llama_hadamard_transform t = rot->second;
         hadamard_rotations[w] = t;
     }
+    output_draft_tokens.assign(ids, ids + n_ids);
+    for (llama_token id = 0, hot = 0; id < n_vocab; ++id) {
+        if ((size_t) hot < n_ids && ids[hot] == id) {
+            ++hot;
+        } else {
+            output_draft_cold.push_back(id);
+        }
+    }
     output_draft     = w;
     output_draft_s   = head_s;
     output_draft_ids = w_ids;

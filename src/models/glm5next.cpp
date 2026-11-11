@@ -940,6 +940,13 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
         const int64_t n_hot   = model.output_draft->ne[1];
         const int64_t n_out   = cur->ne[1];
         ggml_tensor * hot = build_lora_mm(model.output_draft, cur, model.output_draft_s);
+        if (params.candidates_only) {
+            // Select on each vocabulary shard before the full-logit gather.
+            GGML_ASSERT(hot->type == GGML_TYPE_F32 && ggml_is_contiguous(hot));
+            res->t_logits_draft = hot;
+            cb(hot, "mtp_draft_logits", -1);
+            return;
+        }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             // A pad along the split axis gathers the small head before the global-ID scatter.
             hot = ggml_pad(ctx0, hot, 32 - n_hot % 32, 0, 0, 0);
