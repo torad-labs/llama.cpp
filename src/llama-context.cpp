@@ -1962,6 +1962,36 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// whether a device the context computes on has less than graph_device_reserve free (each device of a meta backend is
+// asked: one full device is enough)
+bool llama_context::graph_devices_low() const {
+    if (graph_device_reserve == 0) {
+        return false;
+    }
+    const auto low = [this](ggml_backend_t backend) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return false;
+        }
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        return total > 0 && free < graph_device_reserve;
+    };
+    for (ggml_backend_t backend : backend_ptrs) {
+        if (ggml_backend_is_meta(backend)) {
+            for (size_t j = 0; j < ggml_backend_meta_n_backends(backend); ++j) {
+                if (low(ggml_backend_meta_simple_backend(backend, j))) {
+                    return true;
+                }
+            }
+        } else if (low(backend)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // Keep each ubatch's rows before its graph storage can be reused.
     mtp_index_capture();
@@ -1972,6 +2002,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     graph_clock++;
+    static const bool graph_trace = ggml_env_switch("GGML_GRAPH_TRACE");
 
     // the graph to compute and the scheduler holding it: gf_res_prev on the context's scheduler, or a slot's
     llm_graph_result   * res      = gf_res_prev.get();
@@ -2020,15 +2051,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        // Each retained shape owns its scheduler and input copies. Other shapes use the main scheduler.
+        // Each retained shape owns its scheduler and input copies. Other shapes use the main scheduler. One more is
+        // retained only while the devices keep their reserve (graph_devices_low); with none retained and none to add,
+        // the shape uses the main scheduler too.
+        bool devices_low = use_slots && graph_devices_low();
         if (use_slots) {
-            if (graph_slots.size() < graph_slots_max) {
+            if (graph_slots.size() < graph_slots_max && !devices_low) {
                 graph_slots.push_back({
                     ggml_backend_sched_ptr(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                             sched_max_nodes, false, cparams.op_offload)),
                     llm_graph_result_ptr(new llm_graph_result(sched_max_nodes)),
                 });
             }
+        }
+        if (use_slots && !graph_slots.empty()) {
             auto & slot = *std::min_element(graph_slots.begin(), graph_slots.end(),
                     [](const graph_slot & a, const graph_slot & b) { return a.t_used < b.t_used; });
             res      = slot.res.get();
@@ -2045,7 +2081,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             gf = model.build_graph(gparams);
             return gf != nullptr;
         };
-        const auto fallback = [&]() {
+        const auto fallback = [&](const char * why) {
             const auto it = std::find_if(graph_slots.begin(), graph_slots.end(),
                     [&](const graph_slot & slot) { return slot.res.get() == res; });
             GGML_ASSERT(it != graph_slots.end());
@@ -2054,9 +2090,51 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             sched_gf = sched.get();
             t_used = nullptr;
             gparams = graph_params(res, ubatch, mctx, gtype);
-            LLAMA_LOG_WARN("%s: %s shape with %u rows uses the main scheduler (graph slot memory limit)\n", __func__,
-                    prompt_shape ? "prompt" : "MTP", ubatch.n_tokens);
+            LLAMA_LOG_WARN("process_ubatch: %s shape with %u rows uses the main scheduler (%s)\n",
+                    prompt_shape ? "prompt" : mtp_shape ? "MTP" : "retained", ubatch.n_tokens, why);
         };
+        // A device under its reserve, or with no room for the graph's buffers: the retained graph used least recently,
+        // other than the one being built, gives its back. False when there is none to give back.
+        const auto evict = [&](const char * why) {
+            auto lru = graph_slots.end();
+            for (auto it = graph_slots.begin(); it != graph_slots.end(); ++it) {
+                if (it->res.get() != res && (lru == graph_slots.end() || it->t_used < lru->t_used)) {
+                    lru = it;
+                }
+            }
+            if (lru == graph_slots.end()) {
+                return false;
+            }
+            // its graph may still be on the devices
+            for (ggml_backend_t backend : backend_ptrs) {
+                ggml_backend_synchronize(backend);
+            }
+            if (mtp_index.tensor != nullptr && mtp_index.tensor == lru->res->t_mtp_index) {
+                mtp_index.tensor = nullptr; // an earlier ubatch of this decode left its draft index in that graph
+            }
+            graph_slots.erase(lru);
+            if (t_used) {
+                t_used = &std::find_if(graph_slots.begin(), graph_slots.end(),
+                        [&](const graph_slot & slot) { return slot.res.get() == res; })->t_used;
+            }
+            if (n_graph_slots_no_memory++ == 0) {
+                LLAMA_LOG_WARN("process_ubatch: a device is short of memory for a graph of %u rows (%s): the retained "
+                        "graphs used least recently give their buffers back, %zu are kept now (LLAMA_GRAPH_SLOTS allows "
+                        "%zu, LLAMA_GRAPH_DEVICE_RESERVE_MIB keeps %zu MiB free; logged once a context)\n", ubatch.n_tokens,
+                        why, graph_slots.size(), graph_slots_max, graph_device_reserve / 1048576);
+            }
+            if (graph_trace) {
+                LLAMA_LOG_INFO("graph_trace layer=llama event=evict context=%p reason=%s phase=%s rows=%u slots=%zu\n",
+                        (void *) this, why, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft" : "target",
+                        ubatch.n_tokens, graph_slots.size());
+            }
+            return true;
+        };
+        // before the graph is built: the devices get their reserve back, which the executables of this graph and
+        // of those kept are made from (a device with none left cannot make one, and the graphs run without)
+        while (devices_low && evict("reserve")) {
+            devices_low = graph_devices_low();
+        }
 
         // a prompt shape is not held to the slots' size: there are as many as powers of two up to
         // graph_prompt_shape_max, with and without the prompt's last row
@@ -2082,22 +2160,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             for (size_t i = 0; i < sizes.size(); ++i) { fits &= sizes[i] <= graph_slot_buf_limit[i]; }
             sched_gf = retained_sched;
             gparams = graph_params(res, ubatch, mctx, gtype, sched_gf);
-            if (!fits) { fallback(); }
+            if (!fits) { fallback("graph slot memory limit"); }
             // Measurement rewrites sources to scheduler copies. Rebuild before allocation.
             if (!build()) { ret = GGML_STATUS_FAILED; return nullptr; }
         }
 
+        // A graph that cannot be allocated is tried again while a retained graph gives its buffers back (a failed
+        // allocation leaves the graph split: it is built again first). With none left a retained shape goes to the
+        // main scheduler, whose buffers were reserved for the largest batch when the context was made.
         llama_decode_phase_timer t_alloc(LLAMA_DECODE_PHASE_ALLOC_GRAPH);
-        if (!ggml_backend_sched_alloc_graph(sched_gf, gf)) {
-            if (t_used && ubatch.n_tokens > graph_slot_max_tokens) {
-                fallback();
-                if (!build()) { ret = GGML_STATUS_FAILED; return nullptr; }
-            } else {
-                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-                ret = GGML_STATUS_ALLOC_FAILED;
-                return nullptr;
-            }
-            if (!ggml_backend_sched_alloc_graph(sched_gf, gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
+        bool allocated = ggml_backend_sched_alloc_graph(sched_gf, gf);
+        while (!allocated && evict("no_memory")) {
+            if (!build()) { ret = GGML_STATUS_FAILED; return nullptr; }
+            allocated = ggml_backend_sched_alloc_graph(sched_gf, gf);
+        }
+        if (!allocated && t_used) {
+            fallback("no device memory");
+            if (!build()) { ret = GGML_STATUS_FAILED; return nullptr; }
+            allocated = ggml_backend_sched_alloc_graph(sched_gf, gf);
+        }
+        if (!allocated) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
         }
     }
 
@@ -2106,7 +2191,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     sched_res = sched_gf;
 
-    static const bool graph_trace = ggml_env_switch("GGML_GRAPH_TRACE");
     if (graph_trace) {
         std::string owners;
         if (cparams.n_seq_devices > 1) {

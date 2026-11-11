@@ -18,6 +18,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    int    fail_allocations = 0; // the next allocations that fail, as on a device with no room
 
     ggml_backend_buffer_i              buffer_interface;
     std::vector<ggml_backend_buffer_t> buffers;
@@ -39,6 +40,10 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (ctx->fail_allocations > 0) {
+        ctx->fail_allocations--;
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -688,6 +693,49 @@ static void test_reallocation_unread_input_two_buffers() {
     run_unread_input_rounds(galloc.get(), true);
 }
 
+// A buffer the backend cannot allocate, as on a device with no room: the reserve fails and leaves no buffer behind the
+// plan it wrote. The same graph tried again, once memory was given back, must be planned and allocated anew, not placed
+// in a buffer that is not there (ggml_backend_sched_alloc_splits reserves and allocates so). With one buffer type behind
+// two buffer ids the ids share a buffer, and the second must not keep the one the failed reserve freed.
+static void test_failed_allocation() {
+    for (const bool two_ids : { false, true }) {
+        dummy_backend              backend  = dummy_backend_init(SIZE_MAX);
+        ggml_backend_buffer_type_t bufts[2] = { &backend.buffer_type, &backend.buffer_type };
+        ggml_gallocr_ptr           galloc(ggml_gallocr_new_n(bufts, two_ids ? 2 : 1));
+
+        int leaf_buffer_ids[1] = { 0 };
+        int node_buffer_ids[2] = { 0, two_ids ? 1 : 0 };
+        for (const size_t size : { size_t(16), size_t(64) }) {
+            auto [ctx, graph, ctx_ptr] = make_context();
+            ggml_tensor * x[3];
+            x[0] = make_input_with_size(ctx, size);
+            x[1] = ggml_scale(ctx, x[0], 2.0f);
+            x[2] = ggml_scale(ctx, x[1], 2.0f);
+            ggml_set_output(x[2]);
+            ggml_build_forward_expand(graph, x[2]);
+
+            // the larger graph needs a larger buffer, which the backend refuses once
+            backend.context->fail_allocations = size == 64 ? 1 : 0;
+            const bool reserved = ggml_gallocr_reserve_n(galloc.get(), graph, node_buffer_ids, leaf_buffer_ids);
+            GGML_ASSERT(reserved == (size != 64));
+            if (!reserved) {
+                GGML_ASSERT(backend.context->buffers.empty());
+                // one buffer id: the allocator reserves again by itself; two: it answers false and the caller reserves
+                const bool allocated = ggml_gallocr_alloc_graph(galloc.get(), graph);
+                GGML_ASSERT(allocated == !two_ids);
+                if (!allocated) {
+                    GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_buffer_ids, leaf_buffer_ids));
+                }
+            }
+            GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+            check_all_allocated(graph);
+            GGML_ASSERT(backend.context->buffers.size() == 1);
+        }
+        galloc.reset();
+        GGML_ASSERT(backend.context->buffers.empty());
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -712,5 +760,6 @@ int main() {
     run("test_reallocation", test_reallocation);
     run("test_reallocation_unread_input", test_reallocation_unread_input);
     run("test_reallocation_unread_input_two_buffers", test_reallocation_unread_input_two_buffers);
+    run("test_failed_allocation", test_failed_allocation);
     return 0;
 }

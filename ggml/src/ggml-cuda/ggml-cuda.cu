@@ -8037,6 +8037,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+            // A capture is about to begin, for a new executable or for an update that makes one when it fails, on a
+            // device with no room for one (cuda_graph_has_room): the graph is evaluated directly this time and asked
+            // again at its next evaluation. An executable it still has is of the properties before and goes now, so
+            // nothing replays it meanwhile.
+            if (use_cuda_graph && cuda_graph_update_required && !cuda_ctx->cuda_graph_has_room()) {
+                if (graph->instance != nullptr) {
+                    CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                    graph->instance = nullptr;
+                }
+                use_cuda_graph             = false;
+                cuda_graph_update_required = false;
+                graph_reason               = "no_memory";
+            }
         }
     }
     if (cuda_ctx->graph_trace_enabled()) {
@@ -8160,6 +8173,14 @@ static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
             (void *) cuda_ctx, cuda_ctx->device, (void *) exec, n_nodes, (long long) t_instantiate_us);
     }
     return exec;
+}
+
+// whether the backend's device has no room for a capture's executable now (cuda_graph_has_room): asked before
+// capture_begin, since capture_end's instantiation cannot be left to fail
+static bool ggml_backend_cuda_capture_no_memory(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    return !cuda_ctx->cuda_graph_has_room();
 }
 
 static void ggml_backend_cuda_capture_launch(ggml_backend_t backend, void * exec) {
@@ -9517,6 +9538,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_capture_end") == 0) {
         return (void *)ggml_backend_cuda_capture_end;
+    }
+    if (strcmp(name, "ggml_backend_capture_no_memory") == 0) {
+        return (void *)ggml_backend_cuda_capture_no_memory;
     }
     if (strcmp(name, "ggml_backend_capture_launch") == 0) {
         return (void *)ggml_backend_cuda_capture_launch;

@@ -2210,6 +2210,34 @@ struct ggml_backend_cuda_context {
         }
     }
 
+    // Whether the device has room for one more executable: GGML_CUDA_GRAPH_MEM_FLOOR_MIB free (default 64; 0: never
+    // asked). An executable takes device memory for each node (about 2.75 KiB), and cudaGraphInstantiate on a device
+    // with none left is not survivable: it returns cudaErrorMemoryAllocation, and an instantiate after that has ended
+    // the process inside the driver (a segfault in cuGraphInstantiateWithFlags, CUDA 13.3). So a graph gets an
+    // executable only while this holds, and is evaluated directly otherwise.
+    bool cuda_graph_has_room() {
+        static const size_t floor_bytes = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_MEM_FLOOR_MIB");
+            return (size_t) (env != nullptr ? std::max(atoll(env), 0LL) : 64) * 1024 * 1024;
+        }();
+        if (floor_bytes == 0) {
+            return true;
+        }
+        size_t free_bytes = 0;
+        size_t total      = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
+        if (free_bytes >= floor_bytes) {
+            return true;
+        }
+        if (cuda_graph_no_room++ == 0) {
+            GGML_LOG_WARN("%s: %s: %.0f MiB of device memory free, under the %.0f MiB a CUDA graph executable is made "
+                "with (GGML_CUDA_GRAPH_MEM_FLOOR_MIB): graphs without one are evaluated directly until there is room "
+                "(logged once a context)\n", __func__, name.c_str(), free_bytes / 1048576.0, floor_bytes / 1048576.0);
+        }
+        return false;
+    }
+    size_t cuda_graph_no_room = 0; // evaluations that found none
+
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
     bool any_cuda_graph_enabled() const {

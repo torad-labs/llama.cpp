@@ -231,6 +231,10 @@ extern "C" {
     typedef bool   (*ggml_backend_graph_capturable_t)(ggml_backend_t backend, struct ggml_cgraph * cgraph);
     typedef void   (*ggml_backend_capture_begin_t)(ggml_backend_t backend);
     typedef void * (*ggml_backend_capture_end_t)(ggml_backend_t backend);
+    // optional: whether the backend's device has no room for a capture's executable now. Asked before begin: the
+    // caller puts the capture off and evaluates its steps, since a backend may be unable to fail end's instantiation
+    // safely once the device is full.
+    typedef bool   (*ggml_backend_capture_no_memory_t)(ggml_backend_t backend);
     typedef void   (*ggml_backend_capture_launch_t)(ggml_backend_t backend, void * exec);
     typedef void   (*ggml_backend_capture_free_t)(ggml_backend_t backend, void * exec);
 

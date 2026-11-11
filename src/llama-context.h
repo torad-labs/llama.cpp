@@ -510,6 +510,18 @@ private:
     uint32_t graph_slot_max_rows = graph_slot_max_tokens;
     std::vector<size_t> graph_slot_buf_limit;
     std::vector<graph_slot> graph_slots;
+    // The device memory a context leaves free: LLAMA_GRAPH_DEVICE_RESERVE_MIB, default 256; 0: none. It retains one
+    // more graph only while every device it computes on has this much free, and before it builds a graph on a device
+    // with less, the retained ones used least recently give their buffers back (process_ubatch). The reserve is
+    // what the devices make the graphs' executables from: a CUDA device that runs out while it makes one cannot be
+    // recovered (ggml_backend_cuda_context::cuda_graph_has_room). A slot also gives its buffers back when an
+    // allocation fails; n_graph_slots_no_memory counts both.
+    const size_t graph_device_reserve = [] {
+        const char * s = getenv("LLAMA_GRAPH_DEVICE_RESERVE_MIB");
+        return (size_t) (s != nullptr ? std::max(atoll(s), 0LL) : 256) * 1024 * 1024;
+    }();
+    bool     graph_devices_low() const;
+    uint64_t n_graph_slots_no_memory = 0;
 
     // the graphs that move recurrent states between cells (rs_relocate), by the number of rows each moves; each is made
     // at its first use and computed again at each later one, with its scheduler
