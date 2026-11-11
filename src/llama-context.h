@@ -60,6 +60,10 @@ struct llama_context {
 
     void synchronize();
 
+    // synchronize(), unless the context has synchronized since its last decode or encode: what an accessor of their
+    // outputs waits for
+    void synchronize_outputs();
+
     // every row r of each state tensor takes row rows[r] (llama_memory_recurrent::relocate_states)
     void rs_relocate(const std::vector<ggml_tensor *> & states, const std::vector<int32_t> & rows);
 
@@ -544,6 +548,9 @@ private:
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
+
+    // a decode, an encode or a graph of this context has run since it last synchronized (synchronize_outputs)
+    bool outputs_pending = false;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
