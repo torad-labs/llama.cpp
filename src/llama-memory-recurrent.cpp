@@ -873,6 +873,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         for (int i = (int) n_seqs; i <= max; ++i) {
             relocate_pending = relocate_pending || (!cells[i].is_empty() && cells[i].src0 != i);
         }
+        // and a state of the set that lies in a cell another sequence of the set is written to (a set in another order,
+        // a set closing up over a cell that was left, a second new sequence reading the first one's zeroed cell)
+        for (int i = 0; relocate_disjoint && i < (int) n_seqs; ++i) {
+            relocate_pending = relocate_pending || (cells[i].src0 != i && cells[i].src0 < (int32_t) n_seqs);
+        }
         if (!relocate_pending) {
             n = n_seqs;
         }
@@ -894,6 +899,7 @@ void llama_memory_recurrent::set_relocate(bool value) {
         }
     }
     relocate = value && n_seq_devices == 1 && f32;
+    relocate_disjoint = relocate && !ggml_env_switch("LLAMA_RS_GATHER_LEGACY");
 }
 
 void llama_memory_recurrent::relocate_states(uint32_t n_seqs) {
@@ -901,7 +907,8 @@ void llama_memory_recurrent::relocate_states(uint32_t n_seqs) {
         return;
     }
     relocate_pending = false;
-    GGML_ASSERT(owner_context != nullptr && head == 0 && n > n_seqs && n <= size);
+    // n is n_seqs when only states of the set move (relocate_disjoint)
+    GGML_ASSERT(owner_context != nullptr && head == 0 && n >= n_seqs && n <= size);
 
     // The row each row takes its state from, every other row its own. A cell of the batch takes its sequence's state,
     // at the snapshot of a pending rollback, which this takes as s_copy does: the decode writes its snapshots anew. A
@@ -1536,6 +1543,10 @@ uint32_t llama_memory_recurrent_context::get_head() const {
 int32_t llama_memory_recurrent_context::get_rs_z() const {
     // relocate: the row is zeroed before the decode (zero_rs_z), not by its graph
     return is_full ? 0 : mem->relocate ? -1 : mem->rs_z;
+}
+
+bool llama_memory_recurrent_context::rows_disjoint() const {
+    return !is_full && mem->relocate_disjoint;
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {

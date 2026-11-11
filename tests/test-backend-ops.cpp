@@ -5403,7 +5403,9 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t mem_size;
     const int64_t kv_head;
     // >= 0 (mem_size > 0, one sequence): the initial state is build_rs's gather, GET_ROWS(cache, [state_row]) reshaped
-    // for the op, which CUDA folds into the kernel (ggml_cuda_try_gdn_gather_skip); the cache then starts random
+    // for the op, which CUDA folds into the kernel (ggml_cuda_try_gdn_gather_skip); the cache then starts random.
+    // With several sequences the GET_ROWS carries GGML_TENSOR_FLAG_ROWS_DISJOINT and each sequence its own row
+    // (initialize_tensors), whatever state_row is: the gather is folded for them as well
     const int64_t state_row;
     const bool    kda; // a gate per key element (glm5next's KDA; raw: ggml_gated_delta_net_set_raw_kda_gates)
 
@@ -5453,11 +5455,17 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         ggml_tensor * cache = nullptr;
         ggml_tensor * state;
         if (state_row >= 0) {
-            GGML_ASSERT(mem_size > 0 && n_seqs == 1);
+            GGML_ASSERT(mem_size > 0 && (n_seqs == 1 || kv_head + 2 * n_seqs <= mem_size));
             cache = ggml_new_tensor_2d(ctx, cache_type, D, mem_size * K);
             ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
             ggml_set_name(ids, "ids");
-            state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, cache, ids), head_size, head_size, H_v, n_seqs);
+            ggml_tensor * rows = ggml_get_rows(ctx, cache, ids);
+            if (n_seqs > 1) {
+                // several sequences: none is read from a row another's state is stored to (initialize_tensors), which
+                // the flag tells the backend, as llama.cpp's recurrent memory does under LLAMA_GRAPH_ANY_SEQS=1
+                rows->flags |= GGML_TENSOR_FLAG_ROWS_DISJOINT;
+            }
+            state = ggml_reshape_4d(ctx, rows, head_size, head_size, H_v, n_seqs);
         } else {
             state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
             ggml_set_name(state, "state");
@@ -5570,7 +5578,12 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 // gathered: every row a different state, so reading another row than state_row fails
                 init_tensor_uniform(t, state_row >= 0 ? -1.0f : 0.0f, state_row >= 0 ? 1.0f : 0.0f);
             } else if (strcmp(t->name, "ids") == 0) {
-                const std::vector<int32_t> rows(n_seqs, (int32_t) state_row);
+                std::vector<int32_t> rows(n_seqs, (int32_t) state_row);
+                // several sequences: an even one from its own cell, at a snapshot slot the op may write as well, and an
+                // odd one from a cell past the set's, which the op writes nothing to
+                for (int64_t s = 0; n_seqs > 1 && s < n_seqs; ++s) {
+                    rows[s] = (int32_t) (s % 2 == 0 ? (s % K) * mem_size + kv_head + s : kv_head + n_seqs + s);
+                }
                 ggml_backend_tensor_set(t, rows.data(), 0, rows.size() * sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
@@ -13619,6 +13632,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0, 3, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_F16,  3, 1, 4));
+    // the gather of several sequences' states, each from its own cell or from one past the set's
+    // (GGML_TENSOR_FLAG_ROWS_DISJOINT): the scalar gate and KDA's at decode and at the 3-token verify, 2 and 5
+    // sequences and KDA's 23, an f32 cache (the one LLAMA_GRAPH_ANY_SEQS=1 serves) and a q8_0 one
+    for (ggml_type cache_type : { GGML_TYPE_F32, GGML_TYPE_Q8_0 }) {
+        for (int64_t n_seqs : { 2, 5, 23 }) {
+            for (int64_t n_tokens : { 1, 3 }) {
+                for (bool kda : { false, true }) {
+                    if (n_seqs == 23 && !kda) {
+                        continue; // 48 heads of 23 sequences: a cache of 144 rows of 3 MiB
+                    }
+                    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, n_tokens, n_seqs, 3,
+                        kda ? 1 : 3, true, cache_type, 2 * n_seqs + 2, 1, 0, kda));
+                }
+            }
+        }
+    }
     // a q8_0 cache the fusion refuses keeps its cpy: a 16-wide head, and the chunked prefill ubatch (an f16 one too)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  16, 2, 1, 2, 1, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 3, 3, true, GGML_TYPE_Q8_0));
