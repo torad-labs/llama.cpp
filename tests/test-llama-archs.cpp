@@ -1556,11 +1556,12 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
 // rounding step (CPU, seed 1234, Nov 10, 2026), so they are held to the GPU's bar, with two top tokens within 1% of
 // the row's largest logit counted as tied: over the seeds a row's two top tokens are that close, and the packed maps
 // swap them (seeds 14 and 10963435).
-// The prompt is read 4 positions a decode. The CPU's attention kernel is another one from 64 rows a stream
+// On the CPU the prompt is read 4 positions a decode. The CPU's attention kernel is another one from 64 rows a stream
 // (GGML_FA_TILE_Q, the tiled path), whose output is 2e-4 of its size off the vector path's. Read at once, the prompt's
 // 128 rows are one stream of the shared pool and 16 a stream of a cache a sequence, so the two took different kernels;
 // what that left in the recurrent layer's state moved one row of the first step by a rounding step for about half the
-// seeds (7 of 14), and the byte compare failed for those.
+// seeds (7 of 14), and the byte compare failed for those. On a GPU, where the compare is to a bar and the kernels'
+// row counts are others, the prompt stays one decode.
 // The streams' bank takes a decode's changes as one input its device writes before the maps are made (ggml_kpool_patch),
 // where each change was a write of its own; LLAMA_KPOOL_PATCH_INPUT_LEGACY=1 writes them. The logits are the same again.
 static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
@@ -1580,7 +1581,8 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
     // step, from 128 cells to 1,088
     const int n_seq    = 8;
     const int n_prompt = 16;
-    const int n_prompt_rows = 4; // of a sequence a decode: 32 rows, under the 64 of the CPU's tiled attention
+    // the prompt's positions a decode: on the CPU 32 rows, under the 64 of its tiled attention
+    const int n_prompt_rows = on_cpu ? 4 : n_prompt;
     const int n_rows   = 3;
     const int n_steps  = 40;
     const int n_pos    = n_prompt + n_steps*n_rows;
