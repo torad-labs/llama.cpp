@@ -143,8 +143,9 @@ def make_plan(args):
     if four:
         # Prompts are read in whole chunks, in an eval of their own after the step's replies: one forward pass of the
         # model, where prompt tokens shared out beside the replies are two or more. Fixture, 23 sessions of Claude
-        # Code's sizes (Nov 11, 2026): every prompt-carrying eval is one pass and the run takes 80.2 s, against 2.3
-        # passes an eval and 84.2 s with equal shares and no chunk.
+        # Code's sizes (Nov 11, 2026): every prompt-carrying eval is one pass, against 2.3 passes an eval with equal
+        # shares and no chunk. The runs took 80.2 and 84.2 s on a card that was full and evicting graphs in both, so
+        # the times do not isolate the chunk; four cards have not read it.
         argv += ["--prompt-chunk", "128"]
     if args.dflash:
         # the draft is one small model reading the target's layer inputs: whole on the first card, never split four ways
@@ -175,16 +176,17 @@ def make_plan(args):
     if not dp:
         env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
     if four:
-        # The cards' reductions go through the copy engines and host memory. On two of the three four-card hosts read
+        # The cards' reductions go through the copy engines and host memory. On both four-card hosts read cleanly
         # (Nov 11, 2026) the engine's own routes, whose kernels store into a peer's memory, ran the server at 15.8 and
-        # 13.4 to 14.7 tok/s a session where this route ran it at 33.0 and 42.8; on the third (Nov 10) a reduction took
-        # 105 us on the engine's route and 109 on this one.
+        # 13.4 to 14.7 tok/s a session where this route ran it at 33.0 and 42.8. On a third (Nov 10) a reduction took
+        # 105 us on the engine's route and 109 on this one, in a benchmark whose cards were not shown to be free.
         env.update({"GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0", "GGML_CUDA_AR_COPY_THRESHOLD": "1",
                     "GGML_CUDA_AR_COPY_PEER": "0", "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0"})
         # A share crosses in 8-bit blocks, 36 bytes to 32 elements where the BF16 wire takes 64: a 69-row target decode
-        # is 40.2 ms against 42.5, a session 45.7 tok/s against 42.8. Against an F32 wire's logits on the pack (8,192
-        # tokens) the mean KLD is 0.0141 where the BF16 wire's is 0.0145. A block that holds a NaN or an infinity
-        # crosses as NaN in all 32 elements, where the BF16 wire carries the one.
+        # is 40.2 ms against 42.5, a session's fourth pass after a load 45.7 tok/s against 41.5. Against an F32 wire's
+        # logits on the pack (two chunks at a context of 8,192, 8,190 scored positions) the mean KLD is 0.0141 +- 0.0005
+        # where the BF16 wire's is 0.0145 +- 0.0006: alike on that sample, which is all that was scored. A block that
+        # holds a NaN or an infinity crosses as NaN in all 32 elements, where the BF16 wire carries the one.
         if args.reduction_wire != "bf16":
             env["GGML_CUDA_AR_WIRE_Q8"] = "1"
         # A graph is kept by its shape whichever sessions are in it, 128 a context, and a CUDA executable is not given
