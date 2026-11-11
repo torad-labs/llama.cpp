@@ -2517,6 +2517,8 @@ static bool test_coupled(llama_model * model) {
             }
             proposed[j] = common_sampler_sample_coupled(smpl, cands[j].data(), cands[j].size(), proposed, j);
             ok = ok && proposed[j] != LLAMA_TOKEN_NULL;
+            // asked again at the same place, the same token: the copy's second draw there would be another
+            ok = ok && common_sampler_sample_coupled(smpl, cands[j].data(), cands[j].size(), proposed, j) == proposed[j];
         }
         for (int j = 0; ok && j < 3; ++j) {
             const llama_token id = draw(cands[j]);

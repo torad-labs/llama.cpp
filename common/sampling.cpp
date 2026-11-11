@@ -348,9 +348,11 @@ struct common_sampler {
     int32_t n_candidates = 0;
 
     // common_sampler_sample_coupled's copy of the chain, the tokens a drafter proposed that the copy has accepted since
-    // it was made, and the drafter's candidates. An accept, a reset or a copy into this sampler voids the copy
+    // it was made, whether it has drawn since the last of them, and the drafter's candidates. An accept, a reset or a
+    // copy into this sampler voids the copy
     struct llama_sampler *        chain_ahead = nullptr;
     bool                          ahead_valid = false;
+    bool                          ahead_drawn = false;
     llama_tokens                  ahead       = {};
     std::vector<llama_token_data> cur_ahead   = {};
 
@@ -1087,32 +1089,34 @@ llama_token common_sampler_sample_coupled(struct common_sampler * gsmpl, const l
 
     const auto tm = gsmpl->tm();
 
-    llama_sampler * chain = gsmpl->chain;
-    if (n_proposed > 0) {
-        // the tokens proposed before this one are history when the target samples it: a copy of the chain accepts them,
-        // made again unless what it accepted since the chain last changed is the start of these
-        auto & ahead = gsmpl->ahead;
-        if (!gsmpl->ahead_valid || ahead.size() > n_proposed || !std::equal(ahead.begin(), ahead.end(), proposed)) {
-            if (gsmpl->chain_ahead == nullptr) {
-                gsmpl->chain_ahead = llama_sampler_clone(gsmpl->chain);
-            } else {
-                llama_sampler_copy(gsmpl->chain, gsmpl->chain_ahead);
-            }
-            gsmpl->ahead_valid = true;
-            ahead.clear();
+    // a copy of the chain draws, never the chain: the chain's first draw after an accept is the one foretold, and a draw
+    // here would take its place. The tokens proposed before this one are history when the target samples it, so the
+    // copy accepts them. It is made again unless what it accepted since the chain last changed is the start of these
+    // and it has not drawn after them
+    auto & ahead = gsmpl->ahead;
+    if (!gsmpl->ahead_valid || ahead.size() > n_proposed || (ahead.size() == n_proposed && gsmpl->ahead_drawn) ||
+            !std::equal(ahead.begin(), ahead.end(), proposed)) {
+        if (gsmpl->chain_ahead == nullptr) {
+            gsmpl->chain_ahead = llama_sampler_clone(gsmpl->chain);
+        } else {
+            llama_sampler_copy(gsmpl->chain, gsmpl->chain_ahead);
         }
-        while (ahead.size() < n_proposed) {
-            llama_sampler_accept(gsmpl->chain_ahead, proposed[ahead.size()]);
-            ahead.push_back(proposed[ahead.size()]);
-        }
-        chain = gsmpl->chain_ahead;
+        gsmpl->ahead_valid = true;
+        gsmpl->ahead_drawn = false;
+        ahead.clear();
+    }
+    while (ahead.size() < n_proposed) {
+        llama_sampler_accept(gsmpl->chain_ahead, proposed[ahead.size()]);
+        ahead.push_back(proposed[ahead.size()]);
+        gsmpl->ahead_drawn = false;
     }
 
     auto & cur = gsmpl->cur_ahead;
     cur.assign(cands, cands + n_cands);
     llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
 
-    llama_sampler_apply(chain, &cur_p);
+    llama_sampler_apply(gsmpl->chain_ahead, &cur_p);
+    gsmpl->ahead_drawn = true;
 
     return cur_p.selected < 0 ? LLAMA_TOKEN_NULL : cur_p.data[cur_p.selected].id;
 }

@@ -1169,12 +1169,15 @@ struct llama_sampler_dist : public llama_sampler_backend {
     std::vector<ggml_tensor *> inp_uniforms;
 
     // llama_sampler_init_dist_coupled: the token is the argmax of logit + Gumbel noise, a sample of the same
-    // distribution, with the noise keyed by (seed_cur, n_accept, token id) instead of drawn from rng. A copy of the
-    // chain holds the same noise, so a drafter that applies one to its own logits (and accepts what it proposes into
-    // it) picks, where its logits are near these, the token this sampler will pick; a greedy draft lands with the
-    // probability of its token only.
+    // distribution, with the noise keyed by (seed_cur, n_accept, n_apply, token id) instead of drawn from rng. A copy
+    // of the chain holds the same noise, so a drafter that applies one to its own logits (and accepts what it proposes
+    // into it) picks, where its logits are near these, the token this sampler will pick; a greedy draft lands with the
+    // probability of its token only. Only a sample's first apply is foretold: an apply made again before the accept (a
+    // grammar's resample of a rejected token) has noise of its own, as the generator gives it a number of its own, or
+    // the second draw would be conditioned on the first.
     bool     coupled  = false;
     uint64_t n_accept = 0; // tokens accepted since the last reset: the sample's index
+    uint32_t n_apply  = 0; // coupled applies since the last accept: the draw's index at the sample
 
     void copy_state(const llama_sampler_dist & src) {
         // note: inp_uniforms and backend_transactional belong to the current sampling graph
@@ -1184,17 +1187,19 @@ struct llama_sampler_dist : public llama_sampler_backend {
         n_backend_draws_generated = src.n_backend_draws_generated;
         n_backend_draws_committed = src.n_backend_draws_committed;
         n_accept                  = src.n_accept;
+        n_apply                   = src.n_apply;
     }
 };
 
-// Gumbel(0, 1) noise of a token at a sample: two rounds of splitmix64's finalizer over the key, 53 bits to (0, 1)
-static double llama_sampler_dist_gumbel(uint32_t seed, uint64_t index, llama_token id) {
+// Gumbel(0, 1) noise of a token at a sample's draw: three rounds of splitmix64's finalizer over the key, 53 bits to (0, 1)
+static double llama_sampler_dist_gumbel(uint32_t seed, uint64_t index, uint32_t draw, llama_token id) {
     const auto mix = [](uint64_t z) {
         z ^= z >> 30; z *= 0xBF58476D1CE4E5B9ull;
         z ^= z >> 27; z *= 0x94D049BB133111EBull;
         return z ^ (z >> 31);
     };
-    const uint64_t z = mix(mix(((uint64_t) seed << 32 | (uint32_t) id) + 0x9E3779B97F4A7C15ull) ^ (index * 0xD1B54A32D192ED03ull));
+    const uint64_t z = mix(mix(mix(((uint64_t) seed << 32 | (uint32_t) id) + 0x9E3779B97F4A7C15ull) ^ (index * 0xD1B54A32D192ED03ull)) ^
+                           (draw * 0x8CB92BA72F3D8DD7ull));
     const double   u = ((double) (z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
     return -std::log(-std::log(u));
 }
@@ -1214,6 +1219,9 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     }
 
     cur_p->selected = 0;
+
+    // a coupled sampler's draw at this sample: 0 is the one a copy foretells
+    const uint32_t n_draw = ctx->coupled ? ctx->n_apply++ : 0;
 
     std::uniform_real_distribution<double> dist(0.0f, 1.0f);
 
@@ -1241,11 +1249,13 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     }
 
     if (ctx->coupled) {
-        // Gumbel-max over the tokens the chain left: a token it removed (-inf) never wins
+        // Gumbel-max over the tokens the chain left: a token it removed (-inf) never wins. The noise is added to the
+        // logit less the largest, or logits far from 0 would round it away
         double best = -INFINITY;
         for (size_t i = 0; i < cur_p->size; ++i) {
             if (cur_p->data[i].p > 0.0f) {
-                const double score = (double) cur_p->data[i].logit + llama_sampler_dist_gumbel(ctx->seed_cur, ctx->n_accept, cur_p->data[i].id);
+                const double score = ((double) cur_p->data[i].logit - (double) max_l) +
+                        llama_sampler_dist_gumbel(ctx->seed_cur, ctx->n_accept, n_draw, cur_p->data[i].id);
                 if (score > best) {
                     best            = score;
                     cur_p->selected = i;
@@ -1303,6 +1313,7 @@ static void llama_sampler_dist_reset(struct llama_sampler * smpl) {
     ctx->n_backend_draws_generated = 0;
     ctx->n_backend_draws_committed = 0;
     ctx->n_accept = 0;
+    ctx->n_apply  = 0;
 }
 
 static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sampler * smpl) {
@@ -1320,6 +1331,7 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
         result_ctx->n_backend_draws_generated = ctx->n_backend_draws_generated;
         result_ctx->n_backend_draws_committed = ctx->n_backend_draws_committed;
         result_ctx->n_accept                  = ctx->n_accept;
+        result_ctx->n_apply                   = ctx->n_apply;
     }
 
     return result;
@@ -1451,6 +1463,7 @@ static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token t
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
     ++sctx->n_accept;
+    sctx->n_apply = 0;
 
     if (!sctx->backend_transactional ||
             sctx->n_backend_draws_committed >= sctx->n_backend_draws_generated) {
@@ -4376,7 +4389,7 @@ struct llama_sampler * llama_sampler_init_logit_bias(
 // coupled draws
 
 // the chain ends in a coupled dist sampler, and every sampler before it runs on the host and leaves its own state alone
-// in apply: applying the chain to another model's logits then changes nothing the next sample reads
+// in apply: a copy of the chain applied to another model's logits then draws with the noise of the chain's next sample
 bool llama_sampler_chain_coupled(const struct llama_sampler * chain) {
     if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
         return false;

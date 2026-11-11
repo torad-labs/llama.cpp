@@ -540,6 +540,55 @@ static void test_dist_coupled() {
         llama_sampler_free(smpl);
     }
 
+    // a common offset changes nothing: the noise is not rounded away by logits far from 0
+    for (const float offset : { 0.0f, 1e20f, -1e20f }) {
+        const std::vector<float> logits(3, offset);
+        llama_sampler *  smpl = llama_sampler_init_dist_coupled(1234);
+        const int        n    = 30000;
+        std::vector<int> count(logits.size(), 0);
+        for (int i = 0; i < n; ++i) {
+            const llama_token id = draw_from(smpl, logits, cur);
+            count[id]++;
+            llama_sampler_accept(smpl, id);
+        }
+        for (size_t t = 0; t < logits.size(); ++t) {
+            // one standard deviation of a share is 0.0027 at this n
+            GGML_ASSERT(fabs((double) count[t] / n - 1.0 / 3.0) < 0.012);
+        }
+        llama_sampler_free(smpl);
+    }
+
+    // a draw made again before the accept is independent of the first, as a grammar's resample needs: weights 2, 4 and
+    // 1 under top-k 2, the token of weight 4 rejected and the draw made again over the other two. The token of weight 1
+    // then comes at (4/6)(1/3) = 2/9; with the first draw's noise it would come at 2/7
+    {
+        const std::vector<float> all   = { logf(2.0f), logf(4.0f), logf(1.0f) };
+        const std::vector<float> valid = { logf(2.0f), -INFINITY, logf(1.0f) };
+        llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(2));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist_coupled(4321));
+        GGML_ASSERT(llama_sampler_chain_coupled(chain));
+        llama_sampler * ahead = llama_sampler_clone(chain);
+        const int n = 100000;
+        int last = 0, foretold = 0;
+        for (int i = 0; i < n; ++i) {
+            const llama_token first = draw_from(chain, all, cur);
+            foretold += draw_from(ahead, all, cur) == first;
+            const llama_token id = first == 1 ? draw_from(chain, valid, cur) : first;
+            GGML_ASSERT(id != 1);
+            last += id == 2;
+            llama_sampler_accept(chain, id);
+            llama_sampler_accept(ahead, id);
+        }
+        printf("coupled draws made again: the token of weight 1 at %.4f (2/9 = 0.2222, 2/7 = 0.2857), the first draw foretold %d of %d\n",
+                (double) last / n, foretold, n);
+        // one standard deviation is 0.0013 at this n
+        GGML_ASSERT(fabs((double) last / n - 2.0 / 9.0) < 0.006);
+        GGML_ASSERT(foretold == n);
+        llama_sampler_free(ahead);
+        llama_sampler_free(chain);
+    }
+
     const int32_t n_vocab = 64;
     std::mt19937  rng(7);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
@@ -548,7 +597,9 @@ static void test_dist_coupled() {
     llama_sampler * target = coupled_chain(n_vocab, 99);
     GGML_ASSERT(llama_sampler_chain_coupled(target));
     {
-        llama_sampler * drafter = llama_sampler_clone(target);
+        // a drafter draws once a token, so each of the two has its own copy
+        llama_sampler * drafter      = llama_sampler_clone(target);
+        llama_sampler * drafter_near = llama_sampler_clone(target);
         GGML_ASSERT(llama_sampler_chain_coupled(drafter));
         const int n = 20000;
         int same = 0, near = 0, top = 0;
@@ -558,7 +609,7 @@ static void test_dist_coupled() {
                 q[t] = p[t] + 0.5f * gauss(rng);
             }
             const llama_token d_same = draw_from(drafter, p, cur);
-            const llama_token d_near = draw_from(drafter, q, cur);
+            const llama_token d_near = draw_from(drafter_near, q, cur);
             const llama_token d_top  = (llama_token) (std::max_element(q.begin(), q.end()) - q.begin());
             const llama_token x      = draw_from(target, p, cur);
             same += d_same == x;
@@ -566,11 +617,13 @@ static void test_dist_coupled() {
             top  += d_top == x;
             llama_sampler_accept(target, x);
             llama_sampler_accept(drafter, x);
+            llama_sampler_accept(drafter_near, x);
         }
         printf("coupled draws: %d of %d from the same logits, %d from logits 0.5 away, the top token of those %d\n", same, n, near, top);
         GGML_ASSERT(same == n);
         GGML_ASSERT(near > top + n / 20);
         llama_sampler_free(drafter);
+        llama_sampler_free(drafter_near);
     }
     {
         llama_sampler * clone = llama_sampler_clone(target);

@@ -1442,15 +1442,17 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
-    /// The same distribution, drawn as the argmax of logit + Gumbel noise keyed by (seed, tokens accepted, token id)
-    /// instead of by the next number of a generator, so a copy of the sampler holds the noise of the samples to come.
-    /// A drafter that applies a copy of the chain to its own logits, accepting each token it proposes into the copy,
-    /// proposes the token the target then samples wherever its logits are near the target's. A fixed seed gives
-    /// other tokens than llama_sampler_init_dist does. Never sampled on a backend.
+    /// The same distribution, drawn as the argmax of logit + Gumbel noise keyed by (seed, tokens accepted, applies
+    /// since the last accept, token id) instead of by the next number of a generator, so a copy of the sampler holds
+    /// the noise of the samples to come. A drafter that applies a copy of the chain to its own logits once a token,
+    /// accepting each token it proposes into the copy, proposes the token the target then samples wherever its logits
+    /// are near the target's. Only the first apply after an accept is foretold: an apply made again before the next
+    /// accept (a resample after a grammar's rejection) is an independent draw, as it is with the generator. A fixed
+    /// seed gives other tokens than llama_sampler_init_dist does. Never sampled on a backend.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist_coupled(uint32_t seed);
 
     /// The chain ends in a coupled dist sampler and everything before it is applied on the host without changing its
-    /// own state: llama_sampler_apply on it with another model's logits leaves the next sample as it was.
+    /// own state: a copy of it applied to another model's logits draws with the noise of the chain's next sample.
     LLAMA_API bool llama_sampler_chain_coupled(const struct llama_sampler * chain);
 
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
