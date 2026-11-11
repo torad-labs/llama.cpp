@@ -600,9 +600,32 @@ llama_context::llama_context(
         }
     }
 
+    // LLAMA_KV_SEQ_CELLS=N: a sequence of a shared pool holds N cells at most. A shared pool's sequence may otherwise take
+    // every cell, and the graph reserved at load sizes a pooled indexer's scores for that: three tensors of pools x rows
+    // a layer's turn (the scores, their copy with the dump pools, the bias), 10 bytes a pool a row. At -ub 2048 that is
+    // 2.5 GiB of a card's compute buffer at 524,288 cells and 28.8 GiB at 6,029,312, for the target and again for the
+    // MTP head, which is why the pool 23 sessions of 262,144 need did not load on four RTX PRO 6000 (Nov 9, 2026). With
+    // the limit n_ctx_seq() answers N, so a server's slots end there, and the reserve is sized for the steps such slots
+    // make: sequences of N positions at most, each in a stream of pool maps of its own (llama_kpool_n_pools_reserve).
+    // It is then no longer the worst case. Nothing here refuses a sequence that passes N, and a step of the packed maps
+    // (a server's `n` > 1 completions share their prompt's cells) scores every sequence's pools in one stream: a graph
+    // larger than the reserve is allocated when it comes, the context's kept graphs are evicted for the room, and the
+    // decode returns -2 when the device has none
+    if (cparams.kv_unified) {
+        const char * seq_cells = getenv("LLAMA_KV_SEQ_CELLS");
+        const long   val       = seq_cells ? strtol(seq_cells, nullptr, 10) : 0;
+
+        if (val > 0 && (uint64_t) val < cparams.n_ctx) {
+            cparams.n_seq_cells = GGML_PAD((uint32_t) val, 256);
+        }
+    }
+
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
+    if (cparams.n_seq_cells > 0) {
+        LLAMA_LOG_INFO("%s: n_seq_cells           = %u\n", __func__, cparams.n_seq_cells);
+    }
     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
@@ -1206,7 +1229,7 @@ uint32_t llama_context::n_ctx() const {
 }
 
 uint32_t llama_context::n_ctx_seq() const {
-    return cparams.n_ctx_seq;
+    return cparams.n_seq_cells > 0 ? std::min(cparams.n_seq_cells, cparams.n_ctx_seq) : cparams.n_ctx_seq;
 }
 
 uint32_t llama_context::n_batch() const {

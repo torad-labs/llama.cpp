@@ -4365,8 +4365,14 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 llama_kpool_cells_fn([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
             return kv->get_cells(s);
         });
-        const int64_t n_pools = llama_kpool_n_pools_ubatch(cells_of, ubatch, n_kv, kpool, n_stream, hparams.indexer_top_k,
-                llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
+        // With LLAMA_KV_SEQ_CELLS the reserved graph takes the pools sequences of that many positions give, each in a stream
+        // of its own, not the cache's: its scores, their copy with the dump pools and the bias are pools x rows each. A step
+        // outside that (llama_kpool_n_pools_reserve) still builds its own larger graph here
+        const int64_t n_pools = mctx_attn->is_full() && cparams.n_seq_cells > 0 ?
+                llama_kpool_n_pools_reserve(n_kv, kpool, n_ps, hparams.indexer_top_k,
+                    llama_kpool_pool_pad(mctx_attn->get_kv()->get_n_pad_max(), kpool), cparams.n_seq_cells) :
+                llama_kpool_n_pools_ubatch(cells_of, ubatch, n_kv, kpool, n_stream, hparams.indexer_top_k,
+                    llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
         const int64_t n_dump  = llama_kpool_select_k(n_pools, hparams.indexer_top_k, kpool);
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream_kv);
