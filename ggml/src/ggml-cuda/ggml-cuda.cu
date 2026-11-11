@@ -871,43 +871,73 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (kept > 0) {
             CUDA_CHECK(cudaMemcpy(records.data(), mmq_route_log.records, kept*sizeof(records[0]), cudaMemcpyDeviceToHost));
         }
-        const char * path = getenv("GGML_CUDA_MMQ_ROUTE_LOG_FILE");
-        FILE * file = path && path[0] ? fopen(path, "a") : nullptr;
-        if (path && path[0] && file == nullptr) {
-            GGML_LOG_WARN("%s: cannot append to %s; the route log goes to the log\n", __func__, path);
-        }
-        std::string text;
-        const auto emit = [&](const std::string & line) {
-            if (file != nullptr) {
-                text += line;
-            } else {
-                GGML_LOG_INFO("%s", line.c_str());
+        // a tensor's name is any bytes: as a JSON string, so that no name can end the string or the line early
+        const auto quoted = [](const std::string & name) {
+            std::string out = "\"";
+            for (const unsigned char c : name) {
+                if (c == '"' || c == '\\') {
+                    out += '\\';
+                    out += (char) c;
+                } else if (c < 0x20) {
+                    char escape[8];
+                    snprintf(escape, sizeof(escape), "\\u%04x", (unsigned) c);
+                    out += escape;
+                } else {
+                    out += (char) c;
+                }
             }
+            return out + "\"";
         };
+        std::string text;
         char line[512];
         const int ctx = mmq_route_log.ctx;
         for (size_t i = 0; i < mmq_route_log.sites.size(); ++i) {
             const auto & site = mmq_route_log.sites[i];
-            snprintf(line, sizeof(line), "MMQ_ROUTE_SITE {\"ctx\":%d,\"device\":%d,\"site\":%zu,\"name\":\"%s\","
-                     "\"type\":\"%s\",\"experts\":%d,\"experts_total\":%d,\"paired\":%s}\n", ctx, device, i,
-                     site.name.c_str(), ggml_type_name((ggml_type) site.type), site.n_expert, site.n_expert_total,
+            snprintf(line, sizeof(line), "MMQ_ROUTE_SITE {\"ctx\":%d,\"device\":%d,\"site\":%zu,\"name\":", ctx, device,
+                     i);
+            text += line + quoted(site.name);
+            snprintf(line, sizeof(line), ",\"type\":\"%s\",\"experts\":%d,\"experts_total\":%d,\"paired\":%s}\n",
+                     ggml_type_name((ggml_type) site.type), site.n_expert, site.n_expert_total,
                      site.paired ? "true" : "false");
-            emit(line);
+            text += line;
         }
         for (uint32_t i = 0; i < kept; ++i) {
             const auto & r = records[i];
             snprintf(line, sizeof(line), "MMQ_ROUTE {\"ctx\":%d,\"seq\":%u,\"eval\":%u,\"site\":%u,\"cols\":%u,"
                      "\"used\":%u,\"tiles8\":%u,\"tiles\":%u,\"j\":%u}\n",
                      ctx, i, r.eval, r.site, r.cols, r.used, r.tiles8, r.tiles, r.j);
-            emit(line);
+            text += line;
         }
         snprintf(line, sizeof(line), "MMQ_ROUTE_END {\"ctx\":%d,\"device\":%d,\"ran\":%u,\"kept\":%u,\"capacity\":%u,"
                  "\"evals\":%u}\n", ctx, device, head[0], kept, mmq_route_log.capacity, head[1]);
-        emit(line);
-        if (file != nullptr) {
-            // one write a context: contexts freed by different threads do not interleave their lines
-            fwrite(text.data(), 1, text.size(), file);
-            fclose(file);
+        text += line;
+        const char * path = getenv("GGML_CUDA_MMQ_ROUTE_LOG_FILE");
+        bool filed = false;
+        if (path && path[0]) {
+            // A context's lines are opened, written and closed under one lock: a buffered write is not one append,
+            // and contexts freed by different threads would otherwise splice their lines. The lock is the
+            // process's; two processes are not to share a file.
+            static std::mutex write_mutex;
+            std::lock_guard<std::mutex> lock(write_mutex);
+            FILE * file = fopen(path, "a");
+            if (file == nullptr) {
+                GGML_LOG_WARN("%s: cannot append to %s; the route log goes to the log\n", __func__, path);
+            } else {
+                const size_t written = fwrite(text.data(), 1, text.size(), file);
+                const int    closed  = fclose(file);
+                if (written != text.size() || closed != 0) {
+                    GGML_LOG_WARN("%s: context %d's route log is incomplete in %s (%zu of %zu bytes)\n", __func__, ctx,
+                                  path, written, text.size());
+                }
+                filed = true;
+            }
+        }
+        if (!filed) {
+            for (size_t at = 0; at < text.size();) {
+                const size_t end = text.find('\n', at);
+                GGML_LOG_INFO("%s\n", text.substr(at, end - at).c_str());
+                at = end + 1;
+            }
         }
         CUDA_CHECK(cudaFree(mmq_route_log.records));
         CUDA_CHECK(cudaFree(mmq_route_log.head));
