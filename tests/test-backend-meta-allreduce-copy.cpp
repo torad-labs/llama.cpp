@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -240,6 +241,46 @@ static ggml_backend_meta_split_state mirrored(const ggml_tensor *, void *) {
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
 
+// The Q8 wire's block, as ggml-cuda's allreduce-q8.cuh lays it out: 32 elements in 36 bytes.
+static constexpr int64_t q8_block_elems = 32;
+static constexpr int64_t q8_block_bytes = 36;
+
+// A share as the Q8 wire carries it (GGML_CUDA_AR_WIRE_Q8=1), in place, as allreduce-q8.cuh states it: by block of 32,
+// the step d is the block's largest magnitude a over 127, rounded; one bit pattern up where d is subnormal and d*127
+// falls short of a, one down where d*127 is infinite. An element is d times its count of steps, the nearest integer to
+// x/d, ties to even, within +-127, so a count of zero gives +0. Each division and product is one F32 operation, none
+// merged with another, as the kernels keep theirs. False where an element lands more than half a step from the share's.
+static bool q8_wire_values(std::vector<float> & x) {
+    bool ok = true;
+    const int64_t ne = (int64_t) x.size();
+    for (int64_t begin = 0; begin < ne; begin += q8_block_elems) {
+        const int64_t end = std::min(ne, begin + q8_block_elems);
+        float a = 0.0f;
+        for (int64_t j = begin; j < end; ++j) { a = std::max(a, fabsf(x[j])); }
+        volatile float d_rounded = a/127.0f;
+        float d = d_rounded;
+        volatile float back = d*127.0f;
+        if (d < FLT_MIN && back < a) {
+            d = nextafterf(d, INFINITY);
+            back = d*127.0f;
+        }
+        if (std::isinf((float) back)) {
+            d = nextafterf(d, 0.0f);
+        }
+        for (int64_t j = begin; j < end; ++j) {
+            int q = 0;
+            if (d > 0.0f) {
+                volatile float steps = x[j]/d;
+                q = std::min(127, std::max(-127, (int) nearbyintf(steps)));
+            }
+            volatile float y = d*(float) q;
+            ok = ok && fabs((double) y - (double) x[j]) <= 0.5001*(double) d;
+            x[j] = y;
+        }
+    }
+    return ok;
+}
+
 // Several gathers in one graph, followed by replay with new data, exercise the shared parity ring across captures.
 static bool test_gather_graph(std::vector<ggml_backend_dev_t> devices, int64_t rows, int64_t width = 4096) {
     auto * meta = ggml_backend_meta_device(devices.data(), devices.size(), mirrored, nullptr);
@@ -320,26 +361,34 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
         bool tail_legacy; // GGML_CUDA_AR_COPY_TAIL_LEGACY=1: a payload's remainder as a chunk of its own
     };
     const route routes[] = {
-        {"host LL",      "1048576", "0",       "0", false},
-        {"host chunked", "0",       "0",       "0", false},
-        {"peer LL",      "0",       "1048576", "0", false},
-        {"host copy",    "0",       "0",       "1", false},
+        {"host LL",      "1048576", "0",       "0", false, false},
+        {"host chunked", "0",       "0",       "0", false, false},
+        {"peer LL",      "0",       "1048576", "0", false, false},
+        {"host copy",    "0",       "0",       "1", false, false},
         // the copy engines' chunks as they were cut before the payload was cut into equal ones: 69*4096 + 3 on the BF16
         // wire is a chunk and a tail of 40,966 bytes here and one chunk on every other copy route
         {"host copy tails", "0",    "0",       "1", false, true},
-        {"host serial",  "0",       "0",       "1", true},
-        {"peer copy",    "0",       "1048576", "1", false},
-        {"owner-slice",  "0",       "1048576", "0", false},
+        {"host serial",  "0",       "0",       "1", true,  false},
+        {"peer copy",    "0",       "1048576", "1", false, false},
+        {"owner-slice",  "0",       "1048576", "0", false, false},
         // past the LL and short of the copy engines, where the cards map each other's memory: a -sm dp verify's expert
         // reduce (36 to 108 rows of 4096, up to 864 KB on the BF16 wire) used to stage through host memory, crossing
         // the link twice and reading it back at about 3.5 GB/s; its shares now go card to card, through the inboxes
         // the gathers use, and the receivers add the same bytes in the same order
-        {"peer chunked", "0",       "16",      "0", false},
-        {"owner chunked", "0",      "16",      "0", false},
+        {"peer chunked", "0",       "16",      "0", false, false},
+        {"owner chunked", "0",      "16",      "0", false, false},
     };
     bool ok = true;
-    for (bool bf16 : {false, true}) {
+    enum { WIRE_F32, WIRE_BF16, WIRE_Q8 };
+    for (const int wire : {WIRE_F32, WIRE_BF16, WIRE_Q8}) {
+        const bool bf16 = wire != WIRE_F32;
         for (const auto & route : routes) {
+            // GGML_CUDA_AR_WIRE_Q8=1 puts the copy engines' reductions to every rank on the Q8 wire and nothing else: the
+            // reduce to owners and the gather keep theirs, and so does every other route, which the chunked one shows.
+            const bool q8 = wire == WIRE_Q8 && route.copy[0] == '1';
+            if (wire == WIRE_Q8 && !q8 && strcmp(route.name, "host chunked") != 0) { continue; }
+            const char * wire_name = q8 ? "Q8" : wire == WIRE_Q8 ? "BF16 under the Q8 switch" : bf16 ? "BF16" : "F32";
+            set_env("GGML_CUDA_AR_WIRE_Q8", wire == WIRE_Q8 ? "1" : nullptr);
             set_env("GGML_CUDA_AR_BF16_THRESHOLD", bf16 ? "1" : "0");
             set_env("GGML_CUDA_AR_LL_MAX_BYTES", route.ll);
             set_env("GGML_CUDA_AR_P2P_MAX_BYTES", route.p2p);
@@ -380,7 +429,12 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                 }
             }
             std::vector<int64_t> sizes = {1, 3, 17, 4097, 131079, 23*4096, 69*4096 + 3, 512*4096 + 3};
-            if (route.copy[0] == '1') {
+            if (q8) {
+                // sizes about one block, and a last block of one element past a slice of whole blocks: the wire's 32 MB
+                // hold 932,067 blocks of 36 bytes
+                sizes = {1, 3, 17, 31, 32, 33, 4097, 131079, 23*4096, 69*4096 + 3, 512*4096 + 3,
+                         32*1024*1024/q8_block_bytes*q8_block_elems + 1};
+            } else if (route.copy[0] == '1') {
                 sizes.push_back(32*1024*1024/(bf16 ? 2 : 4) + 3);
             }
             for (const int64_t ne : sizes) {
@@ -394,22 +448,60 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                     buffers[rank] = ggml_backend_alloc_ctx_tensors(contexts[rank], backends[rank]);
                     GGML_ASSERT(buffers[rank]);
                 }
-                std::vector<float> input(ne), expected(ne), output(ne), first(ne);
+                std::vector<float> input(ne), expected(ne), output(ne), first(ne), share(q8 ? ne : 0);
                 const auto value = [](int rank, int64_t j, int iteration) {
                     if (iteration == 6 && rank >= 2) { return 0.0f; }
                     if (j % 17 == 0) { return rank == 0 ? 1e20f : rank == 1 ? -1e20f : (float) rank; }
                     return (float) ((j*13 + rank*7 + iteration) % 41 - 20) / 7.0f;
+                };
+                // The Q8 wire's shares, by block of 32: the values above over nine octaves, a block and a rank to its own, so
+                // each rank's scale differs; one block in eight with the outliers, which take ranks 0 and 1's whole range
+                // and cancel; one of zeros on every other rank; one with its range in a single element; one of whole
+                // counts of the smallest subnormal, whose step rounds to zero before it is raised; one across the
+                // smallest normal, whose step is subnormal; and one where a rank holds the largest finite value and no
+                // other rank adds to it.
+                const auto value_q8 = [](int rank, int64_t j, int iteration) {
+                    if (iteration == 6 && rank >= 2) { return 0.0f; }
+                    const int64_t block = j/q8_block_elems;
+                    const int     k     = (int) ((j*13 + rank*7 + iteration) % 41) - 20;
+                    const float   v     = ldexpf((float) k / 7.0f, (int) ((block + rank) % 9) - 4);
+                    switch ((block + iteration) % 8) {
+                        case 1:  return j % 17 != 0 ? v : rank == 0 ? 1e20f : rank == 1 ? -1e20f : (float) rank;
+                        case 2:  return (block + rank) % 2 == 0 ? 0.0f : v;
+                        case 3:  return j % q8_block_elems == 5 ? v : 0.0f;
+                        case 4:  return ldexpf((float) k, -149);
+                        case 5:  return (float) k / 16.0f * FLT_MIN;
+                        case 6:  return j % q8_block_elems != 3 ? v : rank == block % 2 ? (k < 0 ? -FLT_MAX : FLT_MAX) : 0.0f;
+                        default: return v;
+                    }
                 };
                 for (int iteration = 0; iteration < (pair_comm ? 7 : 6); ++iteration) {
                     std::fill(expected.begin(), expected.end(), 0.0f);
                     for (int rank = 0; rank < n; ++rank) {
                         const bool active = iteration < 2 || iteration == 6 || (iteration < 5 && rank != iteration % n);
                         tensors[rank]->flags = active ? GGML_TENSOR_FLAG_COMPUTE : 0;
+                        if (q8) {
+                            for (int64_t j = 0; j < ne; ++j) {
+                                const float v = value_q8(rank, j, iteration);
+                                input[j] = active ? v : 12345.0f;
+                                share[j] = active ? v : 0.0f;
+                            }
+                            if (!q8_wire_values(share)) {
+                                fprintf(stderr, "FAIL: the Q8 reference left an element more than half a step from its share, "
+                                        "ne=%lld iteration=%d rank=%d\n", (long long) ne, iteration, rank);
+                                case_ok = false;
+                            }
+                        }
                         for (int64_t j = 0; j < ne; ++j) {
-                            float v = value(rank, j, iteration);
-                            input[j] = active ? v : 12345.0f;
-                            v = active ? v : 0.0f;
-                            if (bf16) { v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v)); }
+                            float v;
+                            if (q8) {
+                                v = share[j];
+                            } else {
+                                v = value(rank, j, iteration);
+                                input[j] = active ? v : 12345.0f;
+                                v = active ? v : 0.0f;
+                                if (bf16) { v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v)); }
+                            }
                             // Keep the reference's logical rank order, without regrouping partial sums.
                             volatile float reduced = rank == 0 ? v : expected[j] + v;
                             expected[j] = reduced;
@@ -423,7 +515,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                         ggml_backend_tensor_get(tensors[rank], output.data(), 0, output.size()*sizeof(float));
                         const bool same = memcmp(output.data(), expected.data(), output.size()*sizeof(float)) == 0;
                         if (!same) { fprintf(stderr, "FAIL: %s %s ne=%lld iteration=%d rank=%d vs ordered sum\n",
-                                             route.name, bf16 ? "BF16" : "F32", (long long) ne, iteration, rank); }
+                                             route.name, wire_name, (long long) ne, iteration, rank); }
                         case_ok = case_ok && same;
                         if (rank == 0) { first = output; }
                         else { case_ok = case_ok && memcmp(first.data(), output.data(), output.size()*sizeof(float)) == 0; }
@@ -431,7 +523,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                     if (iteration == 6) {
                         // The same two contributions plus zero-valued ranks must retain the two-device result.
                         for (int rank = 0; rank < 2; ++rank) {
-                            for (int64_t j = 0; j < ne; ++j) { input[j] = value(rank, j, iteration); }
+                            for (int64_t j = 0; j < ne; ++j) { input[j] = q8 ? value_q8(rank, j, iteration) : value(rank, j, iteration); }
                             ggml_backend_tensor_set(tensors[rank], input.data(), 0, input.size()*sizeof(float));
                         }
                         const bool pair_ran = sum(pair_comm, tensors.data());
@@ -484,7 +576,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                         const bool ran = owned(comm, tensors.data(), begin.data(), len.data());
                         if (!ran && must_own) {
                             fprintf(stderr, "FAIL: %s %s ne=%lld iteration=%d did not reduce to owners\n",
-                                    route.name, bf16 ? "BF16" : "F32", (long long) ne, iteration);
+                                    route.name, wire_name, (long long) ne, iteration);
                             case_ok = false;
                         }
                         reduced_owned = reduced_owned && ran;
@@ -499,7 +591,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                             }
                             if (n_wrong_owned || n_wrong_other) {
                                 fprintf(stderr, "FAIL: %s %s ne=%lld iteration=%d rank=%d owns [%lld, %lld): %lld of its own "
-                                        "elements differ from the ordered sum, %lld others %s\n", route.name, bf16 ? "BF16" : "F32",
+                                        "elements differ from the ordered sum, %lld others %s\n", route.name, wire_name,
                                         (long long) ne, iteration, rank, (long long) begin[rank], (long long) (begin[rank] + len[rank]),
                                         (long long) n_wrong_owned, (long long) n_wrong_other,
                                         ran ? "received something" : "changed though it declined");
@@ -535,7 +627,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                 }
                 ok = ok && case_ok;
                 printf("%s: %d ranks, %s%s, %s wire, %lld elements%s, %s\n", case_ok ? "ok" : "FAIL", n, route.name,
-                       peer_requested && !peer_active ? " (host fallback)" : "", bf16 ? "BF16" : "F32", (long long) ne,
+                       peer_requested && !peer_active ? " (host fallback)" : "", wire_name, (long long) ne,
                        pair_comm ? ", including two-rank parity" : "",
                        reduced_owned ? "reduced to owners" : "reduce to owners declined, nothing changed");
             }
@@ -553,7 +645,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                 const bool split_ok = last_split_seen && (!split_route || last_split > 0) && (split_on || last_split == 0);
                 if (!split_ok || split_route) {
                     fprintf(split_ok ? stdout : stderr, "%s: %d ranks, %s, %s wire, %llu split reductions%s, %s\n",
-                            split_ok ? "ok" : "FAIL", n, route.name, bf16 ? "BF16" : "F32", last_split,
+                            split_ok ? "ok" : "FAIL", n, route.name, wire_name, last_split,
                             last_split_seen ? "" : " (no count logged)",
                             split_route ? "some expected" : split_on ? "any number allowed" : "none expected");
                 }
@@ -567,7 +659,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                                                                       : last_chunked_host > 0 && last_chunked_peer == 0);
                 if (!moved) {
                     fprintf(stderr, "FAIL: %d-rank %s %s: %s chunked reductions, %llu card to card and %llu through host memory\n",
-                            n, route.name, bf16 ? "BF16" : "F32", last_chunked_seen ? "counted" : "no count of",
+                            n, route.name, wire_name, last_chunked_seen ? "counted" : "no count of",
                             last_chunked_peer, last_chunked_host);
                     ok = false;
                 }
@@ -941,15 +1033,21 @@ int main(int argc, char ** argv) {
         const char * bf16_threshold; // GGML_CUDA_AR_BF16_THRESHOLD, nullptr for the default
         bool         one_stream;     // GGML_CUDA_AR_COPY_ONE_STREAM=1
         bool         card_to_card;   // GGML_CUDA_AR_COPY_PEER left to its default; 0 otherwise
+        bool         q8;             // GGML_CUDA_AR_WIRE_Q8=1
     };
     // each wire's passes after the sends and card to card follow its pass beside them, whose outputs they must equal
     const pass passes[] = {
-        {"BF16 wire, beside the sends", nullptr, false, false},
-        {"BF16 wire, after the sends",  nullptr, true,  false},
-        {"BF16 wire, card to card",     nullptr, false, true},
-        {"F32 wire, beside the sends",  "0",     false, false},
-        {"F32 wire, after the sends",   "0",     true,  false},
-        {"F32 wire, card to card",      "0",     false, true},
+        {"BF16 wire, beside the sends", nullptr, false, false, false},
+        {"BF16 wire, after the sends",  nullptr, true,  false, false},
+        {"BF16 wire, card to card",     nullptr, false, true,  false},
+        {"F32 wire, beside the sends",  "0",     false, false, false},
+        {"F32 wire, after the sends",   "0",     true,  false, false},
+        {"F32 wire, card to card",      "0",     false, true,  false},
+        // the Q8 wire carries each share to the nearest 1/127 of its block's largest magnitude: farther from the CPU's
+        // sums than the BF16 wire (an NMSE of 1.1e-5 here against 1.2e-6), and the same on every route
+        {"Q8 wire, beside the sends",   nullptr, false, false, true},
+        {"Q8 wire, after the sends",    nullptr, true,  false, true},
+        {"Q8 wire, card to card",       nullptr, false, true,  true},
     };
 
     bool ok = true;
@@ -959,6 +1057,7 @@ int main(int argc, char ** argv) {
         set_env("GGML_CUDA_AR_BF16_THRESHOLD", ps.bf16_threshold);
         set_env("GGML_CUDA_AR_COPY_ONE_STREAM", ps.one_stream ? "1" : nullptr);
         set_env("GGML_CUDA_AR_COPY_PEER", ps.card_to_card ? nullptr : "0");
+        set_env("GGML_CUDA_AR_WIRE_Q8", ps.q8 ? "1" : nullptr);
 
         const int n_pipelines_before = n_pipelines;
         ggml_backend_t cpu     = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);

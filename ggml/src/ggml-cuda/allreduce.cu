@@ -2,6 +2,7 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+#include "allreduce-q8.cuh"
 #include "convert.cuh"
 #include "ggml-impl.h"
 
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -909,6 +911,7 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_chunk_bytes;
     bool     copy_tail_legacy; // GGML_CUDA_AR_COPY_TAIL_LEGACY: a payload's remainder is a chunk of its own, however short
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
+    bool     wire_q8;        // GGML_CUDA_AR_WIRE_Q8: an F32 share the copy engines would carry in BF16 crosses in 8-bit blocks
     size_t   ll_max_bytes;   // wire bytes up to which the host LL path reduces; 0 disables this path
     size_t   p2p_max_bytes;  // wire bytes up to which the LL kernel reduces card to card; 0 when off or unavailable
     bool     copy_peer;      // copy-engine shares go card to card, into the peer's dev_tmp (ggml_cuda_ar_allreduce_copy_peer)
@@ -920,6 +923,7 @@ struct ggml_cuda_ar_pipeline {
     uint64_t n_chunked_peer;  // reductions on the chunked kernel that moved card to card, and through host memory
     uint64_t n_chunked_host;
     uint64_t n_split;         // reductions that went to owners and were gathered from them (GGML_CUDA_AR_SPLIT_REDUCE)
+    uint64_t n_wire_q8;       // reductions to every rank that crossed in 8-bit blocks (wire_q8)
     uint64_t call_count;
 
     // Per-device resources.
@@ -1282,6 +1286,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // Default 0.  1: an F32 share that the copy engines would carry in BF16 crosses in blocks of 32 signed bytes and
+    // an F32 scale (ggml_cuda_ar_allreduce_copy_q8).  The sums differ from the BF16 wire's.
+    p->wire_q8          = ggml_cuda_ar_env_u64("GGML_CUDA_AR_WIRE_Q8", 0) != 0;
     // Wire bytes up to which the host LL path reduces (0 disables this path), capped at one chunk's size.
     p->ll_max_bytes     = std::min(ggml_cuda_ar_env_u64("GGML_CUDA_AR_LL_MAX_BYTES", GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT),
                                    (uint64_t) GGML_CUDA_AR_MAX_BYTES);
@@ -1471,6 +1478,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     if (p->owner_slices) {
         GGML_LOG_INFO("%s: owner-slice-peer gather enabled\n", __func__);
     }
+    if (p->wire_q8) {
+        GGML_LOG_INFO("%s: F32 shares on the copy engines cross on the Q8 wire, %zu bytes to %d elements\n", __func__,
+                      sizeof(ggml_cuda_ar_q8_block), GGML_CUDA_AR_Q8_BLOCK_SIZE);
+    }
 
     return p;
 }
@@ -1484,6 +1495,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     GGML_LOG_DEBUG("%s: on the chunked kernel %llu card to card, %llu through host memory\n", __func__,
                    (unsigned long long) p->n_chunked_peer, (unsigned long long) p->n_chunked_host);
     GGML_LOG_DEBUG("%s: %llu split reductions, to owners and gathered from them\n", __func__, (unsigned long long) p->n_split);
+    GGML_LOG_DEBUG("%s: %llu reductions to every rank on the Q8 wire\n", __func__, (unsigned long long) p->n_wire_q8);
 
     // Drain all in-flight kernels and copies before tearing down resources.
     for (int i = 0; i < p->n_devices; ++i) {
@@ -1546,21 +1558,28 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // for the peer's share in dev_tmp[i]: dst_buf += that share, on the compute
 // stream.  Records dev_tmp-released, which the next call waits for before
 // dev_tmp[i] is overwritten, and AR-done as ev.ker for acquire_slot's
-// pool-wraparound sync.
+// pool-wraparound sync.  On the Q8 wire the share the device sent, own, is
+// summed as its peers received it, so dst_buf is written, not added to: each
+// peer's blocks lie a whole copy_bytes apart in dev_tmp[i], in rank order.
 template <typename T_src, typename T_dst>
 static void ggml_cuda_ar_copy_add(
-        ggml_cuda_ar_pipeline * p, int i, int slot, cudaStream_t stream, T_dst * dst_buf, int64_t ne) {
-    const int block_size = 256;
-    int n_blocks = (int) ((ne + block_size - 1) / block_size);
-    if (n_blocks > 1024) {
-        n_blocks = 1024;
-    }
-    if (p->n_devices == 2) {
-        ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(
-            dst_buf, p->dev_tmp[i].as<const T_src>(), (int) ne);
+        ggml_cuda_ar_pipeline * p, int i, int slot, cudaStream_t stream, const T_src * own, T_dst * dst_buf, int64_t ne) {
+    if constexpr (std::is_same_v<T_src, ggml_cuda_ar_q8_block>) {
+        ggml_cuda_ar_reduce_q8(dst_buf, own, p->dev_tmp[i].as<const char>(), p->copy_bytes, ne, i, p->n_devices, stream);
     } else {
-        ggml_cuda_ar_add_kernel_n<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(
-            dst_buf, p->dev_tmp[i].as<const T_src>(), p->copy_bytes / sizeof(T_src), (int) ne, i, p->n_devices);
+        GGML_UNUSED(own);
+        const int block_size = 256;
+        int n_blocks = (int) ((ne + block_size - 1) / block_size);
+        if (n_blocks > 1024) {
+            n_blocks = 1024;
+        }
+        if (p->n_devices == 2) {
+            ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(
+                dst_buf, p->dev_tmp[i].as<const T_src>(), (int) ne);
+        } else {
+            ggml_cuda_ar_add_kernel_n<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(
+                dst_buf, p->dev_tmp[i].as<const T_src>(), p->copy_bytes / sizeof(T_src), (int) ne, i, p->n_devices);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -1617,7 +1636,7 @@ static bool ggml_cuda_ar_allreduce_copy_peer(
         cudaStream_t stream = cuda_ctx[i]->stream();
         CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[peer][slot].cpy[0]));
         CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[i][slot].cpy[0]));
-        ggml_cuda_ar_copy_add<T_src, T_dst>(p, i, slot, stream, dst_buf[i], ne);
+        ggml_cuda_ar_copy_add<T_src, T_dst>(p, i, slot, stream, src_buf[i], dst_buf[i], ne);
     }
     p->dev_tmp_kernel_done_valid = true;
 
@@ -1703,7 +1722,7 @@ static bool ggml_cuda_ar_allreduce_copy_n(
             CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[i][slot].h2d));
             CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[i][slot].cpy[chunks - 1]));
         }
-        ggml_cuda_ar_copy_add<T_src, T_dst>(p, i, slot, stream, dst_buf[i], ne);
+        ggml_cuda_ar_copy_add<T_src, T_dst>(p, i, slot, stream, src_buf[i], dst_buf[i], ne);
     }
     p->host_large_read_done_valid = !p->copy_peer;
     p->dev_tmp_kernel_done_valid = true;
@@ -1819,7 +1838,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d));
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].cpy[copy_chunks - 1]));
 
-        ggml_cuda_ar_copy_add<T_src, T_dst>(p, i, slot, cuda_ctx[i]->stream(), dst_buf[i], ne);
+        ggml_cuda_ar_copy_add<T_src, T_dst>(p, i, slot, cuda_ctx[i]->stream(), src_buf[i], dst_buf[i], ne);
     }
     p->host_large_read_done_valid = true;
     p->dev_tmp_kernel_done_valid = true;
@@ -1857,6 +1876,41 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
         }
         ok = ggml_cuda_ar_allreduce_copy_impl<T_src, T_dst>(
             p, backends, src, dst, compute, outer_ne, outer_nbytes);
+    }
+    return ok;
+}
+
+// The same for the Q8 wire, whose unit is a block of GGML_CUDA_AR_Q8_BLOCK_SIZE elements: a slice is as many whole
+// blocks as copy_bytes holds, so the wire's last, partly filled block is the last slice's.  wire[i] is the share device
+// i quantized (ggml_cuda_ar_quantize_q8), dst_buf[i] the F32 tensor the sum is written to.
+static bool ggml_cuda_ar_allreduce_copy_q8(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_cuda_ar_q8_block * const wire[GGML_CUDA_MAX_DEVICES],
+        float * const           dst_buf[GGML_CUDA_MAX_DEVICES],
+        int64_t                 ne) {
+    const int64_t slice_blocks = (int64_t) (p->copy_bytes / sizeof(ggml_cuda_ar_q8_block));
+    GGML_ASSERT(slice_blocks > 0);
+    const int64_t slice_elems = slice_blocks * GGML_CUDA_AR_Q8_BLOCK_SIZE;
+
+    bool compute[GGML_CUDA_MAX_DEVICES] = {};
+    for (int i = 0; i < p->n_devices; ++i) {
+        compute[i] = true; // an inactive shard's wire is zero blocks already
+    }
+
+    bool ok = true;
+    for (int64_t start = 0; start < ne && ok; start += slice_elems) {
+        const int64_t slice_ne     = std::min(slice_elems, ne - start);
+        const size_t  slice_nbytes = ggml_cuda_ar_q8_nbytes(slice_ne);
+
+        ggml_cuda_ar_q8_block * src[GGML_CUDA_MAX_DEVICES] = {};
+        float                 * dst[GGML_CUDA_MAX_DEVICES] = {};
+        for (int i = 0; i < p->n_devices; ++i) {
+            src[i] = wire[i] + start / GGML_CUDA_AR_Q8_BLOCK_SIZE;
+            dst[i] = dst_buf[i] + start;
+        }
+        ok = ggml_cuda_ar_allreduce_copy_impl<ggml_cuda_ar_q8_block, float>(
+            p, backends, src, dst, compute, slice_ne, slice_nbytes);
     }
     return ok;
 }
@@ -2158,7 +2212,25 @@ bool ggml_cuda_ar_allreduce(
     ggml_cuda_pool_alloc<nv_bfloat16> bf16_tmp[GGML_CUDA_MAX_DEVICES];
     void * copy_src_ptr[GGML_CUDA_MAX_DEVICES] = {};
 
-    if (use_copy_engine && use_bf16) {
+    // The Q8 wire takes the BF16 wire's place on the copy engines: each share is quantized in a launch of its own on the
+    // device's compute stream, an inactive shard's to zero blocks, and every device sums the quantized shares, its own
+    // among them, in rank order.
+    const bool use_q8 = p->wire_q8 && use_copy_engine && use_bf16;
+    ggml_cuda_pool_alloc<ggml_cuda_ar_q8_block> q8_tmp[GGML_CUDA_MAX_DEVICES];
+
+    if (use_q8) {
+        GGML_ASSERT(input_type == GGML_TYPE_F32);
+        for (int i = 0; i < n; ++i) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+            q8_tmp[i].pool = &cuda_ctx->pool();
+            q8_tmp[i].alloc(ggml_cuda_ar_q8_nbytes(ne) / sizeof(ggml_cuda_ar_q8_block));
+            ggml_cuda_set_device(p->devices[i]);
+            ggml_cuda_ar_quantize_q8(static_cast<const float *>(tensors[i]->data), q8_tmp[i].get(), ne, compute_flag[i],
+                                     cuda_ctx->stream());
+            CUDA_CHECK(cudaGetLastError());
+        }
+    } else if (use_copy_engine && use_bf16) {
         to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
         for (int i = 0; i < n; ++i) {
             auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
@@ -2191,7 +2263,16 @@ bool ggml_cuda_ar_allreduce(
         // is F32 (dst = tensors[i]->data); the combined add kernel rounds dst
         // through BF16 for bit-equivalence and writes F32 directly, so no
         // post-conversion is needed.  Otherwise src == dst (same native type).
-        if (use_bf16) {
+        if (use_q8) {
+            ggml_cuda_ar_q8_block * src[GGML_CUDA_MAX_DEVICES] = {};
+            float                 * dst[GGML_CUDA_MAX_DEVICES] = {};
+            for (int i = 0; i < n; ++i) {
+                src[i] = q8_tmp[i].get();
+                dst[i] = static_cast<float *>(tensors[i]->data);
+            }
+            p->n_wire_q8++;
+            ok = ggml_cuda_ar_allreduce_copy_q8(p, backends, src, dst, ne);
+        } else if (use_bf16) {
             GGML_ASSERT(kernel_type == GGML_TYPE_BF16);
             nv_bfloat16 * src[GGML_CUDA_MAX_DEVICES] = {};
             float       * dst[GGML_CUDA_MAX_DEVICES] = {};
