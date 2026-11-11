@@ -217,6 +217,13 @@ static bool checkpoint_dedup_legacy() {
     return legacy;
 }
 
+// LLAMA_CHECKPOINT_NEAR_END_LEGACY=1: every batch of a prompt's last n_ubatch tokens takes a context checkpoint, where
+// the first of them and the one that ends the prompt do
+static bool checkpoint_near_end_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_CHECKPOINT_NEAR_END_LEGACY");
+    return legacy;
+}
+
 // LLAMA_CHECKPOINT_SPARE_LEGACY=1: a dropped context checkpoint's buffers are freed, and each new checkpoint allocates
 // its own (the behaviour before the slot kept a spare)
 static bool checkpoint_spare_legacy() {
@@ -344,6 +351,9 @@ struct server_slot {
     // where the current prompt forks from the one previously cached in the slot, when the prefix up to it
     // has to be re-processed; a checkpoint is placed there [--checkpoint-every] (-1 = none)
     int32_t n_fork = -1;
+
+    // the task's prompt has its checkpoint near the end (pre_decode)
+    bool checkpoint_near_end = false;
 
     // sampling
     json json_schema;
@@ -4157,6 +4167,8 @@ private:
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
+                        slot.checkpoint_near_end = false;
+
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
@@ -4364,7 +4376,16 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    // Near the prompt's end the minimum step between checkpoints is lifted, so the next task resumes close
+                    // to where this one stopped. A prompt read in whole batches met that once or twice. Read in slices
+                    // (--prompt-step beside other slots' replies, --prompt-chunk), every slice of its last n_ubatch tokens
+                    // is near the end, and each copied the slot's state with every other slot waiting: on four RTX PRO 6000
+                    // with GLM-5.3 Flash 146 MiB and 13 to 40 ms a copy, 803 copies for 46 requests (Nov 11, 2026). So it
+                    // is lifted for the first batch near the end and for the one that ends the prompt, as whole batches
+                    // had it
+                    const bool near_end_any    = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    const bool near_prompt_end = near_end_any && (checkpoint_near_end_legacy() || !slot.checkpoint_near_end ||
+                            slot.prompt.n_tokens() == slot.task->n_tokens());
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
@@ -4416,6 +4437,8 @@ private:
                             if (cur.n_tokens == n_tokens_start) {
                                 cur.id_task   = slot.task->id;
                                 do_checkpoint = false;
+
+                                slot.checkpoint_near_end = slot.checkpoint_near_end || near_end_any;
                                 break;
                             }
                         }
@@ -4426,6 +4449,8 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_requested);
+
+                        slot.checkpoint_near_end = slot.checkpoint_near_end || near_end_any;
                     }
                 }
 
