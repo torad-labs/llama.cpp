@@ -4910,6 +4910,20 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                         !ggml_is_contiguous(dst) || ggml_nelements(dst) != ggml_nelements(src)) {
                     return false;
                 }
+                // A destination is whole rows of the cache: a thread reads and writes its own channels of a row, so a
+                // snapshot landing on a gathered row is written after that row was read. At more than one sequence
+                // the rows are packed, as the kernel steps a sequence's destination, and no two destinations share a
+                // row: a warp writes a sequence's rows, and the CPYs' order would be lost between warps.
+                const ptrdiff_t dst_off = (const char *) dst->data - (const char *) cache->data;
+                if (dst_off % (ptrdiff_t) cache->nb[1] != 0 ||
+                        (n_seqs > 1 && cache->nb[1] != cache->ne[0] * sizeof(float))) {
+                    return false;
+                }
+                for (const ggml_tensor * c : cpys) {
+                    if (n_seqs > 1 && ggml_cuda_ranges_overlap(c->src[1], dst)) {
+                        return false;
+                    }
+                }
                 u.snapshot_dst[cpys.size()] = (float *) dst->data;
                 u.snapshot_col[cpys.size()] = (int) col;
                 cpys.push_back(n);

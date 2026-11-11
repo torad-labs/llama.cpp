@@ -4837,6 +4837,7 @@ struct test_ssm_conv_state_update : public test_case {
     const int64_t l2_heads;    // > 0: an L2_NORM over that many leading heads of 128 channels of the conv output
     const bool    w_segs;      // the weights are three concatenated tensors of n_channels / 3 rows, in a weights buffer
     const int64_t n_seqs;      // sequences in the batch
+    const int64_t dst_shift;   // > 0: the snapshots land that many floats into their rows, which stays with the CPYs
 
     std::vector<ggml_tensor *> cpys;
 
@@ -4850,14 +4851,15 @@ struct test_ssm_conv_state_update : public test_case {
     std::vector<ggml_tensor *> forward_first() override { return cpys; }
 
     std::string vars() override {
-        return VARS_TO_STR10(n_channels, n_t, n_snapshots, mem_size, kv_head, state_row, x_pad, l2_heads, w_segs, n_seqs);
+        return VARS_TO_STR11(n_channels, n_t, n_snapshots, mem_size, kv_head, state_row, x_pad, l2_heads, w_segs, n_seqs,
+                             dst_shift);
     }
 
     test_ssm_conv_state_update(int64_t n_channels = 256, int64_t n_t = 1, int64_t n_snapshots = 3,
             int64_t mem_size = 4, int64_t kv_head = 1, int64_t state_row = 1, int64_t x_pad = 0, int64_t l2_heads = 0,
-            bool w_segs = false, int64_t n_seqs = 1)
+            bool w_segs = false, int64_t n_seqs = 1, int64_t dst_shift = 0)
         : n_channels(n_channels), n_t(n_t), n_snapshots(n_snapshots), mem_size(mem_size), kv_head(kv_head),
-          state_row(state_row), x_pad(x_pad), l2_heads(l2_heads), w_segs(w_segs), n_seqs(n_seqs) {}
+          state_row(state_row), x_pad(x_pad), l2_heads(l2_heads), w_segs(w_segs), n_seqs(n_seqs), dst_shift(dst_shift) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         return build_graph(ctx, nullptr);
@@ -4867,9 +4869,11 @@ struct test_ssm_conv_state_update : public test_case {
         const int64_t d_conv = 4;
         const int64_t row    = (d_conv - 1) * n_channels;
 
-        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, mem_size * n_snapshots);
+        // mem_size < kv_head + n_seqs lays the slots over one another's rows, where the CPYs' order decides
+        const int64_t n_rows = std::max({ mem_size * n_snapshots, (n_snapshots - 1) * mem_size + kv_head + n_seqs,
+                                          state_row + n_seqs }) + (dst_shift > 0 ? 1 : 0);
+        ggml_tensor * cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, n_rows);
         ggml_set_name(cache, "cache");
-        GGML_ASSERT(kv_head + n_seqs <= mem_size && state_row + n_seqs <= mem_size * n_snapshots);
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
         ggml_set_name(ids, "ids");
         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels + x_pad, n_t, n_seqs);
@@ -4899,7 +4903,8 @@ struct test_ssm_conv_state_update : public test_case {
             const int64_t slot = n_snapshots - t;
             ggml_tensor * src  = ggml_view_3d(ctx, conv_input, d_conv - 1, n_channels, n_seqs, conv_input->nb[1],
                                               conv_input->nb[2], ggml_row_size(GGML_TYPE_F32, col));
-            ggml_tensor * dst  = ggml_view_2d(ctx, cache, row, n_seqs, cache->nb[1], (slot * mem_size + kv_head) * cache->nb[1]);
+            ggml_tensor * dst  = ggml_view_2d(ctx, cache, row, n_seqs, cache->nb[1],
+                                              (slot * mem_size + kv_head) * cache->nb[1] + dst_shift * sizeof(float));
             cpys.push_back(ggml_cpy(ctx, src, dst));
         }
 
@@ -11853,6 +11858,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // KDA's weights: three tensors of 128 channels each, concatenated
         test_cases.emplace_back(new test_ssm_conv_state_update(384, n_t, 3, 4, 1, 1, 0, 0, true));
+        // snapshots a channel off their rows: a thread's write would land on its neighbour's state
+        test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 4, 1, 1, 0, 0, false, 1, 3));
     }
     // more than one sequence, each gathering the row another's slot-0 snapshot overwrites (state_row == kv_head) or a
     // row of slot 1 (a rollback's read); 5 tokens and 33 sequences are over that kernel's 4 and 32 and keep the chain
@@ -11869,6 +11876,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, mem_size, 1, 1, 0, l2_heads, false, n_seqs));
             }
             test_cases.emplace_back(new test_ssm_conv_state_update(384, n_t, 3, mem_size, 1, 1, 0, 2, true, n_seqs));
+            // what stays with the CPYs: slots a row apart, so each row is written by more than one snapshot, and
+            // snapshots a channel off their rows
+            test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 1, 1, 1, 0, 0, false, n_seqs));
+            test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, mem_size, 1, 1, 0, 0, false, n_seqs, 3));
         }
     }
 
