@@ -331,6 +331,76 @@ static bool test_moe_replay(ggml_backend_t backend, ggml_backend_t cpu, graph_lo
     return ok;
 }
 
+static bool test_dense_q8_replay(ggml_backend_t backend, ggml_backend_t cpu, graph_log & log,
+        int64_t k, bool reverse_rows) {
+    constexpr int graph_size = 16;
+    const int64_t rows[] = { reverse_rows ? 128 : 64, reverse_rows ? 64 : 128, 256 };
+    ggml_context * wctx = new_ctx(3);
+    ggml_tensor * weights[3];
+    std::vector<uint8_t> quantized[3];
+    std::mt19937 rng(53123);
+    for (int j = 0; j < 3; ++j) {
+        weights[j] = ggml_new_tensor_2d(wctx, GGML_TYPE_Q8_0, k, rows[j]);
+        const auto values = random_values(rng, k*rows[j]);
+        quantized[j].resize(ggml_nbytes(weights[j]));
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, values.data(), quantized[j].data(), 0, rows[j], k, nullptr);
+    }
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    GGML_ASSERT(wbuf);
+    ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (int j = 0; j < 3; ++j) {
+        ggml_backend_tensor_set(weights[j], quantized[j].data(), 0, quantized[j].size());
+    }
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    std::vector<uint8_t> meta(ggml_tensor_overhead()*8 + ggml_graph_overhead_custom(graph_size, false));
+    bool ok = true;
+    bool replayed = false;
+    for (int64_t tokens : { 23, 69, 23 }) {
+        const int readers = tokens == 69 ? 2 : 3;
+        ggml_init_params params = { meta.size(), meta.data(), true };
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        ggml_set_input(x);
+        ggml_tensor * outputs[3];
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+        for (int j = 0; j < readers; ++j) {
+            outputs[j] = ggml_mul_mat(ctx, weights[j], x);
+            ggml_set_output(outputs[j]);
+            ggml_build_forward_expand(graph, outputs[j]);
+        }
+        GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+        bool armed = false;
+        for (int run = 0; run < 5; ++run) {
+            const auto xv = random_values(rng, k*tokens);
+            ggml_backend_tensor_set(x, xv.data(), 0, xv.size()*sizeof(float));
+            const bool was_armed = armed;
+            const graph_log before = log;
+            compute(backend, graph, log, armed);
+            replayed |= was_armed && log.captured == before.captured && log.stale == before.stale;
+            for (int j = 0; j < readers; ++j) {
+                std::vector<float> actual(rows[j]*tokens);
+                ggml_backend_tensor_get(outputs[j], actual.data(), 0, actual.size()*sizeof(float));
+                const auto expected = cpu_mul_mat(cpu, GGML_TYPE_Q8_0, quantized[j], xv, k, rows[j], tokens);
+                const double error = nmse(actual, expected);
+                if (!std::isfinite(error) || error > max_nmse) {
+                    printf("  dense Q8 k=%lld tokens=%lld reader=%d run=%d: NMSE %g\n",
+                           (long long) k, (long long) tokens, j, run, error);
+                    ok = false;
+                }
+            }
+        }
+        ggml_free(ctx);
+    }
+    ggml_gallocr_free(alloc);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(wctx);
+    printf("  dense Q8 k=%lld rows=%lld,%lld,256: changed inputs and rebuilt pair/triple graphs: %s (%s)\n",
+           (long long) k, (long long) rows[0], (long long) rows[1], ok ? "ok" : "FAILED",
+           replayed ? "captured replay exercised" : "no CUDA replay");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
@@ -341,6 +411,7 @@ int main(int argc, char ** argv) {
     bool ok = true;
     const bool moe_cpu = argc == 2 && strcmp(argv[1], "--moe-cpu") == 0;
     const bool moe_only = argc == 2 && strcmp(argv[1], "--moe") == 0;
+    const bool dense_only = argc == 2 && strcmp(argv[1], "--dense-q8") == 0;
     if (moe_cpu) {
         ok = test_moe_replay(cpu, cpu, log);
         ok &= test_moe_replay(cpu, cpu, log, false);
@@ -356,16 +427,24 @@ int main(int argc, char ** argv) {
         }
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         printf("%s (%s):\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
-        ok &= test_moe_replay(backend, cpu, log);
-        ok &= test_moe_replay(backend, cpu, log, false);
-        bool replayed = false;
+        if (!dense_only) {
+            ok &= test_moe_replay(backend, cpu, log);
+            ok &= test_moe_replay(backend, cpu, log, false);
+        }
         if (!moe_only) {
+            for (int64_t k : { 256, 4096 }) {
+                ok &= test_dense_q8_replay(backend, cpu, log, k, false);
+                ok &= test_dense_q8_replay(backend, cpu, log, k, true);
+            }
+        }
+        bool replayed = false;
+        if (!moe_only && !dense_only) {
             ok &= test_parameter_updates(backend, log);
             for (int64_t m : { 1, 8 }) {
                 ok &= test_retype(backend, cpu, log, m, replayed);
             }
         }
-        if (!moe_only && !replayed) {
+        if (!moe_only && !dense_only && !replayed) {
             printf("  no graph was replayed before the retype: this device does not exercise the stale-replay path\n");
         }
         ggml_backend_free(backend);
