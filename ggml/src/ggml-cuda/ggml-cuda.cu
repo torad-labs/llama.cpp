@@ -861,6 +861,87 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             device, counts[0], counts[1], counts[2], counts[3], rows.c_str(), multiplicity.c_str());
         CUDA_CHECK(cudaFree(route_stats.ptr));
     }
+    if (mmq_route_log.records != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        unsigned int head[2] = {};
+        CUDA_CHECK(cudaMemcpy(head, mmq_route_log.head, sizeof(head), cudaMemcpyDeviceToHost));
+        const uint32_t kept = std::min<uint32_t>(head[0], mmq_route_log.capacity);
+        std::vector<ggml_cuda_mmq_route_log::record> records(kept);
+        if (kept > 0) {
+            CUDA_CHECK(cudaMemcpy(records.data(), mmq_route_log.records, kept*sizeof(records[0]), cudaMemcpyDeviceToHost));
+        }
+        // a tensor's name is any bytes: as a JSON string, so that no name can end the string or the line early
+        const auto quoted = [](const std::string & name) {
+            std::string out = "\"";
+            for (const unsigned char c : name) {
+                if (c == '"' || c == '\\') {
+                    out += '\\';
+                    out += (char) c;
+                } else if (c < 0x20) {
+                    char escape[8];
+                    snprintf(escape, sizeof(escape), "\\u%04x", (unsigned) c);
+                    out += escape;
+                } else {
+                    out += (char) c;
+                }
+            }
+            return out + "\"";
+        };
+        std::string text;
+        char line[512];
+        const int ctx = mmq_route_log.ctx;
+        for (size_t i = 0; i < mmq_route_log.sites.size(); ++i) {
+            const auto & site = mmq_route_log.sites[i];
+            snprintf(line, sizeof(line), "MMQ_ROUTE_SITE {\"ctx\":%d,\"device\":%d,\"site\":%zu,\"name\":", ctx, device,
+                     i);
+            text += line + quoted(site.name);
+            snprintf(line, sizeof(line), ",\"type\":\"%s\",\"experts\":%d,\"experts_total\":%d,\"paired\":%s}\n",
+                     ggml_type_name((ggml_type) site.type), site.n_expert, site.n_expert_total,
+                     site.paired ? "true" : "false");
+            text += line;
+        }
+        for (uint32_t i = 0; i < kept; ++i) {
+            const auto & r = records[i];
+            snprintf(line, sizeof(line), "MMQ_ROUTE {\"ctx\":%d,\"seq\":%u,\"eval\":%u,\"site\":%u,\"cols\":%u,"
+                     "\"used\":%u,\"tiles8\":%u,\"tiles\":%u,\"j\":%u}\n",
+                     ctx, i, r.eval, r.site, r.cols, r.used, r.tiles8, r.tiles, r.j);
+            text += line;
+        }
+        snprintf(line, sizeof(line), "MMQ_ROUTE_END {\"ctx\":%d,\"device\":%d,\"ran\":%u,\"kept\":%u,\"capacity\":%u,"
+                 "\"evals\":%u}\n", ctx, device, head[0], kept, mmq_route_log.capacity, head[1]);
+        text += line;
+        const char * path = getenv("GGML_CUDA_MMQ_ROUTE_LOG_FILE");
+        bool filed = false;
+        if (path && path[0]) {
+            // A context's lines are opened, written and closed under one lock: a buffered write is not one append,
+            // and contexts freed by different threads would otherwise splice their lines. The lock is the
+            // process's; two processes are not to share a file.
+            static std::mutex write_mutex;
+            std::lock_guard<std::mutex> lock(write_mutex);
+            FILE * file = fopen(path, "a");
+            if (file == nullptr) {
+                GGML_LOG_WARN("%s: cannot append to %s; the route log goes to the log\n", __func__, path);
+            } else {
+                const size_t written = fwrite(text.data(), 1, text.size(), file);
+                const int    closed  = fclose(file);
+                if (written != text.size() || closed != 0) {
+                    GGML_LOG_WARN("%s: context %d's route log is incomplete in %s (%zu of %zu bytes)\n", __func__, ctx,
+                                  path, written, text.size());
+                }
+                filed = true;
+            }
+        }
+        if (!filed) {
+            for (size_t at = 0; at < text.size();) {
+                const size_t end = text.find('\n', at);
+                GGML_LOG_INFO("%s\n", text.substr(at, end - at).c_str());
+                at = end + 1;
+            }
+        }
+        CUDA_CHECK(cudaFree(mmq_route_log.records));
+        CUDA_CHECK(cudaFree(mmq_route_log.head));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -8032,6 +8113,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->l2_issue_stop.ensure();
     cuda_ctx->hc_front_tickets.ensure();
     cuda_ctx->route_stats.ensure();
+    cuda_ctx->mmq_route_log.ensure();
+    if (cuda_ctx->mmq_route_log.records != nullptr) {
+        // on the stream as it is: inside an outer capture it is captured, and counts each replay
+        ggml_cuda_mmq_route_evaluation(cuda_ctx->mmq_route_log, cuda_ctx->stream());
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -8154,6 +8240,7 @@ static void ggml_backend_cuda_capture_begin(ggml_backend_t backend) {
     cuda_ctx->l2_issue_stop.ensure();
     cuda_ctx->hc_front_tickets.ensure();
     cuda_ctx->route_stats.ensure();
+    cuda_ctx->mmq_route_log.ensure();
     {
         std::lock_guard<std::mutex> lock(ggml_cuda_lock);
         ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);

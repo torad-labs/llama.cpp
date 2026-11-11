@@ -1712,6 +1712,7 @@ struct mmq_args {
     const char * paired_x = nullptr;
     float * paired_dst = nullptr;
     ggml_cuda_q8_layout paired_q8_layout = {};
+    const char * route_name = nullptr; // the routed weights' name, for GGML_CUDA_MMQ_ROUTE_LOG's sites
 };
 
 // MUL_MAT_ID picks its tile width for the columns an expert gets on average and launches only the experts' non-empty
@@ -1724,6 +1725,14 @@ bool ggml_cuda_mmq_fixup_compact_legacy();
 // columns (expert_bounds) fill, then -1 up to ntiles_max.
 void ggml_cuda_mmq_moe_tiles(const int32_t * expert_bounds, int n_expert, int J, int ntiles_max, int32_t * moe_tiles,
                              cudaStream_t stream);
+
+// Appends one record to log for the launch whose experts' columns are expert_bounds, at width J, from site
+// (ggml_cuda_mmq_route_log): one block on stream, each time the device runs it.
+void ggml_cuda_mmq_moe_route_record(const int32_t * expert_bounds, int n_expert, int J, uint32_t site,
+                                    const ggml_cuda_mmq_route_log & log, cudaStream_t stream);
+
+// Begins a graph evaluation in log: one thread on stream that counts it, each time the device runs it.
+void ggml_cuda_mmq_route_evaluation(const ggml_cuda_mmq_route_log & log, cudaStream_t stream);
 
 // GGML_CUDA_MMQ_MOE_NCOLS=N: MUL_MAT_ID's tile width is picked for N columns an expert (0 or unset: the rule below),
 // the knob that measures the width against a routing's spread
@@ -1797,6 +1806,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         nchannels_grid = 1;
         moe_tiles.alloc(ntx);
         ggml_cuda_mmq_moe_tiles(args.expert_bounds, n_expert, J, ntx, moe_tiles.ptr, stream);
+    }
+    if (args.ids_dst && ctx.mmq_route_log.records != nullptr) {
+        const uint32_t site = ctx.mmq_route_log.site_of(args.route_name ? args.route_name : "", (int) type,
+                                                        (int) args.nchannels_y, (int) args.n_experts_total,
+                                                        args.paired_x != nullptr);
+        ggml_cuda_mmq_moe_route_record(args.expert_bounds, (int) args.nchannels_y, J, site, ctx.mmq_route_log, stream);
     }
     const int ntzw = nchannels_grid * args.nsamples_y;
     const dim3 block_nums_xy_tiling(nty, ntx, ntzw);

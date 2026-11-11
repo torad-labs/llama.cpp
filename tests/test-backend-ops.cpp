@@ -8314,6 +8314,64 @@ struct test_glm53_moe_routes : public test_moe_ffn_chain {
     }
 };
 
+// The routes above carried to the routed FFN's output as build_moe_ffn writes it: the down product times the tokens'
+// routing weights, a view of it a slot, and the views added in slot order, each put in the graph before the adds. The
+// CUDA backend runs that tail in one launch (ggml_cuda_op_moe_weighted_sum; GGML_CUDA_MOE_WSUM_LEGACY=1: the MUL and
+// the fused ADDs). The expert weights carry the model's names, so a launch site of GGML_CUDA_MMQ_ROUTE_LOG reads as the
+// pack's would.
+struct test_glm53_moe_routes_wsum : public test_glm53_moe_routes {
+    std::vector<ggml_tensor *> order;
+
+    test_glm53_moe_routes_wsum(int64_t n, int overlap, int64_t k, int64_t ff, int first = 0, int total = 0, int experts = 72)
+        : test_glm53_moe_routes(n, overlap, k, ff, first, total, experts) {}
+
+    std::string op_desc(ggml_tensor *) override { return "GLM53_MOE_ROUTES_WSUM"; }
+    std::vector<ggml_tensor *> forward_first() override { return order; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * downs = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, n_mats);
+        ggml_set_name(gates, "blk.0.ffn_gate_exps.weight");
+        ggml_set_name(ups,   "blk.0.ffn_up_exps.weight");
+        ggml_set_name(downs, "blk.0.ffn_down_exps.weight");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+        ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(weights, "ffn_moe_weights");
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gates, cur, ids);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ups, cur, ids);
+        if (expert_total) {
+            ggml_mul_mat_id_set_expert_range(gate, expert_first, expert_total);
+            ggml_mul_mat_id_set_expert_range(up, expert_first, expert_total);
+        }
+        if (glu_limit > 0.0f) {
+            gate = ggml_clamp(ctx, gate, -INFINITY, glu_limit);
+            up   = ggml_clamp(ctx, up, -glu_limit, glu_limit);
+        }
+        ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * down = ggml_mul_mat_id(ctx, downs, act, ids); // [n_embd, n_used, n_tokens]
+        if (expert_total) { ggml_mul_mat_id_set_expert_range(down, expert_first, expert_total); }
+        ggml_set_name(down, "ffn_moe_down");
+
+        ggml_tensor * experts = ggml_mul(ctx, down, weights);
+        ggml_set_name(experts, "ffn_moe_weighted");
+        order.assign(1, experts);
+        for (int s = 0; s < n_used; ++s) {
+            order.push_back(ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], s*experts->nb[1]));
+        }
+        ggml_tensor * out = order[1];
+        for (int s = 1; s < n_used; ++s) {
+            out = ggml_add(ctx, out, order[1 + s]);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Gate/up preparation must preserve each projection, including padded routes and empty expert owners.
 struct test_glm53_moe_prep : public test_glm53_moe_routes {
     const int routing;
@@ -10886,6 +10944,7 @@ static void add_glm_moe_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     for (int64_t tokens : {36, 72, 108}) {
         for (int routing : {0, 1, 2}) {
             cases.emplace_back(new test_glm53_moe_routes(tokens, routing, 256, 256, routing == 1 ? 0 : 216, 288));
+            cases.emplace_back(new test_glm53_moe_routes_wsum(tokens, routing, 256, 256, routing == 1 ? 0 : 216, 288));
         }
     }
     // Expert tails around the 8- and 16-column boundaries, including a partial weight-row tile.
@@ -12410,6 +12469,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_glm53_moe_routes(n, overlap, 4096, 1024));
             test_cases.emplace_back(new test_glm53_moe_routes(n, overlap, 512, 256));
             test_cases.emplace_back(new test_glm53_moe_routes(n, overlap, 3840, 768));
+            test_cases.emplace_back(new test_glm53_moe_routes_wsum(n, overlap, 512, 256));
         }
     }
     // and its routed experts at a prefill batch, where MMQ tiles each expert's columns: 64 experts with 8 used, so 64
@@ -13828,6 +13888,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int routing : {0, 1, 2}) {
             test_cases.emplace_back(new test_glm53_moe_prep(tokens, routing, 0, true, false, 4096, 512));
             test_cases.emplace_back(new test_glm53_moe_routes(tokens, routing, 4096, 512, 0, 0, 288));
+            test_cases.emplace_back(new test_glm53_moe_routes_wsum(tokens, routing, 4096, 512, 0, 0, 288));
         }
     }
     for (int k : {10, 40, 128, 296}) {

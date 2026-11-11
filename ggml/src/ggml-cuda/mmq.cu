@@ -311,6 +311,7 @@ static void ggml_cuda_mul_mat_q_impl(
 
     args.q8_layout = ggml_cuda_q8_layout_of(src0);
     args.n_experts_total = ggml_get_op_params_i32(dst, 2);
+    args.route_name = src0->name;
     if (paired_src0) {
         args.paired_x = (const char *) paired_src0->data;
         args.paired_dst = (float *) paired_dst->data;
@@ -434,6 +435,56 @@ static __global__ void mmq_moe_tiles_kernel(const int32_t * __restrict__ expert_
 void ggml_cuda_mmq_moe_tiles(const int32_t * expert_bounds, const int n_expert, const int J, const int ntiles_max,
                              int32_t * moe_tiles, cudaStream_t stream) {
     mmq_moe_tiles_kernel<<<1, 1024, 0, stream>>>(expert_bounds, n_expert, J, ntiles_max, moe_tiles);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// One block: every thread sums its experts' columns, then the block's first thread takes the next record, if one is
+// left, and writes the launch's totals there. The count goes up either way, so the records the log could not hold are
+// known.
+static __global__ void mmq_moe_route_kernel(const int32_t * __restrict__ expert_bounds, const int n_expert, const int J,
+                                            const uint32_t site, unsigned int * __restrict__ head,
+                                            ggml_cuda_mmq_route_log::record * __restrict__ records, const uint32_t capacity) {
+    __shared__ unsigned int used, tiles8, tiles;
+    if (threadIdx.x == 0) {
+        used   = 0;
+        tiles8 = 0;
+        tiles  = 0;
+    }
+    __syncthreads();
+
+    unsigned int u = 0, t8 = 0, t = 0;
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        const int cols = expert_bounds[e + 1] - expert_bounds[e];
+        u  += cols > 0;
+        t8 += (cols + 7) / 8;
+        t  += (cols + J - 1) / J;
+    }
+    atomicAdd(&used, u);
+    atomicAdd(&tiles8, t8);
+    atomicAdd(&tiles, t);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        const unsigned int at = atomicAdd(head, 1u);
+        if (at < capacity) {
+            records[at] = {site, head[1], (uint32_t) (expert_bounds[n_expert] - expert_bounds[0]), used, tiles8, tiles,
+                           (uint32_t) J};
+        }
+    }
+}
+
+static __global__ void mmq_route_evaluation_kernel(unsigned int * __restrict__ head) {
+    head[1]++;
+}
+
+void ggml_cuda_mmq_moe_route_record(const int32_t * expert_bounds, const int n_expert, const int J, const uint32_t site,
+                                    const ggml_cuda_mmq_route_log & log, cudaStream_t stream) {
+    mmq_moe_route_kernel<<<1, 256, 0, stream>>>(expert_bounds, n_expert, J, site, log.head, log.records, log.capacity);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_mmq_route_evaluation(const ggml_cuda_mmq_route_log & log, cudaStream_t stream) {
+    mmq_route_evaluation_kernel<<<1, 1, 0, stream>>>(log.head);
     CUDA_CHECK(cudaGetLastError());
 }
 
