@@ -245,6 +245,13 @@ static bool pad_drafts_legacy() {
     return legacy;
 }
 
+// LLAMA_PROMPT_SHARE_LEGACY=1: a step's prompt tokens are shared among the reading slots rounded up, so the first
+// slots served read one token more than the rest
+static bool prompt_share_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_PROMPT_SHARE_LEGACY");
+    return legacy;
+}
+
 struct server_slot {
     int id;
 
@@ -3836,12 +3843,37 @@ private:
             }
             size_t n_pending = prompting.size();
 
+            // the share of the step's prompt tokens every reading slot gets: the largest that fits once the slots with
+            // less left to read take only that. Slots that read as many tokens as each other are sequences of one
+            // length, which one forward pass reads; shares rounded up as the slots were served gave the first of them
+            // a token more, a second length. A slot that has yet to match its cache counts its whole prompt.
+            // --prompt-chunk rounds a share to whole chunks itself
+            int32_t n_share_step = -1;
+            if (!prompt_share_legacy() && params_base.n_prompt_chunk == 0) {
+                std::vector<int32_t> n_rest;
+                for (const auto * slot : prompting) {
+                    n_rest.push_back(std::max(0, slot->task->n_tokens() -
+                                (slot->state == SLOT_STATE_PROCESSING_PROMPT ? slot->prompt.n_tokens() : 0)));
+                }
+                std::sort(n_rest.begin(), n_rest.end());
+                int32_t n_avail = std::max(0, n_batch_prompt - batch.size());
+                n_share_step = 0;
+                for (size_t i = 0; i < n_rest.size(); ++i) {
+                    n_share_step = n_avail / (int32_t) (n_rest.size() - i);
+                    if (n_rest[i] > n_share_step) {
+                        break;
+                    }
+                    n_avail -= n_rest[i];
+                }
+            }
+
             iterate(prompting, [&](server_slot & slot) {
                 const int32_t n_left = (int32_t) n_pending--;
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
-                int32_t n_share = (std::max(0, n_batch_prompt - batch.size()) + n_left - 1) / n_left;
+                int32_t n_share = n_share_step >= 0 ? std::max(1, n_share_step) :
+                    (std::max(0, n_batch_prompt - batch.size()) + n_left - 1) / n_left;
                 if (params_base.n_prompt_chunk > 0) {
                     const int32_t chunk = std::min(params_base.n_prompt_chunk, n_ubatch);
                     n_share = std::max(chunk, n_share / chunk * chunk);
