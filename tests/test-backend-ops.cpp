@@ -4439,6 +4439,7 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     const bool ffn_order;
     const bool weights_buf;
     const bool with_post; // the streams the previous sublayer's DSV4_HC_POST makes, which CUDA fuses with the front
+    const bool norm_in_place; // one token: the normed mix written over the norm's weight, an output over an input
 
     ggml_tensor * weights = nullptr;
     ggml_tensor * hc_pre  = nullptr;
@@ -4462,7 +4463,7 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR7(type_w, n_embd, n_tokens, n_iter, ffn_order, weights_buf, with_post);
+        return VARS_TO_STR8(type_w, n_embd, n_tokens, n_iter, ffn_order, weights_buf, with_post, norm_in_place);
     }
 
     bool use_weight_context() override { return weights_buf; }
@@ -4473,9 +4474,12 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
     }
 
     test_dsv4_hc_pre_fused(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 4096, int64_t n_tokens = 1,
-            int32_t n_iter = 20, bool ffn_order = false, bool weights_buf = true, bool with_post = false)
+            int32_t n_iter = 20, bool ffn_order = false, bool weights_buf = true, bool with_post = false,
+            bool norm_in_place = false)
         : type_w(type_w), n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter), ffn_order(ffn_order),
-          weights_buf(weights_buf), with_post(with_post) {}
+          weights_buf(weights_buf), with_post(with_post), norm_in_place(norm_in_place) {
+        GGML_ASSERT(!norm_in_place || n_tokens == 1);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         return build_graph(ctx, nullptr);
@@ -4526,7 +4530,8 @@ struct test_dsv4_hc_pre_fused : public test_dsv4_hc {
         hc_pre = ggml_dsv4_hc_pre(ctx, x, pre);
         ggml_set_name(hc_pre, "hc_pre");
 
-        out = ggml_mul(ctx, ggml_rms_norm(ctx, hc_pre, 1e-5f), norm_w);
+        ggml_tensor * normed = ggml_rms_norm(ctx, hc_pre, 1e-5f);
+        out = norm_in_place ? ggml_mul_inplace(ctx, norm_w, normed) : ggml_mul(ctx, normed, norm_w);
         ggml_set_name(out, "out");
         return out;
     }
@@ -11103,6 +11108,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 8192, 20, 20, false, true, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_BF16, 9216, 20, 20, false, true, true));
     test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_F32, 1024, 1100, 4, false, false, true));
+    // an output of the site over one of its inputs, which the one launch must leave to the three (its blocks write
+    // while others still read): one token, a Q8_0 hc_fn that the front does not take, the normed mix written in place
+    // over the norm's weight. Under GGML_CUDA_HC_BACK_CHECK=1 a launch that took it would trap on its own reference.
+    // The other such placement, a normed mix that the graph allocator puts over leaf mixes or scale, cannot be made
+    // here: this file gives every tensor memory of its own
+    test_cases.emplace_back(new test_dsv4_hc_pre_fused(GGML_TYPE_Q8_0, 1024, 1, 20, false, false, false, true));
     // the front's mix read by quantized MUL_MATs: its q8_1 copy written by the front on CUDA and read where the readers
     // run on mul_mat_vec_q (not Q4_K's at 8 tokens on Blackwell, which run on MMQ); at 256 (not a multiple of 512) and at
     // 12 tokens (past mul_mat_vec_q's columns) the readers quantize it

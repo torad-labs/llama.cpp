@@ -1850,15 +1850,32 @@ bool ggml_cuda_dsv4_hc_back_fused_supported(const ggml_tensor * weights, const g
     const bool types_ok = x->type == GGML_TYPE_F32 && mixes->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
         base->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && pre->type == GGML_TYPE_F32 &&
         rms->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && norm_w->type == GGML_TYPE_F32;
-    // the kernel writes the weights while its other blocks write the normed mix: the fusion's memory check takes the
-    // weights' view, an intermediate of the three, as never written, and the allocator may place the normed mix over
-    // weights nothing reads after pre (a test, a model's last site)
+    if (!shapes_ok || !layout_ok || !types_ok) {
+        return false;
+    }
+    // The kernel's blocks write the weights and the normed mix while its other blocks still read every input, where each
+    // of the three launches had read its inputs before the next wrote. So neither output may lie over the other or over
+    // any input. The fusion's memory check does not say so: it takes the weights' view, an intermediate of the three, as
+    // never written (the allocator may place the normed mix over weights nothing reads after pre: a test, a model's last
+    // site), and it skips every leaf, which the allocator reuses after its last reader like any tensor when the leaf is
+    // a graph's input and not a model's weight (a normed mix placed over leaf mixes or scale, or written in place over
+    // the norm's weight).
     auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
         const char * a0 = (const char *) a->data;
         const char * b0 = (const char *) b->data;
         return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
     };
-    return shapes_ok && layout_ok && types_ok && !overlaps(mul, weights);
+    if (overlaps(mul, weights)) {
+        return false;
+    }
+    for (const ggml_tensor * out : { weights, mul }) {
+        for (const ggml_tensor * in : { mixes, scale, base, x, norm_w }) {
+            if (overlaps(out, in)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void ggml_cuda_op_dsv4_hc_back_fused(ggml_backend_cuda_context & ctx, ggml_tensor * weights, const ggml_tensor * pre,
@@ -1919,8 +1936,8 @@ void ggml_cuda_op_dsv4_hc_back_fused(ggml_backend_cuda_context & ctx, ggml_tenso
         return;
     }
 
-    // the three launches into scratch, from the same inputs: none of them was written by the launch above (the fusion's
-    // memory check and ggml_cuda_dsv4_hc_back_fused_supported)
+    // the three launches into scratch, from the same inputs: the launch above wrote none of them
+    // (ggml_cuda_dsv4_hc_back_fused_supported keeps both outputs off every input)
     ggml_cuda_pool_alloc<float> w_two(ctx.pool(), (size_t) n_tokens*DSV4_HC_MIX);
     ggml_cuda_pool_alloc<float> p_two(ctx.pool(), (size_t) n_tokens*n_embd);
     ggml_cuda_pool_alloc<float> d_two(ctx.pool(), (size_t) n_tokens*n_embd);
