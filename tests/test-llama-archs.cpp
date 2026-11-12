@@ -1803,6 +1803,148 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
     return true;
 }
 
+// The context's schedulers place their graphs in one buffer a buffer type (llama_context::graph_shared), so between two
+// computes of a graph the graphs of the other schedulers write over its tensors. Decodes of six shapes in turn, five of
+// them retained and one on the main scheduler, give the logits of LLAMA_GRAPH_BUFFER_SHARED_LEGACY=1 (a buffer a
+// scheduler) bit for bit, on the target and on the MTP head, and reuse as many graphs. Two arms: one reads every
+// decode's logits; the other decodes a round's six shapes back to back, each queued on the devices behind the one
+// before with nothing waited for, and reads the last decode's logits, which every sequence's earlier decodes went
+// into. The context's compute memory (llama_get_memory_breakdown) stays what its reserve allocated, where a buffer a
+// scheduler adds the retained graphs' buffers to it.
+static bool test_glm_shared_buffers(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(8)); // the indexer scores from the first step
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int n_embd  = llama_model_n_embd(model);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    // the sequences [first, first + n_seqs) decode rows positions each; 48 rows are past a slot's 32
+    struct shape { int first, n_seqs, rows; };
+    const std::vector<shape> shapes = { {0, 1, 2}, {0, 8, 1}, {0, 4, 3}, {0, 8, 6}, {4, 4, 1}, {0, 8, 3} };
+    const int n_seq    = 8;
+    const int n_rounds = 5;
+    const int n_rows_max = 48;
+    int n_pos = 0;
+    for (const auto & sh : shapes) n_pos += sh.rows;
+    n_pos *= n_rounds;
+    const auto tokens = get_tokens(n_seq*n_pos, n_vocab, seed + 4);
+    std::mt19937 rng(seed + 4);
+    std::normal_distribution<float> normal(0.0f, 0.1f);
+    std::vector<float> hidden((size_t) n_rows_max*n_embd);
+    for (auto & value : hidden) value = normal(rng);
+
+    struct read_result {
+        std::vector<float> logits;  // every row of every decode read
+        int32_t            n_reused = 0;
+        size_t             compute_reserved = 0; // the context's compute buffers before its first decode
+        size_t             compute          = 0; // and after its last
+    };
+    const auto compute_size = [](const llama_context * ctx) {
+        size_t size = 0;
+        for (const auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
+            size += data.compute;
+        }
+        return size;
+    };
+    const auto read = [&](bool legacy, bool mtp, bool queued) {
+        set_env("LLAMA_GRAPH_BUFFER_SHARED_LEGACY", legacy ? "1" : nullptr);
+        set_env("LLAMA_GRAPH_SLOTS", "6");
+        read_result res;
+        llama_context_params params = llama_context_default_params();
+        if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx      = 8192;
+        params.n_batch    = 512;
+        params.n_ubatch   = 512;
+        params.n_seq_max  = n_seq;
+        params.kv_unified = true;
+        params.n_threads  = params.n_threads_batch = 4;
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        set_env("LLAMA_GRAPH_BUFFER_SHARED_LEGACY", nullptr);
+        set_env("LLAMA_GRAPH_SLOTS", nullptr);
+        if (!ctx) throw std::runtime_error("shared buffers: failed to create a context");
+        res.compute_reserved = compute_size(ctx.get());
+
+        std::vector<int> next(n_seq, 0); // a sequence's next position
+        for (int round = 0; round < n_rounds; ++round) {
+            for (const auto & sh : shapes) {
+                llama_batch batch = llama_batch_init(sh.n_seqs*sh.rows, 0, 1);
+                for (int seq = sh.first; seq < sh.first + sh.n_seqs; ++seq) {
+                    for (int i = 0; i < sh.rows; ++i, ++next[seq]) {
+                        common_batch_add(batch, tokens[(size_t) seq*n_pos + next[seq]], next[seq], {seq}, true);
+                    }
+                }
+                if (mtp) batch.embd = hidden.data();
+                const int result = llama_decode(ctx.get(), batch);
+                batch.embd = nullptr;
+                llama_batch_free(batch);
+                if (result) throw std::runtime_error("shared buffers: decode failed");
+                if (queued && &sh != &shapes.back()) {
+                    continue; // nothing of this decode is read: the next one is queued behind it
+                }
+                for (int i = 0; i < sh.n_seqs*sh.rows; ++i) {
+                    const float * row = llama_get_logits_ith(ctx.get(), i);
+                    res.logits.insert(res.logits.end(), row, row + n_vocab);
+                }
+            }
+        }
+        res.n_reused = llama_perf_context(ctx.get()).n_reused;
+        res.compute  = compute_size(ctx.get());
+        return res;
+    };
+
+    bool ok = true;
+    for (const bool mtp : {false, true}) {
+        const auto shared = read(false, mtp, false);
+        const auto legacy = read(true, mtp, false);
+        if (shared.logits.size() != legacy.logits.size() ||
+                std::memcmp(shared.logits.data(), legacy.logits.data(), shared.logits.size()*sizeof(float)) != 0) {
+            LOG_ERR("GLM shared buffers: mtp=%d: the logits differ from LLAMA_GRAPH_BUFFER_SHARED_LEGACY=1's\n", mtp);
+            ok = false;
+        }
+        const auto shared_queued = read(false, mtp, true);
+        const auto legacy_queued = read(true, mtp, true);
+        if (shared_queued.logits.empty() || shared_queued.logits.size() != legacy_queued.logits.size() ||
+                std::memcmp(shared_queued.logits.data(), legacy_queued.logits.data(), shared_queued.logits.size()*sizeof(float)) != 0) {
+            LOG_ERR("GLM shared buffers: mtp=%d: with a round's decodes queued back to back the logits differ from "
+                    "LLAMA_GRAPH_BUFFER_SHARED_LEGACY=1's\n", mtp);
+            ok = false;
+        }
+        if (shared_queued.n_reused != legacy_queued.n_reused || shared_queued.n_reused != shared.n_reused) {
+            LOG_ERR("GLM shared buffers: mtp=%d: %d graphs reused with a round's decodes queued, %d with "
+                    "LLAMA_GRAPH_BUFFER_SHARED_LEGACY=1, %d with every decode read (want the same)\n", mtp,
+                    shared_queued.n_reused, legacy_queued.n_reused, shared.n_reused);
+            ok = false;
+        }
+        // five retained shapes, each built once
+        const int32_t want_reused = (int32_t) (shapes.size() - 1)*(n_rounds - 1);
+        if (shared.n_reused != legacy.n_reused || shared.n_reused < want_reused) {
+            LOG_ERR("GLM shared buffers: mtp=%d: %d graphs reused, %d with LLAMA_GRAPH_BUFFER_SHARED_LEGACY=1 (want %d or "
+                    "more in both)\n", mtp, shared.n_reused, legacy.n_reused, want_reused);
+            ok = false;
+        }
+        // the reserve's buffers hold every graph, where a buffer a scheduler adds the five retained graphs' (pipeline
+        // parallelism, which layers split over devices may run with, keeps a buffer a scheduler)
+        const bool pipeline = devs.size() > 1 && split_mode == LLAMA_SPLIT_MODE_LAYER;
+        for (const auto * res : {&shared, &shared_queued}) {
+            if (!pipeline && (res->compute_reserved == 0 || res->compute != res->compute_reserved)) {
+                LOG_ERR("GLM shared buffers: mtp=%d: the context's compute buffers are %zu bytes after the decodes, %zu "
+                        "as reserved (want the same)\n", mtp, res->compute, res->compute_reserved);
+                ok = false;
+            }
+        }
+        if (legacy.compute <= legacy.compute_reserved || legacy.compute_reserved != shared.compute_reserved) {
+            LOG_ERR("GLM shared buffers: mtp=%d: with LLAMA_GRAPH_BUFFER_SHARED_LEGACY=1 the context's compute buffers are "
+                    "%zu bytes after the decodes, %zu as reserved (want more after, and %zu as reserved)\n", mtp,
+                    legacy.compute, legacy.compute_reserved, shared.compute_reserved);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 // The token embedding table on the GPUs (LLAMA_TOK_EMBD_GPU=1). The served GLM-5.3 Flash kept its 643 MiB q8_0 table
 // in host memory: each 2,048-row prefill step gathered its rows on the CPU and copied the 32 MiB result to each card,
 // and the MTP head gathered the same tokens again, 4 x 8 MiB to each card (the host-gap trace of Nov 1, 2026). With the
@@ -3145,6 +3287,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL shared pool reuse\033[0m";
                         }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_shared_buffers(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL shared buffers\033[0m";
+                        }
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_tok_embd_on_device(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL tok_embd on device\033[0m";
@@ -3213,7 +3359,7 @@ int main(int argc, char ** argv) {
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
     std::string diagnostic_dir, diagnostic_device;
-    std::string dp_device, prefill_device;
+    std::string dp_device, prefill_device, shared_device;
     std::string tensor_device; // --glm-tensor-device CUDA0,CUDA1,CUDA0,CUDA1: one rank per name, repeats allowed
     bool glm_alias_only = false;
     bool glm_kpool_only = false;
@@ -3241,6 +3387,11 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--glm-tensor-device") == 0) {
             if (i + 1 == argc) return 1;
             tensor_device = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--glm-shared-buffers-device") == 0) { // the tensor split's ranks, as --glm-tensor-device
+            if (i + 1 == argc) return 1;
+            shared_device = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--glm-prefix-diagnostics") == 0 || strcmp(argv[i], "--glm-prefix-device") == 0) {
@@ -3319,6 +3470,16 @@ int main(int argc, char ** argv) {
             const int plain = test_glm_tensor(seed, ranks, false);
             const int quantized = test_glm_tensor(seed, ranks, true);
             return plain || quantized;
+        }
+        if (!shared_device.empty()) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> ranks;
+            for (const auto & name : string_split<std::string>(shared_device, ',')) {
+                const auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) throw std::runtime_error("GLM shared buffers device is unavailable: " + name);
+                ranks.push_back(device);
+            }
+            return test_glm_shared_buffers(seed, ranks, ranks.size() == 1 ? LLAMA_SPLIT_MODE_LAYER : LLAMA_SPLIT_MODE_TENSOR, {}) ? 0 : 1;
         }
         if (!dp_device.empty() || !prefill_device.empty()) {
             ggml_backend_load_all();

@@ -587,6 +587,8 @@ struct ggml_backend_meta_buffer_context {
     // addresses repeat and the entries stay as many as the tensors of the graphs.
     std::unordered_map<const ggml_tensor *, ggml_backend_meta_simple_tensor_entry> initialized;
     std::vector<ggml_backend_buffer_ptr> bufs;
+    // the simple buffers are another meta buffer's, which frees them (ggml_backend_meta_buffer_alias)
+    bool alias = false;
 
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
@@ -626,6 +628,11 @@ struct ggml_backend_meta_buffer_context {
 static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+    if (buf_ctx->alias) {
+        for (ggml_backend_buffer_ptr & simple : buf_ctx->bufs) {
+            (void) simple.release();
+        }
+    }
     delete buf_ctx;
 }
 
@@ -2670,6 +2677,25 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
+}
+
+ggml_backend_buffer_t ggml_backend_meta_buffer_alias(ggml_backend_buffer_t buf) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(buf));
+    const ggml_backend_meta_buffer_context * base = (const ggml_backend_meta_buffer_context *) buf->context;
+    GGML_ASSERT(base->stc_static.simple_tensors.empty()); // allocated by its type: no tensors were allocated with it
+
+    ggml_backend_meta_simple_tensor_container stc_static;
+    std::vector<ggml_backend_buffer_t> bufs;
+    bufs.reserve(base->bufs.size());
+    for (const ggml_backend_buffer_ptr & simple : base->bufs) {
+        bufs.push_back(simple.get());
+    }
+    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, bufs);
+    buf_ctx->alias = true;
+
+    ggml_backend_buffer_t alias = ggml_backend_buffer_init(buf->buft, ggml_backend_meta_buffer_iface, buf_ctx, buf->size);
+    alias->usage = buf->usage;
+    return alias;
 }
 
 struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {

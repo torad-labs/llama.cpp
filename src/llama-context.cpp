@@ -965,6 +965,18 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    // the buffers the main scheduler and the slots' place their graphs in (graph_shared), after the schedulers that
+    // held the ones before are gone
+    const bool shared_legacy = ggml_env_switch("LLAMA_GRAPH_BUFFER_SHARED_LEGACY");
+    const auto share_buffers = [&]() {
+        graph_shared.reset();
+        if (!shared_legacy && !graph_reuse_disable && !model.hparams.no_alloc && !cparams.pipeline_parallel) {
+            graph_shared.reset(ggml_gallocr_shared_new());
+            ggml_backend_sched_set_shared_buffers(sched.get(), graph_shared.get());
+        }
+    };
+    share_buffers();
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -999,6 +1011,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                share_buffers();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1047,6 +1060,17 @@ void llama_context::sched_reserve() {
         nextn_mode = LLM_GRAPH_NEXTN_NONE;
     }
     graph_slot_buf_limit = slot_buf_size;
+
+    // a buffer type the main scheduler's plan did not fit in one piece: the slots share one as large as their limit
+    if (graph_shared) {
+        for (size_t i = 0; i < backend_buft.size(); ++i) {
+            size_t size = 0;
+            for (size_t j = 0; j < backend_buft.size(); ++j) {
+                if (backend_buft[j] == backend_buft[i]) { size = std::max(size, slot_buf_size[j]); }
+            }
+            ggml_gallocr_shared_set_size(graph_shared.get(), backend_buft[i], size);
+        }
+    }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
@@ -2085,6 +2109,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             sched_max_nodes, false, cparams.op_offload)),
                     llm_graph_result_ptr(new llm_graph_result(sched_max_nodes)),
                 });
+                if (graph_shared) {
+                    ggml_backend_sched_set_shared_buffers(graph_slots.back().sched.get(), graph_shared.get());
+                }
             }
         }
         if (use_slots && !graph_slots.empty()) {
@@ -2119,9 +2146,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // A device under its reserve, or with no room for the graph's buffers: the retained graph used least recently,
         // other than the one being built, gives its back. False when there is none to give back.
         const auto evict = [&](const char * why) {
+            // with shared buffers (graph_shared) only a slot whose graph did not fit them has any to give back
+            const auto holds_buffers = [&](const graph_slot & slot) {
+                for (ggml_backend_t backend : backend_ptrs) {
+                    if (!ggml_backend_sched_buffer_is_shared(slot.sched.get(), backend) &&
+                            ggml_backend_sched_get_buffer_size(slot.sched.get(), backend) > 0) {
+                        return true;
+                    }
+                }
+                return false;
+            };
             auto lru = graph_slots.end();
             for (auto it = graph_slots.begin(); it != graph_slots.end(); ++it) {
-                if (it->res.get() != res && (lru == graph_slots.end() || it->t_used < lru->t_used)) {
+                if (it->res.get() != res && (lru == graph_slots.end() || it->t_used < lru->t_used) &&
+                        (!graph_shared || holds_buffers(*it))) {
                     lru = it;
                 }
             }
@@ -2222,16 +2260,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
         // a built graph's buffer, the largest of its backends' (a meta backend's is a device's): what a retained graph holds
+        // (buf_shared=1: in the context's shared buffers, graph_shared, whose size it is then)
         double buf_mib = 0.0;
+        bool buf_shared = false;
         if (!reuse) {
             for (ggml_backend_t backend : backend_ptrs) {
                 buf_mib = std::max(buf_mib, ggml_backend_sched_get_buffer_size(sched_res, backend)/1048576.0);
+                buf_shared = buf_shared || ggml_backend_sched_buffer_is_shared(sched_res, backend);
             }
         }
-        LLAMA_LOG_INFO("graph_trace layer=llama event=%s context=%p result=%p uid=%llu phase=%s rows=%u seqs=%u outputs=%u owners=%s slots=%zu slots_allowed=%d nodes=%d buf_mib=%.1f\n",
+        LLAMA_LOG_INFO("graph_trace layer=llama event=%s context=%p result=%p uid=%llu phase=%s rows=%u seqs=%u outputs=%u owners=%s slots=%zu slots_allowed=%d nodes=%d buf_mib=%.1f buf_shared=%d\n",
             reuse ? "reuse" : "build", (void *) this, (void *) res, (unsigned long long) gf->uid,
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft" : "target", ubatch.n_tokens, ubatch.n_seqs, gparams.n_outputs,
-            owners.empty() ? "none" : owners.c_str(), graph_slots.size(), (int) use_slots, ggml_graph_n_nodes(gf), buf_mib);
+            owners.empty() ? "none" : owners.c_str(), graph_slots.size(), (int) use_slots, ggml_graph_n_nodes(gf), buf_mib, (int) buf_shared);
     }
 
     // set the input data for the input tensors
@@ -4677,12 +4718,21 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].compute += backend_buf_exp_size[i];
         }
     } else {
+        // a scheduler's own buffers, and the shared buffers (graph_shared) once for all the schedulers that use them
+        std::set<ggml_backend_buffer_type_t> shared_bufts;
+        const auto add = [&](ggml_backend_sched_t s, ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+            if (!ggml_backend_sched_buffer_is_shared(s, backend)) {
+                ret[buft].compute += ggml_backend_sched_get_buffer_size(s, backend);
+            } else if (shared_bufts.insert(buft).second) {
+                ret[buft].compute += ggml_gallocr_shared_get_size(graph_shared.get(), buft);
+            }
+        };
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            add(sched.get(), backend, buft);
             for (const auto & slot : graph_slots) {
-                ret[buft].compute += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
+                add(slot.sched.get(), backend, buft);
             }
         }
     }

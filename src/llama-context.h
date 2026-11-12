@@ -509,6 +509,18 @@ private:
     uint32_t graph_slot_mtp_seq_tokens = 0;
     uint32_t graph_slot_max_rows = graph_slot_max_tokens;
     std::vector<size_t> graph_slot_buf_limit;
+    // The context's compute buffers. Each retained graph held a buffer of its own on every device beside the main
+    // scheduler's, as large as the largest graph its slot ever held: 404 MiB a card for a 69-row reply graph of
+    // GLM-5.3 Flash on four RTX PRO 6000 (-sm tensor, Nov 11, 2026), so 32 slots could hold 12.6 GiB a card, and a
+    // long-context pool left no room for more. A context computes one graph at a time and every tensor of a graph is
+    // written again at each compute, so the main scheduler and the slots' place their graphs in one buffer a buffer
+    // type (ggml_gallocr_set_shared), which the reserve sizes for the largest batch as it did the main scheduler's; a
+    // graph that does not fit it gets a buffer of its own. Nothing waits for it: a graph's inputs are host tensors,
+    // and what a scheduler writes to a device (its copies of them, the graph's kernels) is queued on the device behind
+    // the graph computed before, its output reads and the draft index rows kept from it, as a prompt's passes, each
+    // built in the main scheduler's buffer over the one before, already relied on. Not with pipeline parallelism.
+    // LLAMA_GRAPH_BUFFER_SHARED_LEGACY=1: a buffer a scheduler
+    ggml_gallocr_shared_ptr graph_shared;
     std::vector<graph_slot> graph_slots;
     // The device memory a context leaves free: LLAMA_GRAPH_DEVICE_RESERVE_MIB, default 256; 0: none. It retains one
     // more graph only while every device it computes on has this much free, and before it builds a graph on a device

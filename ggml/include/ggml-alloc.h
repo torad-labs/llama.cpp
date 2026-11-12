@@ -73,6 +73,25 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// Buffers that several graph allocators place their graphs in, each over the others': for graphs that are computed one
+// at a time and whose tensors are all written again at every compute (nothing a graph left in its buffer is there when
+// it is computed next). An allocator set to share takes a buffer type's shared buffer when its plan is one chunk that
+// fits, and a buffer of its own otherwise. The first allocator to ask allocates the shared buffer, at the size set
+// for its type or at its plan's if that is larger. It is allocated again, larger, only while no allocator has a graph
+// in it: the one allocator that uses it can grow it, as it would a buffer of its own. The buffers are freed with the
+// last allocator set to them, once ggml_gallocr_shared_free was called.
+typedef struct ggml_gallocr_shared * ggml_gallocr_shared_t;
+
+GGML_API ggml_gallocr_shared_t ggml_gallocr_shared_new(void);
+GGML_API void                  ggml_gallocr_shared_free(ggml_gallocr_shared_t shared);
+GGML_API void                  ggml_gallocr_shared_set_size(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft, size_t size);
+// the size of a buffer type's shared buffer as allocated, 0 while no allocator asked for it
+GGML_API size_t                ggml_gallocr_shared_get_size(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft);
+// before the allocator's first reserve; shared may be NULL (the allocator's own buffers, the default)
+GGML_API void                  ggml_gallocr_set_shared(ggml_gallocr_t galloc, ggml_gallocr_shared_t shared);
+// true when the allocator's buffer is the shared one
+GGML_API bool                  ggml_gallocr_buffer_is_shared(ggml_gallocr_t galloc, int buffer_id);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 // ggml_backend_alloc_ctx_tensors_from_buft_size returns the size of the buffer that would be allocated by ggml_backend_alloc_ctx_tensors_from_buft

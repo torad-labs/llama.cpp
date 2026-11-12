@@ -101,6 +101,13 @@ extern "C" {
     // device's graph asks them (weights no kernel writes, which a kernel may read before its dependency wait)
     GGML_API void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buf, enum ggml_backend_buffer_usage usage);
 
+    // A meta buffer over the memory of another, with a record of its own of the tensors initialized in it (their simple
+    // tensors, their split states). The meta backend keeps that record a buffer and clears the split states of the whole
+    // buffer when a graph in it is built again, so graph allocators that place their graphs in one buffer
+    // (ggml_gallocr_set_shared) each take one of these. buf was allocated by its buffer type (no tensors were allocated
+    // with it) and outlives the buffer made here, which does not free its memory.
+    GGML_API ggml_backend_buffer_t ggml_backend_meta_buffer_alias(ggml_backend_buffer_t buf);
+
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
