@@ -607,7 +607,33 @@ struct server_uninit_allocator {
     template <typename U> bool operator==(const server_uninit_allocator<U> &) const { return true; }
     template <typename U> bool operator!=(const server_uninit_allocator<U> &) const { return false; }
 };
-using server_state_bytes = std::vector<uint8_t, server_uninit_allocator<uint8_t>>;
+// A snapshot's bytes: memory of its own (resize), or a range of a file that a stop wrote and the next start mapped (map), which is only read.
+class server_state_bytes {
+public:
+    void resize(size_t n_bytes) {
+        file.reset();
+        own.resize(n_bytes);
+    }
+
+    // [ptr, ptr + n_bytes) of a mapping that keep holds
+    void map(std::shared_ptr<const void> keep, uint8_t * ptr, size_t n_bytes) {
+        own  = {};
+        file = std::move(keep);
+        at   = ptr;
+        n    = n_bytes;
+    }
+
+    uint8_t *       data()        { return file ? at : own.data(); }
+    const uint8_t * data()  const { return file ? at : own.data(); }
+    size_t          size()  const { return file ? n  : own.size(); }
+    bool            empty() const { return size() == 0; }
+
+private:
+    std::vector<uint8_t, server_uninit_allocator<uint8_t>> own;
+    std::shared_ptr<const void> file;
+    uint8_t * at = nullptr;
+    size_t    n  = 0;
+};
 
 struct server_prompt_data {
     server_state_bytes main;
@@ -756,6 +782,16 @@ public:
 
     // a save's copy was done since the last call: a task deferred for its slot can be taken up again
     bool take_saved() { return std::exchange(saved, false); }
+
+    // LLAMA_PROMPT_CACHE_DIR, at a stop: every snapshot is written to a file of its own in dir, oldest first, and leaves
+    // the cache. id is of the models the snapshots are states of: open() takes the files written with the same one.
+    // Returns the snapshots written.
+    size_t store(const std::string & dir, uint64_t id);
+
+    // At a start: the files a stop left in dir join the cache in the order they were written. A snapshot's rows are
+    // mapped, not copied, and its file is removed from dir: the mapping keeps the bytes until the snapshot leaves the
+    // cache. Returns the snapshots taken.
+    size_t open(const std::string & dir, uint64_t id, bool has_mtmd);
 };
 
 // used exclusively by router mode

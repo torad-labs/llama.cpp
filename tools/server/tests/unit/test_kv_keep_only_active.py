@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import threading
 import pytest
@@ -219,6 +220,49 @@ def test_exchange_save_async(monkeypatch):
         server.stop()
 
     assert replies[0] == replies[1]
+
+
+# LLAMA_PROMPT_CACHE_DIR: the sessions of a server that is stopped are files in the directory, and the server started next
+# with the same model takes them into its prompt cache. Both conversations come back with as many tokens reused and the
+# same replies as on a server that never stopped
+def test_sessions_survive_a_stop(monkeypatch, tmp_path):
+    global server
+    prompts = (LONG_PROMPT, OTHER_PROMPT)
+
+    def turn(prompt):
+        res = server.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True})
+        assert res.status_code == 200
+        return res.body["content"], res.body["timings"]["cache_n"]
+
+    def files():
+        return list(tmp_path.glob("*/*.state"))
+
+    # without the directory: each conversation's second turn on the server that had its first
+    monkeypatch.delenv("LLAMA_PROMPT_CACHE_DIR", raising=False)
+    server.start()
+    first = [turn(prompt) for prompt in prompts]
+    again = [turn(prompt) for prompt in prompts]
+    server.stop()
+    assert all(cache_n > 0 for _, cache_n in again)
+    assert not files()
+
+    monkeypatch.setenv("LLAMA_PROMPT_CACHE_DIR", str(tmp_path))
+    server.start()
+    assert [turn(prompt) for prompt in prompts] == first
+    server.stop()
+    assert len(files()) == 2
+    assert all(path.stat().st_mode & 0o077 == 0 for path in files())
+
+    # the second turns, on a server started after the stop
+    server.start()
+    log = LogReader(server.log_path)
+    assert re.search(r"prompt cache: 2 snapshots, .* taken from", log.wait_for("taken from"))
+    assert not files()
+    assert [turn(prompt) for prompt in prompts] == again
+    assert "cache_restore reason=restored" in log.wait_for("cache_restore reason=restored")
+    server.stop()
+    # and that server left them again, for the one after it
+    assert len(files()) == 2
 
 
 # a request for a busy slot waits for it: the prompt cache does not save or replace the slot's state under the running request
