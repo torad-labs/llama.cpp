@@ -808,7 +808,16 @@ class ServingRecipeTest(unittest.TestCase):
         argv, env = self.serve.make_plan(self.serve.arguments(base + ["--context", "3014656", "--slot-context", "262144"]))
         self.assertEqual(argv[argv.index("-c") + 1], "3014656")
         self.assertEqual(env["LLAMA_KV_SEQ_CELLS"], "262144")
+        # graphs sized for long sessions are kept 32 a context, not 128, unless a count is given; four captures beyond
+        self.assertEqual((env["LLAMA_GRAPH_SLOTS"], env["GGML_META_CAPTURE_GRAPHS"]), ("32", "36"))
+        for options, kept in ((["--kept-graphs", "64"], "64"),
+                              (["--context", "3014656", "--slot-context", "262144", "--kept-graphs", "128"], "128")):
+            env = self.serve.make_plan(self.serve.arguments(base + options))[1]
+            self.assertEqual((env["LLAMA_GRAPH_SLOTS"], env["GGML_META_CAPTURE_GRAPHS"]), (kept, str(int(kept) + 4)))
         for options in (base + ["--slots", "0"], base + ["--slots", "257"], base + ["--slots", "8", "--context", "7"],
+                        base + ["--kept-graphs", "0"], base + ["--kept-graphs", "257"],
+                        ["--model", "/models/target.gguf", "--kept-graphs", "32"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--kept-graphs", "32"],
                         base + ["--slot-context", "255"], base + ["--slot-context", "524288"],
                         base + ["--context", "294912", "--slot-context", "294912"],
                         ["--model", "/models/target.gguf", "--slot-context", "262144"],

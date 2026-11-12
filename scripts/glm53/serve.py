@@ -51,6 +51,8 @@ def arguments(argv=None):
     parser.add_argument("--slot-context", type=int, help="tensor-4: tokens one session holds of the pool at most. The graph "
                         "reserved at load is then sized for sessions of that many, so a larger --context loads "
                         "(default: a session may take the whole pool)")
+    parser.add_argument("--kept-graphs", type=int, help="tensor-4: graphs a context keeps by shape, 1..256 (default: 128, "
+                        "and 32 with --slot-context)")
     parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
@@ -105,6 +107,8 @@ def make_plan(args):
         raise ValueError("context is supported only with --profile tensor-4 and holds at least one token a slot")
     if args.slot_context is not None and (not four or not 256 <= args.slot_context < context):
         raise ValueError("slot-context is supported only with --profile tensor-4, from 256 tokens to under the context")
+    if args.kept_graphs is not None and (not four or not 1 <= args.kept_graphs <= 256):
+        raise ValueError("kept-graphs is supported only with --profile tensor-4 and must be 1..256")
     if dp and args.mtp_depth in ("3", "4"):
         raise ValueError("dp-4 is measured at MTP depth 1 and 2")
     if not 0 <= args.mtp_adaptive <= 1:
@@ -192,7 +196,13 @@ def make_plan(args):
         # A graph is kept by its shape whichever sessions are in it, 128 a context, and a CUDA executable is not given
         # back while the server idles between turns: the steps sessions end in are built once, not every pass. A card
         # that fills gives the graphs used least recently back (LLAMA_GRAPH_DEVICE_RESERVE_MIB).
-        env.update({"LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": "128", "GGML_META_CAPTURE_GRAPHS": "132",
+        # With --slot-context a kept graph is sized for sessions that long and 128 of them fill the cards: a pool of
+        # 3,014,656 with sessions of 262,144 is 67.9 GB a card at load, and 23 sessions of 20,000 tokens took the cards
+        # to 97.1 of 97.9 GB with both contexts at their reserve. With 32 they stood at 84.1 GB through the same
+        # sessions, one of 250,000 tokens and four of 100,000 beside 19 short ones, and replies ran alike (four RTX PRO
+        # 6000, Nov 11, 2026). What 32 costs a short-context read against 128 was not read.
+        kept = args.kept_graphs if args.kept_graphs is not None else 32 if args.slot_context is not None else 128
+        env.update({"LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": str(kept), "GGML_META_CAPTURE_GRAPHS": str(kept + 4),
                     "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000"})
     if four and not args.dflash and args.mtp_depth != "off":
         # The MTP head proposes with the session's own sampler and the noise the target will draw with. A reply's
