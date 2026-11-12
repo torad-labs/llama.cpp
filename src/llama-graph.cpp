@@ -832,51 +832,74 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
 
     draft = params.cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? mctx_hyb->get_mtp_index() : nullptr;
 
+    // GGML_GRAPH_TRACE=1 names the condition that turned the kept graph down, under the reject line of its result
+    static const bool trace = ggml_env_switch("GGML_GRAPH_TRACE");
+    const auto no = [&](const char * why) {
+        if (trace) {
+            LLAMA_LOG_INFO("graph_trace layer=llama event=kpool_reject why=%s rows=%u seqs=%u draft=%d\n",
+                    why, params.ubatch.n_tokens, params.ubatch.n_seqs_unq, draft != nullptr);
+        }
+        return false;
+    };
+
     // a unified pool's ubatch that can take a stream a sequence takes it, and one that no longer can leaves it
     std::vector<llama_seq_id> seqs;
     const bool shared_now = pool_cells != nullptr && shared_streams(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool, seqs);
-    if (shared_now != shared) return false;
+    if (shared_now != shared) return no(shared ? "streams_lost" : "streams_gained");
     if (shared && seqs != resident_seqs) {
         // the bank holds every sequence's table and the streams' rows are this ubatch's (set_input): with as many
         // streams, the graph is another set's too
-        if (!params.any_seqs || seqs.size() != resident_seqs.size()) return false;
+        if (!params.any_seqs || seqs.size() != resident_seqs.size()) return no("stream_seqs");
         resident_seqs = seqs;
     }
 
     const auto dims = current_dims(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool, shared);
     const bool reuse_selection = dims.scoring && !dims.rebuild && draft && draft->can_reuse(params.ubatch, dims.n_kv, kpool*dims.n_dump, kpool);
-    if ((draft_top_k != nullptr) != reuse_selection) return false;
+    if ((draft_top_k != nullptr) != reuse_selection) return no(reuse_selection ? "selection_gained" : "selection_lost");
     if (!draft_rows.empty()) {
-        if (draft_rows.size() != params.ubatch.n_tokens) return false;
+        if (draft_rows.size() != params.ubatch.n_tokens) return no("selection_rows");
         // one bank's rows are read by their slots, which set_input takes from the ubatch (draft_ids): the graph is then
         // another set's too, while every sequence's selection is in that bank
         const bool any_seqs = params.any_seqs && draft_ids != nullptr;
         for (uint32_t i = 0; i < params.ubatch.n_tokens; ++i) {
             const llama_seq_id seq = params.ubatch.seq_id[i][0];
-            if (draft_rows[i] != draft->backend_row(seq)) return false;
+            if (draft_rows[i] != draft->backend_row(seq)) return no("selection_store");
             if (draft_seqs[i] != seq) {
-                if (!any_seqs) return false;
+                if (!any_seqs) return no("selection_seqs");
                 draft_seqs[i] = seq;
             }
         }
     }
     if (resident_table) {
         if (resident_seqs.empty()) {
-            if (params.ubatch.n_seqs_unq != 1 || params.ubatch.seq_id_unq[0] != resident_seq) return false;
+            if (params.ubatch.n_seqs_unq != 1 || params.ubatch.seq_id_unq[0] != resident_seq) return no("resident_seq");
         } else if (!shared && (params.ubatch.n_seqs_unq != resident_seqs.size() ||
                 !std::equal(resident_seqs.begin(), resident_seqs.end(), params.ubatch.seq_id_unq))) {
-            return false;
+            return no("resident_seqs");
         }
         auto & views = mctx_attn->get_kv()->get_kpool_views();
         views.begin();
         for (uint32_t s = 0; s < params.ubatch.n_seqs_unq; ++s) {
             const auto seq = params.ubatch.seq_id_unq[s];
-            if (!views.serve(mctx_attn->get_kv()->get_cells(seq), seq, kpool, dims.n_kv, dims.n_pools)) return false;
+            if (!views.serve(mctx_attn->get_kv()->get_cells(seq), seq, kpool, dims.n_kv, dims.n_pools)) return no("view");
         }
     }
     sched = params.sched;
 
-    return shapes_match(dims, *this);
+    if (shapes_match(dims, *this)) {
+        return true;
+    }
+    if (trace) {
+        LLAMA_LOG_INFO("graph_trace layer=llama event=kpool_reject why=dims rows=%u seqs=%u draft=%d "
+                "now=kv:%lld,pools:%lld,dump:%lld,new:%lld,tail:%lld,rebuild:%d,scoring:%d,streams:%lld "
+                "kept=cells:%lld,sel:%lld,new:%lld,tail:%lld,rebuild:%d\n",
+                params.ubatch.n_tokens, params.ubatch.n_seqs_unq, draft != nullptr,
+                (long long) dims.n_kv, (long long) dims.n_pools, (long long) dims.n_dump, (long long) dims.n_new_max,
+                (long long) dims.n_tail, dims.rebuild, dims.scoring, (long long) dims.n_stream,
+                (long long) (pool_cells ? pool_cells->ne[0] : 0), (long long) (sel_mask ? sel_mask->ne[0] : 0),
+                (long long) n_new_max, (long long) n_tail, rebuild);
+    }
+    return false;
 }
 
 llm_graph_input_attn_kv_msa::llm_graph_input_attn_kv_msa(
