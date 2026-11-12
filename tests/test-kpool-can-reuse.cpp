@@ -138,6 +138,13 @@ static void test_host_kv_graph_transition() {
     h.indexer_kpool = 32;
     auto cpu = ggml_backend_cpu_init();
 
+    // The cutoff's row cap is read once a process (LLAMA_KPOOL_DIRECT_ROW_CAP; 2 unless set), so each rule is a run of
+    // this test. A row here reads 2,080 cells through indices: under a cap of 4 or more, 512 rows still stage at 8,192
+    // cells (8 is the rule as it was: its cutoff there is 16,640); under the default every row count below reads
+    // through indices from 8,192 cells on.
+    const char * cap_env = getenv("LLAMA_KPOOL_DIRECT_ROW_CAP");
+    const bool stage_512_at_8192 = cap_env && atoll(cap_env) >= 4;
+
     // Host storage must keep the resident attention kernel before and after the direct-index cutoff.
     for (const uint32_t cells : {2560u, 8192u, 32768u}) {
         for (const uint32_t tokens : {512u, 3u, 1u}) {
@@ -175,7 +182,8 @@ static void test_host_kv_graph_transition() {
                 const bool scoring = llama_kpool_needs_scoring(cells, cells, h.indexer_top_k, h.indexer_kpool);
                 CHECK(scoring, "fresh prompt must enter sparse attention");
                 auto * input = graph.build_inp_kpool(&mctx, mask, scoring);
-                const bool direct = mode == 1 && (cells == 32768 || (cells == 8192 && tokens < 512));
+                const bool direct = mode == 1 &&
+                        (cells == 32768 || (cells == 8192 && (tokens < 512 || !stage_512_at_8192)));
                 CHECK(bool(input->tail_cells) == direct,
                         "host storage changed attention selection: cells=%u tokens=%u host=%d flash=%d", cells, tokens, mode != 0, mode != 2);
                 if (mode == 2) { continue; }
@@ -296,11 +304,15 @@ static void test_cell_capacity(uint32_t top_k) {
                     const uint32_t cutoff = top_k == 8 ? 4096 : 16640;
                     const uint32_t want = unified && old.scoring && old.n_kv >= cutoff ?
                             std::min(size, GGML_PAD((uint32_t) old.n_kv, 65536u)) : (uint32_t) old.n_kv;
-                    for (const int64_t rows : {1, 3, 8, 69, 768}) {
-                        const int64_t staged = llama_kpool_n_kv_max(KPOOL*old.n_dump, std::max<int64_t>(1, old.n_tail));
-                        const int64_t at = std::max<int64_t>(4096, std::min<int64_t>(rows, 8)*staged);
-                        CHECK((d.n_kv >= at) == (old.n_kv >= at),
-                                "cell capacity changed dispatch at %u cells, %lld rows", ends[i], (long long) rows);
+                    // under the cutoff's default row cap (2) and under the rule as it was (8), which the gate keeps
+                    for (const int64_t cap : {2, 8}) {
+                        for (const int64_t rows : {1, 3, 8, 69, 768}) {
+                            const int64_t staged = llama_kpool_n_kv_max(KPOOL*old.n_dump, std::max<int64_t>(1, old.n_tail));
+                            const int64_t at = std::max<int64_t>(4096, std::min<int64_t>(rows, cap)*staged);
+                            CHECK((d.n_kv >= at) == (old.n_kv >= at),
+                                    "cell capacity changed dispatch at %u cells, %lld rows, row cap %lld", ends[i],
+                                    (long long) rows, (long long) cap);
+                        }
                     }
                     CHECK(d.n_kv == want, "cell capacity at %u: got %lld, want %u", ends[i], (long long) d.n_kv, want);
                     CHECK(mctx.get_n_pad() == pads[i], "cell capacity changed pool padding");

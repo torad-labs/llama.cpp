@@ -4316,13 +4316,15 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
 }
 
 // The direct-index cutoff is max(4096, min(rows of a KV stream, this cap) * the cells a row reads through indices): a
-// step whose cell view is narrower keeps the resident kernel. LLAMA_KPOOL_DIRECT_ROW_CAP, read once a process; 8 as it
-// was. The cell-capacity gate (llama_kv_cache::get_n_kv) keeps its own 8 whatever this is
+// step whose cell view is narrower keeps the resident kernel, whose masks are rows x view. The cap is 2: with two rows
+// or more the resident kernel is kept only for views under two rows' worth of cells, where it reads no slower than
+// the indices do. LLAMA_KPOOL_DIRECT_ROW_CAP, read once a process, sets another; 8 is the rule as it was. The
+// cell-capacity gate (llama_kv_cache::get_n_kv) keeps its own 8 whatever this is
 static int64_t kpool_direct_row_cap() {
     static const int64_t cap = [] {
         const char * env = getenv("LLAMA_KPOOL_DIRECT_ROW_CAP");
-        const int64_t value = env ? atoll(env) : 8;
-        return value >= 1 ? value : 8;
+        const int64_t value = env ? atoll(env) : 2;
+        return value >= 1 ? value : 2;
     }();
     return cap;
 }
