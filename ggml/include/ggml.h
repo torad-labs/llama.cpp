@@ -2730,6 +2730,10 @@ extern "C" {
     // value becomes d * roundf(x / d), or 0 when d is 0. op_params[0] is 1; a backend that ignores it must refuse the op
     GGML_API void ggml_lightning_indexer_set_q8_query(struct ggml_tensor * a);
 
+    // Optional padding hint from ggml_kpool_materialize: I32 [6 or 7, n_queries, n_streams], run in field 5.
+    // At and past run, k_rows and each query's mask must repeat their value at run. A backend may ignore this hint.
+    GGML_API void ggml_lightning_indexer_set_kpool_padding(struct ggml_tensor * a, struct ggml_tensor * rows);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.

@@ -534,6 +534,18 @@ static __device__ __forceinline__ void lightning_indexer_oct_level(float * part,
     }
 }
 
+static __device__ __forceinline__ int64_t lightning_indexer_live(const int32_t * counts, int64_t stride, int stream, int64_t n_kv) {
+    const int64_t live = counts ? counts[stream*stride] : n_kv;
+    if (live < 0 || live > n_kv) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        __builtin_trap();
+#else
+        asm("trap;");
+#endif
+    }
+    return live;
+}
+
 // The vector kernel's scores bit for bit, a key to an octet of lanes: lane t of an octet holds the dims lanes t + 8j
 // (j = 0..3) hold in the vector kernel, 32j + 4t to 32j + 4t + 3, and adds its 4 products in registers in the order
 // warp_reduce_sum's xor 16 and 8 add them (the bits of j), then xor 4, 2 and 1 across the octet, each level handing half
@@ -550,7 +562,8 @@ static __global__ void lightning_indexer_kernel_oct(
         size_t nbw1, size_t nbw2, size_t nbw3,
         size_t nbm1, size_t nbm2, size_t nbm3,
         int64_t nem3,
-        const int32_t * rows, int64_t s_rows
+        const int32_t * rows, int64_t s_rows,
+        const int32_t * counts, int64_t s_counts
     ) {
     static_assert(N_EMBD == 4*WARP_SIZE, "a lane of the vector kernel holds 4 dims");
     static_assert(KEYS_PER_OCT == 1 || KEYS_PER_OCT == 2 || KEYS_PER_OCT == 4 || KEYS_PER_OCT == 8, "halved down to one at 3 levels");
@@ -571,6 +584,11 @@ static __global__ void lightning_indexer_kernel_oct(
 
     // key c of an octet: consecutive octets hold consecutive keys, so a warp writes its scores contiguously
     const int start_kv = (blockIdx.x * WARPS_PER_BLOCK + i_warp) * KEYS_PER_WARP + i_oct;
+    const int64_t live = lightning_indexer_live(counts, s_counts, i_stream, n_kv);
+    // Keep the tile containing the first padded score; the fill copies its computed bits.
+    if (int64_t(blockIdx.x)*WARPS_PER_BLOCK*KEYS_PER_WARP > live) {
+        return;
+    }
 
     const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
     const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
@@ -754,7 +772,8 @@ static __global__ void __launch_bounds__(N_WARPS*WARP_SIZE, 2) lightning_indexer
         size_t nbw1, size_t nbw3,
         size_t nbm1, size_t nbm3,
         int64_t nem3,
-        const int32_t * rows, int64_t s_rows) {
+        const int32_t * rows, int64_t s_rows,
+        const int32_t * counts, int64_t s_counts) {
 #if defined(TURING_MMA_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     using namespace ggml_cuda_mma;
     constexpr int N_EMBD = 128;
@@ -773,8 +792,12 @@ static __global__ void __launch_bounds__(N_WARPS*WARP_SIZE, 2) lightning_indexer
     const int64_t i_batch = (int64_t) blockIdx.x*N_WARPS + i_warp;
     const bool active  = i_batch < n_batch;
 
+    const int64_t live = lightning_indexer_live(counts, s_counts, i_stream, n_kv);
     const int64_t kv0 = (int64_t) blockIdx.y*kv_per_block;
-    const int64_t kv1 = min(kv0 + kv_per_block, n_kv);
+    const int64_t kv1 = min(min(kv0 + kv_per_block, n_kv), (live/P + 1)*P);
+    if (kv0 > live) {
+        return;
+    }
 
     // a0..a3 of head tile ht, block b: rows (heads) g and g + 8 at the block's values 4 tig..4 tig + 3 (a0, a1) and
     // 16 + 4 tig.. (a2, a3); dq the two rows' block scales; wv their weights
@@ -894,16 +917,29 @@ static __global__ void __launch_bounds__(N_WARPS*WARP_SIZE, 2) lightning_indexer
     }
 #else
     GGML_UNUSED_VARS(Q, K, W, M, dst, n_batch, n_kv, kv_per_block, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3,
-        nbw1, nbw3, nbm1, nbm3, nem3, rows, s_rows);
+        nbw1, nbw3, nbm1, nbm3, nem3, rows, s_rows, counts, s_counts);
     NO_DEVICE_CODE;
 #endif // defined(TURING_MMA_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+static __global__ void lightning_indexer_fill_padding(float * dst, const int32_t * counts, int64_t s_counts,
+        int64_t n_kv, size_t nb1, size_t nb3) {
+    const int64_t live = lightning_indexer_live(counts, s_counts, blockIdx.z, n_kv);
+    if (live == n_kv) {
+        return;
+    }
+    auto * row = (uint32_t *) ((char *) dst + blockIdx.y*nb1 + blockIdx.z*nb3);
+    const uint32_t value = row[live];
+    for (int64_t p = live + 1 + int64_t(blockIdx.x)*blockDim.x + threadIdx.x; p < n_kv; p += int64_t(gridDim.x)*blockDim.x) {
+        row[p] = value;
+    }
 }
 
 // GGML_CUDA_LIGHTNING_INDEXER_CHECK=1: the vector kernel runs beside the octet (or quad) kernel and a differing bit traps
 static __global__ void lightning_indexer_check(const float * quad, const float * vec, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n && __float_as_uint(quad[i]) != __float_as_uint(vec[i])) {
-        printf("lightning indexer check: score %lld is %08x from the octet (or quad) kernel, %08x from the vector kernel\n",
+        printf("lightning indexer check: score %lld is %08x from the candidate, %08x from the reference\n",
                 (long long) i, __float_as_uint(quad[i]), __float_as_uint(vec[i]));
         __trap();
     }
@@ -937,19 +973,21 @@ static constexpr int LIGHTNING_INDEXER_OCT_KEYS_PER_BLOCK = LIGHTNING_INDEXER_OC
 #define LIGHTNING_INDEXER_VEC_CASE(n_embd, n_head, K, type_K)                                   \
     if (K->type == (type_K)) {                                                                   \
         if (!vec_legacy && !oct_legacy) {                                                        \
-            lightning_indexer_kernel_oct<LIGHTNING_INDEXER_OCT_WARPS, LIGHTNING_INDEXER_OCT_KEYS,   \
-                n_embd, n_head, type_K>                                                          \
-                <<<grid_oct, block_oct, 0, ctx.stream()>>>(                                      \
-                q_d, k_d, w_d, m_d, dst_d,                                                       \
-                n_stream, n_batch, n_kv,                                                         \
-                nb1, nb2, nb3,                                                                   \
-                nbq1, nbq2, nbq3,                                                                \
-                nbk1, nbk2, nbk3s,                                                               \
-                nbw1, nbw2, nbw3,                                                                \
-                nbm1, nbm2, nbm3,                                                                \
-                nem3,                                                                            \
-                rows_d, s_rows                                                                   \
-            );                                                                                   \
+            const auto launch_oct = [&](float * out, const int32_t * counts) {                    \
+                lightning_indexer_kernel_oct<LIGHTNING_INDEXER_OCT_WARPS, LIGHTNING_INDEXER_OCT_KEYS, \
+                    n_embd, n_head, type_K>                                                      \
+                    <<<grid_oct, block_oct, 0, ctx.stream()>>>(                                  \
+                    q_d, k_d, w_d, m_d, out,                                                     \
+                    n_stream, n_batch, n_kv,                                                     \
+                    nb1, nb2, nb3,                                                               \
+                    nbq1, nbq2, nbq3,                                                            \
+                    nbk1, nbk2, nbk3s,                                                           \
+                    nbw1, nbw2, nbw3,                                                            \
+                    nbm1, nbm2, nbm3,                                                            \
+                    nem3, rows_d, s_rows, counts, s_counts);                                     \
+            };                                                                                   \
+            launch_oct(dst_d, counts_d);                                                          \
+            if (pad_ref_d) { launch_oct(pad_ref_d, nullptr); }                                    \
         } else if (!vec_legacy) {                                                                \
             lightning_indexer_kernel_quad<LIGHTNING_INDEXER_QUAD_WARPS, LIGHTNING_INDEXER_QUAD_KEYS, \
                 n_embd, n_head, type_K>                                                          \
@@ -1058,6 +1096,25 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // more, elsewhere q rounded into a buffer the kernels below score, the same scores to f32 rounding.
     // GGML_CUDA_LIGHTNING_INDEXER_Q8_MMA_LEGACY=1 takes the buffer everywhere.
     const bool q8_query = ggml_get_op_params_i32(dst, 0) == 1;
+    const ggml_tensor * limits = dst->src[5];
+    static const bool pad_legacy = ggml_env_switch("GGML_CUDA_LIGHTNING_INDEXER_PAD_LEGACY");
+    static const bool pad_check = ggml_env_switch("GGML_CUDA_LIGHTNING_INDEXER_PAD_CHECK");
+    const bool bounded = limits && q8_query && n_head == 32 && !pad_legacy && !vec_legacy && !oct_legacy;
+    const int32_t * counts_d = bounded ? (const int32_t *) limits->data + 5 : nullptr;
+    const int64_t s_counts = bounded ? limits->nb[2]/sizeof(int32_t) : 0;
+    ggml_cuda_pool_alloc<float> pad_ref_buf(ctx.pool());
+    if (bounded && pad_check) { GGML_ASSERT(ggml_is_contiguous(dst)); }
+    float * pad_ref_d = bounded && pad_check ? pad_ref_buf.alloc(ggml_nelements(dst)) : nullptr;
+    const auto finish_padding = [&]() {
+        if (counts_d) {
+            lightning_indexer_fill_padding<<<dim3(1, n_batch, n_stream), 256, 0, ctx.stream()>>>(
+                    dst_d, counts_d, s_counts, n_kv, nb1, nb3);
+        }
+        if (pad_ref_d) {
+            const int64_t n = ggml_nelements(dst);
+            lightning_indexer_check<<<(n + 255)/256, 256, 0, ctx.stream()>>>(dst_d, pad_ref_d, n);
+        }
+    };
     ggml_cuda_pool_alloc<char> q_round_buf(ctx.pool());
     if (q8_query) {
         GGML_ASSERT(k->type == GGML_TYPE_Q8_0 && rows_d != nullptr && n_embd == 128);
@@ -1074,16 +1131,21 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             const int64_t kv_per_block = (n_tiles + n_by - 1) / n_by * P;
             const dim3 grid(n_bx, (n_kv + kv_per_block - 1) / kv_per_block, n_stream);
             const dim3 block(WARP_SIZE, N_WARPS);
-            lightning_indexer_kernel_q8_mma<N_WARPS><<<grid, block, 0, ctx.stream()>>>(
-                q_d, k_d, w_d, m_d, dst_d,
-                n_batch, n_kv, kv_per_block,
-                nb1, nb3,
-                nbq1, nbq2, nbq3,
-                nbk2, nbk3s,
-                nbw1, nbw3,
-                nbm1, nbm3,
-                nem3,
-                rows_d, s_rows);
+            const auto launch = [&](float * out, const int32_t * counts) {
+                lightning_indexer_kernel_q8_mma<N_WARPS><<<grid, block, 0, ctx.stream()>>>(
+                    q_d, k_d, w_d, m_d, out,
+                    n_batch, n_kv, kv_per_block,
+                    nb1, nb3,
+                    nbq1, nbq2, nbq3,
+                    nbk2, nbk3s,
+                    nbw1, nbw3,
+                    nbm1, nbm3,
+                    nem3,
+                    rows_d, s_rows, counts, s_counts);
+            };
+            launch(dst_d, counts_d);
+            if (pad_ref_d) { launch(pad_ref_d, nullptr); }
+            finish_padding();
             return;
         }
         constexpr int ROUND_ROWS = 4; // warps a block
@@ -1194,6 +1256,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         GGML_ABORT("fatal error");
     }
 
+    finish_padding();
     if (vec_check && vec_d != nullptr) {
         GGML_ASSERT(ggml_is_contiguous(dst));
         const int64_t n = ggml_nelements(dst);
@@ -1230,6 +1293,13 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
 
     const ggml_tensor * r = dst->src[4];
     if (r != nullptr && (r->type != GGML_TYPE_I32 || !ggml_is_contiguous(r))) {
+        return false;
+    }
+
+    const ggml_tensor * limits = dst->src[5];
+    if (limits && (r == nullptr || limits->type != GGML_TYPE_I32 || (limits->ne[0] != 6 && limits->ne[0] != 7) ||
+            limits->ne[1] != q->ne[2] || limits->ne[2] != q->ne[3] || limits->ne[3] != 1 ||
+            !ggml_is_contiguous(limits) || !ggml_cuda_data_is_aligned(limits, sizeof(int32_t)))) {
         return false;
     }
 
