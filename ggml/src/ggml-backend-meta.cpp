@@ -2752,7 +2752,6 @@ struct ggml_backend_meta_context {
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
     size_t                      n_reduce_steps;
-    int                         max_nnodes    = 0;
     size_t                      max_tmp_size  = 0;
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
@@ -2773,6 +2772,28 @@ struct ggml_backend_meta_context {
     };
     std::vector<owned_layout>            owned;
     ggml_backend_graph_next_t            graph_next     = nullptr; // the simple backends' look ahead, or null
+
+    // The steps of the cgraphs evaluated before the one in use, by uid: each device's nodes and subgraphs, the gathers
+    // and the reductions' layouts, which a change of cgraph otherwise makes again on the host. A context that evaluates
+    // its retained graphs in turn pays that at every change: the graph of a depth probe every eighth round and the round
+    // after it, a reply pass after a prompt pass (3.6 ms a change of a 5,900-node graph on four cards, Nov 11, 2026 box
+    // log). As many as the captures kept (GGML_META_CAPTURE_GRAPHS), the one used least recently dropped first; a cgraph
+    // without a uid has none. GGML_META_STEPS_KEEP_LEGACY=1: none are kept, and every change makes its steps again.
+    struct kept_steps {
+        uint64_t                                t_used      = 0;
+        int                                     n_nodes     = 0;
+        size_t                                  n_subgraphs = 0;
+        std::vector<std::vector<cgraph_config>> cgraphs; // a device
+        std::vector<std::vector<ggml_tensor *>> nodes;   // a device
+        std::vector<bool>                       gathers;
+        std::vector<owned_layout>               owned;
+        ggml_context_ptr                        ctx;
+    };
+    const bool                               steps_keep  = !ggml_env_switch("GGML_META_STEPS_KEEP_LEGACY");
+    std::unordered_map<uint64_t, kept_steps> steps_kept;
+    uint64_t                                 steps_clock = 0;
+    ggml_context_ptr                         ctx_steps;       // the subgraphs' cgraphs of the steps in use
+    int                                      n_nodes     = 0; // of the cgraph whose steps are in use
 
     // A whole evaluation of a cgraph, every step's subgraph and all-reduce on every device, captured into one graph a
     // device and replayed with one launch a device while the cgraph's uid holds (ggml_backend_meta_graph_compute): the
@@ -2873,6 +2894,68 @@ struct ggml_backend_meta_context {
                 (void *) this, (unsigned long long) uid, n_nodes, capture.graphs.size());
         }
         return fragment->second;
+    }
+
+    // Sets the steps in use aside for their cgraph's next evaluation, and leaves none in use.
+    void steps_put() {
+        if (uid != 0 && steps_keep) {
+            if (steps_kept.size() >= capture.n_graphs_max) {
+                auto lru = steps_kept.begin();
+                for (auto it = steps_kept.begin(); it != steps_kept.end(); ++it) {
+                    if (it->second.t_used < lru->second.t_used) {
+                        lru = it;
+                    }
+                }
+                steps_kept.erase(lru);
+            }
+            kept_steps & kept = steps_kept[uid];
+            kept.t_used      = ++steps_clock;
+            kept.n_nodes     = n_nodes;
+            kept.n_subgraphs = n_subgraphs;
+            kept.cgraphs.resize(backend_configs.size());
+            kept.nodes.resize(backend_configs.size());
+            for (size_t j = 0; j < backend_configs.size(); j++) {
+                kept.cgraphs[j] = std::move(backend_configs[j].cgraphs);
+                kept.nodes[j]   = std::move(backend_configs[j].nodes);
+            }
+            kept.gathers = std::move(gathers);
+            kept.owned   = std::move(owned);
+            kept.ctx     = std::move(ctx_steps);
+        }
+        for (auto & bcj : backend_configs) {
+            bcj.cgraphs.clear();
+            bcj.nodes.clear();
+        }
+        gathers.clear();
+        owned.clear();
+        ctx_steps.reset();
+        uid         = 0;
+        n_nodes     = 0;
+        n_subgraphs = 0;
+    }
+
+    // Takes the steps kept for a cgraph back into use. False when none are kept for it.
+    bool steps_take(uint64_t uid_cgraph, int n_nodes_cgraph) {
+        const auto it = uid_cgraph != 0 ? steps_kept.find(uid_cgraph) : steps_kept.end();
+        if (it == steps_kept.end()) {
+            return false;
+        }
+        kept_steps & kept = it->second;
+        const bool same = kept.n_nodes == n_nodes_cgraph;
+        if (same) {
+            for (size_t j = 0; j < backend_configs.size(); j++) {
+                backend_configs[j].cgraphs = std::move(kept.cgraphs[j]);
+                backend_configs[j].nodes   = std::move(kept.nodes[j]);
+            }
+            gathers     = std::move(kept.gathers);
+            owned       = std::move(kept.owned);
+            ctx_steps   = std::move(kept.ctx);
+            uid         = uid_cgraph;
+            n_nodes     = kept.n_nodes;
+            n_subgraphs = kept.n_subgraphs;
+        }
+        steps_kept.erase(it);
+        return same;
     }
 
     // Launches a replay on every device. The calling thread launches the devices in turn; at the start of each replay it
@@ -3366,27 +3449,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
-
-    bool max_nnodes_raised = false;
-    if (cgraph->n_nodes > backend_ctx->max_nnodes) {
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            bcj.nodes.resize(cgraph->n_nodes);
-            bcj.cgraphs.resize(cgraph->n_nodes);
+    // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend, and so
+    // can a cgraph evaluated before it whose steps were kept: the ones in use are set aside for theirs (kept_steps).
+    bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    if (needs_rebuild) {
+        backend_ctx->steps_put();
+        needs_rebuild = !backend_ctx->steps_take(cgraph->uid, cgraph->n_nodes);
+        if (backend_ctx->trace_graphs) {
+            GGML_LOG_INFO("graph_trace layer=meta event=steps context=%p uid=%llu source=%s nodes=%d kept=%zu\n",
+                (void *) backend_ctx, (unsigned long long) cgraph->uid, needs_rebuild ? "built" : "kept", cgraph->n_nodes,
+                backend_ctx->steps_kept.size());
         }
-        backend_ctx->max_nnodes = cgraph->n_nodes;
-        max_nnodes_raised = true;
-        assert(needs_rebuild);
     }
 
     if (needs_rebuild) {
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
+        std::vector<int> offsets; // each subgraph's first node
 
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            bcj.nodes.assign(cgraph->n_nodes, nullptr);
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -3658,10 +3741,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 i = i_delayed;
                 backend_ctx->owned.push_back(gather || i + 1 == cgraph->n_nodes ? owned_layout{} : get_owned(i));
 
-                for (size_t j = 0; j < n_backends; j++) {
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    bcj.cgraphs[n_subgraphs].offset = i_start;
-                }
+                offsets.push_back(i_start);
                 n_subgraphs++;
                 i_start = i + 1;
             }
@@ -3669,6 +3749,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         backend_ctx->uid         = cgraph->uid;
+        backend_ctx->n_nodes     = cgraph->n_nodes;
         backend_ctx->n_subgraphs = n_subgraphs;
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
@@ -3681,27 +3762,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->max_tmp_size = max_tmp_size;
         }
 
-        if (max_nnodes_raised || n_subgraphs > backend_ctx->max_subgraphs) {
-            backend_ctx->max_subgraphs = std::max(backend_ctx->max_subgraphs, n_subgraphs);
+        // the scratch of the reductions and gathers between the steps, for the most steps a cgraph has had
+        if (n_subgraphs > backend_ctx->max_subgraphs) {
+            backend_ctx->max_subgraphs = n_subgraphs;
             // tmp + ADD (+zeroing) graph per step and device; the generic gather: tmp, two views and a CPY graph per peer
             const size_t n_nodes_per_device = std::max(3 * backend_ctx->n_reduce_steps, 4 * (n_backends - 1));
             const size_t n_cgraphs_per_device = std::max(2 * backend_ctx->n_reduce_steps, n_backends - 1); // ADD ( + zeroing) graph per step and device
-            const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
             const ggml_init_params params = {
-                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
+                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_aux + mem_per_device_nodes_aux),
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
             backend_ctx->ctx.reset(ggml_init(params));
-            // Recreate the retained capacity: later graphs may grow on either axis without raising its maximum.
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                for (size_t i = 0; i < backend_ctx->max_subgraphs; i++) {
-                    bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), backend_ctx->max_nnodes, /*grads =*/ false);
-                }
-            }
             backend_ctx->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*backend_ctx->max_subgraphs);
             for (size_t k = 0; k < backend_ctx->cgraphs_aux.size(); k++) {
                 backend_ctx->cgraphs_aux[k] = ggml_new_graph_custom(backend_ctx->ctx.get(), 1, cgraph->grads);
@@ -3712,14 +3786,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // each device's cgraph of each step, the size of the step: they stay with the steps when another cgraph's are
+        // taken into use (steps_put)
+        size_t mem_per_device_graphs_main = 0;
+        for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
+            const size_t i_node_stop = i_graph + 1 < n_subgraphs ? offsets[i_graph + 1] : cgraph->n_nodes;
+            mem_per_device_graphs_main += ggml_graph_overhead_custom(i_node_stop - offsets[i_graph], /*grads =*/ false);
+        }
+        backend_ctx->ctx_steps.reset(n_subgraphs > 0 ? ggml_init({n_backends*mem_per_device_graphs_main, nullptr, true}) : nullptr);
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            bcj.cgraphs.assign(n_subgraphs, {});
             for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
-                ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
-                const size_t i_node_start = bcj.cgraphs[i_graph].offset;
-                const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
+                const size_t i_node_start = offsets[i_graph];
+                const size_t i_node_stop = i_graph + 1 < n_subgraphs ? offsets[i_graph + 1] : cgraph->n_nodes;
+                ggml_cgraph * cgraph_ij = ggml_new_graph_custom(backend_ctx->ctx_steps.get(), i_node_stop - i_node_start, /*grads =*/ false);
+                bcj.cgraphs[i_graph].cgraph_main = cgraph_ij;
+                bcj.cgraphs[i_graph].offset      = (int) i_node_start;
                 cgraph_ij->n_nodes = i_node_stop - i_node_start;
-                ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
                     ggml_tensor * node_ij = bcj.nodes[i_node];
                     cgraph_ij->nodes[i_node - i_node_start] = node_ij;

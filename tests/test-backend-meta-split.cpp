@@ -33,6 +33,8 @@ static std::atomic<int> captured {0};
 static unsigned long long expert_hits = 0;
 static unsigned long long reductions_to_owners = 0; // the internal AllReduce's, logged when its pipeline is freed
 static unsigned long long reductions_to_all = 0;
+static int steps_built = 0; // the meta backend made a cgraph's steps (graph_trace layer=meta event=steps)
+static int steps_kept = 0;  // it took back the steps it kept for the cgraph
 static ggml_backend_dev_t peer = nullptr;
 static std::array<ggml_backend_dev_t, 4> host_devices = {};
 
@@ -52,6 +54,10 @@ static void set_env(const char * name, const char * value) {
 
 static void log_cb(ggml_log_level level, const char * text, void *) {
     if (strstr(text, "ggml_backend_cuda_capture_end") && strstr(text, " nodes, ")) { ++captured; }
+    if (strstr(text, "layer=meta event=steps")) {
+        ++(strstr(text, "source=kept") ? steps_kept : steps_built);
+        return;
+    }
     int device, first;
     unsigned long long total;
     if (sscanf(text, "dp_experts device=%d first=%d total=%llu", &device, &first, &total) == 3) { expert_hits += total; }
@@ -342,6 +348,128 @@ static bool test_split_cache(ggml_backend_dev_t device, bool cycle = false) {
     ggml_backend_buffer_free(leaf_buffer);
     ggml_free(leaves);
     ggml_backend_free(backend);
+    return ok;
+}
+
+static ggml_backend_meta_split_state split_ffn(const ggml_tensor * tensor, void * /*userdata*/) {
+    // up: [n_embd, n_ff], its rows; down: [n_ff, n_embd], its columns: a quarter on the first device
+    if (strcmp(tensor->name, "up") == 0) {
+        return {GGML_BACKEND_SPLIT_AXIS_1, {tensor->ne[1]/4, tensor->ne[1] - tensor->ne[1]/4}, {1}, 1};
+    }
+    if (strcmp(tensor->name, "down") == 0) {
+        return {GGML_BACKEND_SPLIT_AXIS_0, {tensor->ne[0]/4, tensor->ne[0] - tensor->ne[0]/4}, {1}, 1};
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// The meta backend keeps the steps it made for a cgraph while it evaluates others (kept_steps), as a context does that
+// evaluates its retained graphs in turn. Four graphs, two layers of x = x + down(up(x)) on 1 to 4 columns with the up
+// rows and the down columns cut over two devices, each allocated once by a scheduler of its own, are evaluated in the
+// order A B A B C D A B A with a new x each time, and each output is compared with the host's arithmetic. The backend
+// keeps two sets beside the one in use (GGML_META_CAPTURE_GRAPHS=2) and its trace says where each evaluation's steps
+// came from: A and B are made once and taken back once each, C and D push them out, so A and B are made again and A
+// taken back, 6 made and 3 taken back; with GGML_META_STEPS_KEEP_LEGACY=1 all 9 are made. On devices that capture a
+// cgraph's evaluation the captured ones no longer reach the steps, and only the outputs are checked.
+static bool test_steps_kept(ggml_backend_dev_t device, bool legacy, bool count) {
+    set_env("GGML_GRAPH_TRACE", "1");
+    set_env("GGML_META_CAPTURE_GRAPHS", "2");
+    set_env("GGML_META_STEPS_KEEP_LEGACY", legacy ? "1" : nullptr);
+    ggml_backend_dev_t devs[] = {device, second_device(device)};
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devs, 2, split_ffn, nullptr);
+    ggml_backend_t meta = ggml_backend_dev_init(meta_dev, nullptr);
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    for (const char * name : {"GGML_GRAPH_TRACE", "GGML_META_CAPTURE_GRAPHS", "GGML_META_STEPS_KEEP_LEGACY"}) { set_env(name, nullptr); }
+
+    constexpr int64_t n_embd = 16, n_ff = 32;
+    constexpr int n_layer = 2;
+    ggml_context * weights = ggml_init({2*ggml_tensor_overhead(), nullptr, true});
+    ggml_tensor * up = ggml_new_tensor_2d(weights, GGML_TYPE_F32, n_embd, n_ff);
+    ggml_tensor * down = ggml_new_tensor_2d(weights, GGML_TYPE_F32, n_ff, n_embd);
+    ggml_set_name(up, "up");
+    ggml_set_name(down, "down");
+    ggml_backend_buffer_t weights_buf = ggml_backend_alloc_ctx_tensors_from_buft(weights, ggml_backend_dev_buffer_type(meta_dev));
+    GGML_ASSERT(weights_buf != nullptr);
+    ggml_backend_buffer_set_usage(weights_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<float> up_data(n_embd*n_ff), down_data(n_ff*n_embd);
+    for (size_t i = 0; i < up_data.size(); ++i) {
+        up_data[i]   = float(int(i % 13) - 6)/64;
+        down_data[i] = float(int(i % 11) - 5)/64;
+    }
+    ggml_backend_tensor_set(up, up_data.data(), 0, ggml_nbytes(up));
+    ggml_backend_tensor_set(down, down_data.data(), 0, ggml_nbytes(down));
+
+    struct ffn { ggml_context * ctx; ggml_cgraph * gf; ggml_tensor * x; ggml_tensor * out; ggml_backend_sched_t sched; };
+    std::vector<ffn> graphs;
+    ggml_backend_t backends[2] = {meta, cpu};
+    for (int64_t n_tok : {1, 2, 3, 4}) {
+        ffn g;
+        g.ctx = ggml_init({(3*n_layer + 2)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        g.x = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n_embd, n_tok);
+        ggml_set_input(g.x);
+        g.out = g.x;
+        for (int il = 0; il < n_layer; ++il) {
+            g.out = ggml_add(g.ctx, ggml_mul_mat(g.ctx, down, ggml_mul_mat(g.ctx, up, g.out)), g.out);
+        }
+        ggml_set_output(g.out);
+        g.gf = ggml_new_graph(g.ctx);
+        ggml_build_forward_expand(g.gf, g.out);
+        g.sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(g.sched, g.gf));
+        graphs.push_back(g);
+    }
+
+    steps_built = steps_kept = 0;
+    bool ok = true;
+    int n_eval = 0;
+    for (int k : {0, 1, 0, 1, 2, 3, 0, 1, 0}) {
+        ffn & g = graphs[k];
+        std::vector<float> x(ggml_nelements(g.x)), out(x.size());
+        for (size_t i = 0; i < x.size(); ++i) { x[i] = float(int((i + 7*n_eval) % 17) - 8)/8; }
+        ggml_backend_tensor_set(g.x, x.data(), 0, ggml_nbytes(g.x));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(g.sched, g.gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(g.out, out.data(), 0, ggml_nbytes(g.out));
+        std::vector<double> ref(x.begin(), x.end());
+        for (int il = 0; il < n_layer; ++il) {
+            for (int64_t t = 0; t < g.x->ne[1]; ++t) {
+                double * col = ref.data() + t*n_embd;
+                double h[n_ff], y[n_embd];
+                for (int64_t j = 0; j < n_ff; ++j) {
+                    h[j] = 0;
+                    for (int64_t c = 0; c < n_embd; ++c) { h[j] += up_data[j*n_embd + c]*col[c]; }
+                }
+                for (int64_t i = 0; i < n_embd; ++i) {
+                    y[i] = col[i];
+                    for (int64_t j = 0; j < n_ff; ++j) { y[i] += down_data[i*n_ff + j]*h[j]; }
+                }
+                std::copy(y, y + n_embd, col);
+            }
+        }
+        double error = 0, norm = 0;
+        for (size_t i = 0; i < out.size(); ++i) {
+            error += (out[i] - ref[i])*(out[i] - ref[i]);
+            norm += ref[i]*ref[i];
+        }
+        const bool ok_eval = std::isfinite(error) && error < 1e-8*norm;
+        printf("%s steps kept%s: eval %d, graph %c, NMSE %.3g\n", ok_eval ? "ok  " : "FAIL", legacy ? " (legacy)" : "", ++n_eval,
+            'A' + k, norm ? error/norm : error);
+        ok = ok_eval && ok;
+    }
+    if (count) {
+        const int built = legacy ? 9 : 6, kept = legacy ? 0 : 3;
+        const bool ok_counts = steps_built == built && steps_kept == kept;
+        printf("%s steps kept%s: %d made and %d taken back (%d and %d expected)\n", ok_counts ? "ok  " : "FAIL",
+            legacy ? " (legacy)" : "", steps_built, steps_kept, built, kept);
+        ok = ok_counts && ok;
+    }
+
+    for (ffn & g : graphs) {
+        ggml_backend_sched_free(g.sched);
+        ggml_free(g.ctx);
+    }
+    ggml_backend_buffer_free(weights_buf);
+    ggml_free(weights);
+    ggml_backend_free(meta);
+    ggml_backend_free(cpu);
     return ok;
 }
 
@@ -1292,6 +1420,10 @@ int main(int argc, char ** argv) {
     if (argc == 2 && (strcmp(argv[1], "--split-cache-cpu") == 0 || strcmp(argv[1], "--split-cycle-cpu") == 0)) {
         return split_test_stack_limit() && test_split_cache(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), strcmp(argv[1], "--split-cycle-cpu") == 0) ? 0 : 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--steps-kept-cpu") == 0) {
+        gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        return test_steps_kept(gpu, false, true) && test_steps_kept(gpu, true, true) ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--permuted-read-cpu") == 0) {
         return test_permuted_reads(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
     }
@@ -1451,6 +1583,7 @@ int main(int argc, char ** argv) {
     }
     for (int64_t n_tokens : {1, 3}) { ok = test_tensor_mode(gpu, 0, n_tokens) && ok; }
     ok = test_tensor_mode(gpu, 1, 8) && ok;
+    ok = test_steps_kept(gpu, false, false) && test_steps_kept(gpu, true, false) && ok;
 
     printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
