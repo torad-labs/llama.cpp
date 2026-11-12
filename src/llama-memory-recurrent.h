@@ -57,7 +57,7 @@ public:
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there
-    bool find_slot(const llama_ubatch & ubatch);
+    bool find_slot(const llama_ubatch & ubatch, bool allow_relocate = true);
 
     bool get_can_shift() const override;
 
