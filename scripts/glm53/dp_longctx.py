@@ -317,9 +317,11 @@ class Server:
         prompt = self.post("/apply-template", {"messages": messages, "tools": tools})["prompt"]
         return len(self.post("/tokenize", {"content": prompt, "add_special": False})["tokens"])
 
-    def chat(self, messages, tools, max_tokens):
-        return self.post("/v1/chat/completions", {"messages": messages, "tools": tools, "max_tokens": max_tokens,
-                                                  "temperature": 0.0, "stream": False})
+    def chat(self, messages, tools, max_tokens, server_sampling=False):
+        body = {"messages": messages, "tools": tools, "max_tokens": max_tokens, "stream": False}
+        if not server_sampling:
+            body["temperature"] = 0.0
+        return self.post("/v1/chat/completions", body)
 
 
 def sample_memory(stop, samples, every):
@@ -343,7 +345,7 @@ def run_stream(server, number, files, args, record, log, start, clock_origin):
     log(f"{name}: history built, {size} tokens, {sum(1 for m in session if m['role'] == 'tool')} reads")
     for turn in range(1, args.turns + 1):
         started = time.monotonic()
-        response = server.chat(session, TOOLS, args.reply_tokens)
+        response = server.chat(session, TOOLS, args.reply_tokens, args.server_sampling)
         ended = time.monotonic()
         wall_ms = (ended - started) * 1000.0
         choice = response["choices"][0]["message"]
@@ -373,6 +375,9 @@ def main(argv=None):
     parser.add_argument("--streams", type=int, default=1)
     parser.add_argument("--turns", type=int, default=3)
     parser.add_argument("--reply-tokens", type=int, default=256)
+    parser.add_argument("--server-sampling", action="store_true",
+                        help="Send no sampling fields: the server's own sampling, what a client that sets none "
+                             "(Claude Code) is served with; without it every turn is sent at temperature 0")
     parser.add_argument("--memory-every", type=float, default=2.0, help="seconds between nvidia-smi samples")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=None,
