@@ -3,6 +3,7 @@
 #include "llama-context.h"
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-memory-recurrent.h"
 
 #include "ggml-backend.h"
 
@@ -67,12 +68,12 @@ void llama_state_async::submit(llama_seq_id seq_id, const std::vector<copy> & co
 
 bool llama_state_async::pending(llama_seq_id seq_id) {
     std::lock_guard<std::mutex> lock(mutex);
-    return seq_id < 0 ? !n_pending.empty() : n_pending.count(seq_id) > 0;
+    return seq_id == -1 ? !n_pending.empty() : n_pending.count(seq_id) > 0;
 }
 
 void llama_state_async::wait(llama_seq_id seq_id) {
     std::unique_lock<std::mutex> lock(mutex);
-    cv_done.wait(lock, [&]() { return seq_id < 0 ? n_pending.empty() : n_pending.count(seq_id) == 0; });
+    cv_done.wait(lock, [&]() { return seq_id == -1 ? n_pending.empty() : n_pending.count(seq_id) == 0; });
 }
 
 void llama_state_async::run() {
@@ -260,6 +261,61 @@ size_t llama_context::state_seq_set_data_async(llama_seq_id seq_id, const uint8_
     return 0;
 }
 
+size_t llama_context::state_seq_get_data_staged(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, int32_t & row) {
+    row = -1;
+
+    llama_memory_recurrent * mem = nullptr;
+    if (memory && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+        mem = memory->staged();
+    }
+    if (mem != nullptr) {
+        // an earlier copy of the sequence may still write the row that is read here
+        state_async_wait(seq_id);
+
+        const int64_t src = mem->stage_src(seq_id);
+        for (uint32_t k = 0; src >= 0 && k < mem->n_stage; ++k) {
+            if (!state_async_pending(llama_state_async::staged_key(k))) {
+                row = k;
+                break;
+            }
+        }
+        if (row >= 0) {
+            llama_io_write_listed io(dst, size);
+            try {
+                std::vector<ggml_tensor *> states;
+                std::vector<ggml_tensor *> stages;
+                mem->stage_tensors(row, states, stages);
+                rs_stage(states, stages, (int32_t) src, row);
+                // the thread that copies reads the spare row by calls of its own, which do not wait for this
+                // thread's: the copy to the spare row is done before it starts
+                synchronize();
+
+                io.write(&io_magic, sizeof(io_magic));
+                io.write(&seq_id,   sizeof(seq_id));
+
+                mem->state_write_staged(io, seq_id, row);
+            } catch (const std::exception & err) {
+                LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+                row = -1;
+                return 0;
+            }
+
+            if (!state_async) {
+                state_async = std::make_unique<llama_state_async>();
+            }
+            state_async->submit(llama_state_async::staged_key(row), io.copies, /*to_device =*/ false);
+            return io.n_bytes();
+        }
+    }
+
+    return state_seq_get_data(seq_id, dst, size, flags);
+}
+
+uint32_t llama_context::state_staged_rows() const {
+    llama_memory_recurrent * mem = memory ? memory->staged() : nullptr;
+    return mem != nullptr ? mem->n_stage : 0;
+}
+
 bool llama_context::state_async_pending(llama_seq_id seq_id) const {
     return state_async && state_async->pending(seq_id);
 }
@@ -305,6 +361,33 @@ size_t llama_state_seq_set_data_async(llama_context * ctx, const uint8_t * src, 
     ctx->synchronize();
 
     return ctx->state_seq_set_data_async(dest_seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_data_staged(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t * row) {
+    ctx->synchronize();
+
+    int32_t taken = -1;
+    const size_t res = ctx->state_seq_get_data_staged(seq_id, dst, size, flags, taken);
+    if (row != nullptr) {
+        *row = taken;
+    } else if (taken >= 0) {
+        ctx->state_async_wait(llama_state_async::staged_key(taken));
+    }
+    return res;
+}
+
+uint32_t llama_state_staged_rows(const llama_context * ctx) {
+    return ctx->state_staged_rows();
+}
+
+bool llama_state_staged_pending(const llama_context * ctx, int32_t row) {
+    return row >= 0 && ctx->state_async_pending(llama_state_async::staged_key(row));
+}
+
+void llama_state_staged_wait(const llama_context * ctx, int32_t row) {
+    if (row >= 0) {
+        ctx->state_async_wait(llama_state_async::staged_key(row));
+    }
 }
 
 bool llama_state_seq_async_pending(const llama_context * ctx, llama_seq_id seq_id) {

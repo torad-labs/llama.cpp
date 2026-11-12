@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -46,6 +47,14 @@ llama_memory_recurrent::llama_memory_recurrent(
     cells.clear();
     cells.resize(mem_size);
 
+    // spare rows (n_stage in the header): rs_stage moves a row through an f32 tensor, as rs_relocate does
+    if (const char * value = getenv("LLAMA_RS_STAGE_ROWS"); value != nullptr && n_seq_devices == 1 &&
+            type_r == GGML_TYPE_F32 && type_s == GGML_TYPE_F32) {
+        n_stage = (uint32_t) std::clamp(atoi(value), 0, 64);
+    }
+    r_stage.assign(n_stage, std::vector<ggml_tensor *>(n_layer, nullptr));
+    s_stage.assign(n_stage, std::vector<ggml_tensor *>(n_layer, nullptr));
+
     // Independent layer arenas keep every state's current rows and rollback
     // planes reachable by an access-policy window. They retain the canonical
     // row layout used by tensor splitting, gather, restore and serialization.
@@ -67,7 +76,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u + 2u*n_stage)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -129,6 +138,22 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
         r_l[i] = r;
         s_l[i] = s;
+
+        for (uint32_t k = 0; k < n_stage; ++k) {
+            // named as the state it holds a row of: a tensor is split over the devices by its name
+            // (llama_meta_device_get_split_state), and a spare row has to lie on them as the state's rows do
+            r_stage[k][i] = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), 1);
+            s_stage[k][i] = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), 1);
+            ggml_format_name(r_stage[k][i], "cache_r_l%d", i);
+            ggml_format_name(s_stage[k][i], "cache_s_l%d", i);
+        }
+    }
+
+    // a memory none of whose layers is recurrent (an MTP head's) has no row to copy
+    if (std::all_of(r_l.begin(), r_l.end(), [](const ggml_tensor * tensor) { return tensor == nullptr; })) {
+        n_stage = 0;
+        r_stage.clear();
+        s_stage.clear();
     }
 
     if (state_arena) {
@@ -162,6 +187,17 @@ llama_memory_recurrent::llama_memory_recurrent(
                 (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
+    }
+
+    if (n_stage > 0) {
+        size_t row_bytes = 0;
+        for (const auto & layers : {r_stage[0], s_stage[0]}) {
+            for (const ggml_tensor * tensor : layers) {
+                row_bytes += tensor != nullptr ? ggml_nbytes(tensor) : 0;
+            }
+        }
+        LLAMA_LOG_INFO("%s: %u spare rows for staged state copies (LLAMA_RS_STAGE_ROWS), %.3f MiB each\n", __func__,
+                n_stage, (float) row_bytes / (1024.0f * 1024.0f));
     }
 }
 
@@ -1069,6 +1105,76 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     state_write_meta(io, cell_ranges, seq_id);
     state_write_data(io, cell_ranges_data);
+}
+
+int64_t llama_memory_recurrent::stage_src(llama_seq_id seq_id) const {
+    if (n_stage == 0 || seq_id < 0 || (size_t) seq_id >= cells.size() || (size_t) seq_id >= rs_idx.size()) {
+        return -1;
+    }
+    const int32_t tail = cells[seq_id].tail;
+    if (tail < 0 || cells[tail].seq_id.size() != 1 || !cells[tail].has_seq_id(seq_id)) {
+        return -1;
+    }
+    // the row state_write reads for the cell
+    return state_row(cells[tail].src >= 0 ? cells[tail].src : tail, n_rs_seq != 0 ? rs_idx[seq_id] : 0);
+}
+
+void llama_memory_recurrent::stage_tensors(uint32_t row, std::vector<ggml_tensor *> & states, std::vector<ggml_tensor *> & stages) const {
+    GGML_ASSERT(row < n_stage);
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        if (r_l[il] != nullptr) {
+            states.push_back(r_l[il]);
+            stages.push_back(r_stage[row][il]);
+        }
+    }
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        if (s_l[il] != nullptr) {
+            states.push_back(s_l[il]);
+            stages.push_back(s_stage[row][il]);
+        }
+    }
+}
+
+void llama_memory_recurrent::state_write_staged(llama_io_write_i & io, llama_seq_id seq_id, uint32_t row) const {
+    GGML_ASSERT(row < n_stage && stage_src(seq_id) >= 0);
+
+    // as state_write for the sequence's one cell
+    const uint32_t cell       = cells[seq_id].tail;
+    const uint32_t cell_count = 1;
+
+    io.write(&cell_count, sizeof(cell_count));
+
+    state_write_meta(io, {{cell, cell + 1}}, seq_id);
+
+    // as state_write_data, each tensor's row read from the spare row: these stay where they are, so a writer that
+    // copies its tensors later may (write_tensor, not write_tensor_now)
+    const uint32_t s_trans = 0;
+    const uint32_t n_layer = hparams.n_layer();
+
+    io.write(&s_trans, sizeof(s_trans));
+    io.write(&n_layer, sizeof(n_layer));
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il] == nullptr) continue;
+
+        const int32_t  r_type_i   = (int32_t) r_l[il]->type;
+        const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+
+        io.write(&r_type_i,   sizeof(r_type_i));
+        io.write(&r_size_row, sizeof(r_size_row));
+        io.write_tensor(r_stage[row][il], 0, r_size_row);
+    }
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (s_l[il] == nullptr) continue;
+
+        const int32_t  s_type_i   = (int32_t) s_l[il]->type;
+        const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+
+        io.write(&s_type_i,   sizeof(s_type_i));
+        io.write(&s_size_row, sizeof(s_size_row));
+        io.write_tensor(s_stage[row][il], 0, s_size_row);
+    }
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {

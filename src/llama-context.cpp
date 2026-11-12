@@ -1206,6 +1206,54 @@ void llama_context::rs_relocate(const std::vector<ggml_tensor *> & states, const
     }
 }
 
+void llama_context::rs_stage(const std::vector<ggml_tensor *> & states, const std::vector<ggml_tensor *> & stages, int32_t src, uint32_t stage_row) {
+    GGML_ASSERT(states.size() == stages.size() && !states.empty());
+
+    // as rs_relocate: a row is read through an index into a tensor of the graph's and written through another, here
+    // into the spare tensor's one row
+    auto & graph = rs_stage_graphs[stage_row];
+    if (!graph.gf) {
+        const size_t n_nodes = 4*states.size() + 8;
+        const ggml_init_params params = {
+            /*.mem_size   =*/ n_nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(n_nodes, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        graph.ctx.reset(ggml_init(params));
+        ggml_context * ctx0 = graph.ctx.get();
+        graph.gf  = ggml_new_graph_custom(ctx0, n_nodes, false);
+        graph.src = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        graph.dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, 1);
+        ggml_set_input(graph.src);
+        ggml_set_input(graph.dst);
+        ggml_set_name(graph.src, "rs_stage_src");
+        ggml_set_name(graph.dst, "rs_stage_dst");
+        for (size_t i = 0; i < states.size(); ++i) {
+            GGML_ASSERT(stages[i] != nullptr && stages[i]->ne[0] == states[i]->ne[0] && stages[i]->ne[1] == 1);
+            ggml_tensor * row = ggml_get_rows(ctx0, states[i], graph.src);
+            ggml_build_forward_expand(graph.gf, ggml_set_rows(ctx0, stages[i], row, graph.dst));
+        }
+        graph.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                n_nodes, false, cparams.op_offload));
+        if (!ggml_backend_sched_alloc_graph(graph.sched.get(), graph.gf)) {
+            throw std::runtime_error("failed to allocate the recurrent state staging graph");
+        }
+    }
+    const int64_t dst = 0;
+    ggml_backend_tensor_set(graph.src, &src, 0, sizeof(src));
+    ggml_backend_tensor_set(graph.dst, &dst, 0, sizeof(dst));
+    outputs_pending = true;
+    const ggml_status status = ggml_backend_sched_graph_compute_async(graph.sched.get(), graph.gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("failed to compute the recurrent state staging graph");
+    }
+    static const bool trace = ggml_env_switch("GGML_GRAPH_TRACE");
+    if (trace) {
+        LLAMA_LOG_INFO("graph_trace layer=llama event=rs_stage context=%p src=%d stage=%u states=%zu\n",
+            (void *) this, src, stage_row, states.size());
+    }
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;

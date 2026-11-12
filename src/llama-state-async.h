@@ -32,9 +32,12 @@ public:
     // A copy with no list of device copies (ggml_backend_meta_tensor_ranges) is made here, on the caller's thread.
     void submit(llama_seq_id seq_id, const std::vector<copy> & copies, bool to_device);
 
-    // seq_id < 0: any sequence
+    // seq_id == -1: any copy. A copy from spare rows no sequence holds (llama_context::state_seq_get_data_staged) has a
+    // key of its own under -1, staged_key(), so a decode of the sequence does not wait for it.
     bool pending(llama_seq_id seq_id);
     void wait(llama_seq_id seq_id);
+
+    static llama_seq_id staged_key(int32_t row) { return -2 - row; }
 
 private:
     struct job {

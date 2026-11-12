@@ -391,8 +391,21 @@ struct server_slot {
     // the server's buffers for context checkpoints; null: the slot keeps the spare above, as before there was a pool
     checkpoint_buffers * ckpt_buffers = nullptr;
 
+    // the spare rows of the context from which a thread still copies checkpoints of this slot (create_checkpoint with
+    // LLAMA_RS_STAGE_ROWS). A checkpoint's bytes are not read, copied or freed before checkpoints_wait(): whatever
+    // restores a checkpoint, clones or clears the prompt, or drops a checkpoint calls it first
+    mutable std::vector<int32_t> ckpt_staged;
+
+    void checkpoints_wait() const {
+        for (const int32_t row : ckpt_staged) {
+            llama_state_staged_wait(ctx_tgt, row);
+        }
+        ckpt_staged.clear();
+    }
+
     // before a checkpoint is dropped: its buffers go to the server's pool, or become the slot's spare unless it has one
     void checkpoint_spare(common_prompt_checkpoint & ckpt) {
+        checkpoints_wait();
         if (checkpoint_spare_legacy()) {
             return;
         }
@@ -451,6 +464,7 @@ struct server_slot {
 
     server_prompt_cache_result prompt_save(server_prompt_cache & prompt_cache,
             const server_prompt_cache_state * protect = nullptr, bool allow_evict = true, bool async = false) const {
+        checkpoints_wait(); // the save copies the checkpoints
         const int64_t t_start = ggml_time_us();
         const auto res = prompt_cache.save(prompt, ctx_tgt, ctx_dft, spec, id, protect, allow_evict, async);
         if (res == server_prompt_cache_result::saved) {
@@ -461,6 +475,7 @@ struct server_slot {
 
     bool prompt_load(server_prompt_cache & prompt_cache, server_prompt_cache_state * selected, bool consume = true) {
         idle_cache_refusal = {};
+        checkpoints_wait(); // the load drops the prompt's checkpoints
         const int64_t t_start = ggml_time_us();
         const bool res = prompt_cache.load(prompt, selected, ctx_tgt, ctx_dft, spec, id, consume);
         t_restore_placed = ggml_time_us() - t_start;
@@ -498,6 +513,7 @@ struct server_slot {
 
     void prompt_clear() {
         idle_cache_refusal = {};
+        checkpoints_wait();
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
@@ -985,6 +1001,9 @@ struct server_slot {
 
         other.stats = stats;
 
+        // the clone copies this slot's checkpoints and drops the other's
+        checkpoints_wait();
+        other.checkpoints_wait();
         other.prompt = prompt.clone();
         other.init_sampler();
     }
@@ -1268,6 +1287,7 @@ private:
         }
 
         for (server_slot & slot : slots) {
+            slot.checkpoints_wait(); // while the context they are copied from is there
             slot.spec = nullptr; // the slots outlive it: sleeping destroys and load_model builds both again
         }
         spec.reset();
@@ -2252,6 +2272,7 @@ private:
                 // if lora has changed, check to see if the cache should be cleared
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
+                    slot.checkpoints_wait();
                     slot.prompt.clear();
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
@@ -3278,19 +3299,45 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // every slot waits while these copy the state to host memory: the line below says how long each took.
+        // LLAMA_RS_STAGE_ROWS=N: the target's state is copied to one of N spare rows on the devices and a thread of
+        // the context copies it to the checkpoint from there, while this slot and the others go on decoding
+        const int64_t t_start = ggml_time_us();
+        int32_t staged = -1;
+        if (llama_state_staged_rows(ctx_tgt) > 0) {
+            const size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.data_tgt.resize(size);
+            const size_t n = llama_state_seq_get_data_staged(ctx_tgt, cur.data_tgt.data(), size, slot.id,
+                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &staged);
+            if (n != size) {
+                GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", size, n);
+            }
+            if (staged >= 0) {
+                slot.ckpt_staged.push_back(staged);
+            }
+        } else {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        const int64_t t_tgt = ggml_time_us();
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_dft = ggml_time_us();
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        const int64_t t_spec = ggml_time_us();
 
         if (slot.ckpt_buffers) {
             slot.ckpt_buffers->made(cur.data_tgt.size(), cur.data_dft.size());
         }
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %s buffers)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %s buffers, "
+                "%.2f ms: target %.3f MiB %.2f%s, draft %.3f MiB %.2f, speculative %.2f)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, kept ? "kept" : "new");
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, kept ? "kept" : "new",
+                (t_spec - t_start) / 1000.0,
+                (float) cur.data_tgt.size() / 1024 / 1024, (t_tgt - t_start) / 1000.0, staged >= 0 ? " to a spare row" : "",
+                (float) cur.data_dft.size() / 1024 / 1024, (t_dft - t_tgt) / 1000.0,
+                (t_spec - t_dft) / 1000.0);
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3564,6 +3611,7 @@ private:
                             throw std::runtime_error("Invalid tokens in slot save file");
                         }
 
+                        slot->checkpoints_wait();
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
                     } catch (const std::exception & err) {
@@ -4005,6 +4053,7 @@ private:
 
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
+                    slot.checkpoints_wait();
                     slot.prompt.clear();
                     slot.prompt.tokens.insert(new_tokens);
                 }
@@ -4519,15 +4568,19 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
-                                        // restore the context checkpoint
+                                        // restore the context checkpoint: every slot waits while it is copied to the devices,
+                                        // and the line below says how long that took
+                                        slot.checkpoints_wait();
+                                        const int64_t t_restore = ggml_time_us();
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        const double ms_restore = (ggml_time_us() - t_restore) / 1000.0;
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB, %.2f ms)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024, ms_restore);
                                     }
 
                                     if (do_reset) {
