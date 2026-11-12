@@ -1340,6 +1340,8 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+struct ggml_cuda_graph_key;
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1363,6 +1365,14 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // The context's bookkeeping (ggml_backend_cuda_context::cuda_graph_account): its key in the context's map, whether
+    // it has an executable and the nodes that counts for, and its place among the graphs that have one, in order of
+    // last use. Kept by the context so that making room for an executable does not walk every graph it holds.
+    const ggml_cuda_graph_key * key = nullptr;
+    bool   held       = false;
+    size_t held_nodes = 0;
+    ggml_cuda_graph * lru_prev = nullptr;
+    ggml_cuda_graph * lru_next = nullptr;
     // What evaluating a node reads from one of its srcs, beyond the node itself: a captured graph is replayed only while
     // all of it is unchanged. A src that is a node of the same graph is also compared whole as that node; a leaf, or a
     // node of an earlier split, is compared only here.
@@ -2192,6 +2202,7 @@ struct ggml_backend_cuda_context {
                         GGML_LOG_INFO("graph_trace layer=cuda event=evict context=%p device=%d uid=%llu reason=idle nodes=%zu\n",
                             (void *) this, device, (unsigned long long) it->second->uid, it->second->num_nodes);
                     }
+                    cuda_graph_forget(it->second.get());
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -2202,13 +2213,19 @@ struct ggml_backend_cuda_context {
         auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
             it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
+            it->second->key = &it->first; // a node's key stays where it is until the node is erased
             if (graph_trace_enabled()) {
                 GGML_LOG_INFO("graph_trace layer=cuda event=miss context=%p device=%d key=%p ggml_nodes=%d entries=%zu\n",
                     (void *) this, device, key.first_node, key.n_nodes, cuda_graphs.size());
             }
         }
-        it->second->last_used_time = time_now;
-        return it->second.get();
+        ggml_cuda_graph * graph = it->second.get();
+        graph->last_used_time = time_now;
+        if (graph->held && graph != cuda_graph_lru_tail) {
+            cuda_graph_lru_unlink(graph);
+            cuda_graph_lru_push(graph);
+        }
+        return graph;
     }
 
     // The CUDA graph executables a context keeps. Each holds device memory beside the buffers the scheduler sizes, a few
@@ -2244,37 +2261,117 @@ struct ggml_backend_cuda_context {
         size_t nodes;
     };
 
+    // Whether an executable the caps evict is given to the graph being captured (ggml_cuda_graph_adopt) instead of
+    // destroyed. GGML_CUDA_GRAPH_RECYCLE_LEGACY=1: it is destroyed and every new graph's is instantiated, as before.
+    static bool cuda_graph_recycle() {
+        static const bool on = !ggml_env_switch("GGML_CUDA_GRAPH_RECYCLE_LEGACY");
+        return on;
+    }
+
+    // The executables held now and their nodes, and the graphs that have one from the least recently used to the most:
+    // kept as executables come and go (cuda_graph_account) and as graphs are used (cuda_graph). cuda_graph_make_room
+    // walked every graph of the context for both, twice when it evicted one: with 7,684 executables held a device
+    // (four RTX PRO 6000 S, Nov 11, 2026) making one took 2.9 to 3.2 ms where it took 0.97 with under 2,000 held.
+    cuda_graphs_held  cuda_graphs_held_now = { 0, 0 };
+    ggml_cuda_graph * cuda_graph_lru_head  = nullptr;
+    ggml_cuda_graph * cuda_graph_lru_tail  = nullptr;
+
+    void cuda_graph_lru_unlink(ggml_cuda_graph * graph) {
+        (graph->lru_prev ? graph->lru_prev->lru_next : cuda_graph_lru_head) = graph->lru_next;
+        (graph->lru_next ? graph->lru_next->lru_prev : cuda_graph_lru_tail) = graph->lru_prev;
+        graph->lru_prev = graph->lru_next = nullptr;
+    }
+    void cuda_graph_lru_push(ggml_cuda_graph * graph) { // the most recently used
+        graph->lru_prev = cuda_graph_lru_tail;
+        graph->lru_next = nullptr;
+        (cuda_graph_lru_tail ? cuda_graph_lru_tail->lru_next : cuda_graph_lru_head) = graph;
+        cuda_graph_lru_tail = graph;
+    }
+
+    // after `graph` got or lost its executable, or was captured again with one (its nodes may differ)
+    void cuda_graph_account(ggml_cuda_graph * graph) {
+        const bool held = graph->instance != nullptr;
+        if (graph->held) {
+            cuda_graphs_held_now.graphs--;
+            cuda_graphs_held_now.nodes -= graph->held_nodes;
+        }
+        if (graph->held && !held) {
+            cuda_graph_lru_unlink(graph);
+        } else if (!graph->held && held) {
+            cuda_graph_lru_push(graph);
+        }
+        graph->held       = held;
+        graph->held_nodes = held ? graph->num_nodes : 0;
+        if (held) {
+            cuda_graphs_held_now.graphs++;
+            cuda_graphs_held_now.nodes += graph->held_nodes;
+        }
+    }
+
+    // before `graph` leaves the map: out of the totals and the list
+    void cuda_graph_forget(ggml_cuda_graph * graph) {
+        if (graph->held) {
+            cuda_graphs_held_now.graphs--;
+            cuda_graphs_held_now.nodes -= graph->held_nodes;
+            cuda_graph_lru_unlink(graph);
+            graph->held       = false;
+            graph->held_nodes = 0;
+        }
+        graph->key = nullptr;
+    }
+
     // before `graph` gets an executable: evict the least recently used others until it fits under the caps (alone, it is
-    // kept whatever its nodes); returns what is held with it
-    cuda_graphs_held cuda_graph_make_room(const ggml_cuda_graph * graph) {
+    // kept whatever its nodes); returns what is held with it. With `donor`, one evicted graph whose capture has as many
+    // CUDA nodes as `graph`'s is handed over whole instead of destroyed: the least recently used of those, when it was
+    // last used within a second of the least recently used of all and is among the 256 after it, so it is of the
+    // evaluation the caps would take from anyway (a graph rebuilt elsewhere leaves a twin of every one of its
+    // executables, all last used together).
+    cuda_graphs_held cuda_graph_make_room(const ggml_cuda_graph * graph, std::unique_ptr<ggml_cuda_graph> * donor = nullptr) {
         const size_t max       = cuda_graphs_max();
         const size_t max_nodes = cuda_graph_nodes_max();
         if (!max && !max_nodes && !graph_mem_stats_enabled() && !graph_trace_enabled()) {
             return {0, 0};
         }
         for (;;) {
-            cuda_graphs_held held = { 1, graph->num_nodes };
-            auto             lru  = cuda_graphs.end();
-            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ++it) {
-                if (it->second->instance == nullptr || it->second.get() == graph) {
-                    continue;
-                }
-                held.graphs++;
-                held.nodes += it->second->num_nodes;
-                if (lru == cuda_graphs.end() || it->second->last_used_time < lru->second->last_used_time) {
-                    lru = it;
-                }
+            cuda_graphs_held held = cuda_graphs_held_now; // the others' executables, and this graph's to come
+            if (graph->held) {
+                held.graphs--;
+                held.nodes -= graph->held_nodes;
+            }
+            held.graphs++;
+            held.nodes += graph->num_nodes;
+            ggml_cuda_graph * lru = cuda_graph_lru_head;
+            if (lru == graph) {
+                lru = lru->lru_next;
             }
             const bool fits = (max == 0 || held.graphs <= max) && (max_nodes == 0 || held.nodes <= max_nodes);
-            if (fits || lru == cuda_graphs.end()) {
+            if (fits || lru == nullptr) {
                 return held;
+            }
+            bool give = false;
+            if (donor != nullptr && *donor == nullptr) {
+                int n = 0;
+                for (ggml_cuda_graph * alike = lru; alike != nullptr && n < 256 &&
+                        alike->last_used_time - lru->last_used_time <= 1'000'000; alike = alike->lru_next, ++n) {
+                    if (alike != graph && alike->num_nodes == graph->num_nodes) {
+                        lru  = alike;
+                        give = true;
+                        break;
+                    }
+                }
             }
             if (graph_trace_enabled()) {
                 GGML_LOG_INFO("graph_trace layer=cuda event=evict context=%p device=%d uid=%llu reason=%s nodes=%zu held_graphs=%zu held_nodes=%zu\n",
-                    (void *) this, device, (unsigned long long) lru->second->uid,
-                    max && held.graphs > max ? "count_cap" : "node_cap", lru->second->num_nodes, held.graphs, held.nodes);
+                    (void *) this, device, (unsigned long long) lru->uid,
+                    max && held.graphs > max ? "count_cap" : "node_cap", lru->num_nodes, held.graphs, held.nodes);
             }
-            cuda_graphs.erase(lru);
+            const auto it = cuda_graphs.find(*lru->key);
+            GGML_ASSERT(it != cuda_graphs.end() && it->second.get() == lru);
+            cuda_graph_forget(lru);
+            if (give) {
+                *donor = std::move(it->second);
+            }
+            cuda_graphs.erase(it);
         }
     }
 

@@ -4418,32 +4418,86 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-// create `graph`'s executable from its captured graph, first evicting what the caps need (cuda_graph_make_room); the
-// device memory that takes is measured (what the driver's pool grew by, if it did), and logged whenever what is held or
-// the most one took is the most on this context so far: at INFO when that is the most memory, or the nodes held reach a
-// power of two (a -sm tensor split's context holds hundreds of small graphs), at DEBUG otherwise
-static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
-    const bool mem_stats = cuda_ctx->graph_mem_stats_enabled();
-    const ggml_backend_cuda_context::cuda_graphs_held held = cuda_ctx->cuda_graph_make_room(graph);
-
-    size_t free_before = 0;
-    size_t free_after = 0;
-    size_t total = 0;
-    if (mem_stats) {
-        CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+// `graph`, just captured and with no executable, takes the one of `donor`, a graph the caps evicted whose capture has as
+// many CUDA nodes (cuda_graph_make_room), when the driver updates it to the capture: cudaGraphExecUpdate needs the same
+// topology, kernels of the same context and copies between the same devices, which a graph rebuilt in other memory or
+// for other rows keeps, and it leaves the executable as it was when it cannot. The executable keeps the graph it was
+// instantiated from, as one updated in place does. An update costs a fraction of an instantiation: on four RTX PRO 6000
+// S (Nov 11, 2026, graphs of some 36 nodes) a device thread updated an executable in place in 0.20 to 0.35 ms and
+// instantiated one in 0.97 with few held. False when the driver refuses: the donor's executable goes with it, and the
+// caller instantiates one.
+static bool ggml_cuda_graph_adopt(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, ggml_cuda_graph & donor) {
+    GGML_ASSERT(graph->instance == nullptr && donor.instance != nullptr);
+#if CUDART_VERSION >= 12000
+    cudaGraphExecUpdateResultInfo result_info;
+    const cudaError_t stat = cudaGraphExecUpdate(donor.instance, graph->graph, &result_info);
+#else
+    cudaGraphNode_t errorNode;
+    cudaGraphExecUpdateResult result_info;
+    const cudaError_t stat = cudaGraphExecUpdate(donor.instance, graph->graph, &errorNode, &result_info);
+#endif // CUDART_VERSION >= 12000
+    if (stat != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (cuda_ctx->graph_trace_enabled()) {
+            GGML_LOG_INFO("graph_trace layer=cuda event=recycle_failed context=%p device=%d uid=%llu from_uid=%llu nodes=%zu\n",
+                (void *) cuda_ctx, cuda_ctx->device, (unsigned long long) graph->uid, (unsigned long long) donor.uid,
+                graph->num_nodes);
+        }
+        return false;
     }
     if (graph->instance_source != nullptr && graph->instance_source != graph->graph) {
         CUDA_CHECK(cudaGraphDestroy(graph->instance_source));
     }
-    graph->instance_source = graph->graph;
-    CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-    if (cuda_ctx->graph_trace_enabled()) {
-        GGML_LOG_INFO("graph_trace layer=cuda event=instantiate context=%p device=%d uid=%llu nodes=%zu held_graphs=%zu held_nodes=%zu\n",
-            (void *) cuda_ctx, cuda_ctx->device, (unsigned long long) graph->uid, graph->num_nodes, held.graphs, held.nodes);
+    graph->instance        = donor.instance;
+    graph->instance_source = donor.instance_source;
+    if (donor.graph == donor.instance_source) {
+        donor.graph = nullptr; // the executable's source, which went with it
     }
-    if (mem_stats) {
-        CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+    donor.instance        = nullptr;
+    donor.instance_source = nullptr;
+    GGML_LOG_DEBUG("%s: CUDA graph executable recycled\n", __func__);
+    return true;
+}
+
+// create `graph`'s executable from its captured graph, first evicting what the caps need (cuda_graph_make_room), or
+// take one of those evicted when it can be updated to the capture (ggml_cuda_graph_adopt); the device memory an
+// instantiation takes is measured (what the driver's pool grew by, if it did), and logged whenever what is held or
+// the most one took is the most on this context so far: at INFO when that is the most memory, or the nodes held reach a
+// power of two (a -sm tensor split's context holds hundreds of small graphs), at DEBUG otherwise
+static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
+    const bool mem_stats = cuda_ctx->graph_mem_stats_enabled();
+    std::unique_ptr<ggml_cuda_graph> donor;
+    const ggml_backend_cuda_context::cuda_graphs_held held = cuda_ctx->cuda_graph_make_room(graph,
+            ggml_backend_cuda_context::cuda_graph_recycle() ? &donor : nullptr);
+    const bool recycled = donor != nullptr && ggml_cuda_graph_adopt(cuda_ctx, graph, *donor);
+    donor.reset(); // what is left of it: its capture, and its executable when the driver refused the update
+
+    size_t free_before = 0;
+    size_t free_after = 0;
+    size_t total = 0;
+    if (recycled) {
+        if (cuda_ctx->graph_trace_enabled()) {
+            GGML_LOG_INFO("graph_trace layer=cuda event=recycle context=%p device=%d uid=%llu nodes=%zu held_graphs=%zu held_nodes=%zu\n",
+                (void *) cuda_ctx, cuda_ctx->device, (unsigned long long) graph->uid, graph->num_nodes, held.graphs, held.nodes);
+        }
+    } else {
+        if (mem_stats) {
+            CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+        }
+        if (graph->instance_source != nullptr && graph->instance_source != graph->graph) {
+            CUDA_CHECK(cudaGraphDestroy(graph->instance_source));
+        }
+        graph->instance_source = graph->graph;
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        if (cuda_ctx->graph_trace_enabled()) {
+            GGML_LOG_INFO("graph_trace layer=cuda event=instantiate context=%p device=%d uid=%llu nodes=%zu held_graphs=%zu held_nodes=%zu\n",
+                (void *) cuda_ctx, cuda_ctx->device, (unsigned long long) graph->uid, graph->num_nodes, held.graphs, held.nodes);
+        }
+        if (mem_stats) {
+            CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+        }
     }
+    cuda_ctx->cuda_graph_account(graph);
     const size_t bytes = free_before > free_after ? free_before - free_after : 0;
     cuda_ctx->cuda_graph_bytes += bytes;
 
@@ -4495,6 +4549,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
+        cuda_ctx->cuda_graph_account(graph);
         ggml_cuda_graph_instantiate(cuda_ctx, graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
@@ -8047,11 +8102,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         const cudaGraph_t instance_source = graph->instance_source;
+        // An executable made for this capture just now, instantiated from it or recycled and updated to it
+        // (ggml_cuda_graph_adopt), has nothing to be updated to: only one kept from an earlier capture has.
+        bool made_now = false;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             ggml_cuda_graph_instantiate(cuda_ctx, graph);
+            made_now = ggml_backend_cuda_context::cuda_graph_recycle();
         }
-        if (cuda_graph_update_required) { // Update graph executable
+        if (cuda_graph_update_required && !made_now) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        }
+        if (cuda_graph_update_required) {
+            cuda_ctx->cuda_graph_account(graph); // a capture's nodes may differ from the one before
         }
         // The instantiation source is either still owned by the executable or was released
         // when a failed update replaced that executable. Only an intermediate capture is ours.
@@ -8174,6 +8236,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (graph->instance != nullptr) {
                     CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
                     graph->instance = nullptr;
+                    cuda_ctx->cuda_graph_account(graph);
                 }
                 use_cuda_graph             = false;
                 cuda_graph_update_required = false;
