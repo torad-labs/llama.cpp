@@ -451,6 +451,102 @@ static void ggml_vbuffer_reset(struct vbuffer * buf) {
     }
 }
 
+// buffers graph allocators share (ggml_gallocr_set_shared), a buffer of one chunk a buffer type. Used from one thread.
+
+#define GGML_GALLOCR_SHARED_MAX_BUFTS 16
+
+struct ggml_gallocr_shared {
+    ggml_backend_buffer_type_t bufts[GGML_GALLOCR_SHARED_MAX_BUFTS];
+    struct vbuffer * buffers[GGML_GALLOCR_SHARED_MAX_BUFTS]; // NULL until an allocator asks
+    size_t sizes[GGML_GALLOCR_SHARED_MAX_BUFTS];             // ggml_gallocr_shared_set_size
+    int n_users[GGML_GALLOCR_SHARED_MAX_BUFTS];              // the allocators whose graphs are placed in the buffer
+    int n_bufts;
+    int n_refs; // the allocators set to it, and its maker until ggml_gallocr_shared_free
+};
+
+ggml_gallocr_shared_t ggml_gallocr_shared_new(void) {
+    ggml_gallocr_shared_t shared = (ggml_gallocr_shared_t)calloc(1, sizeof(struct ggml_gallocr_shared));
+    GGML_ASSERT(shared != NULL);
+    shared->n_refs = 1;
+    return shared;
+}
+
+static void ggml_gallocr_shared_unref(ggml_gallocr_shared_t shared) {
+    if (shared == NULL || --shared->n_refs > 0) {
+        return;
+    }
+    for (int i = 0; i < shared->n_bufts; i++) {
+        ggml_vbuffer_free(shared->buffers[i]);
+    }
+    free(shared);
+}
+
+void ggml_gallocr_shared_free(ggml_gallocr_shared_t shared) {
+    ggml_gallocr_shared_unref(shared);
+}
+
+static int ggml_gallocr_shared_find(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft) {
+    for (int i = 0; i < shared->n_bufts; i++) {
+        if (shared->bufts[i] == buft) {
+            return i;
+        }
+    }
+    if (shared->n_bufts == GGML_GALLOCR_SHARED_MAX_BUFTS) {
+        return -1;
+    }
+    shared->bufts[shared->n_bufts] = buft;
+    return shared->n_bufts++;
+}
+
+void ggml_gallocr_shared_set_size(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft, size_t size) {
+    const int i = ggml_gallocr_shared_find(shared, buft);
+    GGML_ASSERT(i >= 0 && "too many buffer types share buffers");
+    shared->sizes[i] = size;
+}
+
+// the shared buffer of a buffer type, when a plan of one chunk of this size fits it; NULL otherwise. The allocator that
+// gets it gives it back with ggml_gallocr_shared_put.
+static struct vbuffer * ggml_gallocr_shared_get(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft, size_t size) {
+    const int i = ggml_gallocr_shared_find(shared, buft);
+    if (i < 0) {
+        return NULL;
+    }
+    if (shared->buffers[i] != NULL && shared->n_users[i] == 0 && ggml_vbuffer_chunk_size(shared->buffers[i], 0) < size) {
+        // no allocator has a graph in it: allocated again, larger
+        ggml_vbuffer_free(shared->buffers[i]);
+        shared->buffers[i] = NULL;
+    }
+    if (shared->buffers[i] == NULL) {
+        // the size set for the type, unless the type does not allocate that much at once
+        size_t alloc_size = size > shared->sizes[i] ? size : shared->sizes[i];
+        if (alloc_size > ggml_backend_buft_get_max_size(buft)) {
+            alloc_size = size;
+        }
+        struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
+        if (buf == NULL) {
+            return NULL;
+        }
+        buf->chunks[0] = ggml_backend_buft_alloc_buffer(buft, alloc_size);
+        if (buf->chunks[0] == NULL) {
+            free(buf);
+            return NULL;
+        }
+        ggml_backend_buffer_set_usage(buf->chunks[0], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        shared->buffers[i] = buf;
+    }
+    if (ggml_vbuffer_chunk_size(shared->buffers[i], 0) < size) {
+        return NULL;
+    }
+    shared->n_users[i]++;
+    return shared->buffers[i];
+}
+
+static void ggml_gallocr_shared_put(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft) {
+    const int i = ggml_gallocr_shared_find(shared, buft);
+    GGML_ASSERT(i >= 0 && shared->n_users[i] > 0);
+    shared->n_users[i]--;
+}
+
 
 /////////////////////////////////////
 
@@ -486,6 +582,9 @@ struct ggml_gallocr {
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
 
+    ggml_gallocr_shared_t shared; // ggml_gallocr_set_shared, or NULL
+    bool * buffer_shared;         // [n_buffers]: the buffer is the shared one, which the allocator does not free
+
     struct ggml_hash_set hash_set;
     struct hash_node * hash_values; // [hash_set.size]
 
@@ -508,6 +607,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
     GGML_ASSERT(galloc->buf_tallocs != NULL);
+
+    galloc->buffer_shared = calloc(n_bufs, sizeof(bool));
+    GGML_ASSERT(galloc->buffer_shared != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -536,10 +638,35 @@ ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
 }
 
+// the allocator stops using the shared buffers it holds (a buffer type used for several of its buffers holds one once)
+static void ggml_gallocr_shared_release(ggml_gallocr_t galloc) {
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (!galloc->buffer_shared[i]) {
+            continue;
+        }
+        bool held = false;
+        for (int j = 0; j < i; j++) {
+            held = held || galloc->buf_tallocs[j] == galloc->buf_tallocs[i];
+        }
+        if (!held) {
+            ggml_gallocr_shared_put(galloc->shared, galloc->bufts[i]);
+        }
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffer_shared[i]) {
+            galloc->buffers[i] = NULL;
+            galloc->buffer_shared[i] = false;
+        }
+    }
+}
+
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
     if (galloc == NULL) {
         return;
     }
+
+    // the shared buffers are the set's: the allocator frees its own
+    ggml_gallocr_shared_release(galloc);
 
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buffers != NULL) {
@@ -575,9 +702,28 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->bufts);
     free(galloc->buffers);
     free(galloc->buf_tallocs);
+    free(galloc->buffer_shared);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    ggml_gallocr_shared_unref(galloc->shared);
     free(galloc);
+}
+
+void ggml_gallocr_set_shared(ggml_gallocr_t galloc, ggml_gallocr_shared_t shared) {
+    if (galloc->shared == shared) {
+        return;
+    }
+    // a buffer of the set it leaves is given up: the next reserve places the plan again
+    ggml_gallocr_shared_release(galloc);
+    ggml_gallocr_shared_unref(galloc->shared);
+    galloc->shared = shared;
+    if (shared != NULL) {
+        shared->n_refs++;
+    }
+}
+
+bool ggml_gallocr_buffer_is_shared(ggml_gallocr_t galloc, int buffer_id) {
+    return buffer_id >= 0 && buffer_id < galloc->n_buffers && galloc->buffer_shared[buffer_id];
 }
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
@@ -911,6 +1057,7 @@ static bool ggml_gallocr_reserve_n_impl(
         for (int j = 0; j < i; j++) {
             if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
                 galloc->buffers[i] = galloc->buffers[j];
+                galloc->buffer_shared[i] = galloc->buffer_shared[j];
                 break;
             }
         }
@@ -941,13 +1088,26 @@ static bool ggml_gallocr_reserve_n_impl(
             for (int k = i + 1; k < galloc->n_buffers; k++) {
                 if (galloc->buffers[k] == galloc->buffers[i]) {
                     galloc->buffers[k] = NULL;
+                    galloc->buffer_shared[k] = false;
                 }
             }
-            ggml_vbuffer_free(galloc->buffers[i]);
-            if (no_alloc) {
-                galloc->buffers[i] = NULL;
+            // a shared buffer is its allocators': this one only stops using it
+            if (galloc->buffer_shared[i]) {
+                ggml_gallocr_shared_put(galloc->shared, galloc->bufts[i]);
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                ggml_vbuffer_free(galloc->buffers[i]);
+            }
+            galloc->buffers[i] = NULL;
+            galloc->buffer_shared[i] = false;
+            if (!no_alloc) {
+                // the shared buffer when the plan is one chunk that fits it, a buffer of the allocator's own otherwise
+                if (galloc->shared != NULL && galloc->buf_tallocs[i]->n_chunks == 1) {
+                    galloc->buffers[i] = ggml_gallocr_shared_get(galloc->shared, galloc->bufts[i], new_size);
+                    galloc->buffer_shared[i] = galloc->buffers[i] != NULL;
+                }
+                if (galloc->buffers[i] == NULL) {
+                    galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                }
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;

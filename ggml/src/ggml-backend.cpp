@@ -2269,6 +2269,19 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
+void ggml_backend_sched_set_shared_buffers(ggml_backend_sched_t sched, ggml_gallocr_shared_t shared) {
+    GGML_ASSERT(sched);
+    ggml_gallocr_set_shared(sched->galloc, shared);
+}
+
+bool ggml_backend_sched_buffer_is_shared(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    return ggml_gallocr_buffer_is_shared(sched->galloc, backend_index);
+}
+
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

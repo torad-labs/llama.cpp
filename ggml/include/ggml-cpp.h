@@ -23,8 +23,10 @@ typedef std::unique_ptr<gguf_context, gguf_context_deleter> gguf_context_ptr;
 // ggml-alloc
 
 struct ggml_gallocr_deleter { void operator()(ggml_gallocr_t galloc) { ggml_gallocr_free(galloc); } };
+struct ggml_gallocr_shared_deleter { void operator()(ggml_gallocr_shared_t shared) { ggml_gallocr_shared_free(shared); } };
 
 typedef std::unique_ptr<ggml_gallocr, ggml_gallocr_deleter> ggml_gallocr_ptr;
+typedef std::unique_ptr<ggml_gallocr_shared, ggml_gallocr_shared_deleter> ggml_gallocr_shared_ptr;
 
 // ggml-backend
 
