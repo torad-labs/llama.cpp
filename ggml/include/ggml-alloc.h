@@ -85,6 +85,8 @@ typedef struct ggml_gallocr_shared * ggml_gallocr_shared_t;
 GGML_API ggml_gallocr_shared_t ggml_gallocr_shared_new(void);
 GGML_API void                  ggml_gallocr_shared_free(ggml_gallocr_shared_t shared);
 GGML_API void                  ggml_gallocr_shared_set_size(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft, size_t size);
+// the size of a buffer type's shared buffer as allocated, 0 while no allocator asked for it
+GGML_API size_t                ggml_gallocr_shared_get_size(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft);
 // before the allocator's first reserve; shared may be NULL (the allocator's own buffers, the default)
 GGML_API void                  ggml_gallocr_set_shared(ggml_gallocr_t galloc, ggml_gallocr_shared_t shared);
 // true when the allocator's buffer is the shared one

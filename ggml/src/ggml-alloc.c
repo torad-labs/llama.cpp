@@ -504,8 +504,12 @@ void ggml_gallocr_shared_set_size(ggml_gallocr_shared_t shared, ggml_backend_buf
     shared->sizes[i] = size;
 }
 
-// the shared buffer of a buffer type, when a plan of one chunk of this size fits it; NULL otherwise. The allocator that
-// gets it gives it back with ggml_gallocr_shared_put.
+// what an allocator holds of the shared buffer of a buffer type, when a plan of one chunk of this size fits it; NULL
+// otherwise. The allocator that gets it gives it back with ggml_gallocr_shared_put. It holds the buffer itself, or for
+// a meta buffer type a buffer of its own over the shared one's memory: the meta backend keeps a record a buffer of the
+// tensors initialized in it (their simple tensors, their split states) and clears the states of the whole buffer when
+// a graph in it is built again, so with one record for all the allocators every graph that was built cleared the
+// states of all the others' graphs, each computed again at that graph's next use.
 static struct vbuffer * ggml_gallocr_shared_get(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft, size_t size) {
     const int i = ggml_gallocr_shared_find(shared, buft);
     if (i < 0) {
@@ -537,14 +541,33 @@ static struct vbuffer * ggml_gallocr_shared_get(ggml_gallocr_shared_t shared, gg
     if (ggml_vbuffer_chunk_size(shared->buffers[i], 0) < size) {
         return NULL;
     }
+    struct vbuffer * held = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
+    if (held == NULL) {
+        return NULL;
+    }
+    ggml_backend_buffer_t buffer = shared->buffers[i]->chunks[0];
+    held->chunks[0] = ggml_backend_buffer_is_meta(buffer) ? ggml_backend_meta_buffer_alias(buffer) : buffer;
     shared->n_users[i]++;
-    return shared->buffers[i];
+    return held;
 }
 
-static void ggml_gallocr_shared_put(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft) {
+static void ggml_gallocr_shared_put(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft, struct vbuffer * held) {
     const int i = ggml_gallocr_shared_find(shared, buft);
     GGML_ASSERT(i >= 0 && shared->n_users[i] > 0);
+    if (held->chunks[0] != shared->buffers[i]->chunks[0]) {
+        ggml_backend_buffer_free(held->chunks[0]); // the allocator's buffer over the shared memory
+    }
+    free(held);
     shared->n_users[i]--;
+}
+
+size_t ggml_gallocr_shared_get_size(ggml_gallocr_shared_t shared, ggml_backend_buffer_type_t buft) {
+    for (int i = 0; i < shared->n_bufts; i++) {
+        if (shared->bufts[i] == buft) {
+            return shared->buffers[i] ? ggml_vbuffer_size(shared->buffers[i]) : 0;
+        }
+    }
+    return 0;
 }
 
 
@@ -583,7 +606,7 @@ struct ggml_gallocr {
     int n_buffers;
 
     ggml_gallocr_shared_t shared; // ggml_gallocr_set_shared, or NULL
-    bool * buffer_shared;         // [n_buffers]: the buffer is the shared one, which the allocator does not free
+    bool * buffer_shared;         // [n_buffers]: the buffer is the shared one's memory, which the allocator does not free
 
     struct ggml_hash_set hash_set;
     struct hash_node * hash_values; // [hash_set.size]
@@ -649,7 +672,7 @@ static void ggml_gallocr_shared_release(ggml_gallocr_t galloc) {
             held = held || galloc->buf_tallocs[j] == galloc->buf_tallocs[i];
         }
         if (!held) {
-            ggml_gallocr_shared_put(galloc->shared, galloc->bufts[i]);
+            ggml_gallocr_shared_put(galloc->shared, galloc->bufts[i], galloc->buffers[i]);
         }
     }
     for (int i = 0; i < galloc->n_buffers; i++) {
@@ -1093,7 +1116,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
             // a shared buffer is its allocators': this one only stops using it
             if (galloc->buffer_shared[i]) {
-                ggml_gallocr_shared_put(galloc->shared, galloc->bufts[i]);
+                ggml_gallocr_shared_put(galloc->shared, galloc->bufts[i], galloc->buffers[i]);
             } else {
                 ggml_vbuffer_free(galloc->buffers[i]);
             }

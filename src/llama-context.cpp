@@ -4718,12 +4718,21 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].compute += backend_buf_exp_size[i];
         }
     } else {
+        // a scheduler's own buffers, and the shared buffers (graph_shared) once for all the schedulers that use them
+        std::set<ggml_backend_buffer_type_t> shared_bufts;
+        const auto add = [&](ggml_backend_sched_t s, ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+            if (!ggml_backend_sched_buffer_is_shared(s, backend)) {
+                ret[buft].compute += ggml_backend_sched_get_buffer_size(s, backend);
+            } else if (shared_bufts.insert(buft).second) {
+                ret[buft].compute += ggml_gallocr_shared_get_size(graph_shared.get(), buft);
+            }
+        };
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            add(sched.get(), backend, buft);
             for (const auto & slot : graph_slots) {
-                ret[buft].compute += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
+                add(slot.sched.get(), backend, buft);
             }
         }
     }
