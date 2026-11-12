@@ -958,7 +958,7 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
     return ok;
 }
 
-static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owner = false) {
+static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owner = false, bool padded = false) {
     ggml_backend_dev_t devs[] = {gpu, second_device(gpu), gpu, second_device(gpu)};
     ggml_backend_t meta = ggml_backend_dev_init(ggml_backend_meta_device(devs, 4, split_rows, nullptr), nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -988,6 +988,10 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owne
             return t;
         };
         ggml_tensor * out;
+        ggml_tensor * limit_input = nullptr;
+        ggml_tensor * index_input = nullptr;
+        ggml_tensor * mask_input = nullptr;
+        const auto live = [&](int64_t stream) { return single_owner ? 4 : 2*stream; };
         if (variant == 11) {
             const int64_t first[] = {0, 0, 0, 0};
             const int64_t one[] = {0, 0, 1, 0};
@@ -1050,12 +1054,21 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owne
             const int64_t cells = variant == 1 ? 256 : 64;
             const int64_t heads = variant == 1 ? 8 : variant == 2 ? 32 : 2;
             ggml_tensor * q = input(GGML_TYPE_F32, variant == 2 ? std::array<int64_t, 4>{width, heads, 3, 4} : std::array<int64_t, 4>{width, 3, heads, 4}, 3);
-            ggml_tensor * k = input(GGML_TYPE_F16, variant == 2 ? std::array<int64_t, 4>{width, 1, cells, 4} : std::array<int64_t, 4>{width, cells, 1, 4}, 3);
+            ggml_tensor * k = input(padded ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, variant == 2 ? std::array<int64_t, 4>{width, 1, cells, 4} : std::array<int64_t, 4>{width, cells, 1, 4}, 3);
             if (variant == 2) {
                 ggml_tensor * w = input(GGML_TYPE_F32, {heads, 3, 1, 4}, 3);
                 ggml_tensor * mask = input(GGML_TYPE_F16, {8, 3, 1, 4}, 3);
+                if (padded) { mask_input = inputs.back(); }
                 ggml_tensor * rows = input(GGML_TYPE_I32, {8, 4, 1, 1}, 1);
+                if (padded) { index_input = inputs.back(); }
                 out = ggml_lightning_indexer_rows(ctx, q, k, rows, w, mask);
+                if (padded) {
+                    auto * limits = input(GGML_TYPE_I32, {7, 3, 4, 1}, 2);
+                    limit_input = inputs.back();
+                    ggml_lightning_indexer_set_q8_query(out);
+                    ggml_lightning_indexer_set_kpool_padding(out, limits);
+                    outputs.push_back(ggml_cast(ctx, limits, GGML_TYPE_F32));
+                }
             } else {
                 ggml_tensor * v = input(GGML_TYPE_F16, {width, cells, 1, 4}, 3);
                 if (variant == 1) {
@@ -1074,8 +1087,22 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owne
         ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
         for (auto t : inputs) {
+            if (t == limit_input || t == index_input) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    if (t == limit_input) {
+                        for (int64_t row = 0; row < 3; ++row) { data[7*(s*3 + row) + 5] = live(s); }
+                    } else {
+                        for (int64_t p = 0; p < live(s); ++p) { data[s*8 + p] = 7*p + s; }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                continue;
+            }
             std::vector<float> f32(ggml_nelements(t));
-            for (size_t i = 0; i < f32.size(); ++i) { f32[i] = float(int(i % 23) - 11)/32; }
+            for (size_t i = 0; i < f32.size(); ++i) {
+                f32[i] = t == mask_input ? (int64_t(i%8) < live(i/24) ? 0.0f : -INFINITY) : float(int(i % 23) - 11)/32;
+            }
             if (t->type == GGML_TYPE_F32) {
                 ggml_backend_tensor_set(t, f32.data(), 0, ggml_nbytes(t));
             } else if (t->type == GGML_TYPE_F16) {
@@ -1112,7 +1139,7 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owne
     }
     const bool ok = variant == 4 ? results[0] == results[1] : std::isfinite(error) && error < 1e-6*norm;
     const char * names[] = {"attention", "sparse attention", "indexer", "hyper-connections", "k-pool mask", "KDA final state", "KDA snapshots", "RoPE", "SSM convolution", "batched projection", "batched cache gather", "Q8 aliased attention"};
-    printf("%s owned %s%s, NMSE %.9g\n", ok ? "ok  " : "FAIL", names[variant], single_owner ? " (single owner)" : "", norm ? error/norm : error);
+    printf("%s owned %s%s%s, NMSE %.9g\n", ok ? "ok  " : "FAIL", names[variant], single_owner ? " (single owner)" : "", padded ? " (padded)" : "", norm ? error/norm : error);
     ggml_backend_free(meta);
     ggml_backend_free(cpu);
     return ok;
@@ -1441,6 +1468,10 @@ int main(int argc, char ** argv) {
         return test_stream_view(gpu, GGML_TYPE_F32) && test_stream_view(gpu, GGML_TYPE_Q8_0) &&
                test_stream_view(gpu, GGML_TYPE_F32, true) && test_stream_view(gpu, GGML_TYPE_Q8_0, true) ? 0 : 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--padded-indexer-cpu") == 0) {
+        gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        return test_owned_ops(gpu, 2, false, true) && test_owned_ops(gpu, 2, true, true) ? 0 : 1;
+    }
     if (argc == 3 && strcmp(argv[1], "--owned-op-cpu") == 0) {
         return test_owned_ops(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), atoi(argv[2])) ? 0 : 1;
     }
@@ -1455,6 +1486,7 @@ int main(int argc, char ** argv) {
             ok = test_owned_ops(gpu, variant) && ok;
             ok = test_owned_ops(gpu, variant, true) && ok;
         }
+        ok = test_owned_ops(gpu, 2, false, true) && test_owned_ops(gpu, 2, true, true) && ok;
         for (int64_t n_tokens : {1, 3}) { ok = test_tensor_mode(gpu, 0, n_tokens) && ok; }
         ok = test_tensor_mode(gpu, 1, 8) && ok;
         ok = test_scatter_views(gpu) && ok;
@@ -1474,6 +1506,9 @@ int main(int argc, char ** argv) {
     if (gpu == nullptr) {
         printf("no GPU for the meta backend, skipped\n");
         return argc > 1 && strncmp(argv[1], "--host-kv", 9) == 0 ? 77 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--padded-indexer") == 0) {
+        return test_owned_ops(gpu, 2, false, true) && test_owned_ops(gpu, 2, true, true) ? 0 : 1;
     }
     if (argc > 1 && (strcmp(argv[1], "--host-kv") == 0 || strcmp(argv[1], "--host-kv-four") == 0)) {
         if (strcmp(argv[1], "--host-kv-four") == 0) {
@@ -1581,6 +1616,7 @@ int main(int argc, char ** argv) {
         ok = test_owned_ops(gpu, variant) && ok;
         ok = test_owned_ops(gpu, variant, true) && ok;
     }
+    ok = test_owned_ops(gpu, 2, false, true) && test_owned_ops(gpu, 2, true, true) && ok;
     for (int64_t n_tokens : {1, 3}) { ok = test_tensor_mode(gpu, 0, n_tokens) && ok; }
     ok = test_tensor_mode(gpu, 1, 8) && ok;
     ok = test_steps_kept(gpu, false, false) && test_steps_kept(gpu, true, false) && ok;

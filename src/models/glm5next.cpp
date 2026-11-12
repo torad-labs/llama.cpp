@@ -525,6 +525,9 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
             static const bool q8_query = ggml_env_switch("LLAMA_INDEXER_Q8_QUERY");
             if (q8_query && pooled->type == GGML_TYPE_Q8_0) {
                 ggml_lightning_indexer_set_q8_query(pool_score);
+                if (inp_kp->resident_rows) {
+                    ggml_lightning_indexer_set_kpool_padding(pool_score, inp_kp->resident_rows);
+                }
             }
         } else {
             // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
