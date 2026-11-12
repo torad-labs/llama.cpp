@@ -40,20 +40,30 @@
 // Device timestamps from a trace remain trustworthy; host attribution has to come from here.
 // Off (the default) each timer is one test of a static flag.
 enum llama_decode_phase {
+    LLAMA_DECODE_PHASE_BATCH,
+    LLAMA_DECODE_PHASE_MEMORY,
+    LLAMA_DECODE_PHASE_GRAPH_SEARCH,
+    LLAMA_DECODE_PHASE_GRAPH_NEW,
     LLAMA_DECODE_PHASE_BUILD_GRAPH,
     LLAMA_DECODE_PHASE_ALLOC_GRAPH,
     LLAMA_DECODE_PHASE_SET_INPUTS,
     LLAMA_DECODE_PHASE_GRAPH_COMPUTE,
+    LLAMA_DECODE_PHASE_OUTPUTS,
     LLAMA_DECODE_PHASE_DECODE_TOTAL,
     LLAMA_DECODE_PHASE_COUNT,
 };
 
 static const char * llama_decode_phase_name(llama_decode_phase p) {
     switch (p) {
+        case LLAMA_DECODE_PHASE_BATCH:         return "batch";         // the batch allocator's init
+        case LLAMA_DECODE_PHASE_MEMORY:        return "memory";        // pending updates, the batch's cells, their apply
+        case LLAMA_DECODE_PHASE_GRAPH_SEARCH:  return "graph_search";  // the graph to compute: the last one or a slot's
+        case LLAMA_DECODE_PHASE_GRAPH_NEW:     return "graph_new";     // a slot made; a result and a scheduler reset to build in
         case LLAMA_DECODE_PHASE_BUILD_GRAPH:   return "build_graph";
         case LLAMA_DECODE_PHASE_ALLOC_GRAPH:   return "alloc_graph";
         case LLAMA_DECODE_PHASE_SET_INPUTS:    return "set_inputs";
         case LLAMA_DECODE_PHASE_GRAPH_COMPUTE: return "graph_compute";
+        case LLAMA_DECODE_PHASE_OUTPUTS:       return "outputs";       // a ubatch's output reads queued
         case LLAMA_DECODE_PHASE_DECODE_TOTAL:  return "DECODE TOTAL";
         default:                               return "?";
     }
@@ -91,9 +101,15 @@ struct llama_decode_phase_timer {
     }
 
     ~llama_decode_phase_timer() {
+        stop();
+    }
+
+    // ends the phase before the timer's scope does
+    void stop() {
         if (!on) {
             return;
         }
+        on = false;
         struct timespec t1;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         const double us = (t1.tv_sec - t0.tv_sec)*1e6 + (t1.tv_nsec - t0.tv_nsec)/1e3;
@@ -2042,10 +2058,13 @@ bool llama_context::graph_devices_low() const {
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // Keep each ubatch's rows before its graph storage can be reused.
     mtp_index_capture();
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
+    {
+        llama_decode_phase_timer t(LLAMA_DECODE_PHASE_MEMORY);
+        if (mctx && !mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     graph_clock++;
@@ -2055,6 +2074,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     llm_graph_result   * res      = gf_res_prev.get();
     ggml_backend_sched_t sched_gf = sched.get();
     uint64_t           * t_used   = nullptr; // the slot's last use
+
+    llama_decode_phase_timer t_search(LLAMA_DECODE_PHASE_GRAPH_SEARCH);
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -2083,6 +2104,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             reuse    = true;
         }
     }
+    t_search.stop();
 
     auto * gf = res->get_gf();
 
@@ -2104,6 +2126,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         bool devices_low = use_slots && graph_devices_low();
         if (use_slots) {
             if (graph_slots.size() < graph_slots_max && !devices_low) {
+                llama_decode_phase_timer t(LLAMA_DECODE_PHASE_GRAPH_NEW);
                 graph_slots.push_back({
                     ggml_backend_sched_ptr(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                             sched_max_nodes, false, cparams.op_offload)),
@@ -2124,9 +2147,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         const auto build = [&]() {
+            llama_decode_phase_timer t_new(LLAMA_DECODE_PHASE_GRAPH_NEW);
             res->reset();
             ggml_backend_sched_reset(sched_gf);
             ggml_backend_sched_set_eval_callback(sched_gf, cparams.cb_eval, cparams.cb_eval_user_data);
+            t_new.stop();
             llama_decode_phase_timer t(LLAMA_DECODE_PHASE_BUILD_GRAPH);
             gf = model.build_graph(gparams);
             return gf != nullptr;
@@ -2625,9 +2650,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
-        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-        return -1;
+    {
+        llama_decode_phase_timer t(LLAMA_DECODE_PHASE_BATCH);
+        if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+            LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+            return -1;
+        }
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
@@ -2666,6 +2694,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     lens_valid = !cparams.lens_layers.empty();
 
     bool did_optimize = false;
+
+    llama_decode_phase_timer t_memory(LLAMA_DECODE_PHASE_MEMORY);
 
     // handle any pending shifts/copies
     memory_update(false);
@@ -2714,6 +2744,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         break;
     }
+    t_memory.stop();
 
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
@@ -2830,6 +2861,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        llama_decode_phase_timer t_outputs(LLAMA_DECODE_PHASE_OUTPUTS);
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
