@@ -450,8 +450,13 @@ struct server_slot {
     int64_t t_restore_placed = 0; // how long the last restore held the server's thread
 
     server_prompt_cache_result prompt_save(server_prompt_cache & prompt_cache,
-            const server_prompt_cache_state * protect = nullptr, bool allow_evict = true) const {
-        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, spec, id, protect, allow_evict);
+            const server_prompt_cache_state * protect = nullptr, bool allow_evict = true, bool async = false) const {
+        const int64_t t_start = ggml_time_us();
+        const auto res = prompt_cache.save(prompt, ctx_tgt, ctx_dft, spec, id, protect, allow_evict, async);
+        if (res == server_prompt_cache_result::saved) {
+            SLT_INF(*this, "saved to the prompt cache in %.2f ms on the server's thread\n", (ggml_time_us() - t_start) / 1000.0);
+        }
+        return res;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, server_prompt_cache_state * selected, bool consume = true) {
@@ -459,28 +464,28 @@ struct server_slot {
         const int64_t t_start = ggml_time_us();
         const bool res = prompt_cache.load(prompt, selected, ctx_tgt, ctx_dft, spec, id, consume);
         t_restore_placed = ggml_time_us() - t_start;
-        t_restore_start  = restore_pending() ? t_start : 0;
+        t_restore_start  = copy_pending() ? t_start : 0;
         if (res && selected && t_restore_start == 0) {
             SLT_INF(*this, "restored in %.2f ms on the server's thread\n", t_restore_placed / 1000.0);
         }
         return res;
     }
 
-    // LLAMA_STATE_RESTORE_ASYNC=1: a restore of this slot from the prompt cache still copies its rows on a thread of the context
-    bool restore_pending() const {
-        return llama_state_seq_restore_pending(ctx_tgt, id) || (ctx_dft && llama_state_seq_restore_pending(ctx_dft, id));
+    // a thread of the context still copies this slot's rows: from a snapshot of the prompt cache restored into it (LLAMA_STATE_RESTORE_ASYNC=1) or to one saved from it (LLAMA_STATE_SAVE_ASYNC=1)
+    bool copy_pending() const {
+        return llama_state_seq_async_pending(ctx_tgt, id) || (ctx_dft && llama_state_seq_async_pending(ctx_dft, id));
     }
 
-    void restore_wait() const {
-        llama_state_seq_restore_wait(ctx_tgt, id);
+    void copy_wait() const {
+        llama_state_seq_async_wait(ctx_tgt, id);
         if (ctx_dft) {
-            llama_state_seq_restore_wait(ctx_dft, id);
+            llama_state_seq_async_wait(ctx_dft, id);
         }
     }
 
-    // restore_pending(), for the step that would read the slot's prompt: the slot takes no part in a step until the copy is done
-    bool restore_waiting() {
-        if (restore_pending()) {
+    // copy_pending(), for the step that would read or extend the slot's prompt: the slot takes no part in a step until the copy is done
+    bool copy_waiting() {
+        if (copy_pending()) {
             return true;
         }
         if (t_restore_start != 0) {
@@ -1253,9 +1258,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
-        // a restore that still copies reads a snapshot of the cache and writes to the contexts freed here
+        // a restore or a save that still copies uses a snapshot of the cache and the contexts freed here
         if (prompt_cache) {
-            prompt_cache->restore_reap(/*wait =*/ true);
+            prompt_cache->reap(/*wait =*/ true);
         }
 
         for (server_slot & slot : slots) {
@@ -2015,7 +2020,13 @@ private:
             if (update_cache || incoming) {
                 SRV_TRC("%s", "updating prompt cache\n");
                 const int64_t t_start = ggml_time_us();
-                const auto saved = ret->prompt_save(*prompt_cache, incoming);
+                const auto saved = ret->prompt_save(*prompt_cache, incoming, true, /*async =*/ true);
+                if (saved == server_prompt_cache_result::saving) {
+                    // LLAMA_STATE_SAVE_ASYNC=1: the slot's state is being copied to the cache beside the other slots' steps.
+                    // The task is deferred, and taken up again when the copy is done (update_slots)
+                    SLT_TRC(*ret, "cache_exchange task=%d save=saving incoming=%d\n", task.id, incoming != nullptr);
+                    return nullptr;
+                }
                 SLT_TRC(*ret, "cache_exchange task=%d save=%s incoming=%d\n", task.id,
                         server_prompt_cache_result_name(saved), incoming != nullptr);
                 // The snapshot is consumed only when the new prompt keeps all of it (one token may be re-evaluated for
@@ -3652,10 +3663,6 @@ private:
         }
 #endif
 
-        if (prompt_cache) {
-            prompt_cache->restore_reap();
-        }
-
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -3664,6 +3671,15 @@ private:
                 if (slot.is_processing()) {
                     all_idle = false;
                     break;
+                }
+            }
+
+            if (prompt_cache) {
+                // with no slot to step, a save that still copies is waited for here: nothing else would take its task up again
+                prompt_cache->reap(/*wait =*/ all_idle && prompt_cache->is_saving());
+                // a task deferred until a slot's state was in the cache (get_available_slot) is among the deferred ones
+                if (prompt_cache->take_saved()) {
+                    queue_tasks.pop_deferred_tasks();
                 }
             }
 
@@ -3705,11 +3721,11 @@ private:
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
-        // nothing to decode while a slot waits for its restore: the copy is waited for here, not in steps that do nothing
+        // nothing to decode while a slot waits for its copy: the copy is waited for here, not in steps that do nothing
         if (batch.size() == 0) {
             for (const auto & slot : slots) {
-                if (slot.is_processing() && slot.restore_pending()) {
-                    slot.restore_wait();
+                if (slot.is_processing() && slot.copy_pending()) {
+                    slot.copy_wait();
                     break;
                 }
             }
@@ -4022,7 +4038,7 @@ private:
             for (size_t i = 0; i < slots.size(); ++i) {
                 auto & slot = slots[(prompt_cursor + i) % slots.size()];
                 if ((slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) &&
-                        (!slot_batched || slot_batched->can_batch_with(slot)) && !slot.restore_waiting()) {
+                        (!slot_batched || slot_batched->can_batch_with(slot)) && !slot.copy_waiting()) {
                     prompting.push_back(&slot);
                 }
             }

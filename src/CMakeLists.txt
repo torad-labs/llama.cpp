@@ -40,7 +40,7 @@ add_library(llama
             llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp
-            llama-state-restore.cpp
+            llama-state-async.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp

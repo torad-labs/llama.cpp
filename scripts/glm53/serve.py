@@ -56,6 +56,9 @@ def arguments(argv=None):
     parser.add_argument("--restore-async", action="store_true",
                         help="A session brought back from the RAM prompt cache copies its rows on a thread of its own while "
                              "the other sessions decode (opt-in: not read on four cards)")
+    parser.add_argument("--save-async", action="store_true",
+                        help="A session whose slot another session takes is copied to the RAM prompt cache on a thread of "
+                             "its own while the other sessions decode (opt-in: not read on four cards)")
     parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
@@ -220,6 +223,10 @@ def make_plan(args):
     if args.restore_async:
         # A restore stops the server's thread only to place the cells; the rows are copied beside the other sessions' steps
         env["LLAMA_STATE_RESTORE_ASYNC"] = "1"
+    if args.save_async:
+        # A save for a slot that changes hands stops the server's thread only to write the state's layout; the request
+        # that takes the slot waits its turn while the rows are copied beside the other sessions' steps
+        env["LLAMA_STATE_SAVE_ASYNC"] = "1"
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
     if args.trace_decode:

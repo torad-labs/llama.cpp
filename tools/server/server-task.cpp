@@ -1717,6 +1717,7 @@ const char * server_prompt_cache_result_name(server_prompt_cache_result result) 
     switch (result) {
         case server_prompt_cache_result::saved:          return "saved";
         case server_prompt_cache_result::already_cached: return "already_cached";
+        case server_prompt_cache_result::saving:         return "saving";
         case server_prompt_cache_result::empty:          return "empty";
         case server_prompt_cache_result::too_large:      return "too_large";
         case server_prompt_cache_result::no_space:       return "no_space";
@@ -1740,11 +1741,47 @@ server_prompt_cache_result server_prompt_cache::save_idle(const server_prompt & 
     return result;
 }
 
+// LLAMA_STATE_SAVE_ASYNC=1: a slot's state saved for a task that can come back for the slot returns once its layout is written, and a thread of the context copies its rows to the snapshot while the other slots decode (llama_state_seq_get_data_async)
+static bool state_save_async() {
+    static const bool async = ggml_env_switch("LLAMA_STATE_SAVE_ASYNC");
+    return async;
+}
+
 server_prompt_cache_result server_prompt_cache::save(const server_prompt & prompt,
         llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot,
-        const server_prompt_cache_state * protect, bool allow_evict) {
+        const server_prompt_cache_state * protect, bool allow_evict, bool async) {
     if (prompt.tokens.empty()) {
         return server_prompt_cache_result::empty;
+    }
+    async = async && state_save_async();
+
+    // A save of the slot that still copies. The slot takes no part in a step meanwhile, so it is this prompt's: a caller
+    // that can come back does, and another waits for the copy here and finds it cached below.
+    reap(false, protect);
+    if (const auto it = saving_refused.find(id_slot); it != saving_refused.end()) {
+        const auto refused = it->second;
+        saving_refused.erase(it);
+        if (async && refused.first == prompt.tokens.size()) {
+            return refused.second;
+        }
+    }
+    for (const auto & cur : saving) {
+        if (cur.id_slot == id_slot && cur.ctx_tgt == ctx_tgt) {
+            if (async && cur.state.prompt.tokens.size() == prompt.tokens.size()) {
+                return server_prompt_cache_result::saving;
+            }
+            llama_state_seq_async_wait(cur.ctx_tgt, id_slot);
+            if (cur.ctx_dft) {
+                llama_state_seq_async_wait(cur.ctx_dft, id_slot);
+            }
+            reap(false, protect);
+            break;
+        }
+    }
+    // the snapshots other slots' saves still copy to
+    size_t size_saving = 0;
+    for (const auto & cur : saving) {
+        size_saving += cur.state.size();
     }
 
     const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
@@ -1813,15 +1850,17 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
 
         if (limit_size > 0) {
             const size_t retained = protect ? protect->size() : 0;
+            // the snapshots other slots' saves still copy to are held too, and join the cache when their copies are done
             if (retained > limit_size || (protect && size_new > limit_size - retained) ||
-                    (!allow_evict && size() > limit_size - size_new)) {
-                SRV_TRC("cache_save reason=no_space slot=%d bytes=%zu protected=%zu limit=%zu\n",
-                        id_slot, size_new, retained, limit_size);
+                    size_saving > limit_size - size_new ||
+                    (!allow_evict && size() + size_saving > limit_size - size_new)) {
+                SRV_TRC("cache_save reason=no_space slot=%d bytes=%zu protected=%zu saving=%zu limit=%zu\n",
+                        id_slot, size_new, retained, size_saving, limit_size);
                 return server_prompt_cache_result::no_space;
             }
             // Evictions precede allocation to keep snapshot storage bounded.
             // The selected incoming state must survive even when saving fails.
-            for (auto it = states.begin(); size() > limit_size - size_new && it != states.end();) {
+            for (auto it = states.begin(); size() + size_saving > limit_size - size_new && it != states.end();) {
                 if (&*it == protect) {
                     ++it;
                     continue;
@@ -1834,6 +1873,25 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
         pending.prompt = prompt.clone();
         pending.data->main.resize(size_tgt);
         pending.data->drft.resize(size_dft);
+        if (async) {
+            const int64_t t_start = ggml_time_us();
+            const bool ok = llama_state_seq_get_data_async(ctx_tgt, pending.data->main.data(), size_tgt, id_slot,
+                        LLAMA_STATE_SEQ_FLAGS_NONE) == size_tgt &&
+                    (!ctx_dft || llama_state_seq_get_data_async(ctx_dft, pending.data->drft.data(), size_dft, id_slot,
+                        LLAMA_STATE_SEQ_FLAGS_NONE) == size_dft);
+            if (!ok) {
+                // a copy that did start writes to the snapshot freed here
+                llama_state_seq_async_wait(ctx_tgt, id_slot);
+                if (ctx_dft) {
+                    llama_state_seq_async_wait(ctx_dft, id_slot);
+                }
+                SRV_WRN("cache_save reason=serialization_failed slot=%d bytes=%zu\n", id_slot, size_new);
+                return server_prompt_cache_result::failed;
+            }
+            SRV_TRC("cache_save reason=saving slot=%d tokens=%d bytes=%zu\n", id_slot, prompt.n_tokens(), size_new);
+            saving.push_back({ ctx_tgt, ctx_dft, id_slot, t_start, ggml_time_us() - t_start, std::move(pending) });
+            return server_prompt_cache_result::saving;
+        }
         if (llama_state_seq_get_data_ext(ctx_tgt, pending.data->main.data(), size_tgt, id_slot,
                     LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt ||
                 (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, pending.data->drft.data(), size_dft, id_slot,
@@ -1843,27 +1901,35 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
         }
 
         // Publish only after both model states and the drafter state are complete.
-        insert_state(std::move(pending));
-        const auto * saved = &states.back();
-        for (auto it = states.begin(); &*it != saved;) {
-            if (&*it != protect && it->prompt.tokens.size() == prompt.tokens.size() &&
-                    it->prompt.tokens.get_common_prefix(prompt.tokens) == prompt.tokens.size()) {
-                it = erase_state(it);
-            } else {
-                ++it;
-            }
-        }
-        update(protect);
-        if (std::none_of(states.begin(), states.end(),
-                [&](const server_prompt_cache_state & state) { return &state == saved; })) {
-            return server_prompt_cache_result::no_space;
-        }
-        SRV_TRC("cache_save reason=saved slot=%d tokens=%d bytes=%zu\n", id_slot, prompt.n_tokens(), size_new);
-        return server_prompt_cache_result::saved;
+        return publish(std::move(pending), protect, id_slot);
     } catch (const std::exception & e) {
         SRV_ERR("cache_save reason=exception slot=%d error=%s\n", id_slot, e.what());
         return server_prompt_cache_result::failed;
     }
+}
+
+server_prompt_cache_result server_prompt_cache::publish(server_prompt_cache_state && state,
+        const server_prompt_cache_state * protect, int32_t id_slot) {
+    insert_state(std::move(state));
+    const auto * saved = &states.back();
+    const auto & tokens = saved->prompt.tokens;
+    for (auto it = states.begin(); &*it != saved;) {
+        if (&*it != protect && it->prompt.tokens.size() == tokens.size() &&
+                it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+            it = erase_state(it);
+        } else {
+            ++it;
+        }
+    }
+    const int    n_tokens = saved->prompt.n_tokens();
+    const size_t n_bytes  = saved->size();
+    update(protect);
+    if (std::none_of(states.begin(), states.end(),
+            [&](const server_prompt_cache_state & cur) { return &cur == saved; })) {
+        return server_prompt_cache_result::no_space;
+    }
+    SRV_TRC("cache_save reason=saved slot=%d tokens=%d bytes=%zu\n", id_slot, n_tokens, n_bytes);
+    return server_prompt_cache_result::saved;
 }
 
 size_t server_prompt_cache::reusable_prefix(const server_prompt & prompt, const server_tokens & tokens_new,
@@ -1924,7 +1990,7 @@ static bool state_restore_async() {
 
 bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state * selected,
         llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, bool consume) {
-    restore_reap();
+    reap(false, selected);
     if (!selected) {
         return true;
     }
@@ -1936,7 +2002,7 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
     // complete snapshot available for retry, never a metadata-only cache hit.
     const std::shared_ptr<const server_prompt_data> data = it->data;
     const bool async = state_restore_async();
-    const auto set_data = [&](llama_context * ctx, const std::vector<uint8_t> & bytes) {
+    const auto set_data = [&](llama_context * ctx, const server_state_bytes & bytes) {
         return async ?
             llama_state_seq_set_data_async(ctx, bytes.data(), bytes.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) :
             llama_state_seq_set_data_ext  (ctx, bytes.data(), bytes.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -1959,10 +2025,10 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
         // Both sequences may have been partially overwritten, including when the
         // target loader itself failed. Clear them together before a fresh prefill.
         // A target restore that still copies writes to the cells removed here.
-        llama_state_seq_restore_wait(ctx_tgt, id_slot);
+        llama_state_seq_async_wait(ctx_tgt, id_slot);
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
         if (ctx_dft) {
-            llama_state_seq_restore_wait(ctx_dft, id_slot);
+            llama_state_seq_async_wait(ctx_dft, id_slot);
             llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
         }
         common_speculative_set_state(spec, id_slot, {});
@@ -1989,17 +2055,38 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
     return true;
 }
 
-void server_prompt_cache::restore_reap(bool wait) {
-    for (auto it = restoring.begin(); it != restoring.end();) {
+void server_prompt_cache::reap(bool wait, const server_prompt_cache_state * protect) {
+    const auto done = [wait](const llama_context * ctx_tgt, const llama_context * ctx_dft, int32_t id_slot) {
         if (wait) {
-            llama_state_seq_restore_wait(it->ctx_tgt, it->id_slot);
-            if (it->ctx_dft) {
-                llama_state_seq_restore_wait(it->ctx_dft, it->id_slot);
+            llama_state_seq_async_wait(ctx_tgt, id_slot);
+            if (ctx_dft) {
+                llama_state_seq_async_wait(ctx_dft, id_slot);
             }
         }
-        const bool pending = llama_state_seq_restore_pending(it->ctx_tgt, it->id_slot) ||
-            (it->ctx_dft && llama_state_seq_restore_pending(it->ctx_dft, it->id_slot));
-        it = pending ? std::next(it) : restoring.erase(it);
+        return !llama_state_seq_async_pending(ctx_tgt, id_slot) &&
+            !(ctx_dft && llama_state_seq_async_pending(ctx_dft, id_slot));
+    };
+    for (auto it = restoring.begin(); it != restoring.end();) {
+        it = done(it->ctx_tgt, it->ctx_dft, it->id_slot) ? restoring.erase(it) : std::next(it);
+    }
+    for (auto it = saving.begin(); it != saving.end();) {
+        if (!done(it->ctx_tgt, it->ctx_dft, it->id_slot)) {
+            ++it;
+            continue;
+        }
+        const int32_t id_slot = it->id_slot;
+        const double  t_copy  = (ggml_time_us() - it->t_start) / 1000.0;
+        const double  t_here  = it->t_placed / 1000.0;
+        // the room for this one was made before its copy. The state its save protected may have left the cache since: the one kept here is the one this call's caller holds
+        const size_t n_tokens = it->state.prompt.tokens.size();
+        const auto result = publish(std::move(it->state), protect, id_slot);
+        if (result != server_prompt_cache_result::saved) {
+            saving_refused[id_slot] = { n_tokens, result };
+        }
+        SRV_INF("slot %d saved to the prompt cache %.2f ms after the save started, %.2f ms of them on the server's thread, result=%s\n",
+                id_slot, t_copy, t_here, server_prompt_cache_result_name(result));
+        saved = true;
+        it = saving.erase(it);
     }
 }
 

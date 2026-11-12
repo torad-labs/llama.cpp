@@ -469,11 +469,11 @@ extern "C" {
     GGML_API void ggml_backend_meta_set_stream_view(
         struct ggml_tensor * view, const int64_t * counts, const int64_t * first, size_t n_devices);
 
-    // The device writes that one write of [offset, offset + size) to a tensor is made of. fn gets each device's tensor, its range and where that range starts in the write's data. A tensor of another backend is one write of itself.
-    // Returns false and calls nothing when the write is not such a list. The list is made on the calling thread; the writes it names can then go from another thread.
+    // The device copies that one write to, or one read of, [offset, offset + size) of a tensor is made of. fn gets each device's tensor, its range and where that range starts in the copy's data. A tensor of another backend is one copy of itself. A write to a mirrored tensor goes to every device and a read of one comes from the first.
+    // Returns false and calls nothing when the copy is not such a list. The list is made on the calling thread; the copies it names can then go from another thread.
     typedef void (*ggml_backend_meta_range_fn)(struct ggml_tensor * tensor, size_t offset, size_t size, size_t data_offset, void * userdata);
     GGML_API bool ggml_backend_meta_tensor_ranges(
-        struct ggml_tensor * tensor, size_t offset, size_t size, ggml_backend_meta_range_fn fn, void * userdata);
+        struct ggml_tensor * tensor, size_t offset, size_t size, bool read, ggml_backend_meta_range_fn fn, void * userdata);
 
     //
     // Utils

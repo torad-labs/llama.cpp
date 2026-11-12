@@ -178,6 +178,49 @@ def test_clear_and_restore_async(monkeypatch):
     assert replies[0] == replies[1]
 
 
+OTHER_PROMPT = (
+    "The lighthouse keeper counted the ships each evening and wrote their "
+    "names in a ledger bound in green cloth, and on the night of the great "
+    "storm he counted one more ship than had ever sailed from the harbour, "
+    "a vessel with no lanterns that moved against the wind toward the rocks."
+)
+
+
+# LLAMA_STATE_SAVE_ASYNC=1: a conversation that takes the one slot from another has the slot's state copied to the prompt
+# cache on a thread of the context, its task deferred until the copy is done. Both conversations come back from the cache
+# with as many tokens reused and the same replies as after blocking saves
+def test_exchange_save_async(monkeypatch):
+    global server
+    replies = []
+    for switch in (None, "1"):
+        if switch is None:
+            monkeypatch.delenv("LLAMA_STATE_SAVE_ASYNC", raising=False)
+        else:
+            monkeypatch.setenv("LLAMA_STATE_SAVE_ASYNC", switch)
+        server.n_slots = 1
+        server.start()
+        log = LogReader(server.log_path)
+
+        turns = []
+        for prompt in (LONG_PROMPT, OTHER_PROMPT, LONG_PROMPT, OTHER_PROMPT):
+            res = server.make_request("POST", "/completion", data={
+                "prompt": prompt,
+                "cache_prompt": True,
+            })
+            assert res.status_code == 200
+            turns.append((res.body["content"], res.body["timings"]["cache_n"]))
+        # the third and the fourth come back from the cache
+        assert turns[2][1] > 0 and turns[3][1] > 0
+        assert turns[0][0] == turns[2][0] and turns[1][0] == turns[3][0]
+        content = log.wait_for("cache_restore reason=restored")
+        assert ("cache_save reason=saving" in content) == (switch == "1")
+        assert ("save=saving" in content) == (switch == "1")
+        replies.append(turns)
+        server.stop()
+
+    assert replies[0] == replies[1]
+
+
 # a request for a busy slot waits for it: the prompt cache does not save or replace the slot's state under the running request
 def test_named_busy_slot_left_alone():
     global server

@@ -9,7 +9,9 @@
 // whose heads are not a whole number of q4_0 blocks wide (the CI model's are 48).
 // LLAMA_KV_RESTORE_PER_CELL_LEGACY=1 runs the same checks on the per-cell copies.
 // Each check runs again with llama_state_seq_set_data_async: the cells are placed at once, sequence 2 decodes while a thread
-// of the context copies the rows, and the save that follows waits for the copy.
+// of the context copies the rows, and the save that follows waits for the copy. That save is a
+// llama_state_seq_get_data_async, with sequence 2 decoding again while the thread copies the rows out, and it is the saved
+// state byte for byte, as is the blocking save after it, which waits for both copies.
 
 #include "llama.h"
 
@@ -85,7 +87,7 @@ static bool check(llama_model * model, bool fa, ggml_type type, int turn, bool r
     }
     batch.logits[batch.n_tokens - 1] = true;
 
-    std::vector<uint8_t> saved, again;
+    std::vector<uint8_t> saved, again, beside;
     if (llama_decode(ctx, batch) != 0) {
         fprintf(stderr, "%s: decode failed\n", what);
         goto done;
@@ -129,13 +131,38 @@ static bool check(llama_model * model, bool fa, ggml_type type, int turn, bool r
         fprintf(stderr, "%s: restoring sequence 1 failed\n", what);
         goto done;
     }
+    if (async) {
+        beside.resize(llama_state_seq_get_size(ctx, 1));
+        if (llama_state_seq_get_data_async(ctx, beside.data(), beside.size(), 1, LLAMA_STATE_SEQ_FLAGS_NONE) != beside.size()) {
+            fprintf(stderr, "%s: saving sequence 1 beside a decode failed\n", what);
+            goto done;
+        }
+        batch.n_tokens = 0;
+        for (int p = n_tok + turn; p < n_tok + 2*turn; ++p) {
+            add(batch, token_at(vocab, 2, p), p, 2);
+        }
+        batch.logits[batch.n_tokens - 1] = true;
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "%s: decode beside the save failed\n", what);
+            goto done;
+        }
+    }
     again.resize(llama_state_seq_get_size(ctx, 1));
     if (llama_state_seq_get_data(ctx, again.data(), again.size(), 1) != again.size()) {
         fprintf(stderr, "%s: saving sequence 1 again failed\n", what);
         goto done;
     }
-    if (llama_state_seq_restore_pending(ctx, -1)) {
-        fprintf(stderr, "%s: FAIL, the save did not wait for the restore\n", what);
+    if (llama_state_seq_async_pending(ctx, -1)) {
+        fprintf(stderr, "%s: FAIL, the save did not wait for the copies\n", what);
+        goto done;
+    }
+    if (async && (beside.size() != saved.size() || memcmp(beside.data(), saved.data(), saved.size()) != 0)) {
+        size_t i = 0;
+        while (i < std::min(beside.size(), saved.size()) && beside[i] == saved[i]) {
+            ++i;
+        }
+        fprintf(stderr, "%s: FAIL, the state saved beside a decode differs from the saved one (%zu and %zu bytes, first at byte %zu)\n",
+                what, saved.size(), beside.size(), i);
         goto done;
     }
     if (again.size() != saved.size() || memcmp(again.data(), saved.data(), saved.size()) != 0) {

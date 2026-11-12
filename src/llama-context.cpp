@@ -1321,6 +1321,9 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
+        // an update shifts or copies rows of whichever sequences it is pending for: a save or a restore that still copies is waited for
+        state_async_wait(-1);
+
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
@@ -4682,7 +4685,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     // the rows written are those a restore may still copy
-    state_restore_wait(-1);
+    state_async_wait(-1);
 
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
@@ -4704,8 +4707,8 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
-    // the cells replaced here are those a restore may still copy to
-    state_restore_wait(-1);
+    // the cells replaced here are those a save or a restore may still copy
+    state_async_wait(-1);
 
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
@@ -4734,7 +4737,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     // the rows written are those a restore of the sequence may still copy
-    state_restore_wait(seq_id);
+    state_async_wait(seq_id);
 
     if (memory) {
         memory->state_write(io, seq_id, flags);
@@ -4744,8 +4747,8 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    // the cells removed here are those a restore of the sequence may still copy to
-    state_restore_wait(seq_id);
+    // the cells removed here are those a save or a restore of the sequence may still copy
+    state_async_wait(seq_id);
 
     if (memory) {
         memory->state_read(io, seq_id, flags);
@@ -5844,8 +5847,8 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
-    // a restore of one of the batch's sequences that still copies is waited for: the decode reads its rows
-    ctx->state_restore_wait(batch);
+    // a save or a restore of one of the batch's sequences that still copies is waited for: the decode reads the rows a restore writes, and writes state a save reads
+    ctx->state_async_wait(batch);
 
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {

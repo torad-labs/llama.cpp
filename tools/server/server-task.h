@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <utility>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -589,9 +590,28 @@ struct server_prompt {
     }
 };
 
+// std::allocator that leaves new bytes as they are. A snapshot's bytes are all written by the save that fills it, and its pages are first touched by that copy, on whichever thread makes it, where resize() zeroed them on the server's thread first.
+template <typename T>
+struct server_uninit_allocator {
+    using value_type = T;
+
+    server_uninit_allocator() = default;
+    template <typename U> server_uninit_allocator(const server_uninit_allocator<U> &) {}
+
+    T * allocate(size_t n) { return std::allocator<T>().allocate(n); }
+    void deallocate(T * p, size_t n) { std::allocator<T>().deallocate(p, n); }
+
+    template <typename U> void construct(U * p) { ::new ((void *) p) U; }
+    template <typename U, typename... Args> void construct(U * p, Args &&... args) { ::new ((void *) p) U(std::forward<Args>(args)...); }
+
+    template <typename U> bool operator==(const server_uninit_allocator<U> &) const { return true; }
+    template <typename U> bool operator!=(const server_uninit_allocator<U> &) const { return false; }
+};
+using server_state_bytes = std::vector<uint8_t, server_uninit_allocator<uint8_t>>;
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_state_bytes main;
+    server_state_bytes drft;
     // the drafter's own per-sequence state, which the two above do not hold: the MTP head's kept h row and the position
     // it is for, so a prompt restored into a slot drafts from the row its own generation left (common_speculative_get_state)
     std::vector<uint8_t> spec;
@@ -630,6 +650,8 @@ struct server_prompt_cache_state {
 enum class server_prompt_cache_result {
     saved,
     already_cached,
+    // a thread of the context still copies the state to the snapshot: it joins the cache when the copy is done
+    saving,
     empty,
     too_large,
     no_space,
@@ -664,7 +686,7 @@ private:
     size_t total_tokens = 0;
     uint64_t revision = 0;
 
-    // A snapshot a context still copies from (LLAMA_STATE_RESTORE_ASYNC): the copy reads its bytes, so they stay until restore_reap() finds it done, also when the snapshot has left the cache.
+    // A snapshot a context still copies from (LLAMA_STATE_RESTORE_ASYNC): the copy reads its bytes, so they stay until reap() finds it done, also when the snapshot has left the cache.
     struct restoring_state {
         const llama_context * ctx_tgt;
         const llama_context * ctx_dft;
@@ -672,6 +694,23 @@ private:
         std::shared_ptr<const server_prompt_data> data;
     };
     std::list<restoring_state> restoring;
+
+    // A snapshot a context still copies to (LLAMA_STATE_SAVE_ASYNC): it joins the cache when reap() finds its copy done.
+    struct saving_state {
+        const llama_context * ctx_tgt;
+        const llama_context * ctx_dft;
+        int32_t id_slot;
+        int64_t t_start;
+        int64_t t_placed;
+        server_prompt_cache_state state;
+    };
+    std::list<saving_state> saving;
+    bool saved = false;
+    // A slot whose copied snapshot the limits took out of the cache again, with its tokens: the task that comes back for the slot gets that result, not another copy.
+    std::map<int32_t, std::pair<size_t, server_prompt_cache_result>> saving_refused;
+
+    // the state joins the cache and the limits are applied: saved, or no_space when they took it out again
+    server_prompt_cache_result publish(server_prompt_cache_state && state, const server_prompt_cache_state * protect, int32_t id_slot);
 
     void insert_state(server_prompt_cache_state && state);
     std::list<server_prompt_cache_state>::iterator erase_state(std::list<server_prompt_cache_state>::iterator it);
@@ -690,9 +729,11 @@ public:
     server_prompt_cache_result save_idle(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
             common_speculative * spec, int32_t id_slot, server_prompt_cache_refusal & refusal);
 
+    // async: the caller can come back for the slot. With LLAMA_STATE_SAVE_ASYNC=1 the result is then saving, a thread of
+    // the context copies the state while the other slots decode, and take_saved() says when a copy is done.
     server_prompt_cache_result save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
             common_speculative * spec, int32_t id_slot, const server_prompt_cache_state * protect = nullptr,
-            bool allow_evict = true);
+            bool allow_evict = true, bool async = false);
 
     static size_t reusable_prefix(const server_prompt & prompt, const server_tokens & tokens_new,
             llama_pos pos_min, int32_t n_swa, std::optional<size_t> lcp = std::nullopt);
@@ -707,8 +748,14 @@ public:
 
     void update(const server_prompt_cache_state * protect = nullptr);
 
-    // free the snapshots whose copy is done. wait: every copy is waited for first, as before the contexts are freed
-    void restore_reap(bool wait = false);
+    // The copies that are done: a restored snapshot is freed, a saved one joins the cache, where protect stays. wait: every copy is waited for first, as before the contexts are freed.
+    void reap(bool wait = false, const server_prompt_cache_state * protect = nullptr);
+
+    // a save still copies
+    bool is_saving() const { return !saving.empty(); }
+
+    // a save's copy was done since the last call: a task deferred for its slot can be taken up again
+    bool take_saved() { return std::exchange(saved, false); }
 };
 
 // used exclusively by router mode
