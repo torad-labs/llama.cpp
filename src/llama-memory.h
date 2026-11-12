@@ -13,6 +13,7 @@ class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+class llama_memory_recurrent;
 
 struct llama_memory_params {
     // kv cache
@@ -133,6 +134,10 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // the memory a sequence's partial state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) is the whole of, when it has spare
+    // rows on the devices to copy that state to (llama_memory_recurrent::n_stage); nullptr otherwise
+    virtual llama_memory_recurrent * staged() { return nullptr; }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

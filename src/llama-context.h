@@ -68,6 +68,10 @@ struct llama_context {
     // every row r of each state tensor takes row rows[r] (llama_memory_recurrent::relocate_states)
     void rs_relocate(const std::vector<ggml_tensor *> & states, const std::vector<int32_t> & rows);
 
+    // copies row src of each state tensor to its spare tensor of one row (llama_memory_recurrent::stage_tensors), on
+    // the devices; stage_row names the graph, which is made at its first use and computed again at each later one
+    void rs_stage(const std::vector<ggml_tensor *> & states, const std::vector<ggml_tensor *> & stages, int32_t src, uint32_t stage_row);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -184,7 +188,15 @@ struct llama_context {
     size_t state_seq_get_data_async(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data_async(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
-    // a copy one of the two started still runs. seq_id < 0: of any sequence
+    // state_seq_get_data for a partial state that is a recurrent state with spare rows (llama_memory_i::staged): the
+    // state is copied to a free spare row on the devices and state_async copies it to dst from there, so the caller
+    // and every later decode go on at once, a decode of the sequence included. row is the spare row, whose copy
+    // state_staged_pending and state_staged_wait answer for, or -1 when the state was copied to dst before returning
+    // (no such memory, no row free, a sequence that shares its cell)
+    size_t state_seq_get_data_staged(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, int32_t & row);
+    uint32_t state_staged_rows() const;
+
+    // a copy one of the two started still runs. seq_id == -1: any copy; a staged one has llama_state_async::staged_key
     bool state_async_pending(llama_seq_id seq_id) const;
     void state_async_wait(llama_seq_id seq_id) const;
     void state_async_wait(const llama_batch & batch) const;
@@ -555,6 +567,7 @@ private:
         ggml_tensor *          dst = nullptr;
     };
     std::map<size_t, rs_reloc_graph> rs_reloc;
+    std::map<uint32_t, rs_reloc_graph> rs_stage_graphs; // rs_stage, by spare row
     uint64_t graph_clock = 0; // process_ubatch calls, the slots' use times
 
     // the scheduler that allocated the graph process_ubatch last computed: its outputs' backends are looked up there

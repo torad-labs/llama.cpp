@@ -971,9 +971,29 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
-    // a copy one of the two started still runs. seq_id < 0: for any sequence
+    // a copy one of the two started still runs. seq_id == -1: any copy, a staged one included
     LLAMA_API bool llama_state_seq_async_pending(const struct llama_context * ctx, llama_seq_id seq_id);
     LLAMA_API void llama_state_seq_async_wait   (const struct llama_context * ctx, llama_seq_id seq_id);
+
+    // llama_state_seq_get_data_ext for a partial state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) in host memory, where the
+    // context has spare rows for it (LLAMA_RS_STAGE_ROWS=N: a recurrent state of f32 on one set of sequence devices;
+    // llama_state_staged_rows() says how many). The state is copied to a free spare row on the devices, and a thread
+    // of the context copies it to dst from there: the caller and every llama_decode after it go on at once, one of
+    // the sequence included. *row is the spare row: dst holds the state, and must stay, once
+    // llama_state_staged_pending() is false for it. *row is -1 when the state was in dst before the call returned
+    // (no spare row free, no such state), and with row == NULL the call waits for the copy. llama_memory_clear() with
+    // data clears the spare rows as well: wait for the copies before it.
+    LLAMA_API size_t llama_state_seq_get_data_staged(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                         int32_t * row);
+
+    LLAMA_API uint32_t llama_state_staged_rows   (const struct llama_context * ctx);
+    LLAMA_API bool     llama_state_staged_pending(const struct llama_context * ctx, int32_t row);
+    LLAMA_API void     llama_state_staged_wait   (const struct llama_context * ctx, int32_t row);
 
     //
     // Decoding

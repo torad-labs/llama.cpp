@@ -66,6 +66,26 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    llama_memory_recurrent * staged() override { return n_stage > 0 ? this : nullptr; }
+
+    // LLAMA_RS_STAGE_ROWS=N: N spare rows of every state tensor on the devices, each a tensor of one row split as the
+    // state is. A sequence's state is copied to one on the devices (llama_context::rs_stage), where no decode moves it
+    // or writes over it, and from there to host memory by a thread (llama_context::state_seq_get_data_staged): a
+    // context checkpoint then holds the caller for the copy on the devices alone. Off (0) unless set; f32 states on
+    // one set of sequence devices only, as relocate.
+    uint32_t n_stage = 0;
+    std::vector<std::vector<ggml_tensor *>> r_stage; // [row][layer], nullptr where r_l is
+    std::vector<std::vector<ggml_tensor *>> s_stage;
+
+    // the row of the state tensors that holds the sequence's state, when it has one cell of its own; -1 otherwise
+    int64_t stage_src(llama_seq_id seq_id) const;
+
+    // the state tensors and the tensors of spare row `row`, layer by layer, for rs_stage
+    void stage_tensors(uint32_t row, std::vector<ggml_tensor *> & states, std::vector<ggml_tensor *> & stages) const;
+
+    // state_write for a sequence stage_src() has a row for, its tensor data read from spare row `row`
+    void state_write_staged(llama_io_write_i & io, llama_seq_id seq_id, uint32_t row) const;
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)

@@ -63,6 +63,10 @@ def arguments(argv=None):
                         help="A directory the server leaves its sessions in when it is stopped with SIGTERM or SIGINT, and "
                              "takes them from when it starts with the same models: /dev/shm/... keeps them in memory. The "
                              "files hold the sessions' tokens (opt-in: not read on four cards)")
+    parser.add_argument("--checkpoint-rows", type=int,
+                        help="Spare state rows on the cards, 1..64: a session's context checkpoint is copied to one of them "
+                             "on the cards, and from there to RAM on a thread of its own while the sessions decode "
+                             "(opt-in: not read on four cards)")
     parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
@@ -235,6 +239,14 @@ def make_plan(args):
         # At a stop every session is saved to the RAM prompt cache and the cache written to files; the next start maps
         # them, and a session comes back from its snapshot where it would be prefilled from its first token
         env["LLAMA_PROMPT_CACHE_DIR"] = str(args.sessions_dir)
+    if args.checkpoint_rows is not None:
+        # A context checkpoint stops the server's thread for the copy of one state row on the cards; the copy to RAM is
+        # made beside the sessions' steps, and a checkpoint that finds every spare row busy is copied as before
+        env["LLAMA_RS_STAGE_ROWS"] = str(args.checkpoint_rows)
+        if "GGML_META_CAPTURE_GRAPHS" in env:
+            # Each spare row has a graph of its own, which the tensor split keeps captured beside the decodes' graphs:
+            # without room for it, a checkpoint would put a decode's graph out and that decode would capture again
+            env["GGML_META_CAPTURE_GRAPHS"] = str(int(env["GGML_META_CAPTURE_GRAPHS"]) + args.checkpoint_rows)
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
     if args.trace_decode:
