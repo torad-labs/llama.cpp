@@ -711,6 +711,154 @@ static bool test_prompt_shapes(const common_params & params, llama_model * model
 #endif
 }
 
+// LLAMA_GRAPH_PROMPT_KEPT=1 keeps the graph of a prompt's rows in a slot once its shape has come before, and changes
+// nothing a sequence reads: the ubatches are those of a context without the switch, so its logits and states are that
+// context's to the bounds of two contexts that cut their batches the same way. Here a sequence reads four prompts of
+// one ubatch and a tail of 40 rows: without the switch each of the eight is built again on the main scheduler, which
+// holds one graph; with it the first prompt's two are built there, the second's in slots, and the later ones' are
+// reused where no input of theirs has grown, so that context reuses more graphs (n_slots of 8, reuse expected). With two
+// slots every shape takes the slot of the one used least recently, measured before it is taken: the logits and states
+// are the reference's all the same, and how many graphs are reused is not checked.
+static bool test_prompt_kept(const common_params & params, llama_model * model, const int n_vocab, const char * n_slots,
+        const bool reuse_expected) {
+#ifdef _WIN32
+    GGML_UNUSED(params);
+    GGML_UNUSED(model);
+    GGML_UNUSED(n_vocab);
+    GGML_UNUSED(n_slots);
+    GGML_UNUSED(reuse_expected);
+    fprintf(stderr, "%s : skipping on windows, which has no setenv\n", __func__);
+    return true;
+#else
+    constexpr uint32_t n_seqs = 2;
+    constexpr float    eps    = 1e-7f;
+
+    const auto make_ctx = [&](bool kept) {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = n_seqs;
+        cparams.n_rs_seq   = 2;
+        cparams.n_ctx      = 1024;
+        cparams.n_batch    = 512;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = true;
+        // the switch is read when a context is made
+        if (kept) {
+            setenv("LLAMA_GRAPH_PROMPT_KEPT", "1", 1);
+        }
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        unsetenv("LLAMA_GRAPH_PROMPT_KEPT");
+        return ctx;
+    };
+
+    // n_slots of 8: slots for the two prompts' shapes and the reply's beside each other, in both contexts
+    const bool set_slots = getenv("LLAMA_GRAPH_SLOTS") == nullptr;
+    if (set_slots) {
+        setenv("LLAMA_GRAPH_SLOTS", n_slots, 1);
+    }
+    llama_context * ctx_ref  = make_ctx(false);
+    llama_context * ctx_kept = make_ctx(true);
+    if (set_slots) {
+        unsetenv("LLAMA_GRAPH_SLOTS");
+    }
+    const auto cleanup = [&]() {
+        llama_free(ctx_ref);
+        llama_free(ctx_kept);
+    };
+    if (ctx_ref == nullptr || ctx_kept == nullptr) {
+        fprintf(stderr, "%s : failed to init contexts\n", __func__);
+        cleanup();
+        return false;
+    }
+    if (llama_n_rs_seq(ctx_ref) < 2) {
+        fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+        cleanup();
+        return true;
+    }
+
+    std::vector<llama_pos> pos(n_seqs, 0);
+    float max_logits = 0.0f;
+
+    // one decode in both contexts: counts[s] rows of each sequence from where it stands, a logits row for its last
+    const auto step = [&](const char * what, const std::vector<uint32_t> & counts) {
+        uint32_t n_rows = 0;
+        for (const uint32_t count : counts) {
+            n_rows += count;
+        }
+        llama_batch batch = llama_batch_init(n_rows, 0, 1);
+        std::vector<int32_t> out_rows;
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            for (uint32_t i = 0; i < counts[s]; ++i) {
+                const bool output = i + 1 == counts[s];
+                if (output) {
+                    out_rows.push_back(batch.n_tokens);
+                }
+                const llama_pos p = pos[s] + (llama_pos) i;
+                common_batch_add(batch, (llama_token) ((11*(uint32_t) p + 37*s + 5) % (uint32_t) n_vocab), p, { (llama_seq_id) s }, output);
+            }
+            pos[s] += (llama_pos) counts[s];
+        }
+        const bool decoded = llama_decode(ctx_ref, batch) == 0 && llama_decode(ctx_kept, batch) == 0;
+        llama_batch_free(batch);
+        if (!decoded) {
+            fprintf(stderr, "test_prompt_kept : %s: decode failed\n", what);
+            return false;
+        }
+        for (const int32_t i : out_rows) {
+            const float * l_ref  = llama_get_logits_ith(ctx_ref, i);
+            const float * l_kept = llama_get_logits_ith(ctx_kept, i);
+            if (l_ref == nullptr || l_kept == nullptr) {
+                fprintf(stderr, "test_prompt_kept : %s: missing logits at row %d\n", what, i);
+                return false;
+            }
+            for (int t = 0; t < n_vocab; ++t) {
+                max_logits = std::max(max_logits, std::fabs(l_ref[t] - l_kept[t]));
+                if (!(std::fabs(l_ref[t] - l_kept[t]) <= eps)) {
+                    fprintf(stderr, "test_prompt_kept : %s: logits differ at row %d, token %d (%g != %g)\n",
+                            what, i, t, (double) l_ref[t], (double) l_kept[t]);
+                    return false;
+                }
+            }
+        }
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            if (pos[s] == 0) {
+                continue;
+            }
+            const float diff = recurrent_state_diff(ctx_kept, ctx_ref, (llama_seq_id) s);
+            if (!(diff <= state_eps)) {
+                fprintf(stderr, "test_prompt_kept : %s: seq %u state differs from the reference by %g\n", what, s, (double) diff);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    bool ok = true;
+    ok = ok && step("a prompt of one ubatch and a tail",       {104, 0});
+    ok = ok && step("the same shapes: built in slots",          {104, 0});
+    ok = ok && step("a reply row beside another sequence's",    {1, 1});
+    ok = ok && step("the same shapes: reused",                  {104, 0});
+    ok = ok && step("another sequence's prompt",                {0, 70});
+    ok = ok && step("the same shapes after it: reused",         {104, 0});
+    if (!ok) {
+        fprintf(stderr, "%s : the contexts differ\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    const int32_t n_reused_ref  = llama_perf_context(ctx_ref).n_reused;
+    const int32_t n_reused_kept = llama_perf_context(ctx_kept).n_reused;
+    fprintf(stderr, "%s : %s slots: logits max diff %g; graphs reused: %d without the switch, %d with it\n", __func__,
+            n_slots, (double) max_logits, n_reused_ref, n_reused_kept);
+    cleanup();
+    // how many of the later prompts' graphs are reused is the model's (an input that grew rejects a kept graph once)
+    if (reuse_expected && n_reused_kept <= n_reused_ref) {
+        fprintf(stderr, "%s : the switch reused no kept prompt graph\n", __func__);
+        return false;
+    }
+    return true;
+#endif
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -971,6 +1119,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (!test_prompt_shapes(params, model, n_vocab)) {
+        return 1;
+    }
+    if (!test_prompt_kept(params, model, n_vocab, "8", true) || !test_prompt_kept(params, model, n_vocab, "2", false)) {
         return 1;
     }
 

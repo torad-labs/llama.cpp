@@ -2141,8 +2141,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ubatch.n_seq_tokens <= graph_slot_mtp_seq_tokens && ubatch.n_tokens <= graph_slot_max_rows;
     const bool prompt_shape = graph_prompt_shapes && ubatch.n_seqs == 1 && ubatch.n_tokens > graph_slot_max_tokens &&
         ubatch.n_tokens <= graph_prompt_shape_max && (ubatch.n_tokens & (ubatch.n_tokens - 1)) == 0;
-    const bool use_slots = !graph_reuse_disable && (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape || prompt_shape) &&
-        sampling_can_retain();
+    // a shape the slots do not take otherwise, seen before (LLAMA_GRAPH_PROMPT_KEPT): the first sighting is recorded
+    bool   prompt_kept = false;
+    size_t prompt_seen = 0; // its place in graph_prompt_seen
+    if (graph_prompt_kept && graph_shared && !graph_reuse_disable &&
+            ubatch.n_tokens > graph_slot_max_tokens && !mtp_shape && !prompt_shape) {
+        auto seen = std::find_if(graph_prompt_seen.begin(), graph_prompt_seen.end(), [&](const graph_prompt_seen_shape & s) {
+            return s.rows == ubatch.n_tokens && s.seqs == ubatch.n_seqs && s.outputs == (uint32_t) gparams.n_outputs;
+        });
+        if (seen != graph_prompt_seen.end()) {
+            prompt_kept = !seen->no_slot;
+            prompt_seen = seen - graph_prompt_seen.begin();
+            seen->t_seen = graph_clock;
+        } else {
+            const graph_prompt_seen_shape shape = { ubatch.n_tokens, ubatch.n_seqs, (uint32_t) gparams.n_outputs, graph_clock, false };
+            if (graph_prompt_seen.size() < 64) {
+                graph_prompt_seen.push_back(shape);
+            } else {
+                *std::min_element(graph_prompt_seen.begin(), graph_prompt_seen.end(),
+                        [](const graph_prompt_seen_shape & a, const graph_prompt_seen_shape & b) { return a.t_seen < b.t_seen; }) = shape;
+            }
+        }
+    }
+    const bool use_slots = !graph_reuse_disable &&
+        (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape || prompt_shape || prompt_kept) && sampling_can_retain();
 
     bool reuse = !graph_reuse_disable && res->can_reuse(gparams);
     for (size_t i = 0; !reuse && use_slots && i < graph_slots.size(); ++i) {
@@ -2186,8 +2208,55 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // Each retained shape owns its scheduler and input copies. Other shapes use the main scheduler. One more is
         // retained only while the devices keep their reserve (graph_devices_low); with none retained and none to add,
         // the shape uses the main scheduler too.
-        bool devices_low = use_slots && graph_devices_low();
-        if (use_slots) {
+        //
+        // A kept prompt shape is measured before a slot is taken for it, in a result and a scheduler of its own
+        // (graph_measure_res): the measure builds the graph, and built in the slot used least recently it would
+        // overwrite that slot's graph, so a shape that takes no slot would cost another shape its kept graph. It is
+        // held not to the slots' size but to the shared buffers as they are: the main scheduler's, where it holds them
+        // (a plan they do not take would get a buffer of its own, a prompt step's memory a slot). Backends of one
+        // buffer type (the CPU's and BLAS's) have one buffer, whose size a scheduler gives at the first of them only.
+        bool take_slot = use_slots;
+        if (take_slot && prompt_kept) {
+            if (!graph_measure_res) {
+                graph_measure_res.reset(new llm_graph_result(sched_max_nodes));
+            }
+            ggml_backend_sched_ptr measure(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    sched_max_nodes, false, cparams.op_offload));
+            ggml_cgraph * gf_measure = nullptr;
+            {
+                llama_decode_phase_timer t(LLAMA_DECODE_PHASE_BUILD_GRAPH);
+                graph_measure_res->reset();
+                const auto gparams_measure = graph_params(graph_measure_res.get(), ubatch, mctx, gtype, measure.get());
+                gf_measure = model.build_graph(gparams_measure);
+            }
+            if (gf_measure == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            std::vector<size_t> sizes(backend_ptrs.size(), 0);
+            ggml_backend_sched_reserve_size(measure.get(), gf_measure, sizes.data());
+            for (size_t i = 0; i < sizes.size(); ++i) {
+                size_t owner = i;
+                for (size_t j = 0; j < i; ++j) {
+                    if (backend_buft[j] == backend_buft[i]) {
+                        owner = j;
+                        break;
+                    }
+                }
+                const size_t limit = ggml_backend_sched_buffer_is_shared(sched.get(), backend_ptrs[owner]) ?
+                    ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[owner]) : 0;
+                take_slot = take_slot && sizes[i] <= limit;
+            }
+            if (!take_slot) {
+                graph_prompt_seen[prompt_seen].no_slot = true;
+                LLAMA_LOG_WARN("process_ubatch: retained shape with %u rows uses the main scheduler (the shared buffers do "
+                        "not take it)\n", ubatch.n_tokens);
+            }
+            part(us_measure);
+        }
+        bool devices_low = take_slot && graph_devices_low();
+        if (take_slot) {
             if (graph_slots.size() < graph_slots_max && !devices_low) {
                 llama_decode_phase_timer t(LLAMA_DECODE_PHASE_GRAPH_NEW);
                 graph_slots.push_back({
@@ -2200,7 +2269,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
             }
         }
-        if (use_slots && !graph_slots.empty()) {
+        if (take_slot && !graph_slots.empty()) {
             auto & slot = *std::min_element(graph_slots.begin(), graph_slots.end(),
                     [](const graph_slot & a, const graph_slot & b) { return a.t_used < b.t_used; });
             res      = slot.res.get();
@@ -2290,7 +2359,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         part(us_slot);
         ggml_backend_sched_ptr measure;
         const auto retained_sched = sched_gf;
-        if (t_used && ubatch.n_tokens > graph_slot_max_tokens && !prompt_shape) {
+        if (t_used && ubatch.n_tokens > graph_slot_max_tokens && !prompt_shape && !prompt_kept) {
             // A size-only reserve changes allocator state without allocating its buffers.
             measure.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                     sched_max_nodes, false, cparams.op_offload));
@@ -2330,6 +2399,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             fallback("no device memory");
             if (!build()) { ret = GGML_STATUS_FAILED; return nullptr; }
             allocated = ggml_backend_sched_alloc_graph(sched_gf, gf);
+        }
+        // a kept prompt graph stays only in the shared buffers: with a buffer of its own a slot would hold a prompt
+        // step's memory on every device, so one that got one all the same (its plan was measured to fit) goes back
+        // to the main scheduler and its shape is not tried again
+        if (allocated && t_used && prompt_kept) {
+            bool own = false;
+            for (ggml_backend_t backend : backend_ptrs) {
+                own = own || (!ggml_backend_sched_buffer_is_shared(sched_gf, backend) &&
+                        ggml_backend_sched_get_buffer_size(sched_gf, backend) > 0);
+            }
+            if (own) {
+                graph_prompt_seen[prompt_seen].no_slot = true;
+                for (ggml_backend_t backend : backend_ptrs) {
+                    ggml_backend_synchronize(backend);
+                }
+                fallback("a kept prompt graph did not fit the shared buffers");
+                if (!build()) { ret = GGML_STATUS_FAILED; return nullptr; }
+                allocated = ggml_backend_sched_alloc_graph(sched_gf, gf);
+            }
         }
         if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);

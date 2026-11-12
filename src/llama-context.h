@@ -528,6 +528,24 @@ private:
     // beside replies is replayed where every prompt of another length built a graph
     const bool     graph_prompt_shapes    = ggml_env_switch("LLAMA_PROMPT_SHAPES");
     const uint32_t graph_prompt_shape_max = llama_prompt_shape_max();
+    // LLAMA_GRAPH_PROMPT_KEPT=1, read when the context is made: a ubatch the slots do not take otherwise (a prompt's
+    // rows, over graph_slot_max_tokens) keeps its graph in a slot once its shape has come before. A prompt step's
+    // share comes again and again (1,024 rows of one prompt, 512 of each of two), and on the main scheduler, which
+    // holds one graph, each was built again and run uncaptured: 110 of the 229 builds in the turns of 23 sessions of
+    // 20,000 tokens on four RTX PRO 6000 (Nov 11, 2026), over 35 shapes. A shape seen once, as a prompt's tail is,
+    // takes no slot. Only in the shared buffers (graph_shared): a shape is measured before a slot is taken for it, in
+    // graph_measure_res, and one whose graph does not fit the main scheduler's buffers as they are stays on the main
+    // scheduler (no_slot), the slots as they were
+    const bool graph_prompt_kept = ggml_env_switch("LLAMA_GRAPH_PROMPT_KEPT");
+    struct graph_prompt_seen_shape {
+        uint32_t rows;
+        uint32_t seqs;
+        uint32_t outputs;
+        uint64_t t_seen;
+        bool     no_slot;
+    };
+    std::vector<graph_prompt_seen_shape> graph_prompt_seen; // the last shapes of such ubatches, at most 64
+    llm_graph_result_ptr graph_measure_res;                 // where such a shape is measured, made at the first
     uint32_t graph_slot_mtp_seq_tokens = 0;
     uint32_t graph_slot_max_rows = graph_slot_max_tokens;
     std::vector<size_t> graph_slot_buf_limit;
