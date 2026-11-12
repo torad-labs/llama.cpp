@@ -319,8 +319,10 @@ private:
                 next.second.resize(n_dft);
             }
             lock.lock();
-            if (fill && kept.size() < n_keep) {
-                kept.push_back(std::move(next));
+            if (fill) {
+                // the pool may have been filled meanwhile: a pair it has no room for is freed by the next round, unlocked
+                auto & list = kept.size() < n_keep ? kept : dropped;
+                list.push_back(std::move(next));
             }
         }
     }
