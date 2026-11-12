@@ -17,6 +17,10 @@
 // of 8), so each is captured once, the second time round, and replayed from the third. Then sixteen in turn (128
 // nodes): the nodes held reach the cap and never pass it. Under a cap of 8 graphs the twelve are evicted before their
 // turn comes round again and captured anew every time; without the cap on the nodes all sixteen are held.
+// The four graphs captured past the cap each take the executable of the graph evicted for it, updated to the new
+// capture instead of a new one instantiated (the graphs are alike but for their rows), and so do the four that return
+// two rounds later: eight recycled, every output still exact. With `nodes-legacy` (GGML_CUDA_GRAPH_RECYCLE_LEGACY=1)
+// none is recycled and the same graphs are captured.
 //
 // A control first computes one shape three times: a device that does not capture it does not use CUDA graphs and is
 // skipped.
@@ -44,6 +48,7 @@ static constexpr int n_halvings = 8;   // the nodes of each graph with `nodes`
 
 struct graph_log {
     int    captured  = 0;
+    int    recycled  = 0; // "CUDA graph executable recycled": an evicted graph's executable updated to a new capture
     size_t held_max  = 0; // "N CUDA graphs held at most", the most the backend reported
     size_t nodes_max = 0; // "..., K nodes"
     size_t held_lines = 0;
@@ -53,6 +58,9 @@ static void log_callback(ggml_log_level level, const char * text, void * user_da
     graph_log * log = (graph_log *) user_data;
     if (strstr(text, "CUDA graph warmup complete")) {
         log->captured++;
+    }
+    if (strstr(text, "CUDA graph executable recycled")) {
+        log->recycled++;
     }
     if (const char * held = strstr(text, "CUDA graphs held at most")) {
         log->held_lines++;
@@ -321,7 +329,8 @@ static std::string join(const std::vector<int> & v) {
 }
 
 int main(int argc, char ** argv) {
-    const bool nodes = argc > 1 && strcmp(argv[1], "nodes") == 0;
+    const bool nodes_legacy = argc > 1 && strcmp(argv[1], "nodes-legacy") == 0;
+    const bool nodes = nodes_legacy || (argc > 1 && strcmp(argv[1], "nodes") == 0);
     const bool idle  = argc > 1 && strcmp(argv[1], "idle") == 0;
     const bool no_idle = argc > 1 && strcmp(argv[1], "no-idle") == 0;
     const bool no_mem_stats = argc > 1 && strcmp(argv[1], "no-mem-stats") == 0;
@@ -341,6 +350,7 @@ int main(int argc, char ** argv) {
     set_env("GGML_CUDA_GRAPH_MAX", nodes ? nullptr : cap_env.c_str());
     set_env("GGML_CUDA_GRAPH_NODES", nodes ? cap_nodes_env.c_str() : nullptr);
     set_env("GGML_CUDA_GRAPH_MEM_STATS", no_mem_stats ? "0" : nullptr);
+    set_env("GGML_CUDA_GRAPH_RECYCLE_LEGACY", nodes_legacy ? "1" : nullptr);
 
     ggml_backend_load_all();
 
@@ -396,11 +406,12 @@ int main(int argc, char ** argv) {
             bool values = true;
             const std::vector<int> each = compute_rounds(dev, log, { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, 5, values);
             const bool replayed = each == std::vector<int>{ 0, 12, 0, 0, 0 };
-            const bool all_held = log.held_max == 12 && log.nodes_max == 12 * n_halvings;
+            const bool all_held = log.held_max == 12 && log.nodes_max == 12 * n_halvings && log.recycled == 0;
             ok &= values && replayed && all_held;
             printf("  captures each time round %s (0 12 0 0 0 expected), held at most %zu graphs of %zu nodes (12 of "
-                   "%d expected), outputs %s: %s\n", join(each).c_str(), log.held_max, log.nodes_max,
-                   12 * n_halvings, values ? "exact" : "WRONG", values && replayed && all_held ? "ok" : "FAILED");
+                   "%d expected), %d executables recycled (0 expected), outputs %s: %s\n", join(each).c_str(),
+                   log.held_max, log.nodes_max, 12 * n_halvings, log.recycled, values ? "exact" : "WRONG",
+                   values && replayed && all_held ? "ok" : "FAILED");
 
             // sixteen do not: the nodes held reach the cap and never pass it
             printf(" sixteen shapes in turn, four times round, under a cap of %d nodes:\n", cap_nodes);
@@ -408,10 +419,17 @@ int main(int argc, char ** argv) {
             const std::vector<int> over = compute_rounds(dev, log,
                     { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, 4, values);
             const bool under_cap = log.nodes_max <= (size_t) cap_nodes && log.nodes_max > (size_t) (cap_nodes - n_halvings);
-            ok &= values && under_cap;
-            printf("  captures each time round %s, held at most %zu graphs of %zu nodes (at most %d, more than %d "
-                   "expected), outputs %s: %s\n", join(over).c_str(), log.held_max, log.nodes_max, cap_nodes,
-                   cap_nodes - n_halvings, values ? "exact" : "WRONG", values && under_cap ? "ok" : "FAILED");
+            // twelve are held; the four captured past them the second time round each evict one, and those four are
+            // captured again the fourth time round, evicting four more: sixteen and four captures, eight of them into
+            // an evicted graph's executable
+            const bool captures = over == std::vector<int>{ 0, 16, 0, 4 };
+            const int  recycled_expected = nodes_legacy ? 0 : 8;
+            const bool recycled = log.recycled == recycled_expected;
+            ok &= values && under_cap && captures && recycled;
+            printf("  captures each time round %s (0 16 0 4 expected), held at most %zu graphs of %zu nodes (at most %d, "
+                   "more than %d expected), %d executables recycled (%d expected), outputs %s: %s\n", join(over).c_str(),
+                   log.held_max, log.nodes_max, cap_nodes, cap_nodes - n_halvings, log.recycled, recycled_expected,
+                   values ? "exact" : "WRONG", values && under_cap && captures && recycled ? "ok" : "FAILED");
         }
         n_tested++;
     }
