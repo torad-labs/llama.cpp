@@ -1569,6 +1569,8 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
 // sequence that passes it scores more pools by as many rows as the reserve holds, so its graph is allocated when it
 // comes, and the logits are the unlimited pool's again. LLAMA_KV_PAD_PREFILL=256 goes with it here: at its default of
 // 8,192 cells the widest padding is this 8,192-cell pool's pools and the reserve stays the pool's.
+// Cell capacity must not move a step across the direct-index cutoff. Both capacity modes keep this pool's 2,048-cell
+// view below the 4,096-cell floor, with no direct indices and the same logits.
 static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
@@ -1602,15 +1604,18 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         int32_t            n_reused = 0;
         std::set<int64_t>  n_kv;       // the cache lengths the steps' graphs read
         bool               patched = false; // a step's graph wrote the bank's changes
+        bool               direct  = false; // a step's attention read through indices
     };
     struct seen_nodes {
         std::set<int64_t> n_kv;
         bool              patched = false;
+        bool              direct  = false;
     };
 
     const auto read = [&](bool legacy, bool mtp, bool packed = false, bool writes = false, bool unified = true,
-            const char * seq_cells = nullptr) {
+            const char * seq_cells = nullptr, bool cells_legacy = false) {
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", legacy ? "1" : nullptr);
+        set_env("LLAMA_KV_CELL_CAPACITY_LEGACY", cells_legacy ? "1" : nullptr);
         set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", packed ? "1" : nullptr);
         set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", writes ? "1" : nullptr);
         set_env("LLAMA_KV_SEQ_CELLS", seq_cells);
@@ -1626,17 +1631,22 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         params.kv_unified = unified;
         params.n_threads  = params.n_threads_batch = 4;
         params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
-            if (ask && std::string(t->name).rfind("kpool_cand_mask", 0) == 0) {
+            const std::string name = t->name;
+            if (ask && (name.rfind("kpool_cand_mask", 0) == 0 || name == "kpool_mask_cells")) {
                 static_cast<seen_nodes *>(data)->n_kv.insert(t->ne[0]);
             }
-            if (ask && std::string(t->name) == "kpool_resident_patched") {
+            if (ask && name == "kpool_resident_patched") {
                 static_cast<seen_nodes *>(data)->patched = true;
+            }
+            if (ask && name.rfind("kpool_indices", 0) == 0) {
+                static_cast<seen_nodes *>(data)->direct = true;
             }
             return false;
         };
         params.cb_eval_user_data = &seen;
         llama_context_ptr ctx(llama_init_from_model(model, params));
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", nullptr);
+        set_env("LLAMA_KV_CELL_CAPACITY_LEGACY", nullptr);
         set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", nullptr);
         set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", nullptr);
         set_env("LLAMA_KV_SEQ_CELLS", nullptr);
@@ -1677,6 +1687,7 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         res.n_reused = llama_perf_context(ctx.get()).n_reused - n_reused_prompt;
         res.n_kv     = n_kv;
         res.patched  = seen.patched;
+        res.direct   = seen.direct;
         return res;
     };
 
@@ -1733,6 +1744,7 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         const read_result writes = read(false, mtp, false, true);
         const read_result alone  = read(false, mtp, false, false, false);
         const read_result limit  = read(false, mtp, false, false, true, "256");
+        const read_result cells  = read(false, mtp, false, false, true, nullptr, true);
 
         const std::vector<float> long_whole = read_long(mtp, nullptr);
         const std::vector<float> long_limit = read_long(mtp, "256");
@@ -1740,10 +1752,12 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         // 256 cells a sequence: 2,048, which the 1,088 cells never cross, and their pools never cross a quarter of it. The
         // first step builds its graph (another length than the prompt's decodes); every later step reuses it. The
         // prompt's own reuses are not counted. Padded to 256, the pool crosses at
-        // steps 6, 17, 27 and 38 (272, 536, 776 and 1,040 cells), and each builds again
+        // steps 6, 17, 27 and 38 (272, 536, 776 and 1,040 cells), and each builds again. The cells viewed are the
+        // pool's 2,048 in both capacity modes, below the direct-index cutoff's 4,096-cell floor
         const int want_shared     = n_steps - 1;
         const int want_legacy_max = want_shared - 4;
-        const std::set<int64_t> want_n_kv = { 2048 };
+        const std::set<int64_t> want_n_kv       = { 2048 };
+        const std::set<int64_t> want_n_kv_cells = { 2048 };
         const int64_t want_n_kv_legacy = GGML_PAD(n_seq*n_pos, 256);
 
         bool ok = true;
@@ -1759,6 +1773,15 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
                     legacy.n_kv.empty() ? -1LL : (long long) *legacy.n_kv.rbegin(), (long long) want_n_kv_legacy);
             ok = false;
         }
+        if (cells.n_reused != want_shared || cells.n_kv != want_n_kv_cells || shared.direct || cells.direct) {
+            LOG_ERR("GLM shared pool reuse: mtp=%d: with LLAMA_KV_CELL_CAPACITY_LEGACY=1 the steps reused %d graphs (want %d) "
+                    "over %zu cache lengths up to %lld (want 2048 alone), default/legacy through indices %d/%d (want 0/0: under 4,096 cells)\n",
+                    mtp, cells.n_reused, want_shared, cells.n_kv.size(),
+                    cells.n_kv.empty() ? -1LL : (long long) *cells.n_kv.rbegin(), shared.direct, cells.direct);
+            ok = false;
+        }
+        LOG_INF("GLM shared pool reuse: mtp=%d: attention through indices at 2,048 cells: default %d, legacy %d\n",
+                mtp, shared.direct, cells.direct);
         if (limit.n_reused != shared.n_reused || limit.n_kv != shared.n_kv) {
             LOG_ERR("GLM shared pool reuse: mtp=%d: under LLAMA_KV_SEQ_CELLS=256 the steps reused %d graphs (want %d) over "
                     "%zu cache lengths (want %zu)\n", mtp, limit.n_reused, shared.n_reused, limit.n_kv.size(), shared.n_kv.size());
@@ -1778,7 +1801,8 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         for (const auto & other : { std::make_pair("padded to 256", &legacy), std::make_pair("with packed maps", &packed),
                 std::make_pair("whose bank is written a change a write", &writes),
                 std::make_pair("of a cache a sequence", &alone),
-                std::make_pair("under LLAMA_KV_SEQ_CELLS=256", &limit) }) {
+                std::make_pair("under LLAMA_KV_SEQ_CELLS=256", &limit),
+                std::make_pair("with LLAMA_KV_CELL_CAPACITY_LEGACY=1", &cells) }) {
             const bool exact = on_cpu && other.second != &packed;
             if (exact && other.second->logits != shared.logits) {
                 LOG_ERR("GLM shared pool reuse: mtp=%d: logits differ from the pool %s, nmse=%g\n", mtp, other.first,
