@@ -150,6 +150,7 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-recurrent-rollback-rounding.cpp)
+llama_build(test-recurrent-state-async.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -285,6 +286,29 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
+    )
+    # a recurrent state saved and restored with the async calls; gathered: a decode takes the first rows for its
+    # sequences, so the saved or restored sequence's row moves
+    foreach(model glm5next-moe qwen35-dense)
+        llama_test(
+            test-recurrent-state-async
+            NAME test-recurrent-state-async-${model}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf"
+        )
+        set_tests_properties(test-recurrent-state-async-${model} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
+    llama_test(
+        test-recurrent-state-async
+        NAME test-recurrent-state-async-glm5next-moe-gathered
+        LABEL main
+        ARGS -m "${MODEL_DIR}/glm5next-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-async-glm5next-moe-gathered PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        ENVIRONMENT "LLAMA_GRAPH_ANY_SEQS=1"
     )
     # DeepSeek V4's memory serializes its own layout, which the test does not read
     foreach(model qwen35-dense nemotron_h-dense)

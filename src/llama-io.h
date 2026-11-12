@@ -14,6 +14,12 @@ public:
     virtual void write(const void * src, size_t size) = 0;
     virtual void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
 
+    // write_tensor for rows that do not stay where they are: a recurrent state's, which the next decode moves or writes
+    // over, a decode of other sequences included. A writer that copies its tensors later copies these before it returns
+    virtual void write_tensor_now(ggml_tensor * tensor, size_t offset, size_t size) {
+        write_tensor(tensor, offset, size);
+    }
+
     // bytes written so far
     virtual size_t n_bytes() = 0;
 
@@ -27,6 +33,11 @@ public:
 
     virtual void read(void * dst, size_t size) = 0;
     virtual void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
+
+    // read_tensor for rows that do not stay where they are, as write_tensor_now
+    virtual void read_tensor_now(ggml_tensor * tensor, size_t offset, size_t size) {
+        read_tensor(tensor, offset, size);
+    }
 
     // bytes read so far
     virtual size_t n_bytes() = 0;
