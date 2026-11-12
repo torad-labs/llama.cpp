@@ -231,6 +231,113 @@ static bool checkpoint_spare_legacy() {
     return legacy;
 }
 
+// LLAMA_CHECKPOINT_POOL_LEGACY=1: a slot keeps one spare of its own, every other dropped checkpoint's buffers are freed
+// on the server's thread, and a checkpoint without a spare allocates its buffers there
+static bool checkpoint_pool_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_CHECKPOINT_POOL_LEGACY");
+    return legacy;
+}
+
+// The state buffers context checkpoints are copied into, for every slot: those of dropped checkpoints, and new ones a
+// thread of its own maps and zeroes before they are needed. A new buffer costs its page faults and zeroing, and a
+// dropped one its unmapping, with every slot waiting: on four RTX PRO 6000 with GLM-5.3 Flash, 146 MiB a checkpoint,
+// 81.7 ms into a new buffer and 18.6 ms into a used one (Nov 12, 2026). A slot's own spare covered a checkpoint that
+// replaces one; a slot whose list still grows, or that dropped its whole list for a new conversation, had none.
+class checkpoint_buffers {
+public:
+    // n_keep: the pairs kept ready at most
+    explicit checkpoint_buffers(size_t n_keep) : n_keep(n_keep), worker([this]() { run(); }) {}
+
+    ~checkpoint_buffers() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        cv.notify_all();
+        worker.join();
+    }
+
+    // a dropped checkpoint's buffers: kept for the next checkpoint while there is room, freed by the worker otherwise
+    void give(std::vector<uint8_t> & tgt, std::vector<uint8_t> & dft) {
+        if (tgt.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto & list = kept.size() < n_keep ? kept : dropped;
+            list.emplace_back();
+            list.back().first.swap(tgt);
+            list.back().second.swap(dft);
+        }
+        cv.notify_one();
+    }
+
+    // buffers for a new checkpoint, which resizes them to its state: false when none is kept, and the checkpoint
+    // allocates its own
+    bool take(std::vector<uint8_t> & tgt, std::vector<uint8_t> & dft) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (kept.empty()) {
+            return false;
+        }
+        tgt.swap(kept.back().first);
+        dft.swap(kept.back().second);
+        kept.pop_back();
+        return true;
+    }
+
+    // the sizes of the checkpoint just made: the worker fills the pool with buffers of these
+    void made(size_t n_tgt, size_t n_dft) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            size_tgt = n_tgt;
+            size_dft = n_dft;
+        }
+        cv.notify_one();
+    }
+
+private:
+    using pair = std::pair<std::vector<uint8_t>, std::vector<uint8_t>>;
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            cv.wait(lock, [this]() { return stop || !dropped.empty() || (size_tgt > 0 && kept.size() < n_keep); });
+            if (stop) {
+                return;
+            }
+            std::vector<pair> freed;
+            freed.swap(dropped);
+            const bool   fill  = size_tgt > 0 && kept.size() < n_keep;
+            const size_t n_tgt = size_tgt;
+            const size_t n_dft = size_dft;
+            lock.unlock();
+            freed.clear();
+            pair next;
+            if (fill) {
+                // value-initialised: every page is mapped and zeroed here
+                next.first.resize(n_tgt);
+                next.second.resize(n_dft);
+            }
+            lock.lock();
+            if (fill && kept.size() < n_keep) {
+                kept.push_back(std::move(next));
+            }
+        }
+    }
+
+    const size_t n_keep;
+
+    std::mutex              mutex;
+    std::condition_variable cv;
+    std::vector<pair>       kept;
+    std::vector<pair>       dropped;
+    size_t                  size_tgt = 0;
+    size_t                  size_dft = 0;
+    bool                    stop     = false;
+
+    std::thread worker; // last: it uses every member above
+};
+
 // LLAMA_SPEC_PROMPT_COPY_LEGACY=1: every draft round copies the prompt's text tokens for the drafters, even when the
 // slot's list is text only
 static bool spec_prompt_copy_legacy() {
@@ -279,9 +386,19 @@ struct server_slot {
     std::vector<uint8_t> ckpt_spare_tgt;
     std::vector<uint8_t> ckpt_spare_dft;
 
-    // keeps a checkpoint's buffers as the spare before the checkpoint is dropped, unless one is kept already
+    // the server's buffers for context checkpoints; null: the slot keeps the spare above, as before there was a pool
+    checkpoint_buffers * ckpt_buffers = nullptr;
+
+    // before a checkpoint is dropped: its buffers go to the server's pool, or become the slot's spare unless it has one
     void checkpoint_spare(common_prompt_checkpoint & ckpt) {
-        if (checkpoint_spare_legacy() || !ckpt_spare_tgt.empty()) {
+        if (checkpoint_spare_legacy()) {
+            return;
+        }
+        if (ckpt_buffers) {
+            ckpt_buffers->give(ckpt.data_tgt, ckpt.data_dft);
+            return;
+        }
+        if (!ckpt_spare_tgt.empty()) {
             return;
         }
         ckpt_spare_tgt.swap(ckpt.data_tgt);
@@ -345,7 +462,11 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
         common_speculative_set_state(spec, id, {}); // the cells a kept row belongs to are gone
 
-        if (!prompt.checkpoints.empty()) {
+        if (ckpt_buffers) {
+            for (auto & ckpt : prompt.checkpoints) {
+                checkpoint_spare(ckpt);
+            }
+        } else if (!prompt.checkpoints.empty()) {
             checkpoint_spare(prompt.checkpoints.back());
         }
 
@@ -1071,6 +1192,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // the slots' buffers for context checkpoints (null with LLAMA_CHECKPOINT_POOL_LEGACY or without checkpoints)
+    std::unique_ptr<checkpoint_buffers> ckpt_buffers;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1459,6 +1583,12 @@ private:
             slots.emplace_back();
         }
 
+        // one pair of checkpoint buffers a slot kept ready: a step in which every slot takes a checkpoint finds them
+        ckpt_buffers.reset();
+        if (params_base.n_ctx_checkpoints > 0 && !checkpoint_spare_legacy() && !checkpoint_pool_legacy()) {
+            ckpt_buffers = std::make_unique<checkpoint_buffers>(params_base.n_parallel);
+        }
+
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
@@ -1489,6 +1619,8 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
+
+            slot.ckpt_buffers = ckpt_buffers.get();
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -2920,9 +3052,15 @@ private:
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
-        // the spare buffers, if the slot keeps any: update_tgt and update_dft resize them to the state and copy it in
-        cur.data_tgt.swap(slot.ckpt_spare_tgt);
-        cur.data_dft.swap(slot.ckpt_spare_dft);
+        // buffers the pool keeps, or the slot's spare: update_tgt and update_dft resize them to the state and copy it in
+        bool kept = false;
+        if (slot.ckpt_buffers) {
+            kept = slot.ckpt_buffers->take(cur.data_tgt, cur.data_dft);
+        } else {
+            kept = !slot.ckpt_spare_tgt.empty();
+            cur.data_tgt.swap(slot.ckpt_spare_tgt);
+            cur.data_dft.swap(slot.ckpt_spare_dft);
+        }
 
         cur.id_task = id_task;
         cur.pinned  = pinned;
@@ -2937,10 +3075,14 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        if (slot.ckpt_buffers) {
+            slot.ckpt_buffers->made(cur.data_tgt.size(), cur.data_dft.size());
+        }
+
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %s buffers)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, kept ? "kept" : "new");
     }
 
     // returns false to decline the task, it is offered again after the decode is done
