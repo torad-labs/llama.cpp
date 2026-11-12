@@ -2568,6 +2568,13 @@ static void copy_tensor_async_rows(
     }
 }
 
+// LLAMA_OUTPUT_ROWS_WHOLE_LEGACY=1: a ubatch that gives candidates and holds one row read whole copies every row whole
+// and reorders every row, as it did before only the rows read whole were copied (decode, output_reorder)
+static bool output_rows_whole_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_OUTPUT_ROWS_WHOLE_LEGACY");
+    return legacy;
+}
+
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
@@ -2875,11 +2882,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // candidates in place of the rows (llama_set_output_candidates): the rows are copied only when a sequence of
         // the ubatch reads them whole
         bool rows_whole = true;
+        bool rows_cand  = false; // the graph gives candidates, so only the rows named whole below are read whole
         if (ggml_tensor * t_cand = res->get_cand(); t_cand && n_outputs > 0) {
             GGML_ASSERT(cand.records.has_data() && t_cand->ne[0] == cand.k && t_cand->ne[0]*t_cand->ne[1] == cand.n_record &&
                     t_cand->ne[2] == n_outputs);
 
             rows_whole = false;
+            rows_cand  = true;
             uint32_t row = n_outputs_prev;
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 if (!ubatch.output[i]) {
@@ -2907,7 +2916,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                // Beside candidates, only the rows of the sequences that read them whole are copied, in runs. One such
+                // sequence in a ubatch copied every row: a server slot whose grammar constrains (a tool call, from its
+                // start to the end of the turn) reads its rows whole, so one session of 23 inside a tool call put all
+                // 69 rows of 154,880 logits (43 MB) back on every step. A row read as candidates is never read from
+                // this buffer (get_logits_ith refuses it). LLAMA_OUTPUT_ROWS_WHOLE_LEGACY=1 copies every row
+                if (rows_cand && !output_rows_whole_legacy()) {
+                    const size_t row_size = (size_t) n_vocab*sizeof(float);
+                    for (int64_t r = 0; r < n_outputs; ) {
+                        if (cand.state[n_outputs_prev + r] != candidates_info::ROW_WHOLE) {
+                            ++r;
+                            continue;
+                        }
+                        int64_t e = r + 1;
+                        while (e < n_outputs && cand.state[n_outputs_prev + e] == candidates_info::ROW_WHOLE) {
+                            ++e;
+                        }
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out + r*n_vocab, r*row_size, (e - r)*row_size);
+                        r = e;
+                    }
+                } else {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
                 logits_valid = true;
             }
         }
@@ -3368,7 +3398,10 @@ void llama_context::output_reorder() {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
-        if (logits.size > 0 && logits_valid) {
+        // two rows read as candidates hold nothing in the logits buffer (decode copies only the rows read whole)
+        const bool rows_unread = !cand.state.empty() && !output_rows_whole_legacy() &&
+            cand.state[i0] != candidates_info::ROW_WHOLE && cand.state[i1] != candidates_info::ROW_WHOLE;
+        if (logits.size > 0 && logits_valid && !rows_unread) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
