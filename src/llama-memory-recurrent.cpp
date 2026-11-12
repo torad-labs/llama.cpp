@@ -663,7 +663,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     return success;
 }
 
-bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch, bool allow_relocate) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
@@ -815,7 +815,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     }
 
     // relocate: the set is gathered at the first cell, and what it displaces lies up to the highest cell it held
-    if (relocate) {
+    if (relocate && allow_relocate) {
         min = 0;
         max = std::max<int32_t>(max, (int32_t) n_seqs - 1);
     }
@@ -905,7 +905,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // relocate: only a state another sequence keeps past the set's cells has to move (a state of the set is read from
     // the cell it was in and written to the cell it takes); with none, the decode's graph has the set's cells alone
-    if (relocate) {
+    if (relocate && allow_relocate) {
         for (int i = (int) n_seqs; i <= max; ++i) {
             relocate_pending = relocate_pending || (!cells[i].is_empty() && cells[i].src0 != i);
         }
@@ -1380,7 +1380,8 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
         ubatch.n_seq_id[0] = 1;
         ubatch.seq_id[0] = &dest_seq_id;
 
-        if (!find_slot(ubatch)) {
+        // No decode follows a restore to move any displaced states.
+        if (!find_slot(ubatch, /*allow_relocate =*/ false)) {
             LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
             return false;
         }

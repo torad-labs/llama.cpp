@@ -494,6 +494,32 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
                llama_memory_seq_rm(llama_get_memory(ctx_any), (llama_seq_id) seq, -1, -1);
     };
 
+    const auto restore = [&](uint32_t seq, llama_state_seq_flags flags) {
+        for (llama_context * ctx : {ctx_ref, ctx_any}) {
+            std::vector<std::vector<float>> before;
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                before.push_back(recurrent_state(ctx, (llama_seq_id) s));
+            }
+            std::vector<uint8_t> saved(llama_state_seq_get_size_ext(ctx, (llama_seq_id) seq, flags));
+            if (saved.empty() ||
+                llama_state_seq_get_data_ext(ctx, saved.data(), saved.size(), (llama_seq_id) seq, flags) != saved.size() ||
+                llama_state_seq_set_data_ext(ctx, saved.data(), saved.size(), (llama_seq_id) seq, flags) != saved.size()) {
+                fprintf(stderr, "%s : seq %u state round trip failed\n", __func__, seq);
+                return false;
+            }
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                const auto after = recurrent_state(ctx, (llama_seq_id) s);
+                if (after.size() != before[s].size() ||
+                    std::memcmp(after.data(), before[s].data(), after.size()*sizeof(float)) != 0) {
+                    fprintf(stderr, "%s : restoring seq %u changed seq %u state (%s, flags %u)\n",
+                            __func__, seq, s, ctx == ctx_any ? "any sequences" : "reference", (unsigned) flags);
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
     bool ok = true;
     ok = ok && step("three sequences' prompts",                       {6, 6, 6, 0});
     ok = ok && step("the same set",                                   {1, 1, 1, 0});
@@ -517,6 +543,18 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
     ok = ok && clear(1);
     ok = ok && step("a cleared sequence starts again beside another", {0, 3, 0, 3});
     ok = ok && step("all four again",                                 {1, 1, 1, 1});
+    // A restore must preserve other sequences' current states and rollback snapshots.
+    for (const llama_state_seq_flags flags : {llama_state_seq_flags(0), llama_state_seq_flags(LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)}) {
+        for (int cycle = 0; ok && cycle < 3; ++cycle) {
+            ok = ok && step("states before cache exchange", {3, 3, 3, 3});
+            ok = ok && rollback(0, 1);
+            ok = ok && rollback(1, 1);
+            ok = ok && restore(1, flags);
+            ok = ok && restore(2, flags);
+            ok = ok && rollback(3, 1);
+            ok = ok && step("continue after cache exchange", {2, 2, 1, 2});
+        }
+    }
     if (!ok) {
         fprintf(stderr, "%s : the contexts differ, or a rollback or removal was refused\n", __func__);
         cleanup();
