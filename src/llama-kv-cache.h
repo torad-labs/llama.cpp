@@ -207,10 +207,13 @@ public:
     // the cells a graph attends: the cache's used cells padded to 256, or, for a step of at least 256 rows whose pooled
     // indexer scores, to n_pad_prefill (LLAMA_KV_PAD_PREFILL), so a prompt read in equal steps builds its graph once every
     // n_pad_prefill cells instead of every step; in a pool that sequences share, a scoring step of any length is padded
-    // to at least n_pad_shared and a dense one to a power of two. n_pad_used, when given, receives the padding applied
-    uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens = 0, uint32_t * n_pad_used = nullptr) const;
+    // to at least n_pad_shared and a dense one to a power of two. Shared scoring uses a separate cell capacity once
+    // the old span meets every row count's direct-index cutoff; ubatch supplies its tail bound. Without it, keep the old span.
+    // n_pad_used and n_kv_pool receive the original padding and span used to size the indexer's pools
+    uint32_t get_n_kv(const slot_info & sinfo, const llama_ubatch * ubatch = nullptr, uint32_t * n_pad_used = nullptr,
+            uint32_t * n_kv_pool = nullptr) const;
 
-    // the widest padding get_n_kv applies to a step of this cache
+    // the widest padding used to size the indexer's pools
     uint32_t get_n_pad_max() const;
 
     // get views of the current state of the cache
@@ -319,6 +322,9 @@ private:
     // indexer; 0 for any other model, for a pool of one sequence, or with LLAMA_KV_PAD_SHARED_LEGACY=1 when the cache is
     // made
     uint32_t n_pad_shared = 0;
+
+    // Shared scoring cell capacity, independent of pool padding; LLAMA_KV_CELL_CAPACITY_LEGACY keeps the old span.
+    uint32_t n_pad_cells = 0;
 
     // a pool that sequences share is padded to a power of two while it reads densely (get_n_kv); false for a pool of one
     // sequence or with LLAMA_KV_PAD_DENSE_LEGACY=1 when the cache is made
@@ -476,7 +482,10 @@ public:
 
     uint32_t get_n_kv() const;
 
-    // the padding get_n_kv applied for the current ubatch: 256, or the cache's prompt-step padding
+    // The indexer's pool span before cell-capacity padding.
+    uint32_t get_n_kv_pool() const;
+
+    // The padding of the indexer's pool span for the current ubatch.
     uint32_t get_n_pad() const;
 
     // the stream RANGE s1 - s0 + 1 that get_k/get_v use as `ns`, not n_seqs_unq
@@ -564,6 +573,8 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
 
-    // the padding n_kv was given (llama_kv_cache::get_n_kv)
+    uint32_t n_kv_pool = 0;
+
+    // The padding of n_kv_pool (llama_kv_cache::get_n_kv).
     uint32_t n_pad_kv = 256;
 };

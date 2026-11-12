@@ -157,6 +157,9 @@ llama_kv_cache::llama_kv_cache(
         const char * legacy = getenv("LLAMA_KV_PAD_DENSE_LEGACY");
 
         pad_dense_shared = !legacy || atoi(legacy) != 1;
+        if (!ggml_env_switch("LLAMA_KV_CELL_CAPACITY_LEGACY")) {
+            n_pad_cells = std::max(n_pad_shared, 65536u);
+        }
     }
 
     const uint32_t n_layer = hparams.n_layer_all;
@@ -1468,7 +1471,8 @@ uint32_t llama_kv_cache::get_n_pad_max() const {
     return std::max({ std::max(n_pad, 256u), n_pad_prefill, n_pad_shared });
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens, uint32_t * n_pad_used) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * ubatch, uint32_t * n_pad_used,
+        uint32_t * n_kv_pool) const {
     const auto padded = [&](uint32_t pad) {
         uint32_t result = 0;
 
@@ -1492,7 +1496,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens, ui
     // padded to at least n_pad_shared on the same terms. One sequence's decode step, and a step that reads densely in a
     // pool of its own, keep 256
     const bool scores = n_pad_prefill + n_pad_shared > 0 && result > hparams.indexer_top_k + hparams.indexer_kpool - 1;
-    const uint32_t pad_scoring = std::max(n_tokens >= 256 ? n_pad_prefill : 0, n_pad_shared);
+    const uint32_t pad_scoring = std::max(ubatch && ubatch->n_tokens >= 256 ? n_pad_prefill : 0, n_pad_shared);
     if (scores && pad_scoring > pad) {
         pad    = pad_scoring;
         result = padded(pad);
@@ -1510,7 +1514,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens, ui
     if (n_pad_used) {
         *n_pad_used = pad;
     }
+    if (n_kv_pool) {
+        *n_kv_pool = result;
+    }
 
+    // Coarsen only above every row count's staging cutoff (build_inp_kpool). Duplicate positions can widen the tail.
+    if (scores && n_pad_cells > pad && ubatch) {
+        const int64_t tail = std::max<int64_t>(1, llama_kpool_tail_max(
+                [this](llama_seq_id seq) -> const llama_kv_cells & { return get_cells(seq); }, *ubatch, hparams.indexer_kpool));
+        const int64_t cutoff = std::max<int64_t>(4096, 8*llama_kpool_n_kv_max(hparams.indexer_top_k, tail));
+        if (result >= cutoff) {
+            return padded(n_pad_cells);
+        }
+    }
     return result;
 }
 
@@ -3242,7 +3258,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), full(true) {
-    n_kv = kv->get_size();
+    n_kv = n_kv_pool = kv->get_size();
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -3296,7 +3312,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens, &n_pad_kv);
+    n_kv = kv->get_n_kv(sinfos[i_cur], &ubatches[i_cur], &n_pad_kv, &n_kv_pool);
 
     return true;
 }
@@ -3313,6 +3329,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_pool() const {
+    return n_kv_pool;
 }
 
 uint32_t llama_kv_cache_context::get_n_pad() const {

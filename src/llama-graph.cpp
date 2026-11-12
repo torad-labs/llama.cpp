@@ -701,7 +701,8 @@ bool llm_graph_input_kpool::shared_streams(
     const int64_t n_kv    = mctx_attn->get_n_kv();
     const int64_t n_pools = llama_kpool_n_pools_ubatch([kv](llama_seq_id s) -> const llama_kv_cells & {
         return kv->get_cells(s);
-    }, ubatch, n_kv, kpool, ubatch.n_seqs_unq, hparams.indexer_top_k, llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
+    }, ubatch, mctx_attn->get_n_kv_pool(), kpool, ubatch.n_seqs_unq, hparams.indexer_top_k,
+            llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
 
     views.reserve_views(cparams.n_seq_max);
     views.begin();
@@ -738,7 +739,8 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
     dims.n_ps    = ubatch.n_seqs_unq/dims.n_stream;
     dims.n_pools = llama_kpool_n_pools_ubatch([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
         return kv->get_cells(s);
-    }, ubatch, dims.n_kv, kpool, dims.n_stream, hparams.indexer_top_k, llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
+    }, ubatch, mctx_attn->get_n_kv_pool(), kpool, dims.n_stream, hparams.indexer_top_k,
+            llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
     dims.rebuild = mctx_attn->get_kv()->get_kpool_dirty(ubatch);
     dims.n_new_max = dims.rebuild ? dims.n_pools : dims.n_tps/kpool + dims.n_ps;
     dims.n_tail    = llama_kpool_tail_max([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
@@ -4406,7 +4408,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         const int64_t n_pools = mctx_attn->is_full() && cparams.n_seq_cells > 0 ?
                 llama_kpool_n_pools_reserve(n_kv, kpool, n_ps, hparams.indexer_top_k,
                     llama_kpool_pool_pad(mctx_attn->get_kv()->get_n_pad_max(), kpool), cparams.n_seq_cells) :
-                llama_kpool_n_pools_ubatch(cells_of, ubatch, n_kv, kpool, n_stream, hparams.indexer_top_k,
+                llama_kpool_n_pools_ubatch(cells_of, ubatch, mctx_attn->get_n_kv_pool(), kpool, n_stream, hparams.indexer_top_k,
                     llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
         const int64_t n_dump  = llama_kpool_select_k(n_pools, hparams.indexer_top_k, kpool);
 
