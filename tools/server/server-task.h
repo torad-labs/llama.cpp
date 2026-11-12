@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <memory>
 #include <optional>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -602,7 +603,8 @@ struct server_prompt_data {
 
 struct server_prompt_cache_state {
     server_prompt prompt;
-    server_prompt_data data;
+    // shared with a restore that still copies from it (server_prompt_cache::restoring)
+    std::shared_ptr<server_prompt_data> data = std::make_shared<server_prompt_data>();
     // The beginning of the restorable memory, including recurrent/SWA state.
     llama_pos pos_min = 0;
     size_t cached_size = 0;
@@ -611,7 +613,7 @@ struct server_prompt_cache_state {
         if (cached_size != 0) {
             return cached_size;
         }
-        size_t res = data.size();
+        size_t res = data->size();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();
@@ -662,6 +664,15 @@ private:
     size_t total_tokens = 0;
     uint64_t revision = 0;
 
+    // A snapshot a context still copies from (LLAMA_STATE_RESTORE_ASYNC): the copy reads its bytes, so they stay until restore_reap() finds it done, also when the snapshot has left the cache.
+    struct restoring_state {
+        const llama_context * ctx_tgt;
+        const llama_context * ctx_dft;
+        int32_t id_slot;
+        std::shared_ptr<const server_prompt_data> data;
+    };
+    std::list<restoring_state> restoring;
+
     void insert_state(server_prompt_cache_state && state);
     std::list<server_prompt_cache_state>::iterator erase_state(std::list<server_prompt_cache_state>::iterator it);
 
@@ -695,6 +706,9 @@ public:
             llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, bool consume = true);
 
     void update(const server_prompt_cache_state * protect = nullptr);
+
+    // free the snapshots whose copy is done. wait: every copy is waited for first, as before the contexts are freed
+    void restore_reap(bool wait = false);
 };
 
 // used exclusively by router mode

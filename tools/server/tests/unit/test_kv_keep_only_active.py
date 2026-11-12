@@ -134,6 +134,50 @@ def test_clear_and_restore_named_slot():
     assert res.body["timings"]["prompt_n"] < original_prompt_n
 
 
+# LLAMA_STATE_RESTORE_ASYNC=1: the restore's rows are copied on a thread of the context while the server goes on. The
+# returning request reuses as much of its prompt and replies as it does after a blocking restore
+def test_clear_and_restore_async(monkeypatch):
+    global server
+    replies = []
+    for switch in (None, "1"):
+        if switch is None:
+            monkeypatch.delenv("LLAMA_STATE_RESTORE_ASYNC", raising=False)
+        else:
+            monkeypatch.setenv("LLAMA_STATE_RESTORE_ASYNC", switch)
+        server.start()
+        log = LogReader(server.log_path)
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT,
+            "id_slot": 0,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+
+        # Launching slot 1 clears idle slot 0
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "The quick brown fox",
+            "id_slot": 1,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.wait_for("__TEST_TAG_CACHE_IDLE_SLOT__")
+
+        # Slot 0 restores from cache-ram
+        res = server.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT,
+            "id_slot": 0,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        assert res.body["timings"]["cache_n"] > 0
+        assert ("async=1" in log.wait_for("cache_restore reason=restored")) == (switch == "1")
+        replies.append((res.body["content"], res.body["timings"]["cache_n"]))
+        server.stop()
+
+    assert replies[0] == replies[1]
+
+
 # a request for a busy slot waits for it: the prompt cache does not save or replace the slot's state under the running request
 def test_named_busy_slot_left_alone():
     global server

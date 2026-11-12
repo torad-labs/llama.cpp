@@ -6,7 +6,7 @@ struct server_prompt_cache_test_access {
     static void insert(server_prompt_cache & cache, llama_token token) {
         server_prompt_cache_state state;
         state.prompt.tokens.push_back(token);
-        state.data.main.assign(100, 0);
+        state.data->main.assign(100, 0);
         cache.insert_state(std::move(state));
     }
     static size_t count(const server_prompt_cache & cache) { return cache.states.size(); }

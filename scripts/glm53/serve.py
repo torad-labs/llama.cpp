@@ -53,6 +53,9 @@ def arguments(argv=None):
                         "(default: a session may take the whole pool)")
     parser.add_argument("--kept-graphs", type=int, help="tensor-4: graphs a context keeps by shape, 1..256 (default: 128, "
                         "and 32 with --slot-context)")
+    parser.add_argument("--restore-async", action="store_true",
+                        help="A session brought back from the RAM prompt cache copies its rows on a thread of its own while "
+                             "the other sessions decode (opt-in: not read on four cards)")
     parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
@@ -214,6 +217,9 @@ def make_plan(args):
         # of that many, not for one that took every cell: 10 bytes a pool a row, the term that kept the pool for 23
         # sessions of 262144 from loading (docs/torad/glm53-goal.md, cause 3). The engine rounds it up to 256
         env["LLAMA_KV_SEQ_CELLS"] = str(args.slot_context)
+    if args.restore_async:
+        # A restore stops the server's thread only to place the cells; the rows are copied beside the other sessions' steps
+        env["LLAMA_STATE_RESTORE_ASYNC"] = "1"
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
     if args.trace_decode:
