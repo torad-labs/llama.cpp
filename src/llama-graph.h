@@ -1108,8 +1108,10 @@ public:
 
     ggml_context_ptr ctx_compute;
 
-    // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
+    // memory buffers used to evaluate the model. The buffer is for max_nodes tensors and is not written when it is
+    // made: a graph touches the pages of its own nodes only (see reset)
+    std::unique_ptr<uint8_t[]> buf_compute_meta;
+    size_t                     buf_compute_meta_size = 0;
 
     ggml_cgraph * gf;
 
