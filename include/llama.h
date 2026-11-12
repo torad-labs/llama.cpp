@@ -954,8 +954,16 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
-    // llama_state_seq_set_data_ext for a state in host memory, returning once the sequence's cells are placed: a thread of the context then copies the tensor data, and the context can decode other sequences meanwhile. src must stay as it is until llama_state_seq_restore_pending() is false for the sequence.
-    // llama_decode with the sequence in its batch and the llama_state_* calls wait for the copy. The memory API does not: call llama_state_seq_restore_wait() before a llama_memory_* call that removes, copies or shifts the sequence.
+    // llama_state_seq_get_data_ext and llama_state_seq_set_data_ext for a state in host memory, with the tensor data copied by a thread of the context while the context decodes other sequences.
+    // The first returns once the state's layout is written to dst: dst holds the state, and must stay, once llama_state_seq_async_pending() is false for the sequence. The second returns once the sequence's cells are placed: src must stay as it is until then.
+    // llama_decode with the sequence in its batch and the llama_state_* calls wait for the copy, and so does a decode that applies a pending memory update. The memory API does not: call llama_state_seq_async_wait() before a llama_memory_* call that removes, copies or shifts the sequence.
+    LLAMA_API size_t llama_state_seq_get_data_async(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags);
+
     LLAMA_API size_t llama_state_seq_set_data_async(
             struct llama_context * ctx,
                    const uint8_t * src,
@@ -963,9 +971,9 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
-    // seq_id < 0: any sequence
-    LLAMA_API bool llama_state_seq_restore_pending(const struct llama_context * ctx, llama_seq_id seq_id);
-    LLAMA_API void llama_state_seq_restore_wait   (const struct llama_context * ctx, llama_seq_id seq_id);
+    // a copy one of the two started still runs. seq_id < 0: for any sequence
+    LLAMA_API bool llama_state_seq_async_pending(const struct llama_context * ctx, llama_seq_id seq_id);
+    LLAMA_API void llama_state_seq_async_wait   (const struct llama_context * ctx, llama_seq_id seq_id);
 
     //
     // Decoding

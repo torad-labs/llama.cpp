@@ -2646,7 +2646,7 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }
 
-bool ggml_backend_meta_tensor_ranges(ggml_tensor * tensor, size_t offset, size_t size, ggml_backend_meta_range_fn fn, void * userdata) {
+bool ggml_backend_meta_tensor_ranges(ggml_tensor * tensor, size_t offset, size_t size, bool read, ggml_backend_meta_range_fn fn, void * userdata) {
     GGML_ASSERT(tensor != nullptr && tensor->buffer != nullptr && fn != nullptr);
     if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
         fn(tensor, offset, size, 0, userdata);
@@ -2662,7 +2662,7 @@ bool ggml_backend_meta_tensor_ranges(ggml_tensor * tensor, size_t offset, size_t
     if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
         return false;
     }
-    for (size_t j = 0; j < n_bufs; j++) {
+    for (size_t j = 0; j < (read ? 1 : n_bufs); j++) {
         fn(ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size, 0, userdata);
     }
     return true;
