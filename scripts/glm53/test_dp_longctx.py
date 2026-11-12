@@ -192,6 +192,7 @@ class FakeServer:
         self.first_thread = None
         self.tokenize_at = []
         self.chat_at = []
+        self.chat_bodies = []
 
     def __call__(self, request, timeout="unset"):
         route = urllib.parse.urlparse(request.full_url).path
@@ -212,6 +213,7 @@ class FakeServer:
         if route == "/v1/chat/completions":
             with self.lock:
                 self.chat_at.append(time.monotonic())
+                self.chat_bodies.append(body)
             n = chars_by_four(dp_longctx.session_text(body["messages"], body["tools"]))
             return FakeResponse({"choices": [{"message": {"content": "a reply"}, "finish_reason": "stop"}],
                                  "timings": {"prompt_n": n, "cache_n": 0, "prompt_ms": 10.0, "predicted_n": 4,
@@ -250,6 +252,17 @@ class ToolRunTest(unittest.TestCase):
         fake = FakeServer()
         self.assertEqual(self.run_tool(fake, "--streams", "1", "--turns", "1", "--timeout", "120"), 0)
         self.assertEqual(set(fake.timeouts), {120.0})
+
+    def test_server_sampling_sends_no_sampling_field(self):
+        # Claude Code sets no sampling: the read of what it is served with must leave the server's own in place
+        fake = FakeServer()
+        self.assertEqual(self.run_tool(fake, "--streams", "1", "--turns", "2", "--server-sampling"), 0)
+        self.assertEqual(len(fake.chat_bodies), 2)
+        for body in fake.chat_bodies:
+            self.assertEqual(set(body), {"messages", "tools", "max_tokens", "stream"})
+        fake = FakeServer()
+        self.assertEqual(self.run_tool(fake, "--streams", "1", "--turns", "1"), 0)
+        self.assertEqual(fake.chat_bodies[0]["temperature"], 0.0)
 
     def test_the_first_turns_leave_together(self):
         # a burst of Claude Code windows opens at once: no stream sends its first turn while another is still
