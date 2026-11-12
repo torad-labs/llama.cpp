@@ -4615,6 +4615,9 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
+    // the rows written are those a restore may still copy
+    state_restore_wait(-1);
+
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
     // write model info
@@ -4635,6 +4638,9 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    // the cells replaced here are those a restore may still copy to
+    state_restore_wait(-1);
+
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -4661,6 +4667,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // the rows written are those a restore of the sequence may still copy
+    state_restore_wait(seq_id);
+
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -4669,6 +4678,9 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // the cells removed here are those a restore of the sequence may still copy to
+    state_restore_wait(seq_id);
+
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -5766,6 +5778,9 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    // a restore of one of the batch's sequences that still copies is waited for: the decode reads its rows
+    ctx->state_restore_wait(batch);
+
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);

@@ -1751,7 +1751,7 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
     // A longer recurrent snapshot need not be able to roll back to this prompt.
     // Only deduplicate an exact state with at least the same checkpoint coverage.
     for (const auto & state : states) {
-        if (state.data.main.empty() || (ctx_dft && state.data.drft.empty()) ||
+        if (state.data->main.empty() || (ctx_dft && state.data->drft.empty()) ||
                 state.prompt.tokens.size() != prompt.tokens.size() ||
                 state.prompt.tokens.get_common_prefix(prompt.tokens) != prompt.tokens.size() || state.pos_min > pos_min) {
             continue;
@@ -1788,8 +1788,8 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
         const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
         // Serialize the small implementation-specific row before admission, so it
         // is included in the budget rather than appended to an already full cache.
-        common_speculative_get_state(spec, id_slot, pending.data.spec);
-        size_t size_new = pending.data.spec.size();
+        common_speculative_get_state(spec, id_slot, pending.data->spec);
+        size_t size_new = pending.data->spec.size();
         const auto add_size = [&](size_t value) {
             if (value > SIZE_MAX - size_new) {
                 return false;
@@ -1832,11 +1832,11 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
         }
 
         pending.prompt = prompt.clone();
-        pending.data.main.resize(size_tgt);
-        pending.data.drft.resize(size_dft);
-        if (llama_state_seq_get_data_ext(ctx_tgt, pending.data.main.data(), size_tgt, id_slot,
+        pending.data->main.resize(size_tgt);
+        pending.data->drft.resize(size_dft);
+        if (llama_state_seq_get_data_ext(ctx_tgt, pending.data->main.data(), size_tgt, id_slot,
                     LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt ||
-                (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, pending.data.drft.data(), size_dft, id_slot,
+                (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, pending.data->drft.data(), size_dft, id_slot,
                     LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft)) {
             SRV_WRN("cache_save reason=serialization_failed slot=%d bytes=%zu\n", id_slot, size_new);
             return server_prompt_cache_result::failed;
@@ -1895,7 +1895,7 @@ server_prompt_cache_state * server_prompt_cache::find_best(const server_prompt &
     size_t best_reuse = resident_reuse ? *resident_reuse : reusable_prefix(prompt, tokens_new, pos_min, n_swa);
     server_prompt_cache_state * best = nullptr;
     for (auto & state : states) {
-        if (state.data.main.empty()) {
+        if (state.data->main.empty()) {
             continue;
         }
         const size_t lcp = state.prompt.tokens.get_common_prefix(tokens_new);
@@ -1916,8 +1916,15 @@ server_prompt_cache_state * server_prompt_cache::find_best(const server_prompt &
     return best;
 }
 
+// LLAMA_STATE_RESTORE_ASYNC=1: a snapshot restored into a slot returns once its cells are placed, and a thread of the context copies its rows while the other slots decode (llama_state_seq_set_data_async)
+static bool state_restore_async() {
+    static const bool async = ggml_env_switch("LLAMA_STATE_RESTORE_ASYNC");
+    return async;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state * selected,
         llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, bool consume) {
+    restore_reap();
     if (!selected) {
         return true;
     }
@@ -1927,18 +1934,22 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
 
     // Do not consume any bytes until all restores succeed. A failure leaves a
     // complete snapshot available for retry, never a metadata-only cache hit.
-    const auto & data = it->data;
+    const std::shared_ptr<const server_prompt_data> data = it->data;
+    const bool async = state_restore_async();
+    const auto set_data = [&](llama_context * ctx, const std::vector<uint8_t> & bytes) {
+        return async ?
+            llama_state_seq_set_data_async(ctx, bytes.data(), bytes.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) :
+            llama_state_seq_set_data_ext  (ctx, bytes.data(), bytes.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    };
     bool restored = false;
     try {
-        restored = !data.main.empty() && (!ctx_dft || !data.drft.empty()) &&
-                llama_state_seq_set_data_ext(ctx_tgt, data.main.data(), data.main.size(),
-                id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) == data.main.size();
-        if (restored && !data.drft.empty()) {
-            restored = ctx_dft && llama_state_seq_set_data_ext(ctx_dft, data.drft.data(), data.drft.size(),
-                    id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) == data.drft.size();
+        restored = !data->main.empty() && (!ctx_dft || !data->drft.empty()) &&
+                set_data(ctx_tgt, data->main) == data->main.size();
+        if (restored && !data->drft.empty()) {
+            restored = ctx_dft && set_data(ctx_dft, data->drft) == data->drft.size();
         }
         if (restored) {
-            common_speculative_set_state(spec, id_slot, data.spec);
+            common_speculative_set_state(spec, id_slot, data->spec);
         }
     } catch (const std::exception & e) {
         SRV_ERR("cache_restore reason=exception slot=%d error=%s\n", id_slot, e.what());
@@ -1947,8 +1958,11 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
     if (!restored) {
         // Both sequences may have been partially overwritten, including when the
         // target loader itself failed. Clear them together before a fresh prefill.
+        // A target restore that still copies writes to the cells removed here.
+        llama_state_seq_restore_wait(ctx_tgt, id_slot);
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
         if (ctx_dft) {
+            llama_state_seq_restore_wait(ctx_dft, id_slot);
             llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
         }
         common_speculative_set_state(spec, id_slot, {});
@@ -1956,8 +1970,11 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
         SRV_WRN("cache_restore reason=restore_failed slot=%d bytes=%zu retained=1\n", id_slot, it->size());
         return false;
     }
-    SRV_TRC("cache_restore reason=restored slot=%d tokens=%d bytes=%zu consumed=%d\n", id_slot, it->prompt.n_tokens(),
-            it->size(), consume);
+    if (async) {
+        restoring.push_back({ ctx_tgt, ctx_dft, id_slot, data });
+    }
+    SRV_TRC("cache_restore reason=restored slot=%d tokens=%d bytes=%zu consumed=%d async=%d\n", id_slot, it->prompt.n_tokens(),
+            it->size(), consume, async);
     if (consume) {
         GGML_ASSERT(total_bytes >= it->cached_size && total_tokens >= (size_t) it->prompt.n_tokens());
         total_bytes -= it->cached_size;
@@ -1970,6 +1987,20 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
         prompt = it->prompt.clone();
     }
     return true;
+}
+
+void server_prompt_cache::restore_reap(bool wait) {
+    for (auto it = restoring.begin(); it != restoring.end();) {
+        if (wait) {
+            llama_state_seq_restore_wait(it->ctx_tgt, it->id_slot);
+            if (it->ctx_dft) {
+                llama_state_seq_restore_wait(it->ctx_dft, it->id_slot);
+            }
+        }
+        const bool pending = llama_state_seq_restore_pending(it->ctx_tgt, it->id_slot) ||
+            (it->ctx_dft && llama_state_seq_restore_pending(it->ctx_dft, it->id_slot));
+        it = pending ? std::next(it) : restoring.erase(it);
+    }
 }
 
 void server_prompt_cache::update(const server_prompt_cache_state * protect) {

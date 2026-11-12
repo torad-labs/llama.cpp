@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-state-restore.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -178,6 +179,14 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    // state_seq_set_data for a state in host memory that returns once the sequence's cells are placed: state_restore then copies the tensor data from src
+    size_t state_seq_set_data_async(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    // a state_seq_set_data_async that still copies. seq_id < 0: of any sequence
+    bool state_restore_pending(llama_seq_id seq_id) const;
+    void state_restore_wait(llama_seq_id seq_id) const;
+    void state_restore_wait(const llama_batch & batch) const;
 
     bool state_load_file(
             const char * filepath,
@@ -558,6 +567,9 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    // made by the first state_seq_set_data_async. It is declared after the memory and the backends, so its thread ends before they are freed
+    std::unique_ptr<llama_state_restore> state_restore;
 
     bool has_evaluated_once = false;
 

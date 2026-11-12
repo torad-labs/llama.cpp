@@ -954,6 +954,19 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // llama_state_seq_set_data_ext for a state in host memory, returning once the sequence's cells are placed: a thread of the context then copies the tensor data, and the context can decode other sequences meanwhile. src must stay as it is until llama_state_seq_restore_pending() is false for the sequence.
+    // llama_decode with the sequence in its batch and the llama_state_* calls wait for the copy. The memory API does not: call llama_state_seq_restore_wait() before a llama_memory_* call that removes, copies or shifts the sequence.
+    LLAMA_API size_t llama_state_seq_set_data_async(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags);
+
+    // seq_id < 0: any sequence
+    LLAMA_API bool llama_state_seq_restore_pending(const struct llama_context * ctx, llama_seq_id seq_id);
+    LLAMA_API void llama_state_seq_restore_wait   (const struct llama_context * ctx, llama_seq_id seq_id);
+
     //
     // Decoding
     //

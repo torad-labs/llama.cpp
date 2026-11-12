@@ -2646,6 +2646,28 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }
 
+bool ggml_backend_meta_tensor_ranges(ggml_tensor * tensor, size_t offset, size_t size, ggml_backend_meta_range_fn fn, void * userdata) {
+    GGML_ASSERT(tensor != nullptr && tensor->buffer != nullptr && fn != nullptr);
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        fn(tensor, offset, size, 0, userdata);
+        return true;
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    // the split state cache has no lock: it is read here, not by the thread that copies
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    if (ggml_backend_meta_outer_ranges(tensor, split_state, n_bufs, offset, size,
+            [&](size_t rank, size_t local, size_t src, size_t bytes) {
+                fn(ggml_backend_meta_buffer_simple_tensor(tensor, rank), local, bytes, src, userdata);
+            })) { return true; }
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return false;
+    }
+    for (size_t j = 0; j < n_bufs; j++) {
+        fn(ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size, 0, userdata);
+    }
+    return true;
+}
+
 void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buf, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buf));
     for (ggml_backend_buffer_ptr & simple : ((ggml_backend_meta_buffer_context *) buf->context)->bufs) {

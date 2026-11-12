@@ -8,6 +8,8 @@
 // flash attention, f16), V in rows (flash attention, f16), and the served q4_0 rows (flash attention), skipped on a model
 // whose heads are not a whole number of q4_0 blocks wide (the CI model's are 48).
 // LLAMA_KV_RESTORE_PER_CELL_LEGACY=1 runs the same checks on the per-cell copies.
+// Each check runs again with llama_state_seq_set_data_async: the cells are placed at once, sequence 2 decodes while a thread
+// of the context copies the rows, and the save that follows waits for the copy.
 
 #include "llama.h"
 
@@ -48,7 +50,7 @@ static int64_t head_width(const llama_model * model, const char * length) {
     return llama_model_n_embd(model) / llama_model_n_head(model);
 }
 
-static bool check(llama_model * model, bool fa, ggml_type type, int turn, bool refill) {
+static bool check(llama_model * model, bool fa, ggml_type type, int turn, bool refill, bool async) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = 512;
     cparams.n_batch         = 512;
@@ -60,7 +62,8 @@ static bool check(llama_model * model, bool fa, ggml_type type, int turn, bool r
     cparams.type_v          = type;
 
     char what[128];
-    snprintf(what, sizeof(what), "fa %d, %s, turns of %d%s", fa, ggml_type_name(type), turn, refill ? ", holes refilled" : "");
+    snprintf(what, sizeof(what), "fa %d, %s, turns of %d%s%s", fa, ggml_type_name(type), turn, refill ? ", holes refilled" : "",
+            async ? ", async" : "");
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
@@ -108,13 +111,31 @@ static bool check(llama_model * model, bool fa, ggml_type type, int turn, bool r
         }
     }
 
-    if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 1) != saved.size()) {
+    if (async) {
+        if (llama_state_seq_set_data_async(ctx, saved.data(), saved.size(), 1, LLAMA_STATE_SEQ_FLAGS_NONE) != saved.size()) {
+            fprintf(stderr, "%s: restoring sequence 1 failed\n", what);
+            goto done;
+        }
+        batch.n_tokens = 0;
+        for (int p = n_tok; p < n_tok + turn; ++p) {
+            add(batch, token_at(vocab, 2, p), p, 2);
+        }
+        batch.logits[batch.n_tokens - 1] = true;
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "%s: decode beside the restore failed\n", what);
+            goto done;
+        }
+    } else if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 1) != saved.size()) {
         fprintf(stderr, "%s: restoring sequence 1 failed\n", what);
         goto done;
     }
     again.resize(llama_state_seq_get_size(ctx, 1));
     if (llama_state_seq_get_data(ctx, again.data(), again.size(), 1) != again.size()) {
         fprintf(stderr, "%s: saving sequence 1 again failed\n", what);
+        goto done;
+    }
+    if (llama_state_seq_restore_pending(ctx, -1)) {
+        fprintf(stderr, "%s: FAIL, the save did not wait for the restore\n", what);
         goto done;
     }
     if (again.size() != saved.size() || memcmp(again.data(), saved.data(), saved.size()) != 0) {
@@ -177,8 +198,10 @@ int main(int argc, char ** argv) {
         }
         for (const int turn : { 1, 5 }) {
             for (const bool refill : { false, true }) {
-                n_fail += check(model, layout.fa, layout.type, turn, refill) ? 0 : 1;
-                n_checked++;
+                for (const bool async : { false, true }) {
+                    n_fail += check(model, layout.fa, layout.type, turn, refill, async) ? 0 : 1;
+                    n_checked++;
+                }
             }
         }
     }

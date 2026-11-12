@@ -1739,7 +1739,9 @@ done:
     return res;
 }
 
+// The memory API does not wait for a restore of the sequence that still copies (llama_state_seq_set_data_async): these three do, before the cells it copies to are removed, shared or shifted.
 static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    llama_state_seq_restore_wait(ctx, seq_id);
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
@@ -1747,11 +1749,14 @@ static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llam
 }
 
 static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    llama_state_seq_restore_wait(ctx, seq_id_src);
+    llama_state_seq_restore_wait(ctx, seq_id_dst);
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 }
 
 static void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+    llama_state_seq_restore_wait(ctx, seq_id);
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
 }
