@@ -1698,11 +1698,23 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    // The buffer holds max_nodes tensors and their graph, whatever the graph built in it. A std::vector wrote zeros
+    // over all of it when the result was made: 66 MiB for the 163,840 nodes a GLM-5.3 Flash context reserves at a
+    // batch of 1,024 (132 MiB at 2,048), of which a graph of 5,900 nodes uses 2.4. Every kept graph has a result
+    // (128 a context in the serving profile), so a server held 13 GiB of resident memory it never read: 24.5 GiB
+    // against 11.0 on the fixture at 23 sessions (Nov 12, 2026). The run was not shorter for it (0.3 to 0.4 s in
+    // 42 to 44, inside the noise). Nothing reads the buffer before writing it: every rebuild already starts from
+    // the last graph's bytes. LLAMA_GRAPH_RESULT_ZERO_LEGACY=1 writes the zeros
+    const size_t meta_size = ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    if (buf_compute_meta_size != meta_size) {
+        static const bool zero_legacy = ggml_env_switch("LLAMA_GRAPH_RESULT_ZERO_LEGACY");
+        buf_compute_meta.reset(zero_legacy ? new uint8_t[meta_size]() : new uint8_t[meta_size]);
+        buf_compute_meta_size = meta_size;
+    }
 
     ggml_init_params params = {
-        /*.mem_size   =*/ buf_compute_meta.size(),
-        /*.mem_buffer =*/ buf_compute_meta.data(),
+        /*.mem_size   =*/ buf_compute_meta_size,
+        /*.mem_buffer =*/ buf_compute_meta.get(),
         /*.no_alloc   =*/ true,
     };
 
