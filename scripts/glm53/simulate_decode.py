@@ -129,7 +129,7 @@ def simulate(*, slots=36, sequence_ids=(0,), context=400000, depth=2, accepted=1
             'uniform_routing_expected_remote_ranks': (DEVICES - 1) * (1 - no_expert_on_rank),
             'selected_host_bytes_per_cycle_upper': (
                 (target_rows * TARGET_MLA_LAYERS + proposal_rows + catchup_rows) * 2080 * LATENT_ROW_BYTES
-                if host_kv and context >= 16640 else None if host_kv else 0),
+                if host_kv and context >= 4160 else None if host_kv else 0),
             'selected_host_bytes_scope': 'Long sparse target/proposal/catch-up envelope; excludes padding writes and cache writes. Null below all direct-index cutoffs.',
         },
         'prefill': {
