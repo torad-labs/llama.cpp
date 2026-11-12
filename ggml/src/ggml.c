@@ -6626,6 +6626,14 @@ void ggml_lightning_indexer_set_q8_query(struct ggml_tensor * a) {
     ggml_set_op_params_i32(a, 0, 1);
 }
 
+void ggml_lightning_indexer_set_kpool_padding(struct ggml_tensor * a, struct ggml_tensor * rows) {
+    GGML_ASSERT(a->op == GGML_OP_LIGHTNING_INDEXER && a->src[4] != NULL);
+    GGML_ASSERT(rows->type == GGML_TYPE_I32 && (rows->ne[0] == 6 || rows->ne[0] == 7));
+    GGML_ASSERT(rows->ne[1] == a->src[0]->ne[2] && rows->ne[2] == a->src[0]->ne[3] && rows->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(rows));
+    a->src[5] = rows;
+}
+
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(

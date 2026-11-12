@@ -2444,6 +2444,10 @@ struct test_get_rows : public test_case {
     test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false)
         : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v) {}
 
+    double max_nmse_err() override {
+        return type == GGML_TYPE_I32 || type == GGML_TYPE_F32 ? 0.0 : test_case::max_nmse_err();
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * in = ggml_new_tensor_4d(ctx, type, n, m, be1, be2);
         ggml_set_name(in, "in");
@@ -2472,11 +2476,11 @@ struct test_get_rows : public test_case {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
                 // rows
-                std::vector<int> data(r*be1*be2);
-                for (int i = 0; i < r*be1*be2; i++) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
                     data[i] = rand() % m;
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -9977,6 +9981,71 @@ struct test_lightning_indexer_rows : public test_case {
     }
 };
 
+struct test_lightning_indexer_rows_padded : public test_lightning_indexer_rows {
+    const int64_t live;
+    const int exceptional;
+
+    test_lightning_indexer_rows_padded(int64_t kv, int64_t nb, int64_t ns, int64_t live, int exceptional = 0)
+        : test_lightning_indexer_rows(32, kv, 4*kv, nb, ns, GGML_TYPE_Q8_0, true), live(live), exceptional(exceptional) {}
+
+    int64_t limit(int64_t stream) const {
+        return ns == 1 ? std::min(kv, live) : stream == 0 ? kv : std::min(kv, live + (stream - 1)%2);
+    }
+
+    std::string vars() override {
+        return test_lightning_indexer_rows::vars() + ",padded=" + std::to_string(live) + ",exceptional=" + std::to_string(exceptional);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_lightning_indexer_rows::build_graph(ctx);
+        auto * data = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, ns == 1 ? 6 : 7, nb, ns);
+        ggml_set_name(data, "limits_data");
+        ggml_lightning_indexer_set_kpool_padding(out, data);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_lightning_indexer_rows::initialize_tensors(ctx);
+        std::mt19937 rng(0x1D4);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) { continue; }
+            if (strcmp(t->name, "limits_data") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                for (int64_t s = 0; s < ns; ++s) {
+                    for (int64_t row = 0; row < nb; ++row) {
+                        data[t->ne[0]*(s*nb + row) + 5] = (int32_t) limit(s);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "rows") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                for (int64_t s = 0; s < ns; ++s) {
+                    for (int64_t p = 0; p < limit(s); ++p) {
+                        data[s*kv + p] = (int32_t) (rng()%n_rows);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
+                std::vector<float> data(ggml_nelements(t), -INFINITY);
+                for (int64_t s = 0; s < ns; ++s) {
+                    for (int64_t row = 0; row < nb; ++row) {
+                        for (int64_t p = 0; p < limit(s); ++p) {
+                            data[(s*nb + row)*kv + p] = (p + row)%11 == 3 ? -INFINITY : 0.0f;
+                        }
+                    }
+                }
+                set_tensor_kq_mask(t, data);
+            } else if (exceptional && strcmp(t->name, "w") == 0) {
+                const float value = exceptional == 1 ? NAN : exceptional == 2 ? INFINITY : FLT_MAX;
+                std::vector<float> data(ggml_nelements(t), value);
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (exceptional == 3 && (strcmp(t->name, "q") == 0 || strcmp(t->name, "cache") == 0)) {
+                init_tensor_uniform(t, 0.5f, 0.5f);
+            }
+        }
+    }
+};
+
 // GGML_OP_KPOOL_MASK: GLM-5-Next's pooled-indexer masks from a cell's position and pool and a query row's position,
 // sequence, tail and visible pools (kpool_mask_row in src/llama-kv-cache-kpool.cpp is the reference). Every element is 0
 // or -inf, so the backends must agree on every one: the compare checks the -inf pattern element by element, and err()
@@ -10977,8 +11046,36 @@ static void add_glm_kda_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     }
 }
 
+static void add_small_get_rows_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // Tiny vector rows, partial blocks, strided indices, and both batch axes.
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_I32}) {
+        for (int n : {4, 8, 12, 16, 32, 36}) {
+            for (bool v : {false, true}) {
+                test_cases.emplace_back(new test_get_rows(type, n, 257, 513, 3, 2, v));
+            }
+        }
+    }
+    for (int r : {1536, 22016}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 2048, r, 23, 1, false));
+    }
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 8, 3, 700, 100, false));
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int64_t live : {0, 1, 63, 64, 65, 256, 257}) {
+        for (int64_t rows : {3, 9}) {
+            for (int64_t streams : {1, 3}) {
+                test_cases.emplace_back(new test_lightning_indexer_rows_padded(257, rows, streams, live));
+            }
+        }
+    }
+    for (int64_t rows : {1, 8}) {
+        for (int64_t streams : {1, 3}) {
+            test_cases.emplace_back(new test_lightning_indexer_rows_padded(257, rows, streams, 65));
+        }
+    }
+    add_small_get_rows_cases(test_cases);
     add_glm_q8_cases(test_cases);
     add_glm_moe_cases(test_cases);
     for (int64_t tokens : {23, 69}) {
@@ -13882,6 +13979,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int64_t pools : {5700, 32768, 65536}) {
+        for (int64_t rows : {3, 43}) {
+            test_cases.emplace_back(new test_lightning_indexer_rows_padded(pools, rows, 23, 313));
+        }
+    }
+    for (int64_t rows : {3, 43}) {
+        test_cases.emplace_back(new test_lightning_indexer_rows_padded(32768, rows, 23, 32768));
+    }
+    for (int exceptional : {1, 2, 3}) {
+        for (int64_t rows : {3, 9}) {
+            for (int64_t streams : {1, 3}) {
+                test_cases.emplace_back(new test_lightning_indexer_rows_padded(257, rows, streams, 64, exceptional));
+            }
+        }
+    }
+    // GLM-5.3 pooled scoring: 69 or 989 queries, split over 23 streams or kept in one.
+    for (int64_t pools : {5700, 32768, 65536}) {
+        for (int64_t streams : {1, 23}) {
+            for (int64_t rows : {69, 989}) {
+                test_cases.emplace_back(new test_lightning_indexer_rows(32, pools, 4*pools, rows/streams, streams,
+                    GGML_TYPE_Q8_0, true));
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {pools + 512, rows/streams, streams, 1}, 512));
+            }
+        }
+    }
+    add_small_get_rows_cases(test_cases);
     add_glm_q8_cases(test_cases);
     add_glm_moe_cases(test_cases);
     for (int64_t tokens : {23, 69}) {
