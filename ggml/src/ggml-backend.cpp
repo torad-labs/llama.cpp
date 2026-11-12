@@ -1645,7 +1645,28 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// the parts of one graph allocation's host time, for the graph trace (GGML_GRAPH_TRACE): the split, a placement in
+// the plan the allocator holds, the wait for the backends, a new plan, the placement in it
+struct ggml_backend_sched_alloc_us {
+    int64_t split, place, sync, plan, place_new;
+};
+static thread_local ggml_backend_sched_alloc_us sched_alloc_us;
+
+static bool ggml_backend_sched_alloc_trace() {
+    static const bool trace = ggml_env_switch("GGML_GRAPH_TRACE");
+    return trace;
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    const bool trace = ggml_backend_sched_alloc_trace();
+    int64_t t_part = trace ? ggml_time_us() : 0;
+    const auto part = [&](int64_t & us) {
+        if (trace) {
+            const int64_t t = ggml_time_us();
+            us = t - t_part;
+            t_part = t;
+        }
+    };
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1665,7 +1686,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    const bool placed = !backend_ids_changed && ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
+    part(sched_alloc_us.place);
+    if (!placed) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -1686,13 +1709,16 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        part(sched_alloc_us.sync);
 
         // a reserve that could not allocate a buffer leaves none behind its plan: the graph is not placed in it
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids) ||
-            !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        const bool planned = ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        part(sched_alloc_us.plan);
+        if (!planned || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }
+        part(sched_alloc_us.place_new);
     }
 
     return true;
@@ -2181,13 +2207,28 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    const bool trace = ggml_backend_sched_alloc_trace();
+    const int64_t t_start = trace ? ggml_time_us() : 0;
+    if (trace) {
+        sched_alloc_us = {};
+    }
+
     ggml_backend_sched_split_graph(sched, graph);
+    if (trace) {
+        sched_alloc_us.split = ggml_time_us() - t_start;
+    }
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
 
     sched->is_alloc = true;
+
+    if (trace) {
+        GGML_LOG_INFO("graph_trace layer=sched event=alloc sched=%p nodes=%d leafs=%d splits=%d split_us=%lld place_us=%lld sync_us=%lld plan_us=%lld place_new_us=%lld\n",
+            (void *) sched, graph->n_nodes, graph->n_leafs, sched->n_splits, (long long) sched_alloc_us.split, (long long) sched_alloc_us.place,
+            (long long) sched_alloc_us.sync, (long long) sched_alloc_us.plan, (long long) sched_alloc_us.place_new);
+    }
 
     return true;
 }

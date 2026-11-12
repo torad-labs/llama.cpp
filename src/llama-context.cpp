@@ -2159,6 +2159,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * gf = res->get_gf();
 
+    // the parts of a build's host time, for the graph trace's build line (GGML_GRAPH_TRACE): the reserve check and
+    // the slot made, the measure pass, the build, the allocation
+    int64_t us_slot = 0, us_measure = 0, us_build = 0, us_alloc = 0;
+    int64_t t_part = graph_trace ? ggml_time_us() : 0;
+    const auto part = [&](int64_t & us) {
+        if (graph_trace) {
+            const int64_t t = ggml_time_us();
+            us += t - t_part;
+            t_part = t;
+        }
+    };
+
     if (reuse) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -2275,6 +2287,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // a prompt shape is not held to the slots' size: there are as many as powers of two up to
         // graph_prompt_shape_max, with and without the prompt's last row
+        part(us_slot);
         ggml_backend_sched_ptr measure;
         const auto retained_sched = sched_gf;
         if (t_used && ubatch.n_tokens > graph_slot_max_tokens && !prompt_shape) {
@@ -2298,9 +2311,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             sched_gf = retained_sched;
             gparams = graph_params(res, ubatch, mctx, gtype, sched_gf);
             if (!fits) { fallback("graph slot memory limit"); }
+            part(us_measure);
             // Measurement rewrites sources to scheduler copies. Rebuild before allocation.
             if (!build()) { ret = GGML_STATUS_FAILED; return nullptr; }
         }
+        part(us_build);
 
         // A graph that cannot be allocated is tried again while a retained graph gives its buffers back (a failed
         // allocation leaves the graph split: it is built again first). With none left a retained shape goes to the
@@ -2321,6 +2336,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        part(us_alloc);
     }
 
     if (t_used) {
@@ -2345,10 +2361,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 buf_shared = buf_shared || ggml_backend_sched_buffer_is_shared(sched_res, backend);
             }
         }
-        LLAMA_LOG_INFO("graph_trace layer=llama event=%s context=%p result=%p uid=%llu phase=%s rows=%u seqs=%u outputs=%u owners=%s slots=%zu slots_allowed=%d nodes=%d buf_mib=%.1f buf_shared=%d\n",
+        LLAMA_LOG_INFO("graph_trace layer=llama event=%s context=%p result=%p uid=%llu phase=%s rows=%u seqs=%u outputs=%u owners=%s slots=%zu slots_allowed=%d nodes=%d buf_mib=%.1f buf_shared=%d host_us=slot:%lld,measure:%lld,build:%lld,alloc:%lld\n",
             reuse ? "reuse" : "build", (void *) this, (void *) res, (unsigned long long) gf->uid,
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft" : "target", ubatch.n_tokens, ubatch.n_seqs, gparams.n_outputs,
-            owners.empty() ? "none" : owners.c_str(), graph_slots.size(), (int) use_slots, ggml_graph_n_nodes(gf), buf_mib, (int) buf_shared);
+            owners.empty() ? "none" : owners.c_str(), graph_slots.size(), (int) use_slots, ggml_graph_n_nodes(gf), buf_mib, (int) buf_shared,
+            (long long) us_slot, (long long) us_measure, (long long) us_build, (long long) us_alloc);
     }
 
     // set the input data for the input tensors
