@@ -75,6 +75,9 @@ static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, v
 static int  n_pipelines       = 0;     // "initialized AllReduce pipeline" lines logged
 static bool last_one_stream   = false; // the last one's copy-engine receives run after its sends
 static bool last_card_to_card = false; // the last one's copy-engine receives come card to card
+// the last one's copy-engine receives through host memory at three ranks or more: 1 in rank order on one stream, 0 on a
+// stream a peer, -1 where it did not say (two ranks, or card to card)
+static int  last_recv_rank_order = -1;
 static bool last_p2p          = false; // the last one's cards map each other's memory: its LL card-to-card limit is above 0
 static bool last_gather_peer  = false;
 static bool last_owner_slice  = false;
@@ -92,8 +95,11 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/
     if (strstr(text, "owner-slice-peer") != nullptr) {
         last_owner_slice = true;
     }
+    if (strstr(text, "copy-engine receives in rank order on one stream") != nullptr) { last_recv_rank_order = 1; }
+    if (strstr(text, "copy-engine receives on a stream a peer") != nullptr) { last_recv_rank_order = 0; }
     if (strstr(text, "initialized AllReduce pipeline") != nullptr) {
         n_pipelines++;
+        last_recv_rank_order = -1;
         last_one_stream   = strstr(text, "receives after the sends") != nullptr;
         last_card_to_card = strstr(text, "receives card to card") != nullptr;
         last_gather_peer = strstr(text, "large gather card to card") != nullptr;
@@ -388,24 +394,32 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
         const char * copy;
         bool one_stream;
         bool tail_legacy; // GGML_CUDA_AR_COPY_TAIL_LEGACY=1: a payload's remainder as a chunk of its own
+        bool recv_legacy; // GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY=1: a rank takes its peers' shares in on one stream, in rank order
+        bool recv_all;    // GGML_CUDA_AR_RECV_STREAMS_MIN_BYTES=0: on a stream a peer at every size, not from 64 KB on the wire
     };
     const route routes[] = {
-        {"host LL",      "1048576", "0",       "0", false, false},
-        {"host chunked", "0",       "0",       "0", false, false},
-        {"peer LL",      "0",       "1048576", "0", false, false},
-        {"host copy",    "0",       "0",       "1", false, false},
+        {"host LL",      "1048576", "0",       "0", false, false, false, false},
+        {"host chunked", "0",       "0",       "0", false, false, false, false},
+        {"peer LL",      "0",       "1048576", "0", false, false, false, false},
+        {"host copy",    "0",       "0",       "1", false, false, false, false},
         // the copy engines' chunks as they were cut before the payload was cut into equal ones: 69*4096 + 3 on the BF16
         // wire is a chunk and a tail of 40,966 bytes here and one chunk on every other copy route
-        {"host copy tails", "0",    "0",       "1", false, true},
-        {"host serial",  "0",       "0",       "1", true,  false},
-        {"peer copy",    "0",       "1048576", "1", false, false},
-        {"owner-slice",  "0",       "1048576", "0", false, false},
+        {"host copy tails", "0",    "0",       "1", false, true, false, false},
+        {"host serial",  "0",       "0",       "1", true,  false, false, false},
+        // at three ranks or more a rank takes each peer's share in on a stream of its own, as its sender stages it; this
+        // is the one stream and the rank order before, which must add the same bytes
+        {"host copy rank order", "0", "0",    "1", false, false, true, false},
+        // the streams from the first byte: a short reduction keeps the one stream and the rank order otherwise, so
+        // "host copy" crosses from the order to the streams and back as its sizes go, and this takes every size on them
+        {"host copy streams", "0", "0",       "1", false, false, false, true},
+        {"peer copy",    "0",       "1048576", "1", false, false, false, false},
+        {"owner-slice",  "0",       "1048576", "0", false, false, false, false},
         // past the LL and short of the copy engines, where the cards map each other's memory: a -sm dp verify's expert
         // reduce (36 to 108 rows of 4096, up to 864 KB on the BF16 wire) used to stage through host memory, crossing
         // the link twice and reading it back at about 3.5 GB/s; its shares now go card to card, through the inboxes
         // the gathers use, and the receivers add the same bytes in the same order
-        {"peer chunked", "0",       "16",      "0", false, false},
-        {"owner chunked", "0",      "16",      "0", false, false},
+        {"peer chunked", "0",       "16",      "0", false, false, false, false},
+        {"owner chunked", "0",      "16",      "0", false, false, false, false},
     };
     bool ok = true;
     enum { WIRE_F32, WIRE_BF16, WIRE_Q8 };
@@ -424,6 +438,8 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             set_env("GGML_CUDA_AR_COPY_THRESHOLD", route.copy);
             set_env("GGML_CUDA_AR_COPY_ONE_STREAM", route.one_stream ? "1" : "0");
             set_env("GGML_CUDA_AR_COPY_TAIL_LEGACY", route.tail_legacy ? "1" : nullptr);
+            set_env("GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", route.recv_legacy ? "1" : nullptr);
+            set_env("GGML_CUDA_AR_RECV_STREAMS_MIN_BYTES", route.recv_all ? "0" : nullptr);
             set_env("GGML_CUDA_AR_COPY_PEER", "1");
             const bool owner_requested = strcmp(route.name, "owner-slice") == 0 || strcmp(route.name, "owner chunked") == 0;
             set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", owner_requested ? "1" : "0");
@@ -441,6 +457,13 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                     (peer_requested && require_p2p && (!last_p2p || !last_gather_peer ||
                         (route.copy[0] == '1' && !last_card_to_card) || (owner_requested && !last_owner_slice)))) {
                 fprintf(stderr, "FAIL: %d-rank %s did not select the required transport\n", n, route.name);
+                free(comm);
+                for (auto backend : backends) { ggml_backend_free(backend); }
+                return 1;
+            }
+            if (n > 2 && !last_card_to_card && last_recv_rank_order != (route.one_stream || route.recv_legacy ? 1 : 0)) {
+                fprintf(stderr, "FAIL: %d-rank %s: the copy-engine receives are not in the order asked for (%d)\n", n, route.name,
+                        last_recv_rank_order);
                 free(comm);
                 for (auto backend : backends) { ggml_backend_free(backend); }
                 return 1;
@@ -465,6 +488,10 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                          32*1024*1024/q8_block_bytes*q8_block_elems + 1};
             } else if (route.copy[0] == '1') {
                 sizes.push_back(32*1024*1024/(bf16 ? 2 : 4) + 3);
+            }
+            if (route.copy[0] == '1') {
+                // a short reduction after the long ones: from a stream a peer back to the one stream and the rank order
+                sizes.push_back(5);
             }
             for (const int64_t ne : sizes) {
                 bool case_ok = true;

@@ -940,6 +940,23 @@ struct ggml_cuda_ar_pipeline {
     // streams[], so a device takes in its peer's share while it sends its own. streams[] itself under
     // GGML_CUDA_AR_COPY_ONE_STREAM=1, where every receive waits for the device's last send.
     cudaStream_t             recv_streams[GGML_CUDA_MAX_DEVICES];
+    // Copy-engine receives through host memory at three devices or more (ggml_cuda_ar_allreduce_copy_n), one stream a
+    // peer: recv_peer_streams[i][k] takes in the share of device i's k-th peer in rank order, and recv_peer_done[i][k]
+    // is recorded there once that share is in dev_tmp[i]. A share comes in as soon as its sender has staged it,
+    // whatever the peers before it in rank order are doing: on one stream the receives ran in rank order, and a device
+    // whose first peer was the last to send took nothing in until then. The sender waits on the event before it
+    // overwrites its staging, the device's add waits on all of them. recv_rank_order: one stream and that order
+    // (GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY=1, GGML_CUDA_AR_COPY_ONE_STREAM=1); the streams and events are not made.
+    // A reduction of fewer than recv_streams_min_bytes on the wire keeps the one stream and the rank order
+    // (GGML_CUDA_AR_RECV_STREAMS_MIN_BYTES, default 65536, 0 for the streams at every size): its shares are a few
+    // microseconds each, so the order can cost it no more than that, and four ranks on one RTX 5080 or 5070 Ti took 5
+    // to 11 us longer over a reduction of under 32 KB on the streams. Which of the two the reduction before took is
+    // in host_large_read_done_valid and recv_peer_done_valid, and the senders wait on that one's events.
+    cudaStream_t             recv_peer_streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES - 1];
+    cudaEvent_t              recv_peer_done[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES - 1];
+    bool                     recv_peer_done_valid;
+    bool                     recv_rank_order;
+    size_t                   recv_streams_min_bytes;
     ggml_cuda_ar_event_slot  ev_pool[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
 
     // Copy-engine: per-device "I finished reading my peer's host_large"
@@ -1456,6 +1473,29 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
         p->dev_tmp[i].size = receive_bytes;
     }
+    // Default 0.  1: a device takes its peers' shares in on one stream, in rank order.
+    p->recv_rank_order = one_stream || n_devices == 2 || ggml_cuda_ar_env_u64("GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", 0) != 0;
+    p->recv_streams_min_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_RECV_STREAMS_MIN_BYTES", 65536);
+    for (size_t i = 0; !p->copy_peer && !p->recv_rank_order && i < n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        for (size_t k = 0; k + 1 < n_devices; ++k) {
+            // the first peer's share on the receive stream there is, the others on streams of their own
+            if (k == 0) {
+                p->recv_peer_streams[i][k] = p->recv_streams[i];
+            } else if (cudaStreamCreateWithFlags(&p->recv_peer_streams[i][k], cudaStreamNonBlocking) != cudaSuccess) {
+                p->recv_peer_streams[i][k] = nullptr;
+                GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags failed for device %d's receives\n", __func__, p->devices[i]);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+            if (cudaEventCreateWithFlags(&p->recv_peer_done[i][k], cudaEventDisableTiming) != cudaSuccess) {
+                p->recv_peer_done[i][k] = nullptr;
+                GGML_LOG_ERROR("%s: cudaEventCreate for recv_peer_done failed for device %d\n", __func__, p->devices[i]);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+        }
+    }
 
     const size_t gather_bytes = GGML_CUDA_AR_POOL_SIZE * GGML_CUDA_AR_PEER_MAX_BYTES * (n_devices - 1);
     p->gather_peer = p->copy_peer;
@@ -1475,6 +1515,14 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                   p->copy_peer ? "receive buffer" : "staging", p->p2p_max_bytes,
                   p->copy_peer ? "card to card" : one_stream ? "after the sends" : "beside the sends", receive_bytes >> 20,
                   p->gather_peer ? "card to card" : "through host memory");
+    if (!p->copy_peer && n_devices > 2) {
+        if (p->recv_rank_order) {
+            GGML_LOG_INFO("%s: copy-engine receives in rank order on one stream\n", __func__);
+        } else {
+            GGML_LOG_INFO("%s: copy-engine receives on a stream a peer, each as its sender stages it, from %zu bytes on the wire; "
+                          "in rank order on one stream under that\n", __func__, p->recv_streams_min_bytes);
+        }
+    }
     if (p->owner_slices) {
         GGML_LOG_INFO("%s: owner-slice-peer gather enabled\n", __func__);
     }
@@ -1507,6 +1555,12 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
             ggml_cuda_set_device(p->devices[i]);
             cudaStreamSynchronize(p->recv_streams[i]);
         }
+        for (int k = 1; k < GGML_CUDA_MAX_DEVICES - 1; ++k) {
+            if (p->recv_peer_streams[i][k]) {
+                ggml_cuda_set_device(p->devices[i]);
+                cudaStreamSynchronize(p->recv_peer_streams[i][k]);
+            }
+        }
     }
 
     for (int i = 0; i < p->n_devices; ++i) {
@@ -1536,6 +1590,12 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         if (p->dev_tmp_kernel_done[i]) {
             ggml_cuda_set_device(p->devices[i]);
             cudaEventDestroy(p->dev_tmp_kernel_done[i]);
+        }
+        for (int k = 0; k < GGML_CUDA_MAX_DEVICES - 1; ++k) {
+            ggml_cuda_set_device(p->devices[i]);
+            if (p->recv_peer_done[i][k]) { cudaEventDestroy(p->recv_peer_done[i][k]); }
+            // [i][0] is recv_streams[i], destroyed below
+            if (k > 0 && p->recv_peer_streams[i][k]) { cudaStreamDestroy(p->recv_peer_streams[i][k]); }
         }
         if (p->recv_streams[i] && p->recv_streams[i] != p->streams[i]) {
             ggml_cuda_set_device(p->devices[i]);
@@ -1659,6 +1719,8 @@ static bool ggml_cuda_ar_allreduce_copy_n(
     const size_t chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
     GGML_ASSERT(chunks > 0 && chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
     ggml_backend_cuda_context * contexts[GGML_CUDA_MAX_DEVICES] = {};
+    // this reduction's receives through host memory: one stream in rank order, or a stream a peer
+    const bool rank_order = p->recv_rank_order || nbytes < p->recv_streams_min_bytes;
 
     // Queue every sender's previous-call waits before recording any of this call's completion events.
     for (int i = 0; i < p->n_devices; ++i) {
@@ -1672,6 +1734,9 @@ static bool ggml_cuda_ar_allreduce_copy_n(
                 CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[peer]));
             } else if (!p->copy_peer && p->host_large_read_done_valid) {
                 CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[peer]));
+            } else if (!p->copy_peer && p->recv_peer_done_valid) {
+                // the peer's last read of this device's staging, on the stream it takes this device's share in on
+                CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->recv_peer_done[peer][i < peer ? i : i - 1]));
             }
         }
         if (!compute[i]) { CUDA_CHECK(cudaMemsetAsync(src_buf[i], 0, nbytes, p->streams[i])); }
@@ -1701,7 +1766,7 @@ static bool ggml_cuda_ar_allreduce_copy_n(
                 // Includes this rank's sends: its in-place source must remain unchanged until every copy has read it.
                 CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[peer][slot].cpy[chunks - 1]));
             }
-        } else {
+        } else if (rank_order) {
             const cudaStream_t recv = p->recv_streams[i];
             if (p->dev_tmp_kernel_done_valid) {
                 CUDA_CHECK(cudaStreamWaitEvent(recv, p->dev_tmp_kernel_done[i]));
@@ -1721,10 +1786,32 @@ static bool ggml_cuda_ar_allreduce_copy_n(
             CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, recv));
             CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[i][slot].h2d));
             CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[i][slot].cpy[chunks - 1]));
+        } else {
+            // A stream a peer: each share waits for its own sender's chunks and for nothing of the other peers'. The
+            // shares land where the rank order puts them, so the add reads the same bytes in the same order.
+            for (int peer = 0; peer < p->n_devices; ++peer) {
+                if (peer == i) { continue; }
+                const int index = peer < i ? peer : peer - 1;
+                const cudaStream_t recv = p->recv_peer_streams[i][index];
+                if (p->dev_tmp_kernel_done_valid) {
+                    CUDA_CHECK(cudaStreamWaitEvent(recv, p->dev_tmp_kernel_done[i]));
+                }
+                for (size_t c = 0; c < chunks; ++c) {
+                    const size_t offset = c*chunk_bytes;
+                    const size_t bytes = std::min(chunk_bytes, nbytes - offset);
+                    CUDA_CHECK(cudaStreamWaitEvent(recv, p->ev_pool[peer][slot].cpy[c]));
+                    CUDA_CHECK(cudaMemcpyAsync(p->dev_tmp[i].as<char>() + index*p->copy_bytes + offset,
+                                               p->host_large[peer].host + offset, bytes, cudaMemcpyHostToDevice, recv));
+                }
+                CUDA_CHECK(cudaEventRecord(p->recv_peer_done[i][index], recv));
+                CUDA_CHECK(cudaStreamWaitEvent(stream, p->recv_peer_done[i][index]));
+            }
+            CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[i][slot].cpy[chunks - 1]));
         }
         ggml_cuda_ar_copy_add<T_src, T_dst>(p, i, slot, stream, src_buf[i], dst_buf[i], ne);
     }
-    p->host_large_read_done_valid = !p->copy_peer;
+    p->host_large_read_done_valid = !p->copy_peer && rank_order;
+    p->recv_peer_done_valid = !p->copy_peer && !rank_order;
     p->dev_tmp_kernel_done_valid = true;
     return true;
 }
