@@ -4315,6 +4315,18 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
     return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
 }
 
+// The direct-index cutoff is max(4096, min(rows of a KV stream, this cap) * the cells a row reads through indices): a
+// step whose cell view is narrower keeps the resident kernel. LLAMA_KPOOL_DIRECT_ROW_CAP, read once a process; 8 as it
+// was. The cell-capacity gate (llama_kv_cache::get_n_kv) keeps its own 8 whatever this is
+static int64_t kpool_direct_row_cap() {
+    static const int64_t cap = [] {
+        const char * env = getenv("LLAMA_KPOOL_DIRECT_ROW_CAP");
+        const int64_t value = env ? atoll(env) : 8;
+        return value >= 1 ? value : 8;
+    }();
+    return cap;
+}
+
 // the buffer type the resident pool tables live in: the latent cache's, when every layer keeps it in one
 static ggml_backend_buffer_type_t kpool_resident_buft(const llama_kv_cache * kv) {
     const auto layers = kv->get_layer_ids();
@@ -4571,7 +4583,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 hparams.swa_type == LLAMA_SWA_TYPE_NONE && hparams.n_pos_per_embd() == 1 && !hparams.attn_soft_cap &&
                 (int64_t) hparams.indexer_kpool*n_dump + tail_bound <= GGML_KPOOL_INDICES_MAX &&
                 n_tps <= 65535 && n_stream <= 65535 &&
-                n_kv >= std::max<int64_t>(4096, std::min<int64_t>(n_tps_kv, 8)*direct_bound)) {
+                n_kv >= std::max<int64_t>(4096, std::min<int64_t>(n_tps_kv, kpool_direct_row_cap())*direct_bound)) {
             auto * tail = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, tail_bound, n_tps, n_stream);
             auto * selected = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool*n_dump, n_tps, n_stream);
             auto * probe = ggml_kpool_indices(ctx0, inp->mask_cells, inp->mask_rows, selected, tail,
@@ -4761,7 +4773,8 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         if (!direct) { sparse_indices = nullptr; }
     }
     if (ggml_env_switch("LLAMA_KV_HOST") && !direct &&
-            (!cparams.flash_attn || kq_b || n_kv >= std::max<int64_t>(4096, std::min<int64_t>(kq_mask->ne[1], 8)*direct_bound))) {
+            (!cparams.flash_attn || kq_b ||
+             n_kv >= std::max<int64_t>(4096, std::min<int64_t>(kq_mask->ne[1], kpool_direct_row_cap())*direct_bound))) {
         throw std::runtime_error("host KV requires flash attention and direct sparse indices above the staging cutoff");
     }
     ggml_tensor * mask_top_k = nullptr;
