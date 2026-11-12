@@ -1233,6 +1233,10 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // LLAMA_PROMPT_CACHE_DIR: a directory of these models' own in it, where a stop leaves the prompt cache and the next start takes it from
+    std::string prompt_cache_dir;
+    uint64_t    prompt_cache_id = 0;
+
     // the slots' buffers for context checkpoints (null with LLAMA_CHECKPOINT_POOL_LEGACY or without checkpoints)
     std::unique_ptr<checkpoint_buffers> ckpt_buffers;
 
@@ -1279,6 +1283,137 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+    }
+
+    static void id_mix(uint64_t & id, const void * data, size_t size) {
+        const auto * ptr = static_cast<const uint8_t *>(data);
+        for (size_t i = 0; i < size; i++) {
+            id = (id ^ ptr[i]) * 0x100000001b3ull;
+        }
+    }
+
+    // a model as it is loaded, and 16 windows of the file it was loaded from: two files of one shape with other weights differ
+    static void id_mix_model(uint64_t & id, const llama_model * model, const std::string & path) {
+        char desc[256] = {};
+        llama_model_desc(model, desc, sizeof(desc));
+        const uint64_t shape[2] = { llama_model_size(model), llama_model_n_params(model) };
+        id_mix(id, desc, sizeof(desc));
+        id_mix(id, shape, sizeof(shape));
+
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file) {
+            return;
+        }
+        const uint64_t n_file   = file.tellg();
+        const uint64_t n_window = 64 * 1024;
+        id_mix(id, &n_file, sizeof(n_file));
+        std::vector<char> window(n_window);
+        for (uint64_t i = 0; i < 16; i++) {
+            file.clear();
+            file.seekg(n_file > n_window ? (n_file - n_window) / 15 * i : 0);
+            file.read(window.data(), window.size());
+            id_mix(id, window.data(), file.gcount());
+        }
+    }
+
+    template <typename T>
+    static void id_mix_value(uint64_t & id, const T & value) {
+        id_mix(id, &value, sizeof(value));
+    }
+
+    static void id_mix_text(uint64_t & id, const char * text, size_t size) {
+        id_mix_value(id, (uint64_t) size);
+        id_mix(id, text, size);
+    }
+
+    // What a snapshot of the prompt cache is a state of, as one number: the models, and the settings that decide what a
+    // context computes from them and how it keeps it. A file a stop wrote is taken by a start with the same number, so
+    // a start with another model, adapter, override, cache type or context size begins with no session, as before.
+    uint64_t models_id() {
+        uint64_t id = 0xcbf29ce484222325ull;
+        id_mix_model(id, model_tgt, params_base.model.path);
+        if (model_dft != nullptr && model_dft != model_tgt) {
+            id_mix_model(id, model_dft, common_base_params_to_speculative(params_base).model.path);
+        }
+
+        id_mix_value(id, (int64_t) llama_n_ctx(ctx_tgt));
+        const float rope[] = { params_base.rope_freq_base, params_base.rope_freq_scale, params_base.yarn_ext_factor,
+                               params_base.yarn_attn_factor, params_base.yarn_beta_fast, params_base.yarn_beta_slow };
+        const int32_t kinds[] = { params_base.yarn_orig_ctx, (int32_t) params_base.rope_scaling_type, params_base.grp_attn_n,
+                                  params_base.grp_attn_w, (int32_t) params_base.cache_type_k, (int32_t) params_base.cache_type_v,
+                                  (int32_t) params_base.cache_type_s, (int32_t) params_base.cache_type_idx,
+                                  params_base.control_vector_layer_start, params_base.control_vector_layer_end };
+        id_mix(id, rope,  sizeof(rope));
+        id_mix(id, kinds, sizeof(kinds));
+        // the drafters: a snapshot holds the state of one (common_speculative_get_state), and a context keeps as many
+        // recurrent states a sequence as the longest draft rolls back
+        for (const auto type : params_base.speculative.types) {
+            id_mix_value(id, (int32_t) type);
+        }
+        id_mix_value(id, (int32_t) params_base.speculative.draft.n_max);
+        id_mix_value(id, (int32_t) params_base.speculative.n_rollback);
+        id_mix_text(id, params_base.kv_mean_center_path.data(), params_base.kv_mean_center_path.size());
+        for (const auto & kv : params_base.kv_overrides) {
+            // by field: the bytes of the union a value does not use are whatever they were
+            id_mix_text(id, kv.key, strnlen(kv.key, sizeof(kv.key)));
+            id_mix_value(id, (int32_t) kv.tag);
+            switch (kv.tag) {
+                case LLAMA_KV_OVERRIDE_TYPE_INT:   id_mix_value(id, kv.val_i64);                                  break;
+                case LLAMA_KV_OVERRIDE_TYPE_FLOAT: id_mix_value(id, kv.val_f64);                                  break;
+                case LLAMA_KV_OVERRIDE_TYPE_BOOL:  id_mix_value(id, (int32_t) kv.val_bool);                       break;
+                case LLAMA_KV_OVERRIDE_TYPE_STR:   id_mix_text(id, kv.val_str, strnlen(kv.val_str, sizeof(kv.val_str))); break;
+            }
+        }
+        for (const auto & lora : params_base.lora_adapters) {
+            id_mix_text(id, lora.path.data(), lora.path.size());
+            id_mix_value(id, lora.scale);
+        }
+        for (const auto & vector : params_base.control_vectors) {
+            id_mix_text(id, vector.fname.data(), vector.fname.size());
+            id_mix_value(id, vector.strength);
+        }
+        return id;
+    }
+
+    // LLAMA_PROMPT_CACHE_DIR, when the loop has ended: every session goes to the prompt cache, the least recently used
+    // first so that the cache's limits leave out the oldest, and the cache to files (server_prompt_cache::store)
+    void store_prompt_cache() {
+        if (!prompt_cache || prompt_cache_dir.empty()) {
+            return;
+        }
+        const int64_t t_start = ggml_time_us();
+        prompt_cache->reap(/*wait =*/ true);
+
+        // a sleeping server has no contexts, and its slots nothing to save: the cache is stored as it is
+        std::vector<server_slot *> order;
+        for (server_slot & slot : slots) {
+            if (!sleeping && ctx_tgt != nullptr) {
+                order.push_back(&slot);
+            }
+        }
+        std::stable_sort(order.begin(), order.end(), [](const server_slot * a, const server_slot * b) {
+            return a->t_last_used < b->t_last_used;
+        });
+        for (server_slot * slot : order) {
+            // a task the stop cut short ends as a cancelled one does: its slot keeps what was decoded
+            const bool cut = slot->is_processing();
+            slot->release();
+            slot->copy_wait();
+            if (slot->prompt.tokens.empty()) {
+                continue;
+            }
+            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+            if (pos_max + 1 != slot->prompt.tokens.pos_next()) {
+                SLT_WRN(*slot, "not stored: its memory ends at position %d and its %d tokens at %d\n",
+                        pos_max, slot->prompt.n_tokens(), slot->prompt.tokens.pos_next() - 1);
+                continue;
+            }
+            const auto res = slot->prompt_save(*prompt_cache);
+            SLT_INF(*slot, "stop: %d tokens to the prompt cache, %s%s\n", slot->prompt.n_tokens(),
+                    server_prompt_cache_result_name(res), cut ? ", its task cut short" : "");
+        }
+        prompt_cache->store(prompt_cache_dir, prompt_cache_id);
+        SRV_INF("sessions stored for the next start in %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1731,8 +1866,21 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            // LLAMA_PROMPT_CACHE_DIR: where a stop leaves this cache (store_prompt_cache), in a directory of these
+            // models' own. Waking from sleep is not a start.
+            const char * dir = getenv("LLAMA_PROMPT_CACHE_DIR");
+            if (dir != nullptr && dir[0] != '\0' && !is_resume) {
+                prompt_cache_id = models_id();
+                char name[32];
+                snprintf(name, sizeof(name), "%016" PRIx64, prompt_cache_id);
+                prompt_cache_dir = std::string(dir) + "/" + name;
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            if (getenv("LLAMA_PROMPT_CACHE_DIR") != nullptr) {
+                SRV_WRN("%s", "LLAMA_PROMPT_CACHE_DIR is set and the prompt cache is disabled (--cache-ram 0): no session is kept across a stop\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1761,7 +1909,15 @@ private:
         params = params_base;
 
         if (!is_resume) {
-            return init();
+            if (!init()) {
+                return false;
+            }
+            // The sessions a stop left are snapshots of the cache from the start: each comes back to a slot as any
+            // snapshot does, when its conversation does. A start that fails before here leaves the files for the next.
+            if (prompt_cache && !prompt_cache_dir.empty()) {
+                prompt_cache->open(prompt_cache_dir, prompt_cache_id, mctx != nullptr);
+            }
+            return true;
         }
 
         if (callback_state) {
@@ -5309,6 +5465,9 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+
+    // the loop has ended and nothing decodes: the sessions are left for the next start (LLAMA_PROMPT_CACHE_DIR)
+    impl->store_prompt_cache();
 }
 
 void server_context::terminate() {
