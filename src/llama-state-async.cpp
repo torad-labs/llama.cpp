@@ -128,6 +128,10 @@ public:
         copies.push_back({ tensor, const_cast<uint8_t *>(take(size)), size, offset });
     }
 
+    void read_tensor_now(ggml_tensor * tensor, size_t offset, size_t size) override {
+        ggml_backend_tensor_set(tensor, take(size), offset, size);
+    }
+
     size_t n_bytes() override {
         return size_read;
     }
@@ -162,6 +166,10 @@ public:
 
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         copies.push_back({ tensor, take(size), size, offset });
+    }
+
+    void write_tensor_now(ggml_tensor * tensor, size_t offset, size_t size) override {
+        ggml_backend_tensor_get(tensor, take(size), offset, size);
     }
 
     size_t n_bytes() override {

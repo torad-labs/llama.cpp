@@ -1157,7 +1157,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         for (const auto & range : cell_ranges) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * r_size_row;
-            io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+            io.write_tensor_now(r_l[il], range.first * r_size_row, buf_size);
         }
     }
 
@@ -1179,7 +1179,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                io.write_tensor_now(s_l[il], range.first * s_size_row, buf_size);
             }
         }
     } else {
@@ -1208,7 +1208,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
                     const size_t range_size = range.second - range.first;
                     const size_t src_offset = (range.first + j * mem_size) * s_size_el;
                     const size_t buf_size = range_size * s_size_el;
-                    io.write_tensor(s_l[il], src_offset, buf_size);
+                    io.write_tensor_now(s_l[il], src_offset, buf_size);
                 }
             }
         }
@@ -1385,9 +1385,9 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         if (cell_count) {
             // Read and set the keys for the whole cell range
             if (n_seq_devices > 1) {
-                for (const uint32_t cell : restore_cells) { io.read_tensor(r_l[il], state_row(cell, 0)*r_size_row, r_size_row); }
+                for (const uint32_t cell : restore_cells) { io.read_tensor_now(r_l[il], state_row(cell, 0)*r_size_row, r_size_row); }
             } else {
-                io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
+                io.read_tensor_now(r_l[il], head * r_size_row, cell_count * r_size_row);
             }
         }
     }
@@ -1419,9 +1419,9 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             if (cell_count) {
                 // Read and set the values for the whole cell range
                 if (n_seq_devices > 1) {
-                    for (const uint32_t cell : restore_cells) { io.read_tensor(s_l[il], state_row(cell, 0)*s_size_row, s_size_row); }
+                    for (const uint32_t cell : restore_cells) { io.read_tensor_now(s_l[il], state_row(cell, 0)*s_size_row, s_size_row); }
                 } else {
-                    io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                    io.read_tensor_now(s_l[il], head * s_size_row, cell_count * s_size_row);
                 }
             }
         }
@@ -1463,7 +1463,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                 // For each row in the transposed matrix, read the values for the whole cell range
                 for (uint32_t j = 0; j < n_embd_s; ++j) {
                     const size_t dst_offset = (head + j * size) * s_size_el;
-                    io.read_tensor(s_l[il], dst_offset, cell_count * s_size_el);
+                    io.read_tensor_now(s_l[il], dst_offset, cell_count * s_size_el);
                 }
             }
         }
