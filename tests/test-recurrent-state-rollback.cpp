@@ -534,6 +534,66 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
         return true;
     };
 
+    const auto rollback_shared = [&](uint32_t src, uint32_t dst, uint32_t n_rows, bool shared_ref) {
+        if (!clear(dst)) {
+            return false;
+        }
+        llama_context * shared = shared_ref ? ctx_ref : ctx_any;
+        llama_context * independent = shared_ref ? ctx_any : ctx_ref;
+        constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        std::vector<uint8_t> saved(llama_state_seq_get_size_ext(shared, (llama_seq_id) src, flags));
+        if (saved.empty() ||
+            llama_state_seq_get_data_ext(shared, saved.data(), saved.size(), (llama_seq_id) src, flags) != saved.size()) {
+            fprintf(stderr, "%s : failed to save the sibling reference\n", __func__);
+            return false;
+        }
+        // Keep identical attention placement; only the reference's recurrent cell is independent.
+        for (llama_context * ctx : {ctx_ref, ctx_any}) {
+            llama_memory_seq_cp(llama_get_memory(ctx), (llama_seq_id) src, (llama_seq_id) dst, -1, -1);
+        }
+        pos[dst] = pos[src];
+        // Finish deferred copies before constructing the reference; neither sibling decodes.
+        std::vector<uint32_t> advance(n_seqs, 0);
+        uint32_t other = 0;
+        while (other == src || other == dst) { ++other; }
+        advance[other] = 1;
+        if (!step("finish copied streams while the siblings wait", advance)) {
+            return false;
+        }
+        if (llama_state_seq_set_data_ext(independent, saved.data(), saved.size(), (llama_seq_id) dst, flags) != saved.size()) {
+            fprintf(stderr, "%s : failed to restore the independent sibling\n", __func__);
+            return false;
+        }
+        std::vector<std::vector<float>> before;
+        for (llama_context * ctx : {ctx_ref, ctx_any}) {
+            before.push_back(recurrent_state(ctx, (llama_seq_id) dst));
+        }
+        if (!rollback(src, n_rows)) {
+            fprintf(stderr, "%s : rollback of a copied source was refused\n", __func__);
+            return false;
+        }
+        size_t i = 0;
+        for (llama_context * ctx : {ctx_ref, ctx_any}) {
+            const llama_pos actual_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), (llama_seq_id) dst);
+            const auto after = recurrent_state(ctx, (llama_seq_id) dst);
+            if (actual_pos != pos[dst] - 1 || after.size() != before[i].size() ||
+                std::memcmp(after.data(), before[i].data(), after.size()*sizeof(float)) != 0) {
+                fprintf(stderr, "%s : rolling back seq %u changed copied sibling %u (%s, position %d != %d)\n",
+                        __func__, src, dst, ctx == ctx_any ? "any sequences" : "reference",
+                        actual_pos, pos[dst] - 1);
+                return false;
+            }
+            ++i;
+        }
+        const float diff = recurrent_state_diff(shared, independent, (llama_seq_id) src);
+        if (!(diff <= state_eps)) {
+            fprintf(stderr, "%s : a copied source's rollback differs from an independent source by %g\n",
+                    __func__, (double) diff);
+            return false;
+        }
+        return true;
+    };
+
     bool ok = true;
     ok = ok && step("three sequences' prompts",                       {6, 6, 6, 0});
     ok = ok && step("the same set",                                   {1, 1, 1, 0});
@@ -585,6 +645,21 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
     ok = ok && clear(1);
     ok = ok && copy(2, 1);
     ok = ok && step("continue after reusing a rolled back destination", {1, 1, 1, 1});
+    // Earlier full restores can place attention rows differently. Start this matrix from equal caches.
+    for (llama_context * ctx : {ctx_ref, ctx_any}) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+    }
+    std::fill(pos.begin(), pos.end(), 0);
+    ok = ok && step("fresh prefixes for the copied-sibling matrix", {6, 6, 6, 6});
+    for (const bool shared_ref : {true, false}) {
+        for (const uint32_t n_rows : {1u, 2u}) {
+            ok = ok && step("states before copying then rolling back the source", {3, 3, 3, 3});
+            ok = ok && rollback_shared(0, 1, n_rows, shared_ref);
+            ok = ok && step("other sequences advance while both siblings wait", {0, 0, 1, 1});
+            ok = ok && step("the copied sibling continues first", {0, 1, 0, 0});
+            ok = ok && step("the rolled back source follows", {1, 1, 1, 1});
+        }
+    }
     if (!ok) {
         cleanup();
         return false;
