@@ -1263,7 +1263,18 @@ int main(int argc, char ** argv) {
     if (!test_prompt_shapes(params, model, n_vocab)) {
         return 1;
     }
-    if (!test_prompt_kept(params, model, n_vocab, "8", true) || !test_prompt_kept(params, model, n_vocab, "2", false)) {
+    // A model split by layers over several cards runs its graphs as a pipeline, and such a context does not share its
+    // graph buffers, which a kept prompt graph needs: the switch does nothing there and only the outputs are compared.
+    // The model's devices: the ones named on the command line, or every card.
+    size_t n_devices = 0;
+    for (const ggml_backend_dev_t dev : params.devices) {
+        n_devices += dev != nullptr ? 1 : 0;
+    }
+    for (size_t i = 0; params.devices.empty() && i < ggml_backend_dev_count(); ++i) {
+        n_devices += ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU ? 1 : 0;
+    }
+    const bool kept_possible = n_devices <= 1 || params.split_mode != LLAMA_SPLIT_MODE_LAYER;
+    if (!test_prompt_kept(params, model, n_vocab, "8", kept_possible) || !test_prompt_kept(params, model, n_vocab, "2", false)) {
         return 1;
     }
 
