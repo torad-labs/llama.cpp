@@ -449,8 +449,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // rows mode reads the state row in place, so it needs an f32 cache (ggml_gated_delta_net_rows asserts it): any
     // other type (-cts f16, bf16, q8_0) takes the gathered path, whose get_rows converts the row to f32 and whose
     // set_rows converts the snapshots back, as every non-Metal GPU already does.
+    // Nor over a memory that keeps a row a sequence: the cache view (build_rs_cache_view) holds the memory's head and
+    // moves the rows between the batch's, and such a memory has neither
     const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 &&
-                                ssm_states_all->type == GGML_TYPE_F32;
+                                ssm_states_all->type == GGML_TYPE_F32 && !inp->fixed_rows();
 
     ggml_tensor * state;
     if (gdn_state_rows) {

@@ -419,6 +419,16 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// Whether the memory keeps a row a sequence: with several sequence devices, and on one device under
+// LLAMA_RS_FIXED_ROWS=1 for the architectures of llm_arch_rs_by_row
+static bool rs_fixed_rows(const llama_memory_recurrent_context * mctx) {
+    return mctx->is_fixed_rows();
+}
+
+bool llm_graph_input_rs::fixed_rows() const {
+    return rs_fixed_rows(mctx);
+}
+
 void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mctx_cur, const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx_cur->get_n_rs();
 
@@ -446,14 +456,28 @@ void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mct
             data[r] = (r / n_seqs) * (int64_t) mem_size + (int64_t) rs_head + (r % n_seqs);
         }
     }
+    // the row each state of the batch is written to: its set's sequence, or every sequence of its set where the graph
+    // writes a row a sequence (build_rs_store_local), in the sets' order
+    std::vector<int32_t> group;
     for (uint32_t snapshot = 0; snapshot < s_write_local.size(); ++snapshot) {
         ggml_tensor * rows = s_write_local[snapshot];
         if (!rows) { continue; }
-        std::vector<int64_t> data(ubatch->n_seqs);
+        const bool every_owner = rows->ne[0] != (int64_t) ubatch->n_seqs;
+        std::vector<int64_t> data;
+        group.clear();
         for (uint32_t s = 0; s < ubatch->n_seqs; ++s) {
-            data[s] = mctx_cur->s_write(ubatch->seq_id[s*ubatch->n_seq_tokens][0], snapshot);
+            const uint32_t i = s*ubatch->n_seq_tokens;
+            for (int32_t j = 0; j < (every_owner ? ubatch->n_seq_id[i] : 1); ++j) {
+                data.push_back(mctx_cur->s_write(ubatch->seq_id[i][j], snapshot));
+                group.push_back(s);
+            }
         }
+        GGML_ASSERT((int64_t) data.size() == rows->ne[0]);
         ggml_backend_tensor_set(rows, data.data(), 0, ggml_nbytes(rows));
+    }
+    if (s_write_group) {
+        GGML_ASSERT((int64_t) group.size() == s_write_group->ne[0]);
+        ggml_backend_tensor_set(s_write_group, group.data(), 0, ggml_nbytes(s_write_group));
     }
 }
 
@@ -465,7 +489,8 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
     const bool ok_main  = s_copy_main->ne[0]  == params.ubatch.n_seqs;
     const bool ok_extra = s_copy_extra->ne[0] == mctx_cur->get_n_rs() - params.ubatch.n_seqs;
     const bool ok_write = !s_write_rows || s_write_rows->ne[0] == n_write;
-    const bool ok_head  = head == mctx_cur->get_head();
+    // a graph over a row a sequence on one device holds no head: its rows are inputs. Several devices keep the check
+    const bool ok_head  = (rs_fixed_rows(mctx_cur) && mctx_cur->n_devices() == 1) || head == mctx_cur->get_head();
     const bool ok_rs_z  = !rs_z_baked || rs_z == mctx_cur->get_rs_z();
 
     const bool res = ok_copy && ok_main && ok_extra && ok_write && ok_head && ok_rs_z;
@@ -4116,7 +4141,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     auto inp = std::make_unique<llm_graph_input_rs>(mctx_cur);
 
-    const int64_t n_rs   = mctx_cur->n_devices() > 1 ? ubatch.n_seqs : mctx_cur->get_n_rs();
+    // a row a sequence: the batch's rows and no others, since no other sequence's state is moved by the decode
+    const int64_t n_rs   = rs_fixed_rows(mctx_cur) ? ubatch.n_seqs : mctx_cur->get_n_rs();
     const int64_t n_seqs = ubatch.n_seqs;
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
@@ -4156,6 +4182,19 @@ ggml_tensor * llm_graph_context::build_rs(
     if (cparams.n_seq_devices > 1) {
         GGML_ASSERT(state_size == s->ne[0] && n_seqs == inp->s_copy_main->ne[0]);
         return ggml_backend_meta_get_rows_local(ctx0, s, inp->s_copy_main);
+    }
+
+    if (inp->fixed_rows()) {
+        // One device and a row a sequence: the batch's states are the rows s_copy names, read where they lie. The
+        // decode moves no other row and clears none (the memory clears a new sequence's row before it), so the graph
+        // holds neither the head nor rs_z, and is the same for any set of as many sequences
+        GGML_ASSERT(state_size == s->ne[0] && n_seqs == inp->s_copy_main->ne[0]);
+        ggml_tensor * rows = get_state_rows(ctx0, ggml_reshape_2d(ctx0, s, state_size, s->ne[1]), inp->s_copy_main);
+        ggml_build_forward_expand(gf, rows);
+        if (kv_state->rows_disjoint() && rows->op == GGML_OP_GET_ROWS) {
+            rows->flags |= GGML_TENSOR_FLAG_ROWS_DISJOINT;
+        }
+        return rows;
     }
 
     inp->rs_z_baked |= s->type == GGML_TYPE_F32;
@@ -4220,17 +4259,34 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
 
 ggml_tensor * llm_graph_context::build_rs_store_local(llm_graph_input_rs * inp, ggml_tensor * cache,
         ggml_tensor * states, uint32_t snapshot) const {
-    GGML_ASSERT(cparams.n_seq_devices > 1 && snapshot <= cparams.n_rs_seq);
+    GGML_ASSERT(inp->fixed_rows() && snapshot <= cparams.n_rs_seq);
+    const bool local = cparams.n_seq_devices > 1;
+    // a set of several sequences (a token they share) on one device: its state goes to the row of each of them
+    const bool every_owner = !local && ubatch.n_seqs_unq > ubatch.n_seqs;
     if (inp->s_write_local.size() <= snapshot) { inp->s_write_local.resize(snapshot + 1, nullptr); }
     auto & rows = inp->s_write_local[snapshot];
     if (!rows) {
-        rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_seqs);
-        const auto counts = ubatch.device_seqs(cparams.n_seq_devices);
-        ggml_backend_meta_split_input(rows, 0, counts.data(), counts.size());
+        rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, every_owner ? ubatch.n_seqs_unq : ubatch.n_seqs);
+        if (local) {
+            const auto counts = ubatch.device_seqs(cparams.n_seq_devices);
+            ggml_backend_meta_split_input(rows, 0, counts.data(), counts.size());
+        }
         ggml_set_input(rows);
     }
     states = ggml_cont_2d(ctx0, states, cache->ne[0], ubatch.n_seqs);
-    return ggml_backend_meta_set_rows_local(ctx0, cache, states, rows);
+    if (local) {
+        return ggml_backend_meta_set_rows_local(ctx0, cache, states, rows);
+    }
+    if (every_owner) {
+        if (!inp->s_write_group) {
+            inp->s_write_group = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_seqs_unq);
+            ggml_set_input(inp->s_write_group);
+        }
+        states = ggml_get_rows(ctx0, states, inp->s_write_group);
+    }
+    // where every set is one sequence this is the form the several-device store has: a view of the slot, a cont of it
+    // and a set_rows at each sequence's row, which the CUDA backend folds into the recurrent kernel
+    return ggml_set_rows(ctx0, cache, states, rows);
 }
 
 ggml_tensor * llm_graph_context::build_rs_write_rows(

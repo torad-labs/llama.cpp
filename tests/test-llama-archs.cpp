@@ -1535,9 +1535,12 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
                 //              reused, and seq 0, with no dense step of its own and 2,048 cells to the end, reuses 3
                 // The main context's KDA layers bake the recurrent state's zero row into the graph (build_rs): a sequence's
                 // first step starts from it and its second does not, so the second step of each sequence builds too,
-                // whatever the padding. The MTP head has no KDA layer
+                // whatever the padding. The MTP head has no KDA layer, and over a memory that keeps a row a sequence
+                // (LLAMA_RS_FIXED_ROWS=1) the main context's graph holds no zero row either: the memory clears a new
+                // sequence's row before the decode, so the main context reuses as the MTP head does
+                const bool rs_z_baked = !mtp && !ggml_env_switch("LLAMA_RS_FIXED_ROWS");
                 const int want_fine   = 0;
-                const int want_coarse = mtp ?
+                const int want_coarse = !rs_z_baked ?
                     (top_k == 8 ? (unified ? 14 : 12) : (unified ? 3 : 1)) :
                     (top_k == 8 ? (unified ? 12 : 11) : (unified ? 2 : 1));
 

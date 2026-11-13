@@ -31,8 +31,19 @@ llama_memory_recurrent::llama_memory_recurrent(
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max), n_seq_devices(model.n_seq_devices()) {
     const int32_t n_layer = hparams.n_layer();
 
+    const bool fixed_requested = ggml_env_switch("LLAMA_RS_FIXED_ROWS");
+    fixed_rows = fixed_requested && llm_arch_rs_by_row(model.arch);
+    if (fixed_requested && !is_fixed_rows()) {
+        LLAMA_LOG_INFO("%s: fixed rows are not supported for %s; using contiguous rows\n", __func__, llm_arch_name(model.arch));
+    }
+    if (fixed_rows) {
+        // one line a server's operator can look for: the switch took
+        LLAMA_LOG_INFO("%s: fixed rows: each sequence keeps one row for its whole life (LLAMA_RS_FIXED_ROWS)\n", __func__);
+    }
     if (n_seq_devices > 1) {
         GGML_ASSERT(offload);
+    }
+    if (is_fixed_rows()) {
         mem_size = n_seq_max;
     }
 
@@ -220,7 +231,7 @@ void llama_memory_recurrent::zero_rs_z() {
         }
         return;
     }
-    if (n_seq_devices > 1) {
+    if (is_fixed_rows()) {
         if (!zero_cells.empty() && owner_context) { llama_synchronize(owner_context); }
         for (const auto & layers : {r_l, s_l}) {
             for (ggml_tensor * tensor : layers) {
@@ -415,7 +426,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    if (n_seq_devices > 1) {
+    if (is_fixed_rows()) {
         GGML_ASSERT(seq_id_src >= 0 && uint32_t(seq_id_src) < n_seq_max);
         GGML_ASSERT(seq_id_dst >= 0 && uint32_t(seq_id_dst) < n_seq_max);
         const int32_t source = cells[seq_id_src].tail;
@@ -708,6 +719,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_n = n;
     auto org_rs_z = rs_z;
     auto org_zero_cells = zero_cells;
+    auto org_rs_idx = rs_idx;
 
     bool success = true;
 
@@ -729,6 +741,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     n = org_n;
     rs_z = org_rs_z;
     zero_cells = std::move(org_zero_cells);
+    rs_idx = std::move(org_rs_idx);
 
     return success;
 }
@@ -801,29 +814,42 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch, bool allow_r
     // a move the last placement left owed is not forgotten by the next one
     settle();
 
-    if (n_seq_devices > 1) {
+    if (is_fixed_rows()) {
         GGML_ASSERT(ubatch.equal_seqs() && n_seqs > 0);
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            const uint32_t i = s*n_seq_tokens;
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const llama_seq_id seq = ubatch.seq_id[i][j];
+                if (seq < 0 || (uint32_t) seq >= n_seq_max) {
+                    LLAMA_LOG_ERROR("%s: invalid seq_id %d for %u fixed rows\n", __func__, seq, n_seq_max);
+                    return false;
+                }
+            }
+        }
         zero_cells.clear();
         head = llama_seq_to_stream(ubatch.seq_id[0][0], n_seq_max, n_seq_devices);
         n = n_seqs;
         rs_z = -1;
         for (uint32_t s = 0; s < n_seqs; ++s) {
             const uint32_t i = s*n_seq_tokens;
-            GGML_ASSERT(ubatch.n_seq_id[i] == 1);
-            const llama_seq_id seq = ubatch.seq_id[i][0];
-            const uint32_t slot = llama_seq_to_stream(seq, n_seq_max, n_seq_devices);
-            auto & cell = cells[slot];
-            if (cells[seq].tail < 0) {
-                GGML_ASSERT(cell.is_empty());
-                zero_cells.push_back(slot);
-                ++used;
-            } else {
-                GGML_ASSERT(cells[seq].tail == (int32_t) slot && cell.has_seq_id(seq));
+            GGML_ASSERT(n_seq_devices == 1 || ubatch.n_seq_id[i] == 1);
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const llama_seq_id seq = ubatch.seq_id[i][j];
+                const uint32_t slot = llama_seq_to_stream(seq, n_seq_max, n_seq_devices);
+                auto & cell = cells[slot];
+                if (cells[seq].tail < 0) {
+                    GGML_ASSERT(cell.is_empty());
+                    zero_cells.push_back(slot);
+                    rs_idx[seq] = 0;
+                    ++used;
+                } else {
+                    GGML_ASSERT(cells[seq].tail == (int32_t) slot && cell.has_seq_id(seq));
+                }
+                cell.pos = ubatch.pos[i + n_seq_tokens - 1];
+                cell.src0 = cell.src = slot;
+                cell.seq_id.insert(seq);
+                cells[seq].tail = slot;
             }
-            cell.pos = ubatch.pos[i + n_seq_tokens - 1];
-            cell.src0 = cell.src = slot;
-            cell.seq_id.insert(seq);
-            cells[seq].tail = slot;
         }
         return true;
     }
@@ -1069,7 +1095,7 @@ void llama_memory_recurrent::set_relocate(bool value) {
             f32 = f32 && (tensor == nullptr || tensor->type == GGML_TYPE_F32);
         }
     }
-    relocate = value && n_seq_devices == 1 && f32;
+    relocate = value && !is_fixed_rows() && f32;
     relocate_disjoint = relocate && !ggml_env_switch("LLAMA_RS_GATHER_LEGACY");
 }
 
@@ -1466,7 +1492,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 }
 
 bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
-    if (n_seq_devices > 1) {
+    if (is_fixed_rows()) {
         if (cell_count > n_seq_max || (dest_seq_id >= 0 && (uint32_t(dest_seq_id) >= n_seq_max || cell_count > 1))) {
             return false;
         }
@@ -1478,20 +1504,24 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
             uint32_t count;
             io.read(&pos, sizeof(pos));
             io.read(&count, sizeof(count));
-            llama_seq_id seq = dest_seq_id;
-            if (dest_seq_id < 0) {
-                if (count != 1) { return false; }
-                io.read(&seq, sizeof(seq));
-            } else if (count != 0) { return false; }
-            if (seq < 0 || uint32_t(seq) >= n_seq_max || cells[seq].tail >= 0) { return false; }
-            const uint32_t slot = llama_seq_to_stream(seq, n_seq_max, n_seq_devices);
-            auto & cell = cells[slot];
-            cell.pos = pos;
-            cell.src = slot;
-            cell.seq_id.insert(seq);
-            cells[seq].tail = slot;
-            restore_cells.push_back(slot);
-            ++used;
+            if (dest_seq_id < 0 ? (count == 0 || count > n_seq_max) : count != 0) {
+                return false;
+            }
+            restore_cells.emplace_back();
+            // A legacy shared cell restores into each owner's permanent row.
+            for (uint32_t j = 0; j < (dest_seq_id < 0 ? count : 1); ++j) {
+                llama_seq_id seq = dest_seq_id;
+                if (dest_seq_id < 0) { io.read(&seq, sizeof(seq)); }
+                if (seq < 0 || uint32_t(seq) >= n_seq_max || cells[seq].tail >= 0) { return false; }
+                const uint32_t slot = llama_seq_to_stream(seq, n_seq_max, n_seq_devices);
+                auto & cell = cells[slot];
+                cell.pos = pos;
+                cell.src0 = cell.src = slot;
+                cell.seq_id.insert(seq);
+                cells[seq].tail = slot;
+                restore_cells.back().push_back(slot);
+                ++used;
+            }
         }
         return true;
     }
@@ -1592,6 +1622,18 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
 }
 
 bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count) {
+    const auto read_rows = [&](ggml_tensor * tensor, size_t row_size) {
+        for (const auto & rows : restore_cells) {
+            io.read_tensor_now(tensor, state_row(rows.front(), 0)*row_size, row_size);
+            if (rows.size() > 1) {
+                std::vector<uint8_t> bytes(row_size);
+                ggml_backend_tensor_get(tensor, bytes.data(), state_row(rows.front(), 0)*row_size, row_size);
+                for (size_t i = 1; i < rows.size(); ++i) {
+                    ggml_backend_tensor_set(tensor, bytes.data(), state_row(rows[i], 0)*row_size, row_size);
+                }
+            }
+        }
+    };
     uint32_t s_trans;
     uint32_t n_layer;
     io.read(&s_trans, sizeof(s_trans));
@@ -1635,8 +1677,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
         if (cell_count) {
             // Read and set the keys for the whole cell range
-            if (n_seq_devices > 1) {
-                for (const uint32_t cell : restore_cells) { io.read_tensor_now(r_l[il], state_row(cell, 0)*r_size_row, r_size_row); }
+            if (is_fixed_rows()) {
+                read_rows(r_l[il], r_size_row);
             } else {
                 io.read_tensor_now(r_l[il], head * r_size_row, cell_count * r_size_row);
             }
@@ -1669,8 +1711,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
             if (cell_count) {
                 // Read and set the values for the whole cell range
-                if (n_seq_devices > 1) {
-                    for (const uint32_t cell : restore_cells) { io.read_tensor_now(s_l[il], state_row(cell, 0)*s_size_row, s_size_row); }
+                if (is_fixed_rows()) {
+                    read_rows(s_l[il], s_size_row);
                 } else {
                     io.read_tensor_now(s_l[il], head * s_size_row, cell_count * s_size_row);
                 }
@@ -1762,9 +1804,13 @@ bool llama_memory_recurrent_context::apply() {
 
     const llama_ubatch & ubatch = ubatches[i_next];
 
-    mem->find_slot(ubatch);
+    if (!mem->find_slot(ubatch)) {
+        return false;
+    }
     mem->zero_rs_z();
-    mem->relocate_states(ubatch.n_seqs);
+    if (!mem->is_fixed_rows()) {
+        mem->relocate_states(ubatch.n_seqs);
+    }
 
     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
         mem->rs_reach[ubatch.seq_id_unq[s]] = std::min(mem->n_rs_seq, ubatch.n_seq_tokens - 1);
@@ -1793,11 +1839,11 @@ uint32_t llama_memory_recurrent_context::get_head() const {
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
     // relocate: the row is zeroed before the decode (zero_rs_z), not by its graph
-    return is_full ? 0 : mem->relocate ? -1 : mem->rs_z;
+    return is_full ? 0 : (mem->relocate || mem->is_fixed_rows()) ? -1 : mem->rs_z;
 }
 
 bool llama_memory_recurrent_context::rows_disjoint() const {
-    return !is_full && mem->relocate_disjoint;
+    return !is_full && (mem->is_fixed_rows() || mem->relocate_disjoint);
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {
@@ -1813,11 +1859,21 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
-    const uint32_t cell_idx = mem->n_devices() > 1 ?
-        llama_seq_to_stream(get_ubatch().seq_id_unq[i], mem->size, mem->n_devices()) : i + mem->head;
+    if (mem->is_fixed_rows()) {
+        const auto & ubatch = get_ubatch();
+        const uint32_t token = i*ubatch.n_seq_tokens;
+        const llama_seq_id seq = ubatch.seq_id[token][0];
+        const uint32_t cell = llama_seq_to_stream(seq, mem->size, mem->n_devices());
+        const uint32_t snapshot = mem->rs_idx[seq];
+        for (int32_t j = 0; j < ubatch.n_seq_id[token]; ++j) {
+            mem->rs_idx[ubatch.seq_id[token][j]] = 0;
+        }
+        return mem->state_row(cell, snapshot, true);
+    }
+    const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
 
-    if (mem->n_rs_seq == 0) { return mem->n_devices() > 1 ? mem->state_row(src0, 0, true) : src0; }
+    if (mem->n_rs_seq == 0) { return src0; }
 
     uint32_t idx = 0;
     if (!mem->cells[cell_idx].seq_id.empty()) {
@@ -1828,10 +1884,10 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
             mem->rs_idx[seq] = 0;
         }
     }
-    return mem->n_devices() > 1 ? mem->state_row(src0, idx, true) : (int32_t)(idx*mem->size) + src0;
+    return (int32_t)(idx*mem->size) + src0;
 }
 
 uint32_t llama_memory_recurrent_context::s_write(llama_seq_id seq, uint32_t snapshot) const {
-    GGML_ASSERT(mem->n_devices() > 1);
+    GGML_ASSERT(mem->is_fixed_rows());
     return mem->state_row(llama_seq_to_stream(seq, mem->size, mem->n_devices()), snapshot, true);
 }

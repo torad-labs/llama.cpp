@@ -353,6 +353,20 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             FIXTURES_REQUIRED generate-models
         )
     endforeach()
+    # LLAMA_RS_FIXED_ROWS=1: a recurrent memory that keeps a row a sequence on one device, as several sequence devices
+    # always do, for the architectures whose graphs write their states by row (llm_arch_rs_by_row): no decode moves
+    # another sequence's state, a copy has a row of its own at once, and a graph holds neither the memory's head nor a
+    # row to clear. On the host, as its twin above. test-recurrent-arena holds the memory's own cases
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-glm5next-fixed-rows
+        LABEL main
+        ARGS -m "${MODEL_DIR}/glm5next-moe.gguf" --device none
+    )
+    set_tests_properties(test-recurrent-state-rollback-glm5next-fixed-rows PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        ENVIRONMENT "LLAMA_RS_FIXED_ROWS=1"
+    )
     llama_build_and_test(test-kv-mean-center.cpp)
 endif()
 

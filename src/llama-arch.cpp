@@ -1083,6 +1083,20 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_rs_by_row(const llm_arch & arch) {
+    // not bailingmoe3, kimi-k3 or kimi-linear, whose conv states are written through views at the memory's head, nor
+    // the mamba, rwkv, lfm2, plamo2 and minimax-01 graphs, which write every state that way
+    switch (arch) {
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_GLM5NEXT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:

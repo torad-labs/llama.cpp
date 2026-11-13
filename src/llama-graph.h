@@ -368,7 +368,15 @@ public:
     // shared across recurrent layers
     ggml_tensor * s_write_rows = nullptr;
     int64_t       s_write_K    = 0;
-    std::vector<ggml_tensor *> s_write_local; // one device-local I64 index per sequence, for each snapshot
+    // a memory that keeps a row a sequence (fixed_rows): for each snapshot the I64 rows the batch's states are written
+    // to, device-local where the sequences are split over devices. One row a sequence set, or one a sequence where a
+    // set holds several (a token they share); s_write_group, I32, then names the set of each row
+    std::vector<ggml_tensor *> s_write_local;
+    ggml_tensor * s_write_group = nullptr;
+
+    // whether the memory keeps each sequence's state in a row of its own for the sequence's whole life. The graph then
+    // reads and writes the rows by index and holds nothing of where a batch's sequences lie
+    bool fixed_rows() const;
 
     const llama_memory_recurrent_context * mctx;
 

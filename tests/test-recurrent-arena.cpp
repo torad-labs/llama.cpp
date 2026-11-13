@@ -3,10 +3,15 @@
 #include "../src/llama-model.h"
 #include "../src/llama-batch.h"
 #include "../src/llama-memory-recurrent.h"
+#include "../src/llama-io.h"
 #include "ggml-backend.h"
 #include "../ggml/src/ggml-recurrent-arena.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
 #include <memory>
 #include <random>
 #include <set>
@@ -162,6 +167,166 @@ static bool test_owed_moves(const llama_model & model) {
     return true;
 }
 
+struct state_buffer : llama_io_write_i, llama_io_read_i {
+    std::vector<uint8_t> bytes;
+    size_t offset = 0;
+    void write(const void * src, size_t size) override {
+        const auto * begin = static_cast<const uint8_t *>(src);
+        bytes.insert(bytes.end(), begin, begin + size);
+        offset += size;
+    }
+    void write_tensor(ggml_tensor * tensor, size_t at, size_t size) override {
+        const size_t start = bytes.size();
+        bytes.resize(start + size);
+        ggml_backend_tensor_get(tensor, bytes.data() + start, at, size);
+        offset += size;
+    }
+    void read(void * dst, size_t size) override {
+        if (offset > bytes.size() || size > bytes.size() - offset) { throw std::runtime_error("short test state"); }
+        std::memcpy(dst, bytes.data() + offset, size);
+        offset += size;
+    }
+    void read_tensor(ggml_tensor * tensor, size_t at, size_t size) override {
+        if (offset > bytes.size() || size > bytes.size() - offset) { throw std::runtime_error("short test tensor"); }
+        ggml_backend_tensor_set(tensor, bytes.data() + offset, at, size);
+        offset += size;
+    }
+    size_t n_bytes() override { return offset; }
+};
+
+struct fixed_rows_env {
+    const bool present = getenv("LLAMA_RS_FIXED_ROWS") != nullptr;
+    const std::string previous = present ? getenv("LLAMA_RS_FIXED_ROWS") : "";
+    static void set(const char * value) {
+#ifdef _WIN32
+        _putenv_s("LLAMA_RS_FIXED_ROWS", value ? value : "");
+#else
+        if (value) { setenv("LLAMA_RS_FIXED_ROWS", value, 1); }
+        else { unsetenv("LLAMA_RS_FIXED_ROWS"); }
+#endif
+    }
+    ~fixed_rows_env() { set(present ? previous.c_str() : nullptr); }
+};
+
+static bool test_fixed_rows(const llama_model & model) {
+    fixed_rows_env env;
+    env.set("0");
+    llama_memory_recurrent legacy(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 8, 4, 2, {});
+    env.set("1");
+    llama_memory_recurrent fixed(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 8, 4, 2, {});
+    const auto fail = [](const char * what) {
+        fprintf(stderr, "FAIL: fixed rows: %s\n", what);
+        return false;
+    };
+    fixed.set_relocate(true);
+    if (!fixed.is_fixed_rows() || fixed.size != 4 || fixed.relocate || fixed.relocate_disjoint) {
+        return fail("one permanent row per sequence, without relocation");
+    }
+    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+    const auto batch = [&](std::vector<llama_seq_id> owners, llama_pos pos, uint32_t tokens) {
+        auto b = balloc.ubatch_reserve(tokens, 1);
+        b.data->seq_id_data = owners;
+        b.data->seq_id_unq = owners;
+        std::sort(b.data->seq_id_unq.begin(), b.data->seq_id_unq.end());
+        b.seq_id_unq = b.data->seq_id_unq.data();
+        b.n_seqs_unq = owners.size();
+        for (uint32_t t = 0; t < tokens; ++t) {
+            b.pos[t] = pos + t;
+            b.n_seq_id[t] = owners.size();
+            b.seq_id[t] = b.data->seq_id_data.data();
+        }
+        return b;
+    };
+    const auto dump = [](llama_memory_recurrent & mem, llama_seq_id seq) {
+        state_buffer out;
+        mem.state_write(out, seq);
+        return out.bytes;
+    };
+    const auto fill = [](llama_memory_recurrent & mem, llama_seq_id seq) {
+        const uint32_t cell = mem.cells[seq].tail;
+        for (const auto & layers : {mem.r_l, mem.s_l}) {
+            for (auto * tensor : layers) {
+                if (!tensor) { continue; }
+                for (uint32_t p = 0; p <= mem.n_rs_seq; ++p) {
+                    std::vector<float> values(tensor->ne[0], 10.0f + p);
+                    ggml_backend_tensor_set(tensor, values.data(), mem.state_row(cell, p)*tensor->nb[1], tensor->nb[1]);
+                }
+            }
+        }
+    };
+    llama_memory_recurrent_context initial(&fixed, {batch({3}, 0, 4)});
+    if (!initial.apply()) { return fail("initial placement"); }
+    fill(fixed, 3);
+    fixed.seq_cp(3, 1, -1, -1);
+    const auto sibling = dump(fixed, 1);
+    if (fixed.cells[3].tail != 3 || fixed.cells[1].tail != 1 ||
+            fixed.cells[3].seq_id.size() != 1 || fixed.cells[1].seq_id.size() != 1 || sibling != dump(fixed, 3)) {
+        return fail("a copy must own independent bytes and metadata");
+    }
+    if (!fixed.seq_rm(3, 3, -1) || fixed.rs_idx[3] != 1 || dump(fixed, 1) != sibling) {
+        return fail("source rollback changed its copied sibling");
+    }
+    fixed.seq_cp(3, 2, -1, -1);
+    const auto rolled = dump(fixed, 2);
+    if (rolled != dump(fixed, 3) || fixed.rs_idx[2] != 0 || fixed.rs_reach[2] != 0) {
+        return fail("copy of a pending rollback did not take its selected plane");
+    }
+    fixed.seq_rm(3, -1, -1);
+    llama_memory_recurrent_context reused(&fixed, {batch({3}, 0, 1)});
+    if (!reused.apply() || fixed.cells[3].tail != 3 || dump(fixed, 1) != sibling || dump(fixed, 2) != rolled) {
+        return fail("reusing the source changed a copied sibling");
+    }
+    for (const auto & layers : {fixed.r_l, fixed.s_l}) {
+        for (auto * tensor : layers) {
+            if (!tensor) { continue; }
+            std::vector<float> values(tensor->ne[0]);
+            ggml_backend_tensor_get(tensor, values.data(), 3*tensor->nb[1], tensor->nb[1]);
+            if (std::any_of(values.begin(), values.end(), [](float value) { return value != 0; })) {
+                return fail("a reused sequence did not start with a zero state");
+            }
+        }
+    }
+    const auto cells = fixed.cells;
+    const auto indices = fixed.rs_idx;
+    if (!fixed.prepare({batch({0}, 0, 1), batch({2}, 3, 1)}) || fixed.rs_idx != indices) {
+        return fail("trial placement changed rollback selection");
+    }
+    for (size_t i = 0; i < cells.size(); ++i) {
+        const auto & a = cells[i];
+        const auto & b = fixed.cells[i];
+        if (a.pos != b.pos || a.src != b.src || a.src0 != b.src0 || a.tail != b.tail || a.seq_id != b.seq_id) {
+            return fail("trial placement changed ownership");
+        }
+    }
+    llama_memory_recurrent_context shared(&fixed, {batch({2, 0}, 3, 1)});
+    if (!shared.apply() || shared.s_copy(0) != 2 || shared.s_write(0, 0) != 0 || shared.s_write(2, 1) != 6 ||
+            !shared.rows_disjoint() || fixed.cells[0].tail != 0 || fixed.cells[2].tail != 2) {
+        return fail("shared tokens must read their first owner and write each owner's row");
+    }
+
+    llama_memory_recurrent_context old(&legacy, {batch({2}, 0, 4)});
+    if (!old.apply()) { return fail("legacy source placement"); }
+    fill(legacy, 2);
+    legacy.seq_cp(2, 0, -1, -1);
+    const auto expected = dump(legacy, 2);
+    state_buffer wire;
+    legacy.state_write(wire);
+    wire.offset = 0;
+    fixed.state_read(wire);
+    if (fixed.used != 2 || fixed.cells[0].tail != 0 || fixed.cells[2].tail != 2 ||
+            dump(fixed, 0) != expected || dump(fixed, 2) != expected || wire.offset != wire.bytes.size()) {
+        return fail("a legacy shared state must restore into independent fixed rows");
+    }
+    state_buffer reverse;
+    fixed.state_write(reverse);
+    reverse.offset = 0;
+    legacy.state_read(reverse);
+    if (dump(legacy, 0) != expected || dump(legacy, 2) != expected) {
+        return fail("fixed-row state must remain readable by the legacy memory");
+    }
+    return true;
+}
+
 int main() {
     if (!test_window_properties()) { return 5; }
 #ifdef _WIN32
@@ -169,6 +334,9 @@ int main() {
 #else
     setenv("GGML_CUDA_GDN_STATE_ARENA", "1", 1);
 #endif
+    // the cases test the contiguous layout unless they set the switch themselves (test_fixed_rows), whatever the
+    // caller's environment holds: a suite run with LLAMA_RS_FIXED_ROWS=1 exported must not fail test_owed_moves
+    fixed_rows_env::set(nullptr);
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_GLM5NEXT, llama_model_default_params()));
     auto & h = model->hparams;
     h.n_layer_all = 5;
@@ -178,6 +346,7 @@ int main() {
     h.n_embd_head_kda = 128;
     h.ssm_d_conv = 4;
     if (!test_owed_moves(*model)) { return 6; }
+    if (!test_fixed_rows(*model)) { return 7; }
     std::mt19937 rng(530);
     for (const uint32_t slots : {1u, 3u}) {
         for (const uint32_t snapshots : {0u, 1u, 8u}) {
