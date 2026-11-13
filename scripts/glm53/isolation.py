@@ -2,7 +2,7 @@
 """Do sessions on a real server keep their own context? A planted code word per session, asked back under load.
 
   isolation.py --base-url http://127.0.0.1:8100/v1 [--model ID] [--sessions 8] [--turns 5] [--filler 6000]
-               [--filler-max N] [--drop 0.25] [--max-tokens 400] [--seed 1] [--out FILE]
+               [--filler-max N] [--drop 0.25] [--max-tokens 400] [--seed 1] [--top-logprobs N] [--out FILE]
   The API key, when the server wants one, is read from the environment variable ISOLATION_API_KEY.
 
 Every session is a conversation of its own with the SAME system prompt (as agents share one) and its own code word
@@ -16,11 +16,17 @@ Every reply is checked for two things, which are counted apart:
   LEAK  the reply holds a code word that only another session was given
   LOST  the reply does not hold a word the session itself was given
 The words are made of two halves that never occur in the filler, so a reply cannot hold one by chance.
+
+A LOST turn is not always a lost context. The requests are at temperature 0, and a model split between two answers
+(say 0.54 for starting with the newest word and stopping, 0.45 for starting with the first) loses a word with nothing
+wrong in the server. With --top-logprobs N the server is asked for each reply token's N likeliest tokens, and a turn
+that failed says the reply's closest pick, which tells the two apart.
 Nothing private is sent: the filler and the words are generated here.
 """
 import argparse
 import http.client
 import json
+import math
 import os
 import random
 import threading
@@ -39,6 +45,7 @@ ap.add_argument("--drop", type=float, default=0.25, help="share of requests stre
 ap.add_argument("--max-tokens", type=int, default=400)
 ap.add_argument("--seed", type=int, default=1)
 ap.add_argument("--skip", type=int, default=0, help="run only sessions --skip to --sessions - 1: the same conversations, fewer at once")
+ap.add_argument("--top-logprobs", type=int, default=0, help="ask for each reply token's N likeliest tokens; a turn that failed says its closest pick")
 ap.add_argument("--out", default="")
 ap.add_argument("--extra", default="{}", help="JSON merged into every request, e.g. '{\"reasoning_effort\": \"low\"}'")
 args = ap.parse_args()
@@ -81,7 +88,7 @@ assert len(everyone) == args.sessions * args.turns, "two sessions drew the same 
 def chat(messages, drop_after=None):
     conn = (http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection)(url.netloc, timeout=3600)
     body = {"model": args.model, "messages": messages, "max_tokens": args.max_tokens, "temperature": 0,
-            "stream": True, **EXTRA}
+            "stream": True, **({"logprobs": True, "top_logprobs": args.top_logprobs} if args.top_logprobs else {}), **EXTRA}
     head = {"Content-Type": "application/json"}
     if KEY:
         head["Authorization"] = "Bearer " + KEY
@@ -91,7 +98,7 @@ def chat(messages, drop_after=None):
         text = resp.read()[:300]
         conn.close()
         raise RuntimeError(f"HTTP {resp.status}: {text!r}")
-    text, think, n, done, read = [], [], 0, False, {}
+    text, think, n, done, read, probs = [], [], 0, False, {}, []
     for raw in resp:
         if not raw.startswith(b"data: "):
             continue
@@ -109,6 +116,9 @@ def chat(messages, drop_after=None):
             if delta.get("content"):
                 text.append(delta["content"])
                 n += 1
+                for t in (ch.get("logprobs") or {}).get("content") or []:  # the reply's tokens, not the thinking's
+                    top = [[x.get("token"), round(math.exp(x["logprob"]), 4)] for x in t.get("top_logprobs") or [] if x.get("logprob") is not None]
+                    probs.append(sorted(top, key=lambda x: -x[1]))
             if delta.get("reasoning_content"):
                 think.append(delta["reasoning_content"])
                 n += 1
@@ -118,7 +128,18 @@ def chat(messages, drop_after=None):
         if drop_after is not None and n >= drop_after and not done:
             break
     conn.close()
+    if probs:
+        read["probs"] = probs[:64]  # a reply token a row: its likeliest tokens and their probabilities
     return "".join(text), "".join(think), done, read
+
+
+def closest(probs):  # the reply token whose two likeliest tokens are nearest: where the reply could have gone the other way
+    rows = [(top[0][1] - top[1][1], i) for i, top in enumerate(probs) if len(top) > 1]
+    if not rows:
+        return ""
+    i = min(rows)[1]
+    (a, pa), (b, pb) = probs[i][:2]
+    return f"; closest pick: reply token {i}, {a!r} at {pa:.3f} over {b!r} at {pb:.3f}"
 
 
 log, lock = [], threading.Lock()
@@ -171,7 +192,8 @@ def session(s):
                    ("  <== LOST " + ",".join(lost) if lost else "")
             size = f", read {read['prompt_n']} tokens and took {read.get('cache_n', 0)} from the cache" if "prompt_n" in read else ""
             print(f"isolation: session {s} turn {k} ({time.time() - t0:.1f} s): {len(own) - len(lost)} of {len(own)} own "
-                  f"words back, {len(leak)} of another session's{size}{flag}", flush=True)
+                  f"words back, {len(leak)} of another session's{size}{flag}"
+                  f"{closest(read.get('probs', [])) if leak or lost else ''}", flush=True)
         messages.append({"role": "assistant", "content": reply})
         time.sleep(rng.uniform(0.0, 1.0))
 
