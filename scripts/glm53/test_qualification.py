@@ -831,6 +831,19 @@ class ServingRecipeTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
 
+    def test_fixed_rows_is_an_opt_in_of_the_tensor_recipes(self):
+        for profile in ("tensor-2", "tensor-4"):
+            base = ["--model", "/models/target.gguf", "--profile", profile]
+            plain_argv, plain_env = self.serve.make_plan(self.serve.arguments(base))
+            argv, env = self.serve.make_plan(self.serve.arguments(base + ["--fixed-rows"]))
+            # the engine's own switch, set only when asked for, and nothing else of the recipe moves with it
+            self.assertNotIn("LLAMA_RS_FIXED_ROWS", plain_env)
+            self.assertEqual(env, {**plain_env, "LLAMA_RS_FIXED_ROWS": "1"})
+            self.assertEqual(argv, plain_argv)
+        # under dp-4 every session has a row of its own already, so the switch would do nothing there
+        with self.assertRaisesRegex(ValueError, "fixed-rows"):
+            self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4", "--fixed-rows"]))
+
     def test_dp_slot_defaults_and_bounds_do_not_change_tensor_capacity(self):
         args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"])
         argv, _ = self.serve.make_plan(args)
