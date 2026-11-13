@@ -69,3 +69,93 @@ inline topk_tile_stats topk_tile_union(const int32_t * sel, int64_t select_k, in
     st.rows_skipped += n_rows % tile;
     return st;
 }
+
+// How much of what a step selects the card would still hold from the steps before it. Row-level tiering keeps a
+// sequence's latents in host memory and, on the card, those of the pools selected lately: cap pools of a layer, the one
+// selected longest ago leaving first. A pool a step selects and the card does not hold is a miss: its cells' latents
+// come from host memory before the attention reads them. A pool is written on the card, so the step that completes it
+// holds it (born). While a step runs the card holds all it selected, whatever cap is: the pools over cap leave after.
+class topk_lru {
+public:
+    int64_t steps    = 0; // steps counted
+    int64_t selected = 0; // distinct live pools those steps selected
+    int64_t misses   = 0; // of them, not held when the step began
+
+    explicit topk_lru(int64_t cap) : cap(cap) {}
+
+    // the pools [first, last) were written since the last step
+    void born(int64_t first, int64_t last) {
+        for (int64_t id = first; id < last; ++id) touch((int32_t) id);
+        trim();
+    }
+
+    // sel, select_k, n_rows and n_live as topk_tile_union takes them: one step's rows. A step is counted when every one
+    // of its rows selected select_k live pools; a step with a dump pool in it moves the pools it selected and counts
+    // nothing, since a row that takes every live pool has no choice to miss with. Returns the step's misses, -1 for a
+    // step not counted.
+    int64_t step(const int32_t * sel, int64_t select_k, int64_t n_rows, int64_t n_live) {
+        ids.assign(sel, sel + select_k*n_rows);
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        bool full = !ids.empty() && ids.front() >= 0 && ids.back() < n_live;
+
+        int64_t n_miss = 0, n_sel = 0;
+        for (const int32_t id : ids) {
+            if (id < 0 || id >= n_live) continue;
+            n_sel++;
+            if (!held(id)) n_miss++;
+        }
+        for (const int32_t id : ids) {
+            if (id >= 0 && id < n_live) touch(id);
+        }
+        trim();
+
+        if (!full) return -1;
+        steps++;
+        selected += n_sel;
+        misses   += n_miss;
+        return n_miss;
+    }
+
+    bool    held(int32_t id) const { return (size_t) id < in.size() && in[id]; }
+    int64_t n_held() const { return count; }
+
+private:
+    // the pools held, as a list from the one selected last (head) to the one selected longest ago (tail)
+    void touch(int32_t id) {
+        if ((size_t) id >= in.size()) {
+            in.resize((size_t) id + 1, 0);
+            prev.resize((size_t) id + 1, -1);
+            next.resize((size_t) id + 1, -1);
+        }
+        if (in[id]) {
+            if (head == id) return;
+            next[prev[id]] = next[id];
+            if (next[id] >= 0) prev[next[id]] = prev[id]; else tail = prev[id];
+        } else {
+            in[id] = 1;
+            count++;
+        }
+        prev[id] = -1;
+        next[id] = head;
+        if (head >= 0) prev[head] = id; else tail = id;
+        head = id;
+    }
+
+    void trim() {
+        while (count > cap) {
+            const int32_t id = tail;
+            tail = prev[id];
+            if (tail >= 0) next[tail] = -1; else head = -1;
+            in[id] = 0;
+            count--;
+        }
+    }
+
+    int64_t              cap;
+    int64_t              count = 0;
+    int32_t              head  = -1;
+    int32_t              tail  = -1;
+    std::vector<uint8_t> in;
+    std::vector<int32_t> prev, next, ids;
+};

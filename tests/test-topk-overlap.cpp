@@ -1,6 +1,8 @@
 // What a tile of adjacent prompt rows gathers from the KV cache when the rows share one gather of the union of their
 // indexer selections, as a multiple of what one row gathers alone (examples/topk-overlap). Query-tiled sparse attention
 // is worth building only if that multiple stays well under the tile's size on the trained weights.
+// And what a step selects that a hot cache of the pools selected lately does not hold (topk_lru), which row-level
+// tiering has to bring from host memory.
 
 #include "../examples/topk-overlap/topk-overlap.h"
 
@@ -8,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <random>
 #include <set>
 #include <vector>
@@ -154,6 +157,132 @@ static void test_generated() {
     }
 }
 
+static void test_lru_examples() {
+    // a cache of one selection: the pools of the step before are held, the ones before that are gone
+    {
+        topk_lru lru(4);
+        CHECK(lru.step(rows({{0, 1, 2, 3}}).data(), 4, 1, 100) == 4);
+        CHECK(lru.step(rows({{3, 2, 1, 0}}).data(), 4, 1, 100) == 0);
+        CHECK(lru.step(rows({{2, 3, 4, 5}}).data(), 4, 1, 100) == 2);
+        CHECK(lru.step(rows({{0, 1, 2, 3}}).data(), 4, 1, 100) == 2);
+        CHECK(lru.steps == 4 && lru.selected == 16 && lru.misses == 8);
+        CHECK(lru.n_held() == 4);
+    }
+    // a cache of two selections still holds them
+    {
+        topk_lru lru(8);
+        lru.step(rows({{0, 1, 2, 3}}).data(), 4, 1, 100);
+        lru.step(rows({{2, 3, 4, 5}}).data(), 4, 1, 100);
+        CHECK(lru.step(rows({{0, 1, 2, 3}}).data(), 4, 1, 100) == 0);
+        CHECK(lru.n_held() == 6);
+    }
+    // the pool selected longest ago leaves first, and a pool selected again is selected last
+    {
+        topk_lru lru(3);
+        for (const int32_t id : {0, 1, 2, 0, 3}) lru.step(&id, 1, 1, 100);
+        CHECK(lru.held(0) && lru.held(2) && lru.held(3) && !lru.held(1));
+        const int32_t one = 1, zero = 0;
+        CHECK(lru.step(&one, 1, 1, 100) == 1);
+        CHECK(!lru.held(2));
+        CHECK(lru.step(&zero, 1, 1, 100) == 0);
+    }
+    // a pool is born on the card: selecting it is no miss
+    {
+        topk_lru lru(4);
+        lru.born(0, 2);
+        CHECK(lru.step(rows({{0, 1, 2, 3}}).data(), 4, 1, 100) == 2);
+        // and no more are born than the cache holds: of eight, the last four
+        lru.born(4, 12);
+        CHECK(lru.n_held() == 4);
+        CHECK(lru.step(rows({{8, 9, 10, 11}}).data(), 4, 1, 100) == 0);
+    }
+    // a row with a dump pool had no choice: the step counts nothing, and the pools it selected are held after it
+    {
+        topk_lru lru(4);
+        CHECK(lru.step(rows({{0, 1, 100, 101}}).data(), 4, 1, 100) == -1);
+        CHECK(lru.steps == 0 && lru.selected == 0 && lru.misses == 0);
+        CHECK(lru.step(rows({{0, 1, 2, 3}}).data(), 4, 1, 100) == 2);
+    }
+    // a step of several rows selects their union once, holds all of it while it runs, and keeps the cache's size of it
+    {
+        topk_lru lru(4);
+        CHECK(lru.step(rows({{0, 1, 2, 3}, {2, 3, 4, 5}}).data(), 4, 2, 100) == 6);
+        CHECK(lru.selected == 6);
+        CHECK(lru.n_held() == 4);
+    }
+}
+
+// the same cache kept the plain way: the step each held pool was last selected at, the oldest erased while over cap
+static void test_lru_generated() {
+    std::mt19937 rng(20261113);
+    for (int iter = 0; iter < 300; ++iter) {
+        const int64_t k      = 1 + rng() % 12;
+        const int64_t n_live = k + rng() % 80;
+        const int64_t cap    = 1 + rng() % (4*k);
+        const int64_t r      = 1 + rng() % 3;
+
+        topk_lru lru(cap);
+        std::map<int32_t, int64_t> last; // pool -> the stamp of its last selection
+        int64_t stamp = 0, steps = 0, selected = 0, misses = 0, born = 0;
+        const auto trim = [&]() {
+            while ((int64_t) last.size() > cap) {
+                auto old = last.begin();
+                for (auto it = last.begin(); it != last.end(); ++it) {
+                    if (it->second < old->second) old = it;
+                }
+                last.erase(old);
+            }
+        };
+
+        for (int step = 0; step < 60; ++step) {
+            const int64_t n_rows = 1 + rng() % 3;
+            // some pools are born between steps
+            const int64_t born_to = std::min<int64_t>(n_live, born + rng() % (r + 1));
+            lru.born(born, born_to);
+            for (int64_t id = born; id < born_to; ++id) last[(int32_t) id] = stamp++;
+            trim();
+            born = born_to;
+
+            // rows drawn near a centre that drifts, so steps repeat part of each other; now and then a dump pool
+            const int64_t centre = rng() % n_live;
+            std::vector<int32_t> sel;
+            for (int64_t row = 0; row < n_rows; ++row) {
+                std::set<int32_t> ids;
+                while ((int64_t) ids.size() < k) {
+                    const bool dump = rng() % 40 == 0;
+                    ids.insert(dump ? (int32_t) (n_live + rng() % k) : (int32_t) ((centre + rng() % (2*k)) % n_live));
+                }
+                sel.insert(sel.end(), ids.begin(), ids.end());
+            }
+
+            std::set<int32_t> uni;
+            bool full = true;
+            for (const int32_t id : sel) {
+                if (id < n_live) uni.insert(id); else full = false;
+            }
+            int64_t miss = 0;
+            for (const int32_t id : uni) miss += last.count(id) ? 0 : 1;
+            for (const int32_t id : uni) last[id] = stamp++;
+            trim();
+
+            const int64_t got = lru.step(sel.data(), k, n_rows, n_live);
+            if (full) {
+                steps++;
+                selected += (int64_t) uni.size();
+                misses   += miss;
+                CHECK(got == miss);
+            } else {
+                CHECK(got == -1);
+            }
+            CHECK(lru.n_held() == (int64_t) last.size());
+            for (const auto & [id, at] : last) CHECK(lru.held(id));
+        }
+        CHECK(lru.steps == steps);
+        CHECK(lru.selected == selected);
+        CHECK(lru.misses == misses);
+    }
+}
+
 // the selection node by its exact name, never its reshaped view: ggml names the cell gather's input
 // "indexer_top_k_pools-<il> (reshaped)", the same selection as one row, and reading it too doubles every step
 static void test_selection_name() {
@@ -169,6 +298,8 @@ int main() {
     test_selection_name();
     test_examples();
     test_generated();
+    test_lru_examples();
+    test_lru_generated();
     if (failures) {
         std::fprintf(stderr, "test-topk-overlap: %d check(s) failed\n", failures);
         return 1;
