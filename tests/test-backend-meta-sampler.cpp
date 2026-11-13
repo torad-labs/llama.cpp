@@ -18,8 +18,11 @@
 // The sampled tokens are accepted into both chains, so the repeat penalty sees a history. Each meta graph is evaluated 4
 // times: from its second evaluation on, it must be captured as a graph without a gather is (no "not captured" log).
 // The reference is the chains on one GPU, every op pinned there, reading padded rows as llama.cpp builds them on one
-// device. Before the cases, it checks that the cumulative sum dist draws from comes out the same bits run after run on a
-// GLM-5.3 Flash-wide row: if it did not, no two runs, on one device or two, could draw the same tokens.
+// device. A row that the meta device computes on one rank only (a row-local chain) has its reference on that rank's GPU:
+// two cards of unlike kind do not give a row the same bits, since a wide row's softmax sums one block of the row on each
+// of the card's multiprocessors (soft_max_f32_parallelize_cols) and the sum depends on how many it has. Before the
+// cases, it checks that the cumulative sum dist draws from comes out the same bits run after run on a GLM-5.3 Flash-wide
+// row: if it did not, no two runs, on one device or two, could draw the same tokens.
 // On the first two GPUs, or on the first GPU twice; with no GPU the test is skipped.
 
 #include "ggml.h"
@@ -332,6 +335,15 @@ static bool same_output(const char * name, const ggml_tensor * m, const ggml_ten
     return false;
 }
 
+// the plain chains of some rows of a case, every op pinned to one device
+struct reference_run {
+    ggml_backend_t                  backend = nullptr;
+    std::vector<int64_t>            rows; // the rows of the case it computes, in the order of its graph
+    std::vector<llama_sampler *>    chains;
+    std::unique_ptr<sampling_graph> graph;
+    ggml_backend_sched_t            sched = nullptr;
+};
+
 static ggml_backend_meta_split_state split_dp_by_name(const ggml_tensor *, void *) {
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
@@ -339,7 +351,7 @@ static ggml_backend_meta_split_state split_dp_by_name(const ggml_tensor *, void 
 // one shape and one chain kind; returns whether every evaluation matched
 static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, ggml_backend_t cpu, ggml_backend_dev_t meta,
         ggml_backend_dev_t gpu, chain_kind kind, int64_t n_vocab, int64_t n_rows, std::mt19937 & rng,
-        const std::vector<int64_t> & dp_rows = {}) {
+        const std::vector<int64_t> & dp_rows = {}, const std::vector<ggml_backend_t> & rank_backends = {}) {
     const bool dp = !dp_rows.empty();
     std::unique_ptr<ownership_audit> audit;
     if (dp && ggml_backend_dev_type(gpu) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -348,29 +360,62 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
     head_weights w(ggml_backend_dev_buffer_type(meta), n_vocab, rng);
 
     std::vector<llama_sampler *> chains_meta;
-    std::vector<llama_sampler *> chains_ref;
     for (int64_t r = 0; r < n_rows; r++) {
         chains_meta.push_back(make_chain(kind, n_vocab, 1000 + r));
-        chains_ref .push_back(make_chain(kind, n_vocab, 1000 + r));
         GGML_ASSERT(chains_meta[r]->iface->backend_init(chains_meta[r], ggml_backend_dev_buffer_type(meta), 1));
-        GGML_ASSERT(chains_ref [r]->iface->backend_init(chains_ref [r], ggml_backend_dev_buffer_type(gpu),  1));
         for (llama_token t = 20; t < 40; t++) {
             llama_sampler_accept(chains_meta[r], t);
-            llama_sampler_accept(chains_ref [r], t);
         }
     }
 
+    // a mirrored chain's outputs are read from the first rank, so its reference is the one GPU; a row-local chain runs on
+    // the rank that owns its row, so its reference is that rank's GPU
+    std::vector<reference_run> refs;
+    if (dp) {
+        GGML_ASSERT(rank_backends.size() == dp_rows.size());
+        int64_t row = 0;
+        for (size_t rank = 0; rank < dp_rows.size(); rank++) {
+            reference_run ref;
+            ref.backend = rank_backends[rank];
+            for (int64_t i = 0; i < dp_rows[rank]; i++) {
+                ref.rows.push_back(row++);
+            }
+            if (!ref.rows.empty()) {
+                refs.push_back(std::move(ref));
+            }
+        }
+        GGML_ASSERT(row == n_rows);
+    } else {
+        reference_run ref;
+        ref.backend = gpu_backend;
+        ref.rows.resize(n_rows);
+        std::iota(ref.rows.begin(), ref.rows.end(), int64_t(0));
+        refs.push_back(std::move(ref));
+    }
+
     sampling_graph g_meta(dp ? nullptr : &w, n_vocab, n_rows, chains_meta, dp_rows);
-    sampling_graph g_ref (nullptr, n_vocab, n_rows, chains_ref);
 
     ggml_backend_t backends_meta[2] = {meta_backend, cpu};
-    ggml_backend_t backends_ref [2] = {gpu_backend,  cpu};
     ggml_backend_sched_t sched_meta = ggml_backend_sched_new(backends_meta, nullptr, 2, 8192, false, true);
-    ggml_backend_sched_t sched_ref  = ggml_backend_sched_new(backends_ref,  nullptr, 2, 8192, false, true);
     // the scheduler puts a graph input, and the ops reading it, on the CPU: every op is pinned to the device under test,
     // so the reference is the backend sampler on one GPU and the meta graph's chains run on the meta device
-    for (int i = 0; i < ggml_graph_n_nodes(g_ref.gf); i++) {
-        ggml_backend_sched_set_tensor_backend(sched_ref, ggml_graph_node(g_ref.gf, i), gpu_backend);
+    for (reference_run & ref : refs) {
+        const ggml_backend_dev_t dev = dp ? ggml_backend_get_device(ref.backend) : gpu;
+        for (int64_t r : ref.rows) {
+            llama_sampler * chain = make_chain(kind, n_vocab, 1000 + r);
+            GGML_ASSERT(chain->iface->backend_init(chain, ggml_backend_dev_buffer_type(dev), 1));
+            for (llama_token t = 20; t < 40; t++) {
+                llama_sampler_accept(chain, t);
+            }
+            ref.chains.push_back(chain);
+        }
+        ref.graph = std::make_unique<sampling_graph>(nullptr, n_vocab, (int64_t) ref.rows.size(), ref.chains);
+        ggml_backend_t backends_ref[2] = {ref.backend, cpu};
+        ref.sched = ggml_backend_sched_new(backends_ref, nullptr, 2, 8192, false, true);
+        for (int i = 0; i < ggml_graph_n_nodes(ref.graph->gf); i++) {
+            ggml_backend_sched_set_tensor_backend(ref.sched, ggml_graph_node(ref.graph->gf, i), ref.backend);
+        }
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(ref.sched, ref.graph->gf));
     }
     for (int i = 0; i < ggml_graph_n_nodes(g_meta.gf); i++) {
         ggml_backend_sched_set_tensor_backend(sched_meta, ggml_graph_node(g_meta.gf, i), meta_backend);
@@ -379,7 +424,6 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
         ggml_backend_sched_set_tensor_backend(sched_meta, g_meta.logits, meta_backend);
     }
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched_meta, g_meta.gf));
-    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched_ref,  g_ref.gf));
 
     bool ok = true;
     for (int e = 0; e < n_eval; e++) {
@@ -434,30 +478,39 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
             GGML_ASSERT(n_neg_zero > 0 && n_pos_zero > 0);
         }
 
-        ggml_backend_tensor_set(g_ref.logits, logits.data(), 0, ggml_nbytes(g_ref.logits));
-        for (llama_sampler * c : chains_ref) {
-            c->iface->backend_set_input(c);
-        }
-        GGML_ASSERT(ggml_backend_sched_graph_compute(sched_ref, g_ref.gf) == GGML_STATUS_SUCCESS);
-
         bool ok_chain = true;
+        std::vector<llama_token> tok_meta(n_rows);
+        std::vector<llama_token> tok_ref (n_rows);
+        for (reference_run & ref : refs) {
+            std::vector<float> rows_in(n_vocab*ref.rows.size());
+            for (size_t i = 0; i < ref.rows.size(); i++) {
+                memcpy(&rows_in[i*n_vocab], &logits[ref.rows[i]*n_vocab], n_vocab*sizeof(float));
+            }
+            ggml_backend_tensor_set(ref.graph->logits, rows_in.data(), 0, ggml_nbytes(ref.graph->logits));
+            for (llama_sampler * c : ref.chains) {
+                c->iface->backend_set_input(c);
+            }
+            GGML_ASSERT(ggml_backend_sched_graph_compute(ref.sched, ref.graph->gf) == GGML_STATUS_SUCCESS);
+
+            for (size_t i = 0; i < ref.rows.size(); i++) {
+                const int64_t r = ref.rows[i];
+                const llama_sampler_data & m = g_meta.out[r];
+                const llama_sampler_data & f = ref.graph->out[i];
+                ok_chain = same_output("sampled",    m.sampled,    f.sampled)    && ok_chain;
+                ok_chain = same_output("probs",      m.probs,      f.probs)      && ok_chain;
+                ok_chain = same_output("logits",     m.logits,     f.logits)     && ok_chain;
+                ok_chain = same_output("candidates", m.candidates, f.candidates) && ok_chain;
+
+                GGML_ASSERT(m.sampled != nullptr && f.sampled != nullptr);
+                ggml_backend_tensor_get(m.sampled, &tok_meta[r], 0, sizeof(llama_token));
+                ggml_backend_tensor_get(f.sampled, &tok_ref [r], 0, sizeof(llama_token));
+                llama_sampler_accept(chains_meta[r], tok_meta[r]);
+                llama_sampler_accept(ref.chains[i],  tok_ref [r]);
+            }
+        }
         std::string tokens;
         for (int64_t r = 0; r < n_rows; r++) {
-            const llama_sampler_data & m = g_meta.out[r];
-            const llama_sampler_data & f = g_ref.out[r];
-            ok_chain = same_output("sampled",    m.sampled,    f.sampled)    && ok_chain;
-            ok_chain = same_output("probs",      m.probs,      f.probs)      && ok_chain;
-            ok_chain = same_output("logits",     m.logits,     f.logits)     && ok_chain;
-            ok_chain = same_output("candidates", m.candidates, f.candidates) && ok_chain;
-
-            GGML_ASSERT(m.sampled != nullptr && f.sampled != nullptr);
-            llama_token tok_meta;
-            llama_token tok_ref;
-            ggml_backend_tensor_get(m.sampled, &tok_meta, 0, sizeof(tok_meta));
-            ggml_backend_tensor_get(f.sampled, &tok_ref,  0, sizeof(tok_ref));
-            tokens += " " + std::to_string(tok_meta) + (tok_meta == tok_ref ? "" : "/" + std::to_string(tok_ref));
-            llama_sampler_accept(chains_meta[r], tok_meta);
-            llama_sampler_accept(chains_ref [r], tok_ref);
+            tokens += " " + std::to_string(tok_meta[r]) + (tok_meta[r] == tok_ref[r] ? "" : "/" + std::to_string(tok_ref[r]));
         }
 
         const bool ok_eval = ok_gather && ok_chain;
@@ -469,7 +522,9 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
     }
 
     ggml_backend_sched_free(sched_meta);
-    ggml_backend_sched_free(sched_ref);
+    for (reference_run & ref : refs) {
+        ggml_backend_sched_free(ref.sched);
+    }
     if (audit) {
         const bool owned = audit->ok && std::all_of(audit->seen.begin(), audit->seen.end(), [](bool seen) { return seen; });
         printf("%s sampler outputs execute only on their owning ranks\n", owned ? "ok  " : "FAIL");
@@ -478,8 +533,10 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
     for (llama_sampler * c : chains_meta) {
         llama_sampler_free(c);
     }
-    for (llama_sampler * c : chains_ref) {
-        llama_sampler_free(c);
+    for (reference_run & ref : refs) {
+        for (llama_sampler * c : ref.chains) {
+            llama_sampler_free(c);
+        }
     }
     return ok;
 }
@@ -584,6 +641,11 @@ int main(int argc, char ** argv) {
 
     ggml_backend_dev_t dp_meta = ggml_backend_meta_device(gpus.data(), gpus.size(), split_dp_by_name, nullptr);
     ggml_backend_t dp_backend = ggml_backend_dev_init(dp_meta, nullptr);
+    // a plain backend on every rank's device, for the reference of the rows that rank owns
+    std::vector<ggml_backend_t> rank_backends;
+    for (ggml_backend_dev_t dev : gpus) {
+        rank_backends.push_back(dev == gpus[0] ? gpu_backend : ggml_backend_dev_init(dev, nullptr));
+    }
     if (cpu_only) {
         for (size_t rank = 0; rank < gpus.size(); ++rank) {
             ggml_backend_cpu_set_n_threads(ggml_backend_meta_simple_backend(dp_backend, rank), 1);
@@ -596,14 +658,14 @@ int main(int argc, char ** argv) {
         int64_t total = 0;
         for (int64_t n : rows) { total += n; }
         for (chain_kind kind : kinds) {
-            ok = run_case(dp_backend, gpu_backend, cpu, dp_meta, gpus[0], kind, 1000, total, rng, rows) && ok;
+            ok = run_case(dp_backend, gpu_backend, cpu, dp_meta, gpus[0], kind, 1000, total, rng, rows, rank_backends) && ok;
             expected_captures += gpus.size();
         }
     }
     for (chain_kind kind : kinds) {
         const auto & rows = layouts.front();
         const int64_t total = std::accumulate(rows.begin(), rows.end(), int64_t(0));
-        ok = run_case(dp_backend, gpu_backend, cpu, dp_meta, gpus[0], kind, 154880, total, rng, rows) && ok;
+        ok = run_case(dp_backend, gpu_backend, cpu, dp_meta, gpus[0], kind, 154880, total, rng, rows, rank_backends) && ok;
         expected_captures += gpus.size();
     }
     ggml_backend_free(dp_backend);
@@ -616,6 +678,11 @@ int main(int argc, char ** argv) {
         counts.executables, executables, counts.not_captured);
     ok = ok && ok_captures;
 
+    for (ggml_backend_t backend : rank_backends) {
+        if (backend != gpu_backend) {
+            ggml_backend_free(backend);
+        }
+    }
     ggml_backend_free(gpu_backend);
     ggml_backend_free(meta_backend);
     ggml_backend_free(cpu);

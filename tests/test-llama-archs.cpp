@@ -63,9 +63,22 @@ static float max_abs(const float * row, size_t n) {
     return m;
 }
 
-// rows of n_vocab logits: the mean over rows of KL(softmax(a) || softmax(b)), the rows whose top token differs, and apart
-// from those the rows where the two top tokens are tied: each read scores the other's top token within `tie` of its row's
-// largest logit magnitude below its own. 1e-4 is a gap a change of summation order alone can close
+// What two kernels of a device may differ by, as a part of the largest value they compute. A device picks the kernel
+// of a matrix product by the width of the batch and by how many multiprocessors the card has (ggml_cuda_mul_mat), and
+// one of them keeps ten bits of mantissa (cuBLAS in TF32 mode): two units of those ten bits.
+static constexpr float device_rounding = 2.0f/1024.0f;
+
+// whether every device of a configuration is a CPU: where the width of a batch does not change a token's arithmetic
+static bool on_host(const std::vector<ggml_backend_dev_t> & devs) {
+    return std::all_of(devs.begin(), devs.end(), [](ggml_backend_dev_t dev) {
+        return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    });
+}
+
+// rows of n_vocab logits: the mean over rows of KL(softmax(a) || softmax(b)), the rows whose top token differs, and
+// apart from those the rows where the two top tokens are tied: each read scores the other's top token within `tie` of
+// its row's largest logit magnitude below its own. 1e-4 is a gap a change of summation order alone can close; two
+// kernels of a device close device_rounding
 static double mean_kld(const std::vector<float> & a, const std::vector<float> & b, size_t n_vocab, size_t & n_top_differ,
         size_t & n_top_tied, float tie = 1e-4f) {
     GGML_ASSERT(a.size() == b.size() && n_vocab > 0 && a.size() % n_vocab == 0);
@@ -1380,9 +1393,7 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
         const int n_embd  = llama_model_n_embd(model);
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
         // byte for byte where every device is a CPU
-        const bool exact = std::all_of(devs.begin(), devs.end(), [](ggml_backend_dev_t dev) {
-            return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        });
+        const bool exact = on_host(devs);
 
         // top_k 8: every step scores. top_k 256 (the indexer scores past 259 cells): the first step reads densely
         const int n_read   = top_k == 8 ? 4096 : 1024;
@@ -1501,7 +1512,7 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
                 if (!exact) {
                     size_t n_top_differ = 0;
                     size_t n_top_tied   = 0;
-                    const double kld = mean_kld(fine.logits, coarse.logits, n_vocab, n_top_differ, n_top_tied);
+                    const double kld = mean_kld(fine.logits, coarse.logits, n_vocab, n_top_differ, n_top_tied, device_rounding);
                     if (!(kld <= 1e-6) || n_top_differ > 0) {
                         LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: mean KLD %g (at most 1e-6), %zu rows' top "
                                 "token differs, %zu tied rows' swapped, nmse=%g\n", top_k, mtp, unified, kld, n_top_differ,
@@ -1812,7 +1823,8 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
             if (!exact) {
                 size_t n_top_differ = 0;
                 size_t n_top_tied   = 0;
-                const float tie = other.second == &packed ? 1e-2f : 1e-4f;
+                // not exact and not packed: a device, whose kernels differ with the cache's length
+                const float tie = other.second == &packed ? 1e-2f : device_rounding;
                 const double kld = mean_kld(other.second->logits, shared.logits, n_vocab, n_top_differ, n_top_tied, tie);
                 if (!(kld <= 1e-6) || n_top_differ > 0) {
                     LOG_ERR("GLM shared pool reuse: mtp=%d: against the pool %s: mean KLD %g (at most 1e-6), %zu rows' top "
@@ -2807,6 +2819,15 @@ static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggm
     const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     std::mt19937 rng(seed);
     const bool diagnostics = !diagnostic_dir.empty();
+    // The reference decodes only what a round keeps where that is the same arithmetic as decoding the round's whole
+    // width and rolling back: on the host. A device computes a token with another kernel in a wider batch, the scores
+    // of the indexer's pools round another way, and where two of them are closer than that rounding the token reads
+    // another pool: a difference no bound of rounding holds (seed 2742707468 on a card: two pools tied at a score of 0
+    // in the one-token batch, one of them at -7.7e-15 in the seven-token batch, the states 5e-3 of their largest value
+    // apart). So a device's reference decodes the same width and rolls back as well, as the unsplit reference of a
+    // model split by data does: two contexts that did the same must hold the same. The host configuration, which
+    // every run of this test has, holds the rollback to the kept prefix.
+    const bool same_width = partition || !on_host(devs);
     for (const bool unified : {false, true}) {
         if (split_mode == LLAMA_SPLIT_MODE_DATA && unified) { continue; }
         auto params = llama_context_default_params();
@@ -2864,13 +2885,14 @@ static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggm
                     evidence.add("reference-before-full.bin", before_full);
                     evidence.add("input.i32", input.data(), input.size()*sizeof(llama_token));
                 }
-                // DP checks the same rollback on an unsplit model; the CPU test checks the kept-prefix oracle.
+                // DP checks the same rollback on an unsplit model, a device on a second context; the CPU test checks
+                // the kept-prefix oracle.
                 if (diagnostics) {
                     actual_tensors.values.clear();
                     reference_tensors.values.clear();
                 }
                 if (!decode(actual.get(), seq, pos, input, width) ||
-                    !decode(reference.get(), seq, pos, input, partition ? width : keep)) return false;
+                    !decode(reference.get(), seq, pos, input, same_width ? width : keep)) return false;
                 if (diagnostics) {
                     add_glm_tensor_capture(evidence, actual_tensors, reference_tensors);
                 }
@@ -2879,7 +2901,7 @@ static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggm
                     if (keep < width) evidence.snapshot("snapshot-late.bin", [&] { return glm_snapshot(actual.get(), seq, width-keep-1, pos+keep); });
                 }
                 if (keep < width && !llama_memory_seq_rm(llama_get_memory(actual.get()), seq, pos+keep, -1)) return false;
-                if (partition && keep < width && !llama_memory_seq_rm(llama_get_memory(reference.get()), seq, pos+keep, -1)) return false;
+                if (same_width && keep < width && !llama_memory_seq_rm(llama_get_memory(reference.get()), seq, pos+keep, -1)) return false;
                 const bool prefix_ok = evidence.prefix(glm_state_bytes(actual.get(), seq), glm_state_bytes(reference.get(), seq));
                 if (!prefix_ok && !diagnostics) return false;
                 positions[seq] += keep;

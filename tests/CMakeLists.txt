@@ -270,11 +270,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+    # --device none for the two fixtures that pick by score (experts, the pools of a sparse attention). The test holds
+    # a rolled-back state to a context that decoded only the kept rows. On a card a token in a batch of another width
+    # is computed by another kernel: the dense fixtures above part by its rounding, which the test bounds, and these
+    # two can pick another expert or pool, which no bound holds. So on a card the suite does not hold a GLM or
+    # DeepSeek V4 rollback to the kept prefix. Their copies of a state on a card (seq_cp, a shared cell's snapshot
+    # planes) are run by the async and staged tests below (GLM) and by test-llama-archs, which compares two contexts
+    # that did the same
     llama_test(
         test-recurrent-state-rollback
         NAME test-recurrent-state-rollback-glm5next
         LABEL main
-        ARGS -m "${MODEL_DIR}/glm5next-moe.gguf"
+        ARGS -m "${MODEL_DIR}/glm5next-moe.gguf" --device none
     )
     set_tests_properties(test-recurrent-state-rollback-glm5next PROPERTIES
         FIXTURES_REQUIRED generate-models
@@ -283,7 +290,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         test-recurrent-state-rollback
         NAME test-recurrent-state-rollback-dsv4
         LABEL main
-        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
+        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf" --device none
     )
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
