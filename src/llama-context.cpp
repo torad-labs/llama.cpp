@@ -2821,6 +2821,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // a sequence the memory dropped (llama_memory_seq_lost) is decoded no further until the caller removes it
+    const auto batch_seq_lost = [&]() -> llama_seq_id {
+        llama_seq_id last = -1;
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
+            for (int32_t s = 0; s < ns; ++s) {
+                const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
+                if (seq_id != last && memory->seq_lost(seq_id)) {
+                    return seq_id;
+                }
+                last = seq_id;
+            }
+        }
+        return -1;
+    };
+
+    if (const llama_seq_id seq_id = batch_seq_lost(); seq_id >= 0) {
+        LLAMA_LOG_ERROR("%s: the memory dropped the state of sequence %d: remove the sequence and read it again\n", __func__, seq_id);
+        return -4;
+    }
+
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -3306,6 +3327,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // a sequence of the batch the memory dropped while placing it: what was computed for it started from no state
+    if (const llama_seq_id seq_id = batch_seq_lost(); seq_id >= 0) {
+        LLAMA_LOG_ERROR("%s: the memory dropped the state of sequence %d during this decode: its outputs are not to be used\n", __func__, seq_id);
+        return -4;
+    }
 
     return 0;
 }
@@ -4840,6 +4867,13 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
     // the rows written are those a restore may still copy
     state_async_wait(-1);
 
+    // A dropped sequence has cells in the other memories of a hybrid and none in the recurrent one, and a load forgets
+    // that it was dropped: the context is not saved until the dropped sequences are removed. Asking settles a move the
+    // memory still owes
+    if (memory != nullptr && memory->seq_lost(-1)) {
+        throw std::runtime_error("the memory dropped a sequence's state: remove the dropped sequences first");
+    }
+
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
     // write model info
@@ -4891,6 +4925,11 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     // the rows written are those a restore of the sequence may still copy
     state_async_wait(seq_id);
+
+    // a sequence the memory dropped has no state to save: the callers answer 0
+    if (memory && memory->seq_lost(seq_id)) {
+        throw std::runtime_error("the memory dropped this sequence's state");
+    }
 
     if (memory) {
         memory->state_write(io, seq_id, flags);
@@ -5865,6 +5904,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+bool llama_memory_seq_lost(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->seq_lost(seq_id);
 }
 
 // llama state API

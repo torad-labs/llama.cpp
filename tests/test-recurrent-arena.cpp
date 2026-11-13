@@ -1,6 +1,7 @@
 // A layer's current and rollback states must fit in their own addressable
 // allocation, with unchanged canonical rows and no cross-layer or slot aliasing.
 #include "../src/llama-model.h"
+#include "../src/llama-batch.h"
 #include "../src/llama-memory-recurrent.h"
 #include "ggml-backend.h"
 #include "../ggml/src/ggml-recurrent-arena.h"
@@ -52,6 +53,115 @@ static bool test_window_properties() {
     return true;
 }
 
+// A placement that leaves a state to move owes the move until it is made (llama_memory_recurrent::settle). One that
+// is never made drops the sequences it was for and every sequence whose cell names a row its state is not in, and
+// they stay dropped until each is removed; a sequence past the placement's cells is not touched, and a copy of a
+// dropped sequence is dropped. A trial placement (prepare) owes nothing and leaves nothing behind, and a restore's
+// placement moves no one.
+static bool test_owed_moves(const llama_model & model) {
+    llama_memory_recurrent mem(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 4, 4, 1, {});
+    mem.set_relocate(true);
+    if (!mem.relocate) {
+        fprintf(stderr, "FAIL: f32 states on one device do not relocate\n");
+        return false;
+    }
+
+    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+    llama_seq_id ids[4]  = {0, 1, 2, 3};
+    llama_pos    next[4] = {0, 0, 0, 0};
+    // one more token of one sequence, as a decode's ubatch names it
+    const auto one = [&](llama_seq_id seq) {
+        llama_ubatch ubatch = balloc.ubatch_reserve(1, 1);
+        ubatch.pos[0]      = next[seq]++;
+        ubatch.n_seq_id[0] = 1;
+        ubatch.seq_id[0]   = &ids[seq];
+        return ubatch;
+    };
+    const auto fail = [](const char * what) {
+        fprintf(stderr, "FAIL: owed moves: %s\n", what);
+        return false;
+    };
+
+    // sequence 0 takes the first cell; sequence 1 is then gathered there and 0's state is left to move
+    if (!mem.find_slot(one(0)) || mem.relocate_pending) { return fail("a first sequence owes a move"); }
+    if (!mem.find_slot(one(1)) || !mem.relocate_pending) { return fail("a displaced state is not owed a move"); }
+
+    // the move is never made: both cells of that placement name a row their state is not in
+    if (mem.seq_lost(2) || !mem.seq_lost(0) || !mem.seq_lost(1)) { return fail("the sequences of a placement that was never completed are not dropped"); }
+    if (mem.relocate_pending || mem.seq_pos_max(0) != -1 || mem.seq_pos_max(1) != -1 || mem.used != 0) { return fail("a dropped sequence keeps a cell"); }
+
+    // they stay dropped through later placements, until each is removed
+    if (!mem.find_slot(one(2)) || mem.relocate_pending || mem.seq_lost(2)) { return fail("a sequence placed after the drop"); }
+    if (!mem.seq_lost(0) || !mem.seq_lost(1)) { return fail("a dropped sequence came back without being removed"); }
+    mem.seq_rm(0, -1, -1);
+    if (mem.seq_lost(0) || !mem.seq_lost(1)) { return fail("removing one dropped sequence"); }
+    mem.seq_rm(1, -1, -1);
+    if (mem.seq_lost(1)) { return fail("removing the other dropped sequence"); }
+
+    // trial placements that would displace sequence 2 twice: nothing is owed after them and nothing is left behind
+    const auto cells = mem.cells;
+    const auto n = mem.n;
+    const auto rs_z = mem.rs_z;
+    const auto head = mem.head;
+    const auto used = mem.used;
+    if (!mem.prepare({one(3), one(0)})) { return fail("a trial placement"); }
+    bool same = mem.n == n && mem.rs_z == rs_z && mem.head == head && mem.used == used && !mem.relocate_pending;
+    for (size_t i = 0; same && i < cells.size(); ++i) {
+        same = mem.cells[i].pos == cells[i].pos && mem.cells[i].src == cells[i].src && mem.cells[i].tail == cells[i].tail &&
+               mem.cells[i].seq_id == cells[i].seq_id;
+    }
+    if (!same) { return fail("a trial placement left something behind"); }
+    for (llama_seq_id seq = 0; seq < 4; ++seq) {
+        if (mem.seq_lost(seq)) { return fail("a trial placement dropped a sequence"); }
+    }
+
+    // a restore's placement: sequence 3 takes a free cell and sequence 2 keeps its own
+    const int32_t cell_2 = mem.cells[2].tail;
+    if (!mem.find_slot(one(3), /*allow_relocate =*/ false) || mem.relocate_pending) { return fail("a restore's placement owes a move"); }
+    if (mem.cells[2].tail != cell_2 || mem.cells[3].tail < 0 || mem.cells[3].tail == cell_2) { return fail("a restore's placement moved another sequence"); }
+    for (llama_seq_id seq = 0; seq < 4; ++seq) {
+        if (mem.seq_lost(seq)) { return fail("a restore's placement dropped a sequence"); }
+    }
+
+    // A placement for two of four sequences that is never completed. 0 keeps its row, at a position no decode took it
+    // to; 2 takes the second row; 1 is displaced to the row 2 had; 3 lies past the placement's cells
+    llama_memory_recurrent four(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 4, 4, 1, {});
+    four.set_relocate(true);
+    llama_pos at[4] = {0, 0, 0, 0};
+    const auto set = [&](std::initializer_list<llama_seq_id> seqs) {
+        llama_ubatch ubatch = balloc.ubatch_reserve(1, (uint32_t) seqs.size());
+        uint32_t s = 0;
+        for (const llama_seq_id seq : seqs) {
+            ubatch.pos[s]      = at[seq]++;
+            ubatch.n_seq_id[s] = 1;
+            ubatch.seq_id[s]   = &ids[seq];
+            ++s;
+        }
+        return ubatch;
+    };
+    for (llama_seq_id seq = 0; seq < 4; ++seq) {
+        if (!four.find_slot(set({seq}), /*allow_relocate =*/ false) || four.relocate_pending || four.cells[seq].tail != seq) {
+            return fail("four sequences, each placed in a row of its own");
+        }
+    }
+    if (!four.find_slot(set({0, 2})) || !four.relocate_pending) { return fail("a set that displaces a sequence owes no move"); }
+    if (four.cells[0].tail != 0 || four.cells[2].tail != 1 || four.cells[1].tail != 2) { return fail("the set was not gathered at the first rows"); }
+    if (!four.seq_lost(-1) || !four.seq_lost(0) || !four.seq_lost(2)) { return fail("a sequence of an abandoned set is not dropped, the one that kept its row included"); }
+    if (!four.seq_lost(1)) { return fail("the sequence an abandoned set displaced is not dropped"); }
+    if (four.seq_lost(3) || four.cells[3].tail != 3 || four.seq_pos_max(3) != 0 || four.used != 1) { return fail("a sequence past the placement's cells was touched"); }
+
+    // a copy of a dropped sequence is dropped, into a sequence that was removed too; each is cleared by its removal
+    four.seq_rm(1, -1, -1);
+    if (four.seq_lost(1)) { return fail("removing a dropped sequence"); }
+    four.seq_cp(0, 1, -1, -1);
+    if (!four.seq_lost(1) || four.cells[1].tail != -1) { return fail("a copy of a dropped sequence is not dropped"); }
+    for (llama_seq_id seq = 0; seq < 3; ++seq) {
+        four.seq_rm(seq, -1, -1);
+    }
+    if (four.seq_lost(-1) || four.seq_lost(3) || four.cells[3].tail != 3) { return fail("the dropped sequences removed"); }
+    return true;
+}
+
 int main() {
     if (!test_window_properties()) { return 5; }
 #ifdef _WIN32
@@ -67,6 +177,7 @@ int main() {
     h.n_head_kv_arr.fill(2);
     h.n_embd_head_kda = 128;
     h.ssm_d_conv = 4;
+    if (!test_owed_moves(*model)) { return 6; }
     std::mt19937 rng(530);
     for (const uint32_t slots : {1u, 3u}) {
         for (const uint32_t snapshots : {0u, 1u, 8u}) {

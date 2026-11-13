@@ -126,6 +126,11 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // true for a sequence the memory dropped because it could not vouch for its state (llama_memory_recurrent::settle),
+    // until the sequence is removed: a decode or a save of it is refused. A negative id asks whether any sequence is
+    // dropped. Asking settles what the memory still owes, so it is asked before a state is read out
+    virtual bool seq_lost(llama_seq_id seq_id) { (void) seq_id; return false; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

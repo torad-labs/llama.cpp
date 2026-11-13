@@ -119,6 +119,7 @@ public:
     // (112, 99 and 128 ms for its first three target decodes of 66 rows on four cards, where a replay is 48; Nov 10, 2026)
     bool relocate = false;
     bool relocate_pending = false; // find_slot left a state to move
+    uint32_t owed_seqs = 0;        // the sequences of the placement that left it: its first cells
     // With relocate, unless LLAMA_RS_GATHER_LEGACY=1 (read by set_relocate): a state of the batch that lies in a cell
     // another sequence of the batch is written to is moved before the decode as well. Every sequence of the batch then
     // reads its state from the cell it is written to, or from one the decode writes nothing to, and the decode's graph
@@ -131,6 +132,19 @@ public:
 
     // moves the states find_slot left to move, and leaves the batch's cells as the decode's graph expects them
     void relocate_states(uint32_t n_seqs);
+
+    // A move find_slot left to relocate_states is owed until it is made. One that was never made (until e7598775e a
+    // state restore's placement left one, and the next find_slot cleared the flag without a word) leaves cells that
+    // name a row their state is not in, and the placement's own sequences at a position no decode took them to:
+    // settle() drops the sequences of both instead of letting them be read. A sequence past the placement's cells
+    // keeps its state. It runs where the placement has to be complete: before the next placement, before a restore
+    // writes its rows, before a sequence is removed, copied or shifted, and before a state is read out (seq_lost,
+    // which llama_context asks before it decodes or saves).
+    // A dropped sequence has no cell, an error line says why, and seq_lost() stays true for it until it is removed
+    // (seq_rm of all of it, a restore into it, seq_keep of another, clear): no decode and no save takes it before
+    // that, a copy of it is dropped as well, and the whole context is not saved while one is left (seq_lost(-1)).
+    void settle();
+    bool seq_lost(llama_seq_id seq_id) override;
 
     // zero the rs_z row of every non-f32 S tensor on the host (see llm_graph_context::build_rs)
     void zero_rs_z();
@@ -172,6 +186,12 @@ private:
     llama_context * owner_context = nullptr;
     std::vector<uint32_t> zero_cells;
     std::vector<uint32_t> restore_cells;
+
+    // sequences settle() dropped, until each is removed
+    std::vector<llama_seq_id> lost;
+
+    // frees cell i and names its sequences in `lost`
+    void lose(uint32_t i, const char * why);
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

@@ -2083,8 +2083,24 @@ private:
         return nullptr;
     }
 
+    // A sequence the memory dropped because it could not vouch for its state (llama_memory_seq_lost): an idle slot is
+    // emptied, so its conversation comes back from the prompt cache or is read again. A slot at work is left to the
+    // decode, which fails with its batch (llama_decode's -4)
+    void drop_lost_slots() {
+        for (server_slot & slot : slots) {
+            if (slot.is_processing() || !llama_memory_seq_lost(llama_get_memory(ctx_tgt), slot.id)) {
+                continue;
+            }
+            SLT_ERR(slot, "the memory dropped this slot's state (%d tokens): the slot starts empty\n", slot.prompt.n_tokens());
+            slot.prompt_clear();
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
+
+        // before a slot is matched by what it holds
+        drop_lost_slots();
 
         bool update_cache = false;
         std::optional<size_t> resident_reuse;
@@ -4998,6 +5014,12 @@ private:
                 if (ret < -1) {
                     // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
                     err = "Compute error.";
+                }
+
+                if (ret == -4) {
+                    // the memory dropped the state of a sequence of this batch (llama_memory_seq_lost): nothing that was
+                    // computed for the batch is used, and the slots at work start again from nothing below
+                    err = "A session's cached state could not be trusted and was dropped. Send the request again.";
                 }
 
                 // TODO: handle ret == 2 (abort) when we start aborting

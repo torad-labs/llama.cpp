@@ -265,6 +265,11 @@ void llama_memory_recurrent::clear(bool data) {
     std::fill(rs_reach.begin(), rs_reach.end(), 0);
     zero_cells.clear();
     restore_cells.clear();
+
+    // nothing is left to move, and no dropped sequence is left to remove
+    relocate_pending = false;
+    owed_seqs = 0;
+    lost.clear();
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -283,9 +288,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         return false;
     }
 
+    // what a placement left owed is settled before a cell is read or freed
+    settle();
+
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        // the caller removed a sequence settle() dropped: it starts again from nothing
+        lost.erase(std::remove(lost.begin(), lost.end(), seq_id), lost.end());
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -368,6 +378,9 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         return;
     }
 
+    // what a placement left owed is settled before the source's cell is read
+    settle();
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -428,11 +441,24 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         // The copy shares the selected snapshot, but no earlier rollback history.
         rs_idx[seq_id_dst] = tail_src.tail >= 0 ? rs_idx[seq_id_src] : 0;
         rs_reach[seq_id_dst] = 0;
+
+        // A copy of a dropped sequence is dropped with it: it has no state here, and what the other memories of a
+        // hybrid copied for it is not a history to decode from. It stays dropped until it is removed
+        if (std::find(lost.begin(), lost.end(), seq_id_src) != lost.end() &&
+                std::find(lost.begin(), lost.end(), seq_id_dst) == lost.end()) {
+            LLAMA_LOG_ERROR("%s: sequence %d is dropped: it is a copy of sequence %d, which was dropped\n", __func__, seq_id_dst, seq_id_src);
+            lost.push_back(seq_id_dst);
+        }
     }
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
+
+    settle();
+
+    // every other sequence is removed, the dropped ones with them
+    lost.erase(std::remove_if(lost.begin(), lost.end(), [&](llama_seq_id s) { return s != seq_id; }), lost.end());
 
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
@@ -468,6 +494,8 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
         return;
     }
 
+    settle();
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -497,6 +525,8 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
     if (d == 1) {
         return;
     }
+
+    settle();
 
     if (p0 < 0) {
         p0 = 0;
@@ -640,16 +670,27 @@ llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lct
 }
 
 bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches) {
+    // a move still owed is settled before the trial placements, which owe none
+    settle();
+
     // simply remember the full state because it is very small for this type of cache
     // TODO: optimize
     auto org_cells = cells;
     auto org_used = used;
     auto org_head = head;
+    // and what else find_slot sets: a trial leaves nothing behind
+    auto org_n = n;
+    auto org_rs_z = rs_z;
+    auto org_zero_cells = zero_cells;
 
     bool success = true;
 
     for (const auto & ubatch : ubatches) {
-        if (!find_slot(ubatch)) {
+        const bool found = find_slot(ubatch);
+        // a trial's move is never made and is not owed: the cells go back below
+        relocate_pending = false;
+        owed_seqs = 0;
+        if (!found) {
             success = false;
             break;
         }
@@ -659,15 +700,80 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    n = org_n;
+    rs_z = org_rs_z;
+    zero_cells = std::move(org_zero_cells);
 
     return success;
+}
+
+void llama_memory_recurrent::settle() {
+    if (!relocate_pending) {
+        return;
+    }
+    relocate_pending = false;
+    const uint32_t n_set = owed_seqs;
+    owed_seqs = 0;
+
+    // a memory whose layers keep no state here (the MTP head's) has cells and nothing a move would have carried
+    bool has_state = false;
+    for (const auto & layers : {r_l, s_l}) {
+        for (const ggml_tensor * tensor : layers) {
+            has_state = has_state || tensor != nullptr;
+        }
+    }
+    if (!has_state) {
+        return;
+    }
+
+    // The last placement's cells, 0 to n - 1. Its own sequences are the first n_set: each was given the position after
+    // a decode that was never made, also one that kept its row, so its position is ahead of its state and its
+    // snapshots. Past them, a cell that names another row as the place of its state was to be moved there, and was not
+    for (uint32_t i = 0; i < std::min(n, size); ++i) {
+        if (cells[i].is_empty()) {
+            continue;
+        }
+        if (i < n_set) {
+            lose(i, "it was placed for a decode that was never made");
+        } else if (cells[i].src0 != (int32_t) i) {
+            lose(i, "its state was left to move to its cell and the move was never made");
+        }
+    }
+}
+
+void llama_memory_recurrent::lose(uint32_t i, const char * why) {
+    auto & cell = cells[i];
+    for (const llama_seq_id seq : cell.seq_id) {
+        LLAMA_LOG_ERROR("%s: sequence %d is dropped (cell %u, position %d): %s\n", __func__, seq, i, cell.pos, why);
+        if (std::find(lost.begin(), lost.end(), seq) == lost.end()) {
+            lost.push_back(seq);
+        }
+        cells[seq].tail = -1;
+        set_rs_idx(seq, 0);
+        rs_reach[seq] = 0;
+    }
+    if (used > 0) {
+        used--;
+    }
+    cell.seq_id.clear();
+    cell.pos = -1;
+    cell.src = -1;
+}
+
+bool llama_memory_recurrent::seq_lost(llama_seq_id seq_id) {
+    settle();
+    if (seq_id < 0) {
+        return !lost.empty();
+    }
+    return std::find(lost.begin(), lost.end(), seq_id) != lost.end();
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch, bool allow_relocate) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
-    relocate_pending = false;
+    // a move the last placement left owed is not forgotten by the next one
+    settle();
 
     if (n_seq_devices > 1) {
         GGML_ASSERT(ubatch.equal_seqs() && n_seqs > 0);
@@ -916,6 +1022,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch, bool allow_r
         }
         if (!relocate_pending) {
             n = n_seqs;
+        } else {
+            // the set this placement is for, should the move never be made (settle)
+            owed_seqs = n_seqs;
         }
     }
     used = std::count_if(cells.begin(), cells.end(),
@@ -943,6 +1052,7 @@ void llama_memory_recurrent::relocate_states(uint32_t n_seqs) {
         return;
     }
     relocate_pending = false;
+    owed_seqs = 0;
     // n is n_seqs when only states of the set move (relocate_disjoint)
     GGML_ASSERT(owner_context != nullptr && head == 0 && n >= n_seqs && n <= size);
 
@@ -1186,6 +1296,14 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     bool res = true;
 
     res = res && state_read_meta(io, cell_count, seq_id);
+
+    // the placement has to be complete before the rows are written: a restore makes no move, so one its placement
+    // left owed would be written over (the defect of e7598775e). The sequences it would have moved are dropped and
+    // the restore fails
+    if (res && relocate_pending) {
+        settle();
+        res = false;
+    }
 
     try {
         res = res && state_read_data(io, cell_count);
