@@ -407,6 +407,11 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+# The test runs every case once a device and again on the host for each, and the host's side is nearly all of its time
+# (the card sits near 0%): about 1,800 s a device for its 16,000 supported cases, read on one RTX 5080 beside a 16-thread
+# host at load 12 to 19, where ctest's default 1,500 s cut it 500 cases short of its end. 7,200 s holds two devices
+# with as much again to spare. Without a device it ends in under a second
+set_tests_properties(test-backend-ops PROPERTIES TIMEOUT 7200)
 llama_build_and_test(test-fattn-sparse-q8.cpp)
 # This validates the canonical reference graphs. Packed readers run in the dedicated SM120 device matrix.
 add_test(NAME test-backend-q8-readers-canonical-cpu COMMAND test-backend-ops test -b CPU -o Q8_WEIGHT_READERS -j 1)
