@@ -1985,7 +1985,8 @@ struct ggml_cuda_ssm_conv_state_update {
     int             n_seqs       = 1;     // sequences; more than one runs ssm_conv_state_update_seqs_f32
     int64_t         x_seq_stride = 0;     // between sequences' inputs, in floats
     int             n_snapshots = 0;
-    float *         snapshot_dst[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // a snapshot CPY's cache row
+    float *         snapshot_dst[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // cache row, or cache base for indexed stores
+    const int64_t * snapshot_rows[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {};
     int             snapshot_col[GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS] = {}; // the CONCAT column its window starts at
     // the L2_NORM over the leading heads of the SILU output (Qwen3.5's joint q/k norm), folded in: 0 heads, not
     float *         l2_dst   = nullptr; // [GGML_CUDA_SSM_CONV_UPDATE_THREADS, l2_heads, n_t], contiguous

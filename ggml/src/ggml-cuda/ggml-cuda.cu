@@ -4765,9 +4765,10 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
 // Registers the plan under the SSM_CONV. CUDA only (the fold copies mul_mat_vec_f's CUDA arithmetic).
 static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int conv_idx,
         const ggml_tensor * concat, const ggml_tensor * x,
-        const ggml_tensor * ids, const ggml_tensor * l2, ggml_cuda_ssm_conv_state_update & u) {
+        const ggml_tensor * ids, const ggml_tensor * l2, ggml_cuda_ssm_conv_state_update & u,
+        const std::vector<const ggml_tensor *> & write_ids) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(ctx, cgraph, conv_idx, concat, x, ids, l2, u);
+    GGML_UNUSED_VARS(ctx, cgraph, conv_idx, concat, x, ids, l2, u, write_ids);
 #else
     if (!ggml_cuda_ssm_conv_ab_enabled()) {
         return;
@@ -4841,6 +4842,11 @@ static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggm
     for (const ggml_tensor * m : mm) {
         for (const ggml_tensor * t : no_touch) {
             if (t != nullptr && ggml_cuda_ranges_overlap(m, t)) {
+                return;
+            }
+        }
+        for (const ggml_tensor * t : write_ids) {
+            if (ggml_cuda_ranges_overlap(m, t)) {
                 return;
             }
         }
@@ -4996,12 +5002,17 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
     int                             concat_idx = -1;
     const ggml_tensor *             x      = nullptr;
     std::vector<const ggml_tensor *> cpys;
+    std::vector<const ggml_tensor *> conts;
+    std::vector<const ggml_tensor *> write_ids;
     std::vector<const ggml_tensor *> over_x; // the nodes after the CONCAT whose output the allocator put over x
     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         // the kernel reads ids at the SSM_CONV, after the GET_ROWS it skips: as in ggml_cuda_try_gdn_gather_skip,
         // nothing up to and including the SSM_CONV may have been allocated over them
-        if (!ggml_cuda_is_view_or_noop(n) && ggml_cuda_ranges_overlap(n, ids)) {
+        if (!ggml_cuda_is_view_or_noop(n) && (ggml_cuda_ranges_overlap(n, ids) ||
+                std::any_of(write_ids.begin(), write_ids.end(), [&](const ggml_tensor * rows) {
+                    return ggml_cuda_ranges_overlap(n, rows);
+                }))) {
             return false;
         }
         if (concat == nullptr) {
@@ -5033,8 +5044,58 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 continue;
             }
         } else {
+            // Fixed rows: CONT(VIEW(concat)) followed by SET_ROWS into the cache.
+            if (n->op == GGML_OP_CONT && n->src[0]->op == GGML_OP_VIEW && n->src[0]->view_src == concat) {
+                static const bool rows_enabled = ggml_env_switch("GGML_CUDA_SSM_CONV_ROWS");
+                if (!rows_enabled) {
+                    return false;
+                }
+                const ggml_tensor * src = n->src[0];
+                const size_t col = src->view_offs / sizeof(float);
+                int src_idx = j - 1;
+                while (src_idx > concat_idx && cgraph->nodes[src_idx] != src) {
+                    --src_idx;
+                }
+                int set_idx = j + 1;
+                while (set_idx < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[set_idx])) {
+                    ++set_idx;
+                }
+                if (src_idx == concat_idx || set_idx == cgraph->n_nodes ||
+                        cpys.size() != write_ids.size() || cpys.size() == GGML_CUDA_SSM_CONV_MAX_SNAPSHOTS ||
+                        ggml_node_get_use_count(cgraph, src_idx) != 1 || ggml_node_get_use_count(cgraph, j) != 1 ||
+                        (src->flags & GGML_TENSOR_FLAG_OUTPUT) || (n->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                        src->view_offs % sizeof(float) != 0 || src->ne[0] != d_conv - 1 ||
+                        src->ne[1] != concat->ne[1] || src->ne[2] != n_seqs || src->ne[3] != 1 ||
+                        src->nb[1] != concat->nb[1] || src->nb[2] != concat->nb[2] ||
+                        col + (d_conv - 1) > (size_t) concat->ne[0] ||
+                        n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) ||
+                        n->ne[0] != cache->ne[0] || ggml_nelements(n) != cache->ne[0]*n_seqs) {
+                    return false;
+                }
+                const ggml_tensor * set = cgraph->nodes[set_idx];
+                const ggml_tensor * rows = set->src[1];
+                if (set->op != GGML_OP_SET_ROWS || set->src[0] != n || (set->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                        !touches_cache(set) || set->type != GGML_TYPE_F32 || set->data != cache->data ||
+                        set->ne[0] != cache->ne[0] || set->nb[1] != cache->nb[1] ||
+                        rows == nullptr || rows->type != GGML_TYPE_I64 || rows->data == nullptr ||
+                        !ggml_is_contiguous(rows) || ggml_nelements(rows) != n_seqs ||
+                        ggml_cuda_ranges_overlap(rows, cache) || ggml_cuda_ranges_overlap(rows, n)) {
+                    return false;
+                }
+                u.snapshot_dst[cpys.size()] = (float *) set->data;
+                u.snapshot_rows[cpys.size()] = (const int64_t *) rows->data;
+                u.snapshot_col[cpys.size()] = (int) col;
+                cpys.push_back(set);
+                conts.push_back(n);
+                write_ids.push_back(rows);
+                j = set_idx;
+                continue;
+            }
             // a rollback snapshot: CPY(VIEW(concat) at a column, the conv cache's [(d_conv - 1) * channels] row)
             if (n->op == GGML_OP_CPY && n->src[0]->op == GGML_OP_VIEW && n->src[0]->view_src == concat) {
+                if (!write_ids.empty()) {
+                    return false;
+                }
                 const ggml_tensor * src = n->src[0];
                 const ggml_tensor * dst = n->src[1];
                 const size_t        col = src->view_offs / sizeof(float);
@@ -5088,7 +5149,10 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 for (const ggml_tensor * out : outs) {
                     if ((ggml_cuda_ranges_overlap(out, x) &&
                             !(out->data == x->data && out->nb[1] == x->nb[1] && out->nb[2] == x->nb[2])) ||
-                            ggml_cuda_ranges_overlap(out, ids)) {
+                            ggml_cuda_ranges_overlap(out, ids) ||
+                            std::any_of(write_ids.begin(), write_ids.end(), [&](const ggml_tensor * rows) {
+                                return ggml_cuda_ranges_overlap(out, rows);
+                            })) {
                         return false;
                     }
                 }
@@ -5130,7 +5194,10 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                             l2->type == GGML_TYPE_F32 && ggml_is_contiguous(l2) &&
                             !(l2->flags & GGML_TENSOR_FLAG_OUTPUT) && !ggml_cuda_ranges_overlap(l2, x) &&
                             !ggml_cuda_ranges_overlap(l2, ids) && !ggml_cuda_ranges_overlap(l2, n) &&
-                            !ggml_cuda_ranges_overlap(l2, silu);
+                            !ggml_cuda_ranges_overlap(l2, silu) &&
+                            std::none_of(write_ids.begin(), write_ids.end(), [&](const ggml_tensor * rows) {
+                                return ggml_cuda_ranges_overlap(l2, rows);
+                            });
                     if (ok) {
                         u.l2_dst   = (float *) l2->data;
                         u.l2_heads = (int) qk->ne[1];
@@ -5140,13 +5207,14 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 }
 
                 if (n_seqs == 1) {
-                    ggml_cuda_try_ssm_conv_ab(ctx, cgraph, j, concat, x, ids, ctx.ssm_conv_updates().l2_norm_of(n), u);
+                    ggml_cuda_try_ssm_conv_ab(ctx, cgraph, j, concat, x, ids, ctx.ssm_conv_updates().l2_norm_of(n), u, write_ids);
                 }
 
                 auto & reg = ctx.ssm_conv_updates();
                 reg.updates.emplace(n, u);
                 reg.skipped.insert(concat);
                 reg.skipped.insert(cpys.begin(), cpys.end());
+                reg.skipped.insert(conts.begin(), conts.end());
                 if (w_fused) {
                     reg.skipped.insert(w_concats, w_concats + 2);
                 }

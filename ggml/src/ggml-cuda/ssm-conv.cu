@@ -376,7 +376,8 @@ static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_
     }
 
     for (int k = 0; k < u.n_snapshots; ++k) {
-        float *   out = u.snapshot_dst[k] + (int64_t) c * (d_conv - 1);
+        const int64_t row = u.snapshot_rows[k] ? u.snapshot_rows[k][0]*u.row_stride : 0;
+        float *   out = u.snapshot_dst[k] + row + (int64_t) c * (d_conv - 1);
         const int col = u.snapshot_col[k];
         // a compile-time index per candidate column keeps x in registers
 #pragma unroll
@@ -477,7 +478,8 @@ static __global__ void ssm_conv_state_update_seqs_f32(const ggml_cuda_ssm_conv_s
         }
 
         for (int k = 0; k < u.n_snapshots; ++k) {
-            float *   out = u.snapshot_dst[k] + (int64_t) s * snapshot_seq_stride + (int64_t) c * (d_conv - 1);
+            const int64_t row = u.snapshot_rows[k] ? u.snapshot_rows[k][s]*u.row_stride : (int64_t) s*snapshot_seq_stride;
+            float *   out = u.snapshot_dst[k] + row + (int64_t) c * (d_conv - 1);
             const int col = u.snapshot_col[k];
             // a compile-time index per candidate column keeps x in registers
 #pragma unroll
@@ -488,6 +490,10 @@ static __global__ void ssm_conv_state_update_seqs_f32(const ggml_cuda_ssm_conv_s
                         out[j] = x[i + j];
                     }
                 }
+            }
+            // Indexed stores can overlap across slots; preserve their graph order.
+            if (u.snapshot_rows[k]) {
+                __syncthreads();
             }
         }
     }

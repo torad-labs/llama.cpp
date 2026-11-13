@@ -4847,6 +4847,7 @@ struct test_ssm_conv_state_update : public test_case {
     const bool    w_segs;      // the weights are three concatenated tensors of n_channels / 3 rows, in a weights buffer
     const int64_t n_seqs;      // sequences in the batch
     const int64_t dst_shift;   // > 0: the snapshots land that many floats into their rows, which stays with the CPYs
+    const bool scatter;
 
     std::vector<ggml_tensor *> cpys;
 
@@ -4861,14 +4862,15 @@ struct test_ssm_conv_state_update : public test_case {
 
     std::string vars() override {
         return VARS_TO_STR11(n_channels, n_t, n_snapshots, mem_size, kv_head, state_row, x_pad, l2_heads, w_segs, n_seqs,
-                             dst_shift);
+                             dst_shift) + ",scatter=" + std::to_string(scatter);
     }
 
     test_ssm_conv_state_update(int64_t n_channels = 256, int64_t n_t = 1, int64_t n_snapshots = 3,
             int64_t mem_size = 4, int64_t kv_head = 1, int64_t state_row = 1, int64_t x_pad = 0, int64_t l2_heads = 0,
-            bool w_segs = false, int64_t n_seqs = 1, int64_t dst_shift = 0)
+            bool w_segs = false, int64_t n_seqs = 1, int64_t dst_shift = 0, bool scatter = false)
         : n_channels(n_channels), n_t(n_t), n_snapshots(n_snapshots), mem_size(mem_size), kv_head(kv_head),
-          state_row(state_row), x_pad(x_pad), l2_heads(l2_heads), w_segs(w_segs), n_seqs(n_seqs), dst_shift(dst_shift) {}
+          state_row(state_row), x_pad(x_pad), l2_heads(l2_heads), w_segs(w_segs), n_seqs(n_seqs), dst_shift(dst_shift),
+          scatter(scatter) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         return build_graph(ctx, nullptr);
@@ -4879,7 +4881,7 @@ struct test_ssm_conv_state_update : public test_case {
         const int64_t row    = (d_conv - 1) * n_channels;
 
         // mem_size < kv_head + n_seqs lays the slots over one another's rows, where the CPYs' order decides
-        const int64_t n_rows = std::max({ mem_size * n_snapshots, (n_snapshots - 1) * mem_size + kv_head + n_seqs,
+        const int64_t n_rows = std::max({ mem_size * n_snapshots, (n_snapshots - 1) * mem_size + kv_head + (scatter ? 2*n_seqs : n_seqs),
                                           state_row + n_seqs }) + (dst_shift > 0 ? 1 : 0);
         ggml_tensor * cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, n_rows);
         ggml_set_name(cache, "cache");
@@ -4912,9 +4914,15 @@ struct test_ssm_conv_state_update : public test_case {
             const int64_t slot = n_snapshots - t;
             ggml_tensor * src  = ggml_view_3d(ctx, conv_input, d_conv - 1, n_channels, n_seqs, conv_input->nb[1],
                                               conv_input->nb[2], ggml_row_size(GGML_TYPE_F32, col));
-            ggml_tensor * dst  = ggml_view_2d(ctx, cache, row, n_seqs, cache->nb[1],
-                                              (slot * mem_size + kv_head) * cache->nb[1] + dst_shift * sizeof(float));
-            cpys.push_back(ggml_cpy(ctx, src, dst));
+            if (scatter) {
+                ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_seqs);
+                ggml_format_name(rows, "write_ids_%d", (int) slot);
+                cpys.push_back(ggml_set_rows(ctx, cache, ggml_cont_2d(ctx, src, row, n_seqs), rows));
+            } else {
+                ggml_tensor * dst = ggml_view_2d(ctx, cache, row, n_seqs, cache->nb[1],
+                                                (slot * mem_size + kv_head) * cache->nb[1] + dst_shift * sizeof(float));
+                cpys.push_back(ggml_cpy(ctx, src, dst));
+            }
         }
 
         ggml_tensor * conv   = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
@@ -4939,6 +4947,13 @@ struct test_ssm_conv_state_update : public test_case {
                     r[s] = (int32_t) (state_row + (s + 1) % n_seqs);
                 }
                 ggml_backend_tensor_set(t, r.data(), 0, r.size() * sizeof(int32_t));
+            } else if (strncmp(t->name, "write_ids_", 10) == 0) {
+                const int64_t slot = atoi(t->name + 10);
+                std::vector<int64_t> rows(n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    rows[s] = slot*mem_size + kv_head + 2*((s + slot + 1)%n_seqs);
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int64_t));
             } else {
                 // the cache too: every row different, so reading or writing another row fails
                 init_tensor_uniform(t);
@@ -12127,6 +12142,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // snapshots a channel off their rows
             test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 1, 1, 1, 0, 0, false, n_seqs));
             test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, mem_size, 1, 1, 0, 0, false, n_seqs, 3));
+        }
+    }
+
+    // Fixed-row stores, including reordered destinations and overlapping snapshot planes.
+    for (int64_t n_seqs : { 1, 2, 23, 32, 33 }) {
+        for (int64_t n_t : { 1, 3, 5, 9 }) {
+            for (int64_t mem_size : { (int64_t) 1, 2*n_seqs + 3 }) {
+                test_cases.emplace_back(new test_ssm_conv_state_update(
+                    384, n_t, 3, mem_size, 1, mem_size + 1, 64, 2, true, n_seqs, 0, true));
+            }
         }
     }
 
