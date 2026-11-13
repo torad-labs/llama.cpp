@@ -358,19 +358,48 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         )
     endforeach()
     # LLAMA_RS_FIXED_ROWS=1: a recurrent memory that keeps a row a sequence on one device, as several sequence devices
-    # always do, for the architectures whose graphs write their states by row (llm_arch_rs_by_row): no decode moves
-    # another sequence's state, a copy has a row of its own at once, and a graph holds neither the memory's head nor a
-    # row to clear. On the host, as its twin above. test-recurrent-arena holds the memory's own cases
+    # always do, for the architectures whose graphs write their states by row (llm_arch_rs_by_row). The tests above over
+    # that memory: no decode moves another sequence's state, a copy has a row of its own at once, and a graph holds
+    # neither the memory's head nor a row to clear. test-recurrent-arena holds the memory's own cases
+    llama_test(test-llama-archs NAME test-glm5next-fixed-rows ARGS -a glm5next -s 1234)
+    llama_test(test-llama-archs NAME test-qwen35-fixed-rows   ARGS -a qwen35 -s 1234)
+    set_tests_properties(test-glm5next-fixed-rows test-qwen35-fixed-rows PROPERTIES
+        ENVIRONMENT "LLAMA_RS_FIXED_ROWS=1"
+    )
+    # as test-glm5next above: 1,340 s beside it in a suite on a loaded host
+    set_tests_properties(test-glm5next-fixed-rows PROPERTIES TIMEOUT 3600)
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-fixed-rows
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    # --device none: as test-recurrent-state-rollback-glm5next above
     llama_test(
         test-recurrent-state-rollback
         NAME test-recurrent-state-rollback-glm5next-fixed-rows
         LABEL main
         ARGS -m "${MODEL_DIR}/glm5next-moe.gguf" --device none
     )
-    set_tests_properties(test-recurrent-state-rollback-glm5next-fixed-rows PROPERTIES
+    set_tests_properties(test-recurrent-state-rollback-fixed-rows test-recurrent-state-rollback-glm5next-fixed-rows
+        PROPERTIES
         FIXTURES_REQUIRED generate-models
         ENVIRONMENT "LLAMA_RS_FIXED_ROWS=1"
     )
+    foreach(model glm5next-moe qwen35-dense)
+        foreach(kind async staged)
+            llama_test(
+                test-recurrent-state-${kind}
+                NAME test-recurrent-state-${kind}-${model}-fixed-rows
+                LABEL main
+                ARGS -m "${MODEL_DIR}/${model}.gguf"
+            )
+            set_tests_properties(test-recurrent-state-${kind}-${model}-fixed-rows PROPERTIES
+                FIXTURES_REQUIRED generate-models
+                ENVIRONMENT "LLAMA_RS_FIXED_ROWS=1"
+            )
+        endforeach()
+    endforeach()
     llama_build_and_test(test-kv-mean-center.cpp)
 endif()
 
