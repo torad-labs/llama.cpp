@@ -1245,7 +1245,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
             ggml_backend_view_init(tensor);
         }
     } else {
-        if (tensor->data == NULL) {
+        // A buffer of no size has no base, so a tensor placed in it has no address: the buffer it holds says that it
+        // was placed. Such a tensor comes here again as the source of a later node.
+        if (tensor->data == NULL && tensor->buffer == NULL) {
             assert(tensor_alloc->addr.offset != SIZE_MAX);
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
             ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
