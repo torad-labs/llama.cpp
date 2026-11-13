@@ -679,8 +679,7 @@ class ServingRecipeTest(unittest.TestCase):
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1",
             "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": "internal",
             "LLAMA_INDEXER_Q8_QUERY": "1", "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
-            "LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0",
-            "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
+            "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
             "LD_LIBRARY_PATH": str(self.serve.ROOT / "build/bin")})
         self.assertNotIn("--glm53-profile", argv)
         with self.assertRaisesRegex(ValueError, "transport"):
@@ -714,7 +713,6 @@ class ServingRecipeTest(unittest.TestCase):
                     self.assertEqual(env["GGML_CUDA_GRAPH_MEM_STATS"], "0")
                     self.assertEqual(env["GGML_CUDA_GRAPH_NODES"], "32768")
                     self.assertEqual(env["GGML_CUDA_GRAPH_IDLE_MS"], "0")
-                    self.assertNotIn("LLAMA_KPOOL_DIRECT_INDICES", env)
                     for flag, value in {"-ubd": "512", "-ctkd": "q8_0", "-ctvd": "q8_0"}.items():
                         if depth == "off":
                             self.assertNotIn(flag, argv)
@@ -1000,7 +998,7 @@ class ServingRecipeTest(unittest.TestCase):
                 executable, argv, env = execute.call_args.args
                 self.assertEqual(executable, str(Path(sys.executable).resolve()))
                 self.assertEqual(argv[2], str(model))
-                self.assertEqual(env["LLAMA_KPOOL_DIRECT_INDICES"], "0")
+                self.assertEqual(env["GGML_CUDA_MMQ_L2_PF"], "1")
 
     def test_published_assets_have_the_pinned_bytes_and_vocabulary_shape(self):
         self.serve.verify_assets()

@@ -192,7 +192,7 @@ def make_plan(args):
         env.update({"GGML_CUDA_GRAPH_MEM_STATS": "0", "GGML_CUDA_GRAPH_NODES": "32768",
                     "GGML_CUDA_GRAPH_IDLE_MS": "0"})
     if not dp:
-        env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
+        env.update({"GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
     if four:
         # The cards' reductions go through the copy engines and host memory. On both four-card hosts read cleanly
         # (Nov 11, 2026) the engine's own routes, whose kernels store into a peer's memory, ran the server at 15.8 and
