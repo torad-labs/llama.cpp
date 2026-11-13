@@ -33,12 +33,13 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     const bool fixed_requested = ggml_env_switch("LLAMA_RS_FIXED_ROWS");
     fixed_rows = fixed_requested && llm_arch_rs_by_row(model.arch);
+    // Both lines are warnings: a server prints the library's info lines only at -lv 4, and its operator has to see at
+    // the default verbosity whether the switch took
     if (fixed_requested && !is_fixed_rows()) {
-        LLAMA_LOG_INFO("%s: fixed rows are not supported for %s; using contiguous rows\n", __func__, llm_arch_name(model.arch));
+        LLAMA_LOG_WARN("%s: fixed rows are not supported for %s; using contiguous rows\n", __func__, llm_arch_name(model.arch));
     }
     if (fixed_rows) {
-        // one line a server's operator can look for: the switch took
-        LLAMA_LOG_INFO("%s: fixed rows: each sequence keeps one row for its whole life (LLAMA_RS_FIXED_ROWS)\n", __func__);
+        LLAMA_LOG_WARN("%s: fixed rows: each sequence keeps one row for its whole life (LLAMA_RS_FIXED_ROWS)\n", __func__);
     }
     if (n_seq_devices > 1) {
         GGML_ASSERT(offload);
