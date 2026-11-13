@@ -581,6 +581,7 @@ struct hash_node {
     int buffer_id;
     struct buffer_address addr;
     bool allocated;
+    int pos; // where the planned graph holds the tensor (ggml_gallocr_pos)
 };
 
 struct tensor_alloc {
@@ -590,13 +591,25 @@ struct tensor_alloc {
     int lifetime_flags;
 };
 
+// A plan gives a tensor's storage to a later one once its last reader has run, so it holds only for a graph wired as
+// the planned one: every node the same operation, a view of the same tensor, reading the same tensors. A position
+// names a tensor of the planned graph: node i is i + 1, leaf i is -(i + 1). A tensor the graph read without holding
+// it (a graph view's sources) is entry k of the allocator's own list, GGML_GALLOCR_POS_OUT + k.
+#define GGML_GALLOCR_POS_NONE    INT_MIN       // no tensor
+#define GGML_GALLOCR_POS_OUT     (INT_MIN + 1) // the first tensor outside the graph
+#define GGML_GALLOCR_POS_OUT_END (INT_MIN / 2) // above every outside position, below every leaf's
+
 struct leaf_alloc {
     struct tensor_alloc leaf;
+    int view_pos;
 };
 
 struct node_alloc {
     struct tensor_alloc dst;
     struct tensor_alloc src[GGML_MAX_SRC];
+    enum ggml_op op;
+    int view_pos;
+    int src_pos[GGML_MAX_SRC];
 };
 
 struct ggml_gallocr {
@@ -616,6 +629,10 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    const struct ggml_tensor ** outside; // [n_outside]: the tensors the planned graph read without holding them
+    int n_outside;
+    int outside_size;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -728,6 +745,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buffer_shared);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    free(galloc->outside);
     ggml_gallocr_shared_unref(galloc->shared);
     free(galloc);
 }
@@ -754,6 +772,44 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct ggml_tensor * t) {
     size_t i = ggml_hash_find_or_insert(&galloc->hash_set, t);
     return &galloc->hash_values[i];
+}
+
+// the position of a tensor in the graph being planned, once the positions are written (ggml_gallocr_reserve_n_impl)
+static int ggml_gallocr_pos(ggml_gallocr_t galloc, const struct ggml_tensor * t) {
+    if (t == NULL) {
+        return GGML_GALLOCR_POS_NONE;
+    }
+    const size_t i = ggml_hash_find(&galloc->hash_set, t);
+    if (i != GGML_HASHSET_FULL && ggml_bitset_get(galloc->hash_set.used, i) && galloc->hash_values[i].pos != 0) {
+        return galloc->hash_values[i].pos;
+    }
+    for (int k = 0; k < galloc->n_outside; k++) {
+        if (galloc->outside[k] == t) {
+            return GGML_GALLOCR_POS_OUT + k;
+        }
+    }
+    if (galloc->n_outside == galloc->outside_size) {
+        galloc->outside_size = MAX(16, 2 * galloc->outside_size);
+        galloc->outside = realloc(galloc->outside, galloc->outside_size * sizeof(galloc->outside[0]));
+        GGML_ASSERT(galloc->outside != NULL);
+    }
+    galloc->outside[galloc->n_outside] = t;
+    return GGML_GALLOCR_POS_OUT + galloc->n_outside++;
+}
+
+// whether the tensor is the one the planned graph had at the position. A tensor outside the planned graph is the
+// same object or another one; that this graph does not hold it either is ggml_gallocr_needs_realloc's last pass
+static bool ggml_gallocr_is_at(ggml_gallocr_t galloc, const struct ggml_cgraph * graph, int pos, const struct ggml_tensor * t) {
+    if (pos == GGML_GALLOCR_POS_NONE || t == NULL) {
+        return pos == GGML_GALLOCR_POS_NONE && t == NULL;
+    }
+    if (pos > 0) {
+        return pos <= graph->n_nodes && graph->nodes[pos - 1] == t;
+    }
+    if (pos < GGML_GALLOCR_POS_OUT_END) {
+        return pos - GGML_GALLOCR_POS_OUT < galloc->n_outside && galloc->outside[pos - GGML_GALLOCR_POS_OUT] == t;
+    }
+    return pos < 0 && -pos <= graph->n_leafs && graph->leafs[-pos - 1] == t;
 }
 
 static bool ggml_gallocr_is_own(ggml_gallocr_t galloc, struct ggml_tensor * t) {
@@ -1024,9 +1080,22 @@ static bool ggml_gallocr_reserve_n_impl(
         GGML_ASSERT(galloc->node_allocs != NULL);
     }
     galloc->n_nodes = graph->n_nodes;
+    // the planning pass has put every leaf and node in the hash table: a tensor that is both counts as the node
+    for (int i = 0; i < graph->n_leafs; i++) {
+        ggml_gallocr_hash_get(galloc, graph->leafs[i])->pos = -(i + 1);
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ggml_gallocr_hash_get(galloc, graph->nodes[i])->pos = i + 1;
+    }
+    galloc->n_outside = 0;
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        node_alloc->op = node->op;
+        node_alloc->view_pos = ggml_gallocr_pos(galloc, node->view_src);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            node_alloc->src_pos[j] = ggml_gallocr_pos(galloc, node->src[j]);
+        }
         node_alloc->dst.lifetime_flags = node->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT);
         if (node->view_src || node->data) {
             node_alloc->dst.buffer_id = -1;
@@ -1062,6 +1131,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct hash_node * hn = ggml_gallocr_hash_get(galloc, leaf);
+        galloc->leaf_allocs[i].view_pos = ggml_gallocr_pos(galloc, leaf->view_src);
         galloc->leaf_allocs[i].leaf.lifetime_flags = leaf->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT);
         if (leaf->view_src || leaf->data) {
             galloc->leaf_allocs[i].leaf.buffer_id = -1;
@@ -1234,6 +1304,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
+        // Equal counts and sizes do not preserve a plan across another wiring: a node that owned storage and is a
+        // view now keeps its source read past the place where the plan gave that storage to a later node.
+        if (node_alloc->op != node->op || !ggml_gallocr_is_at(galloc, graph, node_alloc->view_pos, node->view_src)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: node %s is another operation or view than planned\n", __func__, node->name);
+#endif
+            return true;
+        }
+
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
@@ -1243,6 +1322,12 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
+            if (!ggml_gallocr_is_at(galloc, graph, node_alloc->src_pos[j], src)) {
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: src %d of node %s is another tensor than planned\n", __func__, j, node->name);
+#endif
+                return true;
+            }
             if (src == NULL) {
                 continue;
             }
@@ -1260,11 +1345,28 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
 
-        if (!ggml_gallocr_node_needs_realloc(galloc, leaf, &galloc->leaf_allocs[i].leaf)) {
+        if (!ggml_gallocr_is_at(galloc, graph, galloc->leaf_allocs[i].view_pos, leaf->view_src) ||
+            !ggml_gallocr_node_needs_realloc(galloc, leaf, &galloc->leaf_allocs[i].leaf)) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: leaf %s is not valid\n", __func__, leaf->name);
 #endif
             return true;
+        }
+    }
+
+    // a tensor the planned graph read without holding it has no slot in the plan: held by this graph, it would have
+    // the slot of the tensor whose place it took, and a reader the plan did not count
+    for (int k = 0; k < galloc->n_outside; k++) {
+        const struct ggml_tensor * t = galloc->outside[k];
+        for (int i = 0; i < graph->n_nodes; i++) {
+            if (graph->nodes[i] == t) {
+                return true;
+            }
+        }
+        for (int i = 0; i < graph->n_leafs; i++) {
+            if (graph->leafs[i] == t) {
+                return true;
+            }
         }
     }
 
