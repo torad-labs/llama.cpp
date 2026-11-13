@@ -765,3 +765,6 @@ bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
+// whether the architecture's graph writes its recurrent states by row and nowhere else (build_conv_state and
+// build_recurrent_attn): what a recurrent memory that keeps a row a sequence asks of a graph on one device
+bool llm_arch_rs_by_row         (const llm_arch & arch);

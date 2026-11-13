@@ -103,6 +103,7 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
     uint32_t n_devices() const { return n_seq_devices; }
+    bool is_fixed_rows() const { return fixed_rows || n_seq_devices > 1; }
     uint32_t state_row(uint32_t cell, uint32_t snapshot, bool local = false) const;
 
     // computed before each graph build
@@ -183,9 +184,10 @@ private:
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_seq_devices;
+    bool fixed_rows = false;
     llama_context * owner_context = nullptr;
     std::vector<uint32_t> zero_cells;
-    std::vector<uint32_t> restore_cells;
+    std::vector<std::vector<uint32_t>> restore_cells;
 
     // sequences settle() dropped, until each is removed
     std::vector<llama_seq_id> lost;
@@ -248,6 +250,7 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
 
+    bool is_fixed_rows() const { return mem->is_fixed_rows(); }
     int32_t s_copy(int i) const;
     uint32_t n_devices() const { return mem->n_devices(); }
     uint32_t s_write(llama_seq_id seq, uint32_t snapshot) const;
