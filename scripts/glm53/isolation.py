@@ -2,11 +2,12 @@
 """Do sessions on a real server keep their own context? A planted code word per session, asked back under load.
 
   isolation.py --base-url http://127.0.0.1:8100/v1 [--model ID] [--sessions 8] [--turns 5] [--filler 6000]
-               [--drop 0.25] [--max-tokens 400] [--seed 1] [--out FILE]
+               [--filler-max N] [--drop 0.25] [--max-tokens 400] [--seed 1] [--out FILE]
   The API key, when the server wants one, is read from the environment variable ISOLATION_API_KEY.
 
 Every session is a conversation of its own with the SAME system prompt (as agents share one) and its own code word
-in its first message, between paragraphs of filler of about --filler tokens. Each later turn plants one more word and
+in its first message, between paragraphs of filler of about --filler tokens (with --filler-max, a size of its own
+between the two, so the sessions are of unlike lengths). Each later turn plants one more word and
 asks for all of the session's words back. The sessions run at once, start at times of their own, and a share of the
 requests is streamed and dropped by the client part-way, as an agent that is interrupted; a dropped turn is asked
 again. With more sessions than the server has slots they take each other's slots and come back from the cache.
@@ -32,6 +33,7 @@ ap.add_argument("--model", default="default")
 ap.add_argument("--sessions", type=int, default=8)
 ap.add_argument("--turns", type=int, default=5)
 ap.add_argument("--filler", type=int, default=6000, help="about this many tokens of filler in a session's first message")
+ap.add_argument("--filler-max", type=int, default=0, help="each session draws its first message's filler between --filler and this")
 ap.add_argument("--grow", type=int, default=600, help="about this many tokens of filler in each later message")
 ap.add_argument("--drop", type=float, default=0.25, help="share of requests streamed and dropped part-way")
 ap.add_argument("--max-tokens", type=int, default=400)
@@ -89,7 +91,7 @@ def chat(messages, drop_after=None):
         text = resp.read()[:300]
         conn.close()
         raise RuntimeError(f"HTTP {resp.status}: {text!r}")
-    text, think, n, done = [], [], 0, False
+    text, think, n, done, read = [], [], 0, False, {}
     for raw in resp:
         if not raw.startswith(b"data: "):
             continue
@@ -100,6 +102,8 @@ def chat(messages, drop_after=None):
         if d.get("error"):  # an error the server sends inside the stream
             conn.close()
             raise RuntimeError(f"server error: {str(d['error'])[:200]}")
+        if d.get("timings"):  # llama-server: the prompt tokens it evaluated and the ones it took from its cache
+            read = {k: d["timings"][k] for k in ("prompt_n", "cache_n", "predicted_n") if k in d["timings"]}
         for ch in d.get("choices") or []:
             delta = ch.get("delta") or {}
             if delta.get("content"):
@@ -110,10 +114,11 @@ def chat(messages, drop_after=None):
                 n += 1
             if ch.get("finish_reason"):
                 done = True
+                read["finish"] = ch["finish_reason"]  # "length": the reply was cut at --max-tokens, which reads as LOST
         if drop_after is not None and n >= drop_after and not done:
             break
     conn.close()
-    return "".join(text), "".join(think), done
+    return "".join(text), "".join(think), done, read
 
 
 log, lock = [], threading.Lock()
@@ -122,9 +127,10 @@ log, lock = [], threading.Lock()
 def session(s):
     rng = random.Random(args.seed * 7907 + s)
     time.sleep(rng.uniform(0.0, 2.0))
+    first = rng.randrange(args.filler, args.filler_max + 1) if args.filler_max > args.filler else args.filler
     messages = [{"role": "system", "content": SYSTEM}]
     for k in range(args.turns):
-        body = filler(rng, args.filler if k == 0 else args.grow)
+        body = filler(rng, first if k == 0 else args.grow)
         half = len(body) // 2
         messages.append({"role": "user", "content": f"{body[:half]} Code word number {k + 1} of this conversation is "
                          f"{codes[s][k]}. {body[half:]} Now repeat every code word of this conversation, one a line."})
@@ -132,7 +138,7 @@ def session(s):
             drop = rng.randrange(1, 6) if rng.random() < args.drop else None
             t0 = time.time()
             try:
-                reply, think, done = chat(messages, drop)
+                reply, think, done, read = chat(messages, drop)
             except Exception as err:  # the server gone, a timeout: said, and the turn asked again a few times
                 with lock:
                     log.append({"session": s, "turn": k, "error": str(err)[:200]})
@@ -159,11 +165,13 @@ def session(s):
         lost = [c for c in own if c not in reply]
         with lock:
             log.append({"session": s, "turn": k, "seconds": round(time.time() - t0, 1), "leak": leak, "lost": lost,
-                        "reply": reply[:400], "think_leak": [c for c in leak if c in think and c not in reply]})
+                        "reply": reply[:400], "think_leak": [c for c in leak if c in think and c not in reply], **read,
+                        **({"think": think[-600:]} if leak or lost else {})})  # what a turn that failed was thinking
             flag = ("  <== LEAK from session " + ",".join(str(everyone[c]) for c in leak) if leak else "") + \
                    ("  <== LOST " + ",".join(lost) if lost else "")
+            size = f", read {read['prompt_n']} tokens and took {read.get('cache_n', 0)} from the cache" if "prompt_n" in read else ""
             print(f"isolation: session {s} turn {k} ({time.time() - t0:.1f} s): {len(own) - len(lost)} of {len(own)} own "
-                  f"words back, {len(leak)} of another session's{flag}", flush=True)
+                  f"words back, {len(leak)} of another session's{size}{flag}", flush=True)
         messages.append({"role": "assistant", "content": reply})
         time.sleep(rng.uniform(0.0, 1.0))
 
