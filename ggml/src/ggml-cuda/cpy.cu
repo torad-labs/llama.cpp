@@ -404,7 +404,8 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
         if (src0->nb[d] != block_nb || src1->nb[d] != block_nb) {
             break;
         }
-        block_nb *= src0->ne[d];
+        // Quantized rows contain blocks, not one stored element per logical value.
+        block_nb = d == 0 ? ggml_row_size(src0->type, src0->ne[0]) : block_nb * src0->ne[d];
     }
 
     // d == 0: nothing contiguous; d == GGML_MAX_DIMS: fully contiguous (handled by memcpy)
