@@ -425,8 +425,8 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
-        // the destination rolls back only into a batch of its own: the source's snapshots count from the batch end,
-        // and a rollback the source has pending already moved the cell back
+        // The copy shares the selected snapshot, but no earlier rollback history.
+        rs_idx[seq_id_dst] = tail_src.tail >= 0 ? rs_idx[seq_id_src] : 0;
         rs_reach[seq_id_dst] = 0;
     }
 }

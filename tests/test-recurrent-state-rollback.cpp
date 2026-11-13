@@ -520,6 +520,20 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
         return true;
     };
 
+    const auto copy = [&](uint32_t src, uint32_t dst) {
+        std::vector<uint8_t> saved(llama_state_seq_get_size(ctx_any, (llama_seq_id) src));
+        if (saved.empty() ||
+            llama_state_seq_get_data(ctx_any, saved.data(), saved.size(), (llama_seq_id) src) != saved.size() ||
+            llama_state_seq_set_data(ctx_ref, saved.data(), saved.size(), (llama_seq_id) dst) != saved.size()) {
+            fprintf(stderr, "%s : failed to restore the copy reference\n", __func__);
+            return false;
+        }
+        llama_memory_seq_cp(llama_get_memory(ctx_any), (llama_seq_id) src, (llama_seq_id) dst, -1, -1);
+        pos[dst] = pos[src];
+        // Some memories defer copies until the next decode; step checks the resulting logits and states.
+        return true;
+    };
+
     bool ok = true;
     ok = ok && step("three sequences' prompts",                       {6, 6, 6, 0});
     ok = ok && step("the same set",                                   {1, 1, 1, 0});
@@ -557,6 +571,21 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
     }
     if (!ok) {
         fprintf(stderr, "%s : the contexts differ, or a rollback or removal was refused\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    ok = ok && step("states before copying a rolled back sequence", {3, 3, 3, 3});
+    ok = ok && rollback(0, 1);
+    ok = ok && clear(1);
+    ok = ok && copy(0, 1);
+    ok = ok && step("continue a copied rollback", {1, 1, 1, 1});
+    ok = ok && step("states before reusing a rolled back destination", {3, 3, 3, 3});
+    ok = ok && rollback(1, 2);
+    ok = ok && clear(1);
+    ok = ok && copy(2, 1);
+    ok = ok && step("continue after reusing a rolled back destination", {1, 1, 1, 1});
+    if (!ok) {
         cleanup();
         return false;
     }
