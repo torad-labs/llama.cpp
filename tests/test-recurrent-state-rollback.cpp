@@ -2,6 +2,8 @@
 #include "common.h"
 #include "llama.h"
 
+#include "../src/llama-ext.h"
+
 #include <algorithm>
 #include <clocale>
 #include <cmath>
@@ -79,6 +81,46 @@ static float recurrent_state_diff(llama_context * ctx_a, llama_context * ctx_b, 
 
 // states reached through batches of different shapes agree to rounding, not bitwise
 constexpr float state_eps = 1e-6f;
+
+// What two computations of the same values may differ by on a device, as a part of the largest value they hold. This
+// test holds a state that was rolled back, copied or replayed to a context that decoded only what was kept, and a
+// device does not give two shapes of one computation the same bits: it picks the kernel of a matrix product by the
+// width of the batch and by how many multiprocessors the card has (ggml_cuda_mul_mat), and past eight columns that is
+// cuBLAS, which keeps ten bits of mantissa (TF32). The bound is two units of those ten bits. Measured: logits 1.8e-7
+// apart at 1.4e-3 (nemotron-h fixture, 1.3e-4 of the value), a state 6.6e-6 from every narrower shape after a batch of
+// nine tokens, with no rollback at all (dsv4 fixture, 1.5e-4 of its largest value); a state one position off is 1.7
+// times the largest value away. On the host every shape agrees to 6e-9 and the fixed bounds of each check stand: they
+// reach a top-k tie picked another way (26ba47bec), and a device's bound cannot.
+// The bound is for a model whose values follow its inputs without a jump. One that picks by score (experts, the pools
+// of a sparse attention) can pick another way in a batch of another width, and no bound of rounding holds that: the
+// fixtures that do (GLM, DeepSeek V4) are registered on the host (tests/CMakeLists.txt).
+constexpr float device_rounding = 2.0f/1024.0f;
+static bool on_device = false; // main: the model computes on a device
+
+// the bound a comparison is held to: `host` on the host; on a device that, or device_rounding of the largest value
+// compared, whichever is more
+static float bound(float host, float largest) {
+    return on_device ? std::max(host, device_rounding*largest) : host;
+}
+
+static float max_abs(const float * values, size_t n) {
+    float m = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isfinite(values[i])) {
+            m = std::max(m, std::fabs(values[i]));
+        }
+    }
+    return m;
+}
+
+// the bound two states of a sequence are held to, the reference's largest value being the one compared
+static float state_bound(llama_context * ctx_ref, llama_seq_id seq_id, float host = state_eps) {
+    if (!on_device) {
+        return host;
+    }
+    const std::vector<float> state = recurrent_state(ctx_ref, seq_id);
+    return bound(host, max_abs(state.data(), state.size()));
+}
 
 // Roll back multiple sequences, then replay them in a single batch whose
 // per-seq token count exceeds n_ubatch: each seq's replay spans several
@@ -170,7 +212,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const float diff = recurrent_state_diff(ctx_roll, ctx_ref, (llama_seq_id) s);
         fprintf(stderr, "%s : seq %u rolled back %u rows, state max diff %g\n", __func__, s, n_rollback, (double) diff);
-        if (!(diff <= state_eps)) {
+        if (!(diff <= state_bound(ctx_ref, (llama_seq_id) s))) {
             fprintf(stderr, "%s : seq %u state after the rollback differs from the reference\n", __func__, s);
             cleanup();
             return false;
@@ -208,9 +250,10 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
             cleanup();
             return false;
         }
+        const float row_eps = bound(eps, max_abs(l_ref, n_vocab));
         for (int t = 0; t < n_vocab; ++t) {
             const float diff = std::fabs(l_roll[t] - l_ref[t]);
-            if (diff > eps && pos_first < 0) {
+            if (diff > row_eps && pos_first < 0) {
                 seq_first = i/n_replay;
                 pos_first = p0 + (int32_t) (i%n_replay);
             }
@@ -218,7 +261,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         }
     }
 
-    if (diff_max > eps) {
+    if (pos_first >= 0) {
         fprintf(stderr, "%s : multi-seq split replay logits mismatch (max diff %g, first at seq %u pos %d)\n",
                 __func__, (double) diff_max, seq_first, pos_first);
         cleanup();
@@ -229,7 +272,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const float diff = recurrent_state_diff(ctx_roll, ctx_ref, (llama_seq_id) s);
-        if (!(diff <= state_eps)) {
+        if (!(diff <= state_bound(ctx_ref, (llama_seq_id) s))) {
             fprintf(stderr, "%s : seq %u state after the split replay differs from the reference (max diff %g)\n",
                     __func__, s, (double) diff);
             cleanup();
@@ -251,7 +294,8 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         llama_batch_free(batch_tail);
     }
 
-    float diff_tail = 0.0f;
+    float diff_tail   = 0.0f;
+    bool  within_tail = true; // every row within its own bound
     for (uint32_t i = 0; i < n_tail && ok; ++i) {
         const llama_pos pos = p0 + (llama_pos) (n_replay + i);
         llama_batch batch_one = llama_batch_init(1, 0, 1);
@@ -266,12 +310,17 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         const float * l_roll = llama_get_logits_ith(ctx_roll, 0);
         const float * l_ref  = llama_get_logits_ith(ctx_ref,  0);
         ok = l_roll != nullptr && l_ref != nullptr;
-        for (int t = 0; ok && t < n_vocab; ++t) {
-            diff_tail = std::max(diff_tail, std::fabs(l_roll[t] - l_ref[t]));
+        if (ok) {
+            const float row_eps = bound(eps, max_abs(l_ref, n_vocab));
+            for (int t = 0; t < n_vocab; ++t) {
+                const float diff = std::fabs(l_roll[t] - l_ref[t]);
+                diff_tail   = std::max(diff_tail, diff);
+                within_tail = within_tail && diff <= row_eps;
+            }
         }
     }
 
-    if (!ok || diff_tail > eps) {
+    if (!ok || !within_tail) {
         fprintf(stderr, "%s : seq-1-only decode leaked seq 0 state (ok=%d, max diff %g)\n",
                 __func__, ok ? 1 : 0, (double) diff_tail);
         cleanup();
@@ -338,7 +387,7 @@ static bool test_short_verify_rollback(const common_params & params, llama_model
 
         const float state_diff = recurrent_state_diff(ctx_roll, ctx_ref, 0);
         fprintf(stderr, "%s : %u of %u rows rolled back, state max diff %g\n", __func__, r, n_verify, (double) state_diff);
-        if (!(state_diff <= state_eps)) {
+        if (!(state_diff <= state_bound(ctx_ref, 0))) {
             fprintf(stderr, "%s : the recurrent state after rolling back %u rows differs from the reference\n", __func__, r);
             cleanup();
             return false;
@@ -460,8 +509,9 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
                 fprintf(stderr, "test_changed_sets : %s: missing logits at row %u\n", what, i);
                 return false;
             }
+            const float row_eps = bound(eps, max_abs(l_ref, n_vocab));
             for (int t = 0; t < n_vocab; ++t) {
-                if (!(std::fabs(l_ref[t] - l_any[t]) <= eps)) {
+                if (!(std::fabs(l_ref[t] - l_any[t]) <= row_eps)) {
                     fprintf(stderr, "test_changed_sets : %s: logits differ at row %u, token %d (%g != %g)\n",
                             what, i, t, (double) l_ref[t], (double) l_any[t]);
                     return false;
@@ -473,7 +523,7 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
                 continue;
             }
             const float diff = recurrent_state_diff(ctx_any, ctx_ref, (llama_seq_id) s);
-            if (!(diff <= state_eps)) {
+            if (!(diff <= state_bound(ctx_ref, (llama_seq_id) s))) {
                 fprintf(stderr, "test_changed_sets : %s: seq %u state differs from the reference by %g\n",
                         what, s, (double) diff);
                 return false;
@@ -586,7 +636,7 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
             ++i;
         }
         const float diff = recurrent_state_diff(shared, independent, (llama_seq_id) src);
-        if (!(diff <= state_eps)) {
+        if (!(diff <= state_bound(independent, (llama_seq_id) src))) {
             fprintf(stderr, "%s : a copied source's rollback differs from an independent source by %g\n",
                     __func__, (double) diff);
             return false;
@@ -952,9 +1002,10 @@ static bool test_prompt_kept(const common_params & params, llama_model * model, 
                 fprintf(stderr, "test_prompt_kept : %s: missing logits at row %d\n", what, i);
                 return false;
             }
+            const float row_eps = bound(eps, max_abs(l_ref, n_vocab));
             for (int t = 0; t < n_vocab; ++t) {
                 max_logits = std::max(max_logits, std::fabs(l_ref[t] - l_kept[t]));
-                if (!(std::fabs(l_ref[t] - l_kept[t]) <= eps)) {
+                if (!(std::fabs(l_ref[t] - l_kept[t]) <= row_eps)) {
                     fprintf(stderr, "test_prompt_kept : %s: logits differ at row %d, token %d (%g != %g)\n",
                             what, i, t, (double) l_ref[t], (double) l_kept[t]);
                     return false;
@@ -966,7 +1017,7 @@ static bool test_prompt_kept(const common_params & params, llama_model * model, 
                 continue;
             }
             const float diff = recurrent_state_diff(ctx_kept, ctx_ref, (llama_seq_id) s);
-            if (!(diff <= state_eps)) {
+            if (!(diff <= state_bound(ctx_ref, (llama_seq_id) s))) {
                 fprintf(stderr, "test_prompt_kept : %s: seq %u state differs from the reference by %g\n", what, s, (double) diff);
                 return false;
             }
@@ -1027,6 +1078,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
         return 0;
     }
+    on_device = llama_model_n_devices(model) > 0;
 
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
@@ -1089,7 +1141,7 @@ int main(int argc, char ** argv) {
     const auto matches = [&](llama_context * ctx, llama_context * truth, const char * what) {
         const float diff = recurrent_state_diff(ctx, truth, 0);
         fprintf(stderr, "%s : %s, state max diff %g\n", __func__, what, (double) diff);
-        return diff <= state_eps;
+        return diff <= state_bound(truth, 0);
     };
     const auto matches_truth = [&](llama_context * ctx, const char * what) {
         return matches(ctx, ctx_truth, what);
