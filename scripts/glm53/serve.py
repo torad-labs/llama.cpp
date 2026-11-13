@@ -67,6 +67,10 @@ def arguments(argv=None):
                         help="Spare state rows on the cards, 1..64: a session's context checkpoint is copied to one of them "
                              "on the cards, and from there to RAM on a thread of its own while the sessions decode "
                              "(opt-in: not read on four cards)")
+    parser.add_argument("--fixed-rows", action="store_true",
+                        help="Tensor profiles: a session's recurrent state keeps one row on the cards for the session's "
+                             "whole life, so no step moves another session's state there and a copied session has a row "
+                             "of its own at once (opt-in: four cards read it for isolation, not for speed)")
     parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
@@ -123,6 +127,8 @@ def make_plan(args):
         raise ValueError("slot-context is supported only with --profile tensor-4, from 256 tokens to under the context")
     if args.kept_graphs is not None and (not four or not 1 <= args.kept_graphs <= 256):
         raise ValueError("kept-graphs is supported only with --profile tensor-4 and must be 1..256")
+    if dp and args.fixed_rows:
+        raise ValueError("fixed-rows is for the tensor profiles: under dp-4 every session has a row of its own already")
     if dp and args.mtp_depth in ("3", "4"):
         raise ValueError("dp-4 is measured at MTP depth 1 and 2")
     if not 0 <= args.mtp_adaptive <= 1:
@@ -247,6 +253,13 @@ def make_plan(args):
             # Each spare row has a graph of its own, which the tensor split keeps captured beside the decodes' graphs:
             # without room for it, a checkpoint would put a decode's graph out and that decode would capture again
             env["GGML_META_CAPTURE_GRAPHS"] = str(int(env["GGML_META_CAPTURE_GRAPHS"]) + args.checkpoint_rows)
+    if args.fixed_rows:
+        # A tensor-split context is one sequence device, whose recurrent memory gathers a step's sessions into a run of
+        # rows and moves a state that is elsewhere before the decode. With this each session's row is its own from its
+        # first token to its last and nothing is moved or shared. Four RTX PRO 6000, ten sessions whose first prompts
+        # are 67,163 to 114,625 tokens taking each other's five slots (Nov 13, 2026): 0 turns of 60 lost a word of
+        # their own or held another session's, in two runs, as without it. What it costs a step was not read.
+        env["LLAMA_RS_FIXED_ROWS"] = "1"
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
     if args.trace_decode:
