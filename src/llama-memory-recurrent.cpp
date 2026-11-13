@@ -321,8 +321,34 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) rs_reach[seq_id]) {
+                    if (cell.seq_id.size() > 1) {
+                        auto dst = std::find_if(cells.begin(), cells.end(), [](const mem_cell & c) { return c.is_empty(); });
+                        if (dst == cells.end()) {
+                            return false;
+                        }
+                        const uint32_t dst_id = (uint32_t) (dst - cells.begin());
+                        const uint32_t src_row = state_row(cell.src >= 0 ? cell.src : tail_id, (uint32_t) rollback);
+                        const uint32_t dst_row = state_row(dst_id, (uint32_t) rollback);
+                        // A sibling keeps this cell. Copy the rollback snapshot before publishing a separate cell.
+                        if (owner_context) { llama_synchronize(owner_context); }
+                        for (const auto & layers : {r_l, s_l}) {
+                            for (ggml_tensor * tensor : layers) {
+                                if (!tensor) { continue; }
+                                std::vector<uint8_t> bytes(tensor->nb[1]);
+                                ggml_backend_tensor_get(tensor, bytes.data(), src_row*tensor->nb[1], bytes.size());
+                                ggml_backend_tensor_set(tensor, bytes.data(), dst_row*tensor->nb[1], bytes.size());
+                            }
+                        }
+                        dst->pos = p0 - 1;
+                        dst->src0 = dst->src = dst_id;
+                        dst->seq_id.insert(seq_id);
+                        cell.seq_id.erase(seq_id);
+                        tail_id = dst_id;
+                        ++used;
+                    } else {
+                        cell.pos = p0 - 1;
+                    }
                     set_rs_idx(seq_id, (uint32_t) rollback);
-                    cell.pos = p0 - 1;
                     return true;
                 }
                 if (has_state) {

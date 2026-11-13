@@ -8486,7 +8486,8 @@ void ggml_compute_forward_argsort(
 struct cmp_top_k {
     const float * data;
     bool operator()(int32_t a, int32_t b) const {
-        return data[a] > data[b];
+        // Masked prefixes must not change which equal scores are selected.
+        return data[a] > data[b] || (data[a] == data[b] && a < b);
     }
 };
 

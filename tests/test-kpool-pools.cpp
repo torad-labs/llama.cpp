@@ -382,8 +382,44 @@ static void check_reserve_limit() {
     }
 }
 
+// Masked pools before or after a sequence must not change which of its tied pools are selected.
+static void check_selection_padding() {
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    for (const int width : { 32, 72, 128 }) {
+        const int rows = width - 12;
+        ggml_context * ctx = ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_tensor * scores = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+        ggml_set_input(scores);
+        ggml_tensor * selected = ggml_top_k(ctx, scores, 2);
+        ggml_set_output(selected);
+        ggml_build_forward_expand(graph, selected);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+        std::vector<float> values(width*rows, -INFINITY);
+        for (int offset = 0; offset < rows; ++offset) {
+            std::fill_n(values.begin() + offset*width + offset, 10, 0.0f);
+            values[offset*width + offset + 3] = 0.5f;
+        }
+        ggml_backend_tensor_set(scores, values.data(), 0, ggml_nbytes(scores));
+        CHECK(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "pool selection failed");
+        std::vector<int32_t> ids(2*rows);
+        ggml_backend_tensor_get(selected, ids.data(), 0, ggml_nbytes(selected));
+        for (int offset = 0; offset < rows; ++offset) {
+            std::sort(ids.begin() + 2*offset, ids.begin() + 2*offset + 2);
+            CHECK(ids[2*offset] == offset && ids[2*offset + 1] == offset + 3,
+                    "width %d, offset %d: selected logical pools %d and %d, expected 0 and 3",
+                    width, offset, ids[2*offset] - offset, ids[2*offset + 1] - offset);
+        }
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(cpu);
+}
+
 int main() {
     std::mt19937 rng(20261029);
+    check_selection_padding();
 
     check_neighbour();
     check_reserve();
