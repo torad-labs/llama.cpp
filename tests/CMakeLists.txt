@@ -236,6 +236,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(test-llama-archs NAME test-glm5next ARGS -a glm5next -s 1234)
     llama_test(test-llama-archs NAME test-glm-nextn-store-cpu ARGS --glm-nextn-store-only --glm-dp-device CPU -s 1234)
     llama_test(test-llama-archs NAME test-qwen35 ARGS -a qwen35 -s 1234)
+    # The all-architectures run and the GLM run are the suite's longest without a device, about 230 s and 180 s alone on
+    # a 16-thread host. In a suite at -j 6 on that host at load 45 to 50 the first passed ctest's default 1,500 s and the
+    # second took 1,363 s: slow, not hung. An hour holds that six times over
+    set_tests_properties(test-llama-archs test-glm5next PROPERTIES TIMEOUT 3600)
     llama_build_and_test(test-speculative-mtp.cpp)
     llama_test(test-speculative-mtp NAME test-speculative-mtp-dp-cpu ARGS --dp-device CPU)
 
