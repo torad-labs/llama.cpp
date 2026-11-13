@@ -2569,6 +2569,36 @@ static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {
     }
 }
 
+// Finite blocks at quantization thresholds and their adjacent f32 values.
+static void init_quantization_edges(ggml_tensor * tensor, ggml_type type) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor));
+    const bool affine = type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_1;
+    const int levels = type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ? 16 : 32;
+    std::mt19937 rng(415203);
+    std::vector<float> data(ggml_nelements(tensor));
+    for (size_t b = 0; b < data.size(); b += 32) {
+        const float scale = std::ldexp(1.0f + float(rng()%65536)/65536.0f, int(rng()%13) - 6);
+        const float lo = affine ? -0.75f*scale : 0.0f;
+        const float hi = affine ? 1.25f*scale : (b%64 ? -scale : scale);
+        const float d = affine ? (hi - lo)/float(levels - 1) : hi/float(-levels/2);
+        const float id = 1.0f/d;
+        data[b] = hi;
+        data[b + 1] = affine ? lo : -0.875f*hi;
+        for (size_t j = 2; j < 32; ++j) {
+            const int level = rng()%(levels - 1);
+            float value = affine ? lo + (float(level) + 0.5f)/id : (float(level + 1) - (levels/2 + 0.5f))/id;
+            if (j%3 != 0) {
+                value = std::nextafter(value, j%3 == 1 ? -INFINITY : INFINITY);
+            }
+            data[b + j] = value;
+        }
+        if (b%2048 == 0) {
+            std::fill(data.begin() + b, data.begin() + b + 32, affine ? 0.75f : 0.0f);
+        }
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(float));
+}
+
 // GGML_OP_SET_ROWS
 struct test_set_rows : public test_case {
     const ggml_type type_src;
@@ -2578,9 +2608,10 @@ struct test_set_rows : public test_case {
     const std::array<int, 2> nr23; // broadcast only dims 2 and 3
     const int r; // rows to set
     const bool v; // view (non-contiguous src1)
+    const bool quant_edges;
 
     std::string vars() override {
-        return VARS_TO_STR7(type_src, type_dst, type_idx, ne, nr23, r, v);
+        return VARS_TO_STR7(type_src, type_dst, type_idx, ne, nr23, r, v) + ",quant_edges=" + std::to_string(quant_edges);
     }
 
     test_set_rows(ggml_type type_src,
@@ -2588,8 +2619,8 @@ struct test_set_rows : public test_case {
             ggml_type type_idx,
             std::array<int64_t, 4> ne,
             std::array<int, 2> nr23,
-            int r, bool v = false)
-        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v) {}
+            int r, bool v = false, bool quant_edges = false)
+        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v), quant_edges(quant_edges) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * dst = ggml_new_tensor_4d(ctx, type_dst, ne[0], ne[1], ne[2]*nr23[0], ne[3]*nr23[1]);
@@ -2620,6 +2651,8 @@ struct test_set_rows : public test_case {
             }
             if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
                 init_set_rows_row_ids(t, ne[1]);
+            } else if (quant_edges && strcmp(t->name, "src") == 0) {
+                init_quantization_edges(t, type_dst);
             } else {
                 init_tensor_uniform(t);
             }
@@ -2627,6 +2660,7 @@ struct test_set_rows : public test_case {
     }
 
     double max_nmse_err() override {
+        if (quant_edges) { return 0.0; }
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
             type_dst == GGML_TYPE_IQ4_NL ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
@@ -3137,6 +3171,7 @@ struct test_cpy : public test_case {
     bool _src_transpose;
     bool _use_dst_shape;
     bool _use_dst_alloc;
+    bool quant_edges;
 
     std::string vars() override {
         if (_use_dst_alloc) {
@@ -3145,7 +3180,7 @@ struct test_cpy : public test_case {
         if (_use_dst_shape) {
             return VARS_TO_STR7(type_src, type_dst, ne_src, ne_dst, permute_src, permute_dst, _src_transpose);
         }
-        return VARS_TO_STR6(type_src, type_dst, ne_src, permute_src, permute_dst, _src_transpose);
+        return VARS_TO_STR6(type_src, type_dst, ne_src, permute_src, permute_dst, _src_transpose) + ",quant_edges=" + std::to_string(quant_edges);
     }
 
     int64_t total_elements() const {
@@ -3153,6 +3188,7 @@ struct test_cpy : public test_case {
     }
 
     double max_nmse_err() override {
+        if (quant_edges) { return 0.0; }
         if (type_src == type_dst) {
             return 0.0;
         }
@@ -3190,14 +3226,14 @@ struct test_cpy : public test_case {
             std::array<int64_t, 4> permute_src = {0, 0, 0, 0},
             std::array<int64_t, 4> permute_dst = {0, 0, 0, 0},
             bool transpose_src = false,
-            std::array<int64_t, 4> dst_alloc = {0, 0, 0, 0})
+            std::array<int64_t, 4> dst_alloc = {0, 0, 0, 0}, bool quant_edges = false)
         : type_src(type_src), type_dst(type_dst), ne_src(ne_src), ne_dst(ne_dst), permute_src(permute_src), permute_dst(permute_dst),
           dst_alloc(dst_alloc),
           _src_use_permute(permute_src[0] + permute_src[1] + permute_src[2] + permute_src[3] > 0),
           _dst_use_permute(permute_dst[0] + permute_dst[1] + permute_dst[2] + permute_dst[3] > 0),
           _src_transpose(transpose_src),
           _use_dst_shape(ne_dst[0] >= 0 && ne_dst[1] >= 0 && ne_dst[2] >= 0 && ne_dst[3] >= 0),
-          _use_dst_alloc(dst_alloc[0] > 0){}
+          _use_dst_alloc(dst_alloc[0] > 0), quant_edges(quant_edges) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * src = ggml_new_tensor(ctx, type_src, 4, ne_src.data());
@@ -3242,8 +3278,12 @@ struct test_cpy : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            // test extended range of values to check if casting between f32 and i32 is consistent
-            init_tensor_uniform(t, -150.f, 150.f);
+            if (quant_edges && strcmp(t->name, "src") == 0) {
+                init_quantization_edges(t, type_dst);
+            } else {
+                // test extended range of values to check if casting between f32 and i32 is consistent
+                init_tensor_uniform(t, -150.f, 150.f);
+            }
         }
     }
 };
@@ -12143,6 +12183,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, 1, 1, 1, 0, 0, false, n_seqs));
             test_cases.emplace_back(new test_ssm_conv_state_update(256, n_t, 3, mem_size, 1, 1, 0, 0, false, n_seqs, 3));
         }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
+        for (ggml_type index : { GGML_TYPE_I32, GGML_TYPE_I64 }) {
+            for (bool view : {false, true}) {
+                test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, index, {256, 11, 1, 7}, {2, 3}, 7, view, true));
+            }
+        }
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, type, {256, 11, 2, 3},
+            {-1, -1, -1, -1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {0, 0, 0, 0}, true));
     }
 
     // Fixed-row stores, including reordered destinations and overlapping snapshot planes.
