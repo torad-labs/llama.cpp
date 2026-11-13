@@ -10,8 +10,20 @@
 // The sequence is then removed and restored with the async call from the partial state and from the full one, the
 // others decoding before the copy is waited for, and saved again: the state is the saved one, and no copy of a
 // partial state is pending when its restore returns.
+//
+// check_dropped: a placement that leaves a state to move and is followed by no move (what a state restore did until
+// e7598775e) drops the sequences it was for, the one that kept its row included, and the one it displaced.
+// llama_decode answers -4 for a batch that holds one, no state of it and no state of the whole context is saved, a
+// copy of one is dropped too, the sequence past the placement keeps its state and decodes, and a dropped sequence
+// that is removed starts again.
 
 #include "llama.h"
+
+#include "../src/llama-batch.h"
+#include "../src/llama-memory-hybrid-iswa.h"
+#include "../src/llama-memory-hybrid.h"
+#include "../src/llama-memory-recurrent.h"
+#include "../src/llama-model.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +31,7 @@
 #include <vector>
 
 static const int n_seq = 3;
+static const int n_seq_dropped = 4; // check_dropped's
 
 // a token that differs by sequence and position, so every state differs
 static llama_token token_at(const llama_vocab * vocab, int seq, int pos) {
@@ -28,7 +41,7 @@ static llama_token token_at(const llama_vocab * vocab, int seq, int pos) {
 struct decoder {
     llama_context *     ctx;
     const llama_vocab * vocab;
-    int                 pos[n_seq] = { 0, 0, 0 };
+    int                 pos[n_seq_dropped] = { 0, 0, 0, 0 };
 
     // n more tokens of each of the sequences, in one batch
     bool run(const std::vector<int> & seqs, int n) {
@@ -49,6 +62,22 @@ struct decoder {
             pos[s] += n;
         }
         return ok;
+    }
+
+    // what llama_decode answers for one more token of each of the sequences; nothing is counted as decoded
+    int32_t probe(const std::vector<int> & seqs) {
+        llama_batch batch = llama_batch_init((int) seqs.size(), 0, 1);
+        for (const int s : seqs) {
+            batch.token   [batch.n_tokens] = token_at(vocab, s, pos[s]);
+            batch.pos     [batch.n_tokens] = pos[s];
+            batch.n_seq_id[batch.n_tokens] = 1;
+            batch.seq_id  [batch.n_tokens][0] = s;
+            batch.logits  [batch.n_tokens] = 1;
+            batch.n_tokens++;
+        }
+        const int32_t ret = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        return ret;
     }
 };
 
@@ -167,6 +196,152 @@ done:
     return ok;
 }
 
+static llama_memory_recurrent * recurrent_of(llama_memory_t mem) {
+    if (auto * m = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        return m;
+    }
+    if (auto * m = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return m->get_mem_recr();
+    }
+    if (auto * m = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return m->get_mem_recr();
+    }
+    return nullptr;
+}
+
+static bool check_dropped(llama_model * model) {
+    const char * what = "an owed move";
+    const llama_state_seq_flags partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    const llama_state_seq_flags all     = LLAMA_STATE_SEQ_FLAGS_NONE;
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx      = 512;
+    cparams.n_batch    = 512;
+    cparams.n_ubatch   = 512;
+    cparams.n_seq_max  = n_seq_dropped;
+    cparams.n_rs_seq   = 2;
+    cparams.kv_unified = true;
+
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (ctx == nullptr) {
+        fprintf(stderr, "%s: failed to create the context\n", what);
+        return false;
+    }
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_recurrent * recr = recurrent_of(mem);
+    decoder dec = { ctx, llama_model_get_vocab(model) };
+    bool ok = false;
+
+    std::vector<uint8_t> ref_3, buf;
+    llama_batch_allocr balloc(model->hparams.n_pos_per_embd());
+    llama_seq_id seq_0 = 0;
+    llama_seq_id seq_2 = 2;
+
+    if (recr == nullptr || !recr->relocate) {
+        // a decode gathers its sequences only with LLAMA_GRAPH_ANY_SEQS=1: elsewhere no placement owes a move
+        fprintf(stderr, "%s: no decode moves a state here, nothing to check\n", what);
+        ok = true;
+        goto done;
+    }
+    if (!dec.run({ 0, 1, 2, 3 }, 12)) {
+        fprintf(stderr, "%s: decode failed\n", what);
+        goto done;
+    }
+    ref_3 = blocking(ctx, 3, partial);
+
+    // Sequences 0 and 2 placed for one more token, as a decode's first step places them, and nothing after. 0 keeps
+    // its row, at a position no decode took it to; 2 takes the second row; 1 is displaced to the row 2 had and its
+    // move is left owed; 3 lies past the placement's cells
+    {
+        llama_ubatch ubatch = balloc.ubatch_reserve(1, 2);
+        ubatch.pos[0]      = dec.pos[0];
+        ubatch.pos[1]      = dec.pos[2];
+        ubatch.n_seq_id[0] = 1;
+        ubatch.n_seq_id[1] = 1;
+        ubatch.seq_id[0]   = &seq_0;
+        ubatch.seq_id[1]   = &seq_2;
+        if (!recr->find_slot(ubatch) || !recr->relocate_pending) {
+            fprintf(stderr, "%s: FAIL, placing sequences 0 and 2 left no state to move\n", what);
+            goto done;
+        }
+    }
+
+    // the decode that finds the move owed refuses the sequence that kept its row, before it asks anything else
+    if (dec.probe({ 0 }) != -4) {
+        fprintf(stderr, "%s: FAIL, a decode of a sequence placed for a decode that was never made did not answer -4\n", what);
+        goto done;
+    }
+    if (!llama_memory_seq_lost(mem, 0) || !llama_memory_seq_lost(mem, 1) || !llama_memory_seq_lost(mem, 2) ||
+            llama_memory_seq_lost(mem, 3) || !llama_memory_seq_lost(mem, -1)) {
+        fprintf(stderr, "%s: FAIL, dropped are %d %d %d %d of sequences 0 to 3, expected 1 1 1 0\n", what,
+                llama_memory_seq_lost(mem, 0), llama_memory_seq_lost(mem, 1), llama_memory_seq_lost(mem, 2), llama_memory_seq_lost(mem, 3));
+        goto done;
+    }
+    if (dec.probe({ 1 }) != -4 || dec.probe({ 2 }) != -4 || dec.probe({ 2, 3 }) != -4) {
+        fprintf(stderr, "%s: FAIL, a batch that holds a dropped sequence did not answer -4\n", what);
+        goto done;
+    }
+    buf.assign(ref_3.size(), 0xa5);
+    if (llama_state_seq_get_size_ext(ctx, 0, all) != 0 || llama_state_seq_get_data_ext(ctx, buf.data(), buf.size(), 2, partial) != 0 ||
+            llama_state_seq_get_data_async(ctx, buf.data(), buf.size(), 1, partial) != 0) {
+        fprintf(stderr, "%s: FAIL, a state of a dropped sequence was saved\n", what);
+        goto done;
+    }
+    // the whole context is not saved either: a load would bring the dropped sequences back without their state
+    if (llama_state_get_size(ctx) != 0 || llama_state_get_data(ctx, buf.data(), buf.size()) != 0) {
+        fprintf(stderr, "%s: FAIL, the context was saved with dropped sequences in it\n", what);
+        goto done;
+    }
+
+    // the sequence past the placement's cells was not part of it: its state is the one it had, and it decodes
+    if (!same(what, "the state of the sequence that was not displaced", blocking(ctx, 3, partial), ref_3)) {
+        goto done;
+    }
+    if (!dec.run({ 3 }, 2)) {
+        fprintf(stderr, "%s: FAIL, the sequence that was not displaced does not decode\n", what);
+        goto done;
+    }
+
+    // a copy of a dropped sequence is dropped, also into a sequence that was removed
+    llama_memory_seq_rm(mem, 1, -1, -1);
+    if (llama_memory_seq_lost(mem, 1)) {
+        fprintf(stderr, "%s: FAIL, a dropped sequence that was removed is still dropped\n", what);
+        goto done;
+    }
+    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+    if (!llama_memory_seq_lost(mem, 1) || dec.probe({ 1 }) != -4) {
+        fprintf(stderr, "%s: FAIL, a copy of a dropped sequence is taken as a sequence with a state\n", what);
+        goto done;
+    }
+
+    // a dropped sequence that is removed starts again from its first token; the others stay dropped until then
+    llama_memory_seq_rm(mem, 0, -1, -1);
+    dec.pos[0] = 0;
+    if (llama_memory_seq_lost(mem, 0) || !llama_memory_seq_lost(mem, 2) || !dec.run({ 0 }, 4) || !dec.run({ 0, 3 }, 2)) {
+        fprintf(stderr, "%s: FAIL, a dropped sequence that was removed does not start again\n", what);
+        goto done;
+    }
+    for (const llama_seq_id seq : { 1, 2 }) {
+        llama_memory_seq_rm(mem, seq, -1, -1);
+        dec.pos[seq] = 0;
+    }
+    if (llama_memory_seq_lost(mem, -1) || !dec.run({ 1, 2 }, 4) || !dec.run({ 0, 1, 2, 3 }, 2)) {
+        fprintf(stderr, "%s: FAIL, the other dropped sequences do not start again\n", what);
+        goto done;
+    }
+    if (blocking(ctx, 0, all).empty() || blocking(ctx, 2, all).empty() || llama_state_get_size(ctx) == 0) {
+        fprintf(stderr, "%s: FAIL, a sequence that started again, or the context, has no state to save\n", what);
+        goto done;
+    }
+
+    fprintf(stderr, "%s: ok, three sequences dropped and refused, a copy of one too, one kept, all started again\n", what);
+    ok = true;
+
+done:
+    llama_free(ctx);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const char * path = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
@@ -194,6 +369,7 @@ int main(int argc, char ** argv) {
     for (const uint32_t n_rs_seq : { 0u, 2u }) {
         n_fail += check(model, n_rs_seq) ? 0 : 1;
     }
+    n_fail += check_dropped(model) ? 0 : 1;
 
     llama_model_free(model);
     llama_backend_free();

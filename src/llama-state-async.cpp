@@ -272,6 +272,12 @@ size_t llama_context::state_seq_get_data_staged(llama_seq_id seq_id, uint8_t * d
         // an earlier copy of the sequence may still write the row that is read here
         state_async_wait(seq_id);
 
+        // a sequence the memory dropped has no state to save
+        if (memory->seq_lost(seq_id)) {
+            LLAMA_LOG_ERROR("%s: the memory dropped the state of sequence %d\n", __func__, seq_id);
+            return 0;
+        }
+
         const int64_t src = mem->stage_src(seq_id);
         for (uint32_t k = 0; src >= 0 && k < mem->n_stage; ++k) {
             if (!state_async_pending(llama_state_async::staged_key(k))) {

@@ -822,6 +822,13 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Returns true for a sequence the memory dropped because it could not vouch for its state (an error line says
+    // why). llama_decode() of a batch that holds such a sequence returns -4 and no state of it is saved, until the
+    // sequence is removed with llama_memory_seq_rm(mem, seq_id, -1, -1) and read again from its first token.
+    // A copy of a dropped sequence is dropped too. seq_id < 0: true when any sequence is dropped, and while one is
+    // the state of the whole context is not saved (llama_state_get_size() and llama_state_get_data() return 0).
+    LLAMA_API bool llama_memory_seq_lost(llama_memory_t mem, llama_seq_id seq_id);
+
     //
     // State / sessions
     //
@@ -1045,6 +1052,8 @@ extern "C" {
     //    1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
     //    2 - aborted     (processed ubatches will remain in the context's memory)
     //   -1 - invalid input batch
+    //   -4 - the memory dropped the state of a sequence of the batch, before this call or during it
+    //        (llama_memory_seq_lost): what was computed for the batch is not to be used
     // < -1 - fatal error (processed ubatches will remain in the context's memory)
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
