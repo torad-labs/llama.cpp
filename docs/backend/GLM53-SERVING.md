@@ -88,7 +88,7 @@ access controls.
 | CUDA graphs/collectives | `GGML_CUDA_GRAPH_MAX=0`, `GGML_CUDA_ALLREDUCE=internal` |
 | Indexer query | `LLAMA_INDEXER_Q8_QUERY=1` |
 | MTP rows/token embeddings | `LLAMA_MTP_DEVICE_H=1`, `LLAMA_TOK_EMBD_GPU=1` |
-| Direct sparse indices | `LLAMA_KPOOL_DIRECT_INDICES=0` |
+| Direct sparse indices | on, the engine's default: the launcher sets nothing (`LLAMA_KPOOL_DIRECT_INDICES_LEGACY=1` is the mask/compaction route) |
 | MMQ scheduling | `GGML_CUDA_MMQ_MOE_NCOLS=0`, `GGML_CUDA_MMQ_L2_PF=1` |
 | Diagnostics | `--metrics --log-timestamps`, `GGML_SCHED_DEBUG=0` |
 
