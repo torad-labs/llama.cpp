@@ -474,7 +474,8 @@ if (NOT GGML_BACKEND_DL)
     if (GGML_CUDA)
         # four ranks on the first GPUs, each reduction past the LL to owners and gathered from them
         llama_test(test-backend-meta-allreduce-copy NAME test-backend-meta-allreduce-split-reduce ARGS --logical 4)
-        set_tests_properties(test-backend-meta-allreduce-split-reduce PROPERTIES ENVIRONMENT "GGML_CUDA_AR_SPLIT_REDUCE=1")
+        # with no card to place a rank on the test says so and returns 77
+        set_tests_properties(test-backend-meta-allreduce-split-reduce PROPERTIES ENVIRONMENT "GGML_CUDA_AR_SPLIT_REDUCE=1" SKIP_RETURN_CODE 77)
     endif()
     llama_build_and_test(test-pq2-mma-device-memory.cpp)
 llama_build_and_test(test-ptq1_0-element-map.cpp)
