@@ -676,6 +676,58 @@ static void test_reallocation_output_lifetime() {
     }
 }
 
+// A copy ends its source's life and a view in its place does not. The two graphs have the same counts and every
+// tensor of the second fits the first one's plan, which gave the source's storage to the multiplication's result.
+static void test_reallocation_view_for_copy() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    for (bool view : {false, true, false, true}) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        auto * input = make_input_1d(ctx, 64);
+        auto * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 16);
+        ggml_set_input(weight);
+        auto * source = ggml_sqr(ctx, input);
+        auto * middle = view ? ggml_reshape_2d(ctx, source, 64, 1) : ggml_cont(ctx, source);
+        auto * output = ggml_mul_mat(ctx, weight, ggml_reshape_2d(ctx, middle, 64, 1));
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        check_no_overlap(graph);
+        GGML_ASSERT(!view || !memory_overlap(source, output));
+    }
+}
+
+// A graph view reads a tensor it does not hold, and the allocator places that tensor with it. The plan made for the
+// view is its own: an allocator of two buffers, which does not plan again by itself, places the view after a reserve.
+static void test_reallocation_graph_view() {
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_backend_buffer_type_t bufts[2] = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, 2));
+    for (int round = 0; round < 3; ++round) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        auto * input = make_input_1d(ctx, 64);
+        auto * first = ggml_sqr(ctx, input);
+        auto * second = ggml_cont(ctx, first);
+        auto * output = second;
+        for (int i = 0; i < 7; ++i) {
+            output = ggml_sqr(ctx, output);
+        }
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        GGML_ASSERT(graph->n_nodes == 9 && graph->nodes[0] == first);
+        ggml_cgraph view = ggml_graph_view(graph, 1, 9);
+        const int node_ids[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        if (!ggml_gallocr_alloc_graph(galloc.get(), &view)) {
+            GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), &view, node_ids, nullptr));
+            GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), &view));
+        }
+        GGML_ASSERT(first->data != nullptr && second->data != nullptr && output->data != nullptr);
+        GGML_ASSERT(!memory_overlap(first, second));
+    }
+}
+
 static void test_reallocation_unread_input() {
     dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
     ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
@@ -745,6 +797,8 @@ static void run(const char * name, void (*f)()) {
 
 int main() {
     run("test_reallocation_output_lifetime", test_reallocation_output_lifetime);
+    run("test_reallocation_view_for_copy", test_reallocation_view_for_copy);
+    run("test_reallocation_graph_view", test_reallocation_graph_view);
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);
