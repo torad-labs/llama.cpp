@@ -554,6 +554,41 @@ static void test_buffer_size_zero() {
     GGML_ASSERT(backend_b.context->allocated_total() == 0);
 }
 
+// A buffer that holds only tensors of no size has no size and no base, so a tensor placed in it has no address. The
+// buffer it holds says that it was placed: read by a later node, it is not placed a second time.
+static void test_buffer_size_zero_with_tensors() {
+    dummy_backend backend_a    = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b    = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * input = make_input_with_size(ctx, 16);
+    ggml_tensor * full  = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * rows  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 0);
+    ggml_set_input(rows);
+    ggml_tensor * first  = ggml_scale(ctx, rows, 2.0f);
+    ggml_tensor * second = ggml_cont(ctx, first);
+
+    ggml_set_output(full);
+    ggml_set_output(second);
+    ggml_build_forward_expand(graph, full);
+    ggml_build_forward_expand(graph, second);
+    GGML_ASSERT(graph->n_leafs == 2 && graph->leafs[0] == input && graph->leafs[1] == rows);
+    GGML_ASSERT(graph->n_nodes == 3 && graph->nodes[0] == full && graph->nodes[1] == first && graph->nodes[2] == second);
+
+    int leaf_buffer_ids[2] = { 0, 1 };
+    int node_buffer_ids[3] = { 0, 1, 1 };
+
+    ggml_backend_buffer_type_t bufts[2] = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_gallocr_ptr           galloc   = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+    GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_buffer_ids, leaf_buffer_ids));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+
+    GGML_ASSERT(full->data != nullptr);
+    GGML_ASSERT(rows->buffer != nullptr && first->buffer != nullptr && second->buffer != nullptr);
+    GGML_ASSERT(first->buffer != full->buffer);
+    GGML_ASSERT(backend_b.context->allocated_total() == 0);
+}
+
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
 static void test_reallocation() {
@@ -811,6 +846,7 @@ int main() {
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
+    run("test_buffer_size_zero_with_tensors", test_buffer_size_zero_with_tensors);
     run("test_reallocation", test_reallocation);
     run("test_reallocation_unread_input", test_reallocation_unread_input);
     run("test_reallocation_unread_input_two_buffers", test_reallocation_unread_input_two_buffers);
