@@ -265,6 +265,13 @@ bool server_http_context::init_listener(const common_params & params) {
 #endif
 
     srv->set_default_headers({{"Server", "llama.cpp"}});
+    // The library adds Keep-Alive by the request's headers alone. A response that closes its connection (a streamed one,
+    // process_handler_response) does not carry it beside its "Connection: close"
+    srv->set_post_routing_handler([](const httplib::Request &, httplib::Response & res) {
+        if (res.get_header_value("Connection") == "close") {
+            res.headers.erase("Keep-Alive");
+        }
+    });
     // srv->set_logger(log_server_request); // TODO @ngxson : this is too spamy, no very useful; improve it in the future
     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
         // this is fail-safe; exceptions should already handled by `ex_wrapper`
@@ -754,6 +761,13 @@ static void process_handler_response(server_http_req_ptr && request, server_http
         // Tell Nginx to not buffer any streamed response
         response->headers["X-Accel-Buffering"] = "no";
         set_headers(res, response->headers);
+        // A streamed response ends its connection: the provider below returns false once the stream is over, which
+        // the HTTP library takes as a cancelled write, and it closes the connection after the last chunk. The headers
+        // have to say so. They said "Keep-Alive: timeout=5, max=100", and a client that sent its next request on the
+        // connection it was told to keep lost it to the close when the two crossed ("Remote end closed connection
+        // without response"; the request never reaches a slot). One Connection header: a proxied response brings its own
+        res.headers.erase("Connection");
+        res.set_header("Connection", "close");
         const std::string content_type = response->content_type;
         // convert to shared_ptr as both chunked_content_provider() and on_complete() need to use it
         std::shared_ptr<server_http_req> q_ptr = std::move(request);
