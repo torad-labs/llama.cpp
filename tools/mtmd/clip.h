@@ -137,3 +137,8 @@ struct clip_cap {
     bool has_audio;
 };
 struct clip_cap clip_get_cap(const char * fname);
+
+// Reads the file's header as clip_init does before it loads a tensor: the modalities, and the hparams of each one
+// clip_init would load (image_min_tokens and image_max_tokens as in clip_context_params). No tensor data is read and no
+// backend is made. Throws what clip_init would refuse the file for: an unknown projector type, a missing key.
+void clip_check_header(const char * fname, int image_min_tokens, int image_max_tokens);

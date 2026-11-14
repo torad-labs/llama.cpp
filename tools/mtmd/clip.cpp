@@ -4017,6 +4017,35 @@ struct clip_cap clip_get_cap(const char * fname) {
     return res;
 }
 
+void clip_check_header(const char * fname, int image_min_tokens, int image_max_tokens) {
+    clip_model_loader loader(fname, /* skip_tensors= */ true);
+
+    // each modality's hparams, read as clip_init reads them: the same loader on a model that carries the caller's
+    // token limits, which clip_ctx's constructor sets before clip_init reads the header
+    auto load_hparams = [&](clip_modality modality) {
+        clip_model model;
+        if (image_min_tokens > 0) {
+            model.hparams.custom_image_min_tokens = image_min_tokens;
+        }
+        if (image_max_tokens > 0) {
+            model.hparams.custom_image_max_tokens = image_max_tokens;
+        }
+        loader.load_hparams(model, modality);
+        return model.proj_type;
+    };
+
+    bool skip_audio = false;
+    if (loader.has_vision) {
+        skip_audio = load_hparams(CLIP_MODALITY_VISION) == PROJECTOR_TYPE_GEMMA3NV; // as clip_init
+    }
+    if (loader.has_audio && !skip_audio) {
+        load_hparams(CLIP_MODALITY_AUDIO);
+    }
+    if (loader.has_gen_audio) {
+        load_hparams(CLIP_MODALITY_GEN_AUDIO);
+    }
+}
+
 void clip_free(clip_ctx * ctx) {
     if (ctx == nullptr) {
         return;

@@ -1,9 +1,12 @@
 #include "testing.h"
 
+#include "gguf.h"
 #include "mtmd-image.h"
 #include "mtmd-internal.h"
 
+#include <filesystem>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -135,6 +138,62 @@ MAKE_TEST(test_temporal_merge_grouping) {
         }
         t.assert_equal("remaining bitmap parts for " + name, groups.size(), n_bitmap_parts);
     }
+}
+
+//
+// mmproj header
+//
+
+// a glm5next projector's header alone (no tensors), as the load reads it before it loads a tensor. Unsloth's
+// GLM-5.3-Flash projector names the type glm5v and the SwiGLU limit swiglu_clamp
+MAKE_TEST(test_header_check_glm5next_spellings) {
+    // { projector type, the SwiGLU limit's key (empty: the header has none), accepted }
+    const std::vector<std::tuple<std::string, std::string, bool>> cases = {
+        { "glm5next", "clip.vision.swiglu_limit", true  },
+        { "glm5v",    "clip.vision.swiglu_clamp", true  }, // Unsloth's spellings
+        { "glm5v",    "",                         false }, // the limit is still required
+        { "glm5w",    "clip.vision.swiglu_limit", false }, // no projector type of this name
+    };
+
+    const std::string path = (std::filesystem::temp_directory_path() /
+        ("test-mtmd-impl-header-" + std::to_string(std::random_device{}()) + ".gguf")).string();
+    const float image_mean[3] = { 0.48145466f, 0.4578275f,  0.40821073f };
+    const float image_std[3]  = { 0.26862954f, 0.26130258f, 0.27577711f };
+
+    for (const auto & [proj_type, swiglu_key, expected] : cases) {
+        gguf_context * gguf = gguf_init_empty();
+        gguf_set_val_bool(gguf, "clip.has_vision_encoder",                  true);
+        gguf_set_val_str (gguf, "clip.projector_type",                      proj_type.c_str());
+        gguf_set_val_bool(gguf, "clip.use_silu",                            true);
+        gguf_set_val_u32 (gguf, "clip.vision.projection_dim",               4096);
+        gguf_set_val_u32 (gguf, "clip.vision.image_size",                   448);
+        gguf_set_val_u32 (gguf, "clip.vision.patch_size",                   14);
+        gguf_set_val_u32 (gguf, "clip.vision.embedding_length",             1024);
+        gguf_set_val_u32 (gguf, "clip.vision.feed_forward_length",          4096);
+        gguf_set_val_u32 (gguf, "clip.vision.block_count",                  24);
+        gguf_set_val_u32 (gguf, "clip.vision.attention.head_count",         16);
+        gguf_set_val_f32 (gguf, "clip.vision.attention.layer_norm_epsilon", 1e-5f);
+        gguf_set_val_u32 (gguf, "clip.vision.spatial_merge_size",           2);
+        gguf_set_arr_data(gguf, "clip.vision.image_mean", GGUF_TYPE_FLOAT32, image_mean, 3);
+        gguf_set_arr_data(gguf, "clip.vision.image_std",  GGUF_TYPE_FLOAT32, image_std,  3);
+        if (!swiglu_key.empty()) {
+            gguf_set_val_f32(gguf, swiglu_key.c_str(), 10.0f);
+        }
+        const bool written = gguf_write_to_file(gguf, path.c_str(), /* only_meta= */ true);
+        gguf_free(gguf);
+        if (!t.assert_true("the header of " + proj_type + " is written to " + path, written)) {
+            continue;
+        }
+
+        const bool actual = mtmd_check_header_from_file(path.c_str(), mtmd_context_params_default());
+
+        t.assert_equal(
+            "projector type " + proj_type + " with " + (swiglu_key.empty() ? "no SwiGLU limit" : swiglu_key),
+            std::string(expected ? "accepted" : "refused"),
+            std::string(actual   ? "accepted" : "refused"));
+    }
+
+    std::filesystem::remove(path);
 }
 
 //
