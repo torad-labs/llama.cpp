@@ -3,6 +3,7 @@
 
   isolation.py --base-url http://127.0.0.1:8100/v1 [--model ID] [--sessions 8] [--turns 5] [--filler 6000]
                [--filler-max N] [--drop 0.25] [--max-tokens 400] [--seed 1] [--top-logprobs N] [--out FILE]
+               [--system 1500] [--stagger S] [--think S]
   The API key, when the server wants one, is read from the environment variable ISOLATION_API_KEY.
 
 Every session is a conversation of its own with the SAME system prompt (as agents share one) and its own code word
@@ -11,6 +12,8 @@ between the two, so the sessions are of unlike lengths). Each later turn plants 
 asks for all of the session's words back. The sessions run at once, start at times of their own, and a share of the
 requests is streamed and dropped by the client part-way, as an agent that is interrupted; a dropped turn is asked
 again. With more sessions than the server has slots they take each other's slots and come back from the cache.
+--system sets the size of the shared prompt.
+With --stagger and --think a session starts while others are between turns, their slots idle: a server then picks a slot for it by the shared prefix.
 
 Every reply is checked for two things, which are counted apart:
   LEAK  the reply holds a code word that only another session was given
@@ -41,6 +44,9 @@ ap.add_argument("--turns", type=int, default=5)
 ap.add_argument("--filler", type=int, default=6000, help="about this many tokens of filler in a session's first message")
 ap.add_argument("--filler-max", type=int, default=0, help="each session draws its first message's filler between --filler and this")
 ap.add_argument("--grow", type=int, default=600, help="about this many tokens of filler in each later message")
+ap.add_argument("--system", type=int, default=1500, help="about this many tokens of filler in the system message, the same for every session")
+ap.add_argument("--stagger", type=float, default=0.0, help="session N starts N times this many seconds after the first, so it arrives while others are between turns")
+ap.add_argument("--think", type=float, default=0.0, help="a session waits about this many seconds between its turns, its slot idle meanwhile")
 ap.add_argument("--drop", type=float, default=0.25, help="share of requests streamed and dropped part-way")
 ap.add_argument("--max-tokens", type=int, default=400)
 ap.add_argument("--seed", type=int, default=1)
@@ -79,7 +85,7 @@ def code(s, k):
 
 
 SYSTEM = ("You are a careful assistant. A conversation may hold code words. When asked, repeat every code word you were "
-          "given in THIS conversation exactly, one a line, and nothing else. " + filler(random.Random(99), 1500))
+          "given in THIS conversation exactly, one a line, and nothing else. " + filler(random.Random(99), args.system))
 codes = {s: [code(s, k) for k in range(args.turns)] for s in range(args.sessions)}
 everyone = {c: s for s, cs in codes.items() for c in cs}
 assert len(everyone) == args.sessions * args.turns, "two sessions drew the same word: take another --seed"
@@ -147,7 +153,7 @@ log, lock = [], threading.Lock()
 
 def session(s):
     rng = random.Random(args.seed * 7907 + s)
-    time.sleep(rng.uniform(0.0, 2.0))
+    time.sleep((s - args.skip) * args.stagger + rng.uniform(0.0, 2.0))
     first = rng.randrange(args.filler, args.filler_max + 1) if args.filler_max > args.filler else args.filler
     messages = [{"role": "system", "content": SYSTEM}]
     for k in range(args.turns):
@@ -195,7 +201,7 @@ def session(s):
                   f"words back, {len(leak)} of another session's{size}{flag}"
                   f"{closest(read.get('probs', [])) if leak or lost else ''}", flush=True)
         messages.append({"role": "assistant", "content": reply})
-        time.sleep(rng.uniform(0.0, 1.0))
+        time.sleep(args.think * 0.5 + (args.think or 1.0) * rng.uniform(0.0, 1.0))
 
 
 threads = [threading.Thread(target=session, args=(s,)) for s in range(args.skip, args.sessions)]
