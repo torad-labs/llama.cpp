@@ -1537,6 +1537,11 @@ private:
     // the slot the last get_available_slot() gave a copy of another slot's prompt, or -1 [LLAMA_SLOT_PREFIX_COPY]
     int id_slot_copied = -1;
 
+    // LLAMA_SLOT_PREFIX_COPY=1 on a unified cache: two slots can hold the same cells, so no slot's positions are shifted
+    bool prefix_copy() const {
+        return slot_prefix_copy() && params_base.kv_unified;
+    }
+
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
@@ -2061,6 +2066,19 @@ private:
             }
         }
 
+        // A copied prefix leaves two slots on the same cells, and a shift of one slot's positions moves the other's.
+        if (prefix_copy()) {
+            if (params_base.ctx_shift) {
+                params_base.ctx_shift = false;
+                SRV_WRN("%s\n", "ctx_shift is not supported with LLAMA_SLOT_PREFIX_COPY, it will be disabled");
+            }
+
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported with LLAMA_SLOT_PREFIX_COPY, it will be disabled");
+            }
+        }
+
         if (llama_model_n_swa(model_tgt) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
@@ -2568,7 +2586,9 @@ private:
                 if (passed) {
                     SLT_INF(*passed, "slot keeps its prompt, f_sim = %.3f, f_keep = %.3f: an empty slot is free\n",
                             f_sim_passed, f_sim_passed * task.tokens.size() / passed->prompt.tokens.size());
-                    if (slot_prefix_copy() && params_base.kv_unified) {
+                    // the prefix was computed with the slot's adapters: it serves a request that runs with the same ones
+                    if (prefix_copy() && are_lora_equal(passed->lora,
+                                task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora))) {
                         donor = passed;
                         donor_reuse = reuse_passed;
                     }
@@ -2681,7 +2701,7 @@ private:
             // The request keeps the prefix it shares and cuts the rest of the copy when it starts, as it does in a slot it takes over. The slot copied from keeps everything.
             donor->checkpoints_wait(); // the copy shares the checkpoints: every one it holds is whole before it can be restored
             donor->copy_prompt_to(*ret);
-            ret->lora = donor->lora; // the copy's rows were computed with them: the launch compares the request's adapters with these
+            ret->lora = donor->lora; // the request runs with these adapters, so the launch finds none changed and keeps the copy
             id_slot_copied = ret->id;
             SLT_INF(*ret, "copied the prompt of slot %d, %d tokens, to reuse %zu of them\n", donor->id, donor->prompt.n_tokens(), donor_reuse);
         }
@@ -5594,9 +5614,11 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // not with a copied prefix: the slot can hold cells another slot holds, and the shift would move both
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    !prefix_copy();
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);

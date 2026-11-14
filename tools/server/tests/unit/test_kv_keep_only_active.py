@@ -688,3 +688,34 @@ def test_shared_prefix_is_copied_to_the_empty_slot(monkeypatch):
         replies.append([res.body["content"] for res in (first, other, again, more)])
         server.stop()
     assert replies[0] == replies[1]
+
+
+# A slot that holds cells another slot holds is never shifted: with the switch a request's n_cache_reuse is ignored.
+# The request below repeats the first conversation's tail a few tokens later, which is what cache reuse shifts, and the first conversation then replies as it does without the copy.
+def test_copied_prefix_is_not_shifted(monkeypatch):
+    replies = []
+    for switch in (None, "1"):
+        if switch is None:
+            monkeypatch.delenv("LLAMA_SLOT_PREFIX_COPY", raising=False)
+        else:
+            monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", switch)
+        log = _shared_prefix_server(3)
+        first = _reply(SHARED_PREFIX + TAIL_A)
+        log.drain()
+        other = server.make_request("POST", "/completion", data={
+            "prompt": SHARED_PREFIX + " A wizard read old books by the fire." + TAIL_A,
+            "cache_prompt": True,
+            "n_predict": 8,
+            "n_cache_reuse": 4,
+        })
+        assert other.status_code == 200
+        content = log.wait_for("ignoring n_cache_reuse")
+        assert other.body["id_slot"] != first.body["id_slot"]
+        assert ("copied the prompt of slot %d," % first.body["id_slot"] in content) == (switch == "1")
+        assert ("ignoring n_cache_reuse" in content) == (switch == "1")
+        again = _reply(SHARED_PREFIX + TAIL_A + " Then he saw the castle.")
+        assert again.body["id_slot"] == first.body["id_slot"]
+        assert again.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+        replies.append([res.body["content"] for res in (first, other, again)])
+        server.stop()
+    assert replies[0] == replies[1]
