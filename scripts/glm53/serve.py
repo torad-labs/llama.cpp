@@ -117,7 +117,8 @@ def arguments(argv=None):
                              "blocks; bf16 is the engine's own)")
     parser.add_argument("--diagnostic-ubatch", type=int, choices=[128, 512],
                         help="Explicit numerical-control microbatch for DP; it never changes the serving default")
-    parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP; 0 removes the cap")
+    parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP, and "
+                        "with --prompt-shapes the largest prompt pass (256, or --prompt-shape-rows); 0 removes the cap")
     parser.add_argument("--trace-decode", action="store_true",
                         help="Opt-in host phase/batch markers, graph identity and CUDA NVTX; not an unprofiled speed run")
     parser.add_argument("--dry-run", action="store_true")
@@ -140,7 +141,10 @@ def make_plan(args):
     if args.diagnostic_ubatch is not None and not dp:
         raise ValueError("diagnostic-ubatch is supported only with --profile dp-4")
     diagnostic_ubatch = args.diagnostic_ubatch if args.diagnostic_ubatch is not None else 512
-    prompt_step = args.prompt_step if args.prompt_step is not None else (512 if dp else 1024)
+    # With prompt shapes a step's prompt tokens go in passes of at most --prompt-shape-rows rows, back to back, and the step's replies wait for all of them.
+    # The step is then one pass, so a reply waits for one. Fixture, three sessions decoding beside a reader (Nov 14, 2026): 39.0 tok/s each at 256 against 34.5 at 1,024, the reader's prompts 4 % slower.
+    shape_step = (args.prompt_shape_rows or 256) if args.prompt_shapes is not None else 1024
+    prompt_step = args.prompt_step if args.prompt_step is not None else (512 if dp else shape_step)
     if not 1 <= args.port <= 65535 or prompt_step < 0:
         raise ValueError("port must be 1..65535 and prompt-step must be nonnegative")
     limit = MAX_SLOTS if args.kv_host or four else 40

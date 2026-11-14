@@ -837,16 +837,22 @@ class ServingRecipeTest(unittest.TestCase):
         for key in ("LLAMA_PROMPT_SHAPES", "LLAMA_PROMPT_SHAPE_SMALL", "LLAMA_PROMPT_SHAPE_ROWS", "LLAMA_KV_PAD_SHARED"):
             self.assertNotIn(key, env)
         self.assertNotIn("--spec-draft-n-min", argv)
+        self.assertEqual(argv[argv.index("--prompt-step") + 1], "1024")
         # 32 is the engine's switch as it was; a smaller count names the rows a short part keeps whole
-        env = self.serve.make_plan(self.serve.arguments(base + ["--prompt-shapes", "32"]))[1]
+        argv, env = self.serve.make_plan(self.serve.arguments(base + ["--prompt-shapes", "32"]))
         self.assertEqual(env["LLAMA_PROMPT_SHAPES"], "1")
         self.assertNotIn("LLAMA_PROMPT_SHAPE_SMALL", env)
         self.assertNotIn("LLAMA_PROMPT_SHAPE_ROWS", env)
+        # with shapes a step takes one prompt pass, the largest the shapes make, unless the step is given
+        self.assertEqual(argv[argv.index("--prompt-step") + 1], "256")
+        argv = self.serve.make_plan(self.serve.arguments(base + ["--prompt-shapes", "8", "--prompt-step", "1024"]))[0]
+        self.assertEqual(argv[argv.index("--prompt-step") + 1], "1024")
         argv, env = self.serve.make_plan(self.serve.arguments(
             base + ["--prompt-shapes", "8", "--prompt-shape-rows", "1024", "--session-step", "65536",
                     "--mtp-depth", "3", "--mtp-depth-min", "2"]))
         self.assertEqual((env["LLAMA_PROMPT_SHAPES"], env["LLAMA_PROMPT_SHAPE_SMALL"], env["LLAMA_PROMPT_SHAPE_ROWS"]),
                          ("1", "8", "1024"))
+        self.assertEqual(argv[argv.index("--prompt-step") + 1], "1024")
         self.assertEqual(env["LLAMA_KV_PAD_SHARED"], "65536")
         self.assertEqual((argv[argv.index("--spec-draft-n-max") + 1], argv[argv.index("--spec-draft-n-min") + 1]), ("3", "2"))
         # the two-card tensor recipe takes the shapes and the low depth; the step is the shared pool's
