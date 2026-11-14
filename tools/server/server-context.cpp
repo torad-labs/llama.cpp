@@ -2489,10 +2489,16 @@ private:
 
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
+            const bool named = task.id_slot != -1;
             float f_sim_best = 0;
+            // the idle slots that hold a prompt, each with the tokens the request can reuse from it
+            std::vector<std::pair<server_slot *, size_t>> held;
+            bool has_empty = false;
+            const server_slot * passed = nullptr;
+            float f_sim_passed = 0;
 
             for (server_slot & slot : slots) {
-                if (task.id_slot != -1 && slot.id != task.id_slot) {
+                if (named && slot.id != task.id_slot) {
                     continue;
                 }
 
@@ -2506,6 +2512,7 @@ private:
 
                 // skip the slot if it does not contains cached tokens
                 if (tokens.empty()) {
+                    has_empty = true;
                     SLT_TRC(slot, "%s", " - skipping, slot is empty\n");
                     continue;
                 }
@@ -2520,19 +2527,56 @@ private:
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu, lcp=%zu) > %.3f\n",
                         f_sim_cur, reusable, task.tokens.size(), lcp_len, slot_prompt_similarity);
 
-                // select the current slot if the criteria match
-                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
-                    f_sim_best = f_sim_cur;
-                    resident_reuse = reusable;
-
-                    ret = &slot;
+                held.emplace_back(&slot, reusable);
+                if (f_sim_cur <= slot_prompt_similarity) {
+                    continue;
                 }
+
+                // A request continues a slot when it keeps at least half of the slot. A smaller match only shares a prefix (a system prompt), and taking the slot cuts another conversation.
+                if (named || 2 * reusable >= tokens.size()) {
+                    if (f_sim_cur > f_sim_best) {
+                        f_sim_best = f_sim_cur;
+                        resident_reuse = reusable;
+
+                        ret = &slot;
+                    }
+                } else if (f_sim_cur > f_sim_passed) {
+                    f_sim_passed = f_sim_cur;
+                    passed = &slot;
+                }
+            }
+
+            bool by_lru = false;
+            if (ret == nullptr && has_empty) {
+                // an empty slot is taken below: no conversation is saved and cut for a prefix
+                if (passed) {
+                    SLT_INF(*passed, "slot keeps its prompt, f_sim = %.3f, f_keep = %.3f: an empty slot is free\n",
+                            f_sim_passed, f_sim_passed * task.tokens.size() / passed->prompt.tokens.size());
+                }
+            } else if (ret == nullptr && !held.empty()) {
+                // No slot is empty, so one conversation is cut. Take the least recently used slot among those that reuse about as much as the best one (within a quarter of the request).
+                size_t reuse_best = 0;
+                for (const auto & cur : held) {
+                    reuse_best = std::max(reuse_best, cur.second);
+                }
+                const size_t margin = task.tokens.size() / 4;
+                for (const auto & cur : held) {
+                    if (cur.second + margin >= reuse_best && (ret == nullptr || cur.first->t_last_used < ret->t_last_used)) {
+                        ret = cur.first;
+                        resident_reuse = cur.second;
+                    }
+                }
+                f_sim_best = task.tokens.empty() ? 0.0f : float(*resident_reuse) / task.tokens.size();
+                by_lru = true;
             }
 
             if (ret != nullptr && !ret->prompt.tokens.empty()) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
-                if (task.id_slot == -1) {
+                if (by_lru) {
+                    SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 ", f_sim = %.3f, f_keep = %.3f\n",
+                            ret->prompt.n_tokens(), ret->t_last_used, f_sim_best, f_keep);
+                } else if (!named) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }

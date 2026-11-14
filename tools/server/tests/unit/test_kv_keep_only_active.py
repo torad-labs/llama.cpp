@@ -581,3 +581,65 @@ def test_admission_eviction_preserves_recent_snapshot():
     res = server.make_request("POST", "/completion", data={"prompt": prompts[-2], "cache_prompt": True, "n_predict": 1})
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] > 0
+
+
+# Conversations that start with the same system prompt.
+# A request that shares only that prefix with a slot does not continue the slot's conversation: it keeps under half of what the slot holds.
+SHARED_PREFIX = LONG_PROMPT
+TAIL_A = " The knight rode north for many days and many nights." * 12
+TAIL_C = " A wizard read old books by the fire every evening." * 12
+
+
+def _shared_prefix_server(n_slots):
+    global server
+    server.no_cache_idle_slots = True
+    server.n_slots = n_slots
+    server.n_ctx = 2048
+    server.start()
+    return LogReader(server.log_path)
+
+
+def _one_token(prompt):
+    res = server.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True, "n_predict": 1})
+    assert res.status_code == 200
+    return res
+
+
+# With an empty slot free, the request takes it: the conversation in the other slot is not saved and cut.
+def test_shared_prefix_takes_an_empty_slot():
+    log = _shared_prefix_server(3)
+    first = _one_token(SHARED_PREFIX + TAIL_A)
+    log.drain()
+    other = _one_token(SHARED_PREFIX + " A small grey cat slept in the sun all day.")
+    content = log.wait_for("selected slot by LRU")
+    assert other.body["id_slot"] != first.body["id_slot"]
+    assert "an empty slot is free" in content
+    assert "selected slot by LCP similarity" not in content
+    assert "cache_save reason=saved" not in content
+    # the first conversation continues in its slot, from the cards
+    again = _one_token(SHARED_PREFIX + TAIL_A + " Then he saw the castle.")
+    content = log.wait_for("selected slot by LCP similarity")
+    assert again.body["id_slot"] == first.body["id_slot"]
+    assert "cache_restore" not in content
+    assert again.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+
+
+# With every slot in use, the request takes the least recently used slot, not the most similar one.
+def test_shared_prefix_takes_the_least_recently_used_slot():
+    log = _shared_prefix_server(2)
+    first = _one_token(SHARED_PREFIX + TAIL_A)
+    second = _one_token(SHARED_PREFIX + TAIL_C)
+    assert second.body["id_slot"] != first.body["id_slot"]
+    log.drain()
+    # shares a few more tokens with the second conversation than with the first
+    other = _one_token(SHARED_PREFIX + " A wizard read a letter and then went to sleep in the tower.")
+    content = log.wait_for("cache_save reason=saved")
+    assert other.body["id_slot"] == first.body["id_slot"]
+    assert "selected slot by LRU" in content
+    assert f"cache_save reason=saved slot={first.body['id_slot']} " in content
+    # the second conversation continues in its slot, and the first returns whole from RAM
+    again = _one_token(SHARED_PREFIX + TAIL_C + " Then the fire went out.")
+    assert again.body["id_slot"] == second.body["id_slot"]
+    assert again.body["timings"]["cache_n"] >= second.body["timings"]["prompt_n"] - 1
+    back = _one_token(SHARED_PREFIX + TAIL_A + " Then he saw the castle.")
+    assert back.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
