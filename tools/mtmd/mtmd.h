@@ -344,6 +344,12 @@ struct mtmd_caps {
 };
 MTMD_API struct mtmd_caps mtmd_get_cap_from_file(const char * mmproj_fname);
 
+// EXPERIMENTAL API to read the mmproj's header as mtmd_init_from_file reads it before it loads a tensor
+// Returns false, with the reason logged, when that load would refuse the file: an unknown projector type, a missing key
+// No tensor data is read and no text model is needed, so llama-server asks before it loads the text model
+// This is only intended to be used by llama-server, breaking changes is expected
+MTMD_API bool mtmd_check_header_from_file(const char * mmproj_fname, struct mtmd_context_params ctx_params);
+
 /////////////////////////////////////////
 // EXPERIMENTAL API for audio generation, subjected to breaking changes
 

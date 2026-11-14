@@ -1555,6 +1555,14 @@ private:
             mparams.progress_callback_user_data = &load_progress_mmproj;
         }
 
+        // the projector's header is read before the text model loads: a file this build cannot load (an unknown
+        // projector type, a missing key) ends the start here and not after the whole text model has loaded, which
+        // under a restart policy was paid on every attempt
+        if (has_mmproj && !mtmd_check_header_from_file(mmproj_path.c_str(), mparams)) {
+            SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+            return false;
+        }
+
         // optionally get the memory usage of mmproj
         if (has_mmproj && params_base.fit_params) {
             int64_t t_start = ggml_time_us();

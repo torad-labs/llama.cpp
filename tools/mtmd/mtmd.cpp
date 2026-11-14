@@ -2672,3 +2672,19 @@ std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const char * mmproj_f
         return {};
     }
 }
+
+bool mtmd_check_header_from_file(const char * mmproj_fname, struct mtmd_context_params ctx_params) {
+    auto saved_log_callback = g_logger_state.log_callback;
+    auto saved_log_user_data = g_logger_state.log_callback_user_data;
+
+    try {
+        mtmd_log_set(stub_log_callback, nullptr); // the load prints the header, once is enough
+        clip_check_header(mmproj_fname, ctx_params.image_min_tokens, ctx_params.image_max_tokens);
+        mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback
+        return true;
+    } catch (const std::exception & e) {
+        mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback
+        LOG_ERR("%s: '%s': %s\n", __func__, mmproj_fname, e.what());
+        return false;
+    }
+}

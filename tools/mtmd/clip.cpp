@@ -1750,7 +1750,13 @@ struct clip_model_loader {
                         // the reference asks for PILImageResampling.BICUBIC, which this only approximates
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
-                        get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit);
+                        {
+                            // Unsloth's projector spells the key swiglu_clamp. swiglu_limit is read when the file has
+                            // both, and is the one asked for when it has neither
+                            const bool unsloth_key = gguf_find_key(ctx_gguf.get(), KEY_VISION_SWIGLU_LIMIT) < 0 &&
+                                                     gguf_find_key(ctx_gguf.get(), KEY_VISION_SWIGLU_CLAMP) >= 0;
+                            get_f32(unsloth_key ? KEY_VISION_SWIGLU_CLAMP : KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit);
+                        }
                         hparams.ffn_op = FFN_SILU_CLAMP;
                         log_ffn_op = "silu_clamp";
                         // the preprocessor's min_pixels/max_pixels, in tokens
@@ -4009,6 +4015,35 @@ struct clip_cap clip_get_cap(const char * fname) {
     res.has_vision = loader.has_vision;
     res.has_audio  = loader.has_audio;
     return res;
+}
+
+void clip_check_header(const char * fname, int image_min_tokens, int image_max_tokens) {
+    clip_model_loader loader(fname, /* skip_tensors= */ true);
+
+    // each modality's hparams, read as clip_init reads them: the same loader on a model that carries the caller's
+    // token limits, which clip_ctx's constructor sets before clip_init reads the header
+    auto load_hparams = [&](clip_modality modality) {
+        clip_model model;
+        if (image_min_tokens > 0) {
+            model.hparams.custom_image_min_tokens = image_min_tokens;
+        }
+        if (image_max_tokens > 0) {
+            model.hparams.custom_image_max_tokens = image_max_tokens;
+        }
+        loader.load_hparams(model, modality);
+        return model.proj_type;
+    };
+
+    bool skip_audio = false;
+    if (loader.has_vision) {
+        skip_audio = load_hparams(CLIP_MODALITY_VISION) == PROJECTOR_TYPE_GEMMA3NV; // as clip_init
+    }
+    if (loader.has_audio && !skip_audio) {
+        load_hparams(CLIP_MODALITY_AUDIO);
+    }
+    if (loader.has_gen_audio) {
+        load_hparams(CLIP_MODALITY_GEN_AUDIO);
+    }
 }
 
 void clip_free(clip_ctx * ctx) {
