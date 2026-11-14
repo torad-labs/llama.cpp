@@ -292,8 +292,8 @@ is the same as unset (the change stays on), and `=0` turns off `GGML_CUDA_LORA_R
 `GGML_CUDA_GDN_CHUNKED`, `GGML_META_CAPTURE_THREADS`, `GGML_CUDA_AR_LL_MAX_BYTES` and `GGML_CUDA_AR_P2P_MAX_BYTES`. The two all-reduce limits control the host and peer LL paths independently; set both to zero to exclude the LL kernel.
 
 Remotes for maintenance: `upstream` → ggml-org/llama.cpp, the base, merged in when this fork takes
-a newer one. `prism` → PrismML-Eng/llama.cpp, where the ternary kernels came from. GitHub still lists
-it as this repo's fork parent, because the repo was first forked from it, but it is not the base. The
+a newer one. `prism` → PrismML-Eng/llama.cpp, where the ternary kernels came from and what this repo
+was first created as a fork of; it is not the base. The
 83 PrismML branches this repo was first pushed with were removed on 2026-09-20 — every one was at
 the same commit as PrismML's copy; they are one `git fetch prism` away.
 
