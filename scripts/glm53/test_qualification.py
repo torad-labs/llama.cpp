@@ -835,14 +835,21 @@ class ServingRecipeTest(unittest.TestCase):
         for profile in ("tensor-2", "tensor-4"):
             base = ["--model", "/models/target.gguf", "--profile", profile]
             plain_argv, plain_env = self.serve.make_plan(self.serve.arguments(base))
-            argv, env = self.serve.make_plan(self.serve.arguments(base + ["--fixed-rows"]))
-            # the engine's own switch, set only when asked for, and nothing else of the recipe moves with it
+            # the engine's own switches, set only when asked for, and nothing else of the recipe moves with them
             self.assertNotIn("LLAMA_RS_FIXED_ROWS", plain_env)
-            self.assertEqual(env, {**plain_env, "LLAMA_RS_FIXED_ROWS": "1"})
-            self.assertEqual(argv, plain_argv)
+            self.assertNotIn("GGML_CUDA_SSM_CONV_ROWS", plain_env)
+            # the rows come with the kernel that keeps their conv-state update one launch; "unfused" is the rows alone
+            rows, fused = {"LLAMA_RS_FIXED_ROWS": "1"}, {"GGML_CUDA_SSM_CONV_ROWS": "1"}
+            for options, switches in ((["--fixed-rows"], {**rows, **fused}), (["--fixed-rows", "fused"], {**rows, **fused}),
+                                      (["--fixed-rows", "unfused"], rows)):
+                with self.subTest(profile=profile, options=options):
+                    argv, env = self.serve.make_plan(self.serve.arguments(base + options))
+                    self.assertEqual(env, {**plain_env, **switches})
+                    self.assertEqual(argv, plain_argv)
         # under dp-4 every session has a row of its own already, so the switch would do nothing there
-        with self.assertRaisesRegex(ValueError, "fixed-rows"):
-            self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4", "--fixed-rows"]))
+        for options in (["--fixed-rows"], ["--fixed-rows", "unfused"]):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, "fixed-rows"):
+                self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"] + options))
 
     def test_dp_slot_defaults_and_bounds_do_not_change_tensor_capacity(self):
         args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"])
