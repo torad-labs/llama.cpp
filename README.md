@@ -236,9 +236,11 @@ disclosing AI-written changes.
 
 ## Upstream
 
-[PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) is the base. This fork merges
-that line when it takes a newer base (`prism` remote). PrismML tracks
-[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) is upstream (`upstream` remote). This
+fork merges it when it takes a newer base, most recently `v1.0.0` on 2026-11-14. The ternary
+PQ/PTQ kernels came from [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp)
+(`prism` remote). This repo was first forked from PrismML's, so GitHub still lists it as the
+parent, but it is not the base. Pull requests go to `torad-labs/llama.cpp`.
 
 A fix that belongs upstream can go as its own commit. Opening it there is a separate pull
 request. The maintained description is the last section of [TORAD.md](TORAD.md).
