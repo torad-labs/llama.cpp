@@ -51,6 +51,23 @@ static constexpr int N_SEQ  = 3;
 static constexpr int N_MAX  = 2;
 static constexpr int WINDOW = 8;
 
+// the target's batch as the drafter takes it (common_speculative_process reads a common_batch): the same rows, viewed
+static common_batch drafter_view(llama_context * ctx, const llama_batch & batch) {
+    common_batch res(ctx);
+    GGML_ASSERT(res.n_pos == 1);
+    const size_t n_embd = (size_t) llama_model_n_embd_inp(llama_get_model(ctx));
+    for (int i = 0; i < batch.n_tokens; ++i) {
+        const bool output = batch.logits[i] != 0;
+        const int32_t idx = batch.token ?
+            res.add(batch.token[i], batch.pos[i], batch.seq_id[i][0], output) :
+            res.add_embd({ batch.embd + (size_t) i*n_embd, 1, n_embd }, &batch.pos[i], batch.seq_id[i][0], output);
+        for (int s = 1; s < batch.n_seq_id[i]; ++s) {
+            res.add_seq(idx, batch.seq_id[i][s]);
+        }
+    }
+    return res;
+}
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     size_t seed = *(const size_t *) userdata;
     seed ^= std::hash<std::string>()(tensor->name);
@@ -282,7 +299,7 @@ struct server_rig {
             }
         }
         const int rc = llama_decode(tgt.get(), batch);
-        const bool ok = rc == 0 && common_speculative_process(spec.get(), batch);
+        const bool ok = rc == 0 && common_speculative_process(spec.get(), drafter_view(tgt.get(), batch));
         logits.clear();
         for (int i = 0; ok && i < batch.n_tokens; ++i) {
             if (batch.logits[i]) {
@@ -309,7 +326,7 @@ struct server_rig {
             batch.logits[i]    = false;
         }
         batch.n_tokens = n;
-        const bool ok = llama_decode(tgt.get(), batch) == 0 && common_speculative_process(spec.get(), batch);
+        const bool ok = llama_decode(tgt.get(), batch) == 0 && common_speculative_process(spec.get(), drafter_view(tgt.get(), batch));
         llama_batch_free(batch);
         logits.clear();
         if (!ok) {
@@ -1344,7 +1361,7 @@ static bool test_media(llama_model * model) {
             if (ok) {
                 const float * row = llama_get_embeddings_nextn_ith(rig.tgt.get(), n - 1);
                 h_last.assign(row, row + n_embd);
-                ok = common_speculative_process(rig.spec.get(), batch);
+                ok = common_speculative_process(rig.spec.get(), drafter_view(rig.tgt.get(), batch));
             }
             llama_batch_free(batch);
             if (!ok) return fail("the drafter refused an image's rows");

@@ -1,3 +1,5 @@
+#pragma once
+
 // Simplified API for asynchronous data loading.
 
 #include "common.cuh"
@@ -56,7 +58,7 @@ static __device__ __forceinline__ void cp_async_wait_all() {
 #endif // CP_ASYNC_AVAILABLE
 }
 
-// Closes a group of this thread's asynchronous copies: the ones issued since the last group.
+// Commits the copies issued since the last commit as one group.
 static __device__ __forceinline__ void cp_async_commit_group() {
 #ifdef CP_ASYNC_AVAILABLE
     asm volatile("cp.async.commit_group;");
@@ -65,8 +67,8 @@ static __device__ __forceinline__ void cp_async_commit_group() {
 #endif // CP_ASYNC_AVAILABLE
 }
 
-// Makes each thread wait until at most its n newest groups are still in flight, every older one done.
-// As cp_async_wait_all, no synchronization beyond the thread.
+// Makes each thread wait until at most n of its copy groups are pending.
+// Like cp_async_wait_all, this does NOT provide any additional synchronization.
 template <int n>
 static __device__ __forceinline__ void cp_async_wait_group() {
 #ifdef CP_ASYNC_AVAILABLE

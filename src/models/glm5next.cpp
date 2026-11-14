@@ -101,7 +101,7 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     // n_embd_out stays n_embd: deepseek4's hc_mult*n_embd overreads t_embd
     hparams.n_embd_out_impl = 0;
 
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead);
@@ -112,7 +112,7 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer_all, false);
 
     if (hparams.n_ff_shexp == 0) {
-        hparams.n_ff_shexp = hparams.n_ff_exp * std::max(1u, hparams.n_expert_shared);
+        hparams.n_ff_shexp = hparams.n_ff_exp() * std::max(1u, hparams.n_expert_shared);
     }
 
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
@@ -237,9 +237,11 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", il), {n_embd, n_expert}, flags);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   il), {n_expert}, flags);
 
-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), {n_embd, hparams.n_ff_exp, n_expert}, flags);
-            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), {n_embd, hparams.n_ff_exp, n_expert}, flags);
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), {hparams.n_ff_exp, n_embd, n_expert}, flags);
+            const int64_t n_ff_exp = hparams.n_ff_exp(il);
+
+            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), {n_embd, n_ff_exp, n_expert}, flags);
+            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), {n_embd, n_ff_exp, n_expert}, flags);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), {n_ff_exp, n_embd, n_expert}, flags);
 
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), {n_embd, hparams.n_ff_shexp}, flags);
             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", il), {n_embd, hparams.n_ff_shexp}, flags);
@@ -502,7 +504,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
 
     // sign-unconstrained head weights; PREC_F32 is load-bearing, bf16 swaps near-tied pools
     ggml_tensor * w = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
-    ggml_mul_mat_set_prec(w, GGML_PREC_F32);
+    ggml_prec_set_acc(w, GGML_PREC_F32);
     w = ggml_reshape_4d(ctx0, w, n_ihead, n_tps, 1, n_stream);
     w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(d_idx*n_ihead)));
     cb(w, "indexer_weights", il);
@@ -671,7 +673,7 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
             layer.ffn_gate_exps,
             layer.ffn_down_exps,
             layer.ffn_exp_probs_b,
-            n_expert, hparams.n_expert_used,
+            n_expert, hparams.n_expert_used(il),
             LLM_FFN_SILU, hparams.expert_weights_norm,
             hparams.expert_weights_scale,
             (llama_expert_gating_func_type) hparams.expert_gating_func,
@@ -694,8 +696,8 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
     return ggml_add(ctx0, moe_out, shexp);
 }
 
-llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llama_model_deepseek4::graph(params) {
+llama_model_glm5next::graph::graph(const llm_graph_params & params) :
+    llama_model_deepseek4::graph(params, no_build{}) {
     ggml_tensor * cur;
 
     ggml_tensor * inp         = build_inp_embd(model.tok_embd);
@@ -714,7 +716,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
                     cparams.n_ctx, hparams.indexer_top_k, hparams.indexer_kpool);
 
             inp_kp = build_inp_kpool(mctx_hyb,
-                    inp_mem->get_attn()->get_kq_mask(), indexer_scoring);
+                    inp_mem->get_attn()->self_attn_mask.raw, indexer_scoring);
         }
     }
 
@@ -733,20 +735,19 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
 
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-            res->t_layer_inp[il] = build_hc_mean(ctx0, inpL);
+            res->t_layer_inp[il] = build_hc_mean(inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
 
         ggml_tensor * residual = inpL;
-        ggml_tensor * post = nullptr;
-        ggml_tensor * comb = nullptr;
 
-        cur = build_hc_pre(inpL,
+        const hc_pre attn_hc = build_hc_pre(inpL,
                 model.layers[il].hc_attn_fn,
                 model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base,
-                &post, &comb, il);
+                il);
+        cur = attn_hc.cur;
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -754,21 +755,22 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
 
         cur = build_layer_attn(model, inp_mem, inp_kp, indexer_scoring, cur, il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, attn_hc.post, attn_hc.comb, il);
         cb(inpL, "hc_attn_post", il);
 
         residual = inpL;
-        cur = build_hc_pre(inpL,
+        const hc_pre ffn_hc = build_hc_pre(inpL,
                 model.layers[il].hc_ffn_fn,
                 model.layers[il].hc_ffn_scale,
                 model.layers[il].hc_ffn_base,
-                &post, &comb, il);
+                il);
+        cur = ffn_hc.cur;
         cb(cur, "hc_ffn_pre", il);
 
         // expand before the sublayer so op offload does not pull mHC state to the experts
         ggml_build_forward_expand(gf, residual);
-        ggml_build_forward_expand(gf, post);
-        ggml_build_forward_expand(gf, comb);
+        ggml_build_forward_expand(gf, ffn_hc.post);
+        ggml_build_forward_expand(gf, ffn_hc.comb);
 
         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
@@ -776,13 +778,13 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_layer_ffn(model, cur, il);
         cb(cur, "ffn_out", il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, ffn_hc.post, ffn_hc.comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
-        res->t_layer_inp[n_layer] = build_hc_mean(ctx0, inpL);
+        res->t_layer_inp[n_layer] = build_hc_mean(inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
@@ -797,7 +799,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     // unweighted mean, not DeepSeek-V4's learned gated head
-    cur = build_hc_mean(ctx0, inpL);
+    cur = build_hc_mean(inpL);
     cb(cur, "hc_mean", -1);
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
@@ -833,8 +835,8 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
 }
 
 // NextN draft head: an ordinary DSA layer, but a plain residual and no hc_* tensors
-llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
-    : graph(params) {
+llama_model_glm5next::graph_mtp::graph_mtp(const llm_graph_params & params)
+    : graph(params, no_build{}) {
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "glm5next MTP supports a single NextN block");
 
     const int il = hparams.n_layer() + cparams.nextn_layer_offset;
@@ -849,7 +851,7 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
             "glm5next MTP block tensors missing; convert without --no-mtp");
     GGML_ASSERT(!layer.hc_attn_fn && "the NextN block has no mHC mixer");
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     split_inp_rows(inp->tokens, 0);
@@ -908,7 +910,7 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
                     cparams.n_ctx, hparams.indexer_top_k, hparams.indexer_kpool);
 
             inp_kp = build_inp_kpool(mctx_hyb,
-                    inp_mem->get_attn()->get_kq_mask(), indexer_scoring);
+                    inp_mem->get_attn()->self_attn_mask.raw, indexer_scoring);
         }
     }
 
@@ -992,8 +994,8 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
 std::unique_ptr<llm_graph_context> llama_model_glm5next::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        return std::make_unique<graph_mtp>(*this, params);
+        return std::make_unique<graph_mtp>(params);
     }
 
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }

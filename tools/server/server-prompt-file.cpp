@@ -27,7 +27,8 @@ namespace {
 
 constexpr uint32_t FILE_MAGIC = 0x43504c54; // "TLPC"
 // of this layout and of what the bytes of a sequence state mean: a build that changes either takes another number
-constexpr uint32_t FILE_VERSION = 1;
+// 2: a K/V state records its rotation sizes (upstream v1.0.0, LLAMA_STATE_SEQ_VERSION 4)
+constexpr uint32_t FILE_VERSION = 2;
 // the models' states start on a page of the file
 constexpr uint64_t FILE_ALIGN = 4096;
 
@@ -205,7 +206,7 @@ void write_state(const server_prompt_cache_state & state, uint64_t id, const std
     uint64_t n_meta = 2 * sizeof(uint64_t) + tokens.size() + state.data->spec.size();
     for (const auto & checkpoint : state.prompt.checkpoints) {
         n_meta += sizeof(file_checkpoint) + 3 * sizeof(uint64_t) +
-            checkpoint.data_tgt.size() + checkpoint.data_dft.size() + checkpoint.data_spec.size();
+            checkpoint->data_tgt.size() + checkpoint->data_dft.size() + checkpoint->data_spec.size();
     }
     header.n_meta      = n_meta;
     header.offset_main = (sizeof(header) + n_meta + FILE_ALIGN - 1) / FILE_ALIGN * FILE_ALIGN;
@@ -217,14 +218,14 @@ void write_state(const server_prompt_cache_state & state, uint64_t id, const std
     out.put_bytes(state.data->spec.data(), state.data->spec.size());
     for (const auto & checkpoint : state.prompt.checkpoints) {
         file_checkpoint cur = {};
-        cur.n_tokens = checkpoint.n_tokens;
-        cur.pos_min  = checkpoint.pos_min;
-        cur.pos_max  = checkpoint.pos_max;
-        cur.pinned   = checkpoint.pinned;
+        cur.n_tokens = checkpoint->n_tokens;
+        cur.pos_min  = checkpoint->pos_min;
+        cur.pos_max  = checkpoint->pos_max;
+        cur.pinned   = checkpoint->pinned;
         out.put(cur);
-        out.put_bytes(checkpoint.data_tgt.data(),  checkpoint.data_tgt.size());
-        out.put_bytes(checkpoint.data_dft.data(),  checkpoint.data_dft.size());
-        out.put_bytes(checkpoint.data_spec.data(), checkpoint.data_spec.size());
+        out.put_bytes(checkpoint->data_tgt.data(),  checkpoint->data_tgt.size());
+        out.put_bytes(checkpoint->data_dft.data(),  checkpoint->data_dft.size());
+        out.put_bytes(checkpoint->data_spec.data(), checkpoint->data_spec.size());
     }
     GGML_ASSERT(out.size() == sizeof(header) + n_meta);
     out.pad(FILE_ALIGN);
@@ -295,14 +296,14 @@ file_result read_state(const std::string & path, uint64_t id, bool has_mtmd, ser
         in.get_bytes(state.data->spec);
         for (uint32_t i = 0; i < header.n_checkpoints; i++) {
             const auto cur = in.get<file_checkpoint>();
-            common_prompt_checkpoint checkpoint;
-            checkpoint.n_tokens = cur.n_tokens;
-            checkpoint.pos_min  = cur.pos_min;
-            checkpoint.pos_max  = cur.pos_max;
-            checkpoint.pinned   = cur.pinned != 0;
-            in.get_bytes(checkpoint.data_tgt);
-            in.get_bytes(checkpoint.data_dft);
-            in.get_bytes(checkpoint.data_spec);
+            auto checkpoint = std::make_shared<common_prompt_checkpoint>();
+            checkpoint->n_tokens = cur.n_tokens;
+            checkpoint->pos_min  = cur.pos_min;
+            checkpoint->pos_max  = cur.pos_max;
+            checkpoint->pinned   = cur.pinned != 0;
+            in.get_bytes(checkpoint->data_tgt);
+            in.get_bytes(checkpoint->data_dft);
+            in.get_bytes(checkpoint->data_spec);
             state.prompt.checkpoints.push_back(std::move(checkpoint));
         }
     } catch (const std::exception & e) {

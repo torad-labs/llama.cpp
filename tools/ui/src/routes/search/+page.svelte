@@ -2,7 +2,11 @@
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { SearchInput, SidebarNavigationSearchResults } from '$lib/components/app';
+	import {
+		DialogConversationDelete,
+		SearchInput,
+		SidebarNavigationSearchResults
+	} from '$lib/components/app';
 	import { ROUTES } from '$lib/constants';
 	import { RouterService } from '$lib/services/router.service';
 	import { chatStore, conversationsStore, deviceStore } from '$lib/stores';
@@ -44,18 +48,30 @@
 		}
 	}
 
-	async function handleDeleteConversation(id: string) {
+	let deleteDialogOpen = $state(false);
+	let deleteTargetId = $state<string | null>(null);
+
+	function handleDeleteConversation(id: string) {
 		const conversation = conversationsStore.conversations.find((c) => c.id === id);
 
 		if (!conversation) return;
 
-		const confirmed = window.confirm(
-			`Delete "${conversation.name}"? This action cannot be undone.`
-		);
+		deleteTargetId = conversation.id;
+		deleteDialogOpen = true;
+	}
 
-		if (!confirmed) return;
+	async function handleDeleteConfirm() {
+		const id = deleteTargetId;
+
+		deleteDialogOpen = false;
+
+		if (!id) return;
 
 		await conversationsStore.deleteConversation(id, { deleteWithForks: false });
+	}
+
+	function handleDeleteCancel() {
+		deleteDialogOpen = false;
 	}
 
 	function handleStopGeneration(id: string) {
@@ -77,9 +93,9 @@
 
 <div class="fixed top-0 z-10 left-0 right-0 p-2">
 	<SearchInput
-		autofocus
-		bind:value={searchQuery}
 		bind:ref={searchInputRef}
+		bind:value={searchQuery}
+		autofocus
 		onClose={handleBack}
 		placeholder="Search conversations..."
 	/>
@@ -87,12 +103,18 @@
 
 <div class="p-2 pt-16">
 	<SidebarNavigationSearchResults
-		{searchQuery}
-		{filteredConversations}
 		{currentChatId}
-		onSelect={selectConversation}
-		onEdit={handleEditConversation}
+		{filteredConversations}
 		onDelete={handleDeleteConversation}
+		onEdit={handleEditConversation}
+		onSelect={selectConversation}
 		onStop={handleStopGeneration}
+		{searchQuery}
 	/>
 </div>
+
+<DialogConversationDelete
+	bind:open={deleteDialogOpen}
+	onCancel={handleDeleteCancel}
+	onConfirm={handleDeleteConfirm}
+/>
