@@ -59,6 +59,17 @@ def arguments(argv=None):
     parser.add_argument("--save-async", action="store_true",
                         help="A session whose slot another session takes is copied to the RAM prompt cache on a thread of "
                              "its own while the other sessions decode (opt-in: not read on four cards)")
+    parser.add_argument("--cache-ram", type=int, default=32768, metavar="MIB",
+                        help="RAM the prompt cache may hold, in MiB: a session whose slot another session took waits "
+                             "there, and the oldest leave when it is full (default: 32768; -1 is no limit, 0 is no cache)")
+    parser.add_argument("--ctx-checkpoints", type=int, metavar="N",
+                        help="Context checkpoints a session keeps, the newest N: a turn whose prompt changed before its "
+                             "end resumes from one, and a session saved to the prompt cache takes them all with it "
+                             "(default: the engine's 32; 0 makes none)")
+    parser.add_argument("--prefix-copy", action="store_true",
+                        help="Tensor profiles: a session that starts in an empty slot takes the prefix it shares with an "
+                             "idle session (a system prompt) from that session's slot, and reads only what follows it. "
+                             "The pool's cells are shared and no row is copied (opt-in: not read on four cards)")
     parser.add_argument("--sessions-dir", type=Path,
                         help="A directory the server leaves its sessions in when it is stopped with SIGTERM or SIGINT, and "
                              "takes them from when it starts with the same models: /dev/shm/... keeps them in memory. The "
@@ -149,6 +160,8 @@ def make_plan(args):
         raise ValueError("fixed-rows is for the tensor profiles: under dp-4 every session has a row of its own already")
     if dp and args.mtp_depth in ("3", "4"):
         raise ValueError("dp-4 is measured at MTP depth 1 and 2")
+    if args.cache_ram < -1 or args.ctx_checkpoints is not None and args.ctx_checkpoints < 0:
+        raise ValueError("cache-ram is a size in MiB (-1: no limit) and ctx-checkpoints a count")
     if not 0 <= args.mtp_adaptive <= 1:
         raise ValueError("mtp-adaptive is a share of a round, 0..1")
     if args.mtp_depth_min is not None and (args.mtp_depth == "off" or args.dflash or int(args.mtp_depth_min) > int(args.mtp_depth)):
@@ -212,7 +225,9 @@ def make_plan(args):
     argv += ["-c", str(slots * DP_SLOT_CONTEXT if dp else context if four else 524288), "-np", str(slots)]
     if not dp:
         argv += ["--kv-unified"]
-    argv += ["--cache-ram", "32768", "--no-cache-idle-slots"]
+    argv += ["--cache-ram", str(args.cache_ram), "--no-cache-idle-slots"]
+    if args.ctx_checkpoints is not None:
+        argv += ["--ctx-checkpoints", str(args.ctx_checkpoints)]
     argv += ["--metrics", "--host", args.host, "--port", str(args.port), "--log-timestamps"]
     env = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3" if dp or four else "0,1",
@@ -270,6 +285,12 @@ def make_plan(args):
         # A save for a slot that changes hands stops the server's thread only to write the state's layout; the request
         # that takes the slot waits its turn while the rows are copied beside the other sessions' steps
         env["LLAMA_STATE_SAVE_ASYNC"] = "1"
+    if args.prefix_copy:
+        if dp:
+            raise ValueError("prefix-copy is for the tensor profiles: it shares the cells of one pool")
+        # The empty slot starts as a copy of the idle session's slot, and the new session cuts the copy at the end of
+        # the prefix it shares: it reads what follows, and the idle session keeps everything
+        env["LLAMA_SLOT_PREFIX_COPY"] = "1"
     if args.sessions_dir is not None:
         # At a stop every session is saved to the RAM prompt cache and the cache written to files; the next start maps
         # them, and a session comes back from its snapshot where it would be prefilled from its first token
@@ -396,8 +417,9 @@ def main(args):
             raise ValueError("missing local " + label + ": " + str(path))
     if not os.access(argv[0], os.X_OK):
         raise ValueError("server is not executable: " + argv[0])
-    if args.kv_host and available_memory_mib() < host_kv_mib(args.slots or 36) + 32768 + 8192:
-        raise ValueError("insufficient available RAM for host KV, 32 GiB prompt cache and 8 GiB system reserve")
+    cache_mib = max(args.cache_ram, 0)
+    if args.kv_host and available_memory_mib() < host_kv_mib(args.slots or 36) + cache_mib + 8192:
+        raise ValueError(f"insufficient available RAM for host KV, a {cache_mib} MiB prompt cache and 8 GiB system reserve")
     argv = resolve_server_arguments(argv, settings)
     os.execve(argv[0], argv, execution_environment(settings))
     return 0
