@@ -646,3 +646,45 @@ def test_shared_prefix_takes_the_least_recently_used_slot():
     assert again.body["timings"]["cache_n"] >= second.body["timings"]["prompt_n"] - 1
     back = _one_token(SHARED_PREFIX + TAIL_A + " Then he saw the castle.")
     assert back.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+
+
+def _reply(prompt):
+    res = server.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True, "n_predict": 8})
+    assert res.status_code == 200
+    return res
+
+
+# LLAMA_SLOT_PREFIX_COPY=1: the request that takes an empty slot starts from a copy of the slot it shares the prefix with, and reads only what follows the prefix.
+# Both conversations then continue in their slots, and every reply is the one the server gives without the copy.
+def test_shared_prefix_is_copied_to_the_empty_slot(monkeypatch):
+    replies = []
+    for switch in (None, "1"):
+        if switch is None:
+            monkeypatch.delenv("LLAMA_SLOT_PREFIX_COPY", raising=False)
+        else:
+            monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", switch)
+        log = _shared_prefix_server(3)
+        n_shared = len(server.make_request("POST", "/tokenize", data={"content": SHARED_PREFIX}).body["tokens"])
+        first = _reply(SHARED_PREFIX + TAIL_A)
+        log.drain()
+        other = _reply(SHARED_PREFIX + TAIL_C)
+        content = log.wait_for("selected slot by LRU")
+        assert other.body["id_slot"] != first.body["id_slot"]
+        assert "an empty slot is free" in content
+        assert "cache_save reason=saved" not in content
+        assert ("copied the prompt of slot %d," % first.body["id_slot"] in content) == (switch == "1")
+        if switch == "1":
+            assert other.body["timings"]["cache_n"] >= n_shared - 2
+        else:
+            assert other.body["timings"]["cache_n"] == 0
+        n_other = other.body["timings"]["cache_n"] + other.body["timings"]["prompt_n"]
+        # the slot copied from keeps everything, and the copy keeps what its own request read
+        again = _reply(SHARED_PREFIX + TAIL_A + " Then he saw the castle.")
+        assert again.body["id_slot"] == first.body["id_slot"]
+        assert again.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+        more = _reply(SHARED_PREFIX + TAIL_C + " Then the fire went out.")
+        assert more.body["id_slot"] == other.body["id_slot"]
+        assert more.body["timings"]["cache_n"] >= n_other - 1
+        replies.append([res.body["content"] for res in (first, other, again, more)])
+        server.stop()
+    assert replies[0] == replies[1]
