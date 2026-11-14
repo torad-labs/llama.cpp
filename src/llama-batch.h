@@ -106,6 +106,11 @@ constexpr uint32_t LLAMA_PROMPT_SHAPE_SMALL = 32;
 // so this bounds what the prompts' graphs take
 uint32_t llama_prompt_shape_max();
 
+// the rows up to which a prompt's part is read whole: LLAMA_PROMPT_SHAPE_SMALL (a power of two from 1 to
+// LLAMA_PROMPT_SHAPE_SMALL, which it is when unset), read when an allocator is made. Below 32 the parts above it are cut
+// to powers of two as the larger ones are, so short prompts make that many shapes and a few more instead of 32
+uint32_t llama_prompt_shape_small();
+
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
 #define ASSERT_EMBD_OR_TOKEN(ubatch) GGML_ASSERT(!(ubatch).is_mixed() && "mixed token/embd ubatch is not supported here")
 
@@ -276,6 +281,7 @@ private:
     // prompt_shape_sets sequence sets bring one (LLAMA_PROMPT_SHAPE_SETS, 2 when unset; see split_equal)
     bool     prompt_shapes     = false;
     uint32_t prompt_shape_max  = 0;
+    uint32_t prompt_shape_small = LLAMA_PROMPT_SHAPE_SMALL;
     uint32_t prompt_shape_sets = 0;
     uint32_t n_prompt_sets     = 0; // the sequence sets with a row that is not an output, counted by split_reset
 
