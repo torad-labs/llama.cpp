@@ -1259,6 +1259,68 @@ static void test_prompt_shapes(testing & t) {
         t.assert_equal(0u, ba.split_equal(1024, false, 3).n_tokens);
     });
 
+    // LLAMA_PROMPT_SHAPE_SMALL=N (read when the allocator is made): a part is read whole up to N rows where it was up to
+    // 32, so the short prompts of an agent's turns make N row counts and the powers of two, not 32
+    t.test("a_small_bound_cuts_short_prompts_to_few_sizes", [&](testing & t) {
+        setenv("LLAMA_PROMPT_SHAPE_SMALL", "8", 1);
+        {
+            batch_builder bb;
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, {3, 21, 31}, {true, false, false}), vocab, false));
+
+            // the reply, then each prompt: what leaves a multiple of 8, then the powers of two (21 = 5 + 16; 31 = 7 + 8 + 16)
+            const uint32_t     n_tokens[] = {3, 5, 16, 7, 8, 16};
+            const llama_seq_id first[]    = {0, 1, 1,  2, 2, 2};
+            llama_pos pos[3] = {0, 0, 0};
+            for (int u = 0; u < 6; ++u) {
+                const llama_ubatch ub = ba.split_equal(1024, false, 3);
+                t.assert_equal(n_tokens[u], ub.n_tokens);
+                t.assert_equal(1u, ub.n_seqs);
+                t.assert_equal(first[u], ub.seq_id[0][0]);
+                for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+                    t.assert_equal(pos[first[u]]++, ub.pos[i]);
+                }
+            }
+            t.assert_equal(55u, ba.get_n_used());
+            t.assert_equal(0u, ba.split_equal(1024, false, 3).n_tokens);
+        }
+        {
+            // up to the bound whole; above 32 as before, less the part under the bound (97 = 1 + 32 + 64)
+            batch_builder bb;
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, {8, 97}, {false, false}), vocab, false));
+
+            const uint32_t n_tokens[] = {8, 1, 32, 64};
+            for (int u = 0; u < 4; ++u) {
+                t.assert_equal(n_tokens[u], ba.split_equal(1024, false, 0).n_tokens);
+            }
+            t.assert_equal(0u, ba.split_equal(1024, false, 0).n_tokens);
+        }
+        {
+            // a tail kept whole that is longer than the bound: the prompt is read as without shapes, never cut inside it
+            batch_builder bb;
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, {21}, {false}), vocab, false));
+
+            t.assert_equal(21u, ba.split_equal(1024, false, 9).n_tokens);
+        }
+
+        // a value that is not a power of two takes the one below it; one out of range keeps 32
+        setenv("LLAMA_PROMPT_SHAPE_SMALL", "12", 1);
+        t.assert_equal(8u, llama_prompt_shape_small());
+        setenv("LLAMA_PROMPT_SHAPE_SMALL", "1", 1);
+        t.assert_equal(1u, llama_prompt_shape_small());
+        for (const char * value : {"0", "32", "64", "-4", "x"}) {
+            setenv("LLAMA_PROMPT_SHAPE_SMALL", value, 1);
+            t.assert_equal(LLAMA_PROMPT_SHAPE_SMALL, llama_prompt_shape_small());
+        }
+        unsetenv("LLAMA_PROMPT_SHAPE_SMALL");
+        t.assert_equal(LLAMA_PROMPT_SHAPE_SMALL, llama_prompt_shape_small());
+    });
+
     t.test("more_prompts_than_the_bound_are_read_together", [&](testing & t) {
         batch_builder bb;
 

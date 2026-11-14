@@ -323,6 +323,23 @@ static void check_reserve_limit() {
             CHECK(n_own <= n_res, "a sequence of %u cells is given %u pools at a padding of %u, over the %u reserved",
                     limit, n_own, pad, n_res);
         }
+
+        // padded (a cache made with LLAMA_KV_PAD_SHARED, here 65,536 cells: 16,384 pools): the limit's runs padded, where
+        // the whole padding went on top. It holds the same step at every padding up to the widest and is never more
+        const uint32_t pad_wide = 16384;
+        const uint32_t runs     = (limit - 1)/4 + 1;
+        const uint32_t n_padded = llama_kpool_n_pools_reserve(n_kv, 4, 1, TOP_K, pad_wide, limit, true);
+        const uint32_t n_on_top = llama_kpool_n_pools_reserve(n_kv, 4, 1, TOP_K, pad_wide, limit);
+
+        CHECK(n_padded == (runs + pad_wide - 1)/pad_wide*pad_wide + 2 && n_padded <= n_on_top && n_padded < whole,
+                "a limit of %u cells reserves %u pools padded to %u (its run is %u), %u with the padding on top, the cache's %u",
+                limit, n_padded, pad_wide, runs, n_on_top, whole);
+        for (const uint32_t pad : { 64u, 2048u, 16384u }) {
+            const uint32_t n_own = llama_kpool_n_pools_ubatch(cells_of, *ub, n_kv, 4, 1, TOP_K, pad);
+
+            CHECK(n_own <= n_padded, "a sequence of %u cells is given %u pools at a padding of %u, over the %u reserved padded",
+                    limit, n_own, pad, n_padded);
+        }
     }
 
     // What the limit's reserve does not hold (llama_kpool_n_pools_reserve): the same sequences are inside it with a stream

@@ -147,6 +147,19 @@ llama_kv_cache::llama_kv_cache(
             while (pad < std::min<uint64_t>(a_sequence*n_seq_max, kv_size)) {
                 pad *= 2;
             }
+            // A session's graphs are sized on its own pools, padded to this many cells (llama_kpool_n_pools_ubatch), so
+            // at 8,192 cells (23 sequences) every graph a session uses is built again each 8,192 tokens it grows, and
+            // sessions 8,192 tokens apart share none. LLAMA_KV_PAD_SHARED=N: at least N cells (the next power of two):
+            // the steps are that much rarer and the sessions inside one share their graphs, and the indexer scores the
+            // empty pools the padding adds
+            const char * wide = getenv("LLAMA_KV_PAD_SHARED");
+            if (wide && atol(wide) > 0) {
+                const uint64_t pad_default = pad;
+                while (pad < std::min<uint64_t>((uint64_t) atol(wide), kv_size)) {
+                    pad *= 2;
+                }
+                pad_shared_wide = pad > pad_default;
+            }
             n_pad_shared = (uint32_t) pad;
         }
     }
@@ -1488,6 +1501,10 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
 
 uint32_t llama_kv_cache::get_n_pad_max() const {
     return std::max({ 256u, n_pad_prefill, n_pad_shared });
+}
+
+bool llama_kv_cache::get_pad_shared_wide() const {
+    return pad_shared_wide;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * ubatch, uint32_t * n_pad_used,

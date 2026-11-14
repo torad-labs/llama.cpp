@@ -69,6 +69,7 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, uint32_t n_devic
     debug = LLAMA_BATCH_DEBUG ? atoi(LLAMA_BATCH_DEBUG) : 0;
     prompt_shapes = ggml_env_switch("LLAMA_PROMPT_SHAPES");
     prompt_shape_max = llama_prompt_shape_max();
+    prompt_shape_small = llama_prompt_shape_small();
     const char * LLAMA_PROMPT_SHAPE_SETS = getenv("LLAMA_PROMPT_SHAPE_SETS");
     prompt_shape_sets = LLAMA_PROMPT_SHAPE_SETS ? std::max(0, atoi(LLAMA_PROMPT_SHAPE_SETS)) : 2;
 
@@ -741,21 +742,33 @@ uint32_t llama_prompt_shape_max() {
     return n_max;
 }
 
+uint32_t llama_prompt_shape_small() {
+    const char * env = getenv("LLAMA_PROMPT_SHAPE_SMALL");
+    uint32_t n_small = LLAMA_PROMPT_SHAPE_SMALL;
+    if (env != nullptr && atoi(env) >= 1 && atoi(env) < (int) LLAMA_PROMPT_SHAPE_SMALL) {
+        n_small = 1;
+        while (2*n_small <= (uint32_t) atoi(env)) {
+            n_small *= 2;
+        }
+    }
+    return n_small;
+}
+
 // The rows of a prompt to take next, of the `remaining` ones. What is left over whole ubatches goes first: up to
-// LLAMA_PROMPT_SHAPE_SMALL rows at once; of more, what leaves a multiple of it, then the powers of two in the rest,
-// smallest first and none above n_max (97 rows go as 1, 32 and 64; 600 as 24, 64, 256 and 256). Then the whole ubatches.
-// So a prompt's ubatches have up to LLAMA_PROMPT_SHAPE_SMALL rows, a power of two up to n_max, or n_ubatch, whatever its
-// length, and its last rows are in its largest.
-static uint32_t prompt_shape_rows(uint32_t remaining, uint32_t n_ubatch, uint32_t n_max) {
+// n_small rows at once; of more, what leaves a multiple of it, then the powers of two in the rest, smallest first and
+// none above n_max (with n_small 32, 97 rows go as 1, 32 and 64, and 600 as 24, 64, 256 and 256; with n_small 8, 21 rows
+// go as 5 and 16). Then the whole ubatches. So a prompt's ubatches have up to n_small rows, a power of two up to n_max,
+// or n_ubatch, whatever its length, and its last rows are in its largest.
+static uint32_t prompt_shape_rows(uint32_t remaining, uint32_t n_ubatch, uint32_t n_max, uint32_t n_small) {
     const uint32_t part = remaining % n_ubatch;
     if (part == 0) {
         return n_ubatch;
     }
-    if (part <= LLAMA_PROMPT_SHAPE_SMALL) {
+    if (part <= n_small) {
         return part;
     }
-    if (part % LLAMA_PROMPT_SHAPE_SMALL != 0) {
-        return part % LLAMA_PROMPT_SHAPE_SMALL;
+    if (part % n_small != 0) {
+        return part % n_small;
     }
     return std::min(part & (~part + 1), n_max); // the lowest set bit
 }
@@ -868,11 +881,11 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     }
 
     // the rows this ubatch may hold: of a prompt alone, one of its shapes (what a shape leaves is none, or no
-    // fewer rows than LLAMA_PROMPT_SHAPE_SMALL, so the tail kept whole is never cut)
+    // fewer rows than prompt_shape_small, so the tail kept whole is never cut)
     uint32_t n_rows_max = n_ubatch;
-    if (prompts_alone && !kind_reply && n_keep_tail <= LLAMA_PROMPT_SHAPE_SMALL) {
+    if (prompts_alone && !kind_reply && n_keep_tail <= prompt_shape_small) {
         const auto & seq_idxs = seq_set_map[cur_seq_set[0]];
-        n_rows_max = prompt_shape_rows(seq_idxs.size() - cur_idx[0], n_ubatch, prompt_shape_max);
+        n_rows_max = prompt_shape_rows(seq_idxs.size() - cur_idx[0], n_ubatch, prompt_shape_max, prompt_shape_small);
     }
 
     // the list of batch indices for each sequence set
