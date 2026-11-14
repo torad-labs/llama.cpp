@@ -10,6 +10,8 @@
 	} from '$lib/types';
 
 	interface Props {
+		/** What every picker's popover floats by. */
+		anchor?: HTMLElement | null;
 		isCommandPickerOpen?: boolean;
 		commandQuery?: string;
 		commands?: ChatFormCommand[];
@@ -17,7 +19,6 @@
 		promptSearchQuery?: string;
 		isMentionPickerOpen?: boolean;
 		mentionQuery?: string;
-		mentionAnchor?: HTMLElement | null;
 		scopePath?: string | null;
 		onCommandPickerClose?: () => void;
 		onCommandSelect?: (command: ChatFormCommand) => void;
@@ -35,12 +36,12 @@
 	}
 
 	let {
+		anchor,
 		commandQuery,
 		commands = [],
 		isCommandPickerOpen,
 		isMentionPickerOpen,
 		isPromptPickerOpen,
-		mentionAnchor,
 		mentionQuery,
 		onCommandPickerClose,
 		onCommandSelect,
@@ -79,30 +80,32 @@
 
 <ChatFormPickerCommand
 	bind:this={commandPickerRef}
-	isOpen={isCommandPickerOpen ?? false}
-	query={commandQuery ?? ''}
 	{commands}
+	customAnchor={anchor}
+	isOpen={isCommandPickerOpen ?? false}
 	onClose={onCommandPickerClose ?? (() => {})}
 	onSelect={onCommandSelect ?? (() => {})}
+	query={commandQuery ?? ''}
 />
 
 <ChatFormPickerMcpPrompts
 	bind:this={promptPickerRef}
+	customAnchor={anchor}
 	isOpen={isPromptPickerOpen}
-	searchQuery={promptSearchQuery}
 	onClose={onPromptPickerClose}
-	{onPromptLoadStart}
 	{onPromptLoadComplete}
 	{onPromptLoadError}
+	{onPromptLoadStart}
+	searchQuery={promptSearchQuery}
 />
 
 <ChatFormPickerMention
 	bind:this={mentionPickerRef}
+	customAnchor={anchor}
 	isOpen={isMentionPickerOpen ?? false}
-	query={mentionQuery ?? ''}
-	customAnchor={mentionAnchor}
-	scopePath={scopePath ?? null}
 	onClose={onMentionPickerClose ?? (() => {})}
 	onOpened={onMentionOpened}
 	onSelect={onMentionSelect ?? (() => {})}
+	query={mentionQuery ?? ''}
+	scopePath={scopePath ?? null}
 />

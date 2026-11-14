@@ -581,6 +581,11 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
                             case GGML_GLU_OP_SWIGLU_OAI:
                                 result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
                                 break;
+                            // upstream v1.0.0's limit as one GLU op (ggml_swiglu_clamp), its limit in glu_limit as the
+                            // two clamps' is
+                            case GGML_GLU_OP_SWIGLU_CLAMP:
+                                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, a.glu_limit);
+                                break;
                             default:
                                 result = result * gate_value;
                                 break;

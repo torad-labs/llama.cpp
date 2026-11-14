@@ -6,21 +6,20 @@
 
 #include <vector>
 
-// FIXME temporary function for better error messages
-bool llama_model_saver_supports_arch(llm_arch arch);
-
 struct llama_model_saver {
     struct gguf_context * gguf_ctx = nullptr;
-    const bool gguf_ctx_owned;
+    const bool gguf_ctx_owned = true;
     const struct llama_model * model;
     const struct LLM_KV llm_kv;
 
     llama_model_saver(const struct llama_model * model);
+    // the KVs of `arch` without a model, into `gguf_ctx` (the caller's, or the saver's own when nullptr)
     llama_model_saver(enum llm_arch arch, struct gguf_context * gguf_ctx);
     ~llama_model_saver();
 
     void add_kv(enum llm_kv key, uint32_t     value);
     void add_kv(enum llm_kv key, int32_t      value);
+    void add_kv(enum llm_kv key, uint64_t     value);
     void add_kv(enum llm_kv key, float        value);
     void add_kv(enum llm_kv key, bool         value);
     void add_kv(enum llm_kv key, const char * value);
@@ -40,5 +39,4 @@ struct llama_model_saver {
     void add_tensors_from_model();
 
     void save(const std::string & path_model);
-    void save(FILE * file);
 };

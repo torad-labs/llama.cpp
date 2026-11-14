@@ -19,7 +19,7 @@ bool ggml_cuda_mmvf_supports(const ggml_tensor * src0, const ggml_tensor * src1)
 
 // Whether to run src0 x src1 on the kernel: ggml_cuda_mmvf_supports holds and the kernel is the fastest choice for src0
 // at ne11 columns.
-bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, const ggml_tensor * src1, int cc, int64_t ne11);
+bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, const ggml_tensor * src1, int cc, int warp_size, int64_t ne11);
 
 // dst_a = src0_a x src1 and dst_b = src0_b x src1 in one launch, as the kernel's two channels: channel 1 reaches src0_b
 // and dst_b through the channel strides. Each product keeps the kernel, block size and summation order it has alone.

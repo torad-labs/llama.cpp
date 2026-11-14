@@ -3,9 +3,10 @@
 #
 # Written 2026-09-20 from the full-history scan of torad-labs/llama.cpp (10,688 commits,
 # gitleaks v8.21.2 as the org workflow pins it): 12 findings, every one opened at its commit,
-# none live — all in upstream ggml-org commits, none in the torad patch-set. It NARROWS five
+# none live — all in upstream ggml-org commits, none in the torad patch-set. It NARROWS six
 # false-positive classes only (three found then; two added on 2026-11-02: the glm53 asset hashes
-# torad's own README records, and the PNG fixture in upstream's server tests); it never disables
+# torad's own README records, and the PNG fixture in upstream's server tests; one on 2026-11-14 with
+# the merge of upstream v1.0.0: a parser tag name in common/chat-peg-parser.h); it never disables
 # a rule and never turns off the default ruleset.
 #
 # `regexTarget = "match"` with FULL identifiers, never "line": the line form suppresses the whole
@@ -36,6 +37,9 @@ description = """
    scripts/glm53/assets/README.md: content hashes that pin an asset, not credentials.
 4. The 1x1 PNG under JSON_MULTIMODAL_KEY in upstream's tools/server/tests/unit/test_completion.py,
    a base64 image fixture the generic-api-key rule reads as a key (iVBORw0KGgo is the PNG header).
+5. The tag name of a dictionary key in upstream's Gemma 4 argument parser, `DICT_KEY = "gemma4-dict-key"`
+   in common/chat-peg-parser.h (upstream v1.0.0, commit 93cf736a8): a PEG rule's tag, not a credential.
+   The value is pinned, so another value under that name still fires.
 """
 regexTarget = "match"
 regexes = [
@@ -44,6 +48,7 @@ regexes = [
   '''tokenizer revision: `[0-9a-f]{40}`''',
   '''Tokenizer JSON SHA256:\s*`[0-9a-f]{64}`''',
   '''JSON_MULTIMODAL_KEY: "iVBORw0KGgo[A-Za-z0-9+/=]+"''',
+  '''DICT_KEY\s+= "gemma4-dict-key"''',
 ]
 
 [[rules]]

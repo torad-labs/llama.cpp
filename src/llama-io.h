@@ -39,6 +39,9 @@ public:
         read_tensor(tensor, offset, size);
     }
 
+    // drop tensor data that has been read but not yet applied (e.g. when a restore fails)
+    virtual void discard() {}
+
     // bytes read so far
     virtual size_t n_bytes() = 0;
 

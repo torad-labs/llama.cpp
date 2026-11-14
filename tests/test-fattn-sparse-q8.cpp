@@ -132,7 +132,7 @@ struct fattn_graph {
 static ggml_tensor * attention(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * mask, ggml_tensor * indices = nullptr) {
     ggml_tensor * out = indices ? ggml_flash_attn_ext_sparse(ctx, q, k, v, indices, 1.0f/sqrtf(float(D))) :
         ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/sqrtf(float(D)), 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
     return out;
 }
