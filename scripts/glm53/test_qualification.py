@@ -864,6 +864,30 @@ class ServingRecipeTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
 
+    def test_prompt_cache_size_checkpoint_count_and_prefix_copy_are_launcher_options(self):
+        base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
+        argv, env = self.serve.make_plan(self.serve.arguments(base))
+        self.assertEqual(argv[argv.index("--cache-ram") + 1], "32768")
+        self.assertIn("--no-cache-idle-slots", argv)
+        self.assertNotIn("--ctx-checkpoints", argv)
+        self.assertNotIn("LLAMA_SLOT_PREFIX_COPY", env)
+        argv, env = self.serve.make_plan(self.serve.arguments(
+            base + ["--cache-ram", "65536", "--ctx-checkpoints", "8", "--prefix-copy"]))
+        self.assertEqual((argv[argv.index("--cache-ram") + 1], argv[argv.index("--ctx-checkpoints") + 1]), ("65536", "8"))
+        self.assertEqual(env["LLAMA_SLOT_PREFIX_COPY"], "1")
+        # -1 (no limit) and 0 (no cache, no checkpoints) are the server's own values and go through as given
+        for value in ("-1", "0"):
+            argv = self.serve.make_plan(self.serve.arguments(base + ["--cache-ram", value, "--ctx-checkpoints", "0"]))[0]
+            self.assertEqual((argv[argv.index("--cache-ram") + 1], argv[argv.index("--ctx-checkpoints") + 1]), (value, "0"))
+        # the two-card tensor recipe shares one pool too; a sequential split has a pool a slot
+        self.assertEqual(self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--prefix-copy"]))[1]["LLAMA_SLOT_PREFIX_COPY"], "1")
+        self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"]))
+        for options in (base + ["--cache-ram", "-2"], base + ["--ctx-checkpoints", "-1"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--prefix-copy"]):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.serve.make_plan(self.serve.arguments(options))
+
     def test_fixed_rows_is_an_opt_in_of_the_tensor_recipes(self):
         for profile in ("tensor-2", "tensor-4"):
             base = ["--model", "/models/target.gguf", "--profile", profile]
