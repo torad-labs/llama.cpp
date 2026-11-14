@@ -1750,7 +1750,13 @@ struct clip_model_loader {
                         // the reference asks for PILImageResampling.BICUBIC, which this only approximates
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
-                        get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit);
+                        {
+                            // Unsloth's projector spells the key swiglu_clamp. swiglu_limit is read when the file has
+                            // both, and is the one asked for when it has neither
+                            const bool unsloth_key = gguf_find_key(ctx_gguf.get(), KEY_VISION_SWIGLU_LIMIT) < 0 &&
+                                                     gguf_find_key(ctx_gguf.get(), KEY_VISION_SWIGLU_CLAMP) >= 0;
+                            get_f32(unsloth_key ? KEY_VISION_SWIGLU_CLAMP : KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit);
+                        }
                         hparams.ffn_op = FFN_SILU_CLAMP;
                         log_ffn_op = "silu_clamp";
                         // the preprocessor's min_pixels/max_pixels, in tokens
