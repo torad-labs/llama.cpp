@@ -67,6 +67,18 @@ def arguments(argv=None):
                         help="Spare state rows on the cards, 1..64: a session's context checkpoint is copied to one of them "
                              "on the cards, and from there to RAM on a thread of its own while the sessions decode "
                              "(opt-in: not read on four cards)")
+    parser.add_argument("--prompt-shapes", type=int, choices=[1, 2, 4, 8, 16, 32], metavar="ROWS",
+                        help="Tensor profiles: a prompt is read apart from the replies, in ubatches of a few row counts "
+                             "whose graphs are kept: up to ROWS rows whole, then powers of two. 32 is the engine's "
+                             "LLAMA_PROMPT_SHAPES=1 as it was; 8 leaves short prompts 8 row counts where 32 leaves 32 "
+                             "(opt-in: not read on four cards)")
+    parser.add_argument("--prompt-shape-rows", type=int, choices=[64, 128, 256, 512, 1024, 2048], metavar="ROWS",
+                        help="With --prompt-shapes: the largest power of two a prompt's ubatch takes (default: 256)")
+    parser.add_argument("--session-step", type=int, choices=[16384, 32768, 65536, 131072], metavar="TOKENS",
+                        help="tensor-4: a session's graphs keep their shape while it grows by this many tokens, and "
+                             "sessions inside one step share them (default: 256 tokens a slot, the next power of two: "
+                             "8192 at 23 slots). The indexer scores the empty pools the wider step adds (opt-in: not "
+                             "read on four cards)")
     parser.add_argument("--fixed-rows", nargs="?", const="fused", choices=["fused", "unfused"],
                         help="Tensor profiles: a session's recurrent state keeps one row on the cards for the session's "
                              "whole life, so no step moves another session's state there and a copied session has a row "
@@ -77,6 +89,10 @@ def arguments(argv=None):
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
                         help="Tokens the pack's own MTP head drafts a step; 3 and 4 on the tensor recipes")
+    parser.add_argument("--mtp-depth-min", choices=["1", "2", "3", "4"],
+                        help="The depth the adaptive choice falls back to: a session drafts this many tokens or "
+                             "--mtp-depth, by what its drafts gain (default: 1). --mtp-depth 3 --mtp-depth-min 2 "
+                             "chooses between 2 and 3")
     parser.add_argument("--mtp-adaptive", type=float, default=0.18,
                         help="The engine's --spec-draft-mtp-adaptive cost: a draft token's share of a one-token round, "
                              "measured at 0.18 for one session on two cards; 0 drafts --mtp-depth every step")
@@ -135,6 +151,14 @@ def make_plan(args):
         raise ValueError("dp-4 is measured at MTP depth 1 and 2")
     if not 0 <= args.mtp_adaptive <= 1:
         raise ValueError("mtp-adaptive is a share of a round, 0..1")
+    if args.mtp_depth_min is not None and (args.mtp_depth == "off" or args.dflash or int(args.mtp_depth_min) > int(args.mtp_depth)):
+        raise ValueError("mtp-depth-min is a depth of the MTP head, no deeper than --mtp-depth")
+    if dp and (args.prompt_shapes is not None or args.prompt_shape_rows is not None):
+        raise ValueError("prompt-shapes is for the tensor profiles: a sequential split reads prompts as it did")
+    if args.prompt_shape_rows is not None and args.prompt_shapes is None:
+        raise ValueError("prompt-shape-rows is given with --prompt-shapes")
+    if args.session_step is not None and not four:
+        raise ValueError("session-step is supported only with --profile tensor-4")
     if (args.dflash or args.backend_sampling or args.reduction_wire) and not four:
         raise ValueError("dflash, backend-sampling and reduction-wire are supported only with --profile tensor-4")
     if (args.dflash is None) != (args.dflash_depth is None) or args.dflash_depth is not None and args.dflash_depth < 1:
@@ -180,6 +204,9 @@ def make_plan(args):
     elif args.mtp_depth != "off":
         argv += ["--spec-type", "draft-mtp", "--spec-draft-n-max", args.mtp_depth,
                  "--spec-draft-mtp-vocab", str(DRAFT_VOCAB), "--spec-draft-mtp-adaptive", f"{args.mtp_adaptive:g}"]
+        if args.mtp_depth_min is not None:
+            # The engine's adaptive choice is between two depths, max(1, --spec-draft-n-min) and --spec-draft-n-max
+            argv += ["--spec-draft-n-min", args.mtp_depth_min]
         if dp:
             argv += ["-ubd", str(diagnostic_ubatch), "-ctkd", "q8_0", "-ctvd", "q8_0"]
     argv += ["-c", str(slots * DP_SLOT_CONTEXT if dp else context if four else 524288), "-np", str(slots)]
@@ -255,6 +282,19 @@ def make_plan(args):
             # Each spare row has a graph of its own, which the tensor split keeps captured beside the decodes' graphs:
             # without room for it, a checkpoint would put a decode's graph out and that decode would capture again
             env["GGML_META_CAPTURE_GRAPHS"] = str(int(env["GGML_META_CAPTURE_GRAPHS"]) + args.checkpoint_rows)
+    if args.prompt_shapes is not None:
+        # A prompt beside replies is cut at the replies' length and its rest is a ubatch of a row count seen once: both
+        # graphs are built, planned and launched kernel by kernel where a kept one replays. With this the replies keep
+        # the graph they make alone and a prompt goes in a few row counts
+        env["LLAMA_PROMPT_SHAPES"] = "1"
+        if args.prompt_shapes != 32:
+            env["LLAMA_PROMPT_SHAPE_SMALL"] = str(args.prompt_shapes)
+        if args.prompt_shape_rows is not None:
+            env["LLAMA_PROMPT_SHAPE_ROWS"] = str(args.prompt_shape_rows)
+    if args.session_step is not None:
+        # A graph is sized on the pools of the longest session in it, padded to the shared pad: each session's graphs
+        # change shape every 8,192 tokens it grows (23 slots), and sessions in different steps share none
+        env["LLAMA_KV_PAD_SHARED"] = str(args.session_step)
     if args.fixed_rows:
         # A tensor-split context is one sequence device, whose recurrent memory gathers a step's sessions into a run of
         # rows and moves a state that is elsewhere before the decode. With this each session's row is its own from its
