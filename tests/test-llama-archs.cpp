@@ -2495,8 +2495,9 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
     };
 
     const auto read = [&](bool legacy, bool mtp, bool packed = false, bool writes = false, bool unified = true,
-            const char * seq_cells = nullptr, bool cells_legacy = false) {
+            const char * seq_cells = nullptr, bool cells_legacy = false, const char * pad_shared = nullptr) {
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", legacy ? "1" : nullptr);
+        set_env("LLAMA_KV_PAD_SHARED", pad_shared);
         set_env("LLAMA_KV_CELL_CAPACITY_LEGACY", cells_legacy ? "1" : nullptr);
         set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", packed ? "1" : nullptr);
         set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", writes ? "1" : nullptr);
@@ -2528,6 +2529,7 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         params.cb_eval_user_data = &seen;
         llama_context_ptr ctx(llama_init_from_model(model, params));
         set_env("LLAMA_KV_PAD_SHARED_LEGACY", nullptr);
+        set_env("LLAMA_KV_PAD_SHARED", nullptr);
         set_env("LLAMA_KV_CELL_CAPACITY_LEGACY", nullptr);
         set_env("LLAMA_KPOOL_SHARED_VIEWS_LEGACY", nullptr);
         set_env("LLAMA_KPOOL_PATCH_INPUT_LEGACY", nullptr);
@@ -2627,6 +2629,7 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         const read_result alone  = read(false, mtp, false, false, false);
         const read_result limit  = read(false, mtp, false, false, true, "256");
         const read_result cells  = read(false, mtp, false, false, true, nullptr, true);
+        const read_result wide   = read(false, mtp, false, false, true, nullptr, true, "4096");
 
         const std::vector<float> long_whole = read_long(mtp, nullptr);
         const std::vector<float> long_limit = read_long(mtp, "256");
@@ -2664,6 +2667,15 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
         }
         LOG_INF("GLM shared pool reuse: mtp=%d: attention through indices at 2,048 cells: default %d, legacy %d\n",
                 mtp, shared.direct, cells.direct);
+        // LLAMA_KV_PAD_SHARED=4096: the pad is 4,096 cells where 256 a sequence gave 2,048, so the steps' pools are padded
+        // to 1,024 where they were to 512, and the cells viewed are 4,096 (with the cell capacity's old sizing, which
+        // keeps the view the pad's). The steps reuse as before, and the pools the wider pad adds are empty: same logits
+        if (wide.n_reused != want_shared || wide.n_kv != std::set<int64_t>{ 4096 } || wide.direct) {
+            LOG_ERR("GLM shared pool reuse: mtp=%d: with LLAMA_KV_PAD_SHARED=4096 the steps reused %d graphs (want %d) over "
+                    "%zu cache lengths up to %lld (want 4096 alone), through indices %d (want 0)\n", mtp, wide.n_reused,
+                    want_shared, wide.n_kv.size(), wide.n_kv.empty() ? -1LL : (long long) *wide.n_kv.rbegin(), wide.direct);
+            ok = false;
+        }
         if (limit.n_reused != shared.n_reused || limit.n_kv != shared.n_kv) {
             LOG_ERR("GLM shared pool reuse: mtp=%d: under LLAMA_KV_SEQ_CELLS=256 the steps reused %d graphs (want %d) over "
                     "%zu cache lengths (want %zu)\n", mtp, limit.n_reused, shared.n_reused, limit.n_kv.size(), shared.n_kv.size());
@@ -2684,7 +2696,8 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
                 std::make_pair("whose bank is written a change a write", &writes),
                 std::make_pair("of a cache a sequence", &alone),
                 std::make_pair("under LLAMA_KV_SEQ_CELLS=256", &limit),
-                std::make_pair("with LLAMA_KV_CELL_CAPACITY_LEGACY=1", &cells) }) {
+                std::make_pair("with LLAMA_KV_CELL_CAPACITY_LEGACY=1", &cells),
+                std::make_pair("with LLAMA_KV_PAD_SHARED=4096", &wide) }) {
             const bool exact = on_cpu && other.second != &packed;
             if (exact && other.second->logits != shared.logits) {
                 LOG_ERR("GLM shared pool reuse: mtp=%d: logits differ from the pool %s, nmse=%g\n", mtp, other.first,

@@ -238,6 +238,9 @@ public:
     // the widest padding used to size the indexer's pools
     uint32_t get_n_pad_max() const;
 
+    // whether LLAMA_KV_PAD_SHARED widened the shared pad when the cache was made (pad_shared_wide)
+    bool get_pad_shared_wide() const;
+
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
@@ -367,6 +370,10 @@ private:
     // indexer; 0 for any other model, for a pool of one sequence, or with LLAMA_KV_PAD_SHARED_LEGACY=1 when the cache is
     // made
     uint32_t n_pad_shared = 0;
+
+    // LLAMA_KV_PAD_SHARED=N made n_pad_shared wider than that when the cache was made: a session's graphs keep their
+    // shape for N cells of its growth, and the graph reserved at load pads a session's runs where it added a padding
+    bool pad_shared_wide = false;
 
     // Shared scoring cell capacity, independent of pool padding; LLAMA_KV_CELL_CAPACITY_LEGACY keeps the old span.
     uint32_t n_pad_cells = 0;

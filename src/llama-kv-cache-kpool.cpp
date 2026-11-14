@@ -35,7 +35,7 @@ uint32_t llama_kpool_pool_pad(uint32_t n_pad_kv, uint32_t kpool) {
 }
 
 uint32_t llama_kpool_n_pools_reserve(uint32_t n_kv, uint32_t kpool, uint32_t n_ps, uint32_t indexer_top_k,
-        uint32_t pool_pad_max, uint32_t seq_cells) {
+        uint32_t pool_pad_max, uint32_t seq_cells, bool padded) {
     GGML_ASSERT(kpool > 0);
     GGML_ASSERT(n_ps > 0);
 
@@ -51,9 +51,13 @@ uint32_t llama_kpool_n_pools_reserve(uint32_t n_kv, uint32_t kpool, uint32_t n_p
     // n_ps sequences in one stream, but a step of a shared pool gives each a stream of its own
     // (llm_graph_input_kpool::shared_streams), and its scores are a stream's pools by the step's rows whatever the
     // streams: one sequence's runs here. The steps outside this are the header's
+    // padded: the runs padded to pool_pad_max, with no whole padding on top. A step pads its runs to a power of two up to
+    // pool_pad_max, so that holds every sequence that starts at a pool's first position; one that starts inside a pool can
+    // run over one pool more, which at a padding's boundary is one padding more: its graph is allocated when it comes
     const int64_t at_least = std::min<int64_t>(whole, indexer_top_k/kpool);
     const int64_t runs     = (seq_cells - 1)/kpool + 1;
-    const int64_t own      = runs + std::max<int64_t>(pool_pad_max, 64) + 2*(int64_t) n_ps;
+    const int64_t pad      = std::max<int64_t>(pool_pad_max, 64);
+    const int64_t own      = (padded ? (runs + pad - 1)/pad*pad : runs + pad) + 2*(int64_t) n_ps;
 
     return (uint32_t) std::min<int64_t>(whole, std::max(at_least, own));
 }

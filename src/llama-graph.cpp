@@ -5180,7 +5180,8 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         // outside that (llama_kpool_n_pools_reserve) still builds its own larger graph here
         const int64_t n_pools = mctx_attn->is_full() && cparams.n_seq_cells > 0 ?
                 llama_kpool_n_pools_reserve(n_kv, kpool, n_ps, hparams.indexer_top_k,
-                    llama_kpool_pool_pad(mctx_attn->get_kv()->get_n_pad_max(), kpool), cparams.n_seq_cells) :
+                    llama_kpool_pool_pad(mctx_attn->get_kv()->get_n_pad_max(), kpool), cparams.n_seq_cells,
+                    mctx_attn->get_kv()->get_pad_shared_wide()) :
                 llama_kpool_n_pools_ubatch(cells_of, ubatch, mctx_attn->get_n_kv_pool(), kpool, n_stream, hparams.indexer_top_k,
                     llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
         const int64_t n_dump  = llama_kpool_select_k(n_pools, hparams.indexer_top_k, kpool);

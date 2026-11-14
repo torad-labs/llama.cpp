@@ -184,9 +184,10 @@ uint32_t llama_kpool_n_pools_ubatch(const llama_kpool_cells_fn & cells_of, const
 // sequences share after a seq_cp, rows not grouped by sequence, LLAMA_KPOOL_SHARED_VIEWS_LEGACY, a device without the
 // bank), and a sequence with a hole in its positions spans more than the cells it holds: such a step's graph can be
 // larger than the reserve and is then allocated when it comes. Never more than the whole cache's and never so few that
-// select_k changes
+// select_k changes. padded (a cache made with LLAMA_KV_PAD_SHARED): the limit's runs padded to pool_pad_max, where the
+// whole padding went on top; with a padding of 16,384 pools the top alone would be a quarter of a 262,144-cell session
 uint32_t llama_kpool_n_pools_reserve(uint32_t n_kv, uint32_t kpool, uint32_t n_ps, uint32_t indexer_top_k,
-        uint32_t pool_pad_max, uint32_t seq_cells);
+        uint32_t pool_pad_max, uint32_t seq_cells, bool padded = false);
 
 // the pools a step's own runs are padded to: 64, or as many pools as the cells a prompt step's cache length is padded to
 // (llama_kv_cache::get_n_kv), so its pool count changes when its cache length does and its graph is reused between
