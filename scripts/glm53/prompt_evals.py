@@ -59,6 +59,8 @@ def read(lines):
     last_decode = None
     checkpoints = []  # (ms, new or kept buffers, the target decodes seen before it)
     plain_checkpoints = 0
+    builds = 0
+    builds_untimed = 0  # build lines of an engine that does not print host_us: their host time is inside the run
     for line in lines:
         match = EVENT.search(line)
         if match:
@@ -92,6 +94,8 @@ def read(lines):
                                'host': {key: int(value) for key, value in host.items()},
                                'sched': pending_alloc if event == 'build' else None, 'cuda': collections.Counter()}
                 pending_alloc = None
+                builds += event == 'build'
+                builds_untimed += event == 'build' and 'host_us' not in f
                 decodes['target' if f.get('phase') == 'target' else 'draft'].append(last_decode)
             elif layer == 'cuda' and last_decode is not None:
                 last_decode['cuda'][event] += 1
@@ -167,7 +171,8 @@ def read(lines):
                 'checkpoint_ms': sum(checkpoint[0] for checkpoint in iteration['checkpoints']),
                 'checkpoints': len(iteration['checkpoints'])})
     counts = {'iterations': len(iterations), 'target_decodes': len(decodes['target']), 'draft_decodes': len(decodes['draft']),
-              'unmatched': unmatched, 'checkpoints': checkpoints, 'plain_checkpoints': plain_checkpoints}
+              'unmatched': unmatched, 'checkpoints': checkpoints, 'plain_checkpoints': plain_checkpoints,
+              'builds': builds, 'builds_untimed': builds_untimed}
     return prompt_evals, reply_evals, outside, counts
 
 
@@ -202,6 +207,9 @@ def report(name, data, show, out):
         file=out)
     if not counts['target_decodes']:
         print('  no graph_trace line: host and run are not split (GGML_GRAPH_TRACE=1 at -lv 4)', file=out)
+    elif counts['builds_untimed']:
+        print('  %d of %d build lines carry no host_us (an engine before the field): the host time of those builds is '
+              'inside "run", and "host" reads 0 for them' % (counts['builds_untimed'], counts['builds']), file=out)
     table('target evals that carry prompt rows, by the eval\'s prompt rows (medians, ms; CUDA subgraphs an eval):',
           prompt_evals, ORDER, out)
     commonest = sorted(reply_evals, key=lambda rows: -len(reply_evals[rows]))[:8]
@@ -222,11 +230,13 @@ def report(name, data, show, out):
             median([x['iteration_ms'] - x['target_ms'] - x['catchup_ms'] - x['proposal_ms'] - x['checkpoint_ms']
                     for x in rows])), file=out)
     checkpoints = counts['checkpoints']
-    if checkpoints or counts['plain_checkpoints']:
+    if checkpoints:
         ms = [checkpoint[0] for checkpoint in checkpoints]
         print('context checkpoints: %d with a time (median %.2f ms, max %.2f; %d into new buffers), %d lines without one' % (
-            len(ms), median(ms), max(ms) if ms else float('nan'), sum(1 for c in checkpoints if c[1] == 'new'),
-            counts['plain_checkpoints']), file=out)
+            len(ms), median(ms), max(ms), sum(1 for c in checkpoints if c[1] == 'new'), counts['plain_checkpoints']), file=out)
+    elif counts['plain_checkpoints']:
+        print('context checkpoints: %d lines, none with a time (an engine that does not print it): what a checkpoint took '
+              'is inside "the rest" of its iteration' % counts['plain_checkpoints'], file=out)
     if show:
         print('every eval with prompt rows: iteration, prompt rows, rows, passes, built, eval ms, host ms, run ms, '
               'direct/capture/replay', file=out)

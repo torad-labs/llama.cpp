@@ -87,6 +87,28 @@ class PromptEvalsTest(unittest.TestCase):
         self.assertIn("context checkpoints: 1 with a time (median 4.50 ms, max 4.50; 1 into new buffers)", text)
         self.assertIn("it 1      p     5 rows     5 passes  1 built  1", text)
 
+    def test_an_older_engines_log_says_what_it_cannot_split(self):
+        # build lines without host_us and checkpoint lines without a time, as an engine before those fields prints them
+        old = [line.split(" host_us=")[0] if "event=build" in line else
+               line.replace(", new buffers, 4.50 ms: target 3.321 MiB 4.36, draft 0.000 MiB 0.02, speculative 0.04)", ")")
+               for line in LOG]
+        data = self.tool.read(old)
+        self.assertEqual((data[3]["builds"], data[3]["builds_untimed"], data[3]["plain_checkpoints"]), (2, 2, 1))
+        built = data[0]["1-32"][0]
+        self.assertEqual((built["built"], built["host_ms"]), (1, 0.0))
+        self.assertAlmostEqual(built["run_ms"], 60.0)
+        out = io.StringIO()
+        self.tool.report("old.log", data, False, out)
+        text = out.getvalue()
+        self.assertIn("2 of 2 build lines carry no host_us", text)
+        self.assertIn("context checkpoints: 1 lines, none with a time", text)
+        self.assertNotIn("nan", text)
+        # the log of an engine that prints both says neither
+        out = io.StringIO()
+        self.tool.report("server.log", self.tool.read(LOG), False, out)
+        self.assertNotIn("carry no host_us", out.getvalue())
+        self.assertNotIn("none with a time", out.getvalue())
+
     def test_a_log_without_graph_lines_says_so_and_the_usage_is_checked(self):
         out = io.StringIO()
         self.tool.report("plain.log", self.tool.read([line for line in LOG if "graph_trace" not in line]), False, out)
