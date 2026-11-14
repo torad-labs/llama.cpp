@@ -1,24 +1,36 @@
-# torad-labs/llama.cpp
+# Torad Labs fork of llama.cpp
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Upstream: ggml-org/llama.cpp](https://img.shields.io/badge/upstream-ggml--org%2Fllama.cpp-informational.svg)](https://github.com/ggml-org/llama.cpp)
 [![CUDA sm_120](https://img.shields.io/badge/CUDA-sm__120-76b900.svg)](#1-build)
 
-A llama.cpp fork with CUDA and server changes for RTX 50-series cards, on
-[PrismML's llama.cpp](https://github.com/PrismML-Eng/llama.cpp) and
-[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). On one 16 GB card,
-[Ternary Bonsai 2 27B](docs/torad/bonsai-27b/README.md) decodes at 35.5 -> 67.3 tok/s
-at 131K context against PrismML's release, and at 104.8 tok/s served with the draft head.
-It is for people running that model on one 16 GB RTX 50-series card.
+This is Torad Labs' fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). It follows
+ggml-org/llama.cpp, whose `v1.0.0` it merged on 2026-11-14, and adds CUDA and server work
+measured on NVIDIA RTX 50-series cards. It also carries the PQ and PTQ ternary formats from
+[PrismML's llama.cpp](https://github.com/PrismML-Eng/llama.cpp), so PrismML's Bonsai models
+load here.
 
-## Why use this fork
+On one 16 GB card, [Ternary Bonsai 2 27B](docs/torad/bonsai-27b/README.md) decodes at
+67.3 tok/s at 131K context, where PrismML's release does 35.5, and at 104.8 tok/s served with
+its draft head.
 
-- [Ternary Bonsai 2 27B](docs/torad/bonsai-27b/README.md) is PrismML's ternary Qwen3.8-27B, PQ2_0 at 2.13 bits per weight, 7.66 GB with its draft head. It fits one 16 GB card, with a 262,144-token window.
-- The gap is at long context. At 131,072 tokens, prefill goes from 547 to 1,104 tok/s and decode from 35.5 to 67.3, against PrismML's release.
-- With the draft head, served decode is 104.8 tok/s. In the same session PrismML's release is at 75.0 tok/s. That release refuses this pack's head at load.
-- Each change has an off switch and a measurement. The list is [TORAD.md](TORAD.md).
+## What this fork adds
+
+- CUDA kernels tuned on sm_120: flash attention that reads a q4_0 K/V cache with int8 tensor
+  cores, a chunked Gated DeltaNet prefill, a PQ2_0 tensor-core mat-vec, and paced L2 prefetch
+  with launch overlap. [Hardware support](#hardware-support) says what runs on other cards.
+- Server features: an MTP draft head, pinned context checkpoints (`--checkpoint-every`), a
+  narrower recurrent-state cache (`-cts`) and a one-bit attention mask (`--attn-mask-bits`).
+- GLM-5.3 Flash across several cards, under the tensor and data splits.
+- Every change comes with its measurement, and with an off switch where it can have one.
+  [TORAD.md](TORAD.md) is the list.
 - Claude Code can use the server through [splice](https://github.com/torad-labs/splice).
 
 ## Headline
+
+Ternary Bonsai 2 27B is PrismML's ternary Qwen3.8-27B, PQ2_0 at 2.13 bits per weight, 7.66 GB
+with its draft head. It fits one 16 GB card with a 262,144-token window. The baseline below is
+PrismML's release, the stock build for this model. The gap is at long context.
 
 One RTX 5070 Ti (16 GB), the public pack, PrismML
 [`prism-b10709-9a9394a`](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10709-9a9394a)
@@ -199,7 +211,9 @@ All published numbers come from RTX 50-series and RTX PRO 6000 cards, sm_120 (Ge
 
 ## What's different from upstream
 
-The changes are general CUDA and server changes. Each row is one commit. The Bonsai page has the measurement on this model.
+Against ggml-org/llama.cpp, this fork also carries PrismML's PQ and PTQ ternary formats. The
+rows below are the fork's own changes behind the headline, general CUDA and server changes.
+Each row is one commit. The Bonsai page has the measurement on this model.
 
 | change | commit | off switch |
 |---|---|---|
@@ -236,26 +250,29 @@ disclosing AI-written changes.
 
 ## Upstream
 
-[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) is upstream (`upstream` remote). This
-fork merges it when it takes a newer base, most recently `v1.0.0` on 2026-11-14. The ternary
-PQ/PTQ kernels came from [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp)
-(`prism` remote). This repo was first forked from PrismML's, so GitHub still lists it as the
-parent, but it is not the base. Pull requests go to `torad-labs/llama.cpp`.
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) is upstream, the `upstream` remote.
+This fork merges it when it takes a newer base, most recently `v1.0.0` on 2026-11-14.
+[Upstream v1.0.0](TORAD.md#upstream-v100) says what that merge changed.
+
+The PQ and PTQ ternary kernels came from
+[PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp), the `prism` remote. This
+repo was first created as a fork of PrismML's, but PrismML's is not the base.
 
 A fix that belongs upstream can go as its own commit. Opening it there is a separate pull
-request. The maintained description is the last section of [TORAD.md](TORAD.md).
+request.
 
 ## Documentation
 
 - [Ternary Bonsai 2 27B](docs/torad/bonsai-27b/README.md): the runs, the method, splice
+- [TORAD.md](TORAD.md): every change, its measurement and its off switch
 - [Build](docs/build.md)
 - [llama-server](tools/server/README.md)
 - [Docker](docs/docker.md)
-- [Upstream README](docs/upstream-readme.md): what llama.cpp is, backends, tools, and PrismML's note on which GGUF to load
+- [Upstream README](docs/upstream-readme.md): llama.cpp's own README as this fork inherited it, with PrismML's note on which GGUF to load
 
-## Made by Torad
+## Made by Torad Labs
 
-[Torad](https://torad.ai)
+[torad.ai](https://torad.ai)
 
 [c008fe8]: https://github.com/torad-labs/llama.cpp/commit/c008fe8cf5d8086586d3527c41868d0da8781f39
 [c54ace8]: https://github.com/torad-labs/llama.cpp/commit/c54ace84bb817d88031c2181e6e3689e1733b8de
