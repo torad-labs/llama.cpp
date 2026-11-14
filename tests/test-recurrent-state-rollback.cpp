@@ -12,6 +12,30 @@
 #include <cstring>
 #include <vector>
 
+// common_batch_add and common_batch_clear as they were before upstream moved common to llama_batch_ext
+static void batch_clear(struct llama_batch & batch) {
+    batch.n_tokens = 0;
+}
+
+static void batch_add(
+                 struct llama_batch & batch,
+                        llama_token   id,
+                          llama_pos   pos,
+    const std::vector<llama_seq_id> & seq_ids,
+                               bool   logits) {
+    GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
+
+    batch.token   [batch.n_tokens] = id;
+    batch.pos     [batch.n_tokens] = pos;
+    batch.n_seq_id[batch.n_tokens] = seq_ids.size();
+    for (size_t i = 0; i < seq_ids.size(); ++i) {
+        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
+    }
+    batch.logits  [batch.n_tokens] = logits;
+
+    batch.n_tokens++;
+}
+
 static llama_context * make_ctx(const common_params & params, llama_model * model) {
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max = 1;
@@ -24,7 +48,7 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
     llama_batch batch = llama_batch_init(count, 0, 1);
     for (uint32_t pos = 0; pos < count; ++pos) {
-        common_batch_add(batch, tokens[pos], pos, { 0 }, pos + 1 == count);
+        batch_add(batch, tokens[pos], pos, { 0 }, pos + 1 == count);
     }
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
@@ -35,7 +59,7 @@ static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & 
 static bool decode_span(llama_context * ctx, const std::vector<llama_token> & tokens, llama_pos p0, llama_pos p1) {
     llama_batch batch = llama_batch_init(p1 - p0, 0, 1);
     for (llama_pos pos = p0; pos < p1; ++pos) {
-        common_batch_add(batch, tokens[pos], pos, { 0 }, true);
+        batch_add(batch, tokens[pos], pos, { 0 }, true);
     }
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
@@ -44,7 +68,7 @@ static bool decode_span(llama_context * ctx, const std::vector<llama_token> & to
 
 static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     llama_batch batch = llama_batch_init(1, 0, 1);
-    common_batch_add(batch, tok, pos, { 0 }, true);
+    batch_add(batch, tok, pos, { 0 }, true);
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     return ok;
@@ -96,6 +120,11 @@ constexpr float state_eps = 1e-6f;
 // fixtures that do (GLM, DeepSeek V4) are registered on the host (tests/CMakeLists.txt).
 constexpr float device_rounding = 2.0f/1024.0f;
 static bool on_device = false; // main: the model computes on a device
+
+// main: the memory served a rollback of its whole last batch. A recurrent state has no snapshot from before a ubatch
+// and refuses it; upstream's DeepSeek V4 cache keeps that state and serves it (rs_max is the ubatch's rows), so the
+// checks that such a rollback is refused do not ask it
+static bool whole_batch_rollback = false;
 
 // the bound a comparison is held to: `host` on the host; on a device that, or device_rounding of the largest value
 // compared, whichever is more
@@ -178,29 +207,29 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
         for (llama_pos pos = 0; pos < (llama_pos) p0 - 1; ++pos) {
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+            batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
         ok = ok && llama_decode(ctx_ref,  batch) == 0;
 
-        common_batch_clear(batch);
-        common_batch_add(batch, tok(s, p0 - 1), p0 - 1, { (llama_seq_id) s }, false);
+        batch_clear(batch);
+        batch_add(batch, tok(s, p0 - 1), p0 - 1, { (llama_seq_id) s }, false);
         ok = ok && llama_decode(ctx_ref, batch) == 0;
 
-        common_batch_clear(batch);
+        batch_clear(batch);
         for (llama_pos pos = p0 - 1; pos < (llama_pos) n_prompt; ++pos) {
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+            batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
         llama_batch_free(batch);
 
         // the whole tail batch reaches back to the state before it, which no snapshot keeps
-        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1);
+        ok = ok && (whole_batch_rollback || !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1));
 
         ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
 
         // a second partial removal while one is pending must be refused
-        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1);
+        ok = ok && (whole_batch_rollback || !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1));
     }
     if (!ok) {
         fprintf(stderr, "%s : multi-seq prefill/rollback failed\n", __func__);
@@ -223,7 +252,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     for (uint32_t s = 0; s < n_seqs; ++s) {
         for (uint32_t i = 0; i < n_replay; ++i) {
             const llama_pos pos = p0 + (llama_pos) i;
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, true);
+            batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, true);
         }
     }
     ok = llama_decode(ctx_roll, batch) == 0;
@@ -288,7 +317,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         llama_batch batch_tail = llama_batch_init(n_tail, 0, 1);
         for (uint32_t i = 0; i < n_tail; ++i) {
             const llama_pos pos = p0 + (llama_pos) (n_replay + i);
-            common_batch_add(batch_tail, tok(0, pos + 7), pos, { 0 }, false);
+            batch_add(batch_tail, tok(0, pos + 7), pos, { 0 }, false);
         }
         ok = llama_decode(ctx_ref, batch_tail) == 0;
         llama_batch_free(batch_tail);
@@ -299,7 +328,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     for (uint32_t i = 0; i < n_tail && ok; ++i) {
         const llama_pos pos = p0 + (llama_pos) (n_replay + i);
         llama_batch batch_one = llama_batch_init(1, 0, 1);
-        common_batch_add(batch_one, tok(1, pos), pos, { 1 }, true);
+        batch_add(batch_one, tok(1, pos), pos, { 1 }, true);
         ok = llama_decode(ctx_roll, batch_one) == 0;
         ok = ok && llama_decode(ctx_ref, batch_one) == 0;
         llama_batch_free(batch_one);
@@ -348,7 +377,7 @@ static bool test_short_verify_rollback(const common_params & params, llama_model
     const auto decode_range = [&](llama_context * ctx, llama_pos p0, llama_pos p1) {
         llama_batch batch = llama_batch_init(p1 - p0, 0, 1);
         for (llama_pos pos = p0; pos < p1; ++pos) {
-            common_batch_add(batch, tok(pos), pos, { 0 }, true);
+            batch_add(batch, tok(pos), pos, { 0 }, true);
         }
         const bool ok = llama_decode(ctx, batch) == 0;
         llama_batch_free(batch);
@@ -492,7 +521,7 @@ static bool test_changed_sets(const common_params & params, llama_model * model,
         llama_batch batch = llama_batch_init(n_rows, 0, 1);
         for (uint32_t s = 0; s < n_seqs; ++s) {
             for (uint32_t i = 0; i < counts[s]; ++i) {
-                common_batch_add(batch, tok(s, pos[s] + (llama_pos) i), pos[s] + (llama_pos) i, { (llama_seq_id) s }, true);
+                batch_add(batch, tok(s, pos[s] + (llama_pos) i), pos[s] + (llama_pos) i, { (llama_seq_id) s }, true);
             }
             pos[s] += (llama_pos) counts[s];
         }
@@ -817,7 +846,7 @@ static bool test_prompt_shapes(const common_params & params, llama_model * model
                 if (output) {
                     out_rows.push_back(batch.n_tokens);
                 }
-                common_batch_add(batch, tok(s, pos[s] + (llama_pos) i), pos[s] + (llama_pos) i, { (llama_seq_id) s }, output);
+                batch_add(batch, tok(s, pos[s] + (llama_pos) i), pos[s] + (llama_pos) i, { (llama_seq_id) s }, output);
             }
             pos[s] += (llama_pos) counts[s];
         }
@@ -985,7 +1014,7 @@ static bool test_prompt_kept(const common_params & params, llama_model * model, 
                     out_rows.push_back(batch.n_tokens);
                 }
                 const llama_pos p = pos[s] + (llama_pos) i;
-                common_batch_add(batch, (llama_token) ((11*(uint32_t) p + 37*s + 5) % (uint32_t) n_vocab), p, { (llama_seq_id) s }, output);
+                batch_add(batch, (llama_token) ((11*(uint32_t) p + 37*s + 5) % (uint32_t) n_vocab), p, { (llama_seq_id) s }, output);
             }
             pos[s] += (llama_pos) counts[s];
         }
@@ -1193,11 +1222,19 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // the replay is the last batch: rolling it back whole, or past it, would read a state no snapshot kept
-    for (const llama_pos p0 : { rollback_pos, rollback_pos - 1 }) {
-        if (llama_memory_seq_rm(llama_get_memory(ctx_src), 0, p0, -1)) {
-            fprintf(stderr, "%s : a rollback of %d rows after a batch of %u was not refused\n",
-                    __func__, (int) n_tokens - p0, n_rollback);
+    // the replay is the last batch: rolling back past it would read a state no snapshot kept
+    if (llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos - 1, -1)) {
+        fprintf(stderr, "%s : a rollback of %u rows after a batch of %u was not refused\n",
+                __func__, n_rollback + 1, n_rollback);
+        return 1;
+    }
+    // rolling it back whole is refused too, unless the memory keeps the state before a ubatch (upstream's DSV4
+    // cache says it does): then that state has to be the truth's, and the rows are replayed for what follows
+    if (llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
+        whole_batch_rollback = true;
+        if (!matches_truth(ctx_dst, "the whole batch rolled back") ||
+            !decode_span(ctx_dst, tokens, rollback_pos, n_tokens)) {
+            fprintf(stderr, "%s : a rollback of the whole last batch (%u rows) was served wrong\n", __func__, n_rollback);
             return 1;
         }
     }

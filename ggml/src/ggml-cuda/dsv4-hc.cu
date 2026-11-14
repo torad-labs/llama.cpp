@@ -159,6 +159,7 @@ static __global__ void dsv4_hc_weights_f32(
     dsv4_hc_weights_token(mixes + it*sm1, scale, base, dst + it*sd1, sm0, ss0, sb0, sd0, eps, n_iter);
 }
 
+template <bool gated>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
         const float * weights,
@@ -171,8 +172,10 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sx2,
         int64_t sw0,
         int64_t sw1,
+        int64_t sw2,
         int64_t sd0,
-        int64_t sd1) {
+        int64_t sd1,
+        float   scale) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
@@ -186,16 +189,23 @@ static __global__ void dsv4_hc_pre_f32(
     const int64_t i0 = ir % n_embd;
     const int64_t it = ir / n_embd;
 
-    float sum = x[i0*sx0 + it*sx2] * weights[it*sw1];
-    for (int64_t ih = 1; ih < hc; ++ih) {
+    float sum = 0.0f;
+    for (int64_t ih = 0; ih < hc; ++ih) {
         const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
-        const float wv = weights[ih*sw0 + it*sw1];
+        float wv;
+        if constexpr (gated) {
+            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+        } else {
+            wv = weights[ih*sw0 + it*sw1];
+        }
         sum += xv * wv;
     }
 
-    dst[i0*sd0 + it*sd1] = sum;
+    dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
+// gated: post = gate_scale_out*sigmoid(gate_scale_in*post), the fused SCALE -> SIGMOID -> SCALE chain of qwen4exp
+template <bool has_comb, bool gated>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
         const float * residual,
@@ -217,7 +227,9 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sc2,
         int64_t sd0,
         int64_t sd1,
-        int64_t sd2) {
+        int64_t sd2,
+        float gate_scale_in,
+        float gate_scale_out) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * hc * n_tokens;
@@ -232,11 +244,20 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
+    float p = post[idst*sp0 + it*sp1];
+    if constexpr (gated) {
+        p = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * p))));
+    }
+
     // the product, then each stream's term fused in, rounded as written: the compiler may not contract them otherwise,
     // so dsv4_hc_mix_gram's fused post makes the same values
-    float sum = __fmul_rn(x[i0*sx0 + it*sx1], post[idst*sp0 + it*sp1]);
-    for (int64_t isrc = 0; isrc < hc; ++isrc) {
-        sum = __fmaf_rn(residual[i0*sr0 + isrc*sr1 + it*sr2], comb[idst*sc0 + isrc*sc1 + it*sc2], sum);
+    float sum = __fmul_rn(x[i0*sx0 + it*sx1], p);
+    if constexpr (has_comb) {
+        for (int64_t isrc = 0; isrc < hc; ++isrc) {
+            sum = __fmaf_rn(residual[i0*sr0 + isrc*sr1 + it*sr2], comb[idst*sc0 + isrc*sc1 + it*sc2], sum);
+        }
+    } else {
+        sum += residual[i0*sr0 + idst*sr1 + it*sr2];
     }
 
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
@@ -360,7 +381,7 @@ static int dsv4_hc_post_rows_nq(const ggml_tensor * dst) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
     const int64_t       n_embd   = x->ne[0];
-    if (legacy || residual->ne[1] != DSV4_HC || x->nb[0] != sizeof(float) || residual->nb[0] != sizeof(float) ||
+    if (legacy || dst->src[3] == nullptr || residual->ne[1] != DSV4_HC || x->nb[0] != sizeof(float) || residual->nb[0] != sizeof(float) ||
             dst->nb[0] != sizeof(float) || n_embd % DSV4_HC_POST_ROW_THREADS != 0 ||
             n_embd > DSV4_HC_POST_ROW_MAX_NQ*DSV4_HC_POST_ROW_THREADS) {
         return 0;
@@ -1277,6 +1298,9 @@ bool ggml_cuda_dsv4_hc_post_pre_fused_supported(const ggml_tensor * post, const 
     const ggml_tensor * residual = post->src[1];
     const ggml_tensor * post_w   = post->src[2];
     const ggml_tensor * comb_w   = post->src[3];
+    if (comb_w == nullptr) {
+        return false;
+    }
 
     const int64_t n_embd   = post->ne[0];
     const int64_t n_tokens = post->ne[2];
@@ -1572,43 +1596,58 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int64_t hc       = x->ne[1];
     const int64_t n_tokens = x->ne[2];
 
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
     const int block_size = 256;
     const int64_t nr = n_embd * n_tokens;
     const dim3 block_dims(block_size, 1, 1);
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    ggml_cuda_kernel_launch(dsv4_hc_pre_f32, launch_params,
+    auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
+    ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) weights->data, (float *) dst->data,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
-            nbw0 / sizeof(float), nbw1 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float));
+            nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+            nbd0 / sizeof(float), nbd1 / sizeof(float),
+            scale);
 }
 
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
+
+    // when fused, read the raw post weights from before the SCALE -> SIGMOID -> SCALE chain
+    const bool          gated = gate_scale_in != nullptr;
+    const ggml_tensor * post  = gated ? gate_scale_in->src[0] : dst->src[2];
+
+    const float gate_in  = gated ? ggml_get_op_params_f32(gate_scale_in,  0) : 1.0f;
+    const float gate_out = gated ? ggml_get_op_params_f32(gate_scale_out, 0) : 1.0f;
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
-    GGML_ASSERT(comb->type == GGML_TYPE_F32);
+    GGML_ASSERT(comb == nullptr || comb->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     GGML_TENSOR_LOCALS(size_t, nbx, x,        nb);
     GGML_TENSOR_LOCALS(size_t, nbr, residual, nb);
     GGML_TENSOR_LOCALS(size_t, nbp, post,     nb);
-    GGML_TENSOR_LOCALS(size_t, nbc, comb,     nb);
     GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
+
+    const size_t nbc0 = comb ? comb->nb[0] : 0;
+    const size_t nbc1 = comb ? comb->nb[1] : 0;
+    const size_t nbc2 = comb ? comb->nb[2] : 0;
 
     const int64_t n_embd   = x->ne[0];
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
 
-    if (dsv4_hc_post_rows_nq(dst) > 0) {
+    if (!gated && dsv4_hc_post_rows_nq(dst) > 0) {
         dsv4_hc_post_rows_launch<false>(ctx, dst, nullptr, 0, 0.0f);
         return;
     }
@@ -1619,15 +1658,18 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    ggml_cuda_kernel_launch(dsv4_hc_post_f32, launch_params,
+    auto kernel = comb ? (gated ? dsv4_hc_post_f32<true,  true> : dsv4_hc_post_f32<true,  false>)
+                       : (gated ? dsv4_hc_post_f32<false, true> : dsv4_hc_post_f32<false, false>);
+    ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) residual->data,
-            (const float *) post->data, (const float *) comb->data, (float *) dst->data,
+            (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float),
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+            gate_in, gate_out);
 }
 
 bool ggml_cuda_dsv4_hc_post_norm_supported(const ggml_tensor * post, const ggml_tensor * rms_flat) {
@@ -1635,7 +1677,7 @@ bool ggml_cuda_dsv4_hc_post_norm_supported(const ggml_tensor * post, const ggml_
         return false;
     }
     for (int i = 0; i < 4; ++i) {
-        if (post->src[i]->type != GGML_TYPE_F32) {
+        if (post->src[i] == nullptr || post->src[i]->type != GGML_TYPE_F32) {
             return false;
         }
     }
@@ -1946,10 +1988,11 @@ void ggml_cuda_op_dsv4_hc_back_fused(ggml_backend_cuda_context & ctx, ggml_tenso
             ggml_cuda_kernel_launch_params(dim3((n_tokens + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream),
             (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, w_two.get(),
             (int64_t) n_tokens, sm0, sm1, ss0, sb0, (int64_t) 1, (int64_t) DSV4_HC_MIX, eps_hc, n_iter);
-    ggml_cuda_kernel_launch(dsv4_hc_pre_f32,
+    ggml_cuda_kernel_launch(dsv4_hc_pre_f32<false>,
             ggml_cuda_kernel_launch_params(dim3((n_embd*n_tokens + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream),
             (const float *) x->data, (const float *) w_two.get(), p_two.get(), n_embd, (int64_t) DSV4_HC,
-            (int64_t) n_tokens, (int64_t) 1, sx1, sx2, (int64_t) 1, (int64_t) DSV4_HC_MIX, (int64_t) 1, n_embd);
+            (int64_t) n_tokens, (int64_t) 1, sx1, sx2, (int64_t) 1, (int64_t) DSV4_HC_MIX, (int64_t) 0, (int64_t) 1,
+            n_embd, 1.0f);
     ggml_cuda_rms_norm_mul_rows(p_two.get(), (const float *) norm_w->data, d_two.get(), n_embd, n_tokens, eps_norm,
             stream);
     dsv4_hc_back_check_bits<<<dim3(n_tokens, 1, 1), 256, 0, stream>>>(
