@@ -67,10 +67,12 @@ def arguments(argv=None):
                         help="Spare state rows on the cards, 1..64: a session's context checkpoint is copied to one of them "
                              "on the cards, and from there to RAM on a thread of its own while the sessions decode "
                              "(opt-in: not read on four cards)")
-    parser.add_argument("--fixed-rows", action="store_true",
+    parser.add_argument("--fixed-rows", nargs="?", const="fused", choices=["fused", "unfused"],
                         help="Tensor profiles: a session's recurrent state keeps one row on the cards for the session's "
                              "whole life, so no step moves another session's state there and a copied session has a row "
-                             "of its own at once (opt-in: four cards read it for isolation, not for speed)")
+                             "of its own at once. The conv-state update on those rows stays one kernel; 'unfused' "
+                             "leaves it node by node, the rows alone (opt-in: four cards read the rows for isolation; "
+                             "their cost was read on one card, 1 to 2%% of a decode fused and 4 to 6%% unfused)")
     parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
     parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "3", "4", "off"], default=DEFAULT_MTP_DEPTH,
@@ -258,8 +260,16 @@ def make_plan(args):
         # rows and moves a state that is elsewhere before the decode. With this each session's row is its own from its
         # first token to its last and nothing is moved or shared. Four RTX PRO 6000, ten sessions whose first prompts
         # are 67,163 to 114,625 tokens taking each other's five slots (Nov 13, 2026): 0 turns of 60 lost a word of
-        # their own or held another session's, in two runs, as without it. What it costs a step was not read.
+        # their own or held another session's, in two runs, as without it.
         env["LLAMA_RS_FIXED_ROWS"] = "1"
+        if args.fixed_rows != "unfused":
+            # The fixed rows store a layer's conv-state snapshots by index, a form the fused conv-state update turned
+            # away, so the chain ran node by node. With this the one kernel takes it. One RTX 5080, a 69-row decode
+            # (Nov 13, 2026), in ms without the rows, with them, and with them and this: 15.5, 16.1 to 16.2 and 16.0
+            # with two ranks on the card; 13.5, 14.4 and 13.7 to 13.8 with one. Four cards were not read for the cost.
+            # An inherited GGML_CUDA_SSM_CONV_ROWS never reaches the server (removed_overrides), so the way to keep
+            # the rows without the kernel is --fixed-rows unfused
+            env["GGML_CUDA_SSM_CONV_ROWS"] = "1"
     if args.kv_host:
         env["LLAMA_KV_HOST"] = "1"
     if args.trace_decode:
