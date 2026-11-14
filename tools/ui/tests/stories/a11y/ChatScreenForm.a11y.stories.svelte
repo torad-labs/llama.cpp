@@ -1,4 +1,4 @@
-<script module lang="ts">
+<script lang="ts" module>
 	import { defineMeta } from '@storybook/addon-svelte-csf';
 	import ChatScreenForm from '$lib/components/app/chat/ChatScreen/ChatScreenForm.svelte';
 	import { ATTACHMENT_TOOLTIP_TEXT } from '$lib/constants';
@@ -15,13 +15,13 @@
 </script>
 
 <Story
-	name="AddButtonSingleTabStop"
 	args={{ class: 'max-w-[56rem] w-[calc(100vw-2rem)]' }}
+	name="AddButtonSingleTabStop"
 	play={async ({ canvas, userEvent }) => {
-		const textarea = await canvas.findByRole('textbox');
+		const editor = await canvas.findByRole('textbox');
 
-		await userEvent.clear(textarea);
-		await userEvent.type(textarea, 'What is the meaning of life?');
+		await userEvent.clear(editor);
+		await userEvent.type(editor, 'What is the meaning of life?');
 
 		const trigger = await canvas.findByRole('button', { name: ATTACHMENT_TOOLTIP_TEXT });
 
@@ -35,8 +35,8 @@
 />
 
 <Story
-	name="AddDropdownFocusesFirstEnabled"
 	args={{ class: 'max-w-[56rem] w-[calc(100vw-2rem)]' }}
+	name="AddDropdownFocusesFirstEnabled"
 	play={async ({ canvas, userEvent }) => {
 		const trigger = await canvas.findByRole('button', { name: ATTACHMENT_TOOLTIP_TEXT });
 

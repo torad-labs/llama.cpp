@@ -6,7 +6,7 @@ from utils import *
 
 server = ServerPreset.stories15m_moe()
 
-MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
+MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org-dev/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
 
 def create_server():
     global server
@@ -53,6 +53,18 @@ def test_with_and_without_draft():
 
     assert tokens_no_draft == tokens_draft
 
+    server.stop()
+    create_server()
+    assert server.spec_draft_n_max is not None
+    server.spec_synth_rates = [0.0] * server.spec_draft_n_max
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+    assert res.body["timings"]["draft_n_accepted"] == 0
+    assert res.body["tokens"] == tokens_no_draft
+
 
 def test_draft_respects_batch_capacity():
     global server
@@ -66,6 +78,11 @@ def test_draft_respects_batch_capacity():
     server.spec_draft_n_min = 1
     server.spec_draft_n_max = 48
     server.server_continuous_batching = True
+    # The tokens are held to the plain run's. Outside flash attention the host computes an attention row by one kernel
+    # for a batch of one column and by another for more, so a column's last bits follow its batch's width, and this
+    # model's 8-bit activations can turn one of them into another token (on eight prompts of 90 tokens: 3 before
+    # upstream v1.0.0, 1 after). The host's flash attention computes every column the same way
+    server.fa = "on"
 
     def complete(slot):
         result = server.make_request("POST", "/completion", data={
@@ -233,6 +250,92 @@ def test_different_draft_min_draft_max():
         if last_content is not None:
             assert last_content == res.body["content"]
         last_content = res.body["content"]
+
+
+def test_synth_is_deterministic():
+    global server
+    assert server.spec_draft_n_max is not None
+    server.spec_synth_rates = [0.75 ** (i + 1) for i in range(server.spec_draft_n_max)]
+    server.start()
+
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.2,
+        "top_k": 5,
+        "seed": 4242,
+        "n_predict": 32,
+    }
+    responses = [server.make_request("POST", "/completion", data=request) for _ in range(2)]
+
+    for res in responses:
+        assert res.status_code == 200
+        assert res.body["timings"]["draft_n"] > 0
+    assert responses[0].body["timings"]["draft_n"] == responses[1].body["timings"]["draft_n"]
+    assert responses[0].body["timings"]["draft_n_accepted"] == responses[1].body["timings"]["draft_n_accepted"]
+
+
+def test_synth_ignores_target_tokens():
+    global server
+    assert server.spec_draft_n_max is not None
+    server.spec_synth_rates = [1.0] * server.spec_draft_n_max
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "seed": 4242,
+        "n_predict": 32,
+    })
+
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+    assert res.body["timings"]["draft_n_accepted"] == res.body["timings"]["draft_n"]
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "seed": 4242,
+        "n_predict": 6,
+        "grammar": 'root ::= "a"{5,5}',
+    })
+    assert res.status_code == 200, res.body
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Respond with only: OK",
+        "temperature": 0.0,
+        "seed": 4242,
+        "n_predict": 64,
+        "ignore_eos": True,
+    })
+    assert res.status_code == 200, res.body
+    assert res.body["tokens_predicted"] == 64
+    assert res.body["stop_type"] == "limit"
+
+
+def test_draft_n_ubatch_smaller_than_target():
+    global server
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+    }
+
+    # draft with the default ubatch size of the draft context
+    server.start()
+    res_default = server.make_request("POST", "/completion", data=request)
+    server.stop()
+    assert res_default.status_code == 200
+    assert res_default.body["timings"]["draft_n"] > 0
+
+    # a smaller draft ubatch splits the draft batches into more ubatches, but must not change the result
+    server.spec_draft_n_ubatch = 8
+    server.start()
+    res_small = server.make_request("POST", "/completion", data=request)
+    server.stop()
+    assert res_small.status_code == 200
+    assert res_small.body["timings"]["draft_n"] > 0
+    assert res_small.body["tokens"] == res_default.body["tokens"]
 
 
 def test_slot_ctx_not_exceeded():

@@ -46,9 +46,6 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
-    bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
-    bool fused_gdn_ch;       // use fused gated delta net (chunked)
-    bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
     bool fused_dsv4_hc_pre;
@@ -56,26 +53,39 @@ struct llama_cparams {
     bool fused_dsv4_hc_post;
     bool fused_dsv4_hc_weights; // pre, post and comb from the mixes in one op
     bool auto_fhc;
+    bool fused_top_k_mask;   // use fused top-k sparse attention mask
+    bool auto_ftkm;
+    bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
+    bool auto_fkvr;
     bool no_perf;
-    bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool attn_mask_bits;     // the KV attention mask is bit-packed (GGML_TYPE_I16) instead of f16; only with flash_attn
     bool pipeline_parallel;
+    bool training;           // set by llama_opt_init()
+
+    size_t moe_cache_size;
+    float  moe_cache_cpu_share;
     bool logits_gather = false; // -sm tensor: the logits are split by vocab, and backend sampling gathers them first
     int32_t n_logits_parts = 1;   // devices that each hold a share of the vocab's logits: 1 unless -sm tensor
     int32_t n_out_candidates = 0; // each output row as its k largest logits, 0 for the row (llama_set_output_candidates)
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
+    bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
 
     std::vector<int32_t> lens_layers; // layers whose output the logit lens reads through the head (empty = off)
     bool lens_channels = false;       // also read each lens layer's block input and its attention and FFN contributions, through the same head, in the block output's scale
 
     enum llama_context_type ctx_type;
+    enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
+    llama_context * ctx_state_src;
 };

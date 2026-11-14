@@ -64,7 +64,7 @@ static bool test_window_properties() {
 // dropped sequence is dropped. A trial placement (prepare) owes nothing and leaves nothing behind, and a restore's
 // placement moves no one.
 static bool test_owed_moves(const llama_model & model) {
-    llama_memory_recurrent mem(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 4, 4, 1, {});
+    llama_memory_recurrent mem(model, false, GGML_TYPE_F32, GGML_TYPE_F32, false, 4, 4, 1, {});
     mem.set_relocate(true);
     if (!mem.relocate) {
         fprintf(stderr, "FAIL: f32 states on one device do not relocate\n");
@@ -130,7 +130,7 @@ static bool test_owed_moves(const llama_model & model) {
 
     // A placement for two of four sequences that is never completed. 0 keeps its row, at a position no decode took it
     // to; 2 takes the second row; 1 is displaced to the row 2 had; 3 lies past the placement's cells
-    llama_memory_recurrent four(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 4, 4, 1, {});
+    llama_memory_recurrent four(model, false, GGML_TYPE_F32, GGML_TYPE_F32, false, 4, 4, 1, {});
     four.set_relocate(true);
     llama_pos at[4] = {0, 0, 0, 0};
     const auto set = [&](std::initializer_list<llama_seq_id> seqs) {
@@ -211,9 +211,9 @@ struct fixed_rows_env {
 static bool test_fixed_rows(const llama_model & model) {
     fixed_rows_env env;
     env.set("0");
-    llama_memory_recurrent legacy(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 8, 4, 2, {});
+    llama_memory_recurrent legacy(model, false, GGML_TYPE_F32, GGML_TYPE_F32, false, 8, 4, 2, {});
     env.set("1");
-    llama_memory_recurrent fixed(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 8, 4, 2, {});
+    llama_memory_recurrent fixed(model, false, GGML_TYPE_F32, GGML_TYPE_F32, false, 8, 4, 2, {});
     const auto fail = [](const char * what) {
         fprintf(stderr, "FAIL: fixed rows: %s\n", what);
         return false;
@@ -352,7 +352,7 @@ int main() {
         for (const uint32_t snapshots : {0u, 1u, 8u}) {
             // Repeated lifetimes exercise reuse of addresses after teardown.
             for (int life = 0; life < 3; ++life) {
-                llama_memory_recurrent mem(*model, GGML_TYPE_F32, GGML_TYPE_F32, false,
+                llama_memory_recurrent mem(*model, false, GGML_TYPE_F32, GGML_TYPE_F32, false,
                                            slots, slots, snapshots, {});
                 std::set<ggml_backend_buffer_t> buffers;
                 std::vector<std::vector<float>> expected;

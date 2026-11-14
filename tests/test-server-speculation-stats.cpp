@@ -102,14 +102,14 @@ static server_prompt_cache_state stored_state(int s) {
         fill(state.data->drft.data(), state.data->drft.size(), 50 + s);
     }
     state.data->spec = { 1, 2, 3, (uint8_t) s };
-    common_prompt_checkpoint checkpoint;
-    checkpoint.n_tokens = s + 1;
-    checkpoint.pos_min  = 0;
-    checkpoint.pos_max  = s;
-    checkpoint.pinned   = s == 2;
-    checkpoint.data_tgt.assign(70 + s, (uint8_t) (10 + s));
-    checkpoint.data_dft.assign(s, (uint8_t) (20 + s));
-    checkpoint.data_spec.assign(5, (uint8_t) (30 + s));
+    auto checkpoint = std::make_shared<common_prompt_checkpoint>();
+    checkpoint->n_tokens = s + 1;
+    checkpoint->pos_min  = 0;
+    checkpoint->pos_max  = s;
+    checkpoint->pinned   = s == 2;
+    checkpoint->data_tgt.assign(70 + s, (uint8_t) (10 + s));
+    checkpoint->data_dft.assign(s, (uint8_t) (20 + s));
+    checkpoint->data_spec.assign(5, (uint8_t) (30 + s));
     state.prompt.checkpoints.push_back(std::move(checkpoint));
     return state;
 }
@@ -126,8 +126,10 @@ static bool same_state(const server_prompt_cache_state & a, const server_prompt_
     }
     auto it = b.prompt.checkpoints.begin();
     for (const auto & cur : a.prompt.checkpoints) {
-        if (cur.n_tokens != it->n_tokens || cur.pos_min != it->pos_min || cur.pos_max != it->pos_max || cur.pinned != it->pinned ||
-                cur.data_tgt != it->data_tgt || cur.data_dft != it->data_dft || cur.data_spec != it->data_spec) {
+        const auto & other = **it;
+        if (cur->n_tokens != other.n_tokens || cur->pos_min != other.pos_min || cur->pos_max != other.pos_max ||
+                cur->pinned != other.pinned || cur->data_tgt != other.data_tgt || cur->data_dft != other.data_dft ||
+                cur->data_spec != other.data_spec) {
             return false;
         }
         ++it;

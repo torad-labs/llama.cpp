@@ -128,6 +128,7 @@ static void test_host_kv_graph_transition() {
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_GLM5NEXT, llama_model_default_params()));
     auto & h = model->hparams;
     h.n_layer_all = 1;
+    model->layers.resize(h.n_layer_all); // the cache reads each layer's K/V scale tensors
     h.n_embd = 512;
     h.n_head_arr.fill(8);
     h.n_head_kv_arr.fill(1);
@@ -148,8 +149,8 @@ static void test_host_kv_graph_transition() {
     // Host storage must keep the resident attention kernel before and after the direct-index cutoff.
     for (const uint32_t cells : {2560u, 8192u, 32768u}) {
         for (const uint32_t tokens : {512u, 3u, 1u}) {
-            llama_memory_hybrid memory(*model, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false,
-                    cells, 256, 0, LLAMA_SWA_TYPE_NONE, GGML_TYPE_F32, GGML_TYPE_F32,
+            llama_memory_hybrid memory(*model, false, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false,
+                    cells, 0, LLAMA_SWA_TYPE_NONE, GGML_TYPE_F32, GGML_TYPE_F32,
                     1, 1, 0, false, false, [](int32_t) { return true; },
                     [](int32_t) { return false; }, [](int32_t) { return true; }, GGML_TYPE_Q8_0);
             llama_memory_hybrid_context mctx(&memory);
@@ -189,7 +190,7 @@ static void test_host_kv_graph_transition() {
                 if (mode == 2) { continue; }
                 llm_graph_input_attn_k attn(h, params.cparams, mctx.get_attn());
                 attn.self_k_idxs = ggml_new_tensor_1d(graph.ctx0, GGML_TYPE_I64, tokens);
-                attn.self_kq_mask_cnv = mask;
+                attn.self_attn_mask.raw = mask;
                 auto * q = ggml_new_tensor_3d(graph.ctx0, GGML_TYPE_F32, 512, 8, tokens);
                 auto * k = ggml_new_tensor_3d(graph.ctx0, GGML_TYPE_F32, 512, 1, tokens);
                 auto * top_k = ggml_new_tensor_3d(graph.ctx0, GGML_TYPE_I32, 2048, tokens, 1);
@@ -243,6 +244,7 @@ static void test_cell_capacity(uint32_t top_k) {
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_GLM5NEXT, llama_model_default_params()));
     auto & h = model->hparams;
     h.n_layer_all = 1;
+    model->layers.resize(h.n_layer_all); // the cache reads each layer's K/V scale tensors
     h.n_embd = 16;
     h.n_head_arr.fill(1);
     h.n_head_kv_arr.fill(1);
@@ -263,8 +265,8 @@ static void test_cell_capacity(uint32_t top_k) {
         std::vector<uint32_t> pads;
         for (const bool legacy : {true, false}) {
             capacity.set(legacy ? "1" : "0");
-            llama_kv_cache kv(*model, h, GGML_TYPE_F32, GGML_TYPE_F32, false, false, unified,
-                    size, n_seq, 256, 0, LLAMA_SWA_TYPE_NONE, nullptr, {}, {}, {});
+            llama_kv_cache kv(*model, false, h, GGML_TYPE_F32, GGML_TYPE_F32, false, false, unified,
+                    size, n_seq, 0, LLAMA_SWA_TYPE_NONE, nullptr, {}, {}, {});
             // The cache keeps the policy it was constructed with.
             capacity.set(legacy ? "0" : "1");
             ggml_context * ctx = ggml_init({32*1024*1024, nullptr, false});
@@ -344,7 +346,9 @@ static void test_cell_capacity(uint32_t top_k) {
                 auto * mask_ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
                 auto * mask = ggml_new_tensor_4d(mask_ctx, GGML_TYPE_F16, d.n_kv, 1, 1, 1);
                 auto * mask_buffer = ggml_backend_alloc_ctx_tensors_from_buft(mask_ctx, ggml_backend_cpu_buffer_type());
-                mctx.set_input_kq_mask(mask, &ub, true);
+                llm_attn_mask attn_mask;
+                attn_mask.raw = mask;
+                mctx.set_input_attn_mask(attn_mask, &ub, true);
                 const auto * values = (const ggml_fp16_t *) mask->data;
                 size_t live = 0;
                 for (uint32_t cell = 0; cell < d.n_kv; ++cell) {

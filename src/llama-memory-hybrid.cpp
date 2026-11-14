@@ -12,12 +12,12 @@
 
 llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -38,6 +38,7 @@ llama_memory_hybrid::llama_memory_hybrid(
     hparams_idx(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
+        no_alloc,
         model.hparams,
         type_k,
         type_v,
@@ -46,7 +47,6 @@ llama_memory_hybrid::llama_memory_hybrid(
         unified,
         kv_size,
         n_seq_max,
-        n_pad,
         n_swa,
         swa_type,
         nullptr,
@@ -55,10 +55,13 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_attn,
         nullptr,
         nullptr,
+        "",
+        false,
         ggml_env_switch("LLAMA_KV_HOST")
     )),
     mem_recr(new llama_memory_recurrent(
         model,
+        no_alloc,
         type_r,
         type_s,
         offload,
@@ -82,8 +85,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                 __func__, kv_size, n_head_idx, hparams_idx.n_embd_head_k_full, ggml_type_name(type_idx));
 
         return new llama_kv_cache(
-            model, hparams_idx, type_idx, type_idx, v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            model, no_alloc, hparams_idx, type_idx, type_idx, v_trans, offload, unified,
+            kv_size, n_seq_max, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr);
     }()) {
     // with one attention stream for every sequence, nothing here is kept by the place of a sequence's recurrent cell
@@ -252,8 +255,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+// each cache applies LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY itself (an SWA window is partial state). With
+// LLAMA_KV_PARTIAL_STATE_LEGACY=1 a cache writes its whole sequence under the flag, so the attention and indexer caches
+// are skipped here as before: a partial state of this memory stays the recurrent one alone, as staged() promises
+static bool llama_memory_hybrid_skip_attn(llama_state_seq_flags flags) {
+    static const bool legacy = ggml_env_switch("LLAMA_KV_PARTIAL_STATE_LEGACY");
+    return legacy && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+}
+
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    if (!llama_memory_hybrid_skip_attn(flags)) {
         mem_attn->state_write(io, seq_id, flags);
         // indexer keys are not recomputable; skipping them here misselects on restore
         if (mem_idx) mem_idx->state_write(io, seq_id, flags);
@@ -263,15 +274,29 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     mtp_index.clear();
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    const bool read_attn = !llama_memory_hybrid_skip_attn(flags);
+    if (read_attn) {
         mem_attn->state_read(io, seq_id, flags);
-        if (mem_idx) {
-            mem_idx->state_read(io, seq_id, flags);
-            // A saved dense prefix may have raw keys but no compressed pools.
-            mem_attn->set_kpool_dirty(seq_id);
-        }
     }
-    mem_recr->state_read(io, seq_id, flags);
+
+    try {
+        if (read_attn && mem_idx) {
+            mem_idx->state_read(io, seq_id, flags);
+            if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+                // A saved dense prefix may have raw keys but no compressed pools.
+                mem_attn->set_kpool_dirty(seq_id);
+            }
+        }
+        mem_recr->state_read(io, seq_id, flags);
+    } catch (...) {
+        // a failed restore leaves the sequence empty in both caches
+        mem_attn->state_clear(seq_id);
+        if (mem_idx) {
+            mem_idx->state_clear(seq_id);
+        }
+
+        throw;
+    }
 }
 
 llama_memory_recurrent * llama_memory_hybrid::staged() {
