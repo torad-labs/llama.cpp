@@ -93,6 +93,29 @@ def test_completion_stream_vs_non_stream():
     assert content_stream == res_non_stream.body["content"]
 
 
+def test_completion_stream_says_its_connection_closes():
+    # A streamed response is the last on its connection, and its headers say so. They said "Keep-Alive: timeout=5,
+    # max=100", and a client that sent its next request on that connection lost it when the close crossed it
+    global server
+    server.start()
+    url = f"http://{server.server_host}:{server.server_port}/completion"
+    with requests.Session() as session:
+        res = session.post(url, json={"prompt": "Once", "n_predict": 4, "stream": True})
+        assert res.status_code == 200
+        assert "data:" in res.text
+        assert res.headers.get("Connection") == "close"
+        assert "Keep-Alive" not in res.headers
+        # a client that keeps its connections goes by the header, so the requests after a stream are all answered
+        for _ in range(8):
+            res = session.post(url, json={"prompt": "Once", "n_predict": 2, "stream": True})
+            assert res.status_code == 200
+        # a response that is not streamed keeps its connection, as it did
+        res = session.post(url, json={"prompt": "Once", "n_predict": 2})
+        assert res.status_code == 200
+        assert res.headers.get("Connection") != "close"
+        assert "Keep-Alive" in res.headers
+
+
 def test_completion_with_openai_library():
     global server
     server.start()
