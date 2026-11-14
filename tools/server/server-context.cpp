@@ -4219,8 +4219,7 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                // as prompt_save does: a checkpoint still copying from a spare row (LLAMA_RS_STAGE_ROWS)
-                                // would be shared with the cache, where another slot could restore it half written
+                                // wait as prompt_save does: the cache shares the checkpoints, and one can still be copying
                                 slot.checkpoints_wait();
                                 const auto saved = prompt_cache->save_idle(slot.prompt, slot.ctx_tgt, slot.ctx_dft,
                                         slot.spec, slot.id, slot.idle_cache_refusal);
