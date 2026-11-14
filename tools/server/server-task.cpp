@@ -1968,12 +1968,14 @@ server_prompt_cache_result server_prompt_cache::publish(server_prompt_cache_stat
     }
     const int    n_tokens = saved->prompt.n_tokens();
     const size_t n_bytes  = saved->size();
+    const size_t n_ckpt   = saved->prompt.checkpoints.size();
     update(protect);
     if (std::none_of(states.begin(), states.end(),
             [&](const server_prompt_cache_state & cur) { return &cur == saved; })) {
         return server_prompt_cache_result::no_space;
     }
-    SRV_TRC("cache_save reason=saved slot=%d tokens=%d bytes=%zu\n", id_slot, n_tokens, n_bytes);
+    // bytes holds the checkpoints too: the entry's size, as cache_evict gives it
+    SRV_INF("cache_save reason=saved slot=%d tokens=%d bytes=%zu checkpoints=%zu\n", id_slot, n_tokens, n_bytes, n_ckpt);
     return server_prompt_cache_result::saved;
 }
 
@@ -2085,8 +2087,8 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
     if (async) {
         restoring.push_back({ ctx_tgt, ctx_dft, id_slot, data });
     }
-    SRV_TRC("cache_restore reason=restored slot=%d tokens=%d bytes=%zu consumed=%d async=%d\n", id_slot, it->prompt.n_tokens(),
-            it->size(), consume, async);
+    SRV_INF("cache_restore reason=restored slot=%d tokens=%d bytes=%zu checkpoints=%zu consumed=%d async=%d\n", id_slot,
+            it->prompt.n_tokens(), it->size(), it->prompt.checkpoints.size(), consume, async);
     if (consume) {
         GGML_ASSERT(total_bytes >= it->cached_size && total_tokens >= (size_t) it->prompt.n_tokens());
         total_bytes -= it->cached_size;
