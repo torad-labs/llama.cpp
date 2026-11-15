@@ -2732,6 +2732,191 @@ static bool test_glm_shared_pool_reuse(const size_t seed, const std::vector<ggml
     return true;
 }
 
+// Sequences of a unified pool that share a prefix (one took it from another: llama_memory_seq_cp, the server's prefix
+// copy), decoding together. A cell of the prefix holds every sharer, and each sharer keeps a stream of pool maps of its
+// own with the shared cells in it (llama_kpool_shared_streams). Sequence 0 reads the prefix, 1 and 2 take it, 3 reads
+// another prompt; then all four decode in the same batches. Read three ways:
+// - the default;
+// - LLAMA_KPOOL_SHARED_CELLS_LEGACY=1: the pool's packed maps for as long as a cell holds two sequences;
+// - no copy: 1 and 2 read the prefix themselves.
+// The steps' logits agree by the packed maps' bar of test_glm_shared_pool_reuse, and the default's steps carry the
+// bank's changes in their graphs where the legacy's steps never do. A prefix of 16 ends on a pool, one of 22 inside one.
+// With a top_k of 8 the indexer scores from the first decode. With 1,024 the cache is read whole until its view passes
+// 1,027 cells, in the middle of the steps: the pools were never written, the first scoring step writes every pool of
+// its four sequences, and the three sharers name the prefix's pools between them (llama_kpool_unique_reps)
+static bool test_glm_shared_prefix_streams(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    const bool on_cpu = std::all_of(devs.begin(), devs.end(), [](ggml_backend_dev_t dev) {
+        return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    });
+
+    const int n_seq   = 4;
+    const int n_rows  = 3;
+    // a prompt's positions a decode
+    const int n_prompt_rows = 8;
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 0.1f);
+
+    enum class mode { streams, legacy, no_copy };
+
+    struct read_result {
+        std::vector<float> logits;          // every row of every step
+        bool               patched = false; // a step's graph wrote the bank's changes
+        int                scored  = -1;    // the first step whose graph wrote a pool's key
+    };
+    struct seen_nodes {
+        bool patched = false;
+        bool scored  = false;
+    };
+
+    for (const uint32_t top_k : {8u, 1024u}) {
+      auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+      kv_writer ms(LLM_ARCH_GLM5NEXT, gguf.get());
+      ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, top_k);
+      auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+      auto * model = pair.first.get();
+      const int n_embd  = llama_model_n_embd(model);
+      const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+      // 12 cells a step on the prompts' 38 to 66: past 1,027 cells by step 83 at the latest
+      const int n_steps = top_k == 8 ? 24 : 100;
+
+      for (const int n_prefix : {16, 22}) {
+        const int n_pos = n_prefix + n_steps*n_rows;
+        const auto prefix = get_tokens(n_prefix, n_vocab, seed + 3);
+        const auto other  = get_tokens(n_prefix, n_vocab, seed + 4);
+        const auto tokens = get_tokens(n_seq*n_pos, n_vocab, seed + 5);
+        std::vector<float> hidden((size_t) n_seq*std::max(n_prompt_rows, n_rows)*n_embd);
+        for (auto & value : hidden) value = normal(rng);
+
+        const auto read = [&](bool mtp, mode how) {
+            set_env("LLAMA_KPOOL_SHARED_CELLS_LEGACY", how == mode::legacy ? "1" : nullptr);
+            seen_nodes seen;
+            llama_context_params params = llama_context_default_params();
+            if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            params.n_ctx      = 4096;
+            params.n_batch    = 512;
+            params.n_ubatch   = 512;
+            params.n_seq_max  = n_seq;
+            params.kv_unified = true;
+            params.n_threads  = params.n_threads_batch = 4;
+            params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+                if (ask && strcmp(t->name, "kpool_resident_patched") == 0) {
+                    static_cast<seen_nodes *>(data)->patched = true;
+                }
+                if (ask && strncmp(t->name, "indexer_pool_new", strlen("indexer_pool_new")) == 0) {
+                    static_cast<seen_nodes *>(data)->scored = true;
+                }
+                return false;
+            };
+            params.cb_eval_user_data = &seen;
+            llama_context_ptr ctx(llama_init_from_model(model, params));
+            set_env("LLAMA_KPOOL_SHARED_CELLS_LEGACY", nullptr);
+            if (!ctx) throw std::runtime_error("shared prefix streams: failed to create a context");
+
+            const auto run = [&](llama_batch & batch) {
+                if (mtp) batch.embd = hidden.data();
+                const int result = llama_decode(ctx.get(), batch);
+                batch.embd = nullptr;
+                llama_batch_free(batch);
+                if (result) throw std::runtime_error("shared prefix streams: decode failed");
+            };
+
+            // one sequence reads a prompt alone
+            const auto read_prompt = [&](int seq, const std::vector<llama_token> & prompt) {
+                for (int begin = 0; begin < n_prefix; begin += n_prompt_rows) {
+                    const int end = std::min(n_prefix, begin + n_prompt_rows);
+                    llama_batch batch = llama_batch_init(end - begin, 0, 1);
+                    for (int pos = begin; pos < end; ++pos) {
+                        batch_add(batch, prompt[pos], pos, {seq}, true);
+                    }
+                    run(batch);
+                }
+            };
+
+            read_prompt(0, prefix);
+            for (const int seq : {1, 2}) {
+                if (how == mode::no_copy) {
+                    read_prompt(seq, prefix);
+                } else {
+                    llama_memory_seq_cp(llama_get_memory(ctx.get()), 0, seq, -1, -1);
+                }
+            }
+            read_prompt(3, other);
+
+            read_result res;
+            seen = seen_nodes();
+            for (int step = 0; step < n_steps; ++step) {
+                llama_batch batch = llama_batch_init(n_seq*n_rows, 0, 1);
+                for (int seq = 0; seq < n_seq; ++seq) {
+                    for (int row = 0; row < n_rows; ++row) {
+                        const int pos = n_prefix + step*n_rows + row;
+                        batch_add(batch, tokens[(size_t) seq*n_pos + pos], pos, {seq}, true);
+                    }
+                }
+                run(batch);
+                if (seen.scored && res.scored < 0) {
+                    res.scored = step;
+                }
+                for (int i = 0; i < n_seq*n_rows; ++i) {
+                    const float * row = llama_get_logits_ith(ctx.get(), i);
+                    res.logits.insert(res.logits.end(), row, row + n_vocab);
+                }
+            }
+            res.patched = seen.patched;
+            return res;
+        };
+
+        for (const bool mtp : {false, true}) {
+            const read_result streams = read(mtp, mode::streams);
+            const read_result legacy  = read(mtp, mode::legacy);
+            const read_result no_copy = read(mtp, mode::no_copy);
+
+            bool ok = true;
+            if (!streams.patched || legacy.patched || !no_copy.patched) {
+                LOG_ERR("GLM shared prefix streams: mtp=%d top_k=%u prefix=%d: the steps' graphs carried the bank's changes: %d "
+                        "(want 1), %d with LLAMA_KPOOL_SHARED_CELLS_LEGACY=1 (want 0: packed maps), %d with no copy (want 1)\n",
+                        mtp, top_k, n_prefix, streams.patched, legacy.patched, no_copy.patched);
+                ok = false;
+            }
+            // the pools' keys are written from the first step, or from a step in the middle that writes them all
+            const bool late = top_k != 8;
+            for (const read_result * res : { &streams, &legacy, &no_copy }) {
+                if (late ? res->scored <= 0 || res->scored >= n_steps - 8 : res->scored != 0) {
+                    LOG_ERR("GLM shared prefix streams: mtp=%d top_k=%u prefix=%d: the first step that wrote a pool's key is %d "
+                            "of %d (want %s)\n", mtp, top_k, n_prefix, res->scored, n_steps, late ? "one in the middle" : "0");
+                    ok = false;
+                }
+            }
+            for (const auto & against : { std::make_pair("with LLAMA_KPOOL_SHARED_CELLS_LEGACY=1", &legacy),
+                    std::make_pair("whose sequences read the prefix themselves", &no_copy) }) {
+                if (on_cpu) {
+                    size_t n_top_differ = 0;
+                    size_t n_top_tied   = 0;
+                    const double kld = mean_kld(against.second->logits, streams.logits, n_vocab, n_top_differ, n_top_tied,
+                            1e-2f);
+                    if (!(kld <= 1e-6) || n_top_differ > 0) {
+                        LOG_ERR("GLM shared prefix streams: mtp=%d top_k=%u prefix=%d: against the pool %s: mean KLD %g (at most "
+                                "1e-6), %zu rows' top token differs, %zu tied rows' swapped, nmse=%g\n", mtp, top_k, n_prefix,
+                                against.first, kld, n_top_differ, n_top_tied, nmse(against.second->logits, streams.logits));
+                        ok = false;
+                    }
+                } else {
+                    const std::string pairing = "mtp=" + std::to_string(mtp) + " top_k=" + std::to_string(top_k) + " prefix=" +
+                            std::to_string(n_prefix) + ": against the pool " + against.first;
+                    if (!glm_device_logits_agree("shared prefix streams", pairing, seed, against.second->logits,
+                                streams.logits, n_vocab, 1e-2f)) {
+                        ok = false;
+                    }
+                }
+            }
+            if (!ok) return false;
+        }
+      }
+    }
+    return true;
+}
+
 // The context's schedulers place their graphs in one buffer a buffer type (llama_context::graph_shared), so between two
 // computes of a graph the graphs of the other schedulers write over its tensors. Decodes of six shapes in turn, five of
 // them retained and one on the main scheduler, give the logits of LLAMA_GRAPH_BUFFER_SHARED_LEGACY=1 (a buffer a
@@ -4321,6 +4506,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_shared_pool_reuse(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL shared pool reuse\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_shared_prefix_streams(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            test_ok = false;
+                            status_nmse = "\033[1;31mFAIL shared prefix streams\033[0m";
                         }
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_shared_buffers(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             test_ok = false;

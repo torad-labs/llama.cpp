@@ -894,7 +894,8 @@ bool llm_graph_input_kpool::shared_streams(
     const auto * kv    = mctx_attn->get_kv();
     auto       & views = kv->get_kpool_views();
 
-    if (!shared_pool(cparams, views) || views.bank_unsupported || !llama_kpool_shared_streams(kv->get_cells(ubatch.seq_id_unq[0]), ubatch, seqs)) {
+    if (!shared_pool(cparams, views) || views.bank_unsupported ||
+            !llama_kpool_shared_streams(kv->get_cells(ubatch.seq_id_unq[0]), ubatch, seqs, views.shared_cells_legacy)) {
         seqs.clear();
         return false;
     }

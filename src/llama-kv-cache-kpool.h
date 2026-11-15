@@ -146,6 +146,9 @@ public:
     const bool packed_legacy = ggml_env_switch("LLAMA_KPOOL_SHARED_VIEWS_LEGACY");
     // LLAMA_KPOOL_PATCH_INPUT_LEGACY=1, read when the cache is made: every change of the bank is a write of its own
     const bool patch_writes_legacy = ggml_env_switch("LLAMA_KPOOL_PATCH_INPUT_LEGACY");
+    // LLAMA_KPOOL_SHARED_CELLS_LEGACY=1, read when the cache is made: while a cell holds two sequences (a copied prefix)
+    // the pool keeps its packed maps (llama_kpool_shared_streams)
+    const bool shared_cells_legacy = ggml_env_switch("LLAMA_KPOOL_SHARED_CELLS_LEGACY");
     std::shared_ptr<llama_kpool_backend_tensor> resident_bank(ggml_backend_buffer_type_t buft,
             int64_t count, uint32_t slots, uint32_t devices);
     // a graph that carried the views' changes was not computed: every view goes whole on its next use
@@ -180,12 +183,13 @@ uint32_t llama_kpool_n_pools_ubatch(const llama_kpool_cells_fn & cells_of, const
 // the pools the graph reserved at load holds: the whole cache's (llama_kpool_n_pools), the worst case, or, under a limit
 // of seq_cells positions a sequence (LLAMA_KV_SEQ_CELLS), those of the steps a server's slots make: each sequence of the
 // ubatch in a stream of its own, its positions spanning seq_cells at most, with the widest padding a step takes
-// (pool_pad_max) on top. That is not a worst case. The packed maps hold every sequence's runs in one stream (cells two
-// sequences share after a seq_cp, rows not grouped by sequence, LLAMA_KPOOL_SHARED_VIEWS_LEGACY, a device without the
-// bank), and a sequence with a hole in its positions spans more than the cells it holds: such a step's graph can be
-// larger than the reserve and is then allocated when it comes. Never more than the whole cache's and never so few that
-// select_k changes. padded (a cache made with LLAMA_KV_PAD_SHARED): the limit's runs padded to pool_pad_max, where the
-// whole padding went on top; with a padding of 16,384 pools the top alone would be a quarter of a 262,144-cell session
+// (pool_pad_max) on top. That is not a worst case. The packed maps hold every sequence's runs in one stream (rows not
+// grouped by sequence, LLAMA_KPOOL_SHARED_VIEWS_LEGACY, a device without the bank, cells two sequences share under
+// LLAMA_KPOOL_SHARED_CELLS_LEGACY), and a sequence with a hole in its positions spans more than the cells it holds:
+// such a step's graph can be larger than the reserve and is then allocated when it comes. Never more than the whole
+// cache's and never so few that select_k changes. padded (a cache made with LLAMA_KV_PAD_SHARED): the limit's runs
+// padded to pool_pad_max, where the whole padding went on top; with a padding of 16,384 pools the top alone would be a
+// quarter of a 262,144-cell session
 uint32_t llama_kpool_n_pools_reserve(uint32_t n_kv, uint32_t kpool, uint32_t n_ps, uint32_t indexer_top_k,
         uint32_t pool_pad_max, uint32_t seq_cells, bool padded = false);
 
@@ -231,9 +235,26 @@ int64_t llama_kpool_n_kv_max(int64_t n_top_k, int64_t n_tail);
 // A unified pool holds every sequence in one stream, and its maps pack the sequences' pools on one axis: built from every
 // cell for each sequence, and every row scored against every sequence's pools. Its ubatch gives each sequence a stream of
 // its own instead (one pool map a sequence over the one cache stream, each served from its view) when every token names
-// one sequence, the sequences come as equal runs of rows and no cell holds two sequences.
+// one sequence and the sequences come as equal runs of rows.
+// A cell that holds two sequences (a prefix one sequence took from another: seq_cp) is in both sequences' views, at its
+// one position, and each stream's maps name it. What two streams can then both name is a complete pool's key, a row of
+// the cache at the pool's last cell: a decode writes the pools its own tokens complete, whose last cell is new and one
+// sequence's, and a step that writes every pool again gives each shared pool to one stream (llama_kpool_unique_reps).
+// disjoint_only (LLAMA_KPOOL_SHARED_CELLS_LEGACY=1): false too while any cell holds two sequences, so one copied prefix
+// keeps every sequence of the pool on the packed maps for as long as both sequences hold it.
 // seqs: each run's sequence, in row order
-bool llama_kpool_shared_streams(const llama_kv_cells & cells, const llama_ubatch & ubatch, std::vector<llama_seq_id> & seqs);
+bool llama_kpool_shared_streams(const llama_kv_cells & cells, const llama_ubatch & ubatch, std::vector<llama_seq_id> & seqs,
+        bool disjoint_only = false);
+
+// The write slots of a unified pool's streams go to the cache in one write, whose rows must differ. Two sequences that
+// share cells hold the same complete pools, and a step that writes every pool again names each of them in both streams.
+// A pool's key is the one row of the cache at its last cell and a function of its members alone, so the first stream to
+// name a row keeps it and a later stream's slot is given back: the stream's last used slot takes its place and the slot
+// freed has cell 0 for its members, as an unused slot has (the caller names a spare row for it).
+// new_cells: r*n_new_max members a stream; new_reps: n_new_max rows a stream; n_new: the slots each stream uses, lowered
+// by what it gave back. Returns the slots given back
+int64_t llama_kpool_unique_reps(int32_t * new_cells, int64_t * new_reps, int64_t * n_new, int64_t n_stream,
+        int64_t n_new_max, int64_t r);
 
 // the maps of llama_kv_cache_set_input_kpool from a cells accessor. views == nullptr builds them from the cells
 // every call; else a sequence alone in its stream is served from its view, byte for byte the same maps.
