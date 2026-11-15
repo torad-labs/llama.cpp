@@ -696,19 +696,28 @@ struct server_prompt {
     // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
+    // The last input boundary follows the prompt through RAM saves and copies; -1 means unknown.
+    int n_tokens_input = -1;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        n_tokens_input = -1;
     }
 
     int n_tokens() const {
         return tokens.size();
     }
 
+    bool is_continuation(size_t lcp) const {
+        return lcp >= (size_t) (n_tokens_input < 0 ? n_tokens() : std::min(n_tokens_input, n_tokens()));
+    }
+
     server_prompt clone() const {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            n_tokens_input,
         };
     }
 };

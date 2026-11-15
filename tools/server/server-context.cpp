@@ -428,8 +428,8 @@ static bool prompt_share_legacy() {
     return legacy;
 }
 
-// LLAMA_SLOT_PREFIX_COPY=1: a request that takes an empty slot starts from a copy of the idle slot it shares a prefix with, and reads only what follows the prefix.
-// The copy shares the cells of a unified cache and copies no row, so it is made only with --kv-unified.
+// LLAMA_SLOT_PREFIX_COPY=1: requests reuse a shared prefix from an idle or active slot instead of reading it again.
+// KV cells are shared and recurrent state is copied, only with --kv-unified.
 static bool slot_prefix_copy() {
     static const bool copy = ggml_env_switch("LLAMA_SLOT_PREFIX_COPY");
     return copy;
@@ -665,6 +665,13 @@ struct server_slot {
     // has to be re-processed; a checkpoint is placed there [--checkpoint-every] (-1 = none)
     int32_t n_fork = -1;
 
+    // An independent request waits for this task's live prefix, never for a reused slot ID alone.
+    struct {
+        int slot = -1;
+        int task = -1;
+        size_t n_tokens = 0;
+    } prefix_source;
+
     // the task's prompt has its checkpoint near the end (pre_decode)
     bool checkpoint_near_end = false;
 
@@ -713,6 +720,7 @@ struct server_slot {
 
     void reset() {
         idle_cache_refusal = {};
+        prefix_source = {};
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
@@ -2525,6 +2533,7 @@ private:
         // the idle slot an empty slot starts as a copy of, and the tokens the request reuses of it [LLAMA_SLOT_PREFIX_COPY]
         const server_slot * donor = nullptr;
         size_t donor_reuse = 0;
+        bool copy_overwrite = false;
         id_slot_copied = -1;
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
@@ -2589,8 +2598,9 @@ private:
                     continue;
                 }
 
-                // A request continues a slot when it keeps at least half of the slot. A smaller match only shares a prefix (a system prompt), and taking the slot cuts another conversation.
-                if (named || 2 * reusable >= tokens.size()) {
+                // Separate branches only when copying preserves their prefix. Otherwise an edited prompt must keep the old reuse path.
+                const bool split_branch = prefix_copy() && slot.prompt.n_tokens_input >= 0;
+                if (named || (split_branch ? slot.prompt.is_continuation(lcp_len) : 2 * reusable >= tokens.size())) {
                     if (f_sim_cur > f_sim_best) {
                         f_sim_best = f_sim_cur;
                         resident_reuse = reusable;
@@ -2618,19 +2628,37 @@ private:
                     }
                 }
             } else if (ret == nullptr && !held.empty()) {
-                // No slot is empty, so one conversation is cut. Among the slots that reuse about as much as the best one (within a quarter of the request),
-                // take the one whose conversation costs the least to cut: the fewest tokens for each second it has been idle (server_slot::victim_cost).
+                // With no empty slot, prefer low rebuild cost. Without a separate copy donor, keep the near-best-prefix candidates.
                 size_t reuse_best = 0;
                 for (const auto & cur : held) {
                     reuse_best = std::max(reuse_best, cur.second);
                 }
+                if (prefix_copy() && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
+                        !task.is_parent() && !task.is_child() && !task.is_stateless() && !task.tokens.has_mtmd) {
+                    const auto lora = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+                    for (const auto & cur : held) {
+                        if (cur.second > donor_reuse && !cur.first->prompt.tokens.has_mtmd &&
+                                float(cur.second) / task.tokens.size() > slot_prompt_similarity &&
+                                are_lora_equal(cur.first->lora, lora)) {
+                            donor = cur.first;
+                            donor_reuse = cur.second;
+                        }
+                    }
+                }
                 const size_t margin = task.tokens.size() / 4;
                 const int64_t t_now = ggml_time_us();
                 for (const auto & cur : held) {
-                    if (cur.second + margin >= reuse_best && (ret == nullptr || cur.first->is_victim_before(*ret, t_now))) {
+                    // A separate donor keeps the reusable prefix, so the cheapest victim need not hold it.
+                    if ((donor || cur.second + margin >= reuse_best) && (ret == nullptr || cur.first->is_victim_before(*ret, t_now))) {
                         ret = cur.first;
                         resident_reuse = cur.second;
                     }
+                }
+                if (donor && donor != ret) {
+                    copy_overwrite = true;
+                    update_cache = true;
+                } else {
+                    donor = nullptr;
                 }
                 f_sim_best = task.tokens.empty() ? 0.0f : float(*resident_reuse) / task.tokens.size();
                 by_lru = true;
@@ -2650,8 +2678,9 @@ private:
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
+                // Save a displaced branch even when it shares most of this young conversation.
+                if (f_keep < 0.5f || (!named && prefix_copy() && ret->prompt.n_tokens_input >= 0 &&
+                        !ret->prompt.is_continuation(ret->prompt.tokens.get_common_prefix(task.tokens)))) {
                     update_cache = true;
                 }
             }
@@ -2671,8 +2700,8 @@ private:
             }
         }
 
-        // The copy is for a request that reuses a prompt and took an empty slot. A snapshot in RAM is restored in its place only when it reuses more than the copy does.
-        if (donor && ret && ret->prompt.tokens.empty() && task.params.cache_prompt && !task.is_stateless() && !task.is_parent()) {
+        // A victim is saved before its prompt is replaced by the donor's. A better RAM snapshot still wins over the copy.
+        if (donor && ret && (ret->prompt.tokens.empty() || copy_overwrite) && task.params.cache_prompt && !task.is_stateless() && !task.is_parent()) {
             resident_reuse = donor_reuse;
         } else {
             donor = nullptr;
@@ -2729,6 +2758,9 @@ private:
         if (donor) {
             // The request keeps the prefix it shares and cuts the rest of the copy when it starts, as it does in a slot it takes over. The slot copied from keeps everything.
             donor->checkpoints_wait(); // the copy shares the checkpoints: every one it holds is whole before it can be restored
+            if (!ret->prompt.tokens.empty()) {
+                ret->prompt_clear();
+            }
             donor->copy_prompt_to(*ret);
             ret->lora = donor->lora; // the request runs with these adapters, so the launch finds none changed and keeps the copy
             id_slot_copied = ret->id;
@@ -2736,6 +2768,116 @@ private:
         }
 
         return ret;
+    }
+
+    void copy_active_prefix(server_slot & source, server_slot & recipient, size_t n_reuse) {
+        source.checkpoints_wait();
+        source.copy_prompt_to(recipient);
+        recipient.lora = source.lora;
+        std::vector<uint8_t> state;
+        common_speculative_get_state(spec.get(), source.id, state);
+        common_speculative_set_state(spec.get(), recipient.id, state);
+        SLT_INF(recipient, "copied the prompt of active slot %d, %d tokens, to reuse %zu of them\n",
+                source.id, source.prompt.n_tokens(), n_reuse);
+    }
+
+    void share_active_prefix(server_slot & recipient) {
+        const auto & task = *recipient.task;
+        if (!prefix_copy() || slot_prompt_similarity == 0 || task.id_slot != -1 ||
+                task.type != SERVER_TASK_TYPE_COMPLETION || task.is_parent() || task.is_child() ||
+                task.is_stateless() || !task.params.cache_prompt || task.tokens.has_mtmd ||
+                task.n_tokens() < 2 || task.n_tokens() >= recipient.n_ctx ||
+                recipient.alora_invocation_start >= 0 ||
+                (!recipient.prompt.tokens.empty() && id_slot_copied != recipient.id)) {
+            return;
+        }
+
+        size_t best = server_prompt_cache::reusable_prefix(recipient.prompt, task.tokens,
+                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), recipient.id), n_swa);
+        server_slot * source = nullptr;
+        bool wait = false;
+        for (auto & candidate : slots) {
+            if (&candidate == &recipient || !candidate.task || candidate.copy_pending() ||
+                    (candidate.state != SLOT_STATE_STARTED && candidate.state != SLOT_STATE_PROCESSING_PROMPT &&
+                     candidate.state != SLOT_STATE_GENERATING) ||
+                    candidate.task->type != SERVER_TASK_TYPE_COMPLETION || candidate.task->is_parent() ||
+                    candidate.task->is_child() || candidate.task->is_stateless() ||
+                    !candidate.task->params.cache_prompt || candidate.task->tokens.has_mtmd ||
+                    candidate.task->n_tokens() < 2 || candidate.task->n_tokens() >= candidate.n_ctx ||
+                    candidate.alora_invocation_start >= 0 || !are_lora_equal(candidate.lora, recipient.lora)) {
+                continue;
+            }
+            const size_t common = candidate.task->tokens.get_common_prefix(task.tokens);
+            // Leave one token for each request's own logits.
+            const size_t fork = std::min({ common, (size_t) task.n_tokens() - 1,
+                    (size_t) candidate.task->n_tokens() - 1 });
+            const bool future = candidate.state == SLOT_STATE_STARTED ||
+                    (candidate.state == SLOT_STATE_PROCESSING_PROMPT && (size_t) candidate.prompt.n_tokens() < fork);
+            if (future && !candidate.can_split()) {
+                continue;
+            }
+            const size_t reuse = future ? fork : server_prompt_cache::reusable_prefix(candidate.prompt, task.tokens,
+                    llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), candidate.id), n_swa);
+            // A handoff should save a useful prompt pass, not wait for a few common tokens.
+            if (reuse < 256 || reuse <= best || float(reuse) / task.tokens.size() <= slot_prompt_similarity) {
+                continue;
+            }
+            best = reuse;
+            source = &candidate;
+            wait = future;
+        }
+        if (!source) {
+            return;
+        }
+        recipient.prompt_clear();
+        if (wait) {
+            recipient.prefix_source = { source->id, source->task->id, best };
+            recipient.state = SLOT_STATE_WAIT_OTHER;
+            SLT_INF(recipient, "waiting for %zu prefix tokens from slot %d, task %d\n", best, source->id, source->task->id);
+        } else {
+            copy_active_prefix(*source, recipient, best);
+        }
+    }
+
+    void resume_prefix_waiters() {
+        for (auto & recipient : slots) {
+            if (recipient.state != SLOT_STATE_WAIT_OTHER || recipient.prefix_source.slot < 0) {
+                continue;
+            }
+            const auto waiting = recipient.prefix_source;
+            auto * source = get_slot_by_id(waiting.slot);
+            if (!source || !source->task || source->task->id != waiting.task ||
+                    (source->state != SLOT_STATE_STARTED && source->state != SLOT_STATE_PROCESSING_PROMPT &&
+                     source->state != SLOT_STATE_GENERATING)) {
+                SLT_INF(recipient, "%s", "prefix source ended, reading the prompt independently\n");
+                recipient.prefix_source = {};
+                recipient.state = SLOT_STATE_STARTED;
+                continue;
+            }
+            if (source->state == SLOT_STATE_STARTED || source->copy_pending() ||
+                    (source->state == SLOT_STATE_PROCESSING_PROMPT && (size_t) source->prompt.n_tokens() < waiting.n_tokens)) {
+                continue;
+            }
+
+            const auto memory = llama_get_memory(ctx_tgt);
+            const auto pos_min = llama_memory_seq_pos_min(memory, source->id);
+            const auto pos_max = llama_memory_seq_pos_max(memory, source->id);
+            if ((size_t) source->prompt.n_tokens() == waiting.n_tokens && params_base.n_ctx_checkpoints > 0 &&
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0) &&
+                    std::none_of(source->prompt.checkpoints.begin(), source->prompt.checkpoints.end(),
+                        [&](const auto & checkpoint) { return checkpoint->n_tokens == (int64_t) waiting.n_tokens; })) {
+                create_checkpoint(*source, 0, pos_min, pos_max, true);
+            }
+            const size_t reuse = server_prompt_cache::reusable_prefix(source->prompt, recipient.task->tokens, pos_min, n_swa);
+            if (reuse >= 256) {
+                copy_active_prefix(*source, recipient, reuse);
+            } else {
+                SLT_INF(recipient, "%s", "prefix source cannot be reused, reading the prompt independently\n");
+            }
+            recipient.prefix_source = {};
+            recipient.state = SLOT_STATE_STARTED;
+        }
     }
 
     // Free one idle sequence under KV pressure, preserving its snapshot when
@@ -4350,6 +4492,10 @@ private:
                         break; // drop the task
                     }
 
+                    if (!slot->task->is_parent()) {
+                        share_active_prefix(*slot);
+                    }
+
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
@@ -5169,6 +5315,8 @@ private:
     }
 
     void pre_decode() {
+        resume_prefix_waiters();
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -6027,8 +6175,20 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    size_t prefix_end = slot.task->n_tokens();
+                    for (const auto & other : slots) {
+                        if (other.state == SLOT_STATE_WAIT_OTHER && other.prefix_source.slot == slot.id &&
+                                other.prefix_source.task == slot.task->id &&
+                                other.prefix_source.n_tokens >= (size_t) slot.prompt.n_tokens()) {
+                            prefix_end = std::min(prefix_end, other.prefix_source.n_tokens);
+                        }
+                    }
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_fill) {
+                        if ((size_t) slot.prompt.n_tokens() == prefix_end) {
+                            break;
+                        }
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -6102,6 +6262,8 @@ private:
                             }
                         }
                     }
+
+                    slot.prompt.n_tokens_input = slot.prompt.n_tokens();
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;

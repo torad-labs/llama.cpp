@@ -3,6 +3,7 @@ import re
 import tempfile
 import threading
 import pytest
+import requests
 from utils import *
 
 server = ServerPreset.tinyllama2()
@@ -634,8 +635,7 @@ def _held(res):
     return res.body["timings"]["cache_n"] + res.body["timings"]["prompt_n"]
 
 
-# With every slot in use, the request takes the slot whose conversation costs the least to cut, not the most similar one and not the oldest one:
-# the fewest tokens for each second it has been idle. LLAMA_SLOT_VICTIM_LRU_LEGACY=1: the least recently used slot.
+# Cost includes both resident tokens and idle age. The legacy switch keeps LRU.
 def test_shared_prefix_takes_the_slot_that_costs_least_to_cut(monkeypatch):
     for legacy in (None, "1"):
         if legacy is None:
@@ -646,8 +646,15 @@ def test_shared_prefix_takes_the_slot_that_costs_least_to_cut(monkeypatch):
         long = _one_token(SHARED_PREFIX + TAIL_A * 3)
         short = _one_token(SHARED_PREFIX + TAIL_C)
         assert short.body["id_slot"] != long.body["id_slot"]
+        # Refresh both cached prompts in one batch so model load and prefill time do not separate their last uses.
+        refreshed = server.make_request("POST", "/completion", data={
+            "prompt": [SHARED_PREFIX + TAIL_A * 3, SHARED_PREFIX + TAIL_C],
+            "cache_prompt": True, "n_predict": 1,
+        })
+        assert refreshed.status_code == 200
+        assert [item["id_slot"] for item in refreshed.body] == [long.body["id_slot"], short.body["id_slot"]]
         log.drain()
-        # both slots were used a moment ago: the short conversation is the cheaper one to bring back, the long one is the least recently used
+        # Both are recent: the short conversation costs less, but the long one is LRU.
         cut = long if legacy else short
         other = _one_token(SHARED_PREFIX + TAIL_E)
         content = log.wait_for("cache_save reason=saved")
@@ -656,8 +663,7 @@ def test_shared_prefix_takes_the_slot_that_costs_least_to_cut(monkeypatch):
         assert ("selected slot by cost" if legacy else "selected slot by LRU") not in content
         assert re.search(rf"cache_save reason=saved slot={cut.body['id_slot']} tokens=\d+ bytes=\d+ checkpoints=\d+ copies=[1-9]\d*\n", content)
         if legacy is None:
-            # the long conversation idles for more seconds than it holds tokens for each of the other slot's, and the other slot is used again:
-            # now the long one is the cheaper one to cut, though it holds more
+            # Age the long conversation enough to outweigh its size, then refresh the short one.
             time.sleep(_held(long) / _held(other) + 0.5)
             more = _one_token(SHARED_PREFIX + TAIL_E + " Then it woke up.")
             assert more.body["id_slot"] == other.body["id_slot"]
@@ -666,7 +672,6 @@ def test_shared_prefix_takes_the_slot_that_costs_least_to_cut(monkeypatch):
             content = log.wait_for("cache_save reason=saved")
             assert third.body["id_slot"] == long.body["id_slot"]
             assert "selected slot by cost" in content
-        # what was cut returns whole from RAM
         back = _one_token(SHARED_PREFIX + (TAIL_A * 3 if legacy else TAIL_C) + " Then the fire went out.")
         assert back.body["timings"]["cache_n"] >= _held(cut) - 1
         server.stop()
@@ -712,6 +717,170 @@ def test_shared_prefix_is_copied_to_the_empty_slot(monkeypatch):
         replies.append([res.body["content"] for res in (first, other, again, more)])
         server.stop()
     assert replies[0] == replies[1]
+
+
+def test_young_branches_keep_separate_slots(monkeypatch):
+    monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+    log = _shared_prefix_server(3)
+    prefix = SHARED_PREFIX * 4
+    first = _reply(prefix + " The red bird sings.")
+    log.drain()
+    sibling = _reply(prefix + " The blue cat sleeps.")
+    assert sibling.body["id_slot"] != first.body["id_slot"]
+    assert "cache_save reason=saved" not in log.drain()
+    again = _reply(prefix + " The red bird sings. What happens next?")
+    assert again.body["id_slot"] == first.body["id_slot"]
+    assert again.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+    assert sibling.body["timings"]["cache_n"] > first.body["timings"]["prompt_n"] // 2
+
+
+@pytest.mark.parametrize("copy_prefix", [False, True])
+def test_editing_the_last_prompt_keeps_its_prefix(monkeypatch, copy_prefix):
+    if copy_prefix:
+        monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+    else:
+        monkeypatch.delenv("LLAMA_SLOT_PREFIX_COPY", raising=False)
+    log = _shared_prefix_server(2)
+    prefix = SHARED_PREFIX * 6
+    first = _reply(prefix + " The red bird sings.")
+    log.drain()
+    edited = _reply(prefix + " The blue cat sleeps.")
+    assert edited.body["timings"]["cache_n"] > first.body["timings"]["prompt_n"] // 2
+    assert (edited.body["id_slot"] != first.body["id_slot"]) == copy_prefix
+    assert "cache_save reason=saved" not in log.drain()
+
+
+@pytest.mark.parametrize("async_state", [False, True])
+def test_prefix_donor_does_not_choose_the_victim(monkeypatch, async_state):
+    monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+    if async_state:
+        monkeypatch.setenv("LLAMA_STATE_SAVE_ASYNC", "1")
+        monkeypatch.setenv("LLAMA_STATE_RESTORE_ASYNC", "1")
+    log = _shared_prefix_server(3)
+    prefix = SHARED_PREFIX * 4
+    prompts = [prefix + TAIL_A * 2, prefix + TAIL_C, "Once upon a time there was a small cat."]
+    held = [_one_token(prompt) for prompt in prompts]
+    assert len({res.body["id_slot"] for res in held}) == 3
+    refreshed = server.make_request("POST", "/completion", data={
+        "prompt": prompts, "cache_prompt": True, "n_predict": 1,
+    })
+    assert refreshed.status_code == 200
+    log.drain()
+    branch = _reply(prefix + TAIL_E)
+    assert branch.body["id_slot"] == held[2].body["id_slot"]
+    n_shared = len(server.make_request("POST", "/tokenize", data={"content": prefix}).body["tokens"])
+    assert branch.body["timings"]["cache_n"] >= n_shared - 2
+    assert "cache_save reason=saved" in log.drain()
+    for prompt, previous in zip(prompts[:2], held[:2]):
+        continued = _reply(prompt + " What happens next?")
+        assert continued.body["id_slot"] == previous.body["id_slot"]
+        assert continued.body["timings"]["cache_n"] >= _held(previous) - 1
+
+
+def test_restored_input_boundary_uses_the_existing_reuse_rule(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+    server.slot_save_path = str(tmp_path)
+    log = _shared_prefix_server(2)
+    prefix = SHARED_PREFIX * 6
+    first = _reply(prefix + " The red bird sings.")
+    slot = first.body["id_slot"]
+    for action in ("save", "restore"):
+        res = server.make_request("POST", f"/slots/{slot}?action={action}", data={"filename": "boundary.bin"})
+        assert res.status_code == 200
+    log.drain()
+    edited = _reply(prefix + " The blue cat sleeps.")
+    assert edited.body["id_slot"] == slot
+    assert edited.body["timings"]["cache_n"] > first.body["timings"]["prompt_n"] // 2
+    assert "cache_save reason=saved" not in log.drain()
+
+
+def test_young_branch_is_saved_when_every_slot_is_occupied(monkeypatch):
+    monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+    log = _shared_prefix_server(1)
+    prefix = SHARED_PREFIX * 4
+    first = _reply(prefix + " The red bird sings.")
+    log.drain()
+    _reply(prefix + " The blue cat sleeps.")
+    assert "cache_save reason=saved" in log.drain()
+    again = _reply(prefix + " The red bird sings. What happens next?")
+    assert again.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+
+
+@pytest.mark.parametrize("cache_prompt", [False, True])
+@pytest.mark.parametrize("identical", [False, True])
+def test_simultaneous_requests_read_the_shared_prefix_once(monkeypatch, cache_prompt, identical):
+    replies = []
+    for copy_prefix in (False, True):
+        if copy_prefix:
+            monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+        else:
+            monkeypatch.delenv("LLAMA_SLOT_PREFIX_COPY", raising=False)
+        server.no_cache_idle_slots = True
+        server.n_slots = 4
+        server.n_ctx = 8192
+        server.n_batch = 128
+        server.n_ubatch = 128
+        server.start()
+        prefix = SHARED_PREFIX * 6
+        n_shared = len(server.make_request("POST", "/tokenize", data={"content": prefix}).body["tokens"])
+        tails = [" The red bird sings.", " The blue cat sleeps.", " The green frog jumps."]
+        prompts = [prefix + (tails[0] if identical else tail) for tail in tails]
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompts, "cache_prompt": cache_prompt, "n_predict": 8,
+        })
+        assert res.status_code == 200
+        assert len(res.body) == len(prompts)
+        assert len({item["id_slot"] for item in res.body}) == len(prompts)
+        cached = sorted(item["timings"]["cache_n"] for item in res.body)
+        if copy_prefix and cache_prompt:
+            assert cached[0] == 0
+            assert cached[1] >= n_shared - 2
+            assert cached[2] >= n_shared - 2
+        else:
+            assert cached == [0, 0, 0]
+        replies.append([item["content"] for item in res.body])
+        server.stop()
+    assert replies[0] == replies[1]
+
+
+def test_cancelled_prefix_source_releases_its_waiter(monkeypatch):
+    monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+    server.no_cache_idle_slots = True
+    server.n_slots = 2
+    server.n_ctx = 4096
+    server.n_batch = 2
+    server.n_ubatch = 2
+    server.n_threads = 1
+    server.start()
+    log = LogReader(server.log_path)
+    prefix = SHARED_PREFIX * 8
+    result = []
+    errors = []
+
+    def finish_follower():
+        try:
+            result.append(_reply(prefix + " The blue cat sleeps."))
+        except Exception as error:
+            errors.append(error)
+
+    follower = threading.Thread(target=finish_follower)
+    try:
+        with requests.post(server.make_url("/completion"), json={
+            "prompt": prefix + " The red bird sings.",
+            "cache_prompt": True, "n_predict": 256,
+            "stream": True, "return_progress": True,
+        }, stream=True, timeout=DEFAULT_REQUEST_TIMEOUT) as source:
+            assert source.status_code == 200, source.text
+            follower.start()
+            assert "prefix tokens from slot" in log.wait_for("prefix tokens from slot")
+        assert "prefix source ended" in log.wait_for("prefix source ended")
+    finally:
+        if follower.ident is not None:
+            follower.join(timeout=DEFAULT_REQUEST_TIMEOUT)
+    assert not follower.is_alive()
+    assert not errors
+    assert len(result) == 1
+    assert result[0].body["timings"]["cache_n"] == 0
 
 
 # A slot that holds cells another slot holds is never shifted: with the switch a request's n_cache_reuse is ignored.
