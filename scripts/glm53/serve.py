@@ -59,6 +59,9 @@ def arguments(argv=None):
     parser.add_argument("--save-async", action="store_true",
                         help="A session whose slot another session takes is copied to the RAM prompt cache on a thread of "
                              "its own while the other sessions decode (opt-in: not read on four cards)")
+    parser.add_argument("--state-copy-legacy", action="store_true",
+                        help="A save to the RAM prompt cache and a restore from it copy a session's runs of cells one "
+                             "by one, as before the batched copies: the off switch, to compare the two on a box")
     parser.add_argument("--cache-ram", type=int, default=32768, metavar="MIB",
                         help="RAM the prompt cache may hold, in MiB: a session whose slot another session took waits "
                              "there, and the oldest leave when it is full (default: 32768; -1 is no limit, 0 is no cache)")
@@ -289,6 +292,10 @@ def make_plan(args):
         # A save for a slot that changes hands stops the server's thread only to write the state's layout; the request
         # that takes the slot waits its turn while the rows are copied beside the other sessions' steps
         env["LLAMA_STATE_SAVE_ASYNC"] = "1"
+    if args.state_copy_legacy:
+        # A session's state is one tensor range for each run of cells that follow each other, a layer: by default a device
+        # copies them as batches through a scratch it keeps, and with this each range is a copy of its own
+        env["GGML_TENSOR_N_STAGE_LEGACY"] = "1"
     if args.prefix_copy:
         if dp:
             raise ValueError("prefix-copy is for the tensor profiles: it shares the cells of one pool")
