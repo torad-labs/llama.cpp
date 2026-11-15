@@ -243,6 +243,7 @@ size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * ds
     }
 
     llama_io_write_listed io(dst, size);
+    state_seq_copies = 0;
     try {
         io.write(&io_magic, sizeof(io_magic));
         io.write(&seq_id,   sizeof(seq_id));
@@ -258,6 +259,7 @@ size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * ds
         state_async = std::make_unique<llama_state_async>();
     }
     state_async->submit(seq_id, io.copies, /*to_device =*/ false);
+    state_seq_copies = io.copies.size();
     return io.n_bytes();
 }
 
@@ -268,6 +270,7 @@ size_t llama_context::state_seq_set_data_async(llama_seq_id seq_id, const uint8_
     }
 
     llama_io_read_listed io(src, size);
+    state_seq_copies = 0;
     bool ok = false;
     try {
         uint32_t magic_read;
@@ -291,6 +294,7 @@ size_t llama_context::state_seq_set_data_async(llama_seq_id seq_id, const uint8_
             state_async = std::make_unique<llama_state_async>();
         }
         state_async->submit(seq_id, io.copies, /*to_device =*/ true);
+        state_seq_copies = io.copies.size();
         return io.n_bytes();
     }
 
@@ -350,6 +354,7 @@ size_t llama_context::state_seq_get_data_staged(llama_seq_id seq_id, uint8_t * d
                 state_async = std::make_unique<llama_state_async>();
             }
             state_async->submit(llama_state_async::staged_key(row), io.copies, /*to_device =*/ false);
+            state_seq_copies = io.copies.size();
             return io.n_bytes();
         }
     }
@@ -442,4 +447,8 @@ bool llama_state_seq_async_pending(const llama_context * ctx, llama_seq_id seq_i
 
 void llama_state_seq_async_wait(const llama_context * ctx, llama_seq_id seq_id) {
     ctx->state_async_wait(seq_id);
+}
+
+size_t llama_state_seq_n_copies(const llama_context * ctx) {
+    return ctx->state_seq_copies;
 }

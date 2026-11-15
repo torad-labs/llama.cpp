@@ -4982,6 +4982,10 @@ public:
         return size_written;
     }
 
+    size_t n_copies() const {
+        return winfos.size();
+    }
+
 private:
     uint8_t * ptr;
     uint8_t * base_ptr;
@@ -5054,6 +5058,10 @@ public:
 
     size_t n_bytes() override {
         return size_read;
+    }
+
+    size_t n_copies() const {
+        return rinfos.size();
     }
 
 private:
@@ -5486,17 +5494,21 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_write_i> io;
+    llama_io_write_host * io_host = nullptr;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        io.reset(io_host = new llama_io_write_host(dst, size));
     }
 
+    state_seq_copies = 0;
     try {
         io->write(&io_magic, sizeof(io_magic));
         io->write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(*io, seq_id, flags);
+        const size_t res = state_seq_write_data(*io, seq_id, flags);
+        state_seq_copies = io_host ? io_host->n_copies() : 0;
+        return res;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -5505,6 +5517,8 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_read_i> io;
+    llama_io_read_host * io_host = nullptr;
+    state_seq_copies = 0;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
         io = std::make_unique<llama_io_read_host>(src, size);
@@ -5522,7 +5536,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
     } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
+        io.reset(io_host = new llama_io_read_host(src, size));
     }
 
     try {
@@ -5535,7 +5549,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        return state_seq_read_data(*io, seq_id, flags);
+        const size_t res = state_seq_read_data(*io, seq_id, flags);
+        state_seq_copies = io_host ? io_host->n_copies() : 0;
+        return res;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         io->discard();

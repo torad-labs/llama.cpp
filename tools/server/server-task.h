@@ -851,6 +851,7 @@ private:
         int32_t id_slot;
         int64_t t_start;
         int64_t t_placed;
+        size_t n_copies;
         server_prompt_cache_state state;
     };
     std::list<saving_state> saving;
@@ -859,7 +860,9 @@ private:
     std::map<int32_t, std::pair<size_t, server_prompt_cache_result>> saving_refused;
 
     // the state joins the cache and the limits are applied: saved, or no_space when they took it out again
-    server_prompt_cache_result publish(server_prompt_cache_state && state, const server_prompt_cache_state * protect, int32_t id_slot);
+    // n_copies: the tensor ranges its save copied (llama_state_seq_n_copies), for the log
+    server_prompt_cache_result publish(server_prompt_cache_state && state, const server_prompt_cache_state * protect, int32_t id_slot,
+            size_t n_copies);
 
     void insert_state(server_prompt_cache_state && state);
     std::list<server_prompt_cache_state>::iterator erase_state(std::list<server_prompt_cache_state>::iterator it);

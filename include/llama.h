@@ -978,6 +978,11 @@ extern "C" {
     LLAMA_API bool llama_state_seq_async_pending(const struct llama_context * ctx, llama_seq_id seq_id);
     LLAMA_API void llama_state_seq_async_wait   (const struct llama_context * ctx, llama_seq_id seq_id);
 
+    // The tensor ranges the context's last llama_state_seq_get_data_* or llama_state_seq_set_data_* call copied between
+    // the devices and host memory, or left for the context's thread to copy: in each layer, one for every run of cells
+    // that follow each other. 0 for a state that stays on the device.
+    LLAMA_API size_t llama_state_seq_n_copies(const struct llama_context * ctx);
+
     // llama_state_seq_get_data_ext for a partial state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) in host memory, where the
     // context has spare rows for it (LLAMA_RS_STAGE_ROWS=N: a recurrent state of f32 on one set of sequence devices;
     // llama_state_staged_rows() says how many). The state is copied to a free spare row on the devices, and a thread
