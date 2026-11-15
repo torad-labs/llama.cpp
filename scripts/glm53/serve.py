@@ -70,9 +70,9 @@ def arguments(argv=None):
                              "end resumes from one, and a session saved to the prompt cache takes them all with it "
                              "(default: the engine's 32; 0 makes none)")
     parser.add_argument("--prefix-copy", action="store_true",
-                        help="Tensor profiles: a session that starts in an empty slot takes the prefix it shares with an "
-                             "idle session (a system prompt) from that session's slot, and reads only what follows it. "
-                             "The pool's cells are shared and no row is copied (opt-in: not read on four cards)")
+                        help="Tensor profiles: a session in an empty slot reuses a shared prefix from an idle or active "
+                             "session. Simultaneous starts can wait for one reader to reach their fork. KV cells are "
+                             "shared; recurrent state is copied (opt-in: not read on four cards)")
     parser.add_argument("--shared-cells-legacy", action="store_true",
                         help="While two sessions hold the same cells (a prefix copy), every session's pool maps go the "
                              "packed way, as before the streams that share cells: the off switch, to compare the two on a box")
