@@ -428,8 +428,8 @@ static bool prompt_share_legacy() {
     return legacy;
 }
 
-// LLAMA_SLOT_PREFIX_COPY=1: a request that takes an empty slot starts from a copy of the idle slot it shares a prefix with, and reads only what follows the prefix.
-// The copy shares the cells of a unified cache and copies no row, so it is made only with --kv-unified.
+// LLAMA_SLOT_PREFIX_COPY=1: requests reuse a shared prefix from an idle or active slot instead of reading it again.
+// KV cells are shared and recurrent state is copied, only with --kv-unified.
 static bool slot_prefix_copy() {
     static const bool copy = ggml_env_switch("LLAMA_SLOT_PREFIX_COPY");
     return copy;
@@ -2533,6 +2533,7 @@ private:
         // the idle slot an empty slot starts as a copy of, and the tokens the request reuses of it [LLAMA_SLOT_PREFIX_COPY]
         const server_slot * donor = nullptr;
         size_t donor_reuse = 0;
+        bool copy_overwrite = false;
         id_slot_copied = -1;
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
@@ -2597,8 +2598,9 @@ private:
                     continue;
                 }
 
-                // A continuation keeps the last input prompt. A branch or an edit before that boundary keeps its own slot when one is free.
-                if (named || slot.prompt.is_continuation(lcp_len)) {
+                // Separate branches only when copying preserves their prefix. Otherwise an edited prompt must keep the old reuse path.
+                const bool split_branch = prefix_copy() && slot.prompt.n_tokens_input >= 0;
+                if (named || (split_branch ? slot.prompt.is_continuation(lcp_len) : 2 * reusable >= tokens.size())) {
                     if (f_sim_cur > f_sim_best) {
                         f_sim_best = f_sim_cur;
                         resident_reuse = reusable;
@@ -2626,19 +2628,37 @@ private:
                     }
                 }
             } else if (ret == nullptr && !held.empty()) {
-                // No slot is empty, so one conversation is cut. Among the slots that reuse about as much as the best one (within a quarter of the request),
-                // take the one whose conversation costs the least to cut: the fewest tokens for each second it has been idle (server_slot::victim_cost).
+                // With no empty slot, prefer low rebuild cost. Without a separate copy donor, keep the near-best-prefix candidates.
                 size_t reuse_best = 0;
                 for (const auto & cur : held) {
                     reuse_best = std::max(reuse_best, cur.second);
                 }
+                if (prefix_copy() && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
+                        !task.is_parent() && !task.is_child() && !task.is_stateless() && !task.tokens.has_mtmd) {
+                    const auto lora = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+                    for (const auto & cur : held) {
+                        if (cur.second > donor_reuse && !cur.first->prompt.tokens.has_mtmd &&
+                                float(cur.second) / task.tokens.size() > slot_prompt_similarity &&
+                                are_lora_equal(cur.first->lora, lora)) {
+                            donor = cur.first;
+                            donor_reuse = cur.second;
+                        }
+                    }
+                }
                 const size_t margin = task.tokens.size() / 4;
                 const int64_t t_now = ggml_time_us();
                 for (const auto & cur : held) {
-                    if (cur.second + margin >= reuse_best && (ret == nullptr || cur.first->is_victim_before(*ret, t_now))) {
+                    // A separate donor keeps the reusable prefix, so the cheapest victim need not hold it.
+                    if ((donor || cur.second + margin >= reuse_best) && (ret == nullptr || cur.first->is_victim_before(*ret, t_now))) {
                         ret = cur.first;
                         resident_reuse = cur.second;
                     }
+                }
+                if (donor && donor != ret) {
+                    copy_overwrite = true;
+                    update_cache = true;
+                } else {
+                    donor = nullptr;
                 }
                 f_sim_best = task.tokens.empty() ? 0.0f : float(*resident_reuse) / task.tokens.size();
                 by_lru = true;
@@ -2659,7 +2679,8 @@ private:
                 }
 
                 // Save a displaced branch even when it shares most of this young conversation.
-                if (f_keep < 0.5f || (!named && !ret->prompt.is_continuation(ret->prompt.tokens.get_common_prefix(task.tokens)))) {
+                if (f_keep < 0.5f || (!named && prefix_copy() && ret->prompt.n_tokens_input >= 0 &&
+                        !ret->prompt.is_continuation(ret->prompt.tokens.get_common_prefix(task.tokens)))) {
                     update_cache = true;
                 }
             }
@@ -2679,8 +2700,8 @@ private:
             }
         }
 
-        // The copy is for a request that reuses a prompt and took an empty slot. A snapshot in RAM is restored in its place only when it reuses more than the copy does.
-        if (donor && ret && ret->prompt.tokens.empty() && task.params.cache_prompt && !task.is_stateless() && !task.is_parent()) {
+        // A victim is saved before its prompt is replaced by the donor's. A better RAM snapshot still wins over the copy.
+        if (donor && ret && (ret->prompt.tokens.empty() || copy_overwrite) && task.params.cache_prompt && !task.is_stateless() && !task.is_parent()) {
             resident_reuse = donor_reuse;
         } else {
             donor = nullptr;
@@ -2737,6 +2758,9 @@ private:
         if (donor) {
             // The request keeps the prefix it shares and cuts the rest of the copy when it starts, as it does in a slot it takes over. The slot copied from keeps everything.
             donor->checkpoints_wait(); // the copy shares the checkpoints: every one it holds is whole before it can be restored
+            if (!ret->prompt.tokens.empty()) {
+                ret->prompt_clear();
+            }
             donor->copy_prompt_to(*ret);
             ret->lora = donor->lora; // the request runs with these adapters, so the launch finds none changed and keeps the copy
             id_slot_copied = ret->id;

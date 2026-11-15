@@ -719,12 +719,8 @@ def test_shared_prefix_is_copied_to_the_empty_slot(monkeypatch):
     assert replies[0] == replies[1]
 
 
-@pytest.mark.parametrize("copy_prefix", [False, True])
-def test_young_branches_keep_separate_slots(monkeypatch, copy_prefix):
-    if copy_prefix:
-        monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
-    else:
-        monkeypatch.delenv("LLAMA_SLOT_PREFIX_COPY", raising=False)
+def test_young_branches_keep_separate_slots(monkeypatch):
+    monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
     log = _shared_prefix_server(3)
     prefix = SHARED_PREFIX * 4
     first = _reply(prefix + " The red bird sings.")
@@ -735,11 +731,71 @@ def test_young_branches_keep_separate_slots(monkeypatch, copy_prefix):
     again = _reply(prefix + " The red bird sings. What happens next?")
     assert again.body["id_slot"] == first.body["id_slot"]
     assert again.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+    assert sibling.body["timings"]["cache_n"] > first.body["timings"]["prompt_n"] // 2
+
+
+@pytest.mark.parametrize("copy_prefix", [False, True])
+def test_editing_the_last_prompt_keeps_its_prefix(monkeypatch, copy_prefix):
     if copy_prefix:
-        assert sibling.body["timings"]["cache_n"] > first.body["timings"]["prompt_n"] // 2
+        monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+    else:
+        monkeypatch.delenv("LLAMA_SLOT_PREFIX_COPY", raising=False)
+    log = _shared_prefix_server(2)
+    prefix = SHARED_PREFIX * 6
+    first = _reply(prefix + " The red bird sings.")
+    log.drain()
+    edited = _reply(prefix + " The blue cat sleeps.")
+    assert edited.body["timings"]["cache_n"] > first.body["timings"]["prompt_n"] // 2
+    assert (edited.body["id_slot"] != first.body["id_slot"]) == copy_prefix
+    assert "cache_save reason=saved" not in log.drain()
 
 
-def test_young_branch_is_saved_when_every_slot_is_occupied():
+@pytest.mark.parametrize("async_state", [False, True])
+def test_prefix_donor_does_not_choose_the_victim(monkeypatch, async_state):
+    monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+    if async_state:
+        monkeypatch.setenv("LLAMA_STATE_SAVE_ASYNC", "1")
+        monkeypatch.setenv("LLAMA_STATE_RESTORE_ASYNC", "1")
+    log = _shared_prefix_server(3)
+    prefix = SHARED_PREFIX * 4
+    prompts = [prefix + TAIL_A * 2, prefix + TAIL_C, "Once upon a time there was a small cat."]
+    held = [_one_token(prompt) for prompt in prompts]
+    assert len({res.body["id_slot"] for res in held}) == 3
+    refreshed = server.make_request("POST", "/completion", data={
+        "prompt": prompts, "cache_prompt": True, "n_predict": 1,
+    })
+    assert refreshed.status_code == 200
+    log.drain()
+    branch = _reply(prefix + TAIL_E)
+    assert branch.body["id_slot"] == held[2].body["id_slot"]
+    n_shared = len(server.make_request("POST", "/tokenize", data={"content": prefix}).body["tokens"])
+    assert branch.body["timings"]["cache_n"] >= n_shared - 2
+    assert "cache_save reason=saved" in log.drain()
+    for prompt, previous in zip(prompts[:2], held[:2]):
+        continued = _reply(prompt + " What happens next?")
+        assert continued.body["id_slot"] == previous.body["id_slot"]
+        assert continued.body["timings"]["cache_n"] >= _held(previous) - 1
+
+
+def test_restored_input_boundary_uses_the_existing_reuse_rule(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
+    server.slot_save_path = str(tmp_path)
+    log = _shared_prefix_server(2)
+    prefix = SHARED_PREFIX * 6
+    first = _reply(prefix + " The red bird sings.")
+    slot = first.body["id_slot"]
+    for action in ("save", "restore"):
+        res = server.make_request("POST", f"/slots/{slot}?action={action}", data={"filename": "boundary.bin"})
+        assert res.status_code == 200
+    log.drain()
+    edited = _reply(prefix + " The blue cat sleeps.")
+    assert edited.body["id_slot"] == slot
+    assert edited.body["timings"]["cache_n"] > first.body["timings"]["prompt_n"] // 2
+    assert "cache_save reason=saved" not in log.drain()
+
+
+def test_young_branch_is_saved_when_every_slot_is_occupied(monkeypatch):
+    monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", "1")
     log = _shared_prefix_server(1)
     prefix = SHARED_PREFIX * 4
     first = _reply(prefix + " The red bird sings.")
