@@ -16,6 +16,11 @@
 // llama_decode answers -4 for a batch that holds one, no state of it and no state of the whole context is saved, a
 // copy of one is dropped too, the sequence past the placement keeps its state and decodes, and a dropped sequence
 // that is removed starts again.
+//
+// check_saved_after_restores: a step of two sequences, two other sequences restored, then the step's two saved, the
+// order a server takes when four slots get a prompt at once: both saved states are the ones the step left.
+//
+// --ranks N: the model split by tensor over N logical ranks of the first GPU device, as a tensor profile runs it.
 
 #include "llama.h"
 
@@ -342,15 +347,92 @@ done:
     return ok;
 }
 
+// A step of two sequences, then two other sequences restored from their saved states, then the step's two saved: the
+// order a server takes when four slots get a prompt at once (two read on together, the other two roll back to a
+// checkpoint, and the first two's checkpoints are made after that). A restore places its one sequence at the first
+// row, so the states of the step's sequences move between the step and the save. What is saved is the state the step
+// left, for both: the reference pass saves right after the step
+static bool check_saved_after_restores(llama_model * model, bool restore_first) {
+    const char * what = restore_first ? "a save after restores, sequences rolled back before their step" : "a save after restores";
+    const llama_state_seq_flags partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    const int n_prompt = 12;
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx      = 2048;
+    cparams.n_batch    = 1024;
+    cparams.n_ubatch   = 1024;
+    cparams.n_seq_max  = n_seq_dropped;
+    cparams.n_rs_seq   = 2;
+    cparams.kv_unified = true;
+
+    std::vector<uint8_t> saved[2][2];
+
+    for (int pass = 0; pass < 2; ++pass) {
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        if (ctx == nullptr) {
+            fprintf(stderr, "%s: failed to create the context\n", what);
+            return false;
+        }
+        llama_memory_t mem = llama_get_memory(ctx);
+        decoder dec = { ctx, llama_model_get_vocab(model) };
+        std::vector<uint8_t> ck[n_seq_dropped];
+
+        const auto roll_back = [&](llama_seq_id seq) {
+            if (llama_state_seq_set_data_ext(ctx, ck[seq].data(), ck[seq].size(), seq, partial) != ck[seq].size()) {
+                return false;
+            }
+            llama_memory_seq_rm(mem, seq, n_prompt, -1);
+            dec.pos[seq] = n_prompt;
+            return true;
+        };
+
+        bool ok = dec.run({ 0, 1, 2, 3 }, n_prompt);
+        for (llama_seq_id seq = 0; ok && seq < n_seq_dropped; ++seq) {
+            ck[seq] = blocking(ctx, seq, partial);
+            ok = !ck[seq].empty();
+        }
+        // each goes on past its saved state, as a reply does
+        ok = ok && dec.run({ 0, 1, 2, 3 }, 3) && dec.run({ 1 }, 2) && dec.run({ 3 }, 2);
+        // 0 and 2 read on in one step, from their saved states or from where they are
+        if (restore_first) {
+            ok = ok && roll_back(0) && roll_back(2);
+        }
+        ok = ok && dec.run({ 0, 2 }, 316);
+        if (pass == 1) {
+            ok = ok && roll_back(1) && roll_back(3);
+        }
+        if (ok) {
+            saved[pass][0] = blocking(ctx, 0, partial);
+            saved[pass][1] = blocking(ctx, 2, partial);
+        }
+        llama_free(ctx);
+        if (!ok) {
+            fprintf(stderr, "%s: FAIL, pass %d did not decode, save or restore\n", what, pass);
+            return false;
+        }
+    }
+
+    const bool same_0 = same(what, "the first sequence of the step, saved after two restores", saved[1][0], saved[0][0]);
+    const bool same_2 = same(what, "the second sequence of the step, saved after two restores", saved[1][1], saved[0][1]);
+    if (same_0 && same_2) {
+        fprintf(stderr, "%s: ok, %zu bytes a state\n", what, saved[0][0].size());
+    }
+    return same_0 && same_2;
+}
+
 int main(int argc, char ** argv) {
     const char * path = nullptr;
+    int n_ranks = 0;
     for (int i = 1; i + 1 < argc; ++i) {
         if (strcmp(argv[i], "-m") == 0) {
             path = argv[i + 1];
         }
+        if (strcmp(argv[i], "--ranks") == 0) {
+            n_ranks = atoi(argv[i + 1]);
+        }
     }
     if (path == nullptr) {
-        fprintf(stderr, "usage: %s -m model.gguf\n", argv[0]);
+        fprintf(stderr, "usage: %s -m model.gguf [--ranks N]\n", argv[0]);
         return 1;
     }
 
@@ -359,6 +441,24 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 99;
+    // --ranks N: the model split by tensor over N logical ranks of the first GPU device, as a tensor profile runs it
+    std::vector<ggml_backend_dev_t> ranks;
+    if (n_ranks > 0) {
+        ggml_backend_dev_t gpu = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count() && gpu == nullptr; ++i) {
+            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                gpu = ggml_backend_dev_get(i);
+            }
+        }
+        if (gpu == nullptr) {
+            fprintf(stderr, "--ranks: no GPU device\n");
+            return 1;
+        }
+        ranks.assign(n_ranks, gpu);
+        ranks.push_back(nullptr);
+        mparams.devices    = ranks.data();
+        mparams.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+    }
     llama_model * model = llama_model_load_from_file(path, mparams);
     if (model == nullptr) {
         fprintf(stderr, "failed to load %s\n", path);
@@ -370,6 +470,9 @@ int main(int argc, char ** argv) {
         n_fail += check(model, n_rs_seq) ? 0 : 1;
     }
     n_fail += check_dropped(model) ? 0 : 1;
+    for (const bool restore_first : { false, true }) {
+        n_fail += check_saved_after_restores(model, restore_first) ? 0 : 1;
+    }
 
     llama_model_free(model);
     llama_backend_free();
