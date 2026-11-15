@@ -48,7 +48,7 @@ private:
 
     void run();
 
-    // LLAMA_STATE_ASYNC_CHUNK_KIB: the bytes of one copy call. A copy engine takes copies of one direction in the order they come, so a small copy of another stream waits for one chunk at most. 0: a copy is one call
+    // LLAMA_STATE_ASYNC_CHUNK_KIB: the bytes of one copy call, which is a batch of copies that follow each other or a part of a larger copy. A copy engine takes copies of one direction in the order they come, so a small copy of another stream waits for one chunk at most. 0: a job's copies are one call
     const size_t chunk;
 
     std::mutex mutex;

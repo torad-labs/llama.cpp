@@ -2,7 +2,11 @@
 #include "common.cuh"
 #include "ggml-cpp.h"
 
+#include <algorithm>
 #include <climits>
+#include <mutex>
+#include <type_traits>
+#include <vector>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 struct ggml_cuda_batch_get_descriptor {
@@ -80,7 +84,194 @@ struct ggml_cuda_batch_get_mapping {
         }
     }
 };
+
+// A scratch on each physical device for batched copies. It is made at the first batch and kept.
+struct ggml_cuda_batch_stage {
+    static constexpr size_t capacity   = ggml_cuda_tensor_n_stage_bytes;
+    static constexpr size_t max_copies = 16*1024;
+
+    std::mutex mutex;
+    unsigned char * data = nullptr;
+    ggml_cuda_batch_get_descriptor * copies = nullptr;
+    bool failed = false;
+};
+
+static ggml_cuda_batch_stage & ggml_cuda_batch_stage_for(int device) {
+    static ggml_cuda_batch_stage stages[GGML_CUDA_MAX_DEVICES];
+    return stages[ggml_cuda_info().devices[device].physical_device];
+}
+
+// write: the host ranges go to the scratch as one copy per run of adjacent ranges, and a kernel scatters them to the tensors.
+// Otherwise a kernel gathers the tensor ranges into the scratch, and they go to host memory the same way.
+template <bool write>
+static bool ggml_cuda_tensor_n_staged(int device,
+        const ggml_tensor * const * tensors, std::conditional_t<write, const void *, void *> const * data,
+        const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    constexpr size_t min_copies = 4;
+    constexpr size_t max_size = ggml_cuda_batch_stage::capacity / 2;
+
+    // the ranges that are written: a batch writes them in no order, so they must not overlap
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+    ranges.reserve(n_tensors);
+    size_t n_staged = 0;
+    bool sorted = true;
+    for (size_t i = 0; i < n_tensors; ++i) {
+        if (sizes[i] == 0) {
+            continue;
+        }
+        const uintptr_t address = write ? (uintptr_t) tensors[i]->data + offsets[i] : (uintptr_t) data[i];
+        GGML_ASSERT(address <= UINTPTR_MAX - sizes[i]);
+        sorted = sorted && (ranges.empty() || ranges.back().second <= address);
+        ranges.emplace_back(address, address + sizes[i]);
+        n_staged += sizes[i] <= max_size;
+    }
+    if (n_staged < min_copies) {
+        return false;
+    }
+    if (!sorted) {
+        std::sort(ranges.begin(), ranges.end());
+        for (size_t i = 1; i < ranges.size(); ++i) {
+            if (ranges[i].first < ranges[i - 1].second) {
+                return false;
+            }
+        }
+    }
+
+    auto & stage = ggml_cuda_batch_stage_for(device);
+    std::lock_guard<std::mutex> lock(stage.mutex);
+    if (stage.failed) {
+        return false;
+    }
+    if (stage.data == nullptr) {
+        void * scratch = nullptr;
+        void * copies = nullptr;
+        if (cudaMalloc(&scratch, ggml_cuda_batch_stage::capacity) != cudaSuccess ||
+                cudaMalloc(&copies, ggml_cuda_batch_stage::max_copies * sizeof(ggml_cuda_batch_get_descriptor)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (scratch) {
+                CUDA_CHECK(cudaFree(scratch));
+            }
+            stage.failed = true;
+            return false;
+        }
+        stage.data = (unsigned char *) scratch;
+        stage.copies = (ggml_cuda_batch_get_descriptor *) copies;
+    }
+
+    // a run of ranges that are adjacent in host memory, in the order they have in the scratch
+    struct span {
+        std::conditional_t<write, const unsigned char *, unsigned char *> host;
+        size_t at;
+        size_t size;
+    };
+    std::vector<ggml_cuda_batch_get_descriptor> copies;
+    std::vector<span> spans;
+    size_t used = 0;
+    [[maybe_unused]] const unsigned char * last_host = nullptr;
+    const size_t nsm = ggml_cuda_info().devices[device].nsm;
+    const cudaStream_t stream = cudaStreamPerThread;
+
+    const auto flush = [&]() {
+        if (copies.empty()) {
+            return;
+        }
+        // a copy from pageable memory returns once it has read the memory, so the descriptors can be filled again
+        CUDA_CHECK(cudaMemcpyAsync(stage.copies, copies.data(), copies.size() * sizeof(copies[0]), cudaMemcpyHostToDevice, stream));
+        if constexpr (write) {
+            for (const auto & s : spans) {
+                CUDA_CHECK(cudaMemcpyAsync(stage.data + s.at, s.host, s.size, cudaMemcpyHostToDevice, stream));
+            }
+        }
+        const size_t blocks_per_copy = std::min<size_t>(UINT16_MAX, std::max<size_t>(1, (nsm + copies.size() - 1) / copies.size()));
+        const dim3 blocks((unsigned int) copies.size(), (unsigned int) blocks_per_copy);
+        ggml_cuda_batch_get_kernel<<<blocks, 256, 0, stream>>>(stage.copies, copies.size());
+        CUDA_CHECK(cudaGetLastError());
+        if constexpr (!write) {
+            for (const auto & s : spans) {
+                CUDA_CHECK(cudaMemcpyAsync(s.host, stage.data + s.at, s.size, cudaMemcpyDeviceToHost, stream));
+            }
+        }
+        // the scratch is free again, and a copy of another stream can go before the next part
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        copies.clear();
+        spans.clear();
+        used = 0;
+    };
+
+    for (size_t i = 0; i < n_tensors; ++i) {
+        if (sizes[i] == 0) {
+            continue;
+        }
+        unsigned char * tensor = (unsigned char *) tensors[i]->data + offsets[i];
+        if (sizes[i] > max_size) {
+            if constexpr (write) {
+                CUDA_CHECK(cudaMemcpyAsync(tensor, data[i], sizes[i], cudaMemcpyHostToDevice, stream));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(data[i], tensor, sizes[i], cudaMemcpyDeviceToHost, stream));
+            }
+            continue;
+        }
+        if (used + sizes[i] > ggml_cuda_batch_stage::capacity || copies.size() == ggml_cuda_batch_stage::max_copies) {
+            flush();
+        }
+        const auto host = (decltype(span::host)) data[i];
+        if constexpr (write) {
+            // the bytes of the range before, for another tensor: they are in the scratch (a tensor mirrored on two devices that are one card)
+            if (!copies.empty() && host == last_host && sizes[i] == copies.back().size) {
+                copies.push_back({copies.back().src, tensor, sizes[i]});
+                continue;
+            }
+            last_host = host;
+        }
+        if (!spans.empty() && spans.back().host + spans.back().size == host) {
+            spans.back().size += sizes[i];
+        } else {
+            spans.push_back({host, used, sizes[i]});
+        }
+        if constexpr (write) {
+            copies.push_back({stage.data + used, tensor, sizes[i]});
+        } else {
+            copies.push_back({tensor, stage.data + used, sizes[i]});
+        }
+        used += sizes[i];
+    }
+    flush();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
+}
 #endif
+
+bool ggml_cuda_get_tensor_n_staged(int device,
+        const ggml_tensor * const * tensors, void * const * data, const size_t * offsets,
+        const size_t * sizes, size_t n_tensors) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(device);
+    GGML_UNUSED(tensors);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offsets);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(n_tensors);
+    return false;
+#else
+    return ggml_cuda_tensor_n_staged<false>(device, tensors, data, offsets, sizes, n_tensors);
+#endif
+}
+
+bool ggml_cuda_set_tensor_n_staged(int device,
+        const ggml_tensor * const * tensors, const void * const * data, const size_t * offsets,
+        const size_t * sizes, size_t n_tensors) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(device);
+    GGML_UNUSED(tensors);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offsets);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(n_tensors);
+    return false;
+#else
+    return ggml_cuda_tensor_n_staged<true>(device, tensors, data, offsets, sizes, n_tensors);
+#endif
+}
 
 bool ggml_cuda_get_tensor_n(int device,
         const ggml_tensor * const * tensors, void * const * data, const size_t * offsets,

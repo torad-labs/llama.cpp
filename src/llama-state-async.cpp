@@ -87,7 +87,47 @@ void llama_state_async::run() {
         jobs.pop_front();
         lock.unlock();
 
-        for (const auto & c : cur.copies) {
+        // copies that follow each other go as one batched call of up to `chunk` bytes, which a device makes as a few copies
+        // GGML_TENSOR_N_STAGE_LEGACY=1: one call a copy, as before
+        static const bool batched = !ggml_env_switch("GGML_TENSOR_N_STAGE_LEGACY");
+        std::vector<ggml_tensor *> tensors;
+        std::vector<size_t>        offsets;
+        std::vector<size_t>        sizes;
+        std::vector<size_t>        data_offsets;
+        for (size_t i = 0; i < cur.copies.size();) {
+            size_t n_batch = 0;
+            size_t bytes   = 0;
+            uint8_t * base = cur.copies[i].ptr;
+            while (batched && i + n_batch < cur.copies.size()) {
+                const auto & c = cur.copies[i + n_batch];
+                if (chunk > 0 && bytes + c.size > chunk) {
+                    break;
+                }
+                base   = std::min(base, c.ptr);
+                bytes += c.size;
+                n_batch++;
+            }
+            if (n_batch > 1) {
+                tensors.clear();
+                offsets.clear();
+                sizes.clear();
+                data_offsets.clear();
+                for (size_t j = i; j < i + n_batch; ++j) {
+                    const auto & c = cur.copies[j];
+                    tensors.push_back(c.tensor);
+                    offsets.push_back(c.offset);
+                    sizes.push_back(c.size);
+                    data_offsets.push_back(c.ptr - base);
+                }
+                if (cur.to_device) {
+                    ggml_backend_tensor_set_n(tensors.data(), base, offsets.data(), sizes.data(), data_offsets.data(), n_batch);
+                } else {
+                    ggml_backend_tensor_get_n(tensors.data(), base, offsets.data(), sizes.data(), data_offsets.data(), n_batch);
+                }
+                i += n_batch;
+                continue;
+            }
+            const auto & c = cur.copies[i++];
             for (size_t done = 0; done < c.size;) {
                 const size_t n = chunk > 0 ? std::min(chunk, c.size - done) : c.size - done;
                 if (cur.to_device) {
@@ -203,6 +243,7 @@ size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * ds
     }
 
     llama_io_write_listed io(dst, size);
+    state_seq_copies = 0;
     try {
         io.write(&io_magic, sizeof(io_magic));
         io.write(&seq_id,   sizeof(seq_id));
@@ -218,6 +259,7 @@ size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * ds
         state_async = std::make_unique<llama_state_async>();
     }
     state_async->submit(seq_id, io.copies, /*to_device =*/ false);
+    state_seq_copies = io.copies.size();
     return io.n_bytes();
 }
 
@@ -228,6 +270,7 @@ size_t llama_context::state_seq_set_data_async(llama_seq_id seq_id, const uint8_
     }
 
     llama_io_read_listed io(src, size);
+    state_seq_copies = 0;
     bool ok = false;
     try {
         uint32_t magic_read;
@@ -251,6 +294,7 @@ size_t llama_context::state_seq_set_data_async(llama_seq_id seq_id, const uint8_
             state_async = std::make_unique<llama_state_async>();
         }
         state_async->submit(seq_id, io.copies, /*to_device =*/ true);
+        state_seq_copies = io.copies.size();
         return io.n_bytes();
     }
 
@@ -310,6 +354,7 @@ size_t llama_context::state_seq_get_data_staged(llama_seq_id seq_id, uint8_t * d
                 state_async = std::make_unique<llama_state_async>();
             }
             state_async->submit(llama_state_async::staged_key(row), io.copies, /*to_device =*/ false);
+            state_seq_copies = io.copies.size();
             return io.n_bytes();
         }
     }
@@ -402,4 +447,8 @@ bool llama_state_seq_async_pending(const llama_context * ctx, llama_seq_id seq_i
 
 void llama_state_seq_async_wait(const llama_context * ctx, llama_seq_id seq_id) {
     ctx->state_async_wait(seq_id);
+}
+
+size_t llama_state_seq_n_copies(const llama_context * ctx) {
+    return ctx->state_seq_copies;
 }

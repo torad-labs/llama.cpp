@@ -174,8 +174,8 @@ def test_clear_and_restore_async(monkeypatch):
         assert res.body["timings"]["cache_n"] > 0
         restored = log.wait_for("cache_restore reason=restored")
         assert ("async=1" in restored) == (switch == "1")
-        # the line gives the entry's size: its tokens, its bytes and the checkpoints among them
-        assert re.search(r"cache_restore reason=restored slot=0 tokens=\d+ bytes=\d+ checkpoints=\d+ ", restored)
+        # the line gives the entry's size: its tokens, its bytes and the checkpoints among them, and the copies the restore makes
+        assert re.search(r"cache_restore reason=restored slot=0 tokens=\d+ bytes=\d+ checkpoints=\d+ copies=[1-9]\d* ", restored)
         replies.append((res.body["content"], res.body["timings"]["cache_n"]))
         server.stop()
 
@@ -639,7 +639,7 @@ def test_shared_prefix_takes_the_least_recently_used_slot():
     content = log.wait_for("cache_save reason=saved")
     assert other.body["id_slot"] == first.body["id_slot"]
     assert "selected slot by LRU" in content
-    assert re.search(rf"cache_save reason=saved slot={first.body['id_slot']} tokens=\d+ bytes=\d+ checkpoints=\d+\n", content)
+    assert re.search(rf"cache_save reason=saved slot={first.body['id_slot']} tokens=\d+ bytes=\d+ checkpoints=\d+ copies=[1-9]\d*\n", content)
     # the second conversation continues in its slot, and the first returns whole from RAM
     again = _one_token(SHARED_PREFIX + TAIL_C + " Then the fire went out.")
     assert again.body["id_slot"] == second.body["id_slot"]

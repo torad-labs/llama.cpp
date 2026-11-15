@@ -894,6 +894,16 @@ class ServingRecipeTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
 
+    def test_state_copy_legacy_is_the_off_switch_of_the_batched_state_copies(self):
+        for profile in ("tensor-2", "tensor-4", "dp-4"):
+            base = ["--model", "/models/target.gguf", "--profile", profile]
+            with self.subTest(profile=profile):
+                self.assertNotIn("GGML_TENSOR_N_STAGE_LEGACY", self.serve.make_plan(self.serve.arguments(base))[1])
+                env = self.serve.make_plan(self.serve.arguments(base + ["--state-copy-legacy"]))[1]
+                self.assertEqual(env["GGML_TENSOR_N_STAGE_LEGACY"], "1")
+        # an inherited setting never reaches the server: the option is how a box turns the batches off
+        self.assertIn("GGML_TENSOR_N_STAGE_LEGACY", self.serve.removed_overrides({"GGML_TENSOR_N_STAGE_LEGACY": "1"}))
+
     def test_fixed_rows_is_an_opt_in_of_the_tensor_recipes(self):
         for profile in ("tensor-2", "tensor-4"):
             base = ["--model", "/models/target.gguf", "--profile", profile]

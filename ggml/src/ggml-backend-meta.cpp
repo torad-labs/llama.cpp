@@ -2729,6 +2729,112 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
     }
 }
 
+// A batch of ranges goes to each device buffer as batches of the ranges of its tensors, which the buffer batches its own way.
+// A range that is no such list (ggml_backend_meta_tensor_ranges) is copied on its own, after the ranges before it.
+// GGML_TENSOR_N_STAGE_LEGACY=1: one copy per range, as before
+template <bool write>
+static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std::conditional_t<write, const void *, void *> const * data,
+        const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    static const bool legacy = ggml_env_switch("GGML_TENSOR_N_STAGE_LEGACY");
+
+    // a part of the batch: its lists stay small enough to be walked in the cache, however many ranges the batch has
+    constexpr size_t part_ranges = 16*1024;
+    constexpr size_t part_bytes  = 4*1024*1024;
+
+    // the ranges of one device buffer, in their order: two devices can have one buffer type, and then their ranges would alternate in one batch
+    struct batch {
+        ggml_backend_buffer_t      buffer;
+        std::vector<ggml_tensor *> tensors;
+        std::vector<size_t>        offsets;
+        std::vector<size_t>        sizes;
+        std::vector<uintptr_t>     host;
+    };
+    std::vector<batch> cur;
+    std::vector<size_t> data_offsets;
+    struct plan {
+        std::vector<batch> * out;
+        uintptr_t            host;
+    };
+
+    const auto flush = [&]() {
+        for (auto & b : cur) {
+            if (b.tensors.empty()) {
+                continue;
+            }
+            const uintptr_t base = *std::min_element(b.host.begin(), b.host.end());
+            data_offsets.resize(b.host.size());
+            for (size_t i = 0; i < b.host.size(); ++i) {
+                data_offsets[i] = b.host[i] - base;
+            }
+            if constexpr (write) {
+                ggml_backend_tensor_set_n(b.tensors.data(), (const void *) base, b.offsets.data(), b.sizes.data(), data_offsets.data(), b.tensors.size());
+            } else {
+                ggml_backend_tensor_get_n(b.tensors.data(), (void *) base, b.offsets.data(), b.sizes.data(), data_offsets.data(), b.tensors.size());
+            }
+            b.tensors.clear();
+            b.offsets.clear();
+            b.sizes.clear();
+            b.host.clear();
+        }
+    };
+
+    size_t n_part = 0;
+    size_t bytes  = 0;
+    for (size_t i = 0; i < n_tensors; ++i) {
+        if (sizes[i] == 0) {
+            continue;
+        }
+        if (n_part == part_ranges || (n_part > 0 && bytes + sizes[i] > part_bytes)) {
+            flush();
+            n_part = 0;
+            bytes  = 0;
+        }
+        plan p = { &cur, (uintptr_t) data[i] };
+        if (!legacy && ggml_backend_meta_tensor_ranges(tensors[i], offsets[i], sizes[i], /*read =*/ !write,
+                [](ggml_tensor * tensor, size_t offset, size_t size, size_t data_offset, void * userdata) {
+                    auto * p = (plan *) userdata;
+                    const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+                    size_t at = 0;
+                    while (at < p->out->size() && (*p->out)[at].buffer != buffer) {
+                        at++;
+                    }
+                    if (at == p->out->size()) {
+                        p->out->push_back({ buffer, {}, {}, {}, {} });
+                    }
+                    batch & b = (*p->out)[at];
+                    b.tensors.push_back(tensor);
+                    b.offsets.push_back(offset);
+                    b.sizes.push_back(size);
+                    b.host.push_back(p->host + data_offset);
+                }, &p)) {
+            n_part++;
+            bytes += sizes[i];
+            continue;
+        }
+        flush();
+        n_part = 0;
+        bytes  = 0;
+        if constexpr (write) {
+            ggml_backend_tensor_set(tensors[i], data[i], offsets[i], sizes[i]);
+        } else {
+            ggml_backend_tensor_get(tensors[i], data[i], offsets[i], sizes[i]);
+        }
+    }
+    flush();
+}
+
+static void ggml_backend_meta_buffer_set_tensor_n(ggml_backend_buffer_t buffer, ggml_tensor * const * tensors, const void * const * data,
+        const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    GGML_UNUSED(buffer);
+    ggml_backend_meta_buffer_tensor_n<true>(tensors, data, offsets, sizes, n_tensors);
+}
+
+static void ggml_backend_meta_buffer_get_tensor_n(ggml_backend_buffer_t buffer, const ggml_tensor * const * tensors, void * const * data,
+        const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    GGML_UNUSED(buffer);
+    ggml_backend_meta_buffer_tensor_n<false>(const_cast<ggml_tensor * const *>(tensors), data, offsets, sizes, n_tensors);
+}
+
 static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
@@ -2741,8 +2847,8 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .cpy_tensor      = */ ggml_backend_meta_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
-    /* .set_tensor_n    = */ NULL,
-    /* .get_tensor_n    = */ NULL,
+    /* .set_tensor_n    = */ ggml_backend_meta_buffer_set_tensor_n,
+    /* .get_tensor_n    = */ ggml_backend_meta_buffer_get_tensor_n,
     /* .cpy_tensor_n    = */ NULL,
 };
 

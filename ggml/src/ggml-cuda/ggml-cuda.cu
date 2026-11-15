@@ -1546,10 +1546,47 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// A batched copy moves the device's bytes as they are, so not a tensor of a buffer in host memory or with a q8 row layout.
+static bool ggml_cuda_tensor_n_plain(const struct ggml_tensor * const * tensors, size_t n_tensors) {
+    const ggml_tensor * prev = nullptr;
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (tensors[i] == prev) {
+            continue;
+        }
+        prev = tensors[i];
+        if (ggml_cuda_buffer_is_host_mapped(prev) || ggml_cuda_q8_layout_of(prev).base) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// GGML_TENSOR_N_STAGE_LEGACY=1: a batch is not copied through the device's scratch (ggml_cuda_get_tensor_n_staged)
+static bool ggml_cuda_tensor_n_stage() {
+    static const bool legacy = ggml_env_switch("GGML_TENSOR_N_STAGE_LEGACY");
+    return !legacy;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+
+    for (size_t i = 0; i < n_tensors; i++) {
+        ggml_cuda_q8_register(tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer, tensors[i]);
+    }
+    if (!ggml_cuda_tensor_n_plain(tensors, n_tensors)) {
+        for (size_t i = 0; i < n_tensors; i++) {
+            if (sizes[i] != 0) {
+                ggml_backend_cuda_buffer_set_tensor(tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer, tensors[i], data[i], offsets[i], sizes[i]);
+            }
+        }
+        return;
+    }
+
+    if (ggml_cuda_tensor_n_stage() && ggml_cuda_set_tensor_n_staged(ctx->device, tensors, data, offsets, sizes, n_tensors)) {
+        return;
+    }
 
     for (size_t i = 0; i < n_tensors; i++) {
         if (sizes[i] == 0) {
@@ -1571,8 +1608,35 @@ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, 
 
     ggml_cuda_set_device(ctx->device);
 
-    if (!ggml_cuda_pinned_memory_disabled() &&
+    if (!ggml_cuda_tensor_n_plain(tensors, n_tensors)) {
+        for (size_t i = 0; i < n_tensors; i++) {
+            if (sizes[i] != 0) {
+                ggml_backend_cuda_buffer_get_tensor(tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer, tensors[i], data[i], offsets[i], sizes[i]);
+            }
+        }
+        return;
+    }
+
+    // A batch the scratch holds at once goes through it, or range by range when it is too few ranges for that: pinning its host memory for the read below costs more than its copies.
+    // A larger one is read into pinned host memory (ggml_cuda_get_tensor_n), and goes through the scratch when that call does not take it.
+    // GGML_TENSOR_N_STAGE_READ=1: a larger one goes through the scratch first as well
+    static const bool stage_read = ggml_env_switch("GGML_TENSOR_N_STAGE_READ");
+    const bool stage = ggml_cuda_tensor_n_stage();
+    bool fits = stage;
+    for (size_t i = 0, bytes = 0; i < n_tensors && fits; i++) {
+        bytes += sizes[i];
+        fits = bytes <= ggml_cuda_tensor_n_stage_bytes;
+    }
+    if (stage && (fits || stage_read) && ggml_cuda_get_tensor_n_staged(ctx->device, tensors, data, offsets, sizes, n_tensors)) {
+        return;
+    }
+
+    if (!fits && !ggml_cuda_pinned_memory_disabled() &&
             ggml_cuda_get_tensor_n(ctx->device, tensors, data, offsets, sizes, n_tensors)) {
+        return;
+    }
+
+    if (stage && !fits && !stage_read && ggml_cuda_get_tensor_n_staged(ctx->device, tensors, data, offsets, sizes, n_tensors)) {
         return;
     }
 

@@ -225,6 +225,9 @@ struct llama_context {
     void state_async_wait(llama_seq_id seq_id) const;
     void state_async_wait(const llama_batch & batch) const;
 
+    // the tensor ranges the last state_seq_get_data* or state_seq_set_data* call copied, or left for state_async to copy
+    size_t state_seq_copies = 0;
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,

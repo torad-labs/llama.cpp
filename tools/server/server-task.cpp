@@ -1786,6 +1786,11 @@ server_prompt_cache_result server_prompt_cache::save_idle(const server_prompt & 
     return result;
 }
 
+// the tensor ranges the last save or restore of the two contexts copied, for the cache_save and cache_restore lines
+static size_t state_copies(const llama_context * ctx_tgt, const llama_context * ctx_dft) {
+    return llama_state_seq_n_copies(ctx_tgt) + (ctx_dft ? llama_state_seq_n_copies(ctx_dft) : 0);
+}
+
 // LLAMA_STATE_SAVE_ASYNC=1: a slot's state saved for a task that can come back for the slot returns once its layout is written, and a thread of the context copies its rows to the snapshot while the other slots decode (llama_state_seq_get_data_async)
 static bool state_save_async() {
     static const bool async = ggml_env_switch("LLAMA_STATE_SAVE_ASYNC");
@@ -1934,7 +1939,8 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
                 return server_prompt_cache_result::failed;
             }
             SRV_TRC("cache_save reason=saving slot=%d tokens=%d bytes=%zu\n", id_slot, prompt.n_tokens(), size_new);
-            saving.push_back({ ctx_tgt, ctx_dft, id_slot, t_start, ggml_time_us() - t_start, std::move(pending) });
+            saving.push_back({ ctx_tgt, ctx_dft, id_slot, t_start, ggml_time_us() - t_start, state_copies(ctx_tgt, ctx_dft),
+                    std::move(pending) });
             return server_prompt_cache_result::saving;
         }
         if (llama_state_seq_get_data_ext(ctx_tgt, pending.data->main.data(), size_tgt, id_slot,
@@ -1946,7 +1952,7 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
         }
 
         // Publish only after both model states and the drafter state are complete.
-        return publish(std::move(pending), protect, id_slot);
+        return publish(std::move(pending), protect, id_slot, state_copies(ctx_tgt, ctx_dft));
     } catch (const std::exception & e) {
         SRV_ERR("cache_save reason=exception slot=%d error=%s\n", id_slot, e.what());
         return server_prompt_cache_result::failed;
@@ -1954,7 +1960,7 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
 }
 
 server_prompt_cache_result server_prompt_cache::publish(server_prompt_cache_state && state,
-        const server_prompt_cache_state * protect, int32_t id_slot) {
+        const server_prompt_cache_state * protect, int32_t id_slot, size_t n_copies) {
     insert_state(std::move(state));
     const auto * saved = &states.back();
     const auto & tokens = saved->prompt.tokens;
@@ -1975,7 +1981,9 @@ server_prompt_cache_result server_prompt_cache::publish(server_prompt_cache_stat
         return server_prompt_cache_result::no_space;
     }
     // bytes holds the checkpoints too: the entry's size, as cache_evict gives it
-    SRV_INF("cache_save reason=saved slot=%d tokens=%d bytes=%zu checkpoints=%zu\n", id_slot, n_tokens, n_bytes, n_ckpt);
+    // copies: the tensor ranges the save copied, one for each run of cells that follow each other, a layer
+    SRV_INF("cache_save reason=saved slot=%d tokens=%d bytes=%zu checkpoints=%zu copies=%zu\n", id_slot, n_tokens, n_bytes, n_ckpt,
+            n_copies);
     return server_prompt_cache_result::saved;
 }
 
@@ -2087,8 +2095,8 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
     if (async) {
         restoring.push_back({ ctx_tgt, ctx_dft, id_slot, data });
     }
-    SRV_INF("cache_restore reason=restored slot=%d tokens=%d bytes=%zu checkpoints=%zu consumed=%d async=%d\n", id_slot,
-            it->prompt.n_tokens(), it->size(), it->prompt.checkpoints.size(), consume, async);
+    SRV_INF("cache_restore reason=restored slot=%d tokens=%d bytes=%zu checkpoints=%zu copies=%zu consumed=%d async=%d\n", id_slot,
+            it->prompt.n_tokens(), it->size(), it->prompt.checkpoints.size(), state_copies(ctx_tgt, ctx_dft), consume, async);
     if (consume) {
         GGML_ASSERT(total_bytes >= it->cached_size && total_tokens >= (size_t) it->prompt.n_tokens());
         total_bytes -= it->cached_size;
@@ -2127,7 +2135,7 @@ void server_prompt_cache::reap(bool wait, const server_prompt_cache_state * prot
         const double  t_here  = it->t_placed / 1000.0;
         // the room for this one was made before its copy. The state its save protected may have left the cache since: the one kept here is the one this call's caller holds
         const size_t n_tokens = it->state.prompt.tokens.size();
-        const auto result = publish(std::move(it->state), protect, id_slot);
+        const auto result = publish(std::move(it->state), protect, id_slot, it->n_copies);
         if (result != server_prompt_cache_result::saved) {
             saving_refused[id_slot] = { n_tokens, result };
         }
