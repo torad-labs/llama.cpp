@@ -435,6 +435,12 @@ static bool slot_prefix_copy() {
     return copy;
 }
 
+// LLAMA_SLOT_VICTIM_LRU_LEGACY=1: the idle slot whose conversation is cut for a request is the least recently used one, whatever it holds
+static bool slot_victim_lru_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_SLOT_VICTIM_LRU_LEGACY");
+    return legacy;
+}
+
 struct server_slot {
     int id;
 
@@ -531,6 +537,24 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+
+    // What cutting this idle slot's conversation is expected to cost: the tokens it has to bring back when it returns (a restore from RAM or a second read, both by the token),
+    // over the seconds it has been idle, since a conversation is less likely to return the longer it has been away. Under a second of idleness says nothing about that, so it counts as one second.
+    double victim_cost(int64_t t_now) const {
+        return prompt.n_tokens() / std::max(1.0, (t_now - t_last_used) / 1e6);
+    }
+
+    // This idle slot is reused before the other one: the lower cost, and between equal costs the one idle for longer. The least recently used one with LLAMA_SLOT_VICTIM_LRU_LEGACY=1.
+    bool is_victim_before(const server_slot & other, int64_t t_now) const {
+        if (!slot_victim_lru_legacy()) {
+            const double cost       = victim_cost(t_now);
+            const double cost_other = other.victim_cost(t_now);
+            if (cost != cost_other) {
+                return cost < cost_other;
+            }
+        }
+        return t_last_used < other.t_last_used;
+    }
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -2594,14 +2618,16 @@ private:
                     }
                 }
             } else if (ret == nullptr && !held.empty()) {
-                // No slot is empty, so one conversation is cut. Take the least recently used slot among those that reuse about as much as the best one (within a quarter of the request).
+                // No slot is empty, so one conversation is cut. Among the slots that reuse about as much as the best one (within a quarter of the request),
+                // take the one whose conversation costs the least to cut: the fewest tokens for each second it has been idle (server_slot::victim_cost).
                 size_t reuse_best = 0;
                 for (const auto & cur : held) {
                     reuse_best = std::max(reuse_best, cur.second);
                 }
                 const size_t margin = task.tokens.size() / 4;
+                const int64_t t_now = ggml_time_us();
                 for (const auto & cur : held) {
-                    if (cur.second + margin >= reuse_best && (ret == nullptr || cur.first->t_last_used < ret->t_last_used)) {
+                    if (cur.second + margin >= reuse_best && (ret == nullptr || cur.first->is_victim_before(*ret, t_now))) {
                         ret = cur.first;
                         resident_reuse = cur.second;
                     }
@@ -2613,9 +2639,12 @@ private:
             if (ret != nullptr && !ret->prompt.tokens.empty()) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
-                if (by_lru) {
+                if (by_lru && slot_victim_lru_legacy()) {
                     SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 ", f_sim = %.3f, f_keep = %.3f\n",
                             ret->prompt.n_tokens(), ret->t_last_used, f_sim_best, f_keep);
+                } else if (by_lru) {
+                    SLT_INF(*ret, "selected slot by cost, n_tokens = %d, idle = %.1f s, f_sim = %.3f, f_keep = %.3f\n",
+                            ret->prompt.n_tokens(), (ggml_time_us() - ret->t_last_used) / 1e6, f_sim_best, f_keep);
                 } else if (!named) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             f_sim_best, slot_prompt_similarity, f_keep);
@@ -3845,7 +3874,7 @@ private:
         return true;
     }
 
-    // idle slots that lose the least by being reused: empty slots first, then the least recently used ones
+    // idle slots that lose the least by being reused: empty slots first, then the ones whose conversation costs the least to cut (server_slot::is_victim_before)
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
@@ -3854,11 +3883,12 @@ private:
             }
         }
 
-        std::stable_sort(free_slots.begin(), free_slots.end(), [](const server_slot * a, const server_slot * b) {
+        const int64_t t_now = ggml_time_us();
+        std::stable_sort(free_slots.begin(), free_slots.end(), [t_now](const server_slot * a, const server_slot * b) {
             if ((a->prompt.n_tokens() == 0) != (b->prompt.n_tokens() == 0)) {
                 return a->prompt.n_tokens() == 0;
             }
-            return a->t_last_used < b->t_last_used;
+            return a->is_victim_before(*b, t_now);
         });
 
         free_slots.resize(std::min(free_slots.size(), n_slots_needed));

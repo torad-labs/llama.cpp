@@ -627,25 +627,49 @@ def test_shared_prefix_takes_an_empty_slot():
     assert again.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
 
 
-# With every slot in use, the request takes the least recently used slot, not the most similar one.
-def test_shared_prefix_takes_the_least_recently_used_slot():
-    log = _shared_prefix_server(2)
-    first = _one_token(SHARED_PREFIX + TAIL_A)
-    second = _one_token(SHARED_PREFIX + TAIL_C)
-    assert second.body["id_slot"] != first.body["id_slot"]
-    log.drain()
-    # shares a few more tokens with the second conversation than with the first
-    other = _one_token(SHARED_PREFIX + " A wizard read a letter and then went to sleep in the tower.")
-    content = log.wait_for("cache_save reason=saved")
-    assert other.body["id_slot"] == first.body["id_slot"]
-    assert "selected slot by LRU" in content
-    assert re.search(rf"cache_save reason=saved slot={first.body['id_slot']} tokens=\d+ bytes=\d+ checkpoints=\d+ copies=[1-9]\d*\n", content)
-    # the second conversation continues in its slot, and the first returns whole from RAM
-    again = _one_token(SHARED_PREFIX + TAIL_C + " Then the fire went out.")
-    assert again.body["id_slot"] == second.body["id_slot"]
-    assert again.body["timings"]["cache_n"] >= second.body["timings"]["prompt_n"] - 1
-    back = _one_token(SHARED_PREFIX + TAIL_A + " Then he saw the castle.")
-    assert back.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+TAIL_E = " A small grey cat slept in the sun all day." * 12
+
+
+def _held(res):
+    return res.body["timings"]["cache_n"] + res.body["timings"]["prompt_n"]
+
+
+# With every slot in use, the request takes the slot whose conversation costs the least to cut, not the most similar one and not the oldest one:
+# the fewest tokens for each second it has been idle. LLAMA_SLOT_VICTIM_LRU_LEGACY=1: the least recently used slot.
+def test_shared_prefix_takes_the_slot_that_costs_least_to_cut(monkeypatch):
+    for legacy in (None, "1"):
+        if legacy is None:
+            monkeypatch.delenv("LLAMA_SLOT_VICTIM_LRU_LEGACY", raising=False)
+        else:
+            monkeypatch.setenv("LLAMA_SLOT_VICTIM_LRU_LEGACY", legacy)
+        log = _shared_prefix_server(2)
+        long = _one_token(SHARED_PREFIX + TAIL_A * 3)
+        short = _one_token(SHARED_PREFIX + TAIL_C)
+        assert short.body["id_slot"] != long.body["id_slot"]
+        log.drain()
+        # both slots were used a moment ago: the short conversation is the cheaper one to bring back, the long one is the least recently used
+        cut = long if legacy else short
+        other = _one_token(SHARED_PREFIX + TAIL_E)
+        content = log.wait_for("cache_save reason=saved")
+        assert other.body["id_slot"] == cut.body["id_slot"]
+        assert ("selected slot by LRU" if legacy else "selected slot by cost") in content
+        assert ("selected slot by cost" if legacy else "selected slot by LRU") not in content
+        assert re.search(rf"cache_save reason=saved slot={cut.body['id_slot']} tokens=\d+ bytes=\d+ checkpoints=\d+ copies=[1-9]\d*\n", content)
+        if legacy is None:
+            # the long conversation idles for more seconds than it holds tokens for each of the other slot's, and the other slot is used again:
+            # now the long one is the cheaper one to cut, though it holds more
+            time.sleep(_held(long) / _held(other) + 0.5)
+            more = _one_token(SHARED_PREFIX + TAIL_E + " Then it woke up.")
+            assert more.body["id_slot"] == other.body["id_slot"]
+            log.drain()
+            third = _one_token(SHARED_PREFIX + " A wizard read a letter and then went to sleep in the tower.")
+            content = log.wait_for("cache_save reason=saved")
+            assert third.body["id_slot"] == long.body["id_slot"]
+            assert "selected slot by cost" in content
+        # what was cut returns whole from RAM
+        back = _one_token(SHARED_PREFIX + (TAIL_A * 3 if legacy else TAIL_C) + " Then the fire went out.")
+        assert back.body["timings"]["cache_n"] >= _held(cut) - 1
+        server.stop()
 
 
 def _reply(prompt):
