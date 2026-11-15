@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 bool llama_kpool_needs_scoring(int64_t n_kv, uint32_t n_ctx, uint32_t indexer_top_k, uint32_t kpool) {
@@ -150,7 +151,8 @@ int64_t llama_kpool_n_kv_max(int64_t n_top_k, int64_t n_tail) {
     return GGML_PAD(n_top_k + n_tail, 32);
 }
 
-bool llama_kpool_shared_streams(const llama_kv_cells & cells, const llama_ubatch & ubatch, std::vector<llama_seq_id> & seqs) {
+bool llama_kpool_shared_streams(const llama_kv_cells & cells, const llama_ubatch & ubatch, std::vector<llama_seq_id> & seqs,
+        bool disjoint_only) {
     seqs.clear();
 
     const uint32_t n_seqs = ubatch.n_seqs_unq;
@@ -179,17 +181,64 @@ bool llama_kpool_shared_streams(const llama_kv_cells & cells, const llama_ubatch
         }
     }
 
-    // a cell that holds two sequences would be in two streams' maps, and its pooled key written by both
-    uint64_t held = 0;
-    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
-        held += cells.seq_cell_count(s);
-    }
-    if (held != cells.get_used()) {
-        seqs.clear();
-        return false;
+    // A cell that holds two sequences is in both sequences' views and both streams' maps name it. The streams' write
+    // rows stay different all the same (llama_kpool_unique_reps); the legacy keeps such a cache on its packed maps
+    if (disjoint_only) {
+        uint64_t held = 0;
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            held += cells.seq_cell_count(s);
+        }
+        if (held != cells.get_used()) {
+            seqs.clear();
+            return false;
+        }
     }
 
     return true;
+}
+
+int64_t llama_kpool_unique_reps(int32_t * new_cells, int64_t * new_reps, int64_t * n_new, int64_t n_stream,
+        int64_t n_new_max, int64_t r) {
+    int64_t n_used = 0;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        GGML_ASSERT(n_new[s] >= 0 && n_new[s] <= n_new_max);
+        n_used += n_new[s];
+    }
+
+    // one stream names a row once (a pool is in its map once), so only a second stream can repeat one
+    if (n_stream < 2 || n_used == n_new[0]) {
+        return 0;
+    }
+
+    std::unordered_set<int64_t> seen;
+    seen.reserve((size_t) n_used);
+
+    int64_t n_back = 0;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        int32_t * cells = new_cells + s*r*n_new_max;
+        int64_t * reps  = new_reps  + s*n_new_max;
+
+        for (int64_t p = 0; p < n_new[s]; ) {
+            if (seen.insert(reps[p]).second) {
+                ++p;
+                continue;
+            }
+
+            // the stream's last used slot takes this one's place, and is looked at next
+            const int64_t last = --n_new[s];
+
+            if (p != last) {
+                std::copy_n(cells + last*r, r, cells + p*r);
+                reps[p] = reps[last];
+            }
+            std::fill_n(cells + last*r, r, 0);
+
+            n_back++;
+        }
+    }
+
+    return n_back;
 }
 
 // sel_mask and cand_mask hold only 0.0f and -INFINITY, so f16 is exact here
@@ -1893,8 +1942,15 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             // one spare cell a slot over every stream, so the rows of the one write stay different
             auto * new_cells = (int32_t *) new_pool_cells->data;
             auto * new_reps  = (int64_t *) new_pool_reps->data;
+            // sequences that share cells name a shared pool once: the slot a later stream gives back is unused from here
+            std::vector<int64_t> n_new(unused.size());
+            for (size_t s = 0; s < unused.size(); ++s) {
+                n_new[s] = unused[s].n_new;
+            }
+            llama_kpool_unique_reps(new_cells, new_reps, n_new.data(), (int64_t) n_new.size(), n_new_max, kpool);
             std::vector<int64_t> written;
             for (size_t s = 0; s < unused.size(); ++s) {
+                unused[s].n_new = n_new[s];
                 written.insert(written.end(), new_reps + s*n_new_max, new_reps + s*n_new_max + unused[s].n_new);
             }
             kpool_spare_cells spare = { mctx_attn->get_kv()->get_cells(resident_seqs[0]), (llama_pos) kpool,

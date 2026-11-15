@@ -1663,9 +1663,13 @@ static void run_draft_bank(std::vector<ggml_backend_dev_t> devs) {
 }
 
 // unified: the slots are the sequences of one pool, each a stream of its own in the maps (llama_kpool_shared_streams)
-static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devices, bool unified = false) {
+// prefix: the odd slots start as copies of slot 0's first positions (a prefix they took from it: seq_cp) and go on with
+// tokens of their own, so the cells of the prefix hold several sequences in every step. The sharers keep streams of their
+// own, with the same maps as the packed ones and as the device makes from the bank
+static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devices, bool unified = false, bool prefix = false) {
     constexpr int64_t capacity = 256, r = 4, np = capacity/r + 2, nd = 2;
     GGML_ASSERT(!unified || devices == 1);
+    GGML_ASSERT(!prefix || unified);
     auto * cpu = resident_test_backend();
     std::vector<ggml_backend_dev_t> devs(devices, ggml_backend_get_device(cpu));
     auto * meta = ggml_backend_meta_device(devs.data(), devs.size(),
@@ -1679,6 +1683,17 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
     views.reserve_views(slots);
     const auto bank = views.resident_bank(buft, 2*capacity + np*(r + 2), slots, devices);
     for (uint32_t s = 0; s < slots; ++s) { w.append(s, 16 + s%17); }
+    for (uint32_t s = 1; prefix && s < slots; s += 2) {
+        // 8, 11 or 14 of slot 0's 16 positions: the prefix ends on a pool or inside one
+        const llama_pos p1 = 8 + 3*((s - 1)/2%3);
+        auto & cells = w.cells_of(0);
+        w.rollback(s, 0);
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.pos_in(i, 0, p1) && cells.seq_has(i, 0) && !cells.seq_has(i, s)) { cells.seq_add(i, s); }
+        }
+        CHECK(w.p_next(s) == p1, "slot %u took %d positions of slot 0, want %d", s, (int) w.p_next(s), (int) p1);
+        w.append(s, 2 + s%5);
+    }
     for (int step = 0; step < 12; ++step) {
         const llama_seq_id changed = step%slots;
         const auto saved = w.cells_of(changed);
@@ -1739,6 +1754,10 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
         if (unified && ns > 0) {
             std::vector<llama_seq_id> runs;
             CHECK(llama_kpool_shared_streams(w.cells_of(0), *ub, runs) && runs == seqs, "shared streams: step=%d", step);
+            // cells that hold two sequences keep the streams, and the legacy takes them away
+            std::vector<llama_seq_id> runs_disjoint;
+            CHECK(llama_kpool_shared_streams(w.cells_of(0), *ub, runs_disjoint, true) == !prefix,
+                    "shared streams of disjoint cells only: step=%d prefix=%d", step, prefix);
             // the pool's packed maps of the same ubatch: a row sees the same pools in the same order, with the same cells
             // and rep, the same tail and the same facts of its sequence's cells
             maps packed(capacity, 1, nr*ns, ns, r, true, false, false, nd, 0x5a, 0, true);
@@ -1860,6 +1879,61 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
         ggml_free(ctx);
     }
     ggml_backend_free(backend);
+}
+
+// llama_kpool_unique_reps: three streams of four write slots, two cells a pool. Streams 1 and 2 name rows that stream 0 or
+// each other named first (sequences that share cells, a step that writes every pool again): each row stays with the first
+// stream that names it, a stream's used slots stay its first ones with their own members, and a slot given back has
+// cell 0 for its members
+static void run_unique_reps() {
+    constexpr int64_t r = 2, n_new_max = 4, n_stream = 3;
+    const int64_t rows[n_stream][n_new_max] = { { 7, 9, 11, -1 }, { 9, 21, 7, 23 }, { 23, 11, -1, -1 } };
+    const auto member = [](int64_t s, int64_t k, int64_t m) { return (int32_t) (1000*s + 10*k + m + 1); };
+
+    std::vector<int32_t> cells(n_stream*r*n_new_max, 0);
+    std::vector<int64_t> reps(n_stream*n_new_max, -1);
+    std::vector<int64_t> n_new = { 3, 4, 2 };
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t k = 0; k < n_new[s]; ++k) {
+            reps[s*n_new_max + k] = rows[s][k];
+            for (int64_t m = 0; m < r; ++m) { cells[s*r*n_new_max + k*r + m] = member(s, k, m); }
+        }
+    }
+
+    const int64_t n_back = llama_kpool_unique_reps(cells.data(), reps.data(), n_new.data(), n_stream, n_new_max, r);
+
+    // stream 1: 9 is stream 0's, so its last slot (23) takes the place; 21 stays; 7 is stream 0's and is the last used.
+    // stream 2: 23 is stream 1's now, 11 takes its place and is stream 0's
+    CHECK(n_back == 4 && n_new == (std::vector<int64_t>{ 3, 2, 0 }), "unique reps: %lld slots given back, streams use %lld, %lld, %lld",
+            (long long) n_back, (long long) n_new[0], (long long) n_new[1], (long long) n_new[2]);
+    const int64_t want_rows[n_stream][2]  = { { 7, 9 }, { 23, 21 }, { -1, -1 } };
+    const int64_t want_from[n_stream][2]  = { { 0, 1 }, { 3, 1 }, { -1, -1 } };
+    std::set<int64_t> seen;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t k = 0; k < n_new_max; ++k) {
+            const int32_t * got = cells.data() + s*r*n_new_max + k*r;
+            if (k < n_new[s]) {
+                const int64_t row = reps[s*n_new_max + k];
+                CHECK(seen.insert(row).second, "unique reps: stream %lld slot %lld repeats row %lld", (long long) s, (long long) k, (long long) row);
+                if (k < 2) {
+                    CHECK(row == want_rows[s][k] && got[0] == member(s, want_from[s][k], 0) && got[1] == member(s, want_from[s][k], 1),
+                            "unique reps: stream %lld slot %lld holds row %lld of cells %d, %d", (long long) s, (long long) k,
+                            (long long) row, got[0], got[1]);
+                }
+            } else {
+                CHECK(got[0] == 0 && got[1] == 0, "unique reps: stream %lld's unused slot %lld holds cells %d, %d", (long long) s,
+                        (long long) k, got[0], got[1]);
+            }
+        }
+    }
+    CHECK(reps[2] == 11 && cells[2*r] == member(0, 2, 0), "unique reps: the first stream's slots changed");
+
+    // one stream names a pool once: nothing to give back, nothing touched
+    std::vector<int32_t> one_cells = { 1, 2, 3, 4 };
+    std::vector<int64_t> one_reps  = { 5, 6 };
+    int64_t one_new = 2;
+    CHECK(llama_kpool_unique_reps(one_cells.data(), one_reps.data(), &one_new, 1, 2, 2) == 0 && one_new == 2 &&
+            one_cells == (std::vector<int32_t>{ 1, 2, 3, 4 }) && one_reps == (std::vector<int64_t>{ 5, 6 }), "unique reps: one stream");
 }
 
 // One device of sequences with several slots (a unified pool under a tensor split): a capture's rows go to one bank, a
@@ -1989,6 +2063,9 @@ int main(int argc, char ** argv) {
     run_resident_bank(rng, 41, 4);
     run_resident_bank(rng, 5, 1, true);
     run_resident_bank(rng, 6, 1, true);
+    run_resident_bank(rng, 5, 1, true, true);
+    run_resident_bank(rng, 6, 1, true, true);
+    run_unique_reps();
     run_direct_indices(rng);
     run_draft_rounds(rng);
     run_draft_bank(std::vector<ggml_backend_dev_t>(4, ggml_backend_get_device(resident_test_backend())));
