@@ -73,6 +73,13 @@ def arguments(argv=None):
                         help="Tensor profiles: a session that starts in an empty slot takes the prefix it shares with an "
                              "idle session (a system prompt) from that session's slot, and reads only what follows it. "
                              "The pool's cells are shared and no row is copied (opt-in: not read on four cards)")
+    parser.add_argument("--shared-cells-legacy", action="store_true",
+                        help="While two sessions hold the same cells (a prefix copy), every session's pool maps go the "
+                             "packed way, as before the streams that share cells: the off switch, to compare the two on a box")
+    parser.add_argument("--victim-lru-legacy", action="store_true",
+                        help="With every slot in use, a new session takes the least recently used slot, whatever it holds, "
+                             "as before the rule that weighs what a session holds against how long it has been idle: "
+                             "the off switch, to compare the two on a box")
     parser.add_argument("--sessions-dir", type=Path,
                         help="A directory the server leaves its sessions in when it is stopped with SIGTERM or SIGINT, and "
                              "takes them from when it starts with the same models: /dev/shm/... keeps them in memory. The "
@@ -302,6 +309,13 @@ def make_plan(args):
         # The empty slot starts as a copy of the idle session's slot, and the new session cuts the copy at the end of
         # the prefix it shares: it reads what follows, and the idle session keeps everything
         env["LLAMA_SLOT_PREFIX_COPY"] = "1"
+    if args.shared_cells_legacy:
+        # A cell two sessions hold sends the whole pool back to the packed maps, for every session, while it is shared
+        env["LLAMA_KPOOL_SHARED_CELLS_LEGACY"] = "1"
+    if args.victim_lru_legacy:
+        # By default the session that is cut when no slot is empty is the one with the fewest tokens for each second it has
+        # been idle (what it has to bring back, against how likely it is to return); with this, the least recently used
+        env["LLAMA_SLOT_VICTIM_LRU_LEGACY"] = "1"
     if args.sessions_dir is not None:
         # At a stop every session is saved to the RAM prompt cache and the cache written to files; the next start maps
         # them, and a session comes back from its snapshot where it would be prefilled from its first token

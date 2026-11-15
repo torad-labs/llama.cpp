@@ -888,6 +888,10 @@ class ServingRecipeTest(unittest.TestCase):
         # the two-card tensor recipe shares one pool too; a sequential split has a pool a slot
         self.assertEqual(self.serve.make_plan(self.serve.arguments(
             ["--model", "/models/target.gguf", "--prefix-copy"]))[1]["LLAMA_SLOT_PREFIX_COPY"], "1")
+        # the off switches of the streams that share cells and of the victim rule reach the engine only as launcher options
+        self.assertFalse({"LLAMA_KPOOL_SHARED_CELLS_LEGACY", "LLAMA_SLOT_VICTIM_LRU_LEGACY"} & set(env))
+        env = self.serve.make_plan(self.serve.arguments(base + ["--shared-cells-legacy", "--victim-lru-legacy"]))[1]
+        self.assertEqual((env["LLAMA_KPOOL_SHARED_CELLS_LEGACY"], env["LLAMA_SLOT_VICTIM_LRU_LEGACY"]), ("1", "1"))
         self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"]))
         for options in (base + ["--cache-ram", "-2"], base + ["--ctx-checkpoints", "-1"],
                         ["--model", "/models/target.gguf", "--profile", "dp-4", "--prefix-copy"]):
