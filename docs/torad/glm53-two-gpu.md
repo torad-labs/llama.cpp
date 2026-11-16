@@ -22,8 +22,12 @@ November 2 sweep stays in [GLM53-SERVING.md](../backend/GLM53-SERVING.md) as his
 What the two tensor profiles now share, because the engine work behind them never counted ranks: the 4-bit
 latent cache, prompts read in chunks apart from replies, graphs kept by shape for any set of sessions
 (`LLAMA_GRAPH_ANY_SEQS` with kept graphs and held CUDA executables), coupled MTP drafts, prompt-cache saves and
-restores beside the decode steps, and every default-on host and kernel change of the four-card period. Two
-settings deliberately differ:
+restores beside the decode steps, and every default-on host and kernel change of the four-card period. Two more
+of that period's asks landed after this page's sums and are live here too: `kpool_indices`, some 14 launches in
+every round, no longer sorts its padding (TORAD.md, row `eeb9dde73`), and a prompt step beside replies can be
+bounded by time, `--prompt-step-ms` (row `ddd16b73c`), which is an opt-in on both tensor profiles like
+`--session-step` with `--prompt-shapes` and `--prefix-copy`; the box read below decides those three for two
+cards. Two settings deliberately differ:
 
 - **The reduction route.** Four cards force reductions onto the copy engines through host memory, because the
   engine's peer routes read three times slower on the rented hosts (glm53-goal.md, November 11). No pair of
@@ -92,23 +96,41 @@ a leg disproves its layout rather than tuning on rented time.
 
 1. **The route, before any serving.** Build `test-backend-meta-allreduce-copy` and run `--bench 2`: p50 of a
    69 x 4,096 reduction on each route. This chooses tensor-2's `--reduction-route` default for the rest of the
-   read; run step 3's sweep on the other route only if the bench is close.
+   read; run step 3's sweep on the other route only if the bench is close. The same bench reads where the
+   pair's own low-latency limits cross on its link: the 16 KB host limit was crossed on a Gen5 x4 link between
+   two desktop cards, and a 3-row verify's 24 KB is over it, so those reductions take the card-to-card path to
+   128 KB where the pair maps each other's memory and the chunked kernel where it cannot (TORAD.md, rows
+   `1cbc66f49`, `3bef5edc2`). Pin what the pair reads in the launcher.
 2. **The load.** `serve.py --profile tensor-2 --dry-run`, then launch. Record free MiB a card at load from the
    server log. Under 4,096 MiB free, relaunch `--slots 5` and record that the default sizing missed, in this
    file, before any rate is read.
 3. **The rate.** `rate.py --sessions 1 2 4 6`, two passes after the load (the first captures graphs), then the
    same at histories of about 4,000 tokens if time allows. Per-session tok/s at each count is the number.
-4. **The depth.** `dp_longctx.py --streams 6 --context-tokens 295000 --turns 2` against the same server: all
+4. **Short turns.** Agent turns of tens of tokens are where graph shapes churn: at six slots a session's
+   graphs change shape every 2,048 tokens it grows, against 32 kept graphs. Relaunch with `--session-step
+   65536 --prompt-shapes 8` and repeat step 3's sweep, with `prompt_evals.py` on a traced pass for the counts
+   of graphs built and replayed. On the two-rank fixture a turn of 1 to 32 new tokens read in 45.9 ms against
+   92.8 and sessions decoding beside a reader ran 39.0 against 36.0 tok/s each, while prompts of hundreds of
+   tokens read slower in several passes (TORAD.md, rows `c9e6bbc4b`, `052fa4c50`): the pair says which side
+   wins at six sessions. If it agrees, the two become tensor-2's defaults in the launcher, as the async save
+   and restore did after their four-card read.
+5. **A read beside a stream.** One session streams a long reply while another reads about 200,000 tokens; the
+   streamer's longest wait for a chunk is the number, as #238's box read it. Then relaunch with
+   `--prompt-step-ms` at about twice the step time step 3 read and read it again, with the server's `prompt
+   step beside replies` lines at `-lv 4` saying where the count settled. Two cards' steps run longer than
+   four-card ones, so a fixed count costs more here than #255's capture read there; the time, not the count,
+   is what carries over.
+6. **The depth.** `dp_longctx.py --streams 6 --context-tokens 295000 --turns 2` against the same server: all
    six sessions populate near the cap at once, no cache lost, VRAM peak per card from its sampler. This is the
    leg the goal is made of; a short-context rate without it is not the goal read.
-5. **The seventh session.** Relaunch `--slots 7`, read free memory and `rate.py --sessions 7` only. Keep
+7. **The seventh session.** Relaunch `--slots 7`, read free memory and `rate.py --sessions 7` only. Keep
    whichever of 6 or 7 the free-memory rule allows as the recorded capacity; do not tune kept graphs to squeeze
    the seventh in on rented time.
-6. **The other layout.** `serve.py --profile dp-2`: boot at 8 and 12 slots for `capacity.py --devices 2
+8. **The other layout.** `serve.py --profile dp-2`: boot at 8 and 12 slots for `capacity.py --devices 2
    --slot-cells 307200`, serve at the estimated count under the same 4,096 MiB rule, `rate.py` at the same
    session counts it fits, one `dp_longctx.py` leg at its full slot count and 100,000 tokens (its 300K fill is
    hours at DP prefill rates; the reservation is what the boot already proved).
-7. **Quality spot checks, if the clock allows.** Greedy 96-token continuations of one prompt set under
+9. **Quality spot checks, if the clock allows.** Greedy 96-token continuations of one prompt set under
    `--reduction-wire q8` and `bf16`, and under both routes: report same-token agreement, no more. A KLD read
    of the wire and the 4-bit cache at two ranks and at depth is its own leg, not squeezed into this one.
 
