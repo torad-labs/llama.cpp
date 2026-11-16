@@ -441,6 +441,22 @@ static bool slot_victim_lru_legacy() {
     return legacy;
 }
 
+// LLAMA_SLOT_VICTIM_IDLE_LEGACY=1: an idle slot's cost is its tokens over the seconds it has been idle, as before the measured chance of a return
+static bool slot_victim_idle_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_SLOT_VICTIM_IDLE_LEGACY");
+    return legacy;
+}
+
+// LLAMA_SLOT_VICTIM_RETURN_S: the seconds of idleness that halve the part of a conversation's chance of a return that fades with its time away (90 when unset)
+static double slot_victim_return_s() {
+    static const double seconds = [] {
+        const char * env = getenv("LLAMA_SLOT_VICTIM_RETURN_S");
+        const double value = env != nullptr ? atof(env) : 0.0;
+        return value > 0.0 ? value : 90.0;
+    }();
+    return seconds;
+}
+
 struct server_slot {
     int id;
 
@@ -538,10 +554,17 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
-    // What cutting this idle slot's conversation is expected to cost: the tokens it has to bring back when it returns (a restore from RAM or a second read, both by the token),
-    // over the seconds it has been idle, since a conversation is less likely to return the longer it has been away. Under a second of idleness says nothing about that, so it counts as one second.
+    // What cutting this idle slot's conversation is expected to cost: the tokens it has to bring back if it returns (a restore from RAM or a second read, both by the token),
+    // times the chance that it returns. The chance is the share of conversations idle that long that took another turn in a deployment's records
+    // (#238, 1,867 turns: 0.97 at 1 s, 0.89 at 10 s, 0.67 at 60 s, 0.34 at 5 min, 0.15 at 30 min), fitted as 0.17 + 0.83 / (1 + idle / 90 s):
+    // a part that fades with the time away and a part that does not. LLAMA_SLOT_VICTIM_IDLE_LEGACY=1: the tokens over the seconds idle,
+    // a second at least, which takes the chance as 1 / idle: 300 times lower at 5 min than at 1 s, where those records have it 3 times lower.
     double victim_cost(int64_t t_now) const {
-        return prompt.n_tokens() / std::max(1.0, (t_now - t_last_used) / 1e6);
+        const double idle = std::max(0.0, (t_now - t_last_used) / 1e6);
+        if (slot_victim_idle_legacy()) {
+            return prompt.n_tokens() / std::max(1.0, idle);
+        }
+        return prompt.n_tokens() * (0.17 + 0.83 / (1.0 + idle / slot_victim_return_s()));
     }
 
     // This idle slot is reused before the other one: the lower cost, and between equal costs the one idle for longer. The least recently used one with LLAMA_SLOT_VICTIM_LRU_LEGACY=1.

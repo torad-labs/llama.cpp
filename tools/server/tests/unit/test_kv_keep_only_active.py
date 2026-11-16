@@ -636,7 +636,9 @@ def _held(res):
 
 
 # Cost includes both resident tokens and idle age. The legacy switch keeps LRU.
+# The age counts by the chance of a return, which fades over LLAMA_SLOT_VICTIM_RETURN_S seconds (90 by default): half a second here, so a few seconds age a conversation.
 def test_shared_prefix_takes_the_slot_that_costs_least_to_cut(monkeypatch):
+    monkeypatch.setenv("LLAMA_SLOT_VICTIM_RETURN_S", "0.5")
     for legacy in (None, "1"):
         if legacy is None:
             monkeypatch.delenv("LLAMA_SLOT_VICTIM_LRU_LEGACY", raising=False)
@@ -663,8 +665,11 @@ def test_shared_prefix_takes_the_slot_that_costs_least_to_cut(monkeypatch):
         assert ("selected slot by cost" if legacy else "selected slot by LRU") not in content
         assert re.search(rf"cache_save reason=saved slot={cut.body['id_slot']} tokens=\d+ bytes=\d+ checkpoints=\d+ copies=[1-9]\d*\n", content)
         if legacy is None:
-            # Age the long conversation enough to outweigh its size, then refresh the short one.
-            time.sleep(_held(long) / _held(other) + 0.5)
+            # Age the long conversation enough to outweigh its size, then refresh the short one: after 6 s its chance of a
+            # return is 0.17 + 0.83 / 13 = 0.23, and the refreshed one's is over 0.76 for its first 200 ms, so the long one
+            # costs less while it holds under 3.2 times the tokens.
+            assert _held(long) < 3 * _held(other)
+            time.sleep(6)
             more = _one_token(SHARED_PREFIX + TAIL_E + " Then it woke up.")
             assert more.body["id_slot"] == other.body["id_slot"]
             log.drain()
@@ -674,6 +679,33 @@ def test_shared_prefix_takes_the_slot_that_costs_least_to_cut(monkeypatch):
             assert "selected slot by cost" in content
         back = _one_token(SHARED_PREFIX + (TAIL_A * 3 if legacy else TAIL_C) + " Then the fire went out.")
         assert back.body["timings"]["cache_n"] >= _held(cut) - 1
+        server.stop()
+
+
+# A few seconds away take little from a conversation's chance of a return (0.97 of it is left after 3 s at the default 90 s),
+# so the conversation of twice the size stays and the one just used is cut. LLAMA_SLOT_VICTIM_IDLE_LEGACY=1 divides the tokens
+# by the seconds idle instead, and those seconds outweigh the size.
+def test_shared_prefix_weighs_idle_seconds_by_the_chance_of_a_return(monkeypatch):
+    monkeypatch.delenv("LLAMA_SLOT_VICTIM_LRU_LEGACY", raising=False)
+    monkeypatch.delenv("LLAMA_SLOT_VICTIM_RETURN_S", raising=False)
+    for legacy in (None, "1"):
+        if legacy is None:
+            monkeypatch.delenv("LLAMA_SLOT_VICTIM_IDLE_LEGACY", raising=False)
+        else:
+            monkeypatch.setenv("LLAMA_SLOT_VICTIM_IDLE_LEGACY", legacy)
+        log = _shared_prefix_server(2)
+        long = _one_token(SHARED_PREFIX + TAIL_A * 3)
+        short = _one_token(SHARED_PREFIX + TAIL_C)
+        assert short.body["id_slot"] != long.body["id_slot"]
+        assert _held(long) > 1.5 * _held(short)
+        time.sleep(_held(long) / _held(short) + 0.5)
+        more = _one_token(SHARED_PREFIX + TAIL_C + " Then the fire went out.")
+        assert more.body["id_slot"] == short.body["id_slot"]
+        log.drain()
+        third = _one_token(SHARED_PREFIX + TAIL_E)
+        content = log.wait_for("cache_save reason=saved")
+        assert third.body["id_slot"] == (long if legacy else short).body["id_slot"]
+        assert "selected slot by cost" in content
         server.stop()
 
 
