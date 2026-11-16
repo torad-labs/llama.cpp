@@ -291,11 +291,11 @@ def common_decode_window(rows):
                 boundary="start exclusive, end inclusive; client receive times; whole bursts")
 
 
-def terminate(child):
+def terminate(child, timeout=10):
     if child is not None and child.poll() is None:
         os.killpg(child.pid, signal.SIGTERM)
         try:
-            child.wait(timeout=10)
+            child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             os.killpg(child.pid, signal.SIGKILL)
             child.wait()
@@ -308,7 +308,9 @@ class ServingLeg:
         self.url = f"http://127.0.0.1:{args.port}"
         self.request_lock = threading.Lock()
         self.request_number = 0
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("GGML_", "LLAMA_", "TEST_"))}
+        self.child = None
+        self.stopped = threading.Event()
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("GGML_", "LLAMA_", "TEST_", "CUDA_", "NVIDIA_"))}
         self.env.update(CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES="0,1",
                         GGML_CUDA_ALLREDUCE="internal", GGML_CUDA_GRAPH_MAX="0",
                         LD_LIBRARY_PATH=f"{args.binary}:{args.root}/cuda-runtime")
@@ -319,10 +321,27 @@ class ServingLeg:
             self.env["GGML_CUDA_ROUTE_STATS"] = "1"
 
     def timeout(self, maximum=300):
+        if self.stopped.is_set():
+            raise InterruptedError("serving leg interrupted")
         left = self.args.deadline - time.time()
         if left <= 0:
             raise TimeoutError("serving deadline reached")
         return min(maximum, left)
+
+    @contextlib.contextmanager
+    def request_pool(self, max_workers, barrier=None):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            yield pool
+        except BaseException:
+            self.stopped.set()
+            if barrier is not None:
+                barrier.abort()
+            # Stop the HTTP server before joining workers blocked on its replies.
+            terminate(self.child, timeout=3)
+            raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def response_record(self):
         with self.request_lock:
@@ -438,7 +457,7 @@ class ServingLeg:
             barrier.wait(timeout=self.timeout(10))
             return self.complete_stream(prompt, tokens, slot, prompt_tokens, repeat)
         started = time.monotonic()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(slots)) as pool:
+        with self.request_pool(max_workers=len(slots), barrier=barrier) as pool:
             rows = list(pool.map(run, slots))
         return dict(slots=slots, output_tokens_per_stream=tokens, streams=rows,
                     common_decode=common_decode_window(rows), http_seconds=time.monotonic()-started,
@@ -513,7 +532,7 @@ class ServingLeg:
             write_json(self.out / "single.json", self.complete(prompt, 64, 0, count))
             if mode == "concurrency":
                 started = time.monotonic()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                with self.request_pool(max_workers=3) as pool:
                     rows = list(pool.map(lambda slot: self.complete(prompt, 64, slot, count), range(3)))
                 write_json(self.out / "concurrent.json", dict(wall_seconds=time.monotonic()-started, rows=rows))
                 write_json(self.out / "tail.json", self.complete(prompt, 64, 0, count))
@@ -585,7 +604,7 @@ class ServingLeg:
         meta = dict(args=vars(self.args), argv=server_command(self.args), model_sha256=self.args.model_sha256,
                     binary_manifest=json.loads((self.args.binary / "manifest.json").read_text()),
                     profile=self.args.profile, instrumented=self.args.mode in ("capacity", "concurrency", "diagnostic"),
-                    engine_env={k: v for k, v in self.env.items() if k.startswith(("GGML_", "LLAMA_", "CUDA_"))})
+                    engine_env={k: v for k, v in self.env.items() if k.startswith(("GGML_", "LLAMA_", "CUDA_", "NVIDIA_", "TEST_"))})
         write_json(self.out / "run.json", meta)
         child, monitor = None, None
         with ((self.out / "server.log").open("w") as log, (self.out / "gpu.csv").open("w") as gpu,
@@ -595,7 +614,7 @@ class ServingLeg:
                     monitor = subprocess.Popen(["stdbuf", "-oL", "nvidia-smi", "--query-gpu=timestamp,index,memory.used,power.draw",
                                                 "--format=csv,noheader,nounits", "--loop-ms=500"],
                                                stdout=gpu, stderr=monitor_log, start_new_session=True)
-                child = subprocess.Popen(meta["argv"], env=self.env, stdout=log, stderr=log, start_new_session=True)
+                self.child = child = subprocess.Popen(meta["argv"], env=self.env, stdout=log, stderr=log, start_new_session=True)
                 ready_until = min(self.args.deadline, time.time()+300)
                 while True:
                     if monitor is not None and monitor.poll() is not None:
@@ -644,6 +663,8 @@ class ServingLeg:
 
 
 def run_measurements(args):
+    if args.repeats < 1:
+        raise ValueError("measurements require a positive repeat count")
     baseline = getattr(args, "baseline_binary", None)
     if baseline is None:
         ServingLeg(args).run()
@@ -658,7 +679,8 @@ def run_measurements(args):
     receipt = dict(order=[name for name, _ in legs], completed=[], deadline=args.deadline, passed=False)
     write_json(folder / "abba.json", receipt)
     for name, binary in legs:
-        leg = argparse.Namespace(**(vars(args) | dict(run=args.run + "-" + name, binary=binary)))
+        profile = "" if name.startswith("A") else args.profile
+        leg = argparse.Namespace(**(vars(args) | dict(run=args.run + "-" + name, binary=binary, profile=profile)))
         ServingLeg(leg).run()
         receipt["completed"].append(leg.run)
         write_json(folder / "abba.json", receipt)

@@ -76,6 +76,15 @@ class PromptEvalsTest(unittest.TestCase):
         self.assertAlmostEqual(second["catchup_ms"], 2.5)
         self.assertEqual(second["catchup_built"], 1)
 
+    def test_a_checkpoint_on_an_iteration_boundary_belongs_to_one_iteration(self):
+        lines = list(LOG)
+        first_end = span("end", 63_000_000, "stage=iteration iteration=1")
+        lines.insert(lines.index(first_end) + 1,
+                     "0.08.431.170 I slot create_check: id 0 | created context checkpoint 1 of 32 (pos = 1, kept buffers, 2.25 ms)")
+        outside = self.tool.read(lines)[2]["1-32"]
+        self.assertEqual([row["checkpoints"] for row in outside], [1, 1])
+        self.assertEqual([row["checkpoint_ms"] for row in outside], [2.25, 4.5])
+
     def test_the_report_names_what_was_built_and_what_replayed(self):
         out = io.StringIO()
         self.tool.report("server.log", self.tool.read(LOG), True, out)

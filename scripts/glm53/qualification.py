@@ -143,6 +143,10 @@ def check_run_identity(meta, expected, context, ubatch, profile):
     manifest = meta.get("binary_manifest", {})
     engine_env = {k: v for k, v in meta.get("engine_env", {}).items() if k.startswith(("GGML_", "LLAMA_"))}
     expected_env = {"GGML_CUDA_ALLREDUCE": "internal", "GGML_CUDA_GRAPH_MAX": "0"} | expected.get("resolved_env", {})
+    placement = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1"}
+    for key, value in meta.get("engine_env", {}).items():
+        if key.startswith(("CUDA_", "NVIDIA_", "TEST_")) and (key not in placement or value != placement[key]):
+            raise ValueError("serving configuration contains an unqualified device override")
     if (any(meta.get("args", {}).get(k) != v for k, v in settings.items())
             or any(manifest.get(k) != expected[k] for k in ("commit", "tarball_sha256"))
             or meta.get("model_sha256") != expected["model_sha256"]
@@ -236,10 +240,12 @@ def device_cases():
                 ops(f"kda-c{columns}-f{front}-gpu{gpu}", "GATED_DELTA_NET,GATED_DELTA_NET_CACHE_FUSION",
                     card | {"GGML_CUDA_KDA_COLUMNS": str(columns), "GGML_CUDA_KDA_FRONT_SHARED": str(front)},
                     185, "kda=1(,K=[0-9]+,rows_mode=0,|$)")
+        # test-backend-ops currently registers 81 GLM53_MOE_ROUTES shapes.
+        iq3_cases = 81
         for slots in (2, 4, 6, 8):
             ops(f"iq3-s{slots}-gpu{gpu}", "GLM53_MOE_ROUTES",
                 card | {"GGML_CUDA_IQ3_COMPACT": "1", "GGML_CUDA_IQ3_SLOTS": str(slots)},
-                72)
+                iq3_cases)
         for publication in (0, 1):
             ops(f"hc-publication-{publication}-gpu{gpu}", "DSV4_HC_PRE_FUSED,DSV4_HC_PRE_Q8_1,DSV4_HC_PRE_POST",
                 card | {"GGML_CUDA_HC_FRONT_ONE": "1", "GGML_CUDA_HC_CTA_PUBLISH": str(publication)}, 65)

@@ -137,8 +137,10 @@ of November 11), and each card carries about half the pack's split weights:
 the sums that give six sessions, and what a seventh would need, are in
 [the two-card goal](../torad/glm53-two-gpu.md). They are arithmetic from the
 four-card reads, not a two-card load: treat a card left with under 4,096 MiB
-free at load as a failed sizing and shrink the pool with `--context`.
-Nominal VRAM
+free at load as a failed sizing and shrink the pool with
+`--context 1536000 --slot-context 307200`, preserving the session cap and the
+32 kept graphs. `--context` alone deliberately removes that cap and selects
+128 kept graphs instead. Nominal VRAM
 alone does not establish fit with other GPU processes, different
 drivers/builds, projector workloads, or deeper drafts; the projector's 1.05
 GiB sits on the first card inside the same headroom. The 32,768 MiB

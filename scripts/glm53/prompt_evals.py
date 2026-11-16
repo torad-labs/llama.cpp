@@ -128,9 +128,8 @@ def read(lines):
         by_decode[checkpoint[2]].append(checkpoint)
     for iteration in iterations:
         # a checkpoint is made in the iteration whose target decodes it sits among
-        iteration['checkpoints'] = [checkpoint for index in range(iteration['first_target'], iteration['last_target'] + 1)
-                                    for checkpoint in by_decode.get(index, [])
-                                    if index > iteration['first_target'] or iteration['last_target'] > iteration['first_target']]
+        iteration['checkpoints'] = [checkpoint for index in range(iteration['first_target'] + 1, iteration['last_target'] + 1)
+                                    for checkpoint in by_decode.get(index, [])]
 
     prompt_evals = collections.defaultdict(list)
     reply_evals = collections.defaultdict(list)

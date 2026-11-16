@@ -112,9 +112,6 @@ def capture_readiness(db, devices, *, expected_sequences=None):
             f'WHERE globalPid=? AND correlationId IN ({placeholders}) AND end>start',
             (phase['pid'], *correlations)) if row[0] >= launch_starts[row[4]]]
         by_device = {device: [row for row in kernels if row[2] == device] for device in expected}
-        result['processes'][str(phase['pid'])] = {str(device): len(rows) for device, rows in by_device.items()}
-        for device, rows in by_device.items():
-            result['kernel_counts'][str(device)] += len(rows)
         if not all(by_device.values()):
             continue
         gpu_events = [row for rows in by_device.values() for row in rows]
@@ -122,6 +119,9 @@ def capture_readiness(db, devices, *, expected_sequences=None):
         end = max(row[1] for row in gpu_events)
         if end <= start:
             continue
+        result['processes'][str(phase['pid'])] = {str(device): len(rows) for device, rows in by_device.items()}
+        for device, rows in by_device.items():
+            result['kernel_counts'][str(device)] += len(rows)
         result['actual_rows'] = phase['rows']
         result['gpu_window'] = dict(start_ns=start, end_ns=end, duration_ns=end-start, kernel_count=len(gpu_events))
         result['usable'] = True

@@ -12,6 +12,7 @@ import unittest
 
 from qualification import device_cases
 from run_window import SiblingStopped, Window, execute
+from unittest.mock import patch
 
 
 def comparison(passed, failures, baseline_tok_s, candidate_tok_s):
@@ -29,6 +30,18 @@ def staged(window, calls, compare):
 
 
 class WindowProcessTest(unittest.TestCase):
+    def test_qualified_children_do_not_inherit_cuda_diagnostics(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
+                "CUDA_LAUNCH_BLOCKING": "1", "NVIDIA_TF32_OVERRIDE": "0"}):
+            window = Window(SimpleNamespace(root=Path(folder), stop_at=time.time()+630))
+            window.out.mkdir()
+            output = window.command("environment", [sys.executable, "-c",
+                "import json,os; print(json.dumps({k: v for k,v in os.environ.items() if k.startswith(('CUDA_', 'NVIDIA_'))}))"])
+            env = json.loads(output)
+            self.assertNotIn("CUDA_LAUNCH_BLOCKING", env)
+            self.assertNotIn("NVIDIA_TF32_OVERRIDE", env)
+            self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
+
     def test_failed_child_identity_survives_unreadable_stderr(self):
         for unavailable in (False, True):
             with self.subTest(unavailable=unavailable), tempfile.TemporaryDirectory(dir="/tmp") as folder:

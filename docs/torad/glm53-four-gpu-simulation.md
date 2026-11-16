@@ -1,4 +1,6 @@
-# GLM-5.3 Flash four-GPU decode simulation
+# GLM-5.3 Flash four-GPU decode simulation (retired)
+
+> Historical DP simulation, not a current serving runbook. PR #262 removed `simulate_decode.py`, `capacity.py`, their tests and the DP launcher profiles on November 16, 2026. Commands and source references below describe the tree before commit `581d4a16f`; they cannot be executed on current main. Use [the tensor serving recipes](../backend/GLM53-SERVING.md) and [the two-card box read](glm53-two-gpu.md) for current work. The offline decode lab and PCIe estimator remain available for existing captures.
 
 ## Goal
 

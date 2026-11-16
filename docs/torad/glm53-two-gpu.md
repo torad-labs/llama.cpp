@@ -103,8 +103,8 @@ a leg disproves its layout rather than tuning on rented time.
    128 KB where the pair maps each other's memory and the chunked kernel where it cannot (TORAD.md, rows
    `1cbc66f49`, `3bef5edc2`). Pin what the pair reads in the launcher.
 2. **The load.** `serve.py --profile tensor-2 --dry-run`, then launch. Record free MiB a card at load from the
-   server log. Under 4,096 MiB free, relaunch with a pool one session smaller, `--context 1536000`, and record
-   that the default sizing missed, in this file, before any rate is read.
+   server log. Under 4,096 MiB free, relaunch with a pool one session smaller, `--context 1536000 --slot-context 307200`, and record
+   that the default sizing missed, in this file, before any rate is read. Keep `--slot-context 307200` with any explicit pool size so that the limit and the 32 kept graphs stay unchanged; `--context` alone removes the limit and selects 128 kept graphs.
 3. **The rate.** `rate.py --sessions 1 2 4 6 12`, two passes after the load (the first captures graphs), then
    the same at histories of about 4,000 tokens if time allows. Per-session tok/s at each count is the number;
    the 12-session pass reads what twelve reserved sessions decoding together cost against six.
@@ -125,7 +125,7 @@ a leg disproves its layout rather than tuning on rented time.
 6. **The depth.** `dp_longctx.py --streams 6 --context-tokens 295000 --turns 2` against the same server: six
    sessions populate the whole pool near the cap at once, no cache lost, VRAM peak per card from its sampler.
    This is the leg the goal is made of; a short-context rate without it is not the goal read.
-7. **The seventh session.** Relaunch `--context 2150400`, a seventh whole session in the pool, read free
+7. **The seventh session.** Relaunch `--context 2150400 --slot-context 307200`, a seventh whole session in the pool, read free
    memory and `rate.py --sessions 7` only. Keep whichever pool the free-memory rule allows as the recorded
    capacity; do not tune kept graphs to squeeze the seventh in on rented time.
 8. **Quality spot checks, if the clock allows.** Greedy 96-token continuations of one prompt set under

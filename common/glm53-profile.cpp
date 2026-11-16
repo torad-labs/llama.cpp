@@ -74,11 +74,16 @@ std::map<std::string, std::string> common_glm53_profile_resolve(
 }
 
 void common_glm53_profile_apply(common_params & params) {
-    if (params.glm53_profile.empty()) { return; }
     static std::mutex mutex;
     static std::string applied_name;
     static std::map<std::string, std::string> applied;
     const std::lock_guard<std::mutex> lock(mutex);
+    if (params.glm53_profile.empty()) {
+        if (!applied_name.empty()) {
+            throw std::invalid_argument("changing GLM profiles requires a new process and model reload");
+        }
+        return;
+    }
     if (!applied_name.empty() && applied_name != params.glm53_profile) {
         throw std::invalid_argument("changing GLM profiles requires a new process and model reload");
     }

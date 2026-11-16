@@ -23,6 +23,10 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
+    for source in [args.draft, *args.target]:
+        if args.out.exists() and args.out.samefile(source):
+            raise SystemExit(f"--out aliases source file {source}: choose another output path")
+
     draft = gguf.GGUFReader(args.draft)
     own = {tensor.name for tensor in draft.tensors}
     shards = [gguf.GGUFReader(path) for path in args.target]
