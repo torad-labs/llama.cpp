@@ -166,7 +166,7 @@ DFlash2 verifies 8 rows a session a step against MTP depth 2's 3, and while a st
 
 ## The layout
 
-`tensor-4`: four-way tensor split (`-sm tensor -ts 1,1,1,1`, every card on every request) with one shared unified pool. It is the layout the reads run on because it is one pass a step whichever slots are busy, with no engine change. It ran on four real cards for the first time on Nov 9 (a fixture of the pack's attention shape, then the pack). `dp-4` (experts split across cards, private 442,368-cell slots) stays in the tree. The rig lead's work on it (Nov 7 to 9: one draft depth a concurrent round, the routed experts' gate and up prepared together, MTP hidden rows kept on the devices, prompt chunks, captures kept by scheduler generation) sat uncommitted until Nov 10 and is on main since `8832d8669`. It read 25 to 28 tok/s a session at 36 sessions on four cards, 920 to 1,030 tok/s over the cards, where `tensor-4`'s 23 sessions at 30 are 690. The two were never read at the same sessions, prompts and engine: `dp-4` at 23 sessions is a number the next box read can give.
+`tensor-4`: four-way tensor split (`-sm tensor -ts 1,1,1,1`, every card on every request) with one shared unified pool. It is the layout the reads run on because it is one pass a step whichever slots are busy, with no engine change. It ran on four real cards for the first time on Nov 9 (a fixture of the pack's attention shape, then the pack). `dp-4` (experts split across cards, private 442,368-cell slots) was in the tree until Nov 16, 2026. The rig lead's work on it (Nov 7 to 9: one draft depth a concurrent round, the routed experts' gate and up prepared together, MTP hidden rows kept on the devices, prompt chunks, captures kept by scheduler generation) sat uncommitted until Nov 10 and is on main since `8832d8669`. It read 25 to 28 tok/s a session at 36 sessions on four cards, 920 to 1,030 tok/s over the cards, where `tensor-4`'s 23 sessions at 30 are 690. The two were never read at the same sessions, prompts and engine. Production settled the choice without that read: the four-card tensor layout carries 23 sessions on its shared pool at work, faster than the 45.7 tok/s a session this page records, because a step's cost follows the requests decoding at once and not the slots reserved (Marcos, Nov 16, 2026). The `dp-4` and `dp-2` profiles and their tooling were removed that day; the engine still takes `-sm dp`, and nothing in the tree selects it.
 
 - Shapes divide four ways on whole IQ3_XXS blocks: expert and shared feed-forward 2,048, dense 12,288, 64 heads, 32 indexer heads, vocabulary 154,880. A fixture with fewer heads than ranks asserts in the meta backend; the pack does not.
 - The DSA latent cache and the indexer cache are mirrored on every card under `-sm tensor`.
@@ -252,8 +252,9 @@ A box read starts with the pack already on the box's disk and the step read in t
 
 The same engine on two RTX PRO 6000 has its own goal (as many sessions as fit at 307,200 tokens each, no
 23-session target): [glm53-two-gpu.md](glm53-two-gpu.md) holds its capacity arithmetic and its box read. The
-launcher's `tensor-2` and `dp-2` profiles carry this page's settings at two ranks since Nov 15; nothing of it
-is read on cards yet, and no four-card number on this page is a two-card expectation.
+launcher's `tensor-2` profile carries this page's settings at two ranks since Nov 15, reserving twelve
+sessions against a pool of six whole ones; nothing of it is read on cards yet, and no four-card number on this
+page is a two-card expectation.
 
 ## Before any work
 

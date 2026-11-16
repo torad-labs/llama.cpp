@@ -40,11 +40,11 @@ int main() {
             self.assertTrue(all('clock=host-monotonic' in line and 'nvtx=' in line for line in records))
 
     def test_launcher_explicitly_preserves_requested_diagnostics_only(self):
-        normal=serve.arguments(['--model','/tmp/not-loaded.gguf','--profile','dp-4','--slots','1'])
+        normal=serve.arguments(['--model','/tmp/not-loaded.gguf','--profile','tensor-4','--slots','1'])
         argv,base=serve.make_plan(normal)
         self.assertNotIn('LLAMA_DECODE_TRACE',base)
         self.assertNotIn('-lv',argv)
-        traced=serve.arguments(['--model','/tmp/not-loaded.gguf','--profile','dp-4','--slots','1','--trace-decode'])
+        traced=serve.arguments(['--model','/tmp/not-loaded.gguf','--profile','tensor-4','--slots','1','--trace-decode'])
         argv,env=serve.make_plan(traced)
         self.assertEqual(env['LLAMA_DECODE_TRACE'],'1')
         self.assertEqual(env['GGML_CUDA_NVTX'],'1')
