@@ -406,7 +406,6 @@ class SolarOpenModel(Glm4MoeModel):
         special_vocab.add_to_gguf(self.gguf_writer)
 
 
-@ModelBase.register("Glm5NextForConditionalGeneration")
 @ModelBase.example("zai-org/GLM-5.3-Flash")
 class Glm5NextModel(TextModel):
 

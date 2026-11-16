@@ -297,9 +297,8 @@ def summarize(results):
 
 def peak(samples):
     """The per-card maximum over samples, each a list of one value per card."""
-    if not samples:
-        return []
-    return [max(column) for column in zip(*samples)]
+    return [max(sample[device] for sample in samples if len(sample) > device)
+            for device in range(max((len(sample) for sample in samples), default=0))]
 
 
 class Server:
@@ -329,7 +328,9 @@ def sample_memory(stop, samples, every):
         try:
             out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
                                  capture_output=True, text=True, timeout=10).stdout
-            samples.append([int(v.strip()) for v in out.split() if v.strip()])
+            sample = [int(v.strip()) for v in out.split() if v.strip()]
+            if sample:
+                samples.append(sample)
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
         stop.wait(every)

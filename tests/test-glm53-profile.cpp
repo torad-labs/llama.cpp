@@ -174,11 +174,16 @@ int main(int argc, char ** argv) {
         params.sampling.backend_sampling != (!canonical || explicit_sampling)) { return 2; }
     // Once resolved, changing a profile in-process must not reuse descriptors
     // or captured graphs from its previous storage/ownership configuration.
+    common_params empty;
+    bool rejected = false;
+    try { common_glm53_profile_apply(empty); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    if (!rejected) { return 3; }
     args[4] = canonical ? "sm120-balanced" : "canonical";
     ptrs.clear();
     for (auto & a : args) { ptrs.push_back(a.data()); }
     common_params changed;
-    if (common_params_parse((int)ptrs.size(), ptrs.data(), changed, LLAMA_EXAMPLE_COMMON)) { return 3; }
+    if (common_params_parse((int)ptrs.size(), ptrs.data(), changed, LLAMA_EXAMPLE_COMMON)) { return 4; }
     puts("complete profile, target sampling and reload boundary passed");
     return 0;
 }

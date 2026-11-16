@@ -4,8 +4,11 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import struct
+import subprocess
+import textwrap
 import sys
 import tempfile
 import threading
@@ -220,6 +223,114 @@ class ServingEvidence(unittest.TestCase):
             self.assertTrue(row["request"]["return_tokens"])
             self.assertEqual(len(row["bursts"]), 3)
             self.assertTrue((leg.out / row["response_record"]).with_suffix(".events.jsonl").is_file())
+
+    def test_sigterm_during_concurrent_http_stops_the_server_before_waiting_for_workers(self):
+        server_path = self.args.binary / "llama-server"
+        server_path.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""
+            import http.server, json, os, signal, sys, threading
+            from pathlib import Path
+            root = Path(sys.argv[0]).parent
+            (root / 'server-pid').write_text(str(os.getpid()))
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *args): pass
+                def send(self, value):
+                    self.send_response(200); self.end_headers()
+                    self.wfile.write(json.dumps(value).encode())
+                def do_GET(self): self.send({'status': 'ok'})
+                def do_POST(self):
+                    data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                    if self.path == '/tokenize':
+                        self.send({'tokens': list(range(32768))}); return
+                    with self.server.lock:
+                        self.server.calls += 1
+                        block = self.server.calls > 2
+                        if block: (root / ('blocked-' + str(data['id_slot']))).touch()
+                    if block:
+                        threading.Event().wait(60); return
+                    self.send({'content': 'ok', 'timings': {
+                        'predicted_n': data['n_predict'], 'prompt_n': 32768}})
+            port = int(sys.argv[sys.argv.index('--port') + 1])
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler)
+            server.calls = 0; server.lock = threading.Lock()
+            server.serve_forever()
+        """))
+        # The existing fixture HTTP server stays alive, on a different port.
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        command = [sys.executable, str(Path(__file__).with_name("measure.py")),
+            "--root", str(self.root), "--fixtures", str(self.root), "--binary", str(self.args.binary),
+            "--model", str(self.args.model), "--run", "interrupted", "--model-sha256", "fixture",
+            "--context", "1048576", "--ubatch", "512", "--mode", "concurrency",
+            "--deadline", str(time.time()+60), "--port", str(port)]
+        env = dict(os.environ, PATH=str(self.args.binary)+os.pathsep+os.environ["PATH"])
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True, env=env)
+        pid = None
+        try:
+            until = time.monotonic()+15
+            while not all((self.args.binary / f"blocked-{slot}").exists() for slot in range(3)):
+                if child.poll() is not None or time.monotonic() >= until:
+                    self.fail("measurement did not reach all three blocked HTTP requests")
+                time.sleep(0.02)
+            pid = int((self.args.binary / "server-pid").read_text())
+            child.send_signal(signal.SIGTERM)
+            try:
+                _out, err = child.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                self.fail("measurement did not clean up within the watchdog's grace period")
+            self.assertNotEqual(child.returncode, 0, err.decode(errors="replace"))
+            exits = json.loads((self.root / "results/interrupted/process-exit.json").read_text())
+            self.assertEqual(exits["pid"], pid)
+            self.assertIsNotNone(exits["exit"])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+            self.assertTrue(self.server_thread.is_alive())
+            self.assertFalse((self.root / "results/interrupted/workload.json").exists())
+        finally:
+            pid_file = self.args.binary / "server-pid"
+            if pid_file.exists():
+                try:
+                    os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+            child.communicate(timeout=5)
+
+    def test_measurements_scrub_inherited_cuda_diagnostics(self):
+        with patch.dict(os.environ, {"CUDA_LAUNCH_BLOCKING": "1", "NVIDIA_TF32_OVERRIDE": "0",
+                                    "GGML_CUDA_ROUTE_STATS": "1", "TEST_OVERRIDE": "1"}):
+            env = ServingLeg(self.args).env
+        for key in ("CUDA_LAUNCH_BLOCKING", "NVIDIA_TF32_OVERRIDE", "GGML_CUDA_ROUTE_STATS", "TEST_OVERRIDE"):
+            self.assertFalse(key in env, key)
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
+
+    def test_empty_timing_workloads_are_rejected_before_launch(self):
+        from measure import run_measurements
+        self.args.mode = "timing"
+        for repeats in (0, -1):
+            self.args.repeats = repeats
+            with self.subTest(repeats=repeats), self.assertRaisesRegex(ValueError, "repeat"):
+                run_measurements(self.args)
+        self.assertFalse((self.root / "results").exists())
+
+    def test_abba_applies_the_candidate_profile_only_to_candidate_legs(self):
+        from measure import run_measurements
+        self.args.mode = "scaling"
+        self.args.baseline_binary = self.root / "baseline"
+        self.args.profile = "sm120-wide"
+        launches = []
+        def run(leg):
+            launches.append(server_command(leg.args))
+        with patch.object(ServingLeg, "run", run):
+            run_measurements(self.args)
+        for i, command in enumerate(launches):
+            with self.subTest(leg=i):
+                self.assertEqual("--glm53-profile" in command, i in (1, 2))
+                if i in (1, 2):
+                    self.assertEqual(command[command.index("--glm53-profile") + 1], "sm120-wide")
 
     def test_abba_runs_all_four_legs_with_shared_deadline_and_raw_streams(self):
         from measure import run_measurements

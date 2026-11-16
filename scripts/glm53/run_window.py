@@ -25,7 +25,7 @@ from verify_results import evaluate, load_rows, validate_route_observations
 
 
 def clean_env():
-    return {k: v for k, v in os.environ.items() if not k.startswith(("GGML_", "LLAMA_", "TEST_"))}
+    return {k: v for k, v in os.environ.items() if not k.startswith(("GGML_", "LLAMA_", "TEST_", "CUDA_", "NVIDIA_"))}
 
 
 def write_json(path, value):

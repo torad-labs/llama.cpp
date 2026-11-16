@@ -105,7 +105,7 @@ def arguments(argv=None):
                              "takes them from when it starts with the same models: /dev/shm/... keeps them in memory. The "
                              "files hold the sessions' tokens (opt-in: not read on four cards)")
     parser.add_argument("--checkpoint-rows", type=int,
-                        help="Spare state rows on the cards, 1..64: a session's context checkpoint is copied to one of them "
+                        help="Spare state rows on the cards, 0..64: a session's context checkpoint is copied to one of them "
                              "on the cards, and from there to RAM on a thread of its own while the sessions decode "
                              "(opt-in: not read on four cards)")
     parser.add_argument("--prompt-shapes", type=int, choices=[1, 2, 4, 8, 16, 32], metavar="ROWS",
@@ -196,6 +196,8 @@ def make_plan(args):
         raise ValueError("kept-graphs must be 1..256")
     if args.cache_ram < -1 or args.ctx_checkpoints is not None and args.ctx_checkpoints < 0:
         raise ValueError("cache-ram is a size in MiB (-1: no limit) and ctx-checkpoints a count")
+    if args.checkpoint_rows is not None and not 0 <= args.checkpoint_rows <= 64:
+        raise ValueError("checkpoint-rows must be 0..64")
     if not 0 <= args.mtp_adaptive <= 1:
         raise ValueError("mtp-adaptive is a share of a round, 0..1")
     if args.mtp_depth_min is not None and (args.mtp_depth == "off" or args.dflash or int(args.mtp_depth_min) > int(args.mtp_depth)):

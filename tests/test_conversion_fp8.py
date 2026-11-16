@@ -18,8 +18,10 @@ import numpy as np
 import torch
 from safetensors.torch import save_file
 
+from conversion import get_model_class
 from conversion.base import LazyTorchTensor, gguf
 from conversion.deepseek import DeepseekV2Model
+from conversion.glm5next import Glm5NextModel
 from conversion.llama import LlamaModel
 from conversion.nemotron import NemotronHModel
 from conversion.phi import PhiMoeModel
@@ -42,6 +44,16 @@ class OffsetNormModel(Qwen2MoeModel):
         if name.endswith("input_layernorm.weight"):
             data_torch = data_torch + 1.0
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+class TestConverterRegistration(unittest.TestCase):
+    def test_glm5next_uses_canonical_converter(self):
+        from conversion.glm import Glm5NextModel as legacy_converter
+
+        self.assertIsNot(legacy_converter, Glm5NextModel)
+        for architecture in ("Glm5NextForConditionalGeneration", "Glm5NextForCausalLM"):
+            with self.subTest(architecture=architecture):
+                self.assertIs(get_model_class(architecture), Glm5NextModel)
 
 
 class TestFP8Conversion(unittest.TestCase):

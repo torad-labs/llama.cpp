@@ -222,6 +222,22 @@ class TraceRecoveryTest(unittest.TestCase):
         self.assertTrue(decode_trace.capture_readiness(db, range(4), expected_sequences=36)['usable'])
         db.close()
 
+    def test_rejected_window_kernels_do_not_count_toward_the_accepted_window(self):
+        db = decoded_capture_database()
+        db.execute('DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE deviceId=3')
+        db.execute("INSERT INTO NVTX_EVENTS VALUES (300,400,16777217,'glm53.v1 stage=target_eval rows=36',NULL)")
+        for sequence in range(36):
+            label = f'glm53.v1 stage=batch sequence={sequence} rows=1 prompt_rows=0'
+            db.execute('INSERT INTO NVTX_EVENTS VALUES (305,NULL,16777217,?,NULL)', (label,))
+        db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (320,321,16777217,8)')
+        for device in range(4):
+            db.execute('INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (330,360,?,16777216,8)', (device,))
+        result = decode_trace.capture_readiness(db, range(4), expected_sequences=36)
+        self.assertTrue(result['usable'], result)
+        self.assertEqual(result['gpu_window'], {'start_ns': 330, 'end_ns': 360, 'duration_ns': 30, 'kernel_count': 4})
+        self.assertEqual(result['kernel_counts'], {'0': 1, '1': 1, '2': 1, '3': 1})
+        db.close()
+
     def test_aborted_application_can_finish_export_before_profiler_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)/'concurrency.v2'

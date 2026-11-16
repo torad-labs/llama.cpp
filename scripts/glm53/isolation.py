@@ -211,11 +211,16 @@ for th in threads:
 for th in threads:
     th.join()
 turns = [e for e in log if "leak" in e]
+requested = (args.sessions - args.skip) * args.turns
 n_leak = sum(bool(e["leak"]) for e in turns)
 n_lost = sum(bool(e["lost"]) for e in turns)
+n_errors = sum(1 for e in log if "error" in e)
 print(f"isolation: {len(turns)} turns of {args.sessions - args.skip} sessions in {time.time() - t0:.0f} s, "
-      f"{sum(1 for e in log if e.get('dropped'))} requests dropped part-way, {sum(1 for e in log if 'error' in e)} errors")
+      f"{sum(1 for e in log if e.get('dropped'))} requests dropped part-way, {n_errors} errors")
 print(f"isolation: turns with ANOTHER session's code word: {n_leak}; turns that lost a word of their own: {n_lost}")
+if len(turns) != requested:
+    print(f"isolation: INCOMPLETE: {len(turns)} of {requested} requested turns completed; {n_errors} errors")
 if args.out:
-    json.dump({"args": vars(args), "codes": codes, "log": log}, open(args.out, "w"), indent=1)
-raise SystemExit(1 if n_leak or n_lost else 0)
+    with open(args.out, "w") as out:
+        json.dump({"args": vars(args), "codes": codes, "log": log}, out, indent=1)
+raise SystemExit(1 if n_leak or n_lost or len(turns) != requested else 0)

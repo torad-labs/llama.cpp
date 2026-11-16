@@ -163,6 +163,7 @@ class SummaryTest(unittest.TestCase):
 
     def test_peak_is_per_card(self):
         self.assertEqual(dp_longctx.peak([[1, 2, 3, 4], [5, 1, 1, 1], [2, 2, 9, 2]]), [5, 2, 9, 4])
+        self.assertEqual(dp_longctx.peak([[1, 2, 3, 4], [], [5, 1, 1, 1], [2, 2, 9, 2]]), [5, 2, 9, 4])
         self.assertEqual(dp_longctx.peak([]), [])
 
 

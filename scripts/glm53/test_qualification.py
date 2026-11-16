@@ -132,7 +132,8 @@ class QualificationTest(unittest.TestCase):
 
         # A timing run must reject hidden check/counter/dispatch overrides, even
         # when its top-level instrumentation label was accidentally left false.
-        for key in ("GGML_CUDA_ROUTE_STATS", "GGML_CUDA_MMVQ_Q8_SM120_CHECK", "GGML_CUDA_Q8_TMA"):
+        for key in ("GGML_CUDA_ROUTE_STATS", "GGML_CUDA_MMVQ_Q8_SM120_CHECK", "GGML_CUDA_Q8_TMA",
+                    "CUDA_LAUNCH_BLOCKING", "NVIDIA_TF32_OVERRIDE"):
             row = copy.deepcopy(meta)
             row["engine_env"][key] = "1"
             with self.subTest(env=key), self.assertRaises(ValueError):
@@ -193,6 +194,8 @@ class QualificationTest(unittest.TestCase):
             # 44+16+5 HC shapes.
             for name in [f"kda-c1-f0-gpu{gpu}"] + [f"kda-c{c}-f{f}-gpu{gpu}" for c in (2, 4) for f in (0, 1)]:
                 self.assertEqual(counts[name], 185, name)
+            for slots in (2, 4, 6, 8):
+                self.assertEqual(counts[f"iq3-s{slots}-gpu{gpu}"], 81)
             for publication in (0, 1):
                 self.assertEqual(counts[f"hc-publication-{publication}-gpu{gpu}"], 65)
 
@@ -317,7 +320,7 @@ class QualificationTest(unittest.TestCase):
                     self.assertIn(f"kda-c{columns}-f{front}-gpu{gpu}", names)
             for slots in (2, 4, 6, 8):
                 case = next(c for c in subset if c["name"] == f"iq3-s{slots}-gpu{gpu}")
-                self.assertEqual(case["cases"], 72)
+                self.assertEqual(case["cases"], 81)
                 self.assertNotIn("-p", case["argv"])
         for route in ("peer", "host", "mixed", "duplicate"):
             self.assertIn(f"capture-{route}", names)
@@ -592,6 +595,10 @@ class ServingRecipeTest(unittest.TestCase):
             base + ["--cache-ram", "65536", "--ctx-checkpoints", "8", "--prefix-copy"]))
         self.assertEqual((argv[argv.index("--cache-ram") + 1], argv[argv.index("--ctx-checkpoints") + 1]), ("65536", "8"))
         self.assertEqual(env["LLAMA_SLOT_PREFIX_COPY"], "1")
+        for rows in (0, 64):
+            with self.subTest(rows=rows):
+                env = self.serve.make_plan(self.serve.arguments(base + ["--checkpoint-rows", str(rows)]))[1]
+                self.assertEqual(env["LLAMA_RS_STAGE_ROWS"], str(rows))
         # -1 (no limit) and 0 (no cache, no checkpoints) are the server's own values and go through as given
         for value in ("-1", "0"):
             argv = self.serve.make_plan(self.serve.arguments(base + ["--cache-ram", value, "--ctx-checkpoints", "0"]))[0]
@@ -603,7 +610,8 @@ class ServingRecipeTest(unittest.TestCase):
         self.assertFalse({"LLAMA_KPOOL_SHARED_CELLS_LEGACY", "LLAMA_SLOT_VICTIM_LRU_LEGACY"} & set(env))
         env = self.serve.make_plan(self.serve.arguments(base + ["--shared-cells-legacy", "--victim-lru-legacy"]))[1]
         self.assertEqual((env["LLAMA_KPOOL_SHARED_CELLS_LEGACY"], env["LLAMA_SLOT_VICTIM_LRU_LEGACY"]), ("1", "1"))
-        for options in (base + ["--cache-ram", "-2"], base + ["--ctx-checkpoints", "-1"]):
+        for options in (base + ["--cache-ram", "-2"], base + ["--ctx-checkpoints", "-1"],
+                        base + ["--checkpoint-rows", "-1"], base + ["--checkpoint-rows", "65"]):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
 

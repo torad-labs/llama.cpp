@@ -1,4 +1,6 @@
-# Fixed four-GPU throughput comparison preparation
+# Fixed four-GPU throughput comparison preparation (retired)
+
+> Historical record, not a current runbook. PR #262 removed `compare_decode.py`, its tests and the DP launcher profiles on November 16, 2026. The commands and implementation descriptions below refer to the tree before commit `581d4a16f` and do not run on current main. Do not restore the DP recipe for a new measurement. Use [the tensor serving recipes](../backend/GLM53-SERVING.md) and [the two-card box read](glm53-two-gpu.md) for current work. `decode_lab.py` remains available for reading existing captures.
 
 ## Goal
 
@@ -20,7 +22,7 @@ The old one-session/4096-context capture is an offline plumbing fixture, not evi
 
 The scheduler is a deterministic **feasible list schedule**, not a proof of globally optimal execution. It supports a supplied complete cost model; it is not itself a calibrated CUDA or PCIe simulator. The old byte-budget estimate is not relabeled as complete.
 
-## Prepare without a GPU
+## Historical preparation commands (removed tooling)
 
 From the repository root, choose a new output file:
 
