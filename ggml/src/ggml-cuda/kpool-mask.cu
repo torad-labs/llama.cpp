@@ -62,6 +62,12 @@ static __global__ void k_kpool_mask(
 }
 
 // One bounded sort per row; physical cell order matches dense-mask compaction.
+// On CUDA the sort is a bitonic network whose comparators all put the smaller entry first: a merge first compares each
+// entry of its lower half with the one opposite it in the upper half, and then halves. An entry at or past n, the
+// selected cells and the tail, is INT32_MAX, the largest, so no comparator moves it: these entries are not stored and
+// their comparators are not run. A row of 2,048 selected cells and a short tail has a network of 4,096 entries and runs
+// about half of its comparators.
+template <int n_threads>
 static __global__ void k_kpool_indices(
         const int32_t * cells, const int32_t * rows, const int32_t * selected, const int32_t * tail,
         int32_t * dst, int nk, int np, int nr, int ntop, int ntail, int extra, int bound, int nsort,
@@ -88,9 +94,15 @@ static __global__ void k_kpool_indices(
     }
     const int32_t * pool = pos + (capacity ? capacity : nk);
     const int32_t base = capacity ? resident_rows[1] : 0;
-    for (int j = threadIdx.x; j < nsort; j += blockDim.x) {
+    const int n = ntop + ntail;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    const int n_fill = nsort;
+#else
+    const int n_fill = n;
+#endif
+    for (int j = threadIdx.x; j < n_fill; j += blockDim.x) {
         int32_t value = INT32_MAX;
-        if (live && j < ntop+ntail) {
+        if (live && j < n) {
             const bool from_top = j < ntop;
             const int32_t cell = from_top ? selected[(int64_t(stream)*nr+row)*ntop+j] : tail[(int64_t(stream)*nr+row)*ntail+j-ntop];
             if (!from_top && cell == -1) {
@@ -113,52 +125,54 @@ static __global__ void k_kpool_indices(
     }
     __syncthreads();
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // The launch uses 256 threads. Keep each warp's compare/exchange stages in registers;
-    // only partners in different warps need shared memory and a block barrier.
+    // Keep each warp's compare/exchange stages in registers; only partners in different warps need shared memory and a
+    // block barrier. A warp holds 32 entries that follow each other, so an entry's lane is the low bits of its index.
     constexpr int warp_width = 32;
-    constexpr int n_warps = 256/warp_width;
-    for (int base = 0; base < nsort; base += blockDim.x) {
+    constexpr int n_warps = n_threads/warp_width;
+    for (int base = 0; base < n; base += n_threads) {
         const int j = base + threadIdx.x;
-        int32_t value = j < nsort ? ids[j] : INT32_MAX;
+        int32_t value = j < n ? ids[j] : INT32_MAX;
         for (int width = 2; width <= min(nsort, warp_width); width *= 2) {
-            for (int stride = width/2; stride > 0; stride /= 2) {
-                const int32_t other = __shfl_xor_sync(0xffffffff, value, stride, warp_width);
-                const bool take_min = ((j & stride) == 0) == ((j & width) == 0);
-                value = take_min ? min(value, other) : max(value, other);
+            // the entry opposite in the merge, then the halves
+            int32_t other = __shfl_xor_sync(0xffffffff, value, width - 1, warp_width);
+            value = (j & (width/2)) == 0 ? min(value, other) : max(value, other);
+            for (int stride = width/4; stride > 0; stride /= 2) {
+                other = __shfl_xor_sync(0xffffffff, value, stride, warp_width);
+                value = (j & stride) == 0 ? min(value, other) : max(value, other);
             }
         }
-        if (j < nsort) { ids[j] = value; }
+        if (j < n) { ids[j] = value; }
     }
     __syncthreads();
     for (int width = 2*warp_width; width <= nsort; width *= 2) {
         for (int stride = width/2; stride >= warp_width; stride /= 2) {
-            for (int j = threadIdx.x; j < nsort; j += blockDim.x) {
-                const int other = j ^ stride;
-                if (other > j && ((ids[j] > ids[other]) == ((j & width) == 0))) {
+            const int flip = stride == width/2 ? width - 1 : stride;
+            for (int j = threadIdx.x; j < n; j += n_threads) {
+                const int other = j ^ flip;
+                if (other > j && other < n && ids[j] > ids[other]) {
                     const int32_t tmp = ids[j]; ids[j] = ids[other]; ids[other] = tmp;
                 }
             }
             __syncthreads();
         }
-        for (int base = 0; base < nsort; base += blockDim.x) {
+        for (int base = 0; base < n; base += n_threads) {
             const int j = base + threadIdx.x;
-            int32_t value = j < nsort ? ids[j] : INT32_MAX;
+            int32_t value = j < n ? ids[j] : INT32_MAX;
 #pragma unroll
             for (int stride = warp_width/2; stride > 0; stride /= 2) {
                 const int32_t other = __shfl_xor_sync(0xffffffff, value, stride, warp_width);
-                const bool take_min = ((j & stride) == 0) == ((j & width) == 0);
-                value = take_min ? min(value, other) : max(value, other);
+                value = (j & stride) == 0 ? min(value, other) : max(value, other);
             }
-            if (j < nsort) { ids[j] = value; }
+            if (j < n) { ids[j] = value; }
         }
         __syncthreads();
     }
 
     // Contiguous chunks preserve sorted order after the exclusive prefix sum. Compare
     // the first entry with its predecessor too, so duplicates spanning chunks vanish.
-    const int chunk = (nsort + blockDim.x - 1)/blockDim.x;
+    const int chunk = (n + n_threads - 1)/n_threads;
     const int begin = threadIdx.x*chunk;
-    const int end = min(begin + chunk, nsort);
+    const int end = min(begin + chunk, n);
     int count = 0;
     for (int j = begin; j < end; ++j) {
         count += ids[j] != INT32_MAX && (j == 0 || ids[j] != ids[j-1]);
@@ -315,13 +329,28 @@ void ggml_cuda_op_kpool_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         while (nsort < n) { nsort *= 2; }
         const dim3 grid(rows->ne[1], rows->ne[2]);
         const int capacity = ggml_get_op_params_i32(dst, 2);
-        k_kpool_indices<<<grid, 256, nsort*sizeof(int32_t), ctx.stream()>>>(
-            (const int32_t *) cells->data, (const int32_t *) rows->data,
-            (const int32_t *) selected->data, (const int32_t *) tail->data, (int32_t *) dst->data,
-            capacity ? ggml_get_op_params_i32(dst, 3) : cells->ne[0], capacity ? 1 : cells->ne[2],
-            rows->ne[1], selected->ne[0], tail->ne[0], ggml_get_op_params_i32(dst, 1), dst->ne[0], nsort,
-            capacity, capacity ? (const int32_t *) dst->src[4]->data : nullptr,
-            capacity ? dst->src[4]->ne[0] : 0, cells->nb[1]/sizeof(int32_t), cells->ne[1]);
+        const auto launch = [&](auto kernel, int n_threads) {
+            kernel<<<grid, n_threads, nsort*sizeof(int32_t), ctx.stream()>>>(
+                (const int32_t *) cells->data, (const int32_t *) rows->data,
+                (const int32_t *) selected->data, (const int32_t *) tail->data, (int32_t *) dst->data,
+                capacity ? ggml_get_op_params_i32(dst, 3) : cells->ne[0], capacity ? 1 : cells->ne[2],
+                rows->ne[1], selected->ne[0], tail->ne[0], ggml_get_op_params_i32(dst, 1), dst->ne[0], nsort,
+                capacity, capacity ? (const int32_t *) dst->src[4]->data : nullptr,
+                capacity ? dst->src[4]->ne[0] : 0, cells->nb[1]/sizeof(int32_t), cells->ne[1]);
+        };
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        launch(k_kpool_indices<256>, 256);
+#else
+        // A row's sort is one block, and its time is the block's. Where each row has an SM of its own, a decode's rows,
+        // a block of 1,024 threads takes two thirds of the time of one of 256 (RTX 5070 Ti, Nov 15, 2026: 23 us against
+        // 35 for 3 rows of 2,048 cells and a tail of 16). Where the rows share the SMs, a prompt pass's, blocks of 256
+        // fill them better (203 us against 315 for 1,024 rows).
+        if (rows->ne[1]*rows->ne[2] <= ggml_cuda_info().devices[ctx.device].nsm) {
+            launch(k_kpool_indices<1024>, 1024);
+        } else {
+            launch(k_kpool_indices<256>, 256);
+        }
+#endif
         CUDA_CHECK(cudaGetLastError());
         return;
     }

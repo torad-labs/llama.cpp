@@ -12063,9 +12063,11 @@ struct test_kpool_mask : public test_case {
     const int64_t n_extra; // -inf columns past n_kv
     const int     mode;    // ggml_kpool_mask_mode
     const int     r;       // cells a pool
+    const int64_t n_top;   // GGML_KPOOL_MASK_INDICES: the selected cells of a row, and the cells of its tail
+    const int64_t n_tail;
 
     std::string vars() override {
-        return VARS_TO_STR7(n_kv, n_rows, n_ps, ns, n_extra, mode, r);
+        return VARS_TO_STR9(n_kv, n_rows, n_ps, ns, n_extra, mode, r, n_top, n_tail);
     }
 
     double max_nmse_err() override {
@@ -12081,8 +12083,8 @@ struct test_kpool_mask : public test_case {
     }
 
     test_kpool_mask(int64_t n_kv = 256, int64_t n_rows = 8, int64_t n_ps = 1, int64_t ns = 1, int64_t n_extra = 0,
-            int mode = GGML_KPOOL_MASK_SEL, int r = 4)
-        : n_kv(n_kv), n_rows(n_rows), n_ps(n_ps), ns(ns), n_extra(n_extra), mode(mode), r(r) {}
+            int mode = GGML_KPOOL_MASK_SEL, int r = 4, int64_t n_top = 64, int64_t n_tail = 16)
+        : n_kv(n_kv), n_rows(n_rows), n_ps(n_ps), ns(ns), n_extra(n_extra), mode(mode), r(r), n_top(n_top), n_tail(n_tail) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv, 2, n_ps, ns);
@@ -12093,11 +12095,11 @@ struct test_kpool_mask : public test_case {
 
         ggml_tensor * out;
         if (mode == GGML_KPOOL_MASK_INDICES) {
-            ggml_tensor * selected = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 64, n_rows, ns);
-            ggml_tensor * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 16, n_rows, ns);
+            ggml_tensor * selected = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_top, n_rows, ns);
+            ggml_tensor * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_tail, n_rows, ns);
             ggml_set_name(selected, "selected");
             ggml_set_name(tail, "tail");
-            out = ggml_kpool_indices(ctx, cells, rows, selected, tail, n_extra, 96);
+            out = ggml_kpool_indices(ctx, cells, rows, selected, tail, n_extra, n_top + n_tail + 16);
         } else {
             out = ggml_kpool_mask(ctx, cells, rows, (ggml_kpool_mask_mode) mode, n_extra);
         }
@@ -17129,6 +17131,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // the indices of a row's cells at counts on each side of a warp, of a block of 256 and of 1,024 threads, and of a
+    // power of two: the sort does not store the entries past the selected cells and the tail. CUDA sorts a row in a
+    // block of 1,024 threads where the rows are no more than the card's SMs, and of 256 threads past that: 300 rows
+    for (auto [n_top, n_tail] : { std::pair{1, 1}, std::pair{30, 1}, std::pair{31, 1}, std::pair{32, 1}, std::pair{63, 1},
+                                  std::pair{250, 6}, std::pair{255, 2}, std::pair{500, 24}, std::pair{1000, 24},
+                                  std::pair{1023, 1}, std::pair{1024, 1}, std::pair{2048, 1}, std::pair{2048, 16},
+                                  std::pair{2048, 300}, std::pair{3000, 9}, std::pair{4000, 96} }) {
+        for (auto [n_rows, ns] : { std::pair{1, 1}, std::pair{3, 2}, std::pair{33, 1}, std::pair{300, 1} }) {
+            test_cases.emplace_back(new test_kpool_mask(4096, n_rows, 1, ns, 37, GGML_KPOOL_MASK_INDICES, 4, n_top, n_tail));
+        }
+    }
+    // the same where most of a row's cells are one cell many times
+    test_cases.emplace_back(new test_kpool_mask(256, 7, 1, 1, 0, GGML_KPOOL_MASK_INDICES, 4, 2048, 16));
 
     for (int mode : { GGML_KPOOL_MATERIALIZE_FACTS, GGML_KPOOL_MATERIALIZE_CELLS,
             GGML_KPOOL_MATERIALIZE_REPS, GGML_KPOOL_MATERIALIZE_BIAS }) {
@@ -18006,6 +18021,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
+    }
+    // the indices of a row's cells as served: 2,048 selected cells and a short tail, for a verify's rows, for a batch of
+    // sessions' and for a prompt pass
+    for (int64_t n_rows : { 1, 3, 8, 24, 64, 256, 1024 }) {
+        test_cases.emplace_back(new test_kpool_mask(131072, n_rows, 1, 1, 4*512, GGML_KPOOL_MASK_INDICES, 4, 2048, 16));
     }
     // kpool_mask at GLM-5.3's served shapes: 4 cells a pool, a 2048-token ubatch, 512 dump pools' columns on sel
     for (int64_t n_kv : { 16384, 131072 }) {
