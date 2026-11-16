@@ -39,6 +39,18 @@ class DecodeSimulationTest(unittest.TestCase):
         self.assertEqual(result['ownership']['target_rows'], [12, 0, 0, 0])
         self.assertEqual(result['ownership']['dense_utilization_ceiling'], 0.25)
 
+    def test_two_devices_split_owners_and_experts_in_two(self):
+        result = simulate(slots=10, sequence_ids=(0, 1, 2, 3), devices=2)
+        self.assertEqual(result['scenario']['devices'], 2)
+        self.assertEqual(result['ownership']['slots'], [5, 5])
+        self.assertEqual(result['ownership']['active'], [2, 2])
+        self.assertEqual(result['ownership']['target_rows'], [6, 6])
+        self.assertEqual(result['ownership']['dense_utilization_ceiling'], 1.0)
+        self.assertEqual(result['layers'][3]['routed_expert_partitions'], [[0, 144], [144, 288]])
+        self.assertEqual(result['transport']['gather']['logical_peer_payload_bytes'], 2 * 12 * 4096 * 4)
+        with self.assertRaises(ValueError):
+            simulate(devices=3)
+
     def test_rejected_drafts_consume_work_but_not_delivered_tokens(self):
         for accepted in (0, 1, 2):
             with self.subTest(accepted=accepted):

@@ -4,19 +4,29 @@ Select the GPU layout explicitly with `scripts/glm53/serve.py --profile`:
 
 | Launcher profile | Server layout | Engine flags and visible devices |
 |---|---|---|
-| `tensor-2` (default) | One server spans two cards with tensor parallelism | `-sm tensor -ts 1,1`, `CUDA_VISIBLE_DEVICES=0,1` |
-| `dp-4` | One server spans all four cards; sequences have individual owners, dense weights are replicated, and routed experts are partitioned across all four | `-sm dp -ts 1,1,1,1`, `CUDA_VISIBLE_DEVICES=0,1,2,3` |
+| `tensor-2` (default) | One server spans two cards with tensor parallelism, one shared pool | `-sm tensor -ts 1,1`, `CUDA_VISIBLE_DEVICES=0,1` |
+| `tensor-4` | The same over four cards, 23 sessions on one shared pool | `-sm tensor -ts 1,1,1,1`, `CUDA_VISIBLE_DEVICES=0,1,2,3` |
+| `dp-2` | One server spans two cards; sequences have individual owners, dense weights are replicated, and routed experts are partitioned across both | `-sm dp -ts 1,1`, `CUDA_VISIBLE_DEVICES=0,1` |
+| `dp-4` | The same over four cards | `-sm dp -ts 1,1,1,1`, `CUDA_VISIBLE_DEVICES=0,1,2,3` |
 
-`dp-4` is the Python launcher's profile name, selected with `--profile dp-4`. It creates one four-card group, not two independent two-card servers or a 2x2 tensor/data split. The four-card launcher, host-KV option, measurements and current throughput blocker are documented in the [four-card DP recipe](../torad/glm53-dp.md#candidate-serving-command). That candidate keeps MTP enabled; the historical MTP-off comparison below is specific to `tensor-2`.
+Each profile creates one card group, not independent servers or a 2x2 tensor/data split. The four-card DP launcher, host-KV option, measurements and current throughput blocker are documented in the [four-card DP recipe](../torad/glm53-dp.md#candidate-serving-command). That candidate keeps MTP enabled; the historical MTP-off comparison below is specific to `tensor-2`.
 
-The remaining commands and measurements on this page describe `tensor-2`. Omitting `--profile` selects that two-card default.
+The remaining commands on this page describe `tensor-2`. Omitting `--profile` selects that two-card default.
 
-This recipe reproduces the retained 524,288-token serving configuration for
-GLM-5.3-Flash-Uncensored IQ3_XXS on two 96 GB RTX PRO 6000 Blackwell cards. It
-uses this fork, the exact model files below, and the bundled chat template and
-MTP shortlist. It does not select `--glm53-profile`: the earlier
+This recipe serves GLM-5.3-Flash-Uncensored IQ3_XXS on two 96 GB RTX PRO 6000
+Blackwell cards to as many sessions as the two cards hold with each able to
+reach 307,200 tokens at once: six sessions on a shared pool of 1,843,200
+tokens by the capacity arithmetic in
+[the two-card goal](../torad/glm53-two-gpu.md). That count is arithmetic, not
+a card read: no two-card box has run this recipe yet, and the November 2
+measurements below are of the recipe it replaced (three slots, a 524,288-token
+pool, Q8 latent caches). The settings are the four-card tensor recipe's,
+carried to two ranks: the 4-bit latent cache, graphs kept by shape, coupled
+MTP drafts, prompt chunks read apart from replies, and prompt-cache saves and
+restores beside the decode steps. It uses this fork, the exact model files
+below, and the bundled chat template and MTP shortlist. It does not select
+`--glm53-profile`: the earlier
 [SM120 experimental bundle](GLM53-SM120.md) has a separate qualification scope.
-Direct sparse-attention indices remain off.
 
 ## Build and local files
 
@@ -79,12 +89,14 @@ access controls.
 | Setting | Recipe |
 |---|---|
 | GPU placement | `CUDA_DEVICE_ORDER=PCI_BUS_ID`, `CUDA_VISIBLE_DEVICES=0,1`, `-ngl 99 -sm tensor -ts 1,1` |
-| Context and slots | `-c 524288 -np 3 --kv-unified` |
-| Attention/indexer caches | `--cache-type-k q8_0 --cache-type-v q8_0 -ctki q8_0` |
-| Prompt batching | `-b 2048 -ub 2048 --prompt-step 1024` |
-| RAM prompt cache | `--cache-ram 32768 --no-cache-idle-slots` |
+| Context and slots | `-c 1843200 -np 6 --kv-unified`, `LLAMA_KV_SEQ_CELLS=307200` |
+| Attention/indexer caches | `--cache-type-k q4_0 --cache-type-v q4_0 -ctki q8_0` |
+| Prompt batching | `-b 2048 -ub 2048 --prompt-step 1024 --prompt-chunk 128` |
+| RAM prompt cache | `--cache-ram 32768 --no-cache-idle-slots`, saves and restores beside the steps (`LLAMA_STATE_SAVE_ASYNC=1`, `LLAMA_STATE_RESTORE_ASYNC=1`) |
 | Chat and attention | `--jinja -fa on`, bundled `GLM-5.3-Flash.jinja` |
-| MTP | `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-mtp-adaptive 0.18`, bundled 98,304-ID shortlist |
+| MTP | `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-mtp-adaptive 0.18`, bundled 98,304-ID shortlist, coupled draws (`LLAMA_SPEC_COUPLED=1`) |
+| Graphs kept by shape | `LLAMA_GRAPH_ANY_SEQS=1 LLAMA_GRAPH_SLOTS=32 GGML_META_CAPTURE_GRAPHS=36 GGML_CUDA_GRAPH_NODES=262144 GGML_CUDA_GRAPH_IDLE_MS=600000 LLAMA_GRAPH_DEVICE_RESERVE_MIB=1024` |
+| Reductions | the engine's own routes, shares in 8-bit blocks where the copy engines carry them (`GGML_CUDA_AR_WIRE_Q8=1`); `--reduction-route host` forces the four-card hosts' route |
 | CUDA graphs/collectives | `GGML_CUDA_GRAPH_MAX=0`, `GGML_CUDA_ALLREDUCE=internal` |
 | Indexer query | `LLAMA_INDEXER_Q8_QUERY=1` |
 | MTP rows/token embeddings | `LLAMA_MTP_DEVICE_H=1`, `LLAMA_TOK_EMBD_GPU=1` |
@@ -112,13 +124,31 @@ manually if you need a different configuration, and record those differences.
 
 ## Memory and concurrency limits
 
-The 524,288 KV cells form **one shared pool**, not three independent 524,288-token
-conversations. Concurrent prompts, retained histories, generated tokens, and
-working memory compete for capacity. The original placement requirement was
-at least 97,000 MiB on each card; nominal VRAM alone does not establish fit with
-other GPU processes, different drivers/builds, projector workloads, or deeper
-drafts. The 32,768 MiB RAM-cache budget is host memory in addition to model
-mapping and other process memory. It is not another GPU-context allocation.
+The 1,843,200 KV cells form **one shared pool**, with each of the six sessions
+capped at 307,200 of them by `LLAMA_KV_SEQ_CELLS`, so every session can be
+full at the same time. Concurrent prompts, retained histories, generated
+tokens, and working memory still compete inside that sizing. The pool's
+caches are mirrored on both cards at 9,088 bytes a token (the four-card load
+of November 11), and each card carries about half the pack's split weights:
+the sums that give six sessions, and what a seventh would need, are in
+[the two-card goal](../torad/glm53-two-gpu.md). They are arithmetic from the
+four-card reads, not a two-card load: treat a card left with under 4,096 MiB
+free at load as a failed sizing and drop a slot with `--slots`. Nominal VRAM
+alone does not establish fit with other GPU processes, different
+drivers/builds, projector workloads, or deeper drafts; the projector's 1.05
+GiB sits on the first card inside the same headroom. The 32,768 MiB
+RAM-cache budget is host memory in addition to model mapping and other
+process memory. It is not another GPU-context allocation.
+
+`--slots N` without `--context` keeps the 307,200 cap and sizes the pool as N
+whole sessions. `--context` without `--slot-context` leaves sessions uncapped
+in a pool of that many tokens, as on four cards. `--latent-cache q8_0`
+restores the wider Q8 latent rows the previous two-card recipe served with,
+at about 3,072 more bytes a pool token. The previous recipe as a whole (three
+slots, 524,288 pool, Q8 caches, none of the graph-keeping or coupled-draft
+settings) is no longer a launcher plan; the November 2 sweep below records
+what it measured, and its exact previous argument list is in the git history
+of this page.
 
 `--no-cache-idle-slots` keeps the served idle-slot policy explicit. Stable prompt
 prefixes permit reuse, but a cache setting cannot repair history that the client
@@ -129,7 +159,7 @@ has been tested. This recipe does not enable the separate 1M-context profile.
 Q8 indexer queries are a retained lossy setting: rounding can change pool
 selection near score ties. Use `--indexer-query f32` to disable query rounding
 for a comparison; `--indexer-query q8` is the default. This option changes query
-scoring only, leaving the Q8 indexer/KV caches unchanged. Matched eight-token
+scoring only, leaving the indexer and latent caches as launched. Matched eight-token
 probes on fresh servers diverged at token eight at 32k and token seven at 128k,
 for both cold and warm requests. The checks do not establish coding-quality
 equivalence or tell which continuation is better.
@@ -177,11 +207,15 @@ that an effort setting disables reasoning.
 
 ## Measurement scope
 
-The measurements below were collected before PR #92 was rebased onto
-`ddf1d49b3` (main after PR #109). The combined branch includes PR #108's
+The measurements below are of the **previous** two-card recipe (three slots,
+a 524,288-token pool, Q8 latent caches), collected before PR #92 was rebased
+onto `ddf1d49b3` (main after PR #109). The combined branch includes PR #108's
 device-resident MTP/token-embedding work and PR #109's peer-copy reductions.
 Local builds and regression checks do not qualify that combined build on GPUs;
-remeasure it before treating these rates as its current performance.
+remeasure it before treating these rates as its current performance. The
+recipe at the top of this page has no card measurements yet; its first read
+is the runbook in [the two-card goal](../torad/glm53-two-gpu.md). What follows
+is kept as the record of the recipe it replaced, not as this recipe's rates.
 
 The exact build, request workload, raw measurements, and remaining limitations
 belong with the associated [PR #92](https://github.com/torad-labs/llama.cpp/pull/92)

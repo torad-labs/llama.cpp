@@ -39,7 +39,7 @@ def server_command(args):
             if value < 1:
                 raise ValueError("thread counts must be positive")
             threads += ["--" + flag.replace("_", "-"), str(value)]
-    if getattr(args, "recipe", "tensor-2") == "dp-4":
+    if getattr(args, "recipe", "tensor-2") in ("dp-2", "dp-4"):
         return dp_plan(args)[0] + threads
     argv = [str(Path(args.binary) / "llama-server"), "-m", str(args.model), "-ngl", "99",
             "-sm", "tensor", "-ts", "1,1", "--jinja", "-fa", "on", "-ctk", "q8_0",
@@ -54,9 +54,10 @@ def server_command(args):
 
 def dp_plan(args):
     import serve
-    if args.profile or args.ubatch != 512 or args.context != args.slots*serve.DP_SLOT_CONTEXT or args.adaptive != 0.18:
+    cells = serve.DP2_SLOT_CONTEXT if args.recipe == "dp-2" else serve.DP_SLOT_CONTEXT
+    if args.profile or args.ubatch != 512 or args.context != args.slots*cells or args.adaptive != 0.18:
         raise ValueError("DP measurements require the documented private-cache recipe, ubatch 512 and adaptive 0.18")
-    argv = ["--profile", "dp-4", "--model", str(args.model), "--server", str(Path(args.binary)/"llama-server"),
+    argv = ["--profile", args.recipe, "--model", str(args.model), "--server", str(Path(args.binary)/"llama-server"),
             "--port", str(args.port), "--slots", str(args.slots), "--mtp-depth", str(args.depth)]
     if getattr(args, "kv_host", False):
         argv += ["--kv-host"]
@@ -329,7 +330,7 @@ class ServingLeg:
                         GGML_CUDA_ALLREDUCE="internal", GGML_CUDA_GRAPH_MAX="0",
                         LD_LIBRARY_PATH=f"{args.binary}:{args.root}/cuda-runtime")
         self.cards = 4 if getattr(args, "recipe", "tensor-2") == "dp-4" else 2
-        if self.cards == 4:
+        if getattr(args, "recipe", "tensor-2") in ("dp-2", "dp-4"):
             import serve
             self.env = serve.execution_environment(dp_plan(args)[1], self.env)
             self.env["LD_LIBRARY_PATH"] = f"{args.binary}:{args.root}/cuda-runtime"
@@ -696,7 +697,7 @@ def main():
     parser.add_argument("--ubatch", type=int, required=True)
     parser.add_argument("--deadline", type=float, required=True)
     parser.add_argument("--mode", choices=("timing", "semantics", "capacity", "concurrency", "diagnostic", "scaling"), default="timing")
-    parser.add_argument("--recipe", choices=("tensor-2", "dp-4"), default="tensor-2")
+    parser.add_argument("--recipe", choices=("tensor-2", "dp-2", "dp-4"), default="tensor-2")
     parser.add_argument("--baseline-binary", type=Path, help="Run scaling in baseline/candidate/candidate/baseline order")
     parser.add_argument("--kv-host", action="store_true")
     parser.add_argument("--host-budget-mib", type=float)
@@ -717,7 +718,7 @@ def main():
     if args.mode == "scaling" and (args.tokens < 2 or args.repeats < 1 or
             any(s < 1 or s > args.slots for s in args.sessions) or any(t <= 128 for t in args.prompt_tokens)):
         parser.error("scaling needs at least two output tokens, a positive repeat count, configured slots and prompts over 128 tokens")
-    if args.recipe != "dp-4" and (args.kv_host or args.host_budget_mib is not None or args.mmproj):
+    if args.recipe == "tensor-2" and (args.kv_host or args.host_budget_mib is not None or args.mmproj):
         parser.error("host KV and projector measurement options require the DP recipe")
     if Path(args.run).name != args.run or args.run in (".", ".."):
         parser.error("run must be one new output directory name")

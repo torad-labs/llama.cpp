@@ -248,6 +248,13 @@ Written before that read, kept as the prediction it was: the cards' work in a st
 
 A box read starts with the pack already on the box's disk and the step read in the first two minutes after load. Under 30 tok/s a session at MTP depth 2, no drafter lands enough tokens to reach the 50 floor (it would take 3.5 a step), and nothing else is read from that box but where the step goes.
 
+## Two cards
+
+The same engine on two RTX PRO 6000 has its own goal (as many sessions as fit at 307,200 tokens each, no
+23-session target): [glm53-two-gpu.md](glm53-two-gpu.md) holds its capacity arithmetic and its box read. The
+launcher's `tensor-2` and `dp-2` profiles carry this page's settings at two ranks since Nov 15; nothing of it
+is read on cards yet, and no four-card number on this page is a two-card expectation.
+
 ## Before any work
 
 Write down which of the three it moves, the number expected, and how it will be read, then do it. Use a rented box only to read a number the local cards and CPU runs can't give, read the target number in its first minutes, and destroy it the moment the number is clearly short.

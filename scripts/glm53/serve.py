@@ -21,6 +21,18 @@ DP_SLOT_CONTEXT = 442368
 # 6,029,312 tokens that 23 sessions of 262144 need fail in the graph reserve (docs/torad/glm53-goal.md, cause 3)
 POOL_SLOTS = 23
 POOL_CONTEXT = 524288
+# tensor-2's goal is as many sessions as two cards hold with each able to reach 300K tokens at once, so its pool is
+# sessions x the session limit and every session can be full at the same time. Six is arithmetic, not a read on
+# cards: the split's half of the weights is about 64 GiB a card, the mirrored caches 9,088 bytes a pool token (the
+# four-card load of Nov 11, 2026), the two compute buffers about 6 GiB, and 4 GiB kept free: six sessions of
+# 307,200 fit a 97,887 MiB card with room to spare and seven sit at its edge. docs/torad/glm53-two-gpu.md has the
+# sums and the box read that settles them.
+TENSOR2_SLOTS = 6
+TENSOR2_SLOT_CONTEXT = 307200
+# dp-2's private caches at the same 300K a session: its dense weights are whole on each card and its q8_0 caches
+# 11,424 bytes a token on the owner's card only, which by the same sums leaves five slots a card
+DP2_SLOTS = 10
+DP2_SLOT_CONTEXT = 307200
 # the engine's sequence limit (LLAMA_MAX_SEQ)
 MAX_SLOTS = 256
 # Inherited engine, profile and diagnostic overrides are removed before the exec; the server's own access controls stay.
@@ -41,29 +53,33 @@ def arguments(argv=None):
                         help="llama-server from this fork, with matching libraries beside it")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8102)
-    parser.add_argument("--profile", choices=["tensor-2", "tensor-4", "dp-4"], default="tensor-2",
-                        help="Two-card tensor recipe, four-card tensor recipe with one shared pool, or experimental "
-                             "four-card DP capacity recipe")
+    parser.add_argument("--profile", choices=["tensor-2", "tensor-4", "dp-2", "dp-4"], default="tensor-2",
+                        help="Tensor recipe on two or four cards with one shared pool, or experimental DP capacity "
+                             "recipe on two or four cards")
     parser.add_argument("--transport", choices=["internal", "internal-nccl-gather"], help="DP collective transport (default: internal)")
-    parser.add_argument("--slots", type=int, help="tensor-4: sessions sharing the pool, 1..256 (default: 23). "
-                        "DP private caches of 442368 cells each: 1..40 resident, 1..256 host KV (default: 36)")
-    parser.add_argument("--context", type=int, help="tensor-4: tokens in the shared pool (default: 524288)")
-    parser.add_argument("--slot-context", type=int, help="tensor-4: tokens one session holds of the pool at most. The graph "
+    parser.add_argument("--slots", type=int, help="Tensor recipes: sessions sharing the pool, 1..256 (default: 6 on two "
+                        "cards, 23 on four). DP private caches: 1..20 resident on two cards, 1..40 on four, 1..256 "
+                        "host KV (default: 10 on two cards, 36 on four)")
+    parser.add_argument("--context", type=int, help="Tensor recipes: tokens in the shared pool (default: on two cards, "
+                        "--slots sessions of --slot-context tokens each; on four, 524288)")
+    parser.add_argument("--slot-context", type=int, help="Tensor recipes: tokens one session holds of the pool at most. The graph "
                         "reserved at load is then sized for sessions of that many, so a larger --context loads "
-                        "(default: a session may take the whole pool)")
-    parser.add_argument("--kept-graphs", type=int, help="tensor-4: graphs a context keeps by shape, 1..256 (default: 128, "
-                        "and 32 with --slot-context)")
+                        "(default: 307200 on two cards when --context is not given; otherwise, and on four cards, a "
+                        "session may take the whole pool). DP recipes: "
+                        "cells in each slot's private cache (default: 307200 on two cards, 442368 on four)")
+    parser.add_argument("--kept-graphs", type=int, help="Tensor recipes: graphs a context keeps by shape, 1..256 (default: 128, "
+                        "and 32 with --slot-context, so 32 on two cards)")
     parser.add_argument("--restore-async", action="store_true",
                         help="A session brought back from the RAM prompt cache copies its rows on a thread of its own while "
-                             "the other sessions decode (tensor-4: the default; the other profiles: opt-in)")
+                             "the other sessions decode (tensor recipes: the default; the DP recipes: opt-in)")
     parser.add_argument("--save-async", action="store_true",
                         help="A session whose slot another session takes is copied to the RAM prompt cache on a thread of "
-                             "its own while the other sessions decode (tensor-4: the default; the other profiles: opt-in)")
+                             "its own while the other sessions decode (tensor recipes: the default; the DP recipes: opt-in)")
     parser.add_argument("--restore-sync", action="store_true",
-                        help="tensor-4: a restore copies its rows on the server's thread with every session waiting, as "
+                        help="Tensor recipes: a restore copies its rows on the server's thread with every session waiting, as "
                              "before it was the default: the off switch, to compare the two on a box")
     parser.add_argument("--save-sync", action="store_true",
-                        help="tensor-4: a save copies its rows on the server's thread with every session waiting, as "
+                        help="Tensor recipes: a save copies its rows on the server's thread with every session waiting, as "
                              "before it was the default: the off switch, to compare the two on a box")
     parser.add_argument("--state-copy-legacy", action="store_true",
                         help="A save to the RAM prompt cache and a restore from it copy a session's runs of cells one "
@@ -111,9 +127,9 @@ def arguments(argv=None):
     parser.add_argument("--prompt-shape-rows", type=int, choices=[64, 128, 256, 512, 1024, 2048], metavar="ROWS",
                         help="With --prompt-shapes: the largest power of two a prompt's ubatch takes (default: 256)")
     parser.add_argument("--session-step", type=int, choices=[16384, 32768, 65536, 131072], metavar="TOKENS",
-                        help="tensor-4: a session's graphs keep their shape while it grows by this many tokens, and "
+                        help="Tensor recipes: a session's graphs keep their shape while it grows by this many tokens, and "
                              "sessions inside one step share them (default: 256 tokens a slot, the next power of two: "
-                             "8192 at 23 slots). The indexer scores the empty pools the wider step adds (opt-in: not "
+                             "8192 at 23 slots, 2048 at 6). The indexer scores the empty pools the wider step adds (opt-in: not "
                              "read on four cards)")
     parser.add_argument("--fixed-rows", nargs="?", const="fused", choices=["fused", "unfused"],
                         help="Tensor profiles: a session's recurrent state keeps one row on the cards for the session's "
@@ -132,14 +148,24 @@ def arguments(argv=None):
     parser.add_argument("--mtp-adaptive", type=float, default=0.18,
                         help="The engine's --spec-draft-mtp-adaptive cost: a draft token's share of a one-token round, "
                              "measured at 0.18 for one session on two cards; 0 drafts --mtp-depth every step")
-    parser.add_argument("--dflash", type=Path, help="tensor-4: a local DFlash draft GGUF that drafts in place of the MTP head, on the first card; "
-                             "one that carries its own token embeddings and output head (dflash_own_head.py)")
+    parser.add_argument("--dflash", type=Path, help="Tensor recipes: a local DFlash draft GGUF that drafts in place of the MTP head, on the first card; "
+                             "one that carries its own token embeddings and output head (dflash_own_head.py). The draft "
+                             "sits whole on the first card beside its half of the target, so two cards hold fewer sessions with it")
     parser.add_argument("--dflash-depth", type=int, help="Tokens the DFlash draft drafts a step: its block size less the anchor row (required with --dflash)")
-    parser.add_argument("--backend-sampling", action="store_true", help="tensor-4: sample on the cards (dp-4 always does)")
+    parser.add_argument("--backend-sampling", action="store_true", help="Tensor recipes: sample on the cards (the DP recipes always do)")
     parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
+    parser.add_argument("--latent-cache", choices=["q4_0", "q8_0"],
+                        help="Tensor recipes: the latent cache's type (default: q4_0, 288 bytes a row; q8_0 is 544 "
+                             "and what the two-card recipe served with before it took the four-card settings). The "
+                             "DP recipes serve q8_0 caches and do not take this")
     parser.add_argument("--reduction-wire", choices=["q8", "bf16"],
-                        help="tensor-4: what a card's share of a reduction crosses to the others as (default: q8, 8-bit "
+                        help="Tensor recipes: what a card's share of a reduction crosses to the others as (default: q8, 8-bit "
                              "blocks; bf16 is the engine's own)")
+    parser.add_argument("--reduction-route", choices=["host", "engine"],
+                        help="Tensor recipes: host sends the cards' reductions on the copy engines through host memory; "
+                             "engine leaves the routes the engine probes (default: host on four cards, where the "
+                             "engine's routes were read three times slower on two hosts; engine on two, unread on "
+                             "any pair: read it with test-backend-meta-allreduce-copy --bench 2 and choose)")
     parser.add_argument("--diagnostic-ubatch", type=int, choices=[128, 512],
                         help="Explicit numerical-control microbatch for DP; it never changes the serving default")
     parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP, and "
@@ -165,12 +191,13 @@ def resolve_transport(args, legacy=None):
 
 
 def make_plan(args):
-    dp = args.profile == "dp-4"
-    four = args.profile == "tensor-4"
+    dp = args.profile in ("dp-2", "dp-4")
+    tensor = not dp
+    devices = 4 if args.profile in ("tensor-4", "dp-4") else 2
     if not dp and args.transport is not None:
-        raise ValueError("transport is supported only with --profile dp-4")
+        raise ValueError("transport is supported only with the DP profiles")
     if args.diagnostic_ubatch is not None and not dp:
-        raise ValueError("diagnostic-ubatch is supported only with --profile dp-4")
+        raise ValueError("diagnostic-ubatch is supported only with the DP profiles")
     diagnostic_ubatch = args.diagnostic_ubatch if args.diagnostic_ubatch is not None else 512
     # With prompt shapes a step's prompt tokens go in passes of at most --prompt-shape-rows rows, back to back, and the step's replies wait for all of them.
     # The step is then one pass, so a reply waits for one. Fixture, three sessions decoding beside a reader (Nov 14, 2026): 39.0 tok/s each at 256 against 34.5 at 1,024, the reader's prompts 4 % slower.
@@ -183,23 +210,33 @@ def make_plan(args):
         raise ValueError("port must be 1..65535 and prompt-step must be nonnegative")
     if args.prompt_step_ms is not None and args.prompt_step_ms < 1:
         raise ValueError("prompt-step-ms must be 1 or more")
-    limit = MAX_SLOTS if args.kv_host or four else 40
-    if args.slots is not None and (not (dp or four) or not 1 <= args.slots <= limit):
-        raise ValueError(f"slots is supported only with --profile tensor-4 or dp-4 and must be 1..{limit}")
-    slots = (36 if dp else POOL_SLOTS) if args.slots is None else args.slots
-    if not (dp or four):
-        slots = 3
-    context = POOL_CONTEXT if args.context is None else args.context
-    if args.context is not None and (not four or context < slots):
-        raise ValueError("context is supported only with --profile tensor-4 and holds at least one token a slot")
-    if args.slot_context is not None and (not four or not 256 <= args.slot_context < context):
-        raise ValueError("slot-context is supported only with --profile tensor-4, from 256 tokens to under the context")
-    if args.kept_graphs is not None and (not four or not 1 <= args.kept_graphs <= 256):
-        raise ValueError("kept-graphs is supported only with --profile tensor-4 and must be 1..256")
+    limit = MAX_SLOTS if tensor or args.kv_host else 20 if devices == 2 else 40
+    if args.slots is not None and not 1 <= args.slots <= limit:
+        raise ValueError(f"slots must be 1..{limit} for --profile {args.profile}")
+    slots = args.slots if args.slots is not None else default_slots(args.profile)
+    # A DP slot's private cache is cells of its own; a tensor session's limit caps what it holds of the shared pool.
+    dp_cells = dp_slot_cells(args)
+    if dp and args.slot_context is not None and args.slot_context < 256:
+        raise ValueError("a DP slot's private cache holds at least 256 cells")
+    slot_context = args.slot_context if tensor else None
+    if tensor and devices == 2 and slot_context is None and args.context is None:
+        slot_context = TENSOR2_SLOT_CONTEXT
+    context = args.context
+    if context is None:
+        # two cards size the pool as whole sessions; four keep the pool measured to load, limited or not
+        context = slots * slot_context if tensor and devices == 2 and slot_context is not None else POOL_CONTEXT
+    if args.context is not None and (dp or context < slots):
+        raise ValueError("context is supported only with the tensor profiles and holds at least one token a slot")
+    if tensor and slot_context is not None and not 256 <= slot_context < context:
+        if args.slot_context is not None:
+            raise ValueError("slot-context is from 256 tokens to under the context on the tensor profiles")
+        slot_context = None  # the default-sized session in a pool of its own size: no limit to set
+    if args.kept_graphs is not None and (dp or not 1 <= args.kept_graphs <= 256):
+        raise ValueError("kept-graphs is supported only with the tensor profiles and must be 1..256")
     if dp and args.fixed_rows:
-        raise ValueError("fixed-rows is for the tensor profiles: under dp-4 every session has a row of its own already")
+        raise ValueError("fixed-rows is for the tensor profiles: under the DP profiles every session has a row of its own already")
     if dp and args.mtp_depth in ("3", "4"):
-        raise ValueError("dp-4 is measured at MTP depth 1 and 2")
+        raise ValueError("the DP profiles are measured at MTP depth 1 and 2")
     if args.cache_ram < -1 or args.ctx_checkpoints is not None and args.ctx_checkpoints < 0:
         raise ValueError("cache-ram is a size in MiB (-1: no limit) and ctx-checkpoints a count")
     if not 0 <= args.mtp_adaptive <= 1:
@@ -210,25 +247,27 @@ def make_plan(args):
         raise ValueError("prompt-shapes is for the tensor profiles: a sequential split reads prompts as it did")
     if args.prompt_shape_rows is not None and args.prompt_shapes is None:
         raise ValueError("prompt-shape-rows is given with --prompt-shapes")
-    if args.session_step is not None and not four:
-        raise ValueError("session-step is supported only with --profile tensor-4")
-    if (args.restore_sync or args.save_sync) and not four:
-        raise ValueError("restore-sync and save-sync are the off switches of the tensor-4 defaults")
+    if args.session_step is not None and dp:
+        raise ValueError("session-step is supported only with the tensor profiles")
+    if (args.restore_sync or args.save_sync) and dp:
+        raise ValueError("restore-sync and save-sync are the off switches of the tensor profiles' defaults")
     if args.restore_sync and args.restore_async or args.save_sync and args.save_async:
         raise ValueError("a save or a restore is async or sync, not both")
     if args.victim_return_s is not None and not (math.isfinite(args.victim_return_s) and args.victim_return_s > 0):
         raise ValueError("victim-return-s is a positive number of seconds")
     if args.victim_return_s is not None and (args.victim_lru_legacy or args.victim_idle_legacy):
         raise ValueError("victim-return-s sets the rule that the legacy switches turn off")
-    if (args.dflash or args.backend_sampling or args.reduction_wire) and not four:
-        raise ValueError("dflash, backend-sampling and reduction-wire are supported only with --profile tensor-4")
+    if (args.dflash or args.backend_sampling or args.reduction_wire or args.reduction_route) and dp:
+        raise ValueError("dflash, backend-sampling and reduction-wire are supported only with the tensor profiles")
+    if args.latent_cache is not None and dp:
+        raise ValueError("latent-cache is for the tensor profiles: the DP profiles serve q8_0 caches")
     if (args.dflash is None) != (args.dflash_depth is None) or args.dflash_depth is not None and args.dflash_depth < 1:
         raise ValueError("dflash and a positive dflash-depth are given together")
     if args.kv_host:
         if not dp or args.mtp_depth != "2":
-            raise ValueError("host KV requires --profile dp-4 and --mtp-depth 2")
-        if args.host_budget_mib is None or not math.isfinite(args.host_budget_mib) or args.host_budget_mib < host_kv_mib(slots):
-            raise ValueError(f"host KV needs a RAM budget of at least {host_kv_mib(slots):.0f} MiB")
+            raise ValueError("host KV requires a DP profile and --mtp-depth 2")
+        if args.host_budget_mib is None or not math.isfinite(args.host_budget_mib) or args.host_budget_mib < host_kv_mib(slots, dp_cells):
+            raise ValueError(f"host KV needs a RAM budget of at least {host_kv_mib(slots, dp_cells):.0f} MiB")
     elif args.host_budget_mib is not None:
         raise ValueError("host-budget-mib requires --kv-host")
     if not args.host or any(char in args.host for char in "\n\r\0"):
@@ -239,10 +278,11 @@ def make_plan(args):
     argv = [str(server), "-m", own_path(args.model)]
     if args.mmproj:
         argv += ["--mmproj", own_path(args.mmproj)]
-    # tensor-4's latent cache is 4-bit: 288 bytes a row against 544; the indexer's keys stay q8_0, the one other
-    # type the engine takes for them
-    latent = "q4_0" if four else "q8_0"
-    argv += ["-ngl", "99", "-sm", "dp" if dp else "tensor", "-ts", "1,1,1,1" if dp or four else "1,1",
+    # The tensor profiles' latent cache is 4-bit: 288 bytes a row against 544; the indexer's keys stay q8_0, the
+    # one other type the engine takes for them. --latent-cache q8_0 keeps the wider rows the two-card recipe
+    # served with before it took the four-card settings.
+    latent = args.latent_cache or ("q4_0" if tensor else "q8_0")
+    argv += ["-ngl", "99", "-sm", "dp" if dp else "tensor", "-ts", "1,1,1,1" if devices == 4 else "1,1",
              "--jinja", "-fa", "on",
              "--cache-type-k", latent, "--cache-type-v", latent, "-ctki", "q8_0",
              "-b", "2048", "-ub", str(diagnostic_ubatch) if dp else "2048", "--prompt-step", str(prompt_step),
@@ -253,7 +293,7 @@ def make_plan(args):
         argv += ["-fit", "off", "-cts", "q8_0", "--backend-sampling", "--prompt-chunk", "128"]
     elif args.backend_sampling:
         argv += ["--backend-sampling"]
-    if four:
+    if tensor:
         # Prompts are read in whole chunks, in an eval of their own after the step's replies: one forward pass of the
         # model, where prompt tokens shared out beside the replies are two or more. Fixture, 23 sessions of Claude
         # Code's sizes (Nov 11, 2026): every prompt-carrying eval is one pass, against 2.3 passes an eval with equal
@@ -261,7 +301,7 @@ def make_plan(args):
         # the times do not isolate the chunk; four cards have not read it.
         argv += ["--prompt-chunk", "128"]
     if args.dflash:
-        # the draft is one small model reading the target's layer inputs: whole on the first card, never split four ways
+        # the draft is one small model reading the target's layer inputs: whole on the first card, never split across them
         argv += ["--spec-type", "draft-dflash", "--spec-draft-model", own_path(args.dflash),
                  "--spec-draft-n-max", str(args.dflash_depth), "--spec-draft-device", "CUDA0", "--spec-draft-ngl", "99"]
     elif args.mtp_depth != "off":
@@ -272,7 +312,7 @@ def make_plan(args):
             argv += ["--spec-draft-n-min", args.mtp_depth_min]
         if dp:
             argv += ["-ubd", str(diagnostic_ubatch), "-ctkd", "q8_0", "-ctvd", "q8_0"]
-    argv += ["-c", str(slots * DP_SLOT_CONTEXT if dp else context if four else 524288), "-np", str(slots)]
+    argv += ["-c", str(slots * dp_cells if dp else context), "-np", str(slots)]
     if not dp:
         argv += ["--kv-unified"]
     argv += ["--cache-ram", str(args.cache_ram), "--no-cache-idle-slots"]
@@ -280,7 +320,7 @@ def make_plan(args):
         argv += ["--ctx-checkpoints", str(args.ctx_checkpoints)]
     argv += ["--metrics", "--host", args.host, "--port", str(args.port), "--log-timestamps"]
     env = {
-        "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3" if dp or four else "0,1",
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3" if devices == 4 else "0,1",
         "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": args.transport or "internal",
         "LLAMA_INDEXER_Q8_QUERY": "1" if args.indexer_query == "q8" else "0",
         "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
@@ -293,13 +333,16 @@ def make_plan(args):
                     "GGML_CUDA_GRAPH_IDLE_MS": "0"})
     if not dp:
         env.update({"GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
-    if four:
+    if tensor and (args.reduction_route or ("host" if devices == 4 else "engine")) == "host":
         # The cards' reductions go through the copy engines and host memory. On both four-card hosts read cleanly
         # (Nov 11, 2026) the engine's own routes, whose kernels store into a peer's memory, ran the server at 15.8 and
         # 13.4 to 14.7 tok/s a session where this route ran it at 33.0 and 42.8. On a third (Nov 10) a reduction took
         # 105 us on the engine's route and 109 on this one, in a benchmark whose cards were not shown to be free.
+        # No pair of cards has been read either way, so two cards keep the engine's routes until a box says
+        # otherwise (--reduction-route host forces this route there).
         env.update({"GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0", "GGML_CUDA_AR_COPY_THRESHOLD": "1",
                     "GGML_CUDA_AR_COPY_PEER": "0", "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0"})
+    if tensor:
         # A share crosses in 8-bit blocks, 36 bytes to 32 elements where the BF16 wire takes 64: a 69-row target decode
         # is 40.2 ms against 42.5, a session's fourth pass after a load 45.7 tok/s against 41.5. Against an F32 wire's
         # logits on the pack (two chunks at a context of 8,192, 8,190 scored positions) the mean KLD is 0.0141 +- 0.0005
@@ -314,21 +357,27 @@ def make_plan(args):
         # 3,014,656 with sessions of 262,144 is 67.9 GB a card at load, and 23 sessions of 20,000 tokens took the cards
         # to 97.1 of 97.9 GB with both contexts at their reserve. With 32 they stood at 84.1 GB through the same
         # sessions, one of 250,000 tokens and four of 100,000 beside 19 short ones, and replies ran alike (four RTX PRO
-        # 6000, Nov 11, 2026). What 32 costs a short-context read against 128 was not read.
-        kept = args.kept_graphs if args.kept_graphs is not None else 32 if args.slot_context is not None else 128
+        # 6000, Nov 11, 2026). What 32 costs a short-context read against 128 was not read. Two cards run the limit
+        # by default, so they keep 32.
+        kept = args.kept_graphs if args.kept_graphs is not None else 32 if slot_context is not None else 128
         env.update({"LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": str(kept), "GGML_META_CAPTURE_GRAPHS": str(kept + 4),
                     "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000"})
-    if four and not args.dflash and args.mtp_depth != "off":
+        if devices == 2:
+            # Two cards carry half the weights each and run fuller: a context gives a kept graph's buffers back
+            # while 1 GiB is still free (the engine's default is 256 MiB), so making a graph's executables, which
+            # a device out of memory cannot recover from, keeps its room.
+            env["LLAMA_GRAPH_DEVICE_RESERVE_MIB"] = "1024"
+    if tensor and not args.dflash and args.mtp_depth != "off":
         # The MTP head proposes with the session's own sampler and the noise the target will draw with. A reply's
         # tokens are samples of the same distribution, though a seed's reply is another than without it. Four RTX PRO
         # 6000, 23 sessions (Nov 11, 2026): 2.17 to 2.21 tokens a step against 2.02 to 2.07.
         env["LLAMA_SPEC_COUPLED"] = "1"
-    if args.slot_context is not None:
+    if slot_context is not None:
         # A session ends at slot-context tokens, and the load-time reserve holds a pooled indexer's scores for sessions
         # of that many, not for one that took every cell: 10 bytes a pool a row, the term that kept the pool for 23
         # sessions of 262144 from loading (docs/torad/glm53-goal.md, cause 3). The engine rounds it up to 256
-        env["LLAMA_KV_SEQ_CELLS"] = str(args.slot_context)
-    # The four-card profile saves and restores beside the sessions' steps unless told not to. Four RTX PRO 6000 with the
+        env["LLAMA_KV_SEQ_CELLS"] = str(slot_context)
+    # The tensor profiles save and restore beside the sessions' steps unless told not to. Four RTX PRO 6000 with the
     # pack, 23 slots, engine 417923e (#238, Nov 14 and 15, 2026), 30 sessions on 23 slots, 90 turns, a quarter of the
     # requests dropped part-way: 87 saves held the server's thread 4.7 s in all and 64 ms at most where 97 blocking ones
     # held it 99.4 s and 7,360 ms, 19 restores 4.4 s and 287 ms where 64 held it 66.6 s and 3,658 ms (the arms' prompt
@@ -336,10 +385,10 @@ def make_plan(args):
     # 182 turns of that churn: no leak, no lost context. 4.3 h of real traffic: 790 streamed answers, none waiting over
     # 3 s for a chunk, no server error. Not read on four cards with the batched state copies that came after that engine
     # (--state-copy-legacy is their off switch).
-    if args.restore_async or four and not args.restore_sync:
+    if args.restore_async or tensor and not args.restore_sync:
         # A restore stops the server's thread only to place the cells; the rows are copied beside the other sessions' steps
         env["LLAMA_STATE_RESTORE_ASYNC"] = "1"
-    if args.save_async or four and not args.save_sync:
+    if args.save_async or tensor and not args.save_sync:
         # A save for a slot that changes hands stops the server's thread only to write the state's layout; the request
         # that takes the slot waits its turn while the rows are copied beside the other sessions' steps
         env["LLAMA_STATE_SAVE_ASYNC"] = "1"
@@ -414,8 +463,18 @@ def make_plan(args):
     return argv, env
 
 
-def host_kv_mib(slots):
-    return slots * SLOT_CELLS * MLA_LAYERS * LATENT_ROW_BYTES / MIB
+def default_slots(profile):
+    return {"tensor-2": TENSOR2_SLOTS, "tensor-4": POOL_SLOTS, "dp-2": DP2_SLOTS, "dp-4": 36}[profile]
+
+
+def dp_slot_cells(args):
+    if args.slot_context is not None:
+        return args.slot_context
+    return DP2_SLOT_CONTEXT if args.profile == "dp-2" else SLOT_CELLS
+
+
+def host_kv_mib(slots, cells=SLOT_CELLS):
+    return slots * cells * MLA_LAYERS * LATENT_ROW_BYTES / MIB
 
 
 def available_memory_mib():
@@ -492,7 +551,7 @@ def main(args):
     if not os.access(argv[0], os.X_OK):
         raise ValueError("server is not executable: " + argv[0])
     cache_mib = max(args.cache_ram, 0)
-    if args.kv_host and available_memory_mib() < host_kv_mib(args.slots or 36) + cache_mib + 8192:
+    if args.kv_host and available_memory_mib() < host_kv_mib(args.slots or default_slots(args.profile), dp_slot_cells(args)) + cache_mib + 8192:
         raise ValueError(f"insufficient available RAM for host KV, a {cache_mib} MiB prompt cache and 8 GiB system reserve")
     argv = resolve_server_arguments(argv, settings)
     os.execve(argv[0], argv, execution_environment(settings))

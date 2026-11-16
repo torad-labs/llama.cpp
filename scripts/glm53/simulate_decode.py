@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU-only structural simulation of the documented GLM four-card recipe."""
+"""CPU-only structural simulation of the documented GLM DP recipes (four cards, or two with --devices 2)."""
 import argparse
 import json
 import math
@@ -18,28 +18,31 @@ EXPERTS_USED = 8
 INDEX_HEAD_BYTES = 128 // 32 * 34
 
 
-def collective_routes(rows, bf16=True):
+def collective_routes(rows, bf16=True, devices=DEVICES):
     payload = rows * EMBEDDING * 4
     wire = payload // 2 if bf16 else payload
     reduction = ('peer-copy-engine' if wire >= 1024 * 1024 else
                  'peer-ll' if wire <= 128 * 1024 else 'host-chunked')
     gather = 'peer-ll' if payload <= 128 * 1024 else 'peer-chunked'
+    peer_pairs = devices * (devices - 1)
     return {
-        'scope': 'One routed layer; four ranks, successful peer probes/inbox allocation, default thresholds.',
+        'scope': f'One routed layer; {devices} ranks, successful peer probes/inbox allocation, default thresholds.',
         'gather': {'route': gather, 'full_buffer_bytes': payload,
-                   'logical_peer_payload_bytes': 12 * payload,
-                   'packet_payload_bytes': 12 * payload * (2 if gather == 'peer-ll' else 1),
+                   'logical_peer_payload_bytes': peer_pairs * payload,
+                   'packet_payload_bytes': peer_pairs * payload * (2 if gather == 'peer-ll' else 1),
                    'capturable': True},
         'reduction': {'route': reduction, 'wire_type': 'bf16' if bf16 else 'f32',
                       'wire_bytes_per_rank': wire,
-                      'logical_peer_payload_bytes': 0 if reduction == 'host-chunked' else 12 * wire,
-                      'logical_host_endpoint_bytes': 16 * wire if reduction == 'host-chunked' else 0,
+                      'logical_peer_payload_bytes': 0 if reduction == 'host-chunked' else peer_pairs * wire,
+                      'logical_host_endpoint_bytes': devices * devices * wire if reduction == 'host-chunked' else 0,
                       'capturable': reduction != 'peer-copy-engine'},
     }
 
 
 def simulate(*, slots=36, sequence_ids=(0,), context=400000, depth=2, accepted=1,
-             host_kv=False, prefill_sequences=0, prefill_rows=512):
+             host_kv=False, prefill_sequences=0, prefill_rows=512, devices=DEVICES):
+    if devices not in (2, 4) or EXPERTS % devices:
+        raise ValueError("This model covers two or four equal expert partitions")
     sequence_ids = tuple(sequence_ids)
     integers = (slots, context, depth, accepted, prefill_sequences, prefill_rows, *sequence_ids)
     if any(type(n) is not int for n in integers):
@@ -62,8 +65,8 @@ def simulate(*, slots=36, sequence_ids=(0,), context=400000, depth=2, accepted=1
     active = len(sequence_ids)
     if active * (depth + 1) > 512 or prefill_sequences > prefill_rows:
         raise ValueError("This model covers one equal-sequence microbatch; the requested rows require splitting")
-    owner_slots = [len(range(device, slots, DEVICES)) for device in range(DEVICES)]
-    owner_active = [sum(seq % DEVICES == device for seq in sequence_ids) for device in range(DEVICES)]
+    owner_slots = [len(range(device, slots, devices)) for device in range(devices)]
+    owner_active = [sum(seq % devices == device for seq in sequence_ids) for device in range(devices)]
     target_rows = active * (depth + 1)
     proposal_rows = active * depth
     catchup_rows = target_rows if depth else 0
@@ -79,16 +82,16 @@ def simulate(*, slots=36, sequence_ids=(0,), context=400000, depth=2, accepted=1
     prefill_path = ('none' if not prefill_sequences else 'chunked' if prefill_tokens >= 128
                     else 'decay-precompute' if prefill_tokens >= 32 else 'recurrent')
     row_bytes = EMBEDDING * 4
-    no_expert_on_rank = math.comb(EXPERTS - EXPERTS // DEVICES, EXPERTS_USED) / math.comb(EXPERTS, EXPERTS_USED)
+    no_expert_on_rank = math.comb(EXPERTS - EXPERTS // devices, EXPERTS_USED) / math.comb(EXPERTS, EXPERTS_USED)
 
     return {
         'schema_version': 1,
         'scenario': {'slots': slots, 'sequence_ids': list(sequence_ids), 'context': context,
-                     'depth': depth, 'accepted': accepted, 'host_kv': host_kv},
+                     'depth': depth, 'accepted': accepted, 'host_kv': host_kv, 'devices': devices},
         'ownership': {
             'slots': owner_slots, 'active': owner_active,
             'target_rows': [n * (depth + 1) for n in owner_active],
-            'dense_utilization_ceiling': active / (DEVICES * max(owner_active)),
+            'dense_utilization_ceiling': active / (devices * max(owner_active)),
         },
         'memory': {
             'reserved_latent_bytes': slots * latent_per_slot,
@@ -125,8 +128,8 @@ def simulate(*, slots=36, sequence_ids=(0,), context=400000, depth=2, accepted=1
             'verified_hidden_d2h_bytes': target_rows * row_bytes if depth else 0,
             'catchup_hidden_logical_h2d_bytes': (active if device_h else target_rows) * row_bytes if depth else 0,
             'target_routed_expert_assignments': MOE_LAYERS * target_rows * EXPERTS_USED,
-            'uniform_routing_expected_ranks_per_token': DEVICES * (1 - no_expert_on_rank),
-            'uniform_routing_expected_remote_ranks': (DEVICES - 1) * (1 - no_expert_on_rank),
+            'uniform_routing_expected_ranks_per_token': devices * (1 - no_expert_on_rank),
+            'uniform_routing_expected_remote_ranks': (devices - 1) * (1 - no_expert_on_rank),
             'selected_host_bytes_per_cycle_upper': (
                 (target_rows * TARGET_MLA_LAYERS + proposal_rows + catchup_rows) * 2080 * LATENT_ROW_BYTES
                 if host_kv and context >= 4160 else None if host_kv else 0),
@@ -137,22 +140,23 @@ def simulate(*, slots=36, sequence_ids=(0,), context=400000, depth=2, accepted=1
             'sequences': prefill_sequences, 'row_budget': prefill_rows,
             'tokens_per_sequence': prefill_tokens, 'kda_path': prefill_path,
         },
-        'transport': collective_routes(target_rows),
-        'f32_wire_control': collective_routes(target_rows, bf16=False),
+        'transport': collective_routes(target_rows, devices=devices),
+        'f32_wire_control': collective_routes(target_rows, bf16=False, devices=devices),
         'hypotheses': {
             'implemented': False,
             'compact_pool_savings_bytes_per_card': [
                 n * layers * (SLOT_CELLS - (SLOT_CELLS + 3) // 4) * INDEX_HEAD_BYTES for n in owner_slots],
             'compact_pool_scope': 'Keep all raw keys/gates; store one pooled key per completed pool. Excludes mapping/allocator overhead.',
-            'native_gather_peer_payload_bytes_per_layer': 3 * target_rows * row_bytes,
+            'native_gather_peer_payload_bytes_per_layer': (devices - 1) * target_rows * row_bytes,
         },
         'layers': [
             {'index': layer, 'attention': 'MLA/DSA' if layer in range(3, 44, 4) else 'KDA',
              'feed_forward': 'dense' if layer < DENSE_LAYERS else 'routed plus shared',
              'owner_rows': [n * (depth + 1) for n in owner_active],
              'shared_expert_rows_per_owner': ([n * (depth + 1) for n in owner_active]
-                                               if layer >= DENSE_LAYERS else [0] * DEVICES),
-             'routed_expert_partitions': ([[d * 72, (d + 1) * 72] for d in range(DEVICES)]
+                                               if layer >= DENSE_LAYERS else [0] * devices),
+             'routed_expert_partitions': ([[d * (EXPERTS // devices), (d + 1) * (EXPERTS // devices)]
+                                            for d in range(devices)]
                                           if layer >= DENSE_LAYERS else []),
              'order': ['mHC pre', 'normalize', 'attention', 'mHC post', 'mHC pre', 'normalize',
                        'feed forward', 'mHC post']}
@@ -169,7 +173,7 @@ def simulate(*, slots=36, sequence_ids=(0,), context=400000, depth=2, accepted=1
         'prediction': {'tokens_per_second': None, 'capacity_qualified': False, 'quality_qualified': False,
                        'reason': 'Byte and operation accounting is not a timing or numerical simulator.'},
         'assumptions': [
-            'Independent equal-length active histories, one owner per sequence, four equal expert partitions.',
+            f'Independent equal-length active histories, one owner per sequence, {devices} equal expert partitions.',
             'Inactive slots retain their full reservation; their unknown occupied history is not in the active-payload subtotal.',
             'One full proposal/verification cycle with fixed depth and acceptance; no EOS, grammar or draft replay.',
             'Q8 latent and indexer geometry from the launcher capacity model; architecture dimensions from retained metadata.',
@@ -180,7 +184,7 @@ def simulate(*, slots=36, sequence_ids=(0,), context=400000, depth=2, accepted=1
             'Full-buffer collective counts assume peer probing succeeded; host fallback and packet flags are separate costs.',
         ],
         'sources': [
-            'scripts/glm53/serve.py:48', 'scripts/glm53/capacity.py:8',
+            'scripts/glm53/serve.py:285', 'scripts/glm53/capacity.py:9',
             'docs/torad/glm53-dp.md:60', 'docs/torad/glm53-dp.md:263',
             'src/models/glm5next.cpp:375', 'ggml/src/ggml-cuda/gated_delta_net.cu',
             'common/speculative.cpp:1783', 'src/llama-memory-recurrent.cpp:114',
@@ -222,6 +226,7 @@ def main():
     p.add_argument('--acceptance-pattern', help='Comma-separated accepted counts for successive fresh cycles')
     p.add_argument('--prefill-sequences', type=int, default=0)
     p.add_argument('--prefill-rows', type=int, default=512)
+    p.add_argument('--devices', type=int, choices=(2, 4), default=DEVICES)
     a = p.parse_args()
     try:
         if not 1 <= a.active <= 256:
@@ -229,10 +234,11 @@ def main():
         ids = tuple(int(seq) for seq in a.sequence_ids.split(',')) if a.sequence_ids else tuple(range(a.active))
         result = simulate(slots=a.slots, sequence_ids=ids, context=a.context,
                           depth=a.depth, accepted=min(1, a.depth) if a.accepted is None else a.accepted,
-                          host_kv=a.host_kv, prefill_sequences=a.prefill_sequences, prefill_rows=a.prefill_rows)
+                          host_kv=a.host_kv, prefill_sequences=a.prefill_sequences, prefill_rows=a.prefill_rows,
+                          devices=a.devices)
         if a.acceptance_pattern:
             result['run'] = simulate_cycles(slots=a.slots, sequence_ids=ids, context=a.context, depth=a.depth,
-                                            host_kv=a.host_kv,
+                                            host_kv=a.host_kv, devices=a.devices,
                                             acceptances=tuple(int(n) for n in a.acceptance_pattern.split(',')))
     except ValueError as error:
         p.error(str(error))
