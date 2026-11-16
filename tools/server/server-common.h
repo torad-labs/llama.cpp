@@ -72,6 +72,167 @@ struct server_prompt_scheduler {
     }
 };
 
+// --prompt-step-ms: the prompt tokens a step takes beside replies, so that the prompt's part of a step stays near a time.
+// The allowance is one of a few token counts, 32 and its doubles up to the token limit, so its passes keep few graphs.
+// The cost of an allowance is the time from one step to the next over that of a step of replies alone, the least of its
+// last six: a step that builds or captures a graph, or waits for a save, is not the allowance's cost.
+struct server_prompt_budget {
+    static constexpr int32_t n_floor = 32;   // the least tokens of an allowance
+    static constexpr int32_t n_start = 256;  // the first allowance: one pass of a prompt shape
+    static constexpr int     n_low   = 6;
+    static constexpr int64_t n_retry = 64;   // steps before a larger allowance is tried whatever it is taken to cost,
+    static constexpr int64_t n_retry_max = 2048; // and twice as many after each time it cost too much, up to this
+
+    struct low {
+        int64_t v[n_low] = {};
+        int64_t n = 0;
+
+        void push(int64_t x) { v[n++ % n_low] = x; }
+        bool full() const { return n >= n_low; }
+        int64_t get() const { return n > 0 ? *std::min_element(v, v + std::min<int64_t>(n, n_low)) : 0; }
+    };
+
+    struct level {
+        int32_t n_tokens;
+        low     cost;
+        int64_t est_us   = -1;      // the cost its last steps gave, and the step that gave it
+        int64_t stamp    = 0;
+        int64_t below_us = -1;      // the cost of the allowance below once this one was left for it: the least of
+        int     n_below  = 0;       // its first n_low readings there
+        int64_t retry    = n_retry;
+    };
+
+    struct step_info {
+        int64_t t_us;
+        int32_t n_generating;
+        int32_t n_prompt;
+        size_t  i_level;
+    };
+
+    int64_t target_us = 0;
+    std::vector<level> levels;
+    size_t  cur     = 0;
+    int64_t clock   = 0;
+    int64_t arrived = 0; // the step cur became the level
+    std::map<int32_t, low> base; // by generating slots: a step of replies alone
+    std::vector<step_info> prev; // the last two steps, the newest first
+
+    void init(int32_t target_ms, int32_t n_ceiling) {
+        target_us = (int64_t) target_ms*1000;
+        levels.clear();
+        for (int32_t n = std::min(n_floor, n_ceiling); n < n_ceiling; n *= 2) {
+            levels.push_back({ n });
+        }
+        levels.push_back({ n_ceiling });
+        cur = 0;
+        while (cur + 1 < levels.size() && levels[cur + 1].n_tokens <= n_start) {
+            cur++;
+        }
+    }
+
+    bool enabled() const { return target_us > 0 && !levels.empty(); }
+
+    int32_t allowance() const { return levels[cur].n_tokens; }
+
+    // the cost of the smallest allowance when it is over the target: steps of up to twice that cost are taken then, as
+    // smaller steps would not be shorter
+    int64_t floor_over_us() const {
+        const level & f = levels.front();
+        return f.est_us > target_us && clock - f.stamp < 8*n_retry ? f.est_us : 0;
+    }
+
+    int64_t limit_us() const { return std::max(target_us, 2*floor_over_us()); }
+
+    // no step follows the last one at once: the time to the next step is not a step's cost
+    void idle() { prev.clear(); }
+
+    // a step's batch is built: the slots that generate and the prompt tokens the step takes
+    void step(int64_t t_us, int32_t n_generating, int32_t n_prompt) {
+        clock++;
+        const size_t i_built = cur;
+        // two steps alike: the time of the second is theirs, whichever of the two a card ran the first one's prompt in
+        if (prev.size() == 2 && prev[0].n_generating > 0 && prev[0].n_generating == prev[1].n_generating &&
+                prev[0].n_prompt == prev[1].n_prompt) {
+            const int64_t period = t_us - prev[0].t_us;
+            if (prev[0].n_prompt == 0) {
+                base[prev[0].n_generating].push(period);
+            } else if (prev[0].i_level == cur && prev[1].i_level == cur && 2*prev[0].n_prompt > levels[cur].n_tokens) {
+                observe(std::max<int64_t>(0, period - base_us(prev[0].n_generating)));
+            }
+        }
+        prev.insert(prev.begin(), { t_us, n_generating, n_prompt, i_built });
+        prev.resize(std::min<size_t>(prev.size(), 2));
+    }
+
+private:
+    // a step of replies alone with that many slots, or with the nearest count seen
+    int64_t base_us(int32_t n_generating) const {
+        const low * best = nullptr;
+        int32_t d_best = 0;
+        for (const auto & [n, cost] : base) {
+            const int32_t d = std::abs(n - n_generating);
+            if (!best || d < d_best) {
+                best = &cost;
+                d_best = d;
+            }
+        }
+        return best ? best->get() : 0;
+    }
+
+    void move(size_t i) {
+        cur = i;
+        levels[cur].cost = {};
+        arrived = clock;
+    }
+
+    void observe(int64_t cost_us) {
+        level & l = levels[cur];
+        l.cost.push(cost_us);
+        if (!l.cost.full()) {
+            return;
+        }
+        l.est_us = l.cost.get();
+        l.stamp  = clock;
+
+        const int64_t limit = limit_us();
+        if (l.est_us > limit) {
+            if (cur > 0) {
+                l.below_us = -1;
+                l.n_below  = 0;
+                l.retry    = std::min(2*l.retry, n_retry_max);
+                move(cur - 1);
+            }
+            return;
+        }
+        l.retry = n_retry;
+        if (cur + 1 == levels.size()) {
+            return;
+        }
+        level & up = levels[cur + 1];
+        if (up.est_us >= 0 && up.n_below < n_low) {
+            up.below_us = up.below_us < 0 ? l.est_us : std::min(up.below_us, l.est_us);
+            up.n_below++;
+        }
+        int64_t next_us;
+        if (up.est_us >= 0 && up.below_us > 0) {
+            // what the next allowance cost, by how this one's cost has changed since. An eighth is added: the least of
+            // six steps moves by a few percent with no change of cost, and that is not a reason to go back
+            next_us = up.est_us*l.est_us/up.below_us;
+            next_us += next_us/8;
+        } else if (cur > 0 && levels[cur - 1].est_us >= 0 && clock - levels[cur - 1].stamp < n_retry) {
+            // the line through this allowance and the one below
+            const level & down = levels[cur - 1];
+            next_us = l.est_us + std::max<int64_t>(0, l.est_us - down.est_us)*(up.n_tokens - l.n_tokens)/(l.n_tokens - down.n_tokens);
+        } else {
+            // a cost in proportion to the tokens is the most the next one costs
+            next_us = l.est_us*up.n_tokens/l.n_tokens;
+        }
+        if (next_us <= limit || clock - arrived >= up.retry) {
+            move(cur + 1);
+        }
+    }
+};
+
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
     // Fallback null to default value

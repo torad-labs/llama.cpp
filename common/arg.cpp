@@ -1725,6 +1725,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PROMPT_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prompt-step-ms"}, "N",
+        string_format("in a step in which another slot is generating, take as many text prompt tokens as keep the prompt's "
+            "part of the step near N ms: 32 tokens or a power of two times that, up to --prompt-step. The server sets "
+            "the count from the time its last steps took, so a reply waits about as long whatever the prompt's depth; "
+            "a first pass of a size, and a pass that cannot be shorter, go over N (default: %d, 0 = off)",
+            params.n_prompt_step_ms),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prompt-step-ms must be non-negative");
+            }
+            params.n_prompt_step_ms = value;
+        }
+    ).set_env("LLAMA_ARG_PROMPT_STEP_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--prompt-chunk"}, "N",
         string_format("prefer at least N text tokens per admitted prompt, rotating pending prompts instead of dividing "
             "a step into thin slices; prompt-step, short tails and checkpoints still bound the chunk "

@@ -138,6 +138,7 @@ class ServerProcess:
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
     prompt_step: int | None = None
+    prompt_step_ms: int | None = None
     llama_cache: str | None = None
 
     # session variables
@@ -213,6 +214,8 @@ class ServerProcess:
             server_args.extend(["--ubatch-size", self.n_ubatch])
         if self.prompt_step is not None:
             server_args.extend(["--prompt-step", self.prompt_step])
+        if self.prompt_step_ms is not None:
+            server_args.extend(["--prompt-step-ms", self.prompt_step_ms])
         if self.n_threads:
             server_args.extend(["--threads", self.n_threads])
         if self.n_gpu_layer:
