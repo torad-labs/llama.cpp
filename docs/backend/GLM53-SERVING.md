@@ -6,17 +6,20 @@ Select the GPU layout explicitly with `scripts/glm53/serve.py --profile`:
 |---|---|---|
 | `tensor-2` (default) | One server spans two cards with tensor parallelism, one shared pool | `-sm tensor -ts 1,1`, `CUDA_VISIBLE_DEVICES=0,1` |
 | `tensor-4` | The same over four cards, 23 sessions on one shared pool | `-sm tensor -ts 1,1,1,1`, `CUDA_VISIBLE_DEVICES=0,1,2,3` |
-| `dp-2` | One server spans two cards; sequences have individual owners, dense weights are replicated, and routed experts are partitioned across both | `-sm dp -ts 1,1`, `CUDA_VISIBLE_DEVICES=0,1` |
-| `dp-4` | The same over four cards | `-sm dp -ts 1,1,1,1`, `CUDA_VISIBLE_DEVICES=0,1,2,3` |
 
-Each profile creates one card group, not independent servers or a 2x2 tensor/data split. The four-card DP launcher, host-KV option, measurements and current throughput blocker are documented in the [four-card DP recipe](../torad/glm53-dp.md#candidate-serving-command). That candidate keeps MTP enabled; the historical MTP-off comparison below is specific to `tensor-2`.
+Each profile creates one card group, not independent servers or a 2x2 tensor/data split. The data-parallel
+profiles (`dp-2`, `dp-4`) and their host-KV option were removed on November 16, 2026: production runs the
+tensor layouts and every read since November 9 ran on them. The four-card DP record stays in the
+[four-card DP recipe](../torad/glm53-dp.md#candidate-serving-command) as history; the historical MTP-off
+comparison below is specific to `tensor-2`.
 
 The remaining commands on this page describe `tensor-2`. Omitting `--profile` selects that two-card default.
 
 This recipe serves GLM-5.3-Flash-Uncensored IQ3_XXS on two 96 GB RTX PRO 6000
 Blackwell cards to as many sessions as the two cards hold with each able to
-reach 307,200 tokens at once: six sessions on a shared pool of 1,843,200
-tokens by the capacity arithmetic in
+reach 307,200 tokens at once: twelve reserved sessions on a shared pool of
+1,843,200 tokens, which holds six of them at that depth at the same time, by
+the capacity arithmetic in
 [the two-card goal](../torad/glm53-two-gpu.md). That count is arithmetic, not
 a card read: no two-card box has run this recipe yet, and the November 2
 measurements below are of the recipe it replaced (three slots, a 524,288-token
@@ -89,7 +92,7 @@ access controls.
 | Setting | Recipe |
 |---|---|
 | GPU placement | `CUDA_DEVICE_ORDER=PCI_BUS_ID`, `CUDA_VISIBLE_DEVICES=0,1`, `-ngl 99 -sm tensor -ts 1,1` |
-| Context and slots | `-c 1843200 -np 6 --kv-unified`, `LLAMA_KV_SEQ_CELLS=307200` |
+| Context and slots | `-c 1843200 -np 12 --kv-unified`, `LLAMA_KV_SEQ_CELLS=307200` |
 | Attention/indexer caches | `--cache-type-k q4_0 --cache-type-v q4_0 -ctki q8_0` |
 | Prompt batching | `-b 2048 -ub 2048 --prompt-step 1024 --prompt-chunk 128` |
 | RAM prompt cache | `--cache-ram 32768 --no-cache-idle-slots`, saves and restores beside the steps (`LLAMA_STATE_SAVE_ASYNC=1`, `LLAMA_STATE_RESTORE_ASYNC=1`) |
@@ -124,24 +127,26 @@ manually if you need a different configuration, and record those differences.
 
 ## Memory and concurrency limits
 
-The 1,843,200 KV cells form **one shared pool**, with each of the six sessions
-capped at 307,200 of them by `LLAMA_KV_SEQ_CELLS`, so every session can be
-full at the same time. Concurrent prompts, retained histories, generated
+The 1,843,200 KV cells form **one shared pool**, with each of the twelve
+reserved sessions capped at 307,200 of them by `LLAMA_KV_SEQ_CELLS`, so six
+can sit at that depth at the same time while all twelve stay live.
+Concurrent prompts, retained histories, generated
 tokens, and working memory still compete inside that sizing. The pool's
 caches are mirrored on both cards at 9,088 bytes a token (the four-card load
 of November 11), and each card carries about half the pack's split weights:
 the sums that give six sessions, and what a seventh would need, are in
 [the two-card goal](../torad/glm53-two-gpu.md). They are arithmetic from the
 four-card reads, not a two-card load: treat a card left with under 4,096 MiB
-free at load as a failed sizing and drop a slot with `--slots`. Nominal VRAM
+free at load as a failed sizing and shrink the pool with `--context`.
+Nominal VRAM
 alone does not establish fit with other GPU processes, different
 drivers/builds, projector workloads, or deeper drafts; the projector's 1.05
 GiB sits on the first card inside the same headroom. The 32,768 MiB
 RAM-cache budget is host memory in addition to model mapping and other
 process memory. It is not another GPU-context allocation.
 
-`--slots N` without `--context` keeps the 307,200 cap and sizes the pool as N
-whole sessions. `--context` without `--slot-context` leaves sessions uncapped
+`--slots N` changes the reserved count only; the pool and the 307,200 cap
+stay. `--context` without `--slot-context` leaves sessions uncapped
 in a pool of that many tokens, as on four cards. `--latent-cache q8_0`
 restores the wider Q8 latent rows the previous two-card recipe served with,
 at about 3,072 more bytes a pool token. The previous recipe as a whole (three

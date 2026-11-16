@@ -13,11 +13,14 @@ There is no per-session rate target yet: the first box read sets the number, as 
 ## Where it stands
 
 The launcher is ready and nothing is read on cards. `scripts/glm53/serve.py --profile tensor-2` (the default now
-sizes for this goal) and an experimental `--profile dp-2` both launch the pack with the settings the four-card
-work measured, sized for two cards. Their plans are pinned by `scripts/glm53/test_qualification.py`, and the
-tensor-4 and dp-4 plans are byte-identical to what they were before this change. The previous two-card recipe
-(three slots, a 524,288-token pool, Q8 latent caches, none of the settings below) is replaced by it; its
-November 2 sweep stays in [GLM53-SERVING.md](../backend/GLM53-SERVING.md) as history.
+sizes for this goal) launches the pack with the settings the four-card work measured, sized for two cards. Its
+plan is pinned by `scripts/glm53/test_qualification.py`, and the tensor-4 plan is what it was before this change.
+The previous two-card recipe (three slots, a 524,288-token pool, Q8 latent caches, none of the settings below)
+is replaced by it; its November 2 sweep stays in [GLM53-SERVING.md](../backend/GLM53-SERVING.md) as history.
+The DP profiles (`dp-2`, `dp-4`) and their tooling were removed on November 16, 2026: production runs the
+four-card tensor layout with 23 sessions on a shared pool, and the decode cost follows the requests decoding at
+once, not the slots reserved, so the data-parallel split has no case left (Marcos, November 16, 2026). The
+engine still takes `-sm dp`; nothing in the tree selects it.
 
 What the two tensor profiles now share, because the engine work behind them never counted ranks: the 4-bit
 latent cache, prompts read in chunks apart from replies, graphs kept by shape for any set of sessions
@@ -58,23 +61,21 @@ four cards, widened for two ranks' larger shares), the pool-map bank 14 bytes a 
 | 6 | 1,843,200 | 15.6 GiB | about 91 GiB | about 4.6 GiB |
 | 7 | 2,150,400 | 18.2 GiB | about 93.8 GiB | about 1.8 GiB |
 
-Six is the default: it keeps the DP qualification's 4,096 MiB free even at the heavy end of the weight range,
-with the vision projector's 1.05 GiB on the first card inside that room. Seven fits only if the weights land
-near the light end, which is why it is the box's second read and not the default. `--slots 7` asks for it;
-`--slots N` always sizes the pool as N whole sessions of the `--slot-context` limit.
+Six whole sessions is the default pool: it keeps the qualification's 4,096 MiB free even at the heavy end of
+the weight range, with the vision projector's 1.05 GiB on the first card inside that room. Seven fits only if
+the weights land near the light end, which is why it is the box's second read and not the default;
+`--context 2150400` asks for it. The pool holds six whole sessions and the launcher reserves twelve, as the
+four-card production server reserves 23 slots against a pool far below 23 whole sessions: the sessions that
+cost time are the ones decoding at once, not the ones reserved (Marcos, November 16, 2026). `--slots` sets the
+reserved count and never resizes the pool; `--context` sizes the pool and `--slot-context` a session's limit in
+it.
 
-Data-parallel split, per card. Routed experts halve (57.9 GiB) and everything else is whole (about 9.4 GiB), so
-about 67 GiB of weights a card. A slot's private Q8 caches are 11,424 bytes a token on its owner's card only
-(`scripts/glm53/capacity.py`'s geometry) plus about 0.13 GiB of recurrent state at MTP depth 2: 3.4 GiB a
-307,200-cell slot. With about 8 GiB of buffers, driver room and the 4 GiB kept free, five slots a card fit and
-six do not, so `dp-2` defaults to 10 slots of 307,200 cells. `capacity.py --devices 2 --slot-cells 307200`
-turns two boot snapshots on the box into the measured count; its claims stay estimates, as on four cards.
-
-The tensor layout is the default candidate: one pass a step whichever slots are busy, a shared pool sessions
-draw from as they grow, and the layout every November 9 to 15 read ran on. The DP layout holds more 300K
-sessions by these sums, at private caches that reserve their cells whether a session fills them or not, dense
-weights read whole on both cards every pass, and a step that still splits on idle slots between busy ones
-(glm53-goal.md, cause 2). The box reads both and the numbers choose.
+The tensor layout is the only one the launcher serves: one pass a step whichever slots are busy, a shared pool
+sessions draw from as they grow, the layout every November 9 to 15 read ran on, and the layout production runs.
+The DP split held more simultaneously-full sessions by these sums, at private caches that reserve their cells
+whether a session fills them or not, dense weights read whole on both cards every pass, and a step that still
+splits on idle slots between busy ones (glm53-goal.md, cause 2). It was removed, with its tooling, on
+November 16, 2026.
 
 ## Speed, as a hypothesis
 
@@ -102,12 +103,13 @@ a leg disproves its layout rather than tuning on rented time.
    128 KB where the pair maps each other's memory and the chunked kernel where it cannot (TORAD.md, rows
    `1cbc66f49`, `3bef5edc2`). Pin what the pair reads in the launcher.
 2. **The load.** `serve.py --profile tensor-2 --dry-run`, then launch. Record free MiB a card at load from the
-   server log. Under 4,096 MiB free, relaunch `--slots 5` and record that the default sizing missed, in this
-   file, before any rate is read.
-3. **The rate.** `rate.py --sessions 1 2 4 6`, two passes after the load (the first captures graphs), then the
-   same at histories of about 4,000 tokens if time allows. Per-session tok/s at each count is the number.
-4. **Short turns.** Agent turns of tens of tokens are where graph shapes churn: at six slots a session's
-   graphs change shape every 2,048 tokens it grows, against 32 kept graphs. Relaunch with `--session-step
+   server log. Under 4,096 MiB free, relaunch with a pool one session smaller, `--context 1536000`, and record
+   that the default sizing missed, in this file, before any rate is read.
+3. **The rate.** `rate.py --sessions 1 2 4 6 12`, two passes after the load (the first captures graphs), then
+   the same at histories of about 4,000 tokens if time allows. Per-session tok/s at each count is the number;
+   the 12-session pass reads what twelve reserved sessions decoding together cost against six.
+4. **Short turns.** Agent turns of tens of tokens are where graph shapes churn: with a dozen sessions a
+   session's graphs change shape every 2,048 tokens it grows, against 32 kept graphs. Relaunch with `--session-step
    65536 --prompt-shapes 8` and repeat step 3's sweep, with `prompt_evals.py` on a traced pass for the counts
    of graphs built and replayed. On the two-rank fixture a turn of 1 to 32 new tokens read in 45.9 ms against
    92.8 and sessions decoding beside a reader ran 39.0 against 36.0 tok/s each, while prompts of hundreds of
@@ -120,24 +122,19 @@ a leg disproves its layout rather than tuning on rented time.
    step beside replies` lines at `-lv 4` saying where the count settled. Two cards' steps run longer than
    four-card ones, so a fixed count costs more here than #255's capture read there; the time, not the count,
    is what carries over.
-6. **The depth.** `dp_longctx.py --streams 6 --context-tokens 295000 --turns 2` against the same server: all
-   six sessions populate near the cap at once, no cache lost, VRAM peak per card from its sampler. This is the
-   leg the goal is made of; a short-context rate without it is not the goal read.
-7. **The seventh session.** Relaunch `--slots 7`, read free memory and `rate.py --sessions 7` only. Keep
-   whichever of 6 or 7 the free-memory rule allows as the recorded capacity; do not tune kept graphs to squeeze
-   the seventh in on rented time.
-8. **The other layout.** `serve.py --profile dp-2`: boot at 8 and 12 slots for `capacity.py --devices 2
-   --slot-cells 307200`, serve at the estimated count under the same 4,096 MiB rule, `rate.py` at the same
-   session counts it fits, one `dp_longctx.py` leg at its full slot count and 100,000 tokens (its 300K fill is
-   hours at DP prefill rates; the reservation is what the boot already proved).
-9. **Quality spot checks, if the clock allows.** Greedy 96-token continuations of one prompt set under
+6. **The depth.** `dp_longctx.py --streams 6 --context-tokens 295000 --turns 2` against the same server: six
+   sessions populate the whole pool near the cap at once, no cache lost, VRAM peak per card from its sampler.
+   This is the leg the goal is made of; a short-context rate without it is not the goal read.
+7. **The seventh session.** Relaunch `--context 2150400`, a seventh whole session in the pool, read free
+   memory and `rate.py --sessions 7` only. Keep whichever pool the free-memory rule allows as the recorded
+   capacity; do not tune kept graphs to squeeze the seventh in on rented time.
+8. **Quality spot checks, if the clock allows.** Greedy 96-token continuations of one prompt set under
    `--reduction-wire q8` and `bf16`, and under both routes: report same-token agreement, no more. A KLD read
    of the wire and the 4-bit cache at two ranks and at depth is its own leg, not squeezed into this one.
 
 Write what each leg read into this file, with the box's card variant, host CPU and topology at the top, then
-destroy the box. Not carried to two cards, by design: `estimate_decode_pcie.py`'s DP4 PCIe model,
-`compare_decode.py`'s fixed four-GPU comparison case, the four-GPU simulation page, and the decode lab's
-four-card ideal. They are models and fixtures of the four-card question; `capacity.py` and
-`simulate_decode.py` take `--devices 2` for the two-card one. `measure.py`'s hand-built tensor-2 control
-command is unchanged, so its historical legs stay comparable; its `--recipe` takes `dp-2` through the launcher
-like `dp-4`.
+destroy the box. Removed with the DP profiles on November 16, 2026: `capacity.py`, `simulate_decode.py`,
+`compare_decode.py`, `server_matrix.py`, `control_matrix.py` and `workload.py`; git has them. The decode lab
+and `estimate_decode_pcie.py` stay: they read recorded captures of the four-card question, and nothing launches
+through them. `measure.py`'s hand-built tensor-2 control command is unchanged, so its historical legs stay
+comparable.

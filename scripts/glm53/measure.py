@@ -39,8 +39,6 @@ def server_command(args):
             if value < 1:
                 raise ValueError("thread counts must be positive")
             threads += ["--" + flag.replace("_", "-"), str(value)]
-    if getattr(args, "recipe", "tensor-2") in ("dp-2", "dp-4"):
-        return dp_plan(args)[0] + threads
     argv = [str(Path(args.binary) / "llama-server"), "-m", str(args.model), "-ngl", "99",
             "-sm", "tensor", "-ts", "1,1", "--jinja", "-fa", "on", "-ctk", "q8_0",
             "-ctv", "q8_0", "-ctki", "q8_0", "-b", "4096", "-ub", str(args.ubatch),
@@ -51,21 +49,6 @@ def server_command(args):
             "--spec-draft-mtp-adaptive", str(args.adaptive)]
     return argv + (["--glm53-profile", args.profile] if args.profile else []) + threads
 
-
-def dp_plan(args):
-    import serve
-    cells = serve.DP2_SLOT_CONTEXT if args.recipe == "dp-2" else serve.DP_SLOT_CONTEXT
-    if args.profile or args.ubatch != 512 or args.context != args.slots*cells or args.adaptive != 0.18:
-        raise ValueError("DP measurements require the documented private-cache recipe, ubatch 512 and adaptive 0.18")
-    argv = ["--profile", args.recipe, "--model", str(args.model), "--server", str(Path(args.binary)/"llama-server"),
-            "--port", str(args.port), "--slots", str(args.slots), "--mtp-depth", str(args.depth)]
-    if getattr(args, "kv_host", False):
-        argv += ["--kv-host"]
-    if getattr(args, "host_budget_mib", None) is not None:
-        argv += ["--host-budget-mib", str(args.host_budget_mib)]
-    if getattr(args, "mmproj", None):
-        argv += ["--mmproj", str(args.mmproj)]
-    return serve.make_plan(serve.arguments(argv))
 
 def validate_response(response, tokens, prompt_tokens=None):
     response = response if isinstance(response, dict) else {}
@@ -329,11 +312,7 @@ class ServingLeg:
         self.env.update(CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES="0,1",
                         GGML_CUDA_ALLREDUCE="internal", GGML_CUDA_GRAPH_MAX="0",
                         LD_LIBRARY_PATH=f"{args.binary}:{args.root}/cuda-runtime")
-        self.cards = 4 if getattr(args, "recipe", "tensor-2") == "dp-4" else 2
-        if getattr(args, "recipe", "tensor-2") in ("dp-2", "dp-4"):
-            import serve
-            self.env = serve.execution_environment(dp_plan(args)[1], self.env)
-            self.env["LD_LIBRARY_PATH"] = f"{args.binary}:{args.root}/cuda-runtime"
+        self.cards = 2
         if args.mode in ("capacity", "concurrency"):
             self.env["GGML_CUDA_MMVQ_Q8_SM120_CHECK"] = "1"
         if args.mode == "diagnostic":
@@ -697,11 +676,7 @@ def main():
     parser.add_argument("--ubatch", type=int, required=True)
     parser.add_argument("--deadline", type=float, required=True)
     parser.add_argument("--mode", choices=("timing", "semantics", "capacity", "concurrency", "diagnostic", "scaling"), default="timing")
-    parser.add_argument("--recipe", choices=("tensor-2", "dp-2", "dp-4"), default="tensor-2")
     parser.add_argument("--baseline-binary", type=Path, help="Run scaling in baseline/candidate/candidate/baseline order")
-    parser.add_argument("--kv-host", action="store_true")
-    parser.add_argument("--host-budget-mib", type=float)
-    parser.add_argument("--mmproj", type=Path)
     parser.add_argument("--sessions", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--prompt-tokens", type=int, nargs="+", default=[512, 4096])
     parser.add_argument("--profile", default="")
@@ -718,8 +693,6 @@ def main():
     if args.mode == "scaling" and (args.tokens < 2 or args.repeats < 1 or
             any(s < 1 or s > args.slots for s in args.sessions) or any(t <= 128 for t in args.prompt_tokens)):
         parser.error("scaling needs at least two output tokens, a positive repeat count, configured slots and prompts over 128 tokens")
-    if args.recipe == "tensor-2" and (args.kv_host or args.host_budget_mib is not None or args.mmproj):
-        parser.error("host KV and projector measurement options require the DP recipe")
     if Path(args.run).name != args.run or args.run in (".", ".."):
         parser.error("run must be one new output directory name")
     def interrupted(signum, frame):
