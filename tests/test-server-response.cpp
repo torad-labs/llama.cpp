@@ -9,8 +9,10 @@
 
 #include "server-queue.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <thread>
 #include <random>
 #include <set>
@@ -218,11 +220,120 @@ bool test_prompt_admission_fairness() {
     return true;
 }
 
+// --prompt-step-ms, driven the way the server drives it: a read beside one reply. A step of the reply alone takes 10 ms,
+// and a step's prompt tokens fixed_us and per_token_us(step) a token more; every spike-th step waits 500 ms more.
+struct budget_run {
+    int32_t settled = 0; // the allowance of most of the last 300 steps
+    double  over    = 0; // the share of the steps after the first 300 whose prompt part was over the target
+};
+
+template <typename F>
+budget_run run_prompt_budget(int target_ms, int32_t n_ceiling, int64_t fixed_us, F per_token_us, int n_steps, int spike = 0) {
+    server_prompt_budget budget;
+    budget.init(target_ms, n_ceiling);
+    int64_t t_us = 0;
+    for (int i = 0; i < 8; ++i) {
+        budget.step(t_us, 1, 0);
+        t_us += 10000;
+    }
+    std::map<int32_t, int> count;
+    int n_over = 0;
+    for (int i = 0; i < n_steps; ++i) {
+        const int32_t n = budget.allowance();
+        budget.step(t_us, 1, n);
+        const int64_t cost_us = fixed_us + (int64_t) per_token_us(i)*n;
+        t_us += 10000 + cost_us + (spike > 0 && i % spike == 0 ? 500000 : 0);
+        if (i >= n_steps - 300) {
+            count[n]++;
+        }
+        if (i >= 300) {
+            n_over += cost_us > (int64_t) target_ms*1000;
+        }
+    }
+    budget_run res;
+    for (const auto & [n, c] : count) {
+        if (c > count[res.settled]) {
+            res.settled = n;
+        }
+    }
+    res.over = n_steps > 300 ? (double) n_over/(n_steps - 300) : 0;
+    return res;
+}
+
+bool test_prompt_budget() {
+    const auto flat = [](int64_t us) { return [us](int) { return us; }; };
+
+    // a cost in proportion to the tokens: 128 tokens take 12.8 ms and 256 take 25.6
+    budget_run res = run_prompt_budget(20, 1024, 0, flat(100), 2000);
+    if (res.settled != 128 || res.over > 0.05) {
+        return fail("the prompt budget did not settle on the largest allowance under its target");
+    }
+    // the same with a slow step in every seven: a wait is not the allowance's cost
+    res = run_prompt_budget(20, 1024, 0, flat(100), 2000, 7);
+    if (res.settled != 128 || res.over > 0.05) {
+        return fail("slow steps moved the prompt budget");
+    }
+    // a fixed part and a part a token: 256 tokens take 22.8 ms and 512 take 35.6
+    res = run_prompt_budget(30, 1024, 10000, flat(50), 2000);
+    if (res.settled != 256 || res.over > 0.05) {
+        return fail("the prompt budget did not find the allowance under its target past a fixed cost");
+    }
+    // a pass that takes 50 ms whatever its tokens: smaller steps are not shorter, so the limit of tokens stands
+    res = run_prompt_budget(20, 1024, 50000, flat(20), 2000);
+    if (res.settled != 1024) {
+        return fail("the prompt budget kept small steps that a fixed cost made no shorter");
+    }
+    // the smallest step, 19 ms, over the target: the steps stay within twice its cost (128 tokens take 31 ms, 256 take 47)
+    res = run_prompt_budget(10, 1024, 15000, flat(125), 2000);
+    if (res.settled != 128) {
+        return fail("the prompt budget went past twice the cost of its smallest step");
+    }
+    // a prompt that costs more a token as it gets deeper: the allowance comes down with it
+    res = run_prompt_budget(20, 1024, 0, [](int i) { return 100 + std::min(i, 3000)/10; }, 3400);
+    if (res.settled != 32) {
+        return fail("the prompt budget did not come down as a token's cost went up");
+    }
+    // a token that comes to cost a third of what it did: the allowance goes back up, and no further than fits
+    res = run_prompt_budget(20, 1024, 0, [](int i) { return i < 600 ? 300 : 100; }, 1200);
+    if (res.settled != 128 || res.over > 0.05) {
+        return fail("the prompt budget did not go back up as a token's cost came down");
+    }
+    // the limit of tokens is the largest allowance, a power of two or not
+    res = run_prompt_budget(1000, 300, 0, flat(100), 600);
+    if (res.settled != 300) {
+        return fail("the prompt budget did not reach its limit of tokens");
+    }
+
+    // the wait for the next request is no step's time
+    server_prompt_budget budget;
+    budget.init(20, 1024);
+    int64_t t_us = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (i == 4) {
+            budget.idle();
+            t_us += 5000000;
+        }
+        budget.step(t_us, 1, 0);
+        t_us += 10000;
+    }
+    const auto & replies = budget.base[1];
+    if (replies.n != 4) {
+        return fail("the prompt budget did not time the steps of replies on each side of an idle wait");
+    }
+    for (int64_t i = 0; i < replies.n; ++i) {
+        if (replies.v[i] != 10000) {
+            return fail("the prompt budget took an idle wait for a step of replies");
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
     bool ok = true;
     ok = test_prompt_admission_fairness() && ok;
+    ok = test_prompt_budget() && ok;
     ok = test_reader_of_several_tasks() && ok;
     ok = test_dropped_results() && ok;
     ok = test_broadcast() && ok;

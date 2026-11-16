@@ -144,6 +144,12 @@ def arguments(argv=None):
                         help="Explicit numerical-control microbatch for DP; it never changes the serving default")
     parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP, and "
                         "with --prompt-shapes the largest prompt pass (256, or --prompt-shape-rows); 0 removes the cap")
+    parser.add_argument("--prompt-step-ms", type=int, metavar="MS",
+                        help="The time the prompt tokens of a step may take beside replies: the server sets their count "
+                             "from the time its last steps took, 32 tokens or a power of two times that, up to "
+                             "--prompt-step (then 1024 on the tensor profiles where it is not given, with "
+                             "--prompt-shapes as well). A reply then waits about as long whatever the prompt's depth "
+                             "(opt-in: not read on four cards)")
     parser.add_argument("--trace-decode", action="store_true",
                         help="Opt-in host phase/batch markers, graph identity and CUDA NVTX; not an unprofiled speed run")
     parser.add_argument("--dry-run", action="store_true")
@@ -169,9 +175,14 @@ def make_plan(args):
     # With prompt shapes a step's prompt tokens go in passes of at most --prompt-shape-rows rows, back to back, and the step's replies wait for all of them.
     # The step is then one pass, so a reply waits for one. Fixture, three sessions decoding beside a reader (Nov 14, 2026): 39.0 tok/s each at 256 against 34.5 at 1,024, the reader's prompts 4 % slower.
     shape_step = (args.prompt_shape_rows or 256) if args.prompt_shapes is not None else 1024
+    # With --prompt-step-ms the step is the most the server's own count comes to, so it is not held to one pass
+    if args.prompt_step_ms is not None:
+        shape_step = 1024
     prompt_step = args.prompt_step if args.prompt_step is not None else (512 if dp else shape_step)
     if not 1 <= args.port <= 65535 or prompt_step < 0:
         raise ValueError("port must be 1..65535 and prompt-step must be nonnegative")
+    if args.prompt_step_ms is not None and args.prompt_step_ms < 1:
+        raise ValueError("prompt-step-ms must be 1 or more")
     limit = MAX_SLOTS if args.kv_host or four else 40
     if args.slots is not None and (not (dp or four) or not 1 <= args.slots <= limit):
         raise ValueError(f"slots is supported only with --profile tensor-4 or dp-4 and must be 1..{limit}")
@@ -236,6 +247,8 @@ def make_plan(args):
              "--cache-type-k", latent, "--cache-type-v", latent, "-ctki", "q8_0",
              "-b", "2048", "-ub", str(diagnostic_ubatch) if dp else "2048", "--prompt-step", str(prompt_step),
              "--alias", "GLM-5.3-Flash-Uncensored-IQ3_XXS", "--chat-template-file", str(TEMPLATE)]
+    if args.prompt_step_ms is not None:
+        argv += ["--prompt-step-ms", str(args.prompt_step_ms)]
     if dp:
         argv += ["-fit", "off", "-cts", "q8_0", "--backend-sampling", "--prompt-chunk", "128"]
     elif args.backend_sampling:

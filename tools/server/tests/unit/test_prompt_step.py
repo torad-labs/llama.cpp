@@ -3,6 +3,10 @@
 # generating, so the reply waits at most one short step between its tokens. A prompt read while no other slot
 # generates still fills whole n_batch steps, and without --prompt-step nothing changes.
 #
+# With --prompt-step-ms the server sets that count itself, from the time its last steps took: 256 tokens at first, then
+# 32 or a power of two times that, up to --prompt-step. What the times make of it is tests/test-server-response.cpp's;
+# here, the count a read starts with and the bound it keeps.
+#
 # A step's prompt tokens are what the read's streamed prompt_progress advances by between two reports.
 import random
 import threading
@@ -129,6 +133,43 @@ def test_prompt_step_bounds_a_read_beside_a_reply(monkeypatch, chunk):
 def test_prompt_step_reads_whole_batches_alone():
     global server
     server.prompt_step = STEP
+    server.start()
+    steps, n_read = read_steps()
+    assert n_read > N_BATCH
+    assert sum(steps) == n_read
+    assert steps[0] == N_BATCH, f"alone, the read's first step took {steps[0]} tokens, not a whole batch of {N_BATCH}: {steps}"
+
+
+def test_prompt_step_ms_starts_a_read_beside_a_reply_at_256_tokens():
+    # a budget no step of this model comes near: the count is not taken down
+    global server
+    server.n_batch = 512
+    server.prompt_step_ms = 60000
+    server.start()
+    steps, n_read, still_generating = read_beside_a_reply()
+    assert still_generating, "the reply in slot 1 ended during the read, so the read was not beside a reply"
+    assert n_read > 3 * 256
+    assert sum(steps) == n_read
+    assert steps[0] == 256, f"beside a reply, the read's first step took {steps[0]} tokens and not 256: {steps}"
+    # the next count is 512, which the batch does not hold beside the reply's token
+    assert max(steps) < 512, f"a step read {max(steps)} prompt tokens beside a reply: {steps}"
+
+
+def test_prompt_step_ms_keeps_under_the_prompt_step():
+    global server
+    server.prompt_step = STEP + STEP // 2
+    server.prompt_step_ms = 60000
+    server.start()
+    steps, n_read, still_generating = read_beside_a_reply()
+    assert still_generating, "the reply in slot 1 ended during the read, so the read was not beside a reply"
+    assert sum(steps) == n_read
+    assert steps[0] == server.prompt_step, f"the read's first step took {steps[0]} tokens, not --prompt-step: {steps}"
+    assert max(steps) <= server.prompt_step, f"a step read {max(steps)} prompt tokens, over --prompt-step: {steps}"
+
+
+def test_prompt_step_ms_reads_whole_batches_alone():
+    global server
+    server.prompt_step_ms = 1
     server.start()
     steps, n_read = read_steps()
     assert n_read > N_BATCH

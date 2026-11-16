@@ -713,6 +713,7 @@ struct common_params {
     int32_t checkpoint_every    = 0;     // also checkpoint every N prompt tokens and where a prompt forks from the cached one (0 = off)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t n_prompt_step       = 0;     // prompt tokens a step takes while another slot generates (0 = up to n_batch)
+    int32_t n_prompt_step_ms    = 0;     // the time the prompt tokens of such a step may take, which sets how many it takes up to n_prompt_step (0 = off)
     int32_t n_prompt_chunk      = 0;     // prefer useful per-sequence prompt chunks (0 = share across all pending slots)
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 

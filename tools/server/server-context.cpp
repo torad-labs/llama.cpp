@@ -1560,6 +1560,7 @@ private:
     std::vector<server_slot> slots;
     size_t prompt_cursor = 0;
     server_prompt_scheduler prompt_scheduler;
+    server_prompt_budget prompt_budget;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -5128,6 +5129,7 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+                prompt_budget.idle();
 
                 return; // skip further processing
 
@@ -5591,9 +5593,15 @@ private:
         // with --prompt-step, a step in which a slot generates takes at most that many prompt tokens besides the generated
         // ones, so the reply waits one short step instead of a whole batch; a prompt read while no slot generates still
         // fills the batch. A prompt that cannot be split keeps n_batch
+        // with --prompt-step-ms the step's prompt tokens follow what the last steps cost, up to --prompt-step
+        if (params_base.n_prompt_step_ms > 0 && !prompt_budget.enabled()) {
+            prompt_budget.init(params_base.n_prompt_step_ms,
+                    params_base.n_prompt_step > 0 ? std::min(params_base.n_prompt_step, n_batch) : n_batch);
+        }
         const int32_t n_generated    = batch.size();
-        const int32_t n_batch_prompt = params_base.n_prompt_step > 0 && n_generated > 0 ?
-            n_generated + std::min(n_batch - n_generated, params_base.n_prompt_step) : n_batch;
+        const int32_t n_prompt_step  = prompt_budget.enabled() ? prompt_budget.allowance() : params_base.n_prompt_step;
+        const int32_t n_batch_prompt = n_prompt_step > 0 && n_generated > 0 ?
+            n_generated + std::min(n_batch - n_generated, n_prompt_step) : n_batch;
 
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
@@ -6404,6 +6412,20 @@ private:
                 n_pending    = children.size();
                 n_share_step = share_step(children);
                 iterate(children, read_prompt);
+            }
+        }
+
+        if (prompt_budget.enabled()) {
+            const int32_t n_before   = prompt_budget.allowance();
+            const bool    over_floor = prompt_budget.floor_over_us() > 0;
+            prompt_budget.step(ggml_time_us(), (int32_t) generating.size(), batch.size() - n_generated);
+            if (prompt_budget.allowance() != n_before) {
+                SRV_TRC("prompt step beside replies: %d -> %d tokens\n", n_before, prompt_budget.allowance());
+            }
+            if (!over_floor && prompt_budget.floor_over_us() > 0) {
+                SRV_WRN("a prompt step of %d tokens takes %.1f ms beside replies, over --prompt-step-ms %d: steps of up to %.1f ms are taken\n",
+                        prompt_budget.levels.front().n_tokens, prompt_budget.floor_over_us() / 1000.0, params_base.n_prompt_step_ms,
+                        prompt_budget.limit_us() / 1000.0);
             }
         }
     }

@@ -832,6 +832,24 @@ class ServingRecipeTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
 
+    def test_prompt_step_ms_is_an_opt_in_and_its_step_is_the_most_a_step_takes(self):
+        base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
+        self.assertNotIn("--prompt-step-ms", self.serve.make_plan(self.serve.arguments(base))[0])
+        argv = self.serve.make_plan(self.serve.arguments(base + ["--prompt-step-ms", "40"]))[0]
+        self.assertEqual((argv[argv.index("--prompt-step-ms") + 1], argv[argv.index("--prompt-step") + 1]), ("40", "1024"))
+        # with shapes the step is one pass; the time takes the count there, so the step is not held to the pass
+        argv = self.serve.make_plan(self.serve.arguments(base + ["--prompt-shapes", "8", "--prompt-step-ms", "40"]))[0]
+        self.assertEqual((argv[argv.index("--prompt-step-ms") + 1], argv[argv.index("--prompt-step") + 1]), ("40", "1024"))
+        argv = self.serve.make_plan(self.serve.arguments(
+            base + ["--prompt-shapes", "8", "--prompt-step-ms", "40", "--prompt-step", "512"]))[0]
+        self.assertEqual(argv[argv.index("--prompt-step") + 1], "512")
+        argv = self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--profile", "dp-4", "--prompt-step-ms", "40"]))[0]
+        self.assertEqual((argv[argv.index("--prompt-step-ms") + 1], argv[argv.index("--prompt-step") + 1]), ("40", "512"))
+        for ms in ("0", "-5"):
+            with self.subTest(ms=ms), self.assertRaises(ValueError):
+                self.serve.make_plan(self.serve.arguments(base + ["--prompt-step-ms", ms]))
+
     def test_prompt_shapes_session_step_and_low_depth_are_opt_ins(self):
         base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
         argv, env = self.serve.make_plan(self.serve.arguments(base))
