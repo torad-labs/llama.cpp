@@ -767,12 +767,13 @@ class ServingRecipeTest(unittest.TestCase):
         two = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))[1]
         self.assertNotIn("LLAMA_SPEC_COUPLED", two)
         # what the four cards serve with and the two do not: the reductions on the copy engines through host memory in
-        # 8-bit blocks, graphs kept by shape, CUDA executables held between turns
+        # 8-bit blocks, graphs kept by shape, CUDA executables held between turns, saves and restores beside the steps
         wire = {"GGML_CUDA_AR_WIRE_Q8": "1"}
         four = {"GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0", "GGML_CUDA_AR_COPY_THRESHOLD": "1",
                 "GGML_CUDA_AR_COPY_PEER": "0", "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0",
                 "LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": "128", "GGML_META_CAPTURE_GRAPHS": "132",
-                "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000", "CUDA_VISIBLE_DEVICES": "0,1,2,3"}
+                "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "LLAMA_STATE_SAVE_ASYNC": "1", "LLAMA_STATE_RESTORE_ASYNC": "1"}
         for key in list(four) + list(wire):
             if key != "CUDA_VISIBLE_DEVICES":
                 self.assertNotIn(key, two)
@@ -895,6 +896,51 @@ class ServingRecipeTest(unittest.TestCase):
         self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"]))
         for options in (base + ["--cache-ram", "-2"], base + ["--ctx-checkpoints", "-1"],
                         ["--model", "/models/target.gguf", "--profile", "dp-4", "--prefix-copy"]):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.serve.make_plan(self.serve.arguments(options))
+
+    def test_four_cards_save_and_restore_beside_the_steps_by_default(self):
+        base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
+        env = self.serve.make_plan(self.serve.arguments(base))[1]
+        self.assertEqual((env["LLAMA_STATE_SAVE_ASYNC"], env["LLAMA_STATE_RESTORE_ASYNC"]), ("1", "1"))
+        # the options a four-card launch line gave before they were the default stay accepted
+        env = self.serve.make_plan(self.serve.arguments(base + ["--save-async", "--restore-async"]))[1]
+        self.assertEqual((env["LLAMA_STATE_SAVE_ASYNC"], env["LLAMA_STATE_RESTORE_ASYNC"]), ("1", "1"))
+        # each off switch brings one of the two back to the server's thread
+        env = self.serve.make_plan(self.serve.arguments(base + ["--save-sync"]))[1]
+        self.assertNotIn("LLAMA_STATE_SAVE_ASYNC", env)
+        self.assertEqual(env["LLAMA_STATE_RESTORE_ASYNC"], "1")
+        env = self.serve.make_plan(self.serve.arguments(base + ["--restore-sync"]))[1]
+        self.assertNotIn("LLAMA_STATE_RESTORE_ASYNC", env)
+        self.assertEqual(env["LLAMA_STATE_SAVE_ASYNC"], "1")
+        # the two-card recipe stays opt-in
+        env = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))[1]
+        self.assertNotIn("LLAMA_STATE_SAVE_ASYNC", env)
+        self.assertNotIn("LLAMA_STATE_RESTORE_ASYNC", env)
+        env = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--save-async"]))[1]
+        self.assertEqual(env["LLAMA_STATE_SAVE_ASYNC"], "1")
+        self.assertNotIn("LLAMA_STATE_RESTORE_ASYNC", env)
+        for options in (base + ["--save-sync", "--save-async"], base + ["--restore-sync", "--restore-async"],
+                        ["--model", "/models/target.gguf", "--save-sync"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--restore-sync"]):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.serve.make_plan(self.serve.arguments(options))
+
+    def test_the_rule_for_the_session_that_is_cut_has_a_setting_and_two_switches(self):
+        base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
+        env = self.serve.make_plan(self.serve.arguments(base))[1]
+        for key in ("LLAMA_SLOT_VICTIM_LRU_LEGACY", "LLAMA_SLOT_VICTIM_IDLE_LEGACY", "LLAMA_SLOT_VICTIM_RETURN_S"):
+            self.assertNotIn(key, env)
+        env = self.serve.make_plan(self.serve.arguments(base + ["--victim-return-s", "45"]))[1]
+        self.assertEqual(env["LLAMA_SLOT_VICTIM_RETURN_S"], "45")
+        env = self.serve.make_plan(self.serve.arguments(base + ["--victim-idle-legacy"]))[1]
+        self.assertEqual(env["LLAMA_SLOT_VICTIM_IDLE_LEGACY"], "1")
+        self.assertNotIn("LLAMA_SLOT_VICTIM_LRU_LEGACY", env)
+        env = self.serve.make_plan(self.serve.arguments(base + ["--victim-lru-legacy"]))[1]
+        self.assertEqual(env["LLAMA_SLOT_VICTIM_LRU_LEGACY"], "1")
+        for options in (base + ["--victim-return-s", "0"], base + ["--victim-return-s", "nan"],
+                        base + ["--victim-return-s", "45", "--victim-idle-legacy"],
+                        base + ["--victim-return-s", "45", "--victim-lru-legacy"]):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
 

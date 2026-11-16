@@ -55,10 +55,16 @@ def arguments(argv=None):
                         "and 32 with --slot-context)")
     parser.add_argument("--restore-async", action="store_true",
                         help="A session brought back from the RAM prompt cache copies its rows on a thread of its own while "
-                             "the other sessions decode (opt-in: not read on four cards)")
+                             "the other sessions decode (tensor-4: the default; the other profiles: opt-in)")
     parser.add_argument("--save-async", action="store_true",
                         help="A session whose slot another session takes is copied to the RAM prompt cache on a thread of "
-                             "its own while the other sessions decode (opt-in: not read on four cards)")
+                             "its own while the other sessions decode (tensor-4: the default; the other profiles: opt-in)")
+    parser.add_argument("--restore-sync", action="store_true",
+                        help="tensor-4: a restore copies its rows on the server's thread with every session waiting, as "
+                             "before it was the default: the off switch, to compare the two on a box")
+    parser.add_argument("--save-sync", action="store_true",
+                        help="tensor-4: a save copies its rows on the server's thread with every session waiting, as "
+                             "before it was the default: the off switch, to compare the two on a box")
     parser.add_argument("--state-copy-legacy", action="store_true",
                         help="A save to the RAM prompt cache and a restore from it copy a session's runs of cells one "
                              "by one, as before the batched copies: the off switch, to compare the two on a box")
@@ -81,6 +87,14 @@ def arguments(argv=None):
                         help="With every slot in use, a new session takes the least recently used slot, whatever it holds, "
                              "as before the rule that weighs what a session holds against how long it has been idle: "
                              "the off switch, to compare the two on a box")
+    parser.add_argument("--victim-idle-legacy", action="store_true",
+                        help="With every slot in use, the session that is cut is the one with the fewest tokens for each "
+                             "second it has been idle, as before the rule that weighs its tokens by the measured chance "
+                             "of its return: the off switch, to compare the two on a box")
+    parser.add_argument("--victim-return-s", type=float, metavar="SECONDS",
+                        help="The seconds of idleness that halve the part of a session's chance of a return that fades "
+                             "with its time away, in the rule for which session is cut (default: the engine's 90, the fit "
+                             "to one deployment's records)")
     parser.add_argument("--sessions-dir", type=Path,
                         help="A directory the server leaves its sessions in when it is stopped with SIGTERM or SIGINT, and "
                              "takes them from when it starts with the same models: /dev/shm/... keeps them in memory. The "
@@ -187,6 +201,14 @@ def make_plan(args):
         raise ValueError("prompt-shape-rows is given with --prompt-shapes")
     if args.session_step is not None and not four:
         raise ValueError("session-step is supported only with --profile tensor-4")
+    if (args.restore_sync or args.save_sync) and not four:
+        raise ValueError("restore-sync and save-sync are the off switches of the tensor-4 defaults")
+    if args.restore_sync and args.restore_async or args.save_sync and args.save_async:
+        raise ValueError("a save or a restore is async or sync, not both")
+    if args.victim_return_s is not None and not (math.isfinite(args.victim_return_s) and args.victim_return_s > 0):
+        raise ValueError("victim-return-s is a positive number of seconds")
+    if args.victim_return_s is not None and (args.victim_lru_legacy or args.victim_idle_legacy):
+        raise ValueError("victim-return-s sets the rule that the legacy switches turn off")
     if (args.dflash or args.backend_sampling or args.reduction_wire) and not four:
         raise ValueError("dflash, backend-sampling and reduction-wire are supported only with --profile tensor-4")
     if (args.dflash is None) != (args.dflash_depth is None) or args.dflash_depth is not None and args.dflash_depth < 1:
@@ -293,10 +315,18 @@ def make_plan(args):
         # of that many, not for one that took every cell: 10 bytes a pool a row, the term that kept the pool for 23
         # sessions of 262144 from loading (docs/torad/glm53-goal.md, cause 3). The engine rounds it up to 256
         env["LLAMA_KV_SEQ_CELLS"] = str(args.slot_context)
-    if args.restore_async:
+    # The four-card profile saves and restores beside the sessions' steps unless told not to. Four RTX PRO 6000 with the
+    # pack, 23 slots, engine 417923e (#238, Nov 14 and 15, 2026), 30 sessions on 23 slots, 90 turns, a quarter of the
+    # requests dropped part-way: 87 saves held the server's thread 4.7 s in all and 64 ms at most where 97 blocking ones
+    # held it 99.4 s and 7,360 ms, 19 restores 4.4 s and 287 ms where 64 held it 66.6 s and 3,658 ms (the arms' prompt
+    # caches differ, 256 and 32 GiB), and a session streaming beside them paused 1.34 s at most where it paused 8.66 s.
+    # 182 turns of that churn: no leak, no lost context. 4.3 h of real traffic: 790 streamed answers, none waiting over
+    # 3 s for a chunk, no server error. Not read on four cards with the batched state copies that came after that engine
+    # (--state-copy-legacy is their off switch).
+    if args.restore_async or four and not args.restore_sync:
         # A restore stops the server's thread only to place the cells; the rows are copied beside the other sessions' steps
         env["LLAMA_STATE_RESTORE_ASYNC"] = "1"
-    if args.save_async:
+    if args.save_async or four and not args.save_sync:
         # A save for a slot that changes hands stops the server's thread only to write the state's layout; the request
         # that takes the slot waits its turn while the rows are copied beside the other sessions' steps
         env["LLAMA_STATE_SAVE_ASYNC"] = "1"
@@ -314,9 +344,14 @@ def make_plan(args):
         # A cell two sessions hold sends the whole pool back to the packed maps, for every session, while it is shared
         env["LLAMA_KPOOL_SHARED_CELLS_LEGACY"] = "1"
     if args.victim_lru_legacy:
-        # By default the session that is cut when no slot is empty is the one with the fewest tokens for each second it has
-        # been idle (what it has to bring back, against how likely it is to return); with this, the least recently used
+        # By default the session that is cut when no slot is empty is the one whose tokens times its chance of a return
+        # are the fewest (what it has to bring back, against how likely it is to return); with this, the least recently used
         env["LLAMA_SLOT_VICTIM_LRU_LEGACY"] = "1"
+    if args.victim_idle_legacy:
+        # The chance of a return taken as one over the seconds idle, as the rule first was, in place of the measured shares
+        env["LLAMA_SLOT_VICTIM_IDLE_LEGACY"] = "1"
+    if args.victim_return_s is not None:
+        env["LLAMA_SLOT_VICTIM_RETURN_S"] = f"{args.victim_return_s:g}"
     if args.sessions_dir is not None:
         # At a stop every session is saved to the RAM prompt cache and the cache written to files; the next start maps
         # them, and a session comes back from its snapshot where it would be prefilled from its first token
