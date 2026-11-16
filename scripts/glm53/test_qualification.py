@@ -661,18 +661,19 @@ class ServingRecipeTest(unittest.TestCase):
         import serve
         self.serve = serve
 
-    def test_default_retains_the_two_card_tensor_recipe(self):
+    def test_default_two_card_tensor_recipe_carries_the_four_card_settings(self):
         args = self.serve.arguments(["--model", "/models/first shard.gguf", "--mmproj", "/models/projector.gguf"])
         argv, env = self.serve.make_plan(args)
         self.assertEqual(argv, [str(self.serve.ROOT / "build/bin/llama-server"),
             "-m", "/models/first shard.gguf", "--mmproj", "/models/projector.gguf",
             "-ngl", "99", "-sm", "tensor", "-ts", "1,1", "--jinja", "-fa", "on",
-            "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-ctki", "q8_0",
+            "--cache-type-k", "q4_0", "--cache-type-v", "q4_0", "-ctki", "q8_0",
             "-b", "2048", "-ub", "2048", "--prompt-step", "1024",
             "--alias", "GLM-5.3-Flash-Uncensored-IQ3_XXS", "--chat-template-file", str(self.serve.TEMPLATE),
+            "--prompt-chunk", "128",
             "--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
             "--spec-draft-mtp-vocab", str(self.serve.DRAFT_VOCAB), "--spec-draft-mtp-adaptive", "0.18",
-            "-c", "524288", "-np", "3", "--kv-unified", "--cache-ram", "32768",
+            "-c", "1843200", "-np", "6", "--kv-unified", "--cache-ram", "32768",
             "--no-cache-idle-slots", "--metrics", "--host", "127.0.0.1", "--port", "8102",
             "--log-timestamps"])
         self.assertEqual(env, {
@@ -680,6 +681,11 @@ class ServingRecipeTest(unittest.TestCase):
             "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": "internal",
             "LLAMA_INDEXER_Q8_QUERY": "1", "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
             "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
+            "GGML_CUDA_AR_WIRE_Q8": "1", "LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": "32",
+            "GGML_META_CAPTURE_GRAPHS": "36", "GGML_CUDA_GRAPH_NODES": "262144",
+            "GGML_CUDA_GRAPH_IDLE_MS": "600000", "LLAMA_GRAPH_DEVICE_RESERVE_MIB": "1024",
+            "LLAMA_SPEC_COUPLED": "1", "LLAMA_KV_SEQ_CELLS": "307200",
+            "LLAMA_STATE_SAVE_ASYNC": "1", "LLAMA_STATE_RESTORE_ASYNC": "1",
             "LD_LIBRARY_PATH": str(self.serve.ROOT / "build/bin")})
         self.assertNotIn("--glm53-profile", argv)
         with self.assertRaisesRegex(ValueError, "transport"):
@@ -764,28 +770,36 @@ class ServingRecipeTest(unittest.TestCase):
         self.assertIn("--kv-unified", argv)
         for flag in ("--backend-sampling", "-fit", "-cts", "-ubd", "--spec-draft-model"):
             self.assertNotIn(flag, argv)
+        # the reductions on the copy engines through host memory in 8-bit blocks, graphs kept by shape, CUDA
+        # executables held between turns, saves and restores beside the steps, the coupled MTP draws
+        self.assertEqual(env, {
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+            "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": "internal",
+            "LLAMA_INDEXER_Q8_QUERY": "1", "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
+            "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
+            "GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0", "GGML_CUDA_AR_COPY_THRESHOLD": "1",
+            "GGML_CUDA_AR_COPY_PEER": "0", "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0", "GGML_CUDA_AR_WIRE_Q8": "1",
+            "LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": "128", "GGML_META_CAPTURE_GRAPHS": "132",
+            "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000",
+            "LLAMA_SPEC_COUPLED": "1", "LLAMA_STATE_SAVE_ASYNC": "1", "LLAMA_STATE_RESTORE_ASYNC": "1",
+            "LD_LIBRARY_PATH": str(self.serve.ROOT / "build/bin")})
+        # two cards serve the same settings; what differs is the devices in sight, the host-memory reduction route
+        # no pair has been read on, the kept graphs a session limit sizes, the session limit itself and the fuller
+        # cards' graph reserve
         two = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))[1]
-        self.assertNotIn("LLAMA_SPEC_COUPLED", two)
-        # what the four cards serve with and the two do not: the reductions on the copy engines through host memory in
-        # 8-bit blocks, graphs kept by shape, CUDA executables held between turns, saves and restores beside the steps
-        wire = {"GGML_CUDA_AR_WIRE_Q8": "1"}
-        four = {"GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0", "GGML_CUDA_AR_COPY_THRESHOLD": "1",
-                "GGML_CUDA_AR_COPY_PEER": "0", "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0",
-                "LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": "128", "GGML_META_CAPTURE_GRAPHS": "132",
-                "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
-                "LLAMA_STATE_SAVE_ASYNC": "1", "LLAMA_STATE_RESTORE_ASYNC": "1"}
-        for key in list(four) + list(wire):
-            if key != "CUDA_VISIBLE_DEVICES":
-                self.assertNotIn(key, two)
-        self.assertEqual(env, {**two, **four, **wire, "LLAMA_SPEC_COUPLED": "1"})
+        self.assertEqual({key for key in set(env) | set(two) if env.get(key) != two.get(key)}, {
+            "CUDA_VISIBLE_DEVICES", "GGML_CUDA_AR_LL_MAX_BYTES", "GGML_CUDA_AR_P2P_MAX_BYTES",
+            "GGML_CUDA_AR_COPY_THRESHOLD", "GGML_CUDA_AR_COPY_PEER", "GGML_CUDA_AR_GATHER_OWNER_SLICES",
+            "LLAMA_GRAPH_SLOTS", "GGML_META_CAPTURE_GRAPHS", "LLAMA_GRAPH_DEVICE_RESERVE_MIB",
+            "LLAMA_KV_SEQ_CELLS"})
         bf16 = self.serve.make_plan(self.serve.arguments(
             ["--model", "/models/target.gguf", "--profile", "tensor-4", "--reduction-wire", "bf16"]))[1]
-        self.assertEqual(bf16, {**two, **four, "LLAMA_SPEC_COUPLED": "1"})
+        self.assertEqual(bf16, {key: value for key, value in env.items() if key != "GGML_CUDA_AR_WIRE_Q8"})
         # the coupled draws are the MTP head's: neither without a draft nor with the DFlash one
         for options in (["--mtp-depth", "off"], ["--dflash", "/models/dflash.gguf", "--dflash-depth", "15"]):
             other = self.serve.make_plan(self.serve.arguments(
                 ["--model", "/models/target.gguf", "--profile", "tensor-4"] + options))[1]
-            self.assertEqual(other, {**two, **four, **wire})
+            self.assertEqual(other, {key: value for key, value in env.items() if key != "LLAMA_SPEC_COUPLED"})
 
     def test_four_card_tensor_recipe_takes_its_sessions_pool_and_drafter(self):
         base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
@@ -815,22 +829,99 @@ class ServingRecipeTest(unittest.TestCase):
             self.assertEqual((env["LLAMA_GRAPH_SLOTS"], env["GGML_META_CAPTURE_GRAPHS"]), (kept, str(int(kept) + 4)))
         for options in (base + ["--slots", "0"], base + ["--slots", "257"], base + ["--slots", "8", "--context", "7"],
                         base + ["--kept-graphs", "0"], base + ["--kept-graphs", "257"],
-                        ["--model", "/models/target.gguf", "--kept-graphs", "32"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-2", "--kept-graphs", "32"],
                         ["--model", "/models/target.gguf", "--profile", "dp-4", "--kept-graphs", "32"],
                         base + ["--slot-context", "255"], base + ["--slot-context", "524288"],
                         base + ["--context", "294912", "--slot-context", "294912"],
-                        ["--model", "/models/target.gguf", "--slot-context", "262144"],
-                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--slot-context", "262144"],
+                        ["--model", "/models/target.gguf", "--context", "400000", "--slot-context", "400000"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--slot-context", "255"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--context", "294912"],
                         base + ["--dflash", "/models/draft.gguf"], base + ["--dflash-depth", "7"],
                         base + ["--mtp-adaptive", "1.5"],
-                        ["--model", "/models/target.gguf", "--context", "294912"],
-                        ["--model", "/models/target.gguf", "--backend-sampling"],
-                        ["--model", "/models/target.gguf", "--reduction-wire", "q8"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-2", "--backend-sampling"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-2", "--reduction-wire", "q8"],
                         ["--model", "/models/target.gguf", "--profile", "dp-4", "--reduction-wire", "bf16"],
-                        ["--model", "/models/target.gguf", "--dflash", "/models/draft.gguf", "--dflash-depth", "7"],
-                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--mtp-depth", "3"]):
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--reduction-route", "host"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-2", "--latent-cache", "q4_0"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--dflash", "/models/draft.gguf", "--dflash-depth", "7"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-4", "--mtp-depth", "3"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-2", "--mtp-depth", "3"]):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
+
+    def test_two_card_tensor_recipe_sizes_its_sessions_at_300k(self):
+        base = ["--model", "/models/target.gguf"]
+        # the plain recipe: six sessions, a pool of six whole 307,200-token sessions, graphs kept 32 a context
+        argv, env = self.serve.make_plan(self.serve.arguments(base))
+        self.assertEqual((argv[argv.index("-np") + 1], argv[argv.index("-c") + 1]), ("6", "1843200"))
+        self.assertEqual(env["LLAMA_KV_SEQ_CELLS"], "307200")
+        self.assertEqual((env["LLAMA_GRAPH_SLOTS"], env["GGML_META_CAPTURE_GRAPHS"]), ("32", "36"))
+        # another session count keeps the same per-session size and a pool of whole sessions
+        argv, env = self.serve.make_plan(self.serve.arguments(base + ["--slots", "7"]))
+        self.assertEqual((argv[argv.index("-np") + 1], argv[argv.index("-c") + 1]), ("7", "2150400"))
+        self.assertEqual(env["LLAMA_KV_SEQ_CELLS"], "307200")
+        argv, env = self.serve.make_plan(self.serve.arguments(base + ["--slot-context", "262144"]))
+        self.assertEqual(argv[argv.index("-c") + 1], "1572864")
+        self.assertEqual(env["LLAMA_KV_SEQ_CELLS"], "262144")
+        # one session in a pool of its own size takes no limit, and keeps 128 graphs as an unlimited pool does
+        argv, env = self.serve.make_plan(self.serve.arguments(base + ["--slots", "1"]))
+        self.assertEqual(argv[argv.index("-c") + 1], "307200")
+        self.assertNotIn("LLAMA_KV_SEQ_CELLS", env)
+        self.assertEqual(env["LLAMA_GRAPH_SLOTS"], "128")
+        # a pool given without a limit leaves its sessions uncapped, as the four cards' pool does
+        argv, env = self.serve.make_plan(self.serve.arguments(base + ["--context", "524288"]))
+        self.assertEqual((argv[argv.index("-np") + 1], argv[argv.index("-c") + 1]), ("6", "524288"))
+        self.assertNotIn("LLAMA_KV_SEQ_CELLS", env)
+        # the two cards take the four cards' own sizing when it is asked for
+        argv, env = self.serve.make_plan(self.serve.arguments(
+            base + ["--slots", "23", "--context", "3014656", "--slot-context", "262144", "--kept-graphs", "64"]))
+        self.assertEqual((argv[argv.index("-np") + 1], argv[argv.index("-c") + 1]), ("23", "3014656"))
+        self.assertEqual((env["LLAMA_KV_SEQ_CELLS"], env["LLAMA_GRAPH_SLOTS"]), ("262144", "64"))
+        self.assertEqual(env["GGML_META_CAPTURE_GRAPHS"], "68")
+
+    def test_reduction_route_and_latent_cache_are_tensor_choices(self):
+        route = {"GGML_CUDA_AR_LL_MAX_BYTES", "GGML_CUDA_AR_P2P_MAX_BYTES", "GGML_CUDA_AR_COPY_THRESHOLD",
+                 "GGML_CUDA_AR_COPY_PEER", "GGML_CUDA_AR_GATHER_OWNER_SLICES"}
+        # two cards keep the engine's own routes until a pair is read; the host route is a launcher option there
+        env = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))[1]
+        self.assertFalse(route & set(env))
+        env = self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--reduction-route", "host"]))[1]
+        self.assertTrue(route <= set(env))
+        env = self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--reduction-route", "engine"]))[1]
+        self.assertFalse(route & set(env))
+        self.assertEqual(env["GGML_CUDA_AR_WIRE_Q8"], "1")
+        # four cards keep the host route by default and can be read on the engine's routes against it
+        env = self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--profile", "tensor-4", "--reduction-route", "engine"]))[1]
+        self.assertFalse(route & set(env))
+        # the cache the two cards served with before the four-card settings stays one flag away
+        argv = self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--latent-cache", "q8_0"]))[0]
+        self.assertEqual((argv[argv.index("--cache-type-k") + 1], argv[argv.index("--cache-type-v") + 1]),
+                         ("q8_0", "q8_0"))
+
+    def test_two_card_dp_recipe_keeps_each_slots_cache_on_one_owner(self):
+        for slots in (1, 10, 20):
+            with self.subTest(slots=slots):
+                argv, env = self.serve.make_plan(self.serve.arguments(
+                    ["--model", "/models/target.gguf", "--profile", "dp-2", "--slots", str(slots)]))
+                expected = {"-sm": "dp", "-ts": "1,1", "-fit": "off", "-np": str(slots),
+                            "-c": str(slots * 307200), "-b": "2048", "-ub": "512", "--prompt-step": "512",
+                            "--cache-type-k": "q8_0", "--cache-type-v": "q8_0", "-ctki": "q8_0", "-cts": "q8_0",
+                            "-ubd": "512", "-ctkd": "q8_0", "-ctvd": "q8_0"}
+                for flag, value in expected.items():
+                    self.assertEqual(argv[argv.index(flag) + 1], value)
+                self.assertNotIn("--kv-unified", argv)
+                self.assertIn("--backend-sampling", argv)
+                self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
+        # the default is five 300K slots a card; a slot's cells are the same option as a tensor session's limit
+        argv, _ = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-2"]))
+        self.assertEqual((argv[argv.index("-np") + 1], argv[argv.index("-c") + 1]), ("10", "3072000"))
+        argv, _ = self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--profile", "dp-2", "--slots", "8", "--slot-context", "442368"]))
+        self.assertEqual(argv[argv.index("-c") + 1], str(8 * 442368))
 
     def test_prompt_step_ms_is_an_opt_in_and_its_step_is_the_most_a_step_takes(self):
         base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
@@ -874,16 +965,18 @@ class ServingRecipeTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--prompt-step") + 1], "1024")
         self.assertEqual(env["LLAMA_KV_PAD_SHARED"], "65536")
         self.assertEqual((argv[argv.index("--spec-draft-n-max") + 1], argv[argv.index("--spec-draft-n-min") + 1]), ("3", "2"))
-        # the two-card tensor recipe takes the shapes and the low depth; the step is the shared pool's
+        # the two-card tensor recipe takes the shapes, the low depth and the step; the step is the shared pool's
         argv, env = self.serve.make_plan(self.serve.arguments(
-            ["--model", "/models/target.gguf", "--prompt-shapes", "8", "--mtp-depth-min", "2"]))
+            ["--model", "/models/target.gguf", "--prompt-shapes", "8", "--mtp-depth-min", "2",
+             "--session-step", "65536"]))
         self.assertEqual((env["LLAMA_PROMPT_SHAPES"], env["LLAMA_PROMPT_SHAPE_SMALL"]), ("1", "8"))
+        self.assertEqual(env["LLAMA_KV_PAD_SHARED"], "65536")
         self.assertEqual(argv[argv.index("--spec-draft-n-min") + 1], "2")
         for options in (base + ["--prompt-shape-rows", "1024"],
                         base + ["--mtp-depth", "2", "--mtp-depth-min", "3"],
                         base + ["--mtp-depth", "off", "--mtp-depth-min", "1"],
                         base + ["--dflash", "/models/draft.gguf", "--dflash-depth", "7", "--mtp-depth-min", "1"],
-                        ["--model", "/models/target.gguf", "--session-step", "65536"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-2", "--session-step", "65536"],
                         ["--model", "/models/target.gguf", "--profile", "dp-4", "--session-step", "65536"],
                         ["--model", "/models/target.gguf", "--profile", "dp-4", "--prompt-shapes", "8"]):
             with self.subTest(options=options), self.assertRaises(ValueError):
@@ -917,7 +1010,7 @@ class ServingRecipeTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
 
-    def test_four_cards_save_and_restore_beside_the_steps_by_default(self):
+    def test_tensor_recipes_save_and_restore_beside_the_steps_by_default(self):
         base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
         env = self.serve.make_plan(self.serve.arguments(base))[1]
         self.assertEqual((env["LLAMA_STATE_SAVE_ASYNC"], env["LLAMA_STATE_RESTORE_ASYNC"]), ("1", "1"))
@@ -931,15 +1024,22 @@ class ServingRecipeTest(unittest.TestCase):
         env = self.serve.make_plan(self.serve.arguments(base + ["--restore-sync"]))[1]
         self.assertNotIn("LLAMA_STATE_RESTORE_ASYNC", env)
         self.assertEqual(env["LLAMA_STATE_SAVE_ASYNC"], "1")
-        # the two-card recipe stays opt-in
+        # the two-card recipe defaults the same way, with the same off switches
         env = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))[1]
+        self.assertEqual((env["LLAMA_STATE_SAVE_ASYNC"], env["LLAMA_STATE_RESTORE_ASYNC"]), ("1", "1"))
+        env = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--save-sync"]))[1]
+        self.assertNotIn("LLAMA_STATE_SAVE_ASYNC", env)
+        self.assertEqual(env["LLAMA_STATE_RESTORE_ASYNC"], "1")
+        # the DP recipes keep them opt-in
+        env = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-2"]))[1]
         self.assertNotIn("LLAMA_STATE_SAVE_ASYNC", env)
         self.assertNotIn("LLAMA_STATE_RESTORE_ASYNC", env)
-        env = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--save-async"]))[1]
+        env = self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--profile", "dp-2", "--save-async"]))[1]
         self.assertEqual(env["LLAMA_STATE_SAVE_ASYNC"], "1")
-        self.assertNotIn("LLAMA_STATE_RESTORE_ASYNC", env)
         for options in (base + ["--save-sync", "--save-async"], base + ["--restore-sync", "--restore-async"],
-                        ["--model", "/models/target.gguf", "--save-sync"],
+                        ["--model", "/models/target.gguf", "--save-sync", "--save-async"],
+                        ["--model", "/models/target.gguf", "--profile", "dp-2", "--save-sync"],
                         ["--model", "/models/target.gguf", "--profile", "dp-4", "--restore-sync"]):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
@@ -963,7 +1063,7 @@ class ServingRecipeTest(unittest.TestCase):
                 self.serve.make_plan(self.serve.arguments(options))
 
     def test_state_copy_legacy_is_the_off_switch_of_the_batched_state_copies(self):
-        for profile in ("tensor-2", "tensor-4", "dp-4"):
+        for profile in ("tensor-2", "tensor-4", "dp-2", "dp-4"):
             base = ["--model", "/models/target.gguf", "--profile", profile]
             with self.subTest(profile=profile):
                 self.assertNotIn("GGML_TENSOR_N_STAGE_LEGACY", self.serve.make_plan(self.serve.arguments(base))[1])
@@ -992,12 +1092,15 @@ class ServingRecipeTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaisesRegex(ValueError, "fixed-rows"):
                 self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"] + options))
 
-    def test_dp_slot_defaults_and_bounds_do_not_change_tensor_capacity(self):
-        args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"])
-        argv, _ = self.serve.make_plan(args)
-        self.assertEqual(argv[argv.index("-np") + 1], "36")
-        for options in (["--slots", "4"], ["--profile", "dp-4", "--slots", "0"],
-                        ["--profile", "dp-4", "--slots", "41"]):
+    def test_slot_defaults_and_bounds_follow_the_profile(self):
+        for options, expected in ((["--profile", "dp-4"], "36"), (["--profile", "dp-2"], "10"),
+                                  (["--profile", "tensor-4"], "23"), (["--profile", "tensor-2"], "6"),
+                                  (["--slots", "4"], "4")):
+            with self.subTest(options=options):
+                argv, _ = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf", *options]))
+                self.assertEqual(argv[argv.index("-np") + 1], expected)
+        for options in (["--slots", "0"], ["--profile", "dp-2", "--slots", "21"],
+                        ["--profile", "dp-4", "--slots", "0"], ["--profile", "dp-4", "--slots", "41"]):
             with self.subTest(options=options):
                 args = self.serve.arguments(["--model", "/models/target.gguf", *options])
                 with self.assertRaisesRegex(ValueError, "slots"):
@@ -1194,6 +1297,23 @@ class CapacityTest(unittest.TestCase):
         limited = self.estimate(36, self.lower, 40, self.upper, host_kv=True, host_budget_mib=50000)
         self.assertEqual(limited['estimated_max']['slots'], 18)
         self.assertEqual(limited['estimated_max']['slots_per_card'], [5, 5, 4, 4])
+
+    def test_two_card_calibration_estimates_over_two_devices(self):
+        lower = [dict(device=d, used_mib=used, free_mib=97887 - used) for d, used in enumerate([70000, 69500])]
+        upper = [dict(device=d, used_mib=used, free_mib=97887 - used) for d, used in enumerate([76800, 76300])]
+        resident = self.estimate(8, lower, 12, upper, devices=2, slot_cells=307200)
+        self.assertEqual(resident['devices'], 2)
+        self.assertEqual(resident['slot_cells'], 307200)
+        self.assertAlmostEqual(resident['cache_mib_per_slot'], 3346.875)
+        self.assertEqual(resident['estimated_max']['slots'], 20)
+        self.assertEqual(resident['estimated_max']['slots_per_card'], [10, 10])
+        self.assertFalse(resident['capacity_qualified'])
+        for call in (lambda: self.estimate(8, lower, 12, upper, devices=3, slot_cells=307200),
+                     lambda: self.estimate(8, self.lower, 12, self.upper, devices=2),
+                     lambda: self.estimate(8, lower, 12, upper, devices=2, slot_cells=255),
+                     lambda: self.estimate(7, lower, 12, upper, devices=2)):
+            with self.assertRaises(ValueError):
+                call()
 
     def test_bad_calibration_cannot_produce_a_capacity_claim(self):
         for field, value in [('peak_extra_mib', float('nan')), ('reserve_mib', float('inf')),
