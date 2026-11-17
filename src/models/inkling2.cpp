@@ -164,7 +164,7 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
 }
 
 ggml_tensor * llama_model_inkling2::graph::convolve(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * dynamic,
-        ggml_tensor * state, ggml_tensor * history, llm_graph_input_rs * inp, int64_t offset) {
+        ggml_tensor * history, int64_t offset, std::vector<ggml_tensor *> & windows) {
     const int64_t kernel = hparams.n_shortconv_l_cache;
     const int64_t channels = cur->ne[0];
     const int64_t nt = ubatch.n_seq_tokens;
@@ -172,14 +172,16 @@ ggml_tensor * llama_model_inkling2::graph::convolve(ggml_tensor * cur, ggml_tens
     auto * past = ggml_view_3d(ctx0, history, kernel - 1, channels, ns, history->nb[1], history->nb[2], offset*history->nb[1]);
     auto * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, channels, nt, ns));
     x = ggml_concat(ctx0, past, x, 0);
-    build_conv_state_store(inp, state, x, kernel - 1, offset*(kernel - 1)*ggml_element_size(state));
+    windows.push_back(x);
     auto * out = ggml_ssm_conv(ctx0, x, weight);
     out = ggml_reshape_2d(ctx0, out, channels, n_tokens);
     if (dynamic) {
         const int64_t heads = dynamic->ne[0]/kernel;
-        dynamic = ggml_reshape_3d(ctx0, dynamic, kernel, heads, n_tokens);
+        // the lags outermost: a lag's taps are one run, at an offset -sm tensor scales as each device's heads are split
+        // (an offset inside a head's taps, which the split axis holds, would be scaled with them)
+        dynamic = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, dynamic, kernel, heads, n_tokens), 2, 0, 1, 3));
         for (int64_t lag = 0; lag < kernel; ++lag) {
-            auto * tap = ggml_view_3d(ctx0, dynamic, 1, heads, n_tokens, dynamic->nb[1], dynamic->nb[2], lag*dynamic->nb[0]);
+            auto * tap = ggml_view_3d(ctx0, dynamic, 1, heads, n_tokens, dynamic->nb[0], dynamic->nb[1], lag*dynamic->nb[2]);
             auto * window = ggml_view_3d(ctx0, x, nt, channels, ns, x->nb[1], x->nb[2], (kernel - 1 - lag)*x->nb[0]);
             window = ggml_cont(ctx0, ggml_transpose(ctx0, window));
             window = ggml_reshape_3d(ctx0, window, channels/heads, heads, n_tokens);
@@ -188,6 +190,24 @@ ggml_tensor * llama_model_inkling2::graph::convolve(ggml_tensor * cur, ggml_tens
         }
     }
     return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*kernel + 1));
+}
+
+// -sm tensor: a hidden stream comes out of its reduction whole on every device, while the kernel and the state of its
+// convolution are split by channel (llama_meta_device_get_split_state). Each device convolves its own channels, which
+// a scatter gives it with the channels outermost so that they are one run of the tensor, and the result is gathered.
+ggml_tensor * llama_model_inkling2::graph::convolve_hidden(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * history,
+        int64_t offset, std::vector<ggml_tensor *> & windows) {
+    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+        return convolve(cur, weight, nullptr, history, offset, windows);
+    }
+    auto ud = model.get_split_state_ud;
+    const ggml_backend_meta_split_state split = llama_meta_device_get_split_state(weight, &ud);
+    GGML_ASSERT(split.axis == GGML_BACKEND_SPLIT_AXIS_1 && split.n_segments == 1);
+    const int64_t channels = cur->ne[0];
+    auto * x = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, cur, channels, ubatch.n_seq_tokens, ubatch.n_seqs), 2, 0, 1, 3));
+    x = ggml_backend_meta_scatter(ctx0, x, 2, split.ne, ud.n_devices);
+    x = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 2, 0, 3)), channels, n_tokens);
+    return ggml_backend_meta_gather(ctx0, convolve(x, weight, nullptr, history, offset, windows));
 }
 
 llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
@@ -243,10 +263,12 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             inputs[2] = build_norm(inputs[2], l.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
         }
         auto * q = build_lora_mm(l.wq, inputs[0]);
+        // the windows of the state's streams, K, V and the two hidden streams, in the order of the state's channels
+        std::vector<ggml_tensor *> windows;
         auto * k = convolve(build_lora_mm(l.wk, inputs[1]), l.attn_k_conv,
-                swa ? nullptr : build_lora_mm(l.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
+                swa ? nullptr : build_lora_mm(l.attn_k_conv_proj, inputs[1]), history, 0, windows);
         auto * v = convolve(build_lora_mm(l.wv, inputs[2]), l.attn_v_conv,
-                swa ? nullptr : build_lora_mm(l.attn_v_conv_proj, inputs[2]), state, history, recr, kv);
+                swa ? nullptr : build_lora_mm(l.attn_v_conv_proj, inputs[2]), history, kv, windows);
         auto * r = build_lora_mm(l.attn_rel, inputs[0]);
         q = clip(ggml_reshape_3d(ctx0, q, hd, nh, n_tokens), l.attn_q_clip, hparams.f_qk_clip);
         k = clip(ggml_reshape_3d(ctx0, k, hd, nk, n_tokens), nullptr, hparams.f_qk_clip);
@@ -275,7 +297,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         ggml_tensor * fa_mask = nullptr;
         if (cparams.flash_attn) {
             fa_mask = ggml_cast(ctx0, ggml_add(ctx0, bias, ggml_cast(ctx0, mask, GGML_TYPE_F32)), GGML_TYPE_F16);
-            sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
+            // zero sinks of this device's heads: the projection's first row is split as the heads are
+            sinks = ggml_fill(ctx0, ggml_view_1d(ctx0, sinks, nh, 0), 0.0f);
             bias = nullptr;
         } else {
             sinks = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0,
@@ -283,7 +306,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         }
         cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, bias, sinks, nullptr, 1.0f/sqrtf(hd), il, fa_mask);
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(l.wqkv_gate, inputs[0])));
-        cur = convolve(build_lora_mm(l.wo, cur), l.attn_post_conv, nullptr, state, history, recr, 2*kv);
+        cur = convolve_hidden(build_lora_mm(l.wo, cur), l.attn_post_conv, history, 2*kv, windows);
         if (il % hparams.attn_res_block_size == 0) {
             blocks.push_back(residual);
         } else {
@@ -295,7 +318,14 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cur = build_moe_ffn(cur, l.ffn_gate_inp, nullptr, nullptr, l.ffn_down_exps, l.ffn_exp_probs_b,
                 hparams.n_expert, hparams.n_expert_used(il), LLM_FFN_SITU, true, hparams.expert_weights_scale,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, nullptr, l.ffn_gate_up_exps);
-        cur = convolve(cur, l.ffn_post_conv, nullptr, state, history, recr, 2*kv + n_embd);
+        cur = convolve_hidden(cur, l.ffn_post_conv, history, 2*kv + n_embd, windows);
+        // the layer's new state in one store of its whole row: under -sm tensor the row is split by the KV heads in four
+        // segments, one a stream, and each device's windows are its part of every segment in the same order
+        auto * window = windows[0];
+        for (size_t i = 1; i < windows.size(); ++i) {
+            window = ggml_concat(ctx0, window, windows[i], 1);
+        }
+        build_conv_state_store(recr, state, window, hparams.n_shortconv_l_cache - 1, 0);
         cur = ggml_add(ctx0, residual, cur);
         cb(cur, "l_out", il);
     }
@@ -309,6 +339,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     ggml_prec_set_acc(cur, GGML_PREC_F32);
     const float cap = hparams.f_final_logit_softcapping;
     cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        // -sm tensor splits the padded vocabulary, which the slice below cuts in no ratio of the split: slice it whole
+        cur = ggml_backend_meta_gather(ctx0, cur);
+    }
     cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
     res->t_logits = cur;
     cb(cur, "result_output", -1);

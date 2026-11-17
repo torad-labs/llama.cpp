@@ -10849,10 +10849,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return op->src[0]->ne[0] == 16 && op->src[0]->ne[1] == 1 && op->src[0]->ne[2] % 128 == 0 && op->src[4]->ne[1] == 1;
             }
         }
-        case GGML_OP_SSM_CONV: {
-            // assumes d_inner % threads == 0
-            return op->src[0]->ne[1] % 128 == 0;
-        }
+        case GGML_OP_SSM_CONV:
+            return true; // any d_inner: a block of channels the last 128 do not fill is bounded
         case GGML_OP_CONT:
             return true;
         case GGML_OP_SOFT_MAX:

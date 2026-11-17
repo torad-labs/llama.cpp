@@ -7,7 +7,7 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
                                     const float * bias_ptr,
                                     const int src0_nb0, const int src0_nb1, const int src0_nb2, const int src1_nb1,
                                     float * dst_ptr, const int dst_nb0, const int dst_nb1, const int dst_nb2,
-                                    const int64_t n_t) {
+                                    const int64_t n_t, const int64_t nr) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
@@ -30,6 +30,9 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
     float w[d_conv] = { 0.0f };
 
     ggml_cuda_pdl_sync();
+    if ((int64_t) bidy * split_d_inner + tid >= nr) {
+        return; // past the last channel of a block the channels do not fill (a rank's share under a tensor split)
+    }
 #pragma unroll
     for (size_t j = 0; j < d_conv; j++) {
         w[j] = w_block[tid * stride_w + j];
@@ -62,7 +65,8 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
                                                const float * __restrict__ bias,
                                                const int src0_nb0, const int src0_nb1, const int src0_nb2,
                                                const int src1_nb1, float * __restrict__ dst, const int dst_nb0,
-                                               const int dst_nb1, const int dst_nb2, const int64_t n_t) {
+                                               const int dst_nb1, const int dst_nb2, const int64_t n_t,
+                                               const int64_t nr) {
     const int tid  = threadIdx.x;
     const int bidx = blockIdx.x;
     const int bidy = blockIdx.y;
@@ -80,6 +84,7 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 
     const int64_t local_n_t = min(split_n_t, n_t - bidz * split_n_t);
     const int     n_cols    = d_conv - 1 + split_n_t;
+    const int     n_rows    = (int) min((int64_t) split_d_inner, nr - bidy * (int64_t) split_d_inner); // the block's channels
 
     extern __shared__ float smem[];
 
@@ -89,7 +94,7 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     int col = tid % load_cols;
 #pragma unroll
     for (int idx = 0; idx < total_elems; idx += split_d_inner) {
-        if (row < (int)split_d_inner) {
+        if (row < n_rows) {
             smem[row * n_cols + col] = x_block[row * stride_x + col];
         }
 
@@ -101,6 +106,9 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
         }
     }
     __syncthreads();
+    if (tid >= n_rows) {
+        return;
+    }
 
     // Load weights into registers (done once, small)
     float w[d_conv] = { 0.0f };
@@ -525,8 +533,7 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
                               const int64_t n_s, cudaStream_t stream) {
-    const int threads = 128;
-    GGML_ASSERT(nr % threads == 0);
+    const int threads = 128; // a block's channels; the last block may hold fewer
 
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
@@ -534,13 +541,13 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
-                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t, nr);
         } else {
             const int64_t split_n_t = 32;
             dim3          blocks(n_s, (nr + threads - 1) / threads, (n_t + split_n_t - 1) / split_n_t);
             const size_t  smem_size = threads * (kNC - 1 + split_n_t) * sizeof(float);
             ssm_conv_long_token_f32<apply_silu, threads, kNC, split_n_t><<<blocks, threads, smem_size, stream>>>(
-                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t, nr);
         }
     };
 

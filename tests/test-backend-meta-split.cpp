@@ -11,6 +11,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "test-backend-meta-split-inkling.h"
 
 #include <algorithm>
 #include <array>
@@ -1620,6 +1621,7 @@ int main(int argc, char ** argv) {
     for (int64_t n_tokens : {1, 3}) { ok = test_tensor_mode(gpu, 0, n_tokens) && ok; }
     ok = test_tensor_mode(gpu, 1, 8) && ok;
     ok = test_steps_kept(gpu, false, false) && test_steps_kept(gpu, true, false) && ok;
+    ok = test_inkling_split_decisions(gpu) && ok;
 
     printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

@@ -311,6 +311,9 @@ public:
     std::vector<ggml_tensor *> get_k_rot() const;
     std::vector<ggml_tensor *> get_v_rot() const;
 
+    // the cache tensors and their buffers
+    const llama_memory_bufs & get_bufs() const { return ctxs_bufs; }
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 

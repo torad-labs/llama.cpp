@@ -267,7 +267,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
 endif()
 
-llama_build(test-llama-archs.cpp)
+llama_build(test-llama-archs.cpp llama-archs-gguf.cpp test-llama-archs-inkling.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
@@ -305,6 +305,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # a 16-thread host. In a suite at -j 6 on that host at load 45 to 50 the first passed ctest's default 1,500 s and the
     # second took 1,363 s: slow, not hung. An hour holds that six times over
     set_tests_properties(test-llama-archs test-glm5next PROPERTIES TIMEOUT 3600)
+    if (GGML_CUDA)
+        # Inkling 2 under a two-rank tensor split on the first GPU against that GPU alone, sequence state included
+        foreach(inkling_case prefill decode chunks seq-cp state rollback)
+            llama_test(test-llama-archs NAME test-inkling2-split-${inkling_case}
+                ARGS --inkling-split ${inkling_case} --inkling-split-device CUDA0,CUDA0 -s 1234)
+        endforeach()
+    endif()
     llama_build_and_test(test-speculative-mtp.cpp)
     llama_test(test-speculative-mtp NAME test-speculative-mtp-dp-cpu ARGS --dp-device CPU)
 
@@ -628,7 +635,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     endif()
     llama_build_and_test(test-cuda-gdn-dp-store.cpp)
     llama_build_and_test(test-backend-meta-views.cpp)
-    llama_build_and_test(test-backend-meta-split.cpp)
+    # with the split decisions of Inkling 2, which load a model with no data over the meta backend
+    llama_build_and_test(test-backend-meta-split.cpp test-backend-meta-split-inkling.cpp llama-archs-gguf.cpp)
+    target_include_directories(test-backend-meta-split PRIVATE ${PROJECT_SOURCE_DIR}/src)
     if (GGML_CUDA)
         llama_test(test-backend-meta-split NAME test-backend-meta-permuted-read ARGS --permuted-read)
     endif()

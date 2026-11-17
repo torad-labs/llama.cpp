@@ -492,13 +492,57 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return split;
     }
 
+    // inkling2: the tensors with no standard analog (llama_model_inkling2::load_arch_tensors)
+    static const std::regex pattern_ink_rel         ("blk\\.\\d*\\.attn_rel\\.weight");
+    static const std::regex pattern_ink_head        ("blk\\.\\d*\\.attn_(q_clip|rel_clip|sink_proj)\\.weight");
+    static const std::regex pattern_ink_kv_conv     ("blk\\.\\d*\\.attn_(k|v)_conv\\.weight");
+    static const std::regex pattern_ink_kv_conv_proj("blk\\.\\d*\\.attn_(k|v)_conv_proj\\.weight");
+    static const std::regex pattern_ink_hidden_conv ("blk\\.\\d*\\.(attn|ffn)_post_conv\\.weight");
+    static const std::regex pattern_ink_mirrored    ("blk\\.\\d*\\.(attn_rel_bias|attn_norm|attn_(q|k|v)_inp_norm|attn_res_query|"
+            "ffn_res_query|ffn_norm|ffn_gate_inp)\\.weight|blk\\.\\d*\\.exp_probs_b\\.bias|"
+            "(token_embd|token_embd_norm|output_norm|output_res_query)\\.weight|"
+            // the scales the loader adds for every architecture: one value a tensor, or one an expert
+            "blk\\.\\d*\\.[a-z_]+\\.(scale|input_scale|k_scale|v_scale)");
+    static const std::regex pattern_ink_standard    ("blk\\.\\d*\\.(attn_(q|k|v|output|gate)|ffn_gate_up_exps|ffn_down_exps)\\.weight|"
+            "output\\.weight");
+    static const std::regex pattern_r_cache         ("cache_r_l\\d*");
+
+    const bool is_inkling2 = ud->model->arch == LLM_ARCH_INKLING2;
+    if (is_inkling2 && (std::regex_match(tensor_name, pattern_ink_hidden_conv) || std::regex_match(tensor_name, pattern_r_cache))) {
+        // Each layer's convolution state holds the last positions of four streams one after the other: K, V, and the
+        // two hidden streams (the attention output and the experts' sum, after their reductions). K and V split by the
+        // layer's KV heads, as attn_k does. The hidden streams split by channel in the same ratio, n_embd/n_head_kv
+        // channels a KV head: the graph's views and stores into the state scale their offsets by one ratio for all
+        // four, and the hidden kernels split as the state they read.
+        const bool cache = tensor_name.rfind("cache_", 0) == 0;
+        const uint32_t il = std::stoul(cache ? tensor_name.substr(tensor_name.find("_l", 6) + 2) : tensor_name.substr(4));
+        const ggml_tensor * k = ud->model->get_tensor(("blk." + std::to_string(il) + ".attn_k.weight").c_str());
+        GGML_ASSERT(k != nullptr);
+        const ggml_backend_meta_split_state heads = llama_meta_device_get_split_state(k, userdata);
+        GGML_ASSERT(heads.axis == GGML_BACKEND_SPLIT_AXIS_1 && heads.n_segments == 1 && heads.nr[0] == 1);
+        const int64_t head_dim = hparams.n_embd_head_k(il);
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        GGML_ASSERT(hparams.n_embd % n_head_kv == 0);
+        const int64_t channels_per_head[4] = {head_dim, head_dim, hparams.n_embd / n_head_kv, hparams.n_embd / n_head_kv};
+        const int64_t n_cols = cache ? hparams.n_shortconv_l_cache - 1 : 1;
+        GGML_ASSERT(!cache || tensor->ne[0] == n_cols*(2*n_head_kv*head_dim + 2*int64_t(hparams.n_embd)));
+        ggml_backend_meta_split_state split = {cache ? GGML_BACKEND_SPLIT_AXIS_0 : GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        split.n_segments = cache ? 4 : 1;
+        for (size_t s = 0; s < split.n_segments; ++s) {
+            split.nr[s] = 1;
+            for (size_t j = 0; j < ud->n_devices; ++j) {
+                split.ne[s*ud->n_devices + j] = n_cols * (heads.ne[j] / head_dim) * channels_per_head[cache ? s : 2];
+            }
+        }
+        return split;
+    }
+
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
     static const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
     static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
     static const std::regex pattern_ssm_beta_alpha_cat("blk\\.\\d*\\.ssm_beta_alpha.weight");
-    static const std::regex pattern_r_cache         ("cache_r_l\\d*");
     static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
@@ -578,6 +622,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // the MTP store of the target's hidden rows (llama_set_nextn_source): a whole copy on every card, as the rows are
         if (tensor_name == "mtp_h_store") {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        if (is_inkling2 && std::regex_match(tensor_name, pattern_s_cache)) {
+            // the recurrent memory's S state, which Inkling has none of: an empty tensor
+            GGML_ASSERT(ggml_nelements(tensor) == 0);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        if (is_inkling2 && tensor_name.rfind("cache_", 0) != 0 && !std::regex_match(tensor_name, pattern_ink_standard)) {
+            // Every inkling2 weight has its decision here or takes the standard table's (pattern_ink_standard: q, k, v,
+            // the output projection and gate, the experts and the output head); the K and V caches take the table's
+            // split by KV heads. The relative projection, the per-head clip scales and the sink projection have one
+            // value or vector a query head and follow the query heads, the K and V kernels and their dynamic taps
+            // follow the KV heads. The relative bias table is shared by all heads, and the norms, the depth-mixing
+            // queries and the router read the whole hidden state.
+            if (std::regex_match(tensor_name, pattern_ink_rel) || std::regex_match(tensor_name, pattern_ink_head) ||
+                    std::regex_match(tensor_name, pattern_ink_kv_conv) || std::regex_match(tensor_name, pattern_ink_kv_conv_proj)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ink_mirrored)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            GGML_ABORT("inkling2: no tensor split decision for %s", tensor_name.c_str());
         }
         if (ud->model->arch == LLM_ARCH_HRM_TEXT || ud->model->arch == LLM_ARCH_METIS16) {
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
@@ -997,6 +1062,22 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
             const int64_t granularity_q    = std::lcm(n_embd_q, blck_size_perf);
             const int64_t granularity_head = granularity_q / hparams.n_embd_head_k(il); // for tensors with one value per head
+            if (is_inkling2) {
+                GGML_ASSERT(segments.size() == 1);
+                const int64_t granularity_kv_heads = granularity_head / n_gqa;
+                if (std::regex_match(tensor_name, pattern_ink_rel)) {
+                    return {granularity_head * hparams.n_relative};
+                }
+                if (std::regex_match(tensor_name, pattern_ink_head)) {
+                    return {granularity_head};
+                }
+                if (std::regex_match(tensor_name, pattern_ink_kv_conv)) {
+                    return {granularity_kv_heads * hparams.n_embd_head_k(il)};
+                }
+                if (std::regex_match(tensor_name, pattern_ink_kv_conv_proj)) {
+                    return {granularity_kv_heads * hparams.n_shortconv_l_cache};
+                }
+            }
             if (std::regex_match(tensor_name, pattern_attn_gate_bias)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_head};
