@@ -195,7 +195,7 @@ blocked_by = []
 guard = false
 spec = 'Through the server and its chat tests, Inkling 2 handles text turns and system prompts, every reasoning effort level with an invalid one refused as a client error, tool declarations, tool calls with nested arguments and their results, thinking content kept across turns, and image parts before, between and after text. Sampling never emits an id at or above the unpadded vocabulary, and generation ends at the model end token. Server-level cases carry inkling in their test names.'
 checks = [
-  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && (cd tools/server/tests && (test -x /tmp/inkling-server-tests-venv/bin/pytest || (python3 -m venv /tmp/inkling-server-tests-venv && /tmp/inkling-server-tests-venv/bin/pip install -q -r requirements.txt)) && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 /tmp/inkling-server-tests-venv/bin/pytest unit -k inkling -q)',
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && cmake --build build-campaign -j --target llama-server test-llama-archs && (cd tools/server/tests && (test -x /tmp/inkling-server-tests-venv/bin/pytest || (python3 -m venv /tmp/inkling-server-tests-venv && /tmp/inkling-server-tests-venv/bin/pip install -q -r requirements.txt)) && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 LLAMA_SERVER_BIN_PATH=$PWD/../../../build-campaign/bin/llama-server /tmp/inkling-server-tests-venv/bin/pytest unit -k inkling -q)',
   'sh .campaign/cases/check.sh inkling-server-parity-chat',
 ]
 reviews = [
@@ -206,6 +206,7 @@ notes = [
   '2026-11-17 04:22 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 04:22 CT llamacpp-issues: The behaviors under qualification are listed in docs/torad/research/inkling-2-small/01-model-facts.md (sampling defaults, reasoning effort levels, the template raising on an unknown level) and Phase 3 of 07-implementation-plan.md. Upstream a946eb541 already answers a rejected reasoning_effort with a 400; what is ours to prove is this fork server end to end. The synthetic inkling2 GGUF written by test-llama-archs -o is the model for server-level cases.',
   '2026-11-17 04:23 CT llamacpp-issues: The check provisions /tmp/inkling-server-tests-venv from tools/server/tests/requirements.txt on first run: the system python cannot collect these tests (no filelock), and earlier sessions ran them from just such a venv. Server-level cases can use the same venv.',
+  '2026-11-17 05:42 CT llamacpp-issues: Lead: the round-1 dispute against this check is right. It ran pytest without building the server or setting LLAMA_SERVER_BIN_PATH, so in the feature worktree the harness fell back to build/bin and every test errored before running, while with the variable set the tests and all 20 cases pass. The check now builds llama-server and test-llama-archs into build-campaign and exports LLAMA_SERVER_BIN_PATH at it, as the state check and the item cases already did. The spec and the cases are unchanged.',
 ]
 
 [[row]]
