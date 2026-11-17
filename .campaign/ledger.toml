@@ -20,7 +20,7 @@ goal = 'Inkling 2 runs split across devices with the same results as on one devi
 id = 'inkling-baseline-merge'
 title = 'Upstream master is merged and the tree builds'
 feature = 'inkling-baseline'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -37,13 +37,14 @@ reviews = [
 notes = [
   '2026-11-16 23:53 CT: added; 2 of 2 checks fail, as they should before the work',
   '2026-11-16 23:53 CT llamacpp-issues: Dry run on 2026-11-16, merging d3c3e242c into 3d9eea147 in a temp worktree (removed after): 33 conflicted paths. Ten are .github/workflows files this fork deleted and upstream edited; keep them deleted. The 23 content conflicts sit mainly in the CUDA flash-attention files, the graph builder, the KV cache, the model loader and the server. Background: docs/torad/research/inkling-2-small/03-upstream-llama-port.md and 04-fork-gap-analysis.md.',
+  '2026-11-17 04:14 CT campaign: done in round 2 of inkling-baseline: its checks, its feature review, its code review passed',
 ]
 
 [[row]]
 id = 'inkling-baseline-glm'
 title = 'GLM 5.3 serving behavior is unchanged by the merge'
 feature = 'inkling-baseline'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = [
   'inkling-baseline-merge',
@@ -61,13 +62,14 @@ reviews = [
 ]
 notes = [
   '2026-11-16 23:53 CT: added; 2 of 2 checks fail, as they should before the work',
+  '2026-11-17 04:14 CT campaign: done in round 1 of inkling-baseline: its checks, its feature review, its code review passed',
 ]
 
 [[row]]
 id = 'inkling-baseline-arch'
 title = 'Inkling 2 runs in this tree'
 feature = 'inkling-baseline'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = [
   'inkling-baseline-merge',
@@ -86,13 +88,14 @@ reviews = [
 notes = [
   '2026-11-16 23:53 CT: added; 2 of 2 checks fail, as they should before the work',
   '2026-11-16 23:53 CT llamacpp-issues: Python FP8 conversion tests are not a check in this feature: torch is not installed for the system python3, and conversion gets its own gate in the later packs work. GPU test runs hold /run/user/1000/gpu1.lock on card 1; card 0 serves another seat and stays untouched.',
+  '2026-11-17 04:14 CT campaign: done in round 1 of inkling-baseline: its checks, its feature review, its code review passed',
 ]
 
 [[row]]
 id = 'inkling-baseline-record'
 title = 'The merge is recorded in TORAD.md'
 feature = 'inkling-baseline'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = [
   'inkling-baseline-merge',
@@ -108,6 +111,7 @@ reviews = [
 ]
 notes = [
   '2026-11-16 23:53 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 04:14 CT campaign: done in round 2 of inkling-baseline: its checks, its feature review passed',
 ]
 
 [[row]]
