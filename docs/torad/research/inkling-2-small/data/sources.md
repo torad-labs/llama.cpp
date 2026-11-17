@@ -17,6 +17,20 @@ Vendor benchmark numbers were recorded as claims, never as measurements of this 
   Block attention residuals, L2 clipping, sinks, gated output, dynamic short
   convolutions, vision encoder description, generational comparison.
 
+## Selected derivative
+
+- Hugging Face repository for `benthecarman/Inkling-2-Small-abliterated`, checked at
+  revision `e4853745aa9cb4587e8959d3c80b92e1bef99a4a` on 2026-11-16:
+  https://huggingface.co/benthecarman/Inkling-2-Small-abliterated
+  The README, `config.json`, `trial.json`, repository API record and file listing were
+  trusted for the derivative's identity, format, architecture, storage and included files.
+  Its evaluation table is author-reported and was recorded as a claim, not an independent
+  measurement.
+- Hugging Face model search for `Inkling-2-Small-abliterated`, accessed 2026-11-16:
+  https://huggingface.co/api/models?search=Inkling-2-Small-abliterated&full=false&limit=100
+  Trusted only for the narrower finding that no same-name GGUF repository appeared in that
+  search when checked; the source repository was the only result.
+
 ## Framework implementations
 
 - Upstream llama.cpp commit `5c008e00085f4d3e394f9a1be649284999de1326` (PR #32217) and

@@ -71,10 +71,12 @@ buys pool tokens at the per-card rates above.
 | UD-Q3_K_XL | about 20 GiB | 2.65M | 4.99M | 9.41M |
 | UD-Q4_K_XL | about 4 GiB | 0.54M | 1.01M | 1.91M |
 
-Read against a 262,144-token session limit, the recommended UD-Q3_K_XL pack holds about
-ten simultaneously full sessions at F16 KV or about nineteen at Q8_0 KV, with 23 sessions
-reserved against the shared pool in the GLM Tensor 4 pattern. UD-Q4_K_XL is a quality
-experiment for shorter work, not a default. A single 1M-token session is possible only by
+Read against a 262,144-token session limit, a locally produced abliterated pack in the
+UD-Q3_K_XL size class holds about ten simultaneously full sessions at F16 KV or about
+nineteen at Q8_0 KV, with 23 sessions reserved against the shared pool in the GLM Tensor 4
+pattern. The Unsloth names in the table supply stock-model size brackets until the local
+abliterated artifacts exist. A Q4-class pack is a quality experiment for shorter work, not
+a default. A single 1M-token session is possible only by
 sizing the whole pool for it and giving up concurrent depth, which contradicts the serving
 goal; vLLM reaches the same conclusion on larger cards and caps tensor parallel 4 at
 262K per request.
@@ -120,17 +122,23 @@ carry over.
 A new `scripts/inkling2/serve.py` by analogy with `scripts/glm53/serve.py`, with dry-run
 plans pinned in its own qualification tests.
 
-- `tensor-4` (default target): UD-Q3_K_XL plus `mmproj-F16.gguf`; `-sm tensor` with equal
-  splits; flash attention on; F16 KV until the Q8_0 leg reads clean; 23 reserved slots;
-  slot context 262,144; pool starting at 2,359,296 tokens (nine full sessions) until the
-  load leg justifies more; unified KV; prompt cache RAM 32,768 MiB; batching, prompt step
-  and prompt chunk starting at the GLM values of 2,048, 1,024 and 128 as first reads, not
-  conclusions; reduction wire BF16 until its quality leg; sampling defaults at temperature
-  1.0, top-p 1.0, top-k 0, min-p 0; reasoning effort left to the template default of high.
-- `tensor-4-capacity`: UD-IQ3_XXS with Q8_0 KV and a larger pool, for when session depth
-  matters more than the last quality points.
-- `tensor-4-quality`: UD-Q4_K_XL with a small pool, kept only if the load leg shows real
-  free memory and a quality leg shows it buying something.
+- `tensor-4` (default target): a locally converted Q3-class pack from the pinned
+  `benthecarman/Inkling-2-Small-abliterated` revision, plus the F16 mmproj converted from
+  the same source; `-sm tensor` with equal splits; flash attention on; F16 KV until the
+  Q8_0 leg reads clean; 23 reserved slots; slot context 262,144; pool starting at
+  2,359,296 tokens (nine full sessions) until the load leg justifies more; unified KV;
+  prompt cache RAM 32,768 MiB; batching, prompt step and prompt chunk starting at the GLM
+  values of 2,048, 1,024 and 128 as first reads, not conclusions; reduction wire BF16 until
+  its quality leg; sampling defaults at temperature 1.0, top-p 1.0, top-k 0, min-p 0;
+  reasoning effort left to the template default of high.
+- `tensor-4-capacity`: a locally converted IQ3-class abliterated pack with Q8_0 KV and a
+  larger pool, for when session depth matters more than the last quality points.
+- `tensor-4-quality`: a locally converted Q4-class abliterated pack with a small pool,
+  kept only if the load leg shows real free memory and a quality leg shows it buying
+  something.
+
+No profile points at a stock Unsloth pack. Stock files are bring-up and comparison inputs
+only, as [09-abliterated-target.md](09-abliterated-target.md) records.
 
 Settings that do not carry from the GLM launcher: q4_0 latent and q8_0 indexer cache
 types, every indexer and MTP environment switch, the coupled-draft flags, and the 8-bit

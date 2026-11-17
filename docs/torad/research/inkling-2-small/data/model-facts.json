@@ -88,6 +88,29 @@
     "mixed_nvfp4_repository": 393480084520,
     "mxfp8_repository": 622803514224
   },
+  "selected_target": {
+    "kind": "abliterated_derivative",
+    "repository": "benthecarman/Inkling-2-Small-abliterated",
+    "revision": "e4853745aa9cb4587e8959d3c80b92e1bef99a4a",
+    "selected_by": "Marcos",
+    "selected_on": "2026-11-16",
+    "base_model": "thinkingmachines/Inkling-2-Small",
+    "base_model_relation": "finetune",
+    "license": "Apache-2.0",
+    "format": "Mixed NVFP4 layers 0-39 and MXFP8 layers 40-47, BF16 elsewhere",
+    "model_shards": 24,
+    "used_storage_bytes": 393509649692,
+    "includes_mtp_safetensors": true,
+    "downloads_when_checked": 0,
+    "likes_when_checked": 0,
+    "gguf_found_on_hf_search": false,
+    "serving_route": "Convert and requantize the pinned source locally; stock Unsloth GGUFs are bring-up references only",
+    "author_reported_same_harness": {
+      "humaneval_percent": {"stock": 95.1, "abliterated": 97.0},
+      "mbpp_percent": {"stock": 90.8, "abliterated": 88.4},
+      "longbench_v2_percent": {"stock": 54.1, "abliterated": 48.5}
+    }
+  },
   "gguf_builds_unsloth": [
     {"name": "UD-IQ1_S", "bytes": 171728965465, "mean_kld_vs_bf16": 0.0922, "same_top_token": 0.897},
     {"name": "UD-IQ1_M", "bytes": 178544971609, "mean_kld_vs_bf16": 0.0829, "same_top_token": 0.902},

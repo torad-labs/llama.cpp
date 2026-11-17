@@ -10,8 +10,11 @@ box rental in Phase 4 is a spending decision for Marcos.
 
 - Pin upstream at `5c008e000` plus `dd099a6bf`. Record any later upstream Inkling fixes at
   branch start and re-check before the box read.
-- Choose the first pack: Unsloth `UD-Q3_K_XL` and `mmproj-F16.gguf`, with `UD-IQ3_XXS`
-  staged as the capacity fallback. Record shard hashes in the launcher docs.
+- Pin the weight source at `benthecarman/Inkling-2-Small-abliterated` revision
+  `e4853745aa9cb4587e8959d3c80b92e1bef99a4a`, and record SHA-256 hashes for every file at
+  download. Stage stock Unsloth `UD-Q3_K_XL` only as an engine bring-up and comparison
+  input. The served packs are locally converted Q3-class and IQ3-class artifacts from the
+  abliterated source; see [09-abliterated-target.md](09-abliterated-target.md).
 - Checks that fail today and define done for the campaign: the converter rejects the
   checkpoint config, the engine rejects the `inkling2` arch, and the server cannot render
   the model's chat template with an image.
@@ -65,8 +68,12 @@ Acceptance:
   is understood and scheduled into the Step 1 kernel work of
   [06-optimization-roadmap.md](06-optimization-roadmap.md) before the box read.
 
-## Phase 3. Server and launcher parity (2 to 3 days)
+## Phase 3. Abliterated packs, server and launcher parity (2 to 3 days)
 
+- Convert the pinned abliterated checkpoint and its vision projector, generate the
+  importance matrix from that reference, and produce the Q3-class default and IQ3-class
+  capacity packs. Record source revision, calibration corpus, recipe and artifact hashes
+  with every pack. Stock Unsloth artifacts never become a launcher default.
 - `scripts/inkling2/serve.py` with the profiles from
   [05-capacity-and-tensor4.md](05-capacity-and-tensor4.md) and pinned dry-run tests in the
   style of `scripts/glm53/test_qualification.py`.
@@ -82,7 +89,10 @@ Acceptance:
 
 Acceptance: server unit tests for the above, dry-run plans pinned, and a CPU or
 single-card smoke of the synthetic fixture through `llama-server` including one image
-request against a synthetic mmproj.
+request against a synthetic mmproj. Pack qualification also compares stock, the abliterated
+reference and each quantized abliterated pack on one pinned behavior set, so conversion and
+quantization are shown to preserve the selected refusal profile without breaking coding or
+tool responses.
 
 ## Phase 4. The four-card box read (one rental)
 
@@ -109,10 +119,11 @@ a leg disproves its layout rather than tuning on rented time.
 7. **Images.** Interleaved image and text requests while sessions decode: encode latency,
    correctness on a screenshot and a chart prompt, multi-image ordering, and an image at
    the token limit.
-8. **Quality.** Greedy continuations on a fixed prompt set under the chosen pack against
-   the quality profile pack at a small pool; a needle probe at the slot limit; the
-   reduction wire leg (BF16 against 8-bit) and the Q8_0 KV leg if the clock allows, each
-   reported as agreement rates, no more.
+8. **Quality.** Greedy continuations on a fixed prompt set under the chosen abliterated
+   pack against the abliterated quality-profile pack at a small pool; a needle probe at the
+   slot limit; long-document completion at 2,048-token and 8,192-token reply budgets, with
+   unfinished answers counted separately; the reduction wire leg (BF16 against 8-bit) and
+   the Q8_0 KV leg if the clock allows, each reported as agreement rates, no more.
 
 Write every leg's result into the launcher docs with the box's card variant, host CPU and
 topology, then destroy the box.
@@ -127,8 +138,9 @@ count are dropped, however elegant.
 
 ## Phase 6. DSpark (1 to 2 weeks, optional and last)
 
-- Converter support for `mtp.safetensors` into a draft GGUF, with its own arch or a
-  clearly separated sub-model representation.
+- Hash the abliterated repository's `mtp.safetensors` against the stock file, then add
+  converter support for the pinned file into a draft GGUF, with its own arch or a clearly
+  separated sub-model representation.
 - Draft graph: five layers with RoPE, one global layer, dense MLPs, input from target
   hidden states at layers 5, 11, 17, 23, 29, 35, 41 and 48, and the Markov RNN head.
 - Target graph taps at those depths without perturbing the non-speculative path's shapes.

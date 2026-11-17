@@ -56,12 +56,28 @@ Stated hardware from the model card:
 Four RTX PRO 6000 cards provide 410.6 GB in total, below both figures. That gap is the
 subject of [05-capacity-and-tensor4.md](05-capacity-and-tensor4.md).
 
+## Selected abliterated derivative
+
+Marcos selected `benthecarman/Inkling-2-Small-abliterated` as the serving target on
+2026-11-16. The checked revision is `e4853745aa9cb4587e8959d3c80b92e1bef99a4a`. It is a
+full checkpoint in the official mixed format, with 24 safetensors shards and an
+`mtp.safetensors` file; Hugging Face reports 393,509,649,692 bytes of used storage. Its
+config matches the architecture above, and its card states that the tokenizer and chat
+template are unchanged.
+
+The author's same-harness results put HumanEval at 97.0% against the stock model's 95.1%,
+MBPP at 88.4% against 90.8%, and LongBench v2 at 48.5% against 54.1%. The author calls
+every difference except LongBench v2 noise and attributes the long-document loss to longer
+reasoning that more often exhausts a fixed reply budget. No GGUF of this derivative was
+found in Hugging Face model search when checked. The target therefore has to be converted
+and requantized locally; see [09-abliterated-target.md](09-abliterated-target.md).
+
 ## Community GGUF builds
 
-Unsloth publishes dynamic, imatrix-calibrated GGUFs today. Their BF16 build keeps the
-original NVFP4 experts bit-exact in layers 0-39 and stores every other weight in BF16,
-which makes it larger than the native checkpoint because the last eight expert layers grow
-from MXFP8 to BF16. Quality figures below are Unsloth's own measurements against that BF16
+Unsloth publishes dynamic, imatrix-calibrated GGUFs of the stock model today. Their BF16
+build keeps the original NVFP4 experts bit-exact in layers 0-39 and stores every other
+weight in BF16, which makes it larger than the native checkpoint because the last eight
+expert layers grow from MXFP8 to BF16. Quality figures below are Unsloth's own measurements against that BF16
 build on wikitext-2, and should be read as relative guidance, not agent-task quality.
 
 | Build | Size (GB) | Mean KLD vs BF16 | Same top token |

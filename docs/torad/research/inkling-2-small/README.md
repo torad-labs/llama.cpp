@@ -1,8 +1,10 @@
 # Inkling 2 Small support study
 
-Date: 2026-11-16. Scope: what it would take for this fork to serve Thinking Machines Lab's
-Inkling 2 Small with optimization and serving functionality comparable to GLM-5.3 Flash on the
-four-card tensor layout (Tensor 4) across four RTX PRO 6000 cards.
+Date: 2026-11-16. Scope: what it would take for this fork to serve the selected abliterated
+Inkling 2 Small derivative with optimization and serving functionality comparable to
+GLM-5.3 Flash on the four-card tensor layout (Tensor 4) across four RTX PRO 6000 cards. The
+target source and its consequences are recorded in
+[09-abliterated-target.md](09-abliterated-target.md).
 
 ## The answer in one page
 
@@ -24,10 +26,12 @@ The hard limit is memory, and it decides the shape of the project before any ker
   alone would leave about 4 GiB per card for the KV cache, compute buffers, CUDA graphs, the
   vision tower and the driver. It does not fit as a serving target.
 - Tensor 4 parity therefore means a requantized pack, the same way GLM Tensor 4 serves an
-  IQ3_XXS pack rather than the reference checkpoint. Unsloth's dynamic GGUFs bracket the
-  useful range: UD-IQ3_XXS at 226.0 GB leaves about 43 GiB per card after an even split, and
-  UD-Q3_K_XL at 285.1 GB leaves about 29 GiB per card. Start from UD-Q3_K_XL for quality and
-  keep UD-IQ3_XXS as the capacity fallback. Details and the arithmetic are in
+  IQ3_XXS pack rather than the reference checkpoint. Unsloth's stock dynamic GGUFs bracket
+  the useful size range: UD-IQ3_XXS at 226.0 GB leaves about 43 GiB per card after an even
+  split, and UD-Q3_K_XL at 285.1 GB leaves about 29 GiB per card. Those files are not the
+  served target because they contain stock weights. Convert and requantize the pinned
+  abliterated checkpoint locally, starting with a Q3-class pack for quality and an IQ3-class
+  pack as the capacity fallback. Details and the arithmetic are in
   [05-capacity-and-tensor4.md](05-capacity-and-tensor4.md).
 
 The second hard problem is attention. Inkling 2 has no RoPE. Position enters through a
@@ -54,7 +58,8 @@ not convert or run yet. DSpark is its own phase at the end.
    caches, the convolution state and the relative-attention tensors each need an explicit,
    tested split decision.
 3. Build the launcher and qualification harness by analogy with `scripts/glm53/`, targeting
-   Unsloth's UD-Q3_K_XL pack and the F16 mmproj first.
+   a locally converted Q3-class pack from the pinned abliterated checkpoint and its F16
+   mmproj. Stock Unsloth files may be used only for earlier engine bring-up.
 4. Run the first four-card box read in the GLM order: reduction route, load memory, rate
    sweep, short turns, a read beside a stream, depth, then quality spot checks.
 5. Optimize in measured order: relative-attention kernel, prologue fusions, short-conv
@@ -71,6 +76,7 @@ not convert or run yet. DSpark is its own phase at the end.
 - [06-optimization-roadmap.md](06-optimization-roadmap.md) - kernel and graph work, in order.
 - [07-implementation-plan.md](07-implementation-plan.md) - phases, tests and the box read.
 - [08-risks-and-questions.md](08-risks-and-questions.md) - risks, unknowns and decisions.
+- [09-abliterated-target.md](09-abliterated-target.md) - the selected derivative, its pack route and target-specific qualification.
 - [data/model-facts.json](data/model-facts.json) - the numbers above in structured form.
 - [data/sources.md](data/sources.md) - every source used, with what it was trusted for.
 
