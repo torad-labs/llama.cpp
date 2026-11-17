@@ -24,3 +24,12 @@ Open work lives in `.campaign/ledger.toml`. Run `campaign help` for the verbs.
   feature is done only when its checks, its feature review and its code review pass in one round. A session given
   items builds them and ends; it never commits, closes an item or reviews it.
 <!-- campaign:end -->
+
+## Host-side tensor memory
+
+- Host-side code (tests, tools, loaders, fixture writers) never holds a full f32 copy of a large tensor.
+  Generate, convert and upload in chunks of whole rows or blocks, so peak host memory stays near the
+  tensor's stored size plus one chunk. On 2026-11-17 the MUL_MAT_ID case in test-backend-ops at 384 experts
+  built its whole 384x2304x4608 weight tensor as one f32 array, about 16 GB, before quantizing it, and hung
+  for 22 minutes under memory pressure; the same case in chunks of about 16M values peaks near its quantized
+  size, about 2.3 GB.
