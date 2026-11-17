@@ -13,6 +13,9 @@ agent = 'campaign seat'
 [feature."inkling-baseline"]
 goal = 'Inkling 2 Small runs in our fork on current upstream llama.cpp, with GLM 5.3 serving unchanged, landed on dev.'
 
+[feature."inkling-split-state"]
+goal = 'Inkling 2 runs split across devices with the same results as on one device, sequence state included.'
+
 [[row]]
 id = 'inkling-baseline-merge'
 title = 'Upstream master is merged and the tree builds'
@@ -105,4 +108,50 @@ reviews = [
 ]
 notes = [
   '2026-11-16 23:53 CT: added; 1 of 1 checks fail, as they should before the work',
+]
+
+[[row]]
+id = 'inkling-split-state-decisions'
+title = 'Every Inkling tensor and cache has a split decision'
+feature = 'inkling-split-state'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Every weight tensor, cache and the convolution state of the inkling2 architecture has an explicit tensor-split decision in the meta backend, with special rules where the standard table has no analog. The global and sliding KV caches split by heads and are never mirrored. The meta split tests cover the Inkling tensor and cache names and fail if any of them would be mirrored instead of split.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && cmake --build build-campaign -j --target test-backend-meta-split && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-backend-meta-split > /tmp/inkling-meta-split.out 2>&1 && grep -qi inkling /tmp/inkling-meta-split.out',
+  'sh .campaign/cases/check.sh inkling-split-state-decisions',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 03:55 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 03:55 CT llamacpp-issues: Study: docs/torad/research/inkling-2-small/04-fork-gap-analysis.md item 6 lists the tensors with no standard analog, and 05-capacity-and-tensor4.md has the split the capacity math assumes. A mirrored global KV cache at BF16 would need about 92 GiB a card at the GLM pool size and simply not load.',
+]
+
+[[row]]
+id = 'inkling-split-state-equivalence'
+title = 'Split and unsplit Inkling runs agree, state included'
+feature = 'inkling-split-state'
+status = 'todo'
+owner = ''
+blocked_by = [
+  'inkling-split-state-decisions',
+]
+guard = false
+spec = 'The synthetic Inkling fixture run under a two-rank tensor split matches one rank within the fixture tolerance for prefill, decode, and prefill crossing at least two chunk boundaries, and stays matching after sequence copy, state save and restore, and rollback of a rejected step. The convolution state is compared directly, since a wrongly split or restored state runs and answers slightly wrong instead of failing. The comparisons run as ctest cases whose names carry inkling, beside the existing architecture fixture.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && cmake --build build-campaign -j && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ctest --test-dir build-campaign -R inkling --no-tests=error --output-on-failure',
+  'sh .campaign/cases/check.sh inkling-split-state-equivalence',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 03:55 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 03:55 CT llamacpp-issues: Phase 2 of docs/torad/research/inkling-2-small/07-implementation-plan.md. The existing tensor fixture (--glm-tensor-device in tests/test-llama-archs.cpp) is GLM-only (test_glm_tensor); its ranks may repeat a device, so CUDA0,CUDA0 gives two ranks on card 1 under CUDA_VISIBLE_DEVICES=1. Card 0 serves another seat: GPU work holds /run/user/1000/gpu1.lock only. Fresh build folders need GGML_CCACHE=OFF (sccache vs nvcc 13.3); the checks carry it.',
 ]
