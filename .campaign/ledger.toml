@@ -4,12 +4,12 @@
 [campaign]
 goal = ''
 base = 'main'
-merge = 'pr'
 judged = [
   '.campaign/checks/',
   '.campaign/cases/',
 ]
 agent = 'campaign seat'
+merge = 'pr'
 
 [feature."inkling-baseline"]
 goal = 'Inkling 2 Small runs in our fork on current upstream llama.cpp, with GLM 5.3 serving unchanged, landed on dev.'
@@ -348,4 +348,19 @@ reviews = [
 notes = [
   '2026-11-17 09:40 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 09:40 CT: Step 6 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. The fork flash-attention already reads q8_0 KV; prove global and sliding layers separately at depth on the synthetic fixture against F16, q4_0 behind the same proof. Real-weight quality verdict waits for packs on the rented box; the inkling2 launcher keeps F16 defaults until then (scripts/inkling2/serve.py). GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.',
+]
+
+[[row]]
+id = 'server-speculative-batch-capacity-cuda'
+title = 'Draft batch capacity holds under CUDA'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "The server test test_draft_respects_batch_capacity passes with CUDA visible the way it passes on the CPU: a draft that would overrun the batch capacity is trimmed the same on both backends, so the generated tokens match. Today it fails only with CUDA visible (tokens differ at index 26, 3 of 3 runs), and it failed the same way before the d3c3e242c merge; TORAD.md records it under Upstream d3c3e242c. Whatever the cause is, the fix lands in the speculative or batching path, not in the test's expectations, unless the test is shown to assert behavior the server never promised."
+checks = [
+  'cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && cmake --build build-campaign -j --target llama-server test-llama-archs && (cd tools/server/tests && (test -x /tmp/inkling-server-tests-venv/bin/pytest || (python3 -m venv /tmp/inkling-server-tests-venv && /tmp/inkling-server-tests-venv/bin/pip install -q -r requirements.txt)) && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 LLAMA_SERVER_BIN_PATH=$PWD/../../../build-campaign/bin/llama-server /tmp/inkling-server-tests-venv/bin/pytest unit/test_speculative.py -k test_draft_respects_batch_capacity -q)',
+]
+notes = [
+  '2026-11-17 13:38 CT: added; 1 of 1 checks fail, as they should before the work',
 ]
