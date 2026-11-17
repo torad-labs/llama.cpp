@@ -169,7 +169,7 @@ notes = [
 id = 'inkling-server-parity-launcher'
 title = 'An Inkling launcher with pinned dry-run plans'
 feature = 'inkling-server-parity'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -185,13 +185,14 @@ reviews = [
 notes = [
   '2026-11-17 04:16 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 04:22 CT llamacpp-issues: Profiles and their values come from docs/torad/research/inkling-2-small/05-capacity-and-tensor4.md; the pattern is scripts/glm53 (serve.py with test_qualification.py). The packs the profiles name come from the conversion work that follows with Marcos; what is pinned now is the plan each profile launches.',
+  '2026-11-17 06:38 CT campaign: done in round 2 of inkling-server-parity: its checks, its feature review, its code review passed',
 ]
 
 [[row]]
 id = 'inkling-server-parity-chat'
 title = 'Chat, tools and template behavior qualified'
 feature = 'inkling-server-parity'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -209,13 +210,14 @@ notes = [
   '2026-11-17 04:22 CT llamacpp-issues: The behaviors under qualification are listed in docs/torad/research/inkling-2-small/01-model-facts.md (sampling defaults, reasoning effort levels, the template raising on an unknown level) and Phase 3 of 07-implementation-plan.md. Upstream a946eb541 already answers a rejected reasoning_effort with a 400; what is ours to prove is this fork server end to end. The synthetic inkling2 GGUF written by test-llama-archs -o is the model for server-level cases.',
   '2026-11-17 04:23 CT llamacpp-issues: The check provisions /tmp/inkling-server-tests-venv from tools/server/tests/requirements.txt on first run: the system python cannot collect these tests (no filelock), and earlier sessions ran them from just such a venv. Server-level cases can use the same venv.',
   '2026-11-17 05:42 CT llamacpp-issues: Lead: the round-1 dispute against this check is right. It ran pytest without building the server or setting LLAMA_SERVER_BIN_PATH, so in the feature worktree the harness fell back to build/bin and every test errored before running, while with the variable set the tests and all 20 cases pass. The check now builds llama-server and test-llama-archs into build-campaign and exports LLAMA_SERVER_BIN_PATH at it, as the state check and the item cases already did. The spec and the cases are unchanged.',
+  '2026-11-17 06:38 CT campaign: done in round 3 of inkling-server-parity: its checks, its feature review, its code review passed',
 ]
 
 [[row]]
 id = 'inkling-server-parity-state'
 title = 'Prompt cache restores Inkling sequence state exactly'
 feature = 'inkling-server-parity'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -231,4 +233,5 @@ reviews = [
 notes = [
   '2026-11-17 04:22 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 04:22 CT llamacpp-issues: The convolution state is 6.1875 MiB a sequence at F32 (docs/torad/research/inkling-2-small/02-architecture.md); the fork recurrent rollback and restore tests are the pattern. GPU work holds /run/user/1000/gpu1.lock on card 1 only; fresh build folders need GGML_CCACHE=OFF and the checks carry it.',
+  '2026-11-17 06:38 CT campaign: done in round 1 of inkling-server-parity: its checks, its feature review, its code review passed',
 ]
