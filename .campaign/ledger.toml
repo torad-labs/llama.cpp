@@ -16,6 +16,9 @@ goal = 'Inkling 2 Small runs in our fork on current upstream llama.cpp, with GLM
 [feature."inkling-split-state"]
 goal = 'Inkling 2 runs split across devices with the same results as on one device, sequence state included.'
 
+[feature."inkling-server-parity"]
+goal = 'A synthetic Inkling model is served through this fork server with the same launcher, chat and prompt-cache behavior the GLM serving has, ready for the real packs.'
+
 [[row]]
 id = 'inkling-baseline-merge'
 title = 'Upstream master is merged and the tree builds'
@@ -158,4 +161,71 @@ reviews = [
 notes = [
   '2026-11-17 03:55 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 03:55 CT llamacpp-issues: Phase 2 of docs/torad/research/inkling-2-small/07-implementation-plan.md. The existing tensor fixture (--glm-tensor-device in tests/test-llama-archs.cpp) is GLM-only (test_glm_tensor); its ranks may repeat a device, so CUDA0,CUDA0 gives two ranks on card 1 under CUDA_VISIBLE_DEVICES=1. Card 0 serves another seat: GPU work holds /run/user/1000/gpu1.lock only. Fresh build folders need GGML_CCACHE=OFF (sccache vs nvcc 13.3); the checks carry it.',
+]
+
+[[row]]
+id = 'inkling-server-parity-launcher'
+title = 'An Inkling launcher with pinned dry-run plans'
+feature = 'inkling-server-parity'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'scripts/inkling2 holds a launcher in the pattern of scripts/glm53: named profiles for the card layouts this work targets, each dry-running to a pinned plan of server arguments and environment, held by unit tests in the same folder. The plans carry the serving defaults this fork uses (flash attention, the prompt step controls, a unified cache, reserved sessions) with the values the capacity study derived and the pack paths the conversion work will produce.'
+checks = [
+  "git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && (cd scripts/inkling2 && python3 -m unittest discover -p 'test_*.py')",
+  'sh .campaign/cases/check.sh inkling-server-parity-launcher',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 04:16 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 04:22 CT llamacpp-issues: Profiles and their values come from docs/torad/research/inkling-2-small/05-capacity-and-tensor4.md; the pattern is scripts/glm53 (serve.py with test_qualification.py). The packs the profiles name come from the conversion work that follows with Marcos; what is pinned now is the plan each profile launches.',
+]
+
+[[row]]
+id = 'inkling-server-parity-chat'
+title = 'Chat, tools and template behavior qualified'
+feature = 'inkling-server-parity'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Through the server and its chat tests, Inkling 2 handles text turns and system prompts, every reasoning effort level with an invalid one refused as a client error, tool declarations, tool calls with nested arguments and their results, thinking content kept across turns, and image parts before, between and after text. Sampling never emits an id at or above the unpadded vocabulary, and generation ends at the model end token. Server-level cases carry inkling in their test names.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && (cd tools/server/tests && (test -x /tmp/inkling-server-tests-venv/bin/pytest || (python3 -m venv /tmp/inkling-server-tests-venv && /tmp/inkling-server-tests-venv/bin/pip install -q -r requirements.txt)) && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 /tmp/inkling-server-tests-venv/bin/pytest unit -k inkling -q)',
+  'sh .campaign/cases/check.sh inkling-server-parity-chat',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 04:22 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 04:22 CT llamacpp-issues: The behaviors under qualification are listed in docs/torad/research/inkling-2-small/01-model-facts.md (sampling defaults, reasoning effort levels, the template raising on an unknown level) and Phase 3 of 07-implementation-plan.md. Upstream a946eb541 already answers a rejected reasoning_effort with a 400; what is ours to prove is this fork server end to end. The synthetic inkling2 GGUF written by test-llama-archs -o is the model for server-level cases.',
+  '2026-11-17 04:23 CT llamacpp-issues: The check provisions /tmp/inkling-server-tests-venv from tools/server/tests/requirements.txt on first run: the system python cannot collect these tests (no filelock), and earlier sessions ran them from just such a venv. Server-level cases can use the same venv.',
+]
+
+[[row]]
+id = 'inkling-server-parity-state'
+title = 'Prompt cache restores Inkling sequence state exactly'
+feature = 'inkling-server-parity'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Saving a session mid-conversation and restoring it, including into a different slot, gives the same next logits as the uninterrupted run, and prefix reuse refuses or snapshots correctly where the convolution state is involved. The comparisons run as ctest cases whose names carry inkling-state.'
+checks = [
+  "git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && ctest --test-dir build-campaign -N -R inkling-state | grep -qE 'Total Tests: [1-9]' && cmake --build build-campaign -j && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ctest --test-dir build-campaign -R inkling-state --no-tests=error --output-on-failure",
+  'sh .campaign/cases/check.sh inkling-server-parity-state',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 04:22 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 04:22 CT llamacpp-issues: The convolution state is 6.1875 MiB a sequence at F32 (docs/torad/research/inkling-2-small/02-architecture.md); the fork recurrent rollback and restore tests are the pattern. GPU work holds /run/user/1000/gpu1.lock on card 1 only; fresh build folders need GGML_CCACHE=OFF and the checks carry it.',
 ]
