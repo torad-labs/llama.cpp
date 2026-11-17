@@ -668,4 +668,5 @@ pass's own script: control 4 of 4 with no exemption (the line and 3 canaries), r
 the `DATABASE_URL` line of the env block in upstream's markdown tutorial fixture
 `ui/apps/chat/tests/stories/fixtures/ai-tutorial.ts`, whose credentials are the words `user` and `password`
 against localhost. The entry pins that line with its value; the same line carrying a different password, or
-anything after it, does not match.
+anything after it, does not match. Its quotes and slashes are bracket expressions: written plainly, the
+exemption is itself a hit, which the pass's second run on the PR showed.
