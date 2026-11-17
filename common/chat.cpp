@@ -1143,7 +1143,16 @@ common_chat_prompt common_chat_template_direct_apply_impl(
 
     // render
     jinja::runtime runtime(ctx);
-    const jinja::value results = runtime.execute(tmpl.prog);
+    jinja::value results;
+    try {
+        results = runtime.execute(tmpl.prog);
+    } catch (const jinja::rethrown_exception & e) {
+        if (!e.refusal) {
+            throw;
+        }
+        // the template refused what it was given (an unknown reasoning effort, roles out of order...): bad inputs
+        throw std::invalid_argument(e.what());
+    }
     auto parts = jinja::runtime::gather_string_parts(results);
 
     common_chat_prompt result;
@@ -1998,5 +2007,7 @@ common_json common_chat_templates_get_caps(const common_chat_templates * chat_te
     common_json result = caps.to_map();
     result["reasoning_effort_levels"] = caps.reasoning_effort_levels;
     result["reasoning_effort_rejected"] = caps.reasoning_effort_rejected;
+    result["reasoning_effort_accepted"] = caps.reasoning_effort_accepted;
+    result["reasoning_effort_none"]     = caps.reasoning_effort_none;
     return result;
 }

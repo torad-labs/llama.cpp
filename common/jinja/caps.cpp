@@ -649,7 +649,25 @@ caps caps_get(jinja::program & prog) {
         // a template that renders no level fails the probe for another reason, so its failures say nothing about the levels
         if (!result.reasoning_effort_levels.empty()) {
             result.reasoning_effort_rejected = rejected;
+            if (!unknown) {
+                for (const auto & level : candidates) {
+                    if (std::find(rejected.begin(), rejected.end(), level) == rejected.end()) {
+                        result.reasoning_effort_accepted.push_back(level);
+                    }
+                }
+            }
         }
+
+        // "none" is not one of the levels above: it turns thinking off, and a template may also have a level for it
+        const auto none = render("none");
+        std::optional<std::string> echoed = unknown;
+        if (echoed) {
+            const std::string probe = "REASONING_EFFORT_UNKNOWN";
+            for (size_t pos = echoed->find(probe); pos != std::string::npos; pos = echoed->find(probe, pos + 4)) {
+                echoed->replace(pos, probe.size(), "none");
+            }
+        }
+        result.reasoning_effort_none = none && none != unknown && none != echoed;
     }
 
     JJ_DEBUG("%s\n", result.to_string().c_str());

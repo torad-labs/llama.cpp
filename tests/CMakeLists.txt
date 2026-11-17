@@ -494,6 +494,28 @@ set_tests_properties(test-llama-context PROPERTIES
     ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
 )
 
+# Inkling 2's sequence state (attention caches and the convolution state) through the context cases, on a fixture
+# whose weights spread 0.1, where the next logits follow every earlier token. A case that skips fails: these must run
+set(INKLING_STATE_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-inkling-state")
+file(MAKE_DIRECTORY "${INKLING_STATE_DIR}")
+llama_test(test-llama-archs NAME test-inkling-state-model LABEL main ARGS -a inkling2 -s 1 -d 0.1 -o "${INKLING_STATE_DIR}")
+set_tests_properties(test-inkling-state-model PROPERTIES FIXTURES_SETUP inkling-state-model)
+# a session saved before its last token and restored: the same next logits as the run that never stopped
+set(INKLING_STATE_CASES_restore           "^(baseline|state_load|rt)$")
+# the same session restored into another sequence, over the host and the device paths, and into scattered cells
+set(INKLING_STATE_CASES_restore-other-seq "^(baseline|cp_h|cp_d|cp_h_s|cp_d_s|frag)$")
+# prefix reuse: a cut the convolution snapshots cannot serve is refused, an accepted one serves the kept tokens' state
+set(INKLING_STATE_CASES_prefix            "^(replay|rollback|rollback_bound|shared|seq_rm)$")
+foreach(name restore restore-other-seq prefix)
+    llama_test(test-llama-context NAME test-inkling-state-${name} LABEL main
+        ARGS -m "${INKLING_STATE_DIR}/inkling2-moe.gguf" --test "${INKLING_STATE_CASES_${name}}")
+    set_tests_properties(test-inkling-state-${name} PROPERTIES
+        FIXTURES_REQUIRED inkling-state-model
+        FAIL_REGULAR_EXPRESSION "skipped  *: *[1-9]"
+        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+    )
+endforeach()
+
 llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)

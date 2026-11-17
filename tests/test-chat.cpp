@@ -8972,6 +8972,27 @@ static void test_reasoning_effort_caps() {
     assert_effort_rejected("models/templates/deepseek-ai-DeepSeek-V4.jinja", {});
     assert_effort_rejected("models/templates/openai-gpt-oss-120b.jinja", {});
     assert_effort_rejected("models/templates/Cohere2MoE.jinja", {});
+
+    // a template that raises on an unknown level takes only the levels it renders, aliases included (xhigh is max)
+    auto assert_effort_accepted = [](const std::string & path, const std::vector<std::string> & expected) {
+        auto tmpls = read_templates(path);
+        assert_equals(json(expected).dump(), common_chat_templates_get_caps(tmpls.get()).at("reasoning_effort_accepted").dump());
+    };
+
+    assert_effort_accepted("models/templates/thinkingmachines-Inkling-2-Small.jinja", all_levels);
+    assert_effort_accepted("models/templates/IFM-K2-Horizon.jinja", { "low", "medium", "high" });
+    assert_effort_accepted("models/templates/openai-gpt-oss-120b.jinja", {});
+
+    // none turns thinking off; a template that also has a level for it is given it, not one that echoes any string
+    auto assert_effort_none = [](const std::string & path, bool expected) {
+        auto tmpls = read_templates(path);
+        assert_equals(expected, common_chat_templates_get_caps(tmpls.get()).at("reasoning_effort_none").get<bool>());
+    };
+
+    assert_effort_none("models/templates/thinkingmachines-Inkling-2-Small.jinja", true);
+    assert_effort_none("models/templates/openai-gpt-oss-120b.jinja", false);
+    assert_effort_none("models/templates/IFM-K2-Horizon.jinja", false);
+    assert_effort_none("models/templates/Qwen-Qwen3-0.6B.jinja", false);
 }
 
 static void test_msg_diffs_compute() {

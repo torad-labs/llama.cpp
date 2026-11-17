@@ -1754,13 +1754,24 @@ json oaicompat_chat_params_parse(
 
     // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
     if (body.contains("reasoning_effort")) {
+        // the OAI field names a level; a template's own number goes in chat_template_kwargs, where the template checks it
+        if (!body.at("reasoning_effort").is_string() && !body.at("reasoning_effort").is_null()) {
+            throw std::invalid_argument("reasoning_effort must be a level name (a string), got " + body.at("reasoning_effort").dump());
+        }
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
-            inputs.chat_template_kwargs.erase("reasoning_effort");
+            // a template with a level of its own for none (Inkling 2: effort 0) takes it, where its default would think
+            if (caps.at("reasoning_effort_none").get<bool>()) {
+                inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+            } else {
+                inputs.chat_template_kwargs.erase("reasoning_effort");
+            }
         } else if (!reasoning_effort.empty()) {
             const auto rejected = caps.at("reasoning_effort_rejected").get<std::vector<std::string>>();
-            if (std::find(rejected.begin(), rejected.end(), reasoning_effort) != rejected.end()) {
+            const auto accepted = caps.at("reasoning_effort_accepted").get<std::vector<std::string>>();
+            if (std::find(rejected.begin(), rejected.end(), reasoning_effort) != rejected.end() ||
+                (!accepted.empty() && std::find(accepted.begin(), accepted.end(), reasoning_effort) == accepted.end())) {
                 const auto levels = caps.at("reasoning_effort_levels").get<std::vector<std::string>>();
                 throw std::invalid_argument("reasoning_effort \"" + reasoning_effort + "\" is not supported by the chat template, supported levels: " + string_join(levels, ", "));
             }

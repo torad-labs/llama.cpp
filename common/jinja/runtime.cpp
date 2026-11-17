@@ -55,6 +55,7 @@ static void ensure_key_type_allowed(const value & val) {
 value statement::execute(context & ctx) const {
     std::exception_ptr pending;
     std::string message;
+    bool refusal = false;
     try {
         return execute_impl(ctx);
     } catch (const continue_statement::signal & /* ex */) {
@@ -66,6 +67,7 @@ value statement::execute(context & ctx) const {
     } catch (const not_implemented_exception & /* ex */) {
         pending = std::current_exception();
     } catch (const std::exception & e) {
+        refusal = dynamic_cast<const template_refusal *>(&e) != nullptr;
         const std::string & source = *ctx.src;
         if (source.empty()) {
             std::ostringstream oss;
@@ -85,7 +87,7 @@ value statement::execute(context & ctx) const {
         std::rethrow_exception(pending);
     }
     // throw as another exception to avoid repeated formatting
-    throw rethrown_exception(message);
+    throw rethrown_exception(message, refusal);
 }
 
 value identifier::execute_impl(context & ctx) const {

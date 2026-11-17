@@ -26,6 +26,12 @@ struct caps {
     // reasoning effort levels the template raises on
     std::vector<std::string> reasoning_effort_rejected;
 
+    // when the template raises on an unknown level: the levels it takes, aliases included (empty: it takes any string)
+    std::vector<std::string> reasoning_effort_accepted;
+
+    // the template renders reasoning_effort "none" as a level of its own, neither its fallback nor an echo of the string
+    bool reasoning_effort_none = false;
+
     // one of the 2 content capabilities must be true
     bool supports_string_content = true;
     bool supports_typed_content = false;

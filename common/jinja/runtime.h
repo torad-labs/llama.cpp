@@ -765,10 +765,16 @@ struct raised_exception : public std::exception {
     }
 };
 
+// raise_exception() called by the template: the template refuses the inputs it was given
+struct template_refusal : public raised_exception {
+    using raised_exception::raised_exception;
+};
+
 // Used to rethrow exceptions with modified messages
 struct rethrown_exception : public std::exception {
     std::string message;
-    rethrown_exception(const std::string & msg) : message(msg) {}
+    bool refusal; // the template's own raise_exception(), not a fault of the template or the runtime
+    rethrown_exception(const std::string & msg, bool refusal = false) : message(msg), refusal(refusal) {}
     const char* what() const noexcept override {
         return message.c_str();
     }
