@@ -350,6 +350,14 @@ common_models_handler common_models_handler_init(const common_params & params, l
                                            params.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
 
+    const bool spec_type_draft_dflash2 = std::find(params.speculative.types.begin(),
+                                            params.speculative.types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2) != params.speculative.types.end();
+
+    const bool spec_type_draft_lilicorr = std::find(params.speculative.types.begin(),
+                                             params.speculative.types.end(),
+                                             COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR) != params.speculative.types.end();
+
     const bool spec_type_draft_eagle3 = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params.speculative.types.end();
@@ -374,7 +382,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
     opts.offline         = params.offline;
     opts.download_mtp    = spec_type_draft_mtp;
     opts.download_eagle3 = spec_type_draft_eagle3;
-    opts.download_dflash = spec_type_draft_dflash;
+    opts.download_dflash = spec_type_draft_dflash || spec_type_draft_dflash2 || spec_type_draft_lilicorr;
     opts.download_dspark = spec_type_draft_dspark;
     opts.download_mmproj = use_mmproj && !params.no_mmproj
                         && params.mmproj.path.empty() && params.mmproj.url.empty();
@@ -2932,7 +2940,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             const std::regex regex{ R"([,/]+)" };
             std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
             std::vector<std::string> split_arg{ it, {} };
-            if (split_arg.size() >= llama_max_devices()) {
+            if (split_arg.size() > llama_max_devices()) {
                 throw std::invalid_argument(
                     string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
                 );
@@ -2998,7 +3006,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             const std::regex regex{ R"([,/]+)" };
             std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
             std::vector<std::string> split_arg{ it, {} };
-            if (split_arg.size() >= llama_max_devices()) {
+            if (split_arg.size() > llama_max_devices()) {
                 throw std::invalid_argument(
                     string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
                 );
@@ -3587,7 +3595,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--ui-mcp-proxy", "--webui-mcp-proxy"},
         {"--no-ui-mcp-proxy", "--no-webui-mcp-proxy"},
-        "experimental: whether to enable MCP CORS proxy, for the Web UI to reach public MCP servers without CORS headers; local and private addresses are refused - do not enable in untrusted environments (default: disabled)\n"
+        "experimental: whether to enable MCP CORS proxy, for Llama Chat to reach public MCP servers without CORS headers; local and private addresses are refused - do not enable in untrusted environments (default: disabled)\n"
         "note: for security reasons, this will limit --cors-origins to localhost by default",
         [](common_params & params, bool value) {
             params.ui_mcp_proxy = value;
@@ -3656,7 +3664,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--ui", "--webui"},
         {"--no-ui", "--no-webui"},
-        string_format("whether to enable the Web UI (default: %s)", params.ui ? "enabled" : "disabled"),
+        string_format("whether to enable Llama Chat, the built-in chat app (default: %s)", params.ui ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.ui = value;
         }
@@ -4758,7 +4766,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--tts-lang"}, "FNAME",
         "language (ISO 639-1) for audio generation\n"
-        "see tts/README.md for per-model usage notes",
+        "see docs/multimodal/tts.md for per-model usage notes",
         [](common_params & params, const std::string & value) {
             params.tts_lang = value;
         }
@@ -4766,7 +4774,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--tts-voice"}, "VOICE",
         "voice for audio generation (model-dependent)\n"
-        "see tts/README.md for per-model usage notes",
+        "see docs/multimodal/tts.md for per-model usage notes",
         [](common_params & params, const std::string & value) {
             params.tts_voice = value;
         }
@@ -4776,6 +4784,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "speaker file path for audio generation",
         [](common_params & params, const std::string & value) {
             params.tts_speaker_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    add_opt(common_arg(
+        {"--tts-speaker-text"}, "TEXT",
+        "transcript of --tts-speaker-file, for models that need it to clone the voice\n"
+        "see docs/multimodal/tts.md for per-model usage notes",
+        [](common_params & params, const std::string & value) {
+            params.tts_speaker_text = value;
         }
     ).set_examples({LLAMA_EXAMPLE_TTS}));
 

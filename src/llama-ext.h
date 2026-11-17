@@ -193,9 +193,6 @@ LLAMA_API int64_t llama_get_nextn_rows_to_host(const struct llama_context * ctx_
 // model/context data extraction
 //
 
-// returns true if the draft model carries a DSpark Markov head. Both lineages declare
-// general.architecture = dflash, so this is how to tell them apart.
-LLAMA_API bool            llama_model_has_dspark_markov_head(const struct llama_model * model);
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

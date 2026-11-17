@@ -41,7 +41,7 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
         const int32_t mask_packed);
 
 // The mask is f16 additive values or bit-packed (GGML_TYPE_I16: 16 KV cells per 16-bit word, LSB first, bit set = attend).
@@ -388,8 +388,8 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
     }
 #pragma unroll
     for (int mask = QI8_1/2; mask > 0; mask >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 32));
-        sum +=             __shfl_xor_sync(0xFFFFFFFF, sum,  mask, 32);
+        amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, mask, 32));
+        sum +=             ggml_cuda_shfl_xor(sum,  mask, 32);
     }
 
     const float d = amax / 127;
@@ -1579,6 +1579,7 @@ void launch_fattn(
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I16);
     const bool mask_packed = mask && mask->type == GGML_TYPE_I16;
+    GGML_ASSERT(!mask_packed || mask->ne[2] == 1); // a packed mask is shared by all heads
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1740,8 +1741,10 @@ void launch_fattn(
     //     At a decode-sized batch neither the range scan nor the live steps below find a tile to skip, so both are left out and
     //     the kernel applies the mask over the whole range. GGML_CUDA_FATTN_MASK_PREFIX_LEGACY=1: the hint is ignored.
     static const bool mask_prefix_legacy = ggml_env_switch("GGML_CUDA_FATTN_MASK_PREFIX_LEGACY");
-    const bool mask_prefix = !mask_prefix_legacy && mask && Q->ne[1] <= 16 && ggml_flash_attn_ext_get_mask_prefix(KQV);
-    const bool kv_range = !use_sparse && !kv_rows && !kv_range_legacy && !mask_prefix && mask && Q->ne[1] <= 16 && K->ne[1] >= 4096 &&
+    // A mask with a head dimension (one mask a Q head) is read as it is: the scans below read one mask for all heads.
+    const bool mask_shared = mask && mask->ne[2] == 1;
+    const bool mask_prefix = !mask_prefix_legacy && mask_shared && Q->ne[1] <= 16 && ggml_flash_attn_ext_get_mask_prefix(KQV);
+    const bool kv_range = !use_sparse && !kv_rows && !kv_range_legacy && !mask_prefix && mask_shared && Q->ne[1] <= 16 && K->ne[1] >= 4096 &&
         (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0; // 16-byte mask reads
 
     // kv_live: the mma kernel reads only the KV steps a row of its Q tile sees, the masked tiles between them skipped too (with
@@ -1751,14 +1754,14 @@ void launch_fattn(
     // The live fixup tests the blocks it combines for an empty range only when there can be one (fewer units of work than
     // blocks), and lets the next kernel launch as it starts. GGML_CUDA_FATTN_LIVE_FIXUP_LEGACY=1: it tests every block and does not.
     static const bool kv_live_fixup_legacy = ggml_env_switch("GGML_CUDA_FATTN_LIVE_FIXUP_LEGACY");
-    const bool kv_live = !use_sparse && !kv_rows && kv_live_ok && !kv_live_legacy && !mask_prefix && stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && mask && K->ne[1] >= 4096 &&
+    const bool kv_live = !use_sparse && !kv_rows && kv_live_ok && !kv_live_legacy && !mask_prefix && stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && mask_shared && K->ne[1] >= 4096 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 && (nbatch_fa == 32 || nbatch_fa == 64) &&
         (uintptr_t) mask->data % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0;
     // The live steps depend on the mask and the split alone, and every attention layer of a graph reads the same mask: the
     // first layer scans it into the context's memory and the others read what it found (ggml_cuda_fattn_kv_live_context),
     // one memset and one scan a graph instead of one a layer. GGML_CUDA_FATTN_LIVE_SCAN_EACH_LEGACY=1: every layer scans.
     static const bool kv_live_scan_each_legacy = ggml_env_switch("GGML_CUDA_FATTN_LIVE_SCAN_EACH_LEGACY");
-    const bool scan_mask = !use_sparse && !kv_live && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 &&
+    const bool scan_mask = !use_sparse && !kv_live && mask_shared && n_kv_cols % FATTN_KQ_STRIDE == 0 &&
         (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_range || kv_rows);
     const int * KV_live_ptr = nullptr;
     if (kv_live) {
