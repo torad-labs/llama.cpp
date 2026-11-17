@@ -488,7 +488,7 @@ bool server_http_context::init_listener(const common_params & params) {
     };
 
     //
-    // Web UI setup
+    // Llama Chat setup
     //
 
     // Use new `params.ui` field (backed by old `params.webui` for compat)
@@ -761,11 +761,11 @@ static void process_handler_response(server_http_req_ptr && request, server_http
         // Tell Nginx to not buffer any streamed response
         response->headers["X-Accel-Buffering"] = "no";
         set_headers(res, response->headers);
-        // A streamed response ends its connection: the provider below returns false once the stream is over, which
-        // the HTTP library takes as a cancelled write, and it closes the connection after the last chunk. The headers
-        // have to say so. They said "Keep-Alive: timeout=5, max=100", and a client that sent its next request on the
-        // connection it was told to keep lost it to the close when the two crossed ("Remote end closed connection
-        // without response"; the request never reaches a slot). One Connection header: a proxied response brings its own
+        // A streamed response ends its connection: the HTTP library closes it after the last chunk because of this
+        // header. Keeping it would hold an HTTP worker for up to the keep-alive timeout on every idle connection. The
+        // headers said "Keep-Alive: timeout=5, max=100" before, and a client that sent its next request on that
+        // connection lost it to the close ("Remote end closed connection without response"; the request never reaches
+        // a slot). One Connection header: a proxied response brings its own
         res.headers.erase("Connection");
         res.set_header("Connection", "close");
         const std::string content_type = response->content_type;
@@ -786,7 +786,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
                 sink.done();
                 SRV_DBG("%s", "http: stream ended\n");
             }
-            return has_next;
+            return true;
         };
         const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
             response->on_complete();

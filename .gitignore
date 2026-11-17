@@ -157,3 +157,4 @@ AGENTS.local.md
 # Local agent build, trace, and model-test artifacts
 .Codex/tmp/
 /results/
+.campaign/.lock

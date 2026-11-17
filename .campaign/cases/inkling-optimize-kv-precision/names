@@ -1,0 +1,6 @@
+inkling-kv-ctest-cases-registered
+inkling-kv-ctest-cases-pass-on-card-1
+inkling-kv-ctest-cases-all-run
+inkling2-serves-from-q8_0-kv-cache
+inkling2-serves-from-q4_0-kv-cache
+inkling2-launcher-default-keeps-kv-cache-f16

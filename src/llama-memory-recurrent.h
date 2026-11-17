@@ -55,6 +55,9 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // the state tensors and their buffers, stage rows included
+    const llama_memory_bufs & get_bufs() const { return ctxs_bufs; }
+
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there

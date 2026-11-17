@@ -544,55 +544,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
-        uint32_t new_head = cells.size();
-
-        // a speculative rollback removes the few cells placed last, just below the head: up to 1024 cells are found
-        // walking backward from it, stopping at the last one, instead of scanning every cell of the cache
-        static const bool scan_all = ggml_env_switch("LLAMA_KV_SEQ_RM_SCAN_LEGACY");
-        static constexpr uint32_t n_rollback_max = 1024;
-        uint32_t n_rm = scan_all ? UINT32_MAX : cells.seq_pos_count(seq_id, p0, p1, n_rollback_max);
-
-        if (n_rm <= n_rollback_max) {
-            const auto visit = [&](uint32_t i) {
-                if (cells.pos_in(i, p0, p1) && cells.seq_has(i, seq_id)) {
-                    --n_rm;
-                    if (cells.seq_rm(i, seq_id)) {
-                        new_head = std::min(new_head, i);
-                    }
-                }
-            };
-            // In a pool that sequences share, the first sequence to roll back in a step lowers the head to its freed
-            // cell, and the cells the others placed in that step are then above it: walking down from the head missed
-            // them, went on to cell 0, and came back from the cache's last cell, every cell of the pool for each
-            // sequence each step (23 sessions, 131,072 cells: 15 % of the server's loop, 2.6 ms of a step's verify stage
-            // against a 11,776-cell pool's, Nov 9, 2026). The cells just above the head are read first, and no cell
-            // above the last one used is read at all. LLAMA_KV_SEQ_RM_HEAD_LEGACY=1: from the head down, then from the
-            // cache's end
-            static const bool head_legacy = ggml_env_switch("LLAMA_KV_SEQ_RM_HEAD_LEGACY");
-            const uint32_t top  = head_legacy ? cells.size() : std::max(head, cells.used_max_p1());
-            const uint32_t near = head_legacy ? head : (uint32_t) std::min<uint64_t>(top, uint64_t(head) + n_rollback_max);
-            for (uint32_t i = near; n_rm > 0 && i-- > head;) {
-                visit(i);
-            }
-            for (uint32_t i = head; n_rm > 0 && i-- > 0;) {
-                visit(i);
-            }
-            for (uint32_t i = top; n_rm > 0 && i-- > near;) {
-                visit(i);
-            }
-        } else {
-            for (uint32_t i = 0; i < cells.size(); ++i) {
-                if (!cells.pos_in(i, p0, p1)) {
-                    continue;
-                }
-
-                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                    if (new_head == cells.size()) {
-                        new_head = i;
-                    }
-                }
-            }
-        }
+        // the sequence's position index finds the cells, so a speculative rollback's few cells cost a lookup each, not a
+        // walk of the cache (this replaces the fork's walk from the head, 6ea8df2 and 3db1d577d)
+        const uint32_t new_head = cells.seq_rm(seq_id, p0, p1);
 
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
@@ -2666,6 +2620,20 @@ bool llama_kv_cache::has_cell_ext() const {
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
 }
 
+void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    const int64_t n_kv = dst->ne[0];
+    std::vector<int32_t> data(n_kv * ubatch->n_tokens);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
+            data[i*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -3821,6 +3789,10 @@ void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
+}
+
+void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_relative_pos(dst, ubatch, extent);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

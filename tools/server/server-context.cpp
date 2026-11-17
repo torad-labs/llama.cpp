@@ -1078,6 +1078,10 @@ struct server_slot {
         size_t stop_pos = std::string::npos;
 
         for (const std::string & word : task->params.antiprompt) {
+            if (word.empty()) {
+                continue;
+            }
+
             size_t pos;
 
             if (is_full_stop) {
@@ -2109,6 +2113,8 @@ private:
         }
 
         mtmd_cap = mtmd_helper_get_capabilities(model_tgt, mctx);
+        // the helper only knows about the built-in video decoder
+        mtmd_cap.video = mtmd_cap.video || (mtmd_cap.vision && init_opt.video_params.decoder != nullptr);
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
             if (params_base.ctx_shift) {
@@ -2248,6 +2254,10 @@ private:
 
             if (has_cap_tts()) {
                 slot.tts.ctx.init(ctx_tgt, mctx);
+                if (!slot.tts.is_supported()) {
+                    SRV_ERR("%s", "the context cannot run the audio generation of this model\n");
+                    return false;
+                }
             }
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
@@ -2943,22 +2953,18 @@ private:
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         slot.idle_cache_refusal = {};
-        // process per-request lora adapters
-        if (!task.params.lora.empty()) {
-            auto task_loras = construct_lora_list(task.params.lora);
-            if (!are_lora_equal(task_loras, slot.lora)) {
-                // if lora has changed, check to see if the cache should be cleared
-                if (lora_should_clear_cache(slot.lora, task_loras)) {
-                    SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
-                    slot.checkpoints_wait();
-                    slot.prompt.clear();
-                } else {
-                    SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
-                }
-                slot.lora = task_loras;
+        // per-request lora if given, otherwise the global config
+        auto task_loras = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+        if (!are_lora_equal(task_loras, slot.lora)) {
+            // if lora has changed, check to see if the cache should be cleared
+            if (lora_should_clear_cache(slot.lora, task_loras)) {
+                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
+                slot.checkpoints_wait();
+                slot.prompt.clear();
+            } else {
+                SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
             }
-        } else {
-            slot.lora = params_base.lora_adapters;
+            slot.lora = task_loras;
         }
 
         // if using alora, make sure it's only a single one requested and active
@@ -3024,7 +3030,12 @@ private:
             // mtmd_helper always re-eval the whole prompt
             slot.prompt_clear();
             task.tts_inp.data.seq_id = slot.id;
-            if (slot.tts.ctx.set_input(task.tts_inp.get()) != 0) {
+            const int32_t ret = slot.tts.ctx.set_input(task.tts_inp.get());
+            if (ret == 2) {
+                send_error(task, "invalid TTS input: the model may not support \"speed\", \"loudness\", \"cfg_scale\" or \"flow_steps\", see the server log", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            if (ret != 0) {
                 send_error(task, "failed to process TTS prompt", ERROR_TYPE_SERVER);
                 return false;
             }
@@ -5289,7 +5300,7 @@ private:
                 return;
             }
 
-            const int32_t n_predict = slot.n_predict_max > 0 ? slot.n_predict_max : 512;
+            const int32_t n_predict = slot.tts.ctx.max_frames(slot.n_predict_max);
             if (slot.tts.stop || slot.tts.n_decoded >= n_predict) {
                 int32_t      sample_rate = 0;
                 const char * data        = nullptr;
@@ -7243,6 +7254,10 @@ void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
 }
 
+void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder) {
+    impl->init_opt.video_params.decoder = decoder;
+}
+
 //
 // server_routes
 //
@@ -7666,12 +7681,12 @@ json server_routes::get_model_info() const {
 // body of /tts and /v1/audio/speech; multipart form fields arrive as strings, the numeric and boolean params get their types back
 static json parse_tts_body(const server_http_req & req) {
     json body = json::parse(req.body);
-    for (const char * k : { "top_k", "n_predict", "max_tokens", "seed" }) {
+    for (const char * k : { "top_k", "n_predict", "max_tokens", "seed", "flow_steps" }) {
         if (body.contains(k) && body[k].is_string()) {
             body[k] = std::stoll(body[k].get<std::string>());
         }
     }
-    for (const char * k : { "top_p", "temperature", "repeat_penalty", "speed" }) {
+    for (const char * k : { "top_p", "temperature", "repeat_penalty", "speed", "loudness", "cfg_scale" }) {
         if (body.contains(k) && body[k].is_string()) {
             body[k] = std::stof(body[k].get<std::string>());
         }
@@ -9008,6 +9023,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const serve
     }
     task.tts_inp.set_prompt(tts_prompt.empty() ? prompt : tts_prompt);
     task.tts_inp.set_lang(lang);
+    task.tts_inp.set_speaker_ref_text(json_value(body, "speaker_ref_text", std::string()));
     task.tts_inp.data.stream    = stream;
     task.tts_inp.data.out_type  = response_format == "pcm" || pcm16
         ? MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM
@@ -9078,8 +9094,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const serve
     task.id = rd.get_new_id();
     rd.post_task(std::move(task));
 
-    // raw LE mono samples; audio/L16 would imply 16-bit big-endian (RFC 2586)
-    const std::string pcm_type = "audio/pcm;rate=" + std::to_string(info.sample_rate);
+    // raw LE samples, channels interleaved; audio/L16 would imply 16-bit big-endian (RFC 2586)
+    const std::string pcm_type = "audio/pcm;rate=" + std::to_string(info.sample_rate) +
+        (info.n_channels > 1 ? ";channels=" + std::to_string(info.n_channels) : "");
     const std::string content_type = pcm16 ? pcm_type + ";encoding=signed-int;bits=16"
         : response_format == "pcm" ? pcm_type + ";encoding=float;bits=32"
         : "audio/wav";

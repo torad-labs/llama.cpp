@@ -627,9 +627,14 @@ caps caps_get(jinja::program & prog) {
         // levels sharing a render are aliases and the highest one is kept
         const auto unknown = render("REASONING_EFFORT_UNKNOWN");
         std::vector<std::string> renders;
+        std::vector<std::string> rejected;
         for (const auto & level : candidates) {
             const auto rendered = render(level);
-            if (!rendered || rendered == unknown) {
+            if (!rendered) {
+                rejected.push_back(level);
+                continue;
+            }
+            if (rendered == unknown) {
                 continue;
             }
             const auto it = std::find(renders.begin(), renders.end(), *rendered);
@@ -640,6 +645,29 @@ caps caps_get(jinja::program & prog) {
                 result.reasoning_effort_levels.push_back(level);
             }
         }
+
+        // a template that renders no level fails the probe for another reason, so its failures say nothing about the levels
+        if (!result.reasoning_effort_levels.empty()) {
+            result.reasoning_effort_rejected = rejected;
+            if (!unknown) {
+                for (const auto & level : candidates) {
+                    if (std::find(rejected.begin(), rejected.end(), level) == rejected.end()) {
+                        result.reasoning_effort_accepted.push_back(level);
+                    }
+                }
+            }
+        }
+
+        // "none" is not one of the levels above: it turns thinking off, and a template may also have a level for it
+        const auto none = render("none");
+        std::optional<std::string> echoed = unknown;
+        if (echoed) {
+            const std::string probe = "REASONING_EFFORT_UNKNOWN";
+            for (size_t pos = echoed->find(probe); pos != std::string::npos; pos = echoed->find(probe, pos + 4)) {
+                echoed->replace(pos, probe.size(), "none");
+            }
+        }
+        result.reasoning_effort_none = none && none != unknown && none != echoed;
     }
 
     JJ_DEBUG("%s\n", result.to_string().c_str());

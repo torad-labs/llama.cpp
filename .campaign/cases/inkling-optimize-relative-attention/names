@@ -1,0 +1,8 @@
+inkling-rel-ctest-cases-registered
+inkling-rel-ctest-cases-pass-on-card-1
+inkling-rel-ctest-cases-all-run
+inkling2-fixture-agrees
+inkling2-prompt-past-distance-1024-agrees-with-cpu
+inkling2-decode-past-distance-1024-agrees-with-cpu
+inkling2-no-per-head-bias-grows-with-the-cache-pool
+inkling2-graph-reuse-holds-while-sessions-come-and-go

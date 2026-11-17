@@ -267,7 +267,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
 endif()
 
-llama_build(test-llama-archs.cpp)
+llama_build(test-llama-archs.cpp llama-archs-gguf.cpp test-llama-archs-inkling.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
@@ -305,6 +305,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # a 16-thread host. In a suite at -j 6 on that host at load 45 to 50 the first passed ctest's default 1,500 s and the
     # second took 1,363 s: slow, not hung. An hour holds that six times over
     set_tests_properties(test-llama-archs test-glm5next PROPERTIES TIMEOUT 3600)
+    if (GGML_CUDA)
+        # Inkling 2 under a two-rank tensor split on the first GPU against that GPU alone, sequence state included
+        foreach(inkling_case prefill decode chunks seq-cp state rollback)
+            llama_test(test-llama-archs NAME test-inkling2-split-${inkling_case}
+                ARGS --inkling-split ${inkling_case} --inkling-split-device CUDA0,CUDA0 -s 1234)
+        endforeach()
+    endif()
     llama_build_and_test(test-speculative-mtp.cpp)
     llama_test(test-speculative-mtp NAME test-speculative-mtp-dp-cpu ARGS --dp-device CPU)
 
@@ -487,6 +494,28 @@ set_tests_properties(test-llama-context PROPERTIES
     ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
 )
 
+# Inkling 2's sequence state (attention caches and the convolution state) through the context cases, on a fixture
+# whose weights spread 0.1, where the next logits follow every earlier token. A case that skips fails: these must run
+set(INKLING_STATE_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-inkling-state")
+file(MAKE_DIRECTORY "${INKLING_STATE_DIR}")
+llama_test(test-llama-archs NAME test-inkling-state-model LABEL main ARGS -a inkling2 -s 1 -d 0.1 -o "${INKLING_STATE_DIR}")
+set_tests_properties(test-inkling-state-model PROPERTIES FIXTURES_SETUP inkling-state-model)
+# a session saved before its last token and restored: the same next logits as the run that never stopped
+set(INKLING_STATE_CASES_restore           "^(baseline|state_load|rt)$")
+# the same session restored into another sequence, over the host and the device paths, and into scattered cells
+set(INKLING_STATE_CASES_restore-other-seq "^(baseline|cp_h|cp_d|cp_h_s|cp_d_s|frag)$")
+# prefix reuse: a cut the convolution snapshots cannot serve is refused, an accepted one serves the kept tokens' state
+set(INKLING_STATE_CASES_prefix            "^(replay|rollback|rollback_bound|shared|seq_rm)$")
+foreach(name restore restore-other-seq prefix)
+    llama_test(test-llama-context NAME test-inkling-state-${name} LABEL main
+        ARGS -m "${INKLING_STATE_DIR}/inkling2-moe.gguf" --test "${INKLING_STATE_CASES_${name}}")
+    set_tests_properties(test-inkling-state-${name} PROPERTIES
+        FIXTURES_REQUIRED inkling-state-model
+        FAIL_REGULAR_EXPRESSION "skipped  *: *[1-9]"
+        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+    )
+endforeach()
+
 llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
@@ -628,7 +657,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     endif()
     llama_build_and_test(test-cuda-gdn-dp-store.cpp)
     llama_build_and_test(test-backend-meta-views.cpp)
-    llama_build_and_test(test-backend-meta-split.cpp)
+    # with the split decisions of Inkling 2, which load a model with no data over the meta backend
+    llama_build_and_test(test-backend-meta-split.cpp test-backend-meta-split-inkling.cpp llama-archs-gguf.cpp)
+    target_include_directories(test-backend-meta-split PRIVATE ${PROJECT_SOURCE_DIR}/src)
     if (GGML_CUDA)
         llama_test(test-backend-meta-split NAME test-backend-meta-permuted-read ARGS --permuted-read)
     endif()

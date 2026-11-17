@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -1066,7 +1067,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
                         return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                     }
                 }
-                GGML_ABORT("shape mismatch for %s", ggml_op_name(tensor->op));
+                GGML_ABORT("shape mismatch for %s: node=%s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src=%s [%" PRId64 ",%" PRId64
+                    ",%" PRId64 ",%" PRId64 "] split on axis %d in %u segments", ggml_op_name(tensor->op), tensor->name,
+                    tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], tensor->src[0]->name, tensor->src[0]->ne[0],
+                    tensor->src[0]->ne[1], tensor->src[0]->ne[2], tensor->src[0]->ne[3], (int) src_ss[0].axis, src_ss[0].n_segments);
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
             case GGML_BACKEND_SPLIT_AXIS_LOCAL:
@@ -1277,7 +1281,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
             return handle_batch_axes(src_ss, 3, {3, 3, 3, 3, -1, 3});
         }
         GGML_ASSERT(tensor->src[5] == nullptr || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        // A mask with a row of its own a head (ne[2] the heads of q, as a relative position bias folded into it) is split
+        // as q's heads are: each device masks its heads with their rows
+        const bool mask_by_heads = tensor->src[3] != nullptr && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_2 && tensor->src[3]->ne[2] == tensor->src[0]->ne[2];
+        GGML_ASSERT(!mask_by_heads || split_states_equal(src_ss[0], src_ss[3]));
+        GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || mask_by_heads);
 
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);

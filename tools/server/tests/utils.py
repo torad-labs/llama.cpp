@@ -77,6 +77,7 @@ class ServerProcess:
     n_ga: int | None = None
     n_ga_w: int | None = None
     n_predict: int | None = None
+    reverse_prompt: str | None = None
     n_prompts: int | None = 0
     slot_save_path: str | None = None
     id_slot: int | None = None
@@ -118,6 +119,7 @@ class ServerProcess:
     chat_template_file: str | None = None
     server_path: str | None = None
     mmproj_url: str | None = None
+    mmproj_file: str | None = None
     no_mmproj: bool | None = None
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
@@ -256,6 +258,8 @@ class ServerProcess:
             server_args.extend(["-fa", self.fa])
         if self.n_predict:
             server_args.extend(["--n-predict", self.n_predict])
+        if self.reverse_prompt is not None:
+            server_args.extend(["--reverse-prompt", self.reverse_prompt])
         if self.slot_save_path:
             server_args.extend(["--slot-save-path", self.slot_save_path])
         if self.n_ga:
@@ -306,6 +310,8 @@ class ServerProcess:
             server_args.extend(["--chat-template-file", self.chat_template_file])
         if self.mmproj_url:
             server_args.extend(["--mmproj-url", self.mmproj_url])
+        if self.mmproj_file:
+            server_args.extend(["--mmproj", self.mmproj_file])
         if self.no_mmproj:
             server_args.append("--no-mmproj")
         if self.media_path:

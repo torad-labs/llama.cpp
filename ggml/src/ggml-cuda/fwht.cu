@@ -51,7 +51,7 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
 #pragma unroll
         for (int j = 0; j < el_w; j++) {
             const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+            const float val2 = ggml_cuda_shfl_xor(val, h, warp_size);
 
             reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
         }
@@ -158,7 +158,7 @@ static __device__ __forceinline__ void fwht_block_transform(float (&reg)[N / NT]
 #pragma unroll
         for (int j = 0; j < NE; j++) {
             const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+            const float val2 = ggml_cuda_shfl_xor(val, h, warp_size);
             reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
         }
     }

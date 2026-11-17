@@ -429,23 +429,21 @@ def resolve_server_arguments(argv, settings):
     return argv[:index] + argv[index + 2:]
 
 
-def verify_assets():
-    for path, expected in ASSET_SHA256.items():
+def verify_assets(assets=ASSET_SHA256):
+    for path, expected in assets.items():
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise ValueError("serving asset SHA256 mismatch: " + str(path))
 
 
-def main(args):
-    argv, settings = make_plan(args)
-    verify_assets()
-    if args.dry_run:
+def launch(argv, settings, paths, dry_run):
+    """Print the plan as JSON on a dry run; otherwise check the server and the (label, path or None) local files it
+    reads, then replace this process with the server."""
+    if dry_run:
         if Path(argv[0]).is_file():
             argv = resolve_server_arguments(argv, settings)
         print(json.dumps({"argv": argv, "env": settings, "removed": removed_overrides(os.environ)}, indent=2))
         return 0
-    for label, path in [("server", Path(argv[0])), ("model", args.model.expanduser()),
-                        ("mmproj", args.mmproj.expanduser() if args.mmproj else None),
-                        ("dflash draft", args.dflash.expanduser() if args.dflash else None)]:
+    for label, path in [("server", Path(argv[0])), *paths]:
         if path is not None and not path.is_file():
             raise ValueError("missing local " + label + ": " + str(path))
     if not os.access(argv[0], os.X_OK):
@@ -453,6 +451,14 @@ def main(args):
     argv = resolve_server_arguments(argv, settings)
     os.execve(argv[0], argv, execution_environment(settings))
     return 0
+
+
+def main(args):
+    argv, settings = make_plan(args)
+    verify_assets()
+    return launch(argv, settings, [("model", args.model.expanduser()),
+                                   ("mmproj", args.mmproj.expanduser() if args.mmproj else None),
+                                   ("dflash draft", args.dflash.expanduser() if args.dflash else None)], args.dry_run)
 
 
 if __name__ == "__main__":

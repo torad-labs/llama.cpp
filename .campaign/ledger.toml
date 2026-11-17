@@ -1,0 +1,351 @@
+# The campaign ledger. Read and changed through `campaign` (run `campaign help`).
+# Hand edits are fine; keep everything in fields, comments are not kept.
+
+[campaign]
+goal = ''
+base = 'main'
+merge = 'pr'
+judged = [
+  '.campaign/checks/',
+  '.campaign/cases/',
+]
+agent = 'campaign seat'
+
+[feature."inkling-baseline"]
+goal = 'Inkling 2 Small runs in our fork on current upstream llama.cpp, with GLM 5.3 serving unchanged, landed on dev.'
+
+[feature."inkling-split-state"]
+goal = 'Inkling 2 runs split across devices with the same results as on one device, sequence state included.'
+
+[feature."inkling-server-parity"]
+goal = 'A synthetic Inkling model is served through this fork server with the same launcher, chat and prompt-cache behavior the GLM serving has, ready for the real packs.'
+
+[feature."inkling-optimize"]
+goal = 'Inkling 2 serving carries the optimization level of GLM Tensor 4 and is proven on this machine, so a rented four-card box only confirms numbers.'
+
+[[row]]
+id = 'inkling-baseline-merge'
+title = 'Upstream master is merged and the tree builds'
+feature = 'inkling-baseline'
+status = 'done'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Upstream ggml-org/llama.cpp at d3c3e242c16b8cbf51400fad410cd69b22d64f35 is merged into this fork. Conflicts are resolved so the fork GLM 5.3 serving behavior is preserved, and workflow files this fork deleted stay deleted. The merged tree configures and builds the server and its test programs with CUDA enabled.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD',
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target llama-server test-llama-archs test-chat test-mtmd-impl test-backend-meta-split test-server-response test-backend-ops',
+  'sh .campaign/cases/check.sh inkling-baseline-merge',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-16 23:53 CT: added; 2 of 2 checks fail, as they should before the work',
+  '2026-11-16 23:53 CT llamacpp-issues: Dry run on 2026-11-16, merging d3c3e242c into 3d9eea147 in a temp worktree (removed after): 33 conflicted paths. Ten are .github/workflows files this fork deleted and upstream edited; keep them deleted. The 23 content conflicts sit mainly in the CUDA flash-attention files, the graph builder, the KV cache, the model loader and the server. Background: docs/torad/research/inkling-2-small/03-upstream-llama-port.md and 04-fork-gap-analysis.md.',
+  '2026-11-17 04:14 CT campaign: done in round 2 of inkling-baseline: its checks, its feature review, its code review passed',
+]
+
+[[row]]
+id = 'inkling-baseline-glm'
+title = 'GLM 5.3 serving behavior is unchanged by the merge'
+feature = 'inkling-baseline'
+status = 'done'
+owner = ''
+blocked_by = [
+  'inkling-baseline-merge',
+]
+guard = false
+spec = 'After the merge, GLM 5.3 Flash serving behaves as it did before it. The architecture fixtures, the tensor split decisions, the prompt step budget logic and the pinned launcher qualification dry runs all pass on the merged tree.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target test-llama-archs test-backend-meta-split test-server-response && ./build-campaign/bin/test-llama-archs && ./build-campaign/bin/test-backend-meta-split && ./build-campaign/bin/test-server-response',
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && (cd scripts/glm53 && python3 -m unittest test_qualification)',
+  'sh .campaign/cases/check.sh inkling-baseline-glm',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-16 23:53 CT: added; 2 of 2 checks fail, as they should before the work',
+  '2026-11-17 04:14 CT campaign: done in round 1 of inkling-baseline: its checks, its feature review, its code review passed',
+]
+
+[[row]]
+id = 'inkling-baseline-arch'
+title = 'Inkling 2 runs in this tree'
+feature = 'inkling-baseline'
+status = 'done'
+owner = ''
+blocked_by = [
+  'inkling-baseline-merge',
+]
+guard = false
+spec = 'The Inkling 2 architecture is live in this fork. Its synthetic fixture agrees in the architecture tests, its per-head attention mask cases pass on CUDA against the CPU reference, its chat media handling passes, and the image preprocessor cases pass.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target test-llama-archs test-chat test-mtmd-impl && ./build-campaign/bin/test-llama-archs && ./build-campaign/bin/test-chat && ./build-campaign/bin/test-mtmd-impl',
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target test-backend-ops && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT',
+  'sh .campaign/cases/check.sh inkling-baseline-arch',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-16 23:53 CT: added; 2 of 2 checks fail, as they should before the work',
+  '2026-11-16 23:53 CT llamacpp-issues: Python FP8 conversion tests are not a check in this feature: torch is not installed for the system python3, and conversion gets its own gate in the later packs work. GPU test runs hold /run/user/1000/gpu1.lock on card 1; card 0 serves another seat and stays untouched.',
+  '2026-11-17 04:14 CT campaign: done in round 1 of inkling-baseline: its checks, its feature review, its code review passed',
+]
+
+[[row]]
+id = 'inkling-baseline-record'
+title = 'The merge is recorded in TORAD.md'
+feature = 'inkling-baseline'
+status = 'done'
+owner = ''
+blocked_by = [
+  'inkling-baseline-merge',
+]
+guard = false
+spec = 'TORAD.md records this upstream merge in the form earlier upstream merges are recorded there, naming the upstream commit and any fork behavior the conflict resolutions changed.'
+checks = [
+  'grep -q d3c3e242c TORAD.md',
+  'sh .campaign/cases/check.sh inkling-baseline-record',
+]
+reviews = [
+  'feature',
+]
+notes = [
+  '2026-11-16 23:53 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 04:14 CT campaign: done in round 2 of inkling-baseline: its checks, its feature review passed',
+]
+
+[[row]]
+id = 'inkling-split-state-decisions'
+title = 'Every Inkling tensor and cache has a split decision'
+feature = 'inkling-split-state'
+status = 'done'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Every weight tensor, cache and the convolution state of the inkling2 architecture has an explicit tensor-split decision in the meta backend, with special rules where the standard table has no analog. The global and sliding KV caches split by heads and are never mirrored. The meta split tests cover the Inkling tensor and cache names and fail if any of them would be mirrored instead of split.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && cmake --build build-campaign -j --target test-backend-meta-split && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-backend-meta-split > /tmp/inkling-meta-split.out 2>&1 && grep -qi inkling /tmp/inkling-meta-split.out',
+  'sh .campaign/cases/check.sh inkling-split-state-decisions',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 03:55 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 03:55 CT llamacpp-issues: Study: docs/torad/research/inkling-2-small/04-fork-gap-analysis.md item 6 lists the tensors with no standard analog, and 05-capacity-and-tensor4.md has the split the capacity math assumes. A mirrored global KV cache at BF16 would need about 92 GiB a card at the GLM pool size and simply not load.',
+  '2026-11-17 06:09 CT campaign: done in round 1 of inkling-split-state: its checks, its feature review, its code review passed',
+]
+
+[[row]]
+id = 'inkling-split-state-equivalence'
+title = 'Split and unsplit Inkling runs agree, state included'
+feature = 'inkling-split-state'
+status = 'done'
+owner = ''
+blocked_by = [
+  'inkling-split-state-decisions',
+]
+guard = false
+spec = 'The synthetic Inkling fixture run under a two-rank tensor split matches one rank within the fixture tolerance for prefill, decode, and prefill crossing at least two chunk boundaries, and stays matching after sequence copy, state save and restore, and rollback of a rejected step. The convolution state is compared directly, since a wrongly split or restored state runs and answers slightly wrong instead of failing. The comparisons run as ctest cases whose names carry inkling, beside the existing architecture fixture.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && cmake --build build-campaign -j && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ctest --test-dir build-campaign -R inkling --no-tests=error --output-on-failure',
+  'sh .campaign/cases/check.sh inkling-split-state-equivalence',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 03:55 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 03:55 CT llamacpp-issues: Phase 2 of docs/torad/research/inkling-2-small/07-implementation-plan.md. The existing tensor fixture (--glm-tensor-device in tests/test-llama-archs.cpp) is GLM-only (test_glm_tensor); its ranks may repeat a device, so CUDA0,CUDA0 gives two ranks on card 1 under CUDA_VISIBLE_DEVICES=1. Card 0 serves another seat: GPU work holds /run/user/1000/gpu1.lock only. Fresh build folders need GGML_CCACHE=OFF (sccache vs nvcc 13.3); the checks carry it.',
+  '2026-11-17 06:09 CT campaign: done in round 1 of inkling-split-state: its checks, its feature review, its code review passed',
+]
+
+[[row]]
+id = 'inkling-server-parity-launcher'
+title = 'An Inkling launcher with pinned dry-run plans'
+feature = 'inkling-server-parity'
+status = 'done'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'scripts/inkling2 holds a launcher in the pattern of scripts/glm53: named profiles for the card layouts this work targets, each dry-running to a pinned plan of server arguments and environment, held by unit tests in the same folder. The plans carry the serving defaults this fork uses (flash attention, the prompt step controls, a unified cache, reserved sessions) with the values the capacity study derived and the pack paths the conversion work will produce.'
+checks = [
+  "git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && (cd scripts/inkling2 && python3 -m unittest discover -p 'test_*.py')",
+  'sh .campaign/cases/check.sh inkling-server-parity-launcher',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 04:16 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 04:22 CT llamacpp-issues: Profiles and their values come from docs/torad/research/inkling-2-small/05-capacity-and-tensor4.md; the pattern is scripts/glm53 (serve.py with test_qualification.py). The packs the profiles name come from the conversion work that follows with Marcos; what is pinned now is the plan each profile launches.',
+  '2026-11-17 06:38 CT campaign: done in round 2 of inkling-server-parity: its checks, its feature review, its code review passed',
+]
+
+[[row]]
+id = 'inkling-server-parity-chat'
+title = 'Chat, tools and template behavior qualified'
+feature = 'inkling-server-parity'
+status = 'done'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Through the server and its chat tests, Inkling 2 handles text turns and system prompts, every reasoning effort level with an invalid one refused as a client error, tool declarations, tool calls with nested arguments and their results, thinking content kept across turns, and image parts before, between and after text. Sampling never emits an id at or above the unpadded vocabulary, and generation ends at the model end token. Server-level cases carry inkling in their test names.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && cmake --build build-campaign -j --target llama-server test-llama-archs && (cd tools/server/tests && (test -x /tmp/inkling-server-tests-venv/bin/pytest || (python3 -m venv /tmp/inkling-server-tests-venv && /tmp/inkling-server-tests-venv/bin/pip install -q -r requirements.txt)) && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 LLAMA_SERVER_BIN_PATH=$PWD/../../../build-campaign/bin/llama-server /tmp/inkling-server-tests-venv/bin/pytest unit -k inkling -q)',
+  'sh .campaign/cases/check.sh inkling-server-parity-chat',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 04:22 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 04:22 CT llamacpp-issues: The behaviors under qualification are listed in docs/torad/research/inkling-2-small/01-model-facts.md (sampling defaults, reasoning effort levels, the template raising on an unknown level) and Phase 3 of 07-implementation-plan.md. Upstream a946eb541 already answers a rejected reasoning_effort with a 400; what is ours to prove is this fork server end to end. The synthetic inkling2 GGUF written by test-llama-archs -o is the model for server-level cases.',
+  '2026-11-17 04:23 CT llamacpp-issues: The check provisions /tmp/inkling-server-tests-venv from tools/server/tests/requirements.txt on first run: the system python cannot collect these tests (no filelock), and earlier sessions ran them from just such a venv. Server-level cases can use the same venv.',
+  '2026-11-17 05:42 CT llamacpp-issues: Lead: the round-1 dispute against this check is right. It ran pytest without building the server or setting LLAMA_SERVER_BIN_PATH, so in the feature worktree the harness fell back to build/bin and every test errored before running, while with the variable set the tests and all 20 cases pass. The check now builds llama-server and test-llama-archs into build-campaign and exports LLAMA_SERVER_BIN_PATH at it, as the state check and the item cases already did. The spec and the cases are unchanged.',
+  '2026-11-17 06:38 CT campaign: done in round 3 of inkling-server-parity: its checks, its feature review, its code review passed',
+]
+
+[[row]]
+id = 'inkling-server-parity-state'
+title = 'Prompt cache restores Inkling sequence state exactly'
+feature = 'inkling-server-parity'
+status = 'done'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Saving a session mid-conversation and restoring it, including into a different slot, gives the same next logits as the uninterrupted run, and prefix reuse refuses or snapshots correctly where the convolution state is involved. The comparisons run as ctest cases whose names carry inkling-state.'
+checks = [
+  "git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && ctest --test-dir build-campaign -N -R inkling-state | grep -qE 'Total Tests: [1-9]' && cmake --build build-campaign -j && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ctest --test-dir build-campaign -R inkling-state --no-tests=error --output-on-failure",
+  'sh .campaign/cases/check.sh inkling-server-parity-state',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 04:22 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 04:22 CT llamacpp-issues: The convolution state is 6.1875 MiB a sequence at F32 (docs/torad/research/inkling-2-small/02-architecture.md); the fork recurrent rollback and restore tests are the pattern. GPU work holds /run/user/1000/gpu1.lock on card 1 only; fresh build folders need GGML_CCACHE=OFF and the checks carry it.',
+  '2026-11-17 06:38 CT campaign: done in round 1 of inkling-server-parity: its checks, its feature review, its code review passed',
+]
+
+[[row]]
+id = 'inkling-optimize-relative-attention'
+title = 'Relative attention without a materialized bias'
+feature = 'inkling-optimize'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "An Inkling layer's relative-position bias is added inside the attention kernel, computed from the relative features and the learned distance table, with distances derived on the device from query and cache-cell positions. No host distance matrix is built, and no per-layer bias tensor grows with the unified cache pool, so the served graph keeps its shape and graph reuse holds while sequences come and go. Focal logits agree with the materialized-mask path within the fixture's tolerance, including distances beyond the 1024 table extent that use the sentinel entry."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && ctest --test-dir build-campaign -N -R inkling-rel | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ctest --test-dir build-campaign -R inkling-rel --no-tests=error --output-on-failure && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-llama-archs -a inkling2',
+  'sh .campaign/cases/check.sh inkling-optimize-relative-attention',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 09:31 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 09:40 CT: Step 1 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. Today the model graph materializes a per-head F16 bias over heads x KV cells x query rows from an I32 host distance matrix every step (src/models/inkling2.cpp); where cells live is already hung off the mask (llama-kv-cache cell headers). Keep the mask path as the test oracle; the new kernel path must agree with it, sink folded in-kernel the way the flash graph folds it today. Position growth beyond distance 1024 uses the table sentinel row; global layers also carry the 1 + 0.1*ln scale on Q and R. Local card reads order the work; four-card rates come later. GPU: card 1 only, flock /run/user/1000/gpu1.lock, CUDA_VISIBLE_DEVICES=1 (programs see it as CUDA0).',
+]
+
+[[row]]
+id = 'inkling-optimize-layer-fusions'
+title = 'Per-layer prologue and epilogue fusions'
+feature = 'inkling-optimize'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "Each Inkling layer's small tensor work becomes a handful of fused kernels instead of a launch queue: the residual depth mix for the attention block and expert block runs as one kernel over its block summaries and partial state, the norm clips are fused with the projections they follow, the attention output gate is fused with the output side it feeds, and the router chain runs in F32 through the fused expert-selection path including sigmoid scoring, selection bias, sum-plus-epsilon normalization and the softcapped expert activation. Small-row decode is no longer launch-bound on this work, and no layer silently falls back to an unfused path."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && ctest --test-dir build-campaign -N -R inkling-fuse | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ctest --test-dir build-campaign -R inkling-fuse --no-tests=error --output-on-failure && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-backend-ops test -b CUDA0 -o MOE && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-llama-archs -a inkling2',
+  'sh .campaign/cases/check.sh inkling-optimize-layer-fusions',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 09:33 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 09:40 CT: Step 2 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. AttnRes: 8 blocks of 6 layers, at most 9 mix sources (finished summaries plus current partial); math in 02-architecture.md. Router is F32, sigmoid scoring plus selection bias, normalize by selected sum + 1e-20, route_scale 8.0, softcapped SwiGLU is LLM_FFN_SITU. Check the fork topk-moe path first and extend it rather than falling back; a silent unfused fallback fails the spec. GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.',
+]
+
+[[row]]
+id = 'inkling-optimize-conv-kernel'
+title = 'Short convolution as one stateful kernel'
+feature = 'inkling-optimize'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "Each of an Inkling layer's four short convolutions runs as one stateful kernel instead of a chain of small operations: it reads the ring of the previous three positions plus the current rows, applies the static taps and, where the layer has them, the dynamic per-token taps and the scaled residual term, and writes the advanced ring for the next step. The state it leaves behind is the same state the current graph plumbing leaves, so rollback, chunked prompt processing, sequence copy and prompt-cache restore all behave exactly as before, and logits agree across chunk and sequence boundaries."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && ctest --test-dir build-campaign -N -R inkling-conv | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ctest --test-dir build-campaign -R inkling-conv --no-tests=error --output-on-failure && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-llama-archs -a inkling2',
+  'sh .campaign/cases/check.sh inkling-optimize-conv-kernel',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 09:36 CT: added; 1 of 1 checks fail, as they should before the work',
+  "2026-11-17 09:40 CT: Step 3 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. Four depthwise convs per layer (K, V, post-attn-out, post-MoE), kernel 4, 3-position ring; 11,264 state channels per layer, 6.1875 MiB per sequence. Global-layer K/V convs add dynamic per-token taps. Preserve the build_conv_state_store contract exactly: the split-state campaign's test-inkling2-split-* ctests and the state cases are the regression packs for rollback, chunk boundaries, seq copy and restore. Today this is 192 conv sites per forward as graph plumbing. GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.",
+]
+
+[[row]]
+id = 'inkling-optimize-moe-shapes'
+title = 'Expert paths proven at Inkling shapes'
+feature = 'inkling-optimize'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "The routed-expert paths run at Inkling's real shapes, 384 experts with eight per token, intermediate 2304 against hidden 4608, without a removable gate declining them: the softcapped expert activation runs inside the fused path wherever it is the faster choice, and the choice between the small-row path and the grouped-matmul path is decided per row count from reads on this machine's card and recorded with the change. Backend operation tests at those shapes and the synthetic model both agree with the reference results."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && ctest --test-dir build-campaign -N -R inkling-moe | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ctest --test-dir build-campaign -R inkling-moe --no-tests=error --output-on-failure && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-backend-ops test -b CUDA0 -o MUL_MAT_ID && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-llama-archs -a inkling2',
+  'sh .campaign/cases/check.sh inkling-optimize-moe-shapes',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 09:38 CT: added; 1 of 1 checks fail, as they should before the work',
+  "2026-11-17 09:40 CT: Step 4 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. Re-examine ggml_cuda_mmvq_moe_usable bounds, ggml_cuda_can_share_mmq_id and ggml_cuda_should_fuse_mul_mat_q at 384 experts, top-8, 2304/4608. At 23 served rows a layer touches roughly 150 experts, which is where the small-row vs grouped decision bites; decide from reads on this machine's card and record the read with the change. SITU softcapped activation must run in the fused path. GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.",
+]
+
+[[row]]
+id = 'inkling-optimize-kv-precision'
+title = 'Quantized KV proven for Inkling'
+feature = 'inkling-optimize'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "Inkling's keys and values, global and sliding layers, run from a q8_0 cache with logits agreeing with the F16 cache within the fixture's tolerance, and the two layers' precisions can be chosen separately where the plumbing allows. q4_0 stands behind the same proof. Nothing below F16 becomes the launcher's default until the real packs give a quality verdict, so what this item proves is that the capability is correct and in place, ready to switch on."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF && ctest --test-dir build-campaign -N -R inkling-kv | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ctest --test-dir build-campaign -R inkling-kv --no-tests=error --output-on-failure && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-llama-archs -a inkling2',
+  'sh .campaign/cases/check.sh inkling-optimize-kv-precision',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-17 09:40 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-17 09:40 CT: Step 6 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. The fork flash-attention already reads q8_0 KV; prove global and sliding layers separately at depth on the synthetic fixture against F16, q4_0 behind the same proof. Real-weight quality verdict waits for packs on the rented box; the inkling2 launcher keeps F16 defaults until then (scripts/inkling2/serve.py). GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.',
+]
