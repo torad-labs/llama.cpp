@@ -121,7 +121,7 @@ notes = [
 id = 'inkling-split-state-decisions'
 title = 'Every Inkling tensor and cache has a split decision'
 feature = 'inkling-split-state'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -137,13 +137,14 @@ reviews = [
 notes = [
   '2026-11-17 03:55 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 03:55 CT llamacpp-issues: Study: docs/torad/research/inkling-2-small/04-fork-gap-analysis.md item 6 lists the tensors with no standard analog, and 05-capacity-and-tensor4.md has the split the capacity math assumes. A mirrored global KV cache at BF16 would need about 92 GiB a card at the GLM pool size and simply not load.',
+  '2026-11-17 06:09 CT campaign: done in round 1 of inkling-split-state: its checks, its feature review, its code review passed',
 ]
 
 [[row]]
 id = 'inkling-split-state-equivalence'
 title = 'Split and unsplit Inkling runs agree, state included'
 feature = 'inkling-split-state'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = [
   'inkling-split-state-decisions',
@@ -161,6 +162,7 @@ reviews = [
 notes = [
   '2026-11-17 03:55 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 03:55 CT llamacpp-issues: Phase 2 of docs/torad/research/inkling-2-small/07-implementation-plan.md. The existing tensor fixture (--glm-tensor-device in tests/test-llama-archs.cpp) is GLM-only (test_glm_tensor); its ranks may repeat a device, so CUDA0,CUDA0 gives two ranks on card 1 under CUDA_VISIBLE_DEVICES=1. Card 0 serves another seat: GPU work holds /run/user/1000/gpu1.lock only. Fresh build folders need GGML_CCACHE=OFF (sccache vs nvcc 13.3); the checks carry it.',
+  '2026-11-17 06:09 CT campaign: done in round 1 of inkling-split-state: its checks, its feature review, its code review passed',
 ]
 
 [[row]]
