@@ -1,0 +1,108 @@
+# The campaign ledger. Read and changed through `campaign` (run `campaign help`).
+# Hand edits are fine; keep everything in fields, comments are not kept.
+
+[campaign]
+goal = ''
+base = 'main'
+judged = [
+  '.campaign/checks/',
+  '.campaign/cases/',
+]
+agent = 'campaign seat'
+
+[feature."inkling-baseline"]
+goal = 'Inkling 2 Small runs in our fork on current upstream llama.cpp, with GLM 5.3 serving unchanged.'
+
+[[row]]
+id = 'inkling-baseline-merge'
+title = 'Upstream master is merged and the tree builds'
+feature = 'inkling-baseline'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Upstream ggml-org/llama.cpp at d3c3e242c16b8cbf51400fad410cd69b22d64f35 is merged into this fork. Conflicts are resolved so the fork GLM 5.3 serving behavior is preserved, and workflow files this fork deleted stay deleted. The merged tree configures and builds the server and its test programs with CUDA enabled.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD',
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target llama-server test-llama-archs test-chat test-mtmd-impl test-backend-meta-split test-server-response test-backend-ops',
+  'sh .campaign/cases/check.sh inkling-baseline-merge',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-16 23:53 CT: added; 2 of 2 checks fail, as they should before the work',
+  '2026-11-16 23:53 CT llamacpp-issues: Dry run on 2026-11-16, merging d3c3e242c into 3d9eea147 in a temp worktree (removed after): 33 conflicted paths. Ten are .github/workflows files this fork deleted and upstream edited; keep them deleted. The 23 content conflicts sit mainly in the CUDA flash-attention files, the graph builder, the KV cache, the model loader and the server. Background: docs/torad/research/inkling-2-small/03-upstream-llama-port.md and 04-fork-gap-analysis.md.',
+]
+
+[[row]]
+id = 'inkling-baseline-glm'
+title = 'GLM 5.3 serving behavior is unchanged by the merge'
+feature = 'inkling-baseline'
+status = 'todo'
+owner = ''
+blocked_by = [
+  'inkling-baseline-merge',
+]
+guard = false
+spec = 'After the merge, GLM 5.3 Flash serving behaves as it did before it. The architecture fixtures, the tensor split decisions, the prompt step budget logic and the pinned launcher qualification dry runs all pass on the merged tree.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target test-llama-archs test-backend-meta-split test-server-response && ./build-campaign/bin/test-llama-archs && ./build-campaign/bin/test-backend-meta-split && ./build-campaign/bin/test-server-response',
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && (cd scripts/glm53 && python3 -m unittest test_qualification)',
+  'sh .campaign/cases/check.sh inkling-baseline-glm',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-16 23:53 CT: added; 2 of 2 checks fail, as they should before the work',
+]
+
+[[row]]
+id = 'inkling-baseline-arch'
+title = 'Inkling 2 runs in this tree'
+feature = 'inkling-baseline'
+status = 'todo'
+owner = ''
+blocked_by = [
+  'inkling-baseline-merge',
+]
+guard = false
+spec = 'The Inkling 2 architecture is live in this fork. Its synthetic fixture agrees in the architecture tests, its per-head attention mask cases pass on CUDA against the CPU reference, its chat media handling passes, and the image preprocessor cases pass.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target test-llama-archs test-chat test-mtmd-impl && ./build-campaign/bin/test-llama-archs && ./build-campaign/bin/test-chat && ./build-campaign/bin/test-mtmd-impl',
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target test-backend-ops && flock /run/user/1000/gpu1.lock env CUDA_VISIBLE_DEVICES=1 ./build-campaign/bin/test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT',
+  'sh .campaign/cases/check.sh inkling-baseline-arch',
+]
+reviews = [
+  'feature',
+  'code',
+]
+notes = [
+  '2026-11-16 23:53 CT: added; 2 of 2 checks fail, as they should before the work',
+  '2026-11-16 23:53 CT llamacpp-issues: Python FP8 conversion tests are not a check in this feature: torch is not installed for the system python3, and conversion gets its own gate in the later packs work. GPU test runs hold /run/user/1000/gpu1.lock on card 1; card 0 serves another seat and stays untouched.',
+]
+
+[[row]]
+id = 'inkling-baseline-record'
+title = 'The merge is recorded in TORAD.md'
+feature = 'inkling-baseline'
+status = 'todo'
+owner = ''
+blocked_by = [
+  'inkling-baseline-merge',
+]
+guard = false
+spec = 'TORAD.md records this upstream merge in the form earlier upstream merges are recorded there, naming the upstream commit and any fork behavior the conflict resolutions changed.'
+checks = [
+  'grep -q d3c3e242c TORAD.md',
+  'sh .campaign/cases/check.sh inkling-baseline-record',
+]
+reviews = [
+  'feature',
+]
+notes = [
+  '2026-11-16 23:53 CT: added; 1 of 1 checks fail, as they should before the work',
+]
