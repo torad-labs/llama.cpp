@@ -3,7 +3,7 @@
 
 [campaign]
 goal = ''
-base = 'main'
+base = 'dev'
 judged = [
   '.campaign/checks/',
   '.campaign/cases/',
@@ -11,7 +11,7 @@ judged = [
 agent = 'campaign seat'
 
 [feature."inkling-baseline"]
-goal = 'Inkling 2 Small runs in our fork on current upstream llama.cpp, with GLM 5.3 serving unchanged.'
+goal = 'Inkling 2 Small runs in our fork on current upstream llama.cpp, with GLM 5.3 serving unchanged, landed on dev.'
 
 [[row]]
 id = 'inkling-baseline-merge'
