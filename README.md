@@ -5,7 +5,7 @@
 [![CUDA sm_120](https://img.shields.io/badge/CUDA-sm__120-76b900.svg)](#1-build)
 
 This is Torad Labs' fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). It follows
-ggml-org/llama.cpp, whose `v1.0.0` it merged on 2026-11-14, and adds CUDA and server work
+ggml-org/llama.cpp, whose `v1.0.0` it merged on 2026-11-14 and `d3c3e242c` on 2026-11-17, and adds CUDA and server work
 measured on NVIDIA RTX 50-series cards. It also carries the PQ and PTQ ternary formats from
 [PrismML's llama.cpp](https://github.com/PrismML-Eng/llama.cpp), so PrismML's Bonsai models
 load here.
@@ -251,8 +251,9 @@ disclosing AI-written changes.
 ## Upstream
 
 [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) is upstream, the `upstream` remote.
-This fork merges it when it takes a newer base, most recently `v1.0.0` on 2026-11-14.
-[Upstream v1.0.0](TORAD.md#upstream-v100) says what that merge changed.
+This fork merges it when it takes a newer base, most recently `d3c3e242c` on 2026-11-17, after `v1.0.0` on
+2026-11-14. [Upstream d3c3e242c](TORAD.md#upstream-d3c3e242c) and [Upstream v1.0.0](TORAD.md#upstream-v100) say what
+those merges changed.
 
 The PQ and PTQ ternary kernels came from
 [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp), the `prism` remote. This
