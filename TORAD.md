@@ -664,4 +664,8 @@ for a credential-like name assigned a literal. The merge of upstream `v1.0.0` ch
 whose `TEST_API_KEY`, the literal `sk-this-is-the-secret-key`, is the key upstream's server tests start their test
 server with (the same line was on `main` before; the pass had never read the file). The one entry pins that whole line. Run on the
 pass's own script: control 4 of 4 with no exemption (the line and 3 canaries), red 3 of 3 canaries still firing with it
-(one sharing the line, one under the same name with another value), green 0 on the merge's 2,345 changed files.
+(one sharing the line, one under the same name with another value), green 0 on the merge's 2,345 changed files. The merge of upstream `d3c3e242c` (2026-11-17) added a second entry, on PR #264's first run of the pass:
+the `DATABASE_URL` line of the env block in upstream's markdown tutorial fixture
+`ui/apps/chat/tests/stories/fixtures/ai-tutorial.ts`, whose credentials are the words `user` and `password`
+against localhost. The entry pins that line with its value; the same line carrying a different password, or
+anything after it, does not match.
