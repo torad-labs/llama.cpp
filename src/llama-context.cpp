@@ -2205,6 +2205,9 @@ bool llama_context::supports_embd_row() const {
 
     // one of our backends must be able to read the buffer, e.g. not a draft on another GPU than the target output
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src->buffer);
+    if (llama_model_is_inkling_draft(model) && ggml_backend_buft_is_meta(buft)) {
+        return false;
+    }
     for (const auto & backend : backends) {
         if (ggml_backend_supports_buft(backend.get(), buft)) {
             return true;
@@ -2244,6 +2247,14 @@ void llama_context::layer_inp_dev_alloc() {
         return;
     }
 
+    auto * dev = model.dev_output();
+    auto * buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+    // The Inkling tensor split has no layout for layer_inp_dev.
+    if (model.arch == LLM_ARCH_INKLING2 && ggml_backend_buft_is_meta(buft)) {
+        cparams.embeddings_layer_inp_dev = false;
+        return;
+    }
+
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -2254,8 +2265,7 @@ void llama_context::layer_inp_dev_alloc() {
     layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, cparams.n_batch);
     ggml_set_name(layer_inp_dev, "layer_inp_dev");
 
-    layer_inp_dev_dev = model.dev_output();
-    auto * buft = layer_inp_dev_dev ? ggml_backend_dev_buffer_type(layer_inp_dev_dev) : ggml_backend_cpu_buffer_type();
+    layer_inp_dev_dev = dev;
 
     buf_layer_inp_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_layer_inp_dev.get(), buft));
     if (!buf_layer_inp_dev) {
@@ -2400,7 +2410,7 @@ bool llama_context::supports_state_row() const {
 
     // the rows replace the host state rows, so they must have the width the graph takes for those
     const ggml_tensor * src = cparams.ctx_state_src ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr;
-    if (src == nullptr || src->ne[0] != (int64_t) llama_batch_ext_select_n_embd_state(cparams.ctx_type, model.hparams)) {
+    if (src == nullptr || src->ne[0] != (int64_t) llama_batch_ext_select_n_embd_state(cparams.ctx_type, model)) {
         return false;
     }
 
@@ -4344,7 +4354,7 @@ uint32_t llama_context::graph_max_nodes() const {
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_HY_V4 ||
-        model.arch == LLM_ARCH_INKLING2) {
+        model.arch == LLM_ARCH_INKLING2 || llama_model_is_inkling_draft(model)) {
         res = std::max<uint32_t>(1024u, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
@@ -4472,6 +4482,13 @@ ggml_cgraph * llama_context::graph_reserve(
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd(), model.n_seq_devices());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+
+    if (llama_model_is_inkling_draft(model)) {
+        // Reserve an equal output prefix for every draft sequence.
+        const uint32_t rows = std::min({1 + (n_outputs - 1)/n_seqs, n_tokens/n_seqs,
+                cparams.n_outputs_max_per_seq, model.hparams.dflash_block_size});
+        n_outputs = rows*n_seqs;
+    }
 
     // Sampler limits can leave fewer output rows than a fused-op probe requests.
     this->n_outputs = ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);

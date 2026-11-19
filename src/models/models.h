@@ -1649,6 +1649,19 @@ struct llama_model_dflash : public llama_model_base {
     variant_type  variant  = VARIANT_DFLASH;
     backbone_type backbone = BACKBONE_BASE;
 
+    struct inkling_layer {
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+        ggml_tensor * k_norm = nullptr;
+        ggml_tensor * norm = nullptr;
+    };
+    uint32_t dspark_markov_rank = 0;
+    std::vector<inkling_layer> inkling_layers;
+    ggml_tensor * dspark_fuse         = nullptr;
+    ggml_tensor * dspark_norm         = nullptr;
+    ggml_tensor * dspark_hidden_out   = nullptr;
+    ggml_tensor * dspark_hidden_out_b = nullptr;
+
     void load_hparams_lilicorr(llama_model_loader & ml);
     void load_hparams_dsv4(llama_model_loader & ml);
     void load_hparams_mistral_large4(llama_model_loader & ml);
@@ -1725,6 +1738,11 @@ struct llama_model_dflash : public llama_model_base {
 
     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);
+
+    // Inkling2 DSpark: block backbone decoded once, then one recurrent markov head step per drafted token
+    struct graph_inkling2 : public llm_graph_context {
+        graph_inkling2(const llm_graph_params & params);
+    };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

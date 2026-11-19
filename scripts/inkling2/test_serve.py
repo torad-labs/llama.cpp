@@ -1,6 +1,7 @@
 """The Inkling launcher's profiles dry-run to pinned plans."""
 import json
 import os
+import tempfile
 import subprocess
 import sys
 import unittest
@@ -38,6 +39,36 @@ def plan(*options):
 
 
 class ProfilePlanTest(unittest.TestCase):
+    def test_tensor_4_auto_draft(self):
+        with tempfile.TemporaryDirectory() as root:
+            packs = Path(root)
+            draft = packs / serve.DRAFT
+            plain, _ = plan("--packs", root)
+            self.assertNotIn("--spec-type", plain)
+            draft.touch()
+            self.assertEqual(plain, plan("--packs", root)[0])
+            auto, _ = plan("--packs", root, "--profile", "tensor-4-draft")
+            for flag, value in {
+                "--spec-type": "draft-dspark", "--spec-draft-model": str(draft),
+                "--spec-draft-n-max": "3", "--spec-draft-sampling": "greedy",
+                "--spec-draft-device": "CUDA3", "--spec-draft-type-k": "q8_0",
+                "--cache-type-k": "q8_0", "--cache-type-k-swa": "f16", "-c": "1572864", "-ub": "256",
+            }.items():
+                self.assertEqual(auto[auto.index(flag) + 1], value)
+            self.assertEqual(auto, plan("--packs", root, "--draft")[0])
+            override, _ = plan("--packs", root, "--draft", "--ubatch-size", "512")
+            self.assertEqual(override[override.index("-ub") + 1], "512")
+            self.assertEqual(plain, plan("--packs", root, "--no-draft")[0])
+            control, _ = plan("--packs", root, "--profile", "tensor-4-draft", "--no-draft")
+            self.assertEqual(control, auto[:auto.index("--spec-type")])
+            custom = ["--packs", root, "--model", str(packs / "custom.gguf")]
+            self.assertNotIn("--spec-type", plan(*custom)[0])
+            self.assertIn("--spec-type", plan(*custom, "--draft-model", str(draft))[0])
+            with self.assertRaises(ValueError):
+                plan(*custom, "--draft")
+            with self.assertRaises(ValueError):
+                plan("--no-draft", "--draft-model", str(draft))
+
     def test_tensor_4_defaults_to_the_qualified_q3_pack_and_pool(self):
         argv, env = plan()
         self.assertEqual(argv, pinned("Inkling-2-Small-abliterated-e4853745-Q3_K_M-imatrix", "f16", "3014656",
@@ -88,7 +119,7 @@ class ProfilePlanTest(unittest.TestCase):
             argv, env = plan("--profile", name)
             with self.subTest(profile=name):
                 text = " ".join(argv).lower()
-                for glm in ("-ctki", "--spec-", "glm", "unsloth", "ud-"):
+                for glm in ("-ctki", "glm", "unsloth", "ud-"):
                     self.assertNotIn(glm, text)
                 for key in ("LLAMA_INDEXER_Q8_QUERY", "LLAMA_MTP_DEVICE_H", "LLAMA_SPEC_COUPLED", "GGML_CUDA_AR_WIRE_Q8"):
                     self.assertNotIn(key, env)

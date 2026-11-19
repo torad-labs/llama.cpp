@@ -359,6 +359,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         auto * state = recr->mctx->get_r_l(il);
         auto * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
         history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+        res->t_layer_inp[il] = cur;
         auto * residual = cur;
         ggml_tensor * inputs[3] = {cur, cur, cur};
         if (l.attn_res_query) {
@@ -454,12 +455,13 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cur = ggml_add(ctx0, residual, cur);
         cb(cur, "l_out", il);
     }
-    if (state_only) {
+    const bool tap_output = cparams.embeddings_layer_inp[n_layer];
+    if (state_only && !tap_output) {
         // All attention and convolution state writes have been added to the graph.
         return;
     }
     // A sparse prefill needs only the selected rows of each depth source for its final mix.
-    const bool sparse_output = cparams.fused_inkling2 && !cparams.pipeline_parallel && cparams.n_seq_devices <= 1 &&
+    const bool sparse_output = !tap_output && cparams.fused_inkling2 && !cparams.pipeline_parallel && cparams.n_seq_devices <= 1 &&
             out_ids && n_outputs > 0 && n_tokens >= 256 && n_outputs*int64_t(blocks.size() + 1) < n_tokens;
     if (sparse_output) {
         for (auto * & block : blocks) {
@@ -469,10 +471,20 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     }
     cur = mix(blocks, cur, model.output_res_query, -1);
     cur = ggml_reshape_2d(ctx0, cur, n_embd, cur->ne[2]);
-    if (out_ids && !sparse_output) {
+    if (out_ids && !sparse_output && !tap_output) {
         cur = ggml_get_rows(ctx0, cur, out_ids);
     }
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    if (tap_output) {
+        res->t_layer_inp[n_layer] = cur;
+        ggml_build_forward_expand(gf, cur);
+        if (state_only) {
+            return;
+        }
+        if (out_ids) {
+            cur = ggml_get_rows(ctx0, cur, out_ids);
+        }
+    }
     res->t_embd = cur;
     cur = build_lora_mm(model.output, cur);
     ggml_prec_set_acc(cur, GGML_PREC_F32);
