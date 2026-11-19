@@ -227,52 +227,38 @@ int ggml_cuda_get_device() {
     return id;
 }
 
-static bool ggml_cuda_env_flag(const char * name) {
-    const char * env = getenv(name);
-    return env != nullptr && std::atoi(env) != 0;
-}
-
-static int ggml_cuda_env_int(const char * name, int default_value) {
-    const char * env = getenv(name);
-    return env != nullptr ? std::atoi(env) : default_value;
-}
-
-static bool ggml_cuda_env_set(const char * name) {
-    return getenv(name) != nullptr;
-}
-
 static bool ggml_cuda_unified_memory_enabled() {
-    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
+    static const bool enabled = ggml_env_switch("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
     return enabled;
 }
 
 static bool ggml_cuda_pinned_memory_disabled() {
-    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_NO_PINNED");
+    static const bool disabled = ggml_env_switch("GGML_CUDA_NO_PINNED");
     return disabled;
 }
 
 static bool ggml_cuda_register_host_enabled() {
-    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_REGISTER_HOST");
+    static const bool enabled = ggml_env_switch("GGML_CUDA_REGISTER_HOST");
     return enabled;
 }
 
 static bool ggml_cuda_fusion_disabled() {
-    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
+    static const bool disabled = ggml_env_switch("GGML_CUDA_DISABLE_FUSION");
     return disabled;
 }
 
 static bool ggml_cuda_p2p_enabled() {
-    static const bool enabled = ggml_cuda_env_set("GGML_CUDA_P2P");
+    static const bool enabled = ggml_env_switch("GGML_CUDA_P2P");
     return enabled;
 }
 
 bool ggml_cuda_pool_debug_enabled() {
-    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_POOL_DEBUG");
+    static const bool enabled = ggml_env_switch("GGML_CUDA_POOL_DEBUG");
     return enabled;
 }
 
 static int ggml_cuda_op_offload_min_batch() {
-    static const int min_batch = ggml_cuda_env_int("GGML_OP_OFFLOAD_MIN_BATCH", 32);
+    static const int min_batch = (int) ggml_env_int("GGML_OP_OFFLOAD_MIN_BATCH");
     return min_batch;
 }
 
@@ -925,10 +911,7 @@ bool ggml_backend_cuda_context::any_cuda_graph_has_instance() const {
 
 #if defined(GGML_CUDA_USE_PDL)
 bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
-    static const bool env_pdl_enabled = []() {
-        const char * env = getenv("GGML_CUDA_PDL");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
+    static const bool env_pdl_enabled = ggml_env_switch("GGML_CUDA_PDL");
     if (!env_pdl_enabled) {
         return false;
     }
@@ -2161,8 +2144,7 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ret->comms.resize(n);
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
-        const char * slices = getenv("GGML_CUDA_NCCL_GATHER_SLICES");
-        ret->gather_slices = slices && strcmp(slices, "1") == 0;
+        ret->gather_slices = ggml_env_switch("GGML_CUDA_NCCL_GATHER_SLICES");
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
         return;
     }
@@ -2198,7 +2180,7 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
     }
 
-    const char * env = getenv("GGML_CUDA_ALLREDUCE");
+    const char * env = ggml_env_str("GGML_CUDA_ALLREDUCE");
     if (!env) {
         // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
 #if defined(__linux__)
@@ -2219,10 +2201,7 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
 #endif // GGML_USE_NCCL
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
-        } else if (env_str == "none") {
-            ggml_backend_cuda_comm_init_none(ret);
         } else {
-            GGML_LOG_WARN("unknown GGML_CUDA_ALLREDUCE value: %s\n", env);
             ggml_backend_cuda_comm_init_none(ret);
         }
     }
@@ -2859,20 +2838,15 @@ static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_backend_cuda_c
         compute_type = GGML_TYPE_F32;
     }
 
-    const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
-    if (env_c != nullptr) {
-        std::string env_cpp = env_c;
-        for (char & c : env_cpp) {
-            c = std::tolower(c);
-        }
-        if (env_cpp == "f32" || env_cpp == "fp32") {
+    // unset and auto keep the type chosen above
+    if (const char * env_c = ggml_env_str("GGML_CUDA_CUBLAS_COMPUTE_TYPE"); env_c != nullptr) {
+        const std::string forced = env_c;
+        if (forced == "f32" || forced == "fp32") {
             compute_type = GGML_TYPE_F32;
-        } else if (env_cpp == "f16" || env_cpp == "fp16") {
+        } else if (forced == "f16" || forced == "fp16") {
             compute_type = GGML_TYPE_F16;
-        } else if (env_cpp == "bf16") {
+        } else if (forced == "bf16") {
             compute_type = GGML_TYPE_BF16;
-        } else if (env_cpp != "auto") {
-            GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
     }
     return compute_type;
@@ -3168,10 +3142,7 @@ static bool ggml_cuda_pq2_mma_fuses(ggml_backend_cuda_context & ctx, const ggml_
 // does GGML_CUDA_GRAPH_OPT=1, whose concurrent streams give q, k and v a stream each.
 static bool ggml_cuda_pq2_mma_group_enabled() {
     static const bool enabled = [] {
-        const char * no_fusion = getenv("GGML_CUDA_DISABLE_FUSION");
-        const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
-        return !ggml_env_switch("GGML_CUDA_PQ2_MMA_GROUP_LEGACY") && !(no_fusion != nullptr && atoi(no_fusion) != 0) &&
-            !(graph_opt != nullptr && atoi(graph_opt) == 1);
+        return !ggml_env_switch("GGML_CUDA_PQ2_MMA_GROUP_LEGACY") && !ggml_cuda_fusion_disabled() && !ggml_env_switch("GGML_CUDA_GRAPH_OPT");
     }();
     return enabled;
 }
@@ -3532,11 +3503,6 @@ static void ggml_cuda_l2_persist_check(const ggml_backend_cuda_context & ctx, cu
 }
 #endif // defined(GGML_CUDA_USE_L2_WINDOW)
 
-static double ggml_cuda_l2_issue_env(const char * name, const double def) {
-    const char * env = getenv(name);
-    return env != nullptr ? std::max(0.0, atof(env)) : def;
-}
-
 // A decode graph's weight-heavy launches, and what a kernel beside the graph requests into L2 after each (ggml_cuda_l2_issue).
 // A launch is the mat-vecs in a row that read one src1 with the same op (a gated pair, KDA's q, k and v), at mul_mat_vec's
 // columns, reading weights; it is heavy when it is a MUL_MAT reading the minimum. Once a heavy launch has been enqueued, the
@@ -3580,12 +3546,12 @@ struct ggml_cuda_l2_issue_plan {
 static ggml_cuda_l2_issue_plan ggml_cuda_l2_issue_plan_of(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph,
                                                           const ggml_cgraph * next) {
     static const bool legacy = ggml_env_switch("GGML_CUDA_L2_ISSUE_LEGACY");
-    static const double min_kb    = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_MIN_KB", 8192.0);
-    static const double l2_frac   = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_L2_FRAC", 0.5);
-    static const double rate_frac = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_RATE_FRAC", 0.9);
-    static const double node_us   = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_NODE_US", 0.75);
-    static const double ar_us     = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_AR_US", 4.0);
-    static const double busy_kb   = ggml_cuda_l2_issue_env("GGML_CUDA_L2_ISSUE_BUSY_KB", 0.0);
+    static const double min_kb    = ggml_env_float("GGML_CUDA_L2_ISSUE_MIN_KB");
+    static const double l2_frac   = ggml_env_float("GGML_CUDA_L2_ISSUE_L2_FRAC");
+    static const double rate_frac = ggml_env_float("GGML_CUDA_L2_ISSUE_RATE_FRAC");
+    static const double node_us   = ggml_env_float("GGML_CUDA_L2_ISSUE_NODE_US");
+    static const double ar_us     = ggml_env_float("GGML_CUDA_L2_ISSUE_AR_US");
+    static const double busy_kb   = ggml_env_float("GGML_CUDA_L2_ISSUE_BUSY_KB");
 
     ggml_cuda_l2_issue_plan plan;
     const ggml_cuda_device_info::cuda_device_info & dev = ggml_cuda_info().devices[ctx.device];
@@ -5083,7 +5049,7 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_debug_enabled() {
-    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DEBUG");
+    static const bool enabled = ggml_env_switch("GGML_CUDA_GRAPH_DEBUG");
     return enabled;
 }
 
@@ -10084,10 +10050,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     GGML_UNUSED(cgraph);
 #endif
 
-    static bool enable_graph_optimization = [] {
-        const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-        return env != nullptr && atoi(env) == 1;
-    }();
+    static bool enable_graph_optimization = ggml_env_switch("GGML_CUDA_GRAPH_OPT");
 
     if (!enable_graph_optimization) {
         return;
@@ -11413,8 +11376,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_comm_allgather_tensor;
     }
     if (strcmp(name, "ggml_backend_comm_reduce_owned_rows") == 0) {
-        const char * flag = getenv("GGML_CUDA_AR_HOST_OWNER_ROWS");
-        return flag && strcmp(flag, "1") == 0 ? (void *) ggml_backend_cuda_comm_reduce_owned_rows : nullptr;
+        return ggml_env_switch("GGML_CUDA_AR_HOST_OWNER_ROWS") ? (void *) ggml_backend_cuda_comm_reduce_owned_rows : nullptr;
     }
     if (strcmp(name, "ggml_backend_comm_reduce_owned_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_reduce_owned_tensor;

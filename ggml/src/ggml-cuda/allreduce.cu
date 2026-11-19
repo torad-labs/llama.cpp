@@ -859,19 +859,15 @@ static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
 // Peer inboxes can hold a larger gather without splitting its owners across synchronization rounds.
 static constexpr size_t GGML_CUDA_AR_PEER_MAX_BYTES = 2 * 1024 * 1024;
 
-// Largest wire size the host LL path reduces by default; GGML_CUDA_AR_LL_MAX_BYTES overrides (0 disables this path).
-static constexpr size_t GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT = 16 * 1024; // 16 KB
-
-// Largest wire size the LL kernel reduces card to card by default; GGML_CUDA_AR_P2P_MAX_BYTES overrides (0 disables).
-static constexpr size_t GGML_CUDA_AR_P2P_MAX_BYTES_DEFAULT = 128 * 1024; // 128 KB
+// The knobs GGML_CUDA_AR_LL_MAX_BYTES (16 KB) and GGML_CUDA_AR_P2P_MAX_BYTES (128 KB) set the largest wire size the host LL path
+// and the card to card LL kernel reduce; 0 disables the path. Their defaults are in tunables.toml.
 
 // Copy-engine path: largest tensor accepted on this path; sets host_large /
 // dev_tmp allocation size.
 static constexpr size_t GGML_CUDA_AR_COPY_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
 
-// AR wire size at which the copy-engine path takes over from the chunked-
-// kernel path.  Override via GGML_CUDA_AR_COPY_THRESHOLD.
-static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 1024 * 1024; // 1 MB
+// The knob GGML_CUDA_AR_COPY_THRESHOLD (1 MB) is the AR wire size at which the copy-engine path takes over from the
+// chunked-kernel path.
 // Per-call CE chunk-size heuristic: chunk_bytes = clamp(nbytes / 4, MIN, MAX).
 // The /4 keeps ~4 chunks in flight at any moment (good D2H/H2D overlap with
 // the peer); the clamps cover the cases where nbytes/4 is too small (per-
@@ -1026,17 +1022,6 @@ struct ggml_cuda_ar_pipeline {
     // finished (ggml_cuda_ar_kernel).
     int *                    counter[GGML_CUDA_MAX_DEVICES];
 };
-
-static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) {
-    const char * value = getenv(name);
-    if (value == nullptr || value[0] == '\0') {
-        return default_value;
-    }
-
-    char * end = nullptr;
-    const unsigned long long parsed = strtoull(value, &end, 10);
-    return end != value ? (uint64_t) parsed : default_value;
-}
 
 // The copy-engine path's event slot for its next call, once both devices have
 // finished the call two back.
@@ -1332,39 +1317,39 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     auto * p = new ggml_cuda_ar_pipeline{};
     p->n_devices        = n_devices;
     p->copy_bytes       = GGML_CUDA_AR_COPY_MAX_BYTES;
-    p->copy_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_THRESHOLD", GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT);
+    p->copy_threshold   = (size_t) ggml_env_int("GGML_CUDA_AR_COPY_THRESHOLD");
     // 0 = use the per-call heuristic (default).  Non-zero env value forces a
     // fixed chunk size for diagnostics, with a floor at COPY_CHUNK_BYTES_MIN.
-    p->copy_chunk_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_CHUNK_BYTES", 0);
+    p->copy_chunk_bytes = (size_t) ggml_env_int("GGML_CUDA_AR_COPY_CHUNK_BYTES");
     if (p->copy_chunk_bytes > 0 && p->copy_chunk_bytes < GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN) {
         GGML_LOG_WARN("%s: GGML_CUDA_AR_COPY_CHUNK_BYTES=%zu below minimum %zu; clamping\n",
                       __func__, p->copy_chunk_bytes, GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
         p->copy_chunk_bytes = GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN;
     }
-    p->copy_tail_legacy = ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_TAIL_LEGACY", 0) != 0;
+    p->copy_tail_legacy = ggml_env_switch("GGML_CUDA_AR_COPY_TAIL_LEGACY");
     // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
-    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    p->bf16_threshold   = (size_t) ggml_env_int("GGML_CUDA_AR_BF16_THRESHOLD");
     // Default 0.  1: an F32 share that the copy engines would carry in BF16 crosses in blocks of 32 signed bytes and
     // an F32 scale (ggml_cuda_ar_allreduce_copy_q8).  The sums differ from the BF16 wire's.
-    p->wire_q8          = ggml_cuda_ar_env_u64("GGML_CUDA_AR_WIRE_Q8", 0) != 0;
+    p->wire_q8          = ggml_env_switch("GGML_CUDA_AR_WIRE_Q8");
     // Wire bytes up to which the host LL path reduces (0 disables this path), capped at one chunk's size.
-    p->ll_max_bytes     = std::min(ggml_cuda_ar_env_u64("GGML_CUDA_AR_LL_MAX_BYTES", GGML_CUDA_AR_LL_MAX_BYTES_DEFAULT),
+    p->ll_max_bytes     = std::min((uint64_t) ggml_env_int("GGML_CUDA_AR_LL_MAX_BYTES"),
                                    (uint64_t) GGML_CUDA_AR_MAX_BYTES);
     // The same for the LL kernel card to card (ggml_cuda_ar_p2p_init), which takes over from the limit above where it is
     // larger.
-    p->p2p_max_bytes    = std::min(ggml_cuda_ar_env_u64("GGML_CUDA_AR_P2P_MAX_BYTES", GGML_CUDA_AR_P2P_MAX_BYTES_DEFAULT),
+    p->p2p_max_bytes    = std::min((uint64_t) ggml_env_int("GGML_CUDA_AR_P2P_MAX_BYTES"),
                                    (uint64_t) GGML_CUDA_AR_MAX_BYTES);
     // Default 1: a reduce whose only reader is a scatter by rows sums each element only on the rank that reads it.
-    p->host_owner_rows  = ggml_cuda_ar_env_u64("GGML_CUDA_AR_HOST_OWNER_ROWS", 0) == 1;
-    p->reduce_owners    = ggml_cuda_ar_env_u64("GGML_CUDA_AR_REDUCE_OWNERS", 1) != 0;
+    p->host_owner_rows  = ggml_env_switch("GGML_CUDA_AR_HOST_OWNER_ROWS");
+    p->reduce_owners    = ggml_env_switch("GGML_CUDA_AR_REDUCE_OWNERS");
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
 
     // Per-device streams and event pools.
-    const bool one_stream = ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_ONE_STREAM", 0) != 0;
+    const bool one_stream = ggml_env_switch("GGML_CUDA_AR_COPY_ONE_STREAM");
     for (size_t i = 0; i < n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
 
@@ -1488,7 +1473,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // the other's memory, unless GGML_CUDA_AR_COPY_PEER=0: each device then
     // copies its share straight into its peer's dev_tmp, which is mapped for
     // both cards.  A mapping that fails leaves the host staging.
-    p->copy_peer = p->p2p_max_bytes > 0 && ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_PEER", 1) != 0;
+    p->copy_peer = p->p2p_max_bytes > 0 && ggml_env_switch("GGML_CUDA_AR_COPY_PEER");
     const size_t receive_bytes = p->copy_bytes * (n_devices - 1);
     for (size_t i = 0; p->copy_peer && i < n_devices; ++i) {
         if (!ggml_cuda_ar_peer_alloc(p, (int) i, receive_bytes, p->dev_tmp[i])) {
@@ -1518,8 +1503,8 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         p->dev_tmp[i].size = receive_bytes;
     }
     // Default 0.  1: a device takes its peers' shares in on one stream, in rank order.
-    p->recv_rank_order = one_stream || n_devices == 2 || ggml_cuda_ar_env_u64("GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", 0) != 0;
-    p->recv_streams_min_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_RECV_STREAMS_MIN_BYTES", 65536);
+    p->recv_rank_order = one_stream || n_devices == 2 || ggml_env_switch("GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY");
+    p->recv_streams_min_bytes = (size_t) ggml_env_int("GGML_CUDA_AR_RECV_STREAMS_MIN_BYTES");
     for (size_t i = 0; !p->copy_peer && !p->recv_rank_order && i < n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         for (size_t k = 0; k + 1 < n_devices; ++k) {
@@ -1550,8 +1535,8 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             GGML_LOG_WARN("%s: gather inbox allocation failed; large gathers stage through host memory\n", __func__);
         }
     }
-    p->host_slices = ggml_cuda_ar_env_u64("GGML_CUDA_AR_GATHER_HOST_SLICES", 0) != 0 && !p->gather_peer;
-    p->owner_slices = ggml_cuda_ar_env_u64("GGML_CUDA_AR_GATHER_OWNER_SLICES", 1) != 0 && p->gather_peer;
+    p->host_slices = ggml_env_switch("GGML_CUDA_AR_GATHER_HOST_SLICES") && !p->gather_peer;
+    p->owner_slices = ggml_env_switch("GGML_CUDA_AR_GATHER_OWNER_SLICES") && p->gather_peer;
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu KB LL staging (up to %zu KB on the wire) + %zu MB copy-engine %s per GPU, "

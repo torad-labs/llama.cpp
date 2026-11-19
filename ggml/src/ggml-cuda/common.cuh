@@ -1569,7 +1569,7 @@ struct ggml_cuda_graph {
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
-        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+        static const bool disable_cuda_graphs_due_to_env = ggml_env_switch("GGML_CUDA_DISABLE_GRAPHS");
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env || ggml_cuda_pool_debug_enabled());
     }
 #endif
@@ -2379,18 +2379,12 @@ struct ggml_backend_cuda_context {
     }
 
     static bool graph_mem_stats_enabled() {
-        static const bool enabled = [] {
-            const char * env = getenv("GGML_CUDA_GRAPH_MEM_STATS");
-            return env == nullptr || atoi(env) != 0;
-        }();
+        static const bool enabled = ggml_env_switch("GGML_CUDA_GRAPH_MEM_STATS");
         return enabled;
     }
 
     static int64_t cuda_graph_idle_us() {
-        static const int64_t timeout = [] {
-            const char * env = getenv("GGML_CUDA_GRAPH_IDLE_MS");
-            return env ? int64_t(std::max(0, atoi(env)))*1000 : int64_t(10'000'000);
-        }();
+        static const int64_t timeout = ggml_env_int("GGML_CUDA_GRAPH_IDLE_MS") * 1000;
         return timeout;
     }
 
@@ -2447,17 +2441,11 @@ struct ggml_backend_cuda_context {
     // small graph for each all-reduce step on each device, hundreds a token, and a cap on the count below that evicts
     // every one of them before its turn comes round again, to be captured anew every token.
     static size_t cuda_graphs_max() {
-        static const size_t n = [] {
-            const char * env = getenv("GGML_CUDA_GRAPH_MAX");
-            return env != nullptr ? (size_t) std::max(0, atoi(env)) : (size_t) 0;
-        }();
+        static const size_t n = (size_t) ggml_env_int("GGML_CUDA_GRAPH_MAX");
         return n;
     }
     static size_t cuda_graph_nodes_max() {
-        static const size_t n = [] {
-            const char * env = getenv("GGML_CUDA_GRAPH_NODES");
-            return env != nullptr ? (size_t) std::max(0, atoi(env)) : (size_t) 32768;
-        }();
+        static const size_t n = (size_t) ggml_env_int("GGML_CUDA_GRAPH_NODES");
         return n;
     }
     size_t cuda_graphs_held_max      = 0; // the most executables held at once here
@@ -2590,10 +2578,7 @@ struct ggml_backend_cuda_context {
     // the process inside the driver (a segfault in cuGraphInstantiateWithFlags, CUDA 13.3). So a graph gets an
     // executable only while this holds, and is evaluated directly otherwise.
     bool cuda_graph_has_room() {
-        static const size_t floor_bytes = [] {
-            const char * env = getenv("GGML_CUDA_GRAPH_MEM_FLOOR_MIB");
-            return (size_t) (env != nullptr ? std::max(atoll(env), 0LL) : 64) * 1024 * 1024;
-        }();
+        static const size_t floor_bytes = (size_t) ggml_env_int("GGML_CUDA_GRAPH_MEM_FLOOR_MIB") * 1024 * 1024;
         if (floor_bytes == 0) {
             return true;
         }

@@ -226,19 +226,13 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // 25 % faster than MMQ at 9-12 tokens and 19 % at 16 (RTX PRO 4500, E288; TORAD.md). Other types keep the 8-token ceiling.
 // GGML_CUDA_MMVQ_MMID_MAX=N (8-16, read once) sets every type's ceiling to N; 8 is the ceiling before this was added.
 static int get_mmvq_mmid_max_batch_ada_plus(ggml_type type, int cc) {
-    static const int forced = [] {
-        const char * s = getenv("GGML_CUDA_MMVQ_MMID_MAX");
-        return s ? std::min(MMVQ_MMID_BLOCK_WARPS, std::max(MMVQ_MAX_BATCH_SIZE, atoi(s))) : 0;
-    }();
+    static const int forced = (int) ggml_env_int_or("GGML_CUDA_MMVQ_MMID_MAX", 0);
     if (forced != 0) {
         return forced;
     }
     // Compare the row kernel with MMQ at serving batch sizes on SM120 without changing the default crossover.
     if (cc == GGML_CUDA_CC_BLACKWELL && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) {
-        static const int kquant_max = [] {
-            const char * s = getenv("GGML_CUDA_MMVQ_KQUANT_MMID_MAX");
-            return s ? std::min(MMVQ_MMID_CEILING, std::max(MMVQ_MAX_BATCH_SIZE, atoi(s))) : MMVQ_MAX_BATCH_SIZE;
-        }();
+        static const int kquant_max = (int) ggml_env_int("GGML_CUDA_MMVQ_KQUANT_MMID_MAX");
         return kquant_max;
     }
     return type == GGML_TYPE_IQ3_XXS ? MMVQ_MMID_BLOCK_WARPS : MMVQ_MAX_BATCH_SIZE;

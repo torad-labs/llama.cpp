@@ -386,9 +386,7 @@ llama_kv_cache::llama_kv_cache(
     } else {
         // two knobs turn the same thing off: the environment variable, for the whole process, and
         //   the model setting, for the contexts of one model - see llama_model_set_attn_rot
-        const char * env_rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
-
-        const bool attn_rot_disable = !model.attn_rot || (env_rot_disable != nullptr && atoi(env_rot_disable) != 0);
+        const bool attn_rot_disable = !model.attn_rot || ggml_env_switch("LLAMA_ATTN_ROT_DISABLE");
         if (attn_rot_disable) {
             LLAMA_LOG_INFO("%s: attention rotation force disabled (%s)\n", __func__,
                     model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");

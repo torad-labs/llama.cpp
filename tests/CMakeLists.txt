@@ -609,6 +609,13 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+# the knob registry over every knob tunables.toml declares, and the list against the source
+llama_build_and_test(test-tunables.cpp  LABEL behavior  LINK ggml)
+find_package(Python3 3.11 COMPONENTS Interpreter)
+if (Python3_FOUND)
+    add_test(NAME test-tunables-list COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/tunables.py check)
+    set_property(TEST test-tunables-list PROPERTY LABELS behavior)
+endif()
 llama_build_and_test(test-ngram-mod.cpp)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately

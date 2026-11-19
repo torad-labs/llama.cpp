@@ -606,10 +606,7 @@ private:
     // 3, or LLAMA_GRAPH_SLOTS: with LLAMA_GRAPH_ANY_SEQS a graph serves every set of as many sequences, and a slot for
     // each count of sequences keeps every decode a reuse (the meta backend then needs GGML_META_CAPTURE_GRAPHS of
     // at least the slots and two more, to keep their captured evaluations)
-    const size_t graph_slots_max = [] {
-        const char * s = getenv("LLAMA_GRAPH_SLOTS");
-        return s != nullptr && atoi(s) >= 1 ? (size_t) atoi(s) : (size_t) 3;
-    }();
+    const size_t graph_slots_max = (size_t) ggml_env_int("LLAMA_GRAPH_SLOTS");
     // LLAMA_GRAPH_ANY_SEQS=1, read when the context is made (llm_graph_params::any_seqs)
     const bool graph_any_seqs = ggml_env_switch("LLAMA_GRAPH_ANY_SEQS");
     // LLAMA_PROMPT_SHAPES=1, read when the context is made: a ubatch of one sequence and a power of two of rows above
@@ -658,10 +655,7 @@ private:
     // what the devices make the graphs' executables from: a CUDA device that runs out while it makes one cannot be
     // recovered (ggml_backend_cuda_context::cuda_graph_has_room). A slot also gives its buffers back when an
     // allocation fails; n_graph_slots_no_memory counts both.
-    const size_t graph_device_reserve = [] {
-        const char * s = getenv("LLAMA_GRAPH_DEVICE_RESERVE_MIB");
-        return (size_t) (s != nullptr ? std::max(atoll(s), 0LL) : 256) * 1024 * 1024;
-    }();
+    const size_t graph_device_reserve = (size_t) ggml_env_int("LLAMA_GRAPH_DEVICE_RESERVE_MIB") * 1024 * 1024;
     bool     graph_devices_low() const;
     uint64_t n_graph_slots_no_memory = 0;
 

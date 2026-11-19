@@ -2983,10 +2983,49 @@ extern "C" {
     GGML_API void ggml_log_get(ggml_log_callback * log_callback, void ** user_data);
     GGML_API void ggml_log_set(ggml_log_callback   log_callback, void *  user_data);
 
-    // an off switch in the environment (the *_LEGACY variables): false when unset or set to "", 0, false, no or off, true
-    // when set to 1, true, yes, on or another number but 0 (words in any case, spaces around the value dropped); any other
-    // value is taken as on, with a warning
-    GGML_API bool ggml_env_switch(const char * name);
+    // Knobs. Every environment variable the engine reads is declared in tunables.toml with its type, default and range,
+    // and read through these; unset reads the declared default. A value that does not parse or is outside the range is
+    // reported once and replaced (the nearest bound for a number, on for a switch, unset otherwise). With
+    // GGML_TUNABLES_STRICT=1 the process stops instead, at its first read, and also for a GGML_* or LLAMA_* variable
+    // that no knob declares. GGML_TUNABLES_DUMP=<file> writes what the run read when the process exits.
+
+    // a switch: off when set to "", 0, false, no or off, on when set to 1, true, yes, on or another number but 0 (words in
+    // any case, spaces around the value dropped). A name no knob declares is read the same way, unset being off
+    GGML_API bool         ggml_env_switch(const char * name);
+    GGML_API int64_t      ggml_env_int   (const char * name);
+    GGML_API double       ggml_env_float (const char * name);
+    GGML_API const char * ggml_env_str   (const char * name); // NULL when unset
+
+    // for a knob declared with default "auto": what unset means depends on the device or the model, and the reader says
+    GGML_API bool    ggml_env_switch_or(const char * name, bool    fallback);
+    GGML_API int64_t ggml_env_int_or   (const char * name, int64_t fallback);
+    GGML_API double  ggml_env_float_or (const char * name, double  fallback);
+
+    enum ggml_tunable_type {
+        GGML_TUNABLE_BOOL,
+        GGML_TUNABLE_INT,
+        GGML_TUNABLE_FLOAT,
+        GGML_TUNABLE_STR,
+    };
+
+    struct ggml_tunable {
+        const char *           name;
+        enum ggml_tunable_type type;
+        bool                   is_auto;    // the default is the reader's
+        bool                   is_checked; // read through the functions above; false: declared, and still read with getenv
+        double                 def;
+        double                 min;
+        double                 max;
+        const char *           values;     // the allowed values as a comma list, or NULL
+    };
+
+    // the declared knobs, sorted by name
+    GGML_API size_t ggml_tunables_count(void);
+    GGML_API bool   ggml_tunables_get(size_t i, struct ggml_tunable * out);
+
+    // writes, as JSON, each knob read so far with the value used and its source, and the engine's variables that were
+    // set and not read, not checked or not declared
+    GGML_API bool ggml_tunables_dump(const char * path);
 
     GGML_API struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor);
 

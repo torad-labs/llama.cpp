@@ -13,9 +13,7 @@
 #include <stdexcept>
 
 static size_t llama_state_async_chunk() {
-    const char * value = getenv("LLAMA_STATE_ASYNC_CHUNK_KIB");
-    const long long kib = value ? atoll(value) : 1024;
-    return kib > 0 ? (size_t) kib * 1024 : 0;
+    return (size_t) ggml_env_int("LLAMA_STATE_ASYNC_CHUNK_KIB") * 1024;
 }
 
 llama_state_async::llama_state_async() : chunk(llama_state_async_chunk()), worker([this]() { run(); }) {}
