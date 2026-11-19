@@ -35,3 +35,31 @@ ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261
 ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261104.json:generic-api-key:902
 ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261104.json:generic-api-key:939
 ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261104.json:generic-api-key:976
+
+# Lines of main's tree that rig's job scan reads as credentials under gitleaks' default rules. The job scan reads
+# none of .gitleaks.toml, where this project already let several of them go. Each line was read on 2026-11-19 at
+# e01a4aa6c and is none. The repository names no lead, so the President decided that the seat shipping the tree
+# adds them. One fingerprint a finding, so every other line and rule stays active.
+#
+# The tag name of a dictionary constant in upstream's Gemma 4 argument parser.
+common/chat-peg-parser.h:generic-api-key:46
+# Three comment lines of this project's gitleaks config, which quote CI cache names and that same tag name.
+.gitleaks.toml:generic-api-key:33
+.gitleaks.toml:generic-api-key:34
+.gitleaks.toml:generic-api-key:41
+# The name of a GGUF tensor in a converter unit test.
+tests/test_conversion_fp8.py:generic-api-key:527
+# The public revision hash of the GLM tokenizer and the heading of its SHA-256 line.
+scripts/glm53/assets/README.md:generic-api-key:20
+scripts/glm53/assets/README.md:generic-api-key:21
+# The base64 of a one-pixel PNG in upstream's server test.
+tools/server/tests/unit/test_completion.py:generic-api-key:315
+# The name of an environment variable in the Inkling 2 launcher's test.
+scripts/inkling2/test_serve.py:generic-api-key:134
+# Upstream's curl example to localhost, with a placeholder where the caller's own value goes.
+tools/server/README.md:curl-auth-header:1870
+# A sentence of TORAD.md that quotes the same Gemma 4 tag name.
+TORAD.md:generic-api-key:657
+# Two SIMD variables of the vendored xxHash.
+vendor/hash/xxhash/xxhash.h:generic-api-key:4905
+vendor/hash/xxhash/xxhash.h:generic-api-key:4954
