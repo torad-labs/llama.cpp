@@ -196,6 +196,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-batch-alloc.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-kv-cache.cpp LABEL behavior)
     target_include_directories(test-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    # the long reader's bucket is read once a process: the bucket as served, and a narrower one, are their own runs
+    llama_test(test-kv-cache NAME test-kv-cache-bucket LABEL behavior)
+    set_tests_properties(test-kv-cache-bucket PROPERTIES ENVIRONMENT "LLAMA_INKLING2_BUCKET_PREFILL_KV=1")
+    llama_test(test-kv-cache NAME test-kv-cache-bucket-2048 LABEL behavior)
+    set_tests_properties(test-kv-cache-bucket-2048 PROPERTIES ENVIRONMENT "LLAMA_INKLING2_BUCKET_PREFILL_KV=1;LLAMA_INKLING2_BUCKET_CELLS=2048")
     llama_build_and_test(test-kv-mask.cpp)
     llama_build_and_test(test-recurrent-arena.cpp)
     llama_build_and_test(test-q8-backend-storage.cpp)
@@ -321,6 +326,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     endif()
     foreach(inkling_path_device ${inkling_path_devices})
         string(TOLOWER ${inkling_path_device} inkling_path_name)
+        # sessions that share one cache, a call of several micro-batches included, against each session alone
+        llama_test(test-llama-archs NAME test-inkling-window-${inkling_path_name}
+            ARGS --inkling-window ${inkling_path_device} -s 1234)
         foreach(inkling_case prompt decode unified streams)
             llama_test(test-llama-archs NAME test-inkling-rel-${inkling_path_name}-${inkling_case}
                 ARGS --inkling-path rel/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
@@ -609,6 +617,13 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+# the knob registry over every knob tunables.toml declares, and the list against the source
+llama_build_and_test(test-tunables.cpp  LABEL behavior  LINK ggml)
+find_package(Python3 3.11 COMPONENTS Interpreter)
+if (Python3_FOUND)
+    add_test(NAME test-tunables-list COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/tunables.py check)
+    set_property(TEST test-tunables-list PROPERTY LABELS behavior)
+endif()
 llama_build_and_test(test-ngram-mod.cpp)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
@@ -643,6 +658,11 @@ if (GGML_CUDA)
     add_test(NAME test-inkling-moe-routed-rows-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
         -p "n_mats=32,n_used=8,.*m=256,n=(17|23|32),k=512,")
     set_tests_properties(test-inkling-moe-routed-rows-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
+    # the expert products of the split Q3_K_M pack with their routes sorted, at each token count the sort takes
+    add_test(NAME test-inkling-moe-sorted-routes-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
+        -p "n_mats=384,n_used=8,b=[01],m=(1024|4608),n=(1|23|32),k=(4608|512),")
+    set_tests_properties(test-inkling-moe-sorted-routes-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_EXPERT_SORT_23=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX=32")
     add_test(NAME test-inkling-norm-clip-cuda0 COMMAND test-backend-ops test -b CUDA0 -o NORM_CLIP)
     add_test(NAME test-inkling-short-conv-op-cuda0 COMMAND test-backend-ops test -b CUDA0 -o SHORT_CONV)
     set_tests_properties(test-inkling-moe-mul-mat-id-cuda0 test-inkling-moe-block-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600)

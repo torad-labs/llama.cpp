@@ -260,6 +260,7 @@ reviews = [
 notes = [
   '2026-11-17 09:31 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 09:40 CT: Step 1 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. Today the model graph materializes a per-head F16 bias over heads x KV cells x query rows from an I32 host distance matrix every step (src/models/inkling2.cpp); where cells live is already hung off the mask (llama-kv-cache cell headers). Keep the mask path as the test oracle; the new kernel path must agree with it, sink folded in-kernel the way the flash graph folds it today. Position growth beyond distance 1024 uses the table sentinel row; global layers also carry the 1 + 0.1*ln scale on Q and R. Local card reads order the work; four-card rates come later. GPU: card 1 only, flock /run/user/1000/gpu1.lock, CUDA_VISIBLE_DEVICES=1 (programs see it as CUDA0).',
+  "2026-11-17 15:07 CT: Machine load: keep every build you start at 8 jobs or fewer (cmake --build ... -j 8, never a bare -j). The frozen checks predate this and some run unbounded; that is the lead's to fix after this campaign lands, not yours to edit. Your own builds are yours: bound them.",
 ]
 
 [[row]]
@@ -282,6 +283,7 @@ reviews = [
 notes = [
   '2026-11-17 09:33 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 09:40 CT: Step 2 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. AttnRes: 8 blocks of 6 layers, at most 9 mix sources (finished summaries plus current partial); math in 02-architecture.md. Router is F32, sigmoid scoring plus selection bias, normalize by selected sum + 1e-20, route_scale 8.0, softcapped SwiGLU is LLM_FFN_SITU. Check the fork topk-moe path first and extend it rather than falling back; a silent unfused fallback fails the spec. GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.',
+  "2026-11-17 15:07 CT: Machine load: keep every build you start at 8 jobs or fewer (cmake --build ... -j 8, never a bare -j). The frozen checks predate this and some run unbounded; that is the lead's to fix after this campaign lands, not yours to edit. Your own builds are yours: bound them.",
 ]
 
 [[row]]
@@ -304,6 +306,7 @@ reviews = [
 notes = [
   '2026-11-17 09:36 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-17 09:40 CT: Step 3 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. Four depthwise convs per layer (K, V, post-attn-out, post-MoE), kernel 4, 3-position ring; 11,264 state channels per layer, 6.1875 MiB per sequence. Global-layer K/V convs add dynamic per-token taps. Preserve the build_conv_state_store contract exactly: the split-state campaign's test-inkling2-split-* ctests and the state cases are the regression packs for rollback, chunk boundaries, seq copy and restore. Today this is 192 conv sites per forward as graph plumbing. GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.",
+  "2026-11-17 15:07 CT: Machine load: keep every build you start at 8 jobs or fewer (cmake --build ... -j 8, never a bare -j). The frozen checks predate this and some run unbounded; that is the lead's to fix after this campaign lands, not yours to edit. Your own builds are yours: bound them.",
 ]
 
 [[row]]
@@ -326,6 +329,7 @@ reviews = [
 notes = [
   '2026-11-17 09:38 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-17 09:40 CT: Step 4 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. Re-examine ggml_cuda_mmvq_moe_usable bounds, ggml_cuda_can_share_mmq_id and ggml_cuda_should_fuse_mul_mat_q at 384 experts, top-8, 2304/4608. At 23 served rows a layer touches roughly 150 experts, which is where the small-row vs grouped decision bites; decide from reads on this machine's card and record the read with the change. SITU softcapped activation must run in the fused path. GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.",
+  "2026-11-17 15:07 CT: Machine load: keep every build you start at 8 jobs or fewer (cmake --build ... -j 8, never a bare -j). The frozen checks predate this and some run unbounded; that is the lead's to fix after this campaign lands, not yours to edit. Your own builds are yours: bound them.",
 ]
 
 [[row]]
@@ -348,6 +352,7 @@ reviews = [
 notes = [
   '2026-11-17 09:40 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 09:40 CT: Step 6 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. The fork flash-attention already reads q8_0 KV; prove global and sliding layers separately at depth on the synthetic fixture against F16, q4_0 behind the same proof. Real-weight quality verdict waits for packs on the rented box; the inkling2 launcher keeps F16 defaults until then (scripts/inkling2/serve.py). GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.',
+  "2026-11-17 15:07 CT: Machine load: keep every build you start at 8 jobs or fewer (cmake --build ... -j 8, never a bare -j). The frozen checks predate this and some run unbounded; that is the lead's to fix after this campaign lands, not yours to edit. Your own builds are yours: bound them.",
 ]
 
 [[row]]

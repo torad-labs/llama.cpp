@@ -234,8 +234,10 @@ static void check_cells(const llama_kv_cells & cells, uint32_t n_seq) {
 static void check_inkling2_decode_masks() {
     using mode = inkling2_decode_mask;
     std::vector<uint32_t> cells(23, 8192);
+    const inkling2_mask_shapes served = {32, 8, 32, 8192, 8, 23, 262144, 6};
+    auto shapes = served;
     const auto classify = [&](uint32_t pool, bool mean) {
-        return inkling2_classify_decode_mask(pool, cells.size(), mean, [&](uint32_t i) { return cells[i]; });
+        return inkling2_classify_decode_mask(pool, cells.size(), mean, [&](uint32_t i) { return cells[i]; }, shapes);
     };
     CHECK(classify(262144, false) == mode::bounded_rows, "private rows must preserve the old bound");
     cells[0] = 262144;
@@ -255,6 +257,41 @@ static void check_inkling2_decode_masks() {
     cells.assign(23, 262144);
     CHECK(classify(2097152, true) == mode::bounded_rows, "the original bounded mode takes precedence");
 
+    // each shape a search can move (tunables.toml) moves its own bound
+    cells.assign(23, 16385);
+    CHECK(classify(262144, false) == mode::bounded_rows, "a row past a sixteenth of the pool is within an eighth");
+    shapes.pool_share = 16;
+    CHECK(classify(262144, false) == mode::dense, "a share of 16 bounds a row at a sixteenth of the pool");
+    cells.assign(23, 16384);
+    CHECK(classify(262144, false) == mode::bounded_rows, "a row at the share's bound keeps the class");
+    shapes = served;
+    shapes.rows_min = 24;
+    CHECK(classify(262144, false) == mode::dense, "a step under the fewest rows is dense");
+    shapes = served;
+    shapes.rows_max = 22;
+    CHECK(classify(262144, false) == mode::dense, "a step over the most rows is dense");
+    shapes = served;
+    shapes.pool_min = 524288;
+    CHECK(classify(262144, false) == mode::dense, "a pool under the smallest is not bounded");
+    cells.assign(23, 8192);
+    cells[0] = 262144;
+    CHECK(classify(327680, true) == mode::low_mean, "the smallest bounded pool leaves the low-mean class alone");
+    shapes = served;
+    cells.assign(23, 65536);
+    shapes.mean_pool_share = 7;
+    CHECK(classify(393216, true) == mode::dense, "a mean share of 7 turns away rows at a sixth");
+    shapes.mean_pool_share = 4;
+    ++cells.back();
+    CHECK(classify(393216, true) == mode::low_mean, "a mean share of 4 takes rows past a sixth");
+    shapes = served;
+    cells.assign(16, 8192);
+    cells[0] = 131072;
+    CHECK(classify(196608, true) == mode::dense, "a 16-row step is dense while the low-mean class takes 23 rows");
+    shapes.mean_rows = 16;
+    CHECK(classify(196608, true) == mode::dense, "and while its pool is under the low-mean class's smallest");
+    shapes.mean_pool_min = 131072;
+    CHECK(classify(196608, true) == mode::low_mean, "16 rows in a pool the low-mean class takes are low mean");
+
     llama_kv_cells shared;
     shared.resize(32769);
     for (uint32_t i = 0; i < shared.size(); ++i) {
@@ -264,7 +301,7 @@ static void check_inkling2_decode_masks() {
     shared.seq_add(32768, 1);
     CHECK(shared.seq_n_cells(0) == 32769 && shared.seq_n_cells(1) == 1, "shared cell contributes to both sequence counts");
     const auto shared_mode = [&]() {
-        return inkling2_classify_decode_mask(262144, 23, true, [&](uint32_t s) { return shared.seq_n_cells(s); });
+        return inkling2_classify_decode_mask(262144, 23, true, [&](uint32_t s) { return shared.seq_n_cells(s); }, served);
     };
     CHECK(shared_mode() == mode::low_mean, "shared reader exceeds the per-row bound");
     shared.seq_rm(32768, 0);

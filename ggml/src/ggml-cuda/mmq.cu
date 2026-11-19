@@ -103,24 +103,11 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 
 // overrides the src1 precision requested by the graph, "auto" keeps the requested one
 static ggml_prec ggml_cuda_mmq_get_prec_env() {
-    const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
+    const char * env_c = ggml_env_str("GGML_CUDA_MMQ_PREC");
     if (env_c == nullptr) {
         return GGML_PREC_UNDEFINED;
     }
-    std::string env_cpp = env_c;
-    for (char & c : env_cpp) {
-        c = std::tolower(c);
-    }
-    if (env_cpp == "q4") {
-        return GGML_PREC_Q4;
-    }
-    if (env_cpp == "q8") {
-        return GGML_PREC_Q8;
-    }
-    if (env_cpp != "auto") {
-        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'auto'.\n", __func__, env_cpp.c_str());
-    }
-    return GGML_PREC_UNDEFINED;
+    return strcmp(env_c, "q4") == 0 ? GGML_PREC_Q4 : strcmp(env_c, "q8") == 0 ? GGML_PREC_Q8 : GGML_PREC_UNDEFINED;
 }
 
 // src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
@@ -501,18 +488,12 @@ bool ggml_cuda_mmq_fixup_compact_legacy() {
 }
 
 int ggml_cuda_mmq_l2_prefetch() {
-    static const int pf = [] {
-        const char * s = getenv("GGML_CUDA_MMQ_L2_PF");
-        return s ? std::max(0, atoi(s)) : 1;
-    }();
+    static const int pf = (int) ggml_env_int("GGML_CUDA_MMQ_L2_PF");
     return pf;
 }
 
 int64_t ggml_cuda_mmq_moe_ncols() {
-    static const int64_t ncols = [] {
-        const char * s = getenv("GGML_CUDA_MMQ_MOE_NCOLS");
-        return s ? std::max<int64_t>(0, atoll(s)) : int64_t(0);
-    }();
+    static const int64_t ncols = ggml_env_int("GGML_CUDA_MMQ_MOE_NCOLS");
     return ncols;
 }
 

@@ -36,6 +36,16 @@ ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261
 ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261104.json:generic-api-key:939
 ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261104.json:generic-api-key:976
 
+# The name of a GGUF tensor (blk.0.ffn_gate_up_exps.weight) in a converter unit test, not a credential.
+5c008e00085f4d3e394f9a1be649284999de1326:tests/test_conversion_fp8.py:generic-api-key:513
+# The same tensor name as the note above first wrote it, in that commit's copy of this file and in its message.
+90ee9503853ba0cf1f1cd90e84dd6d18143078e2:.gitleaksignore:generic-api-key:39
+90ee9503853ba0cf1f1cd90e84dd6d18143078e2:.git/message:generic-api-key:4
+
+# Upstream's Granite Vision README (llama.cpp #12006) links an image by a GitHub asset URL signed on 2025-02-21 for
+# 300 seconds: the key id of GitHub's own bucket in a link that expired that day, public upstream, not a credential of ours.
+4d1051a40ffc2fdff80bc532eea5b9568b85c156:examples/llava/README-granitevision.md:aws-access-token:172
+
 # Lines of main's tree that rig's job scan reads as credentials under gitleaks' default rules. The job scan reads
 # none of .gitleaks.toml, where this project already let several of them go. Each line was read on 2026-11-19 at
 # e01a4aa6c and is none. The repository names no lead, so the President decided that the seat shipping the tree
@@ -58,8 +68,8 @@ tools/server/tests/unit/test_completion.py:generic-api-key:315
 scripts/inkling2/test_serve.py:generic-api-key:134
 # Upstream's curl example to localhost, with a placeholder where the caller's own value goes.
 tools/server/README.md:curl-auth-header:1870
-# A sentence of TORAD.md that quotes the same Gemma 4 tag name.
-TORAD.md:generic-api-key:657
+# A sentence of TORAD.md that quotes the same Gemma 4 tag name (line 657 at e01a4aa6c, 664 since 9c494a2ec).
+TORAD.md:generic-api-key:664
 # Two SIMD variables of the vendored xxHash.
 vendor/hash/xxhash/xxhash.h:generic-api-key:4905
 vendor/hash/xxhash/xxhash.h:generic-api-key:4954

@@ -451,11 +451,7 @@ static bool slot_victim_idle_legacy() {
 
 // LLAMA_SLOT_VICTIM_RETURN_S: the seconds of idleness that halve the part of a conversation's chance of a return that fades with its time away (90 when unset)
 static double slot_victim_return_s() {
-    static const double seconds = [] {
-        const char * env = getenv("LLAMA_SLOT_VICTIM_RETURN_S");
-        const double value = env != nullptr ? atof(env) : 0.0;
-        return value > 0.0 ? value : 90.0;
-    }();
+    static const double seconds = ggml_env_float("LLAMA_SLOT_VICTIM_RETURN_S");
     return seconds;
 }
 

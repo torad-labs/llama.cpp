@@ -198,6 +198,8 @@ add_library(ggml-base
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
+            ggml-tunables.cpp
+            ggml-tunables.inc
             ggml-quants.c
             ggml-quants.h
             gguf.cpp)

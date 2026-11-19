@@ -226,19 +226,13 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // 25 % faster than MMQ at 9-12 tokens and 19 % at 16 (RTX PRO 4500, E288; TORAD.md). Other types keep the 8-token ceiling.
 // GGML_CUDA_MMVQ_MMID_MAX=N (8-16, read once) sets every type's ceiling to N; 8 is the ceiling before this was added.
 static int get_mmvq_mmid_max_batch_ada_plus(ggml_type type, int cc) {
-    static const int forced = [] {
-        const char * s = getenv("GGML_CUDA_MMVQ_MMID_MAX");
-        return s ? std::min(MMVQ_MMID_BLOCK_WARPS, std::max(MMVQ_MAX_BATCH_SIZE, atoi(s))) : 0;
-    }();
+    static const int forced = (int) ggml_env_int_or("GGML_CUDA_MMVQ_MMID_MAX", 0);
     if (forced != 0) {
         return forced;
     }
     // Compare the row kernel with MMQ at serving batch sizes on SM120 without changing the default crossover.
     if (cc == GGML_CUDA_CC_BLACKWELL && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) {
-        static const int kquant_max = [] {
-            const char * s = getenv("GGML_CUDA_MMVQ_KQUANT_MMID_MAX");
-            return s ? std::min(MMVQ_MMID_CEILING, std::max(MMVQ_MAX_BATCH_SIZE, atoi(s))) : MMVQ_MAX_BATCH_SIZE;
-        }();
+        static const int kquant_max = (int) ggml_env_int("GGML_CUDA_MMVQ_KQUANT_MMID_MAX");
         return kquant_max;
     }
     return type == GGML_TYPE_IQ3_XXS ? MMVQ_MMID_BLOCK_WARPS : MMVQ_MAX_BATCH_SIZE;
@@ -1048,12 +1042,13 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
-static __global__ void mmvq_sort_routes_23(const int32_t * ids, uint32_t stride, int32_t * routes) {
+// Sorts the routes of up to 32 tokens with 8 experts each (256 keys, one a thread) by expert.
+static __global__ void mmvq_sort_routes(const int32_t * ids, uint32_t stride, uint32_t n_routes, int32_t * routes) {
     __shared__ uint32_t keys[256];
     const uint32_t i = threadIdx.x;
     const uint32_t slot = i % 8, token = i / 8;
     uint32_t key = UINT32_MAX;
-    if (i < 23*8) {
+    if (i < n_routes) {
         const int expert = ids[token*stride + slot];
         key = (uint32_t(max(expert, -1) + 1) << 8) | i;
     }
@@ -1072,7 +1067,7 @@ static __global__ void mmvq_sort_routes_23(const int32_t * ids, uint32_t stride,
             key = take_min ? min(peer, key) : max(peer, key);
         }
     }
-    if (i < 23*8) {
+    if (i < n_routes) {
         routes[i] = int32_t(key);
     }
 }
@@ -2108,14 +2103,17 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     static const bool sort_experts = ggml_env_switch("GGML_CUDA_MMVQ_EXPERT_SORT_23");
+    static const int sort_rows_min = ggml_env_int("GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN");
+    static const int sort_rows_max = ggml_env_int("GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX");
     // Adjacent warps read the same expert rows when their tokens share a route.
-    if (sort_experts && ids && !fusion && ncols_dst == 23 && nchannels_dst == 8 && ne02 == 384 && ne03 == 1 && ne3 == 1 &&
+    if (sort_experts && ids && !fusion && ncols_dst >= sort_rows_min && ncols_dst <= sort_rows_max && nchannels_dst == 8 &&
+            ne02 == 384 && ne03 == 1 && ne3 == 1 &&
             ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL &&
             ((src0->type == GGML_TYPE_Q3_K && ne00 == 4608 && (ne01 == 1024 || ne01 == 1536)) ||
              (src0->type == GGML_TYPE_Q4_K && (ne00 == 512 || ne00 == 768) && ne01 == 4608))) {
-        ggml_cuda_pool_alloc<int32_t> routes(ctx.pool(), 23*8);
-        mmvq_sort_routes_23<<<1, 256, 0, stream>>>(ids_d, ids_stride, routes.get());
-        const dim3 grid(ne01/2, 23), block(32, 8);
+        ggml_cuda_pool_alloc<int32_t> routes(ctx.pool(), ncols_dst*8);
+        mmvq_sort_routes<<<1, 256, 0, stream>>>(ids_d, ids_stride, uint32_t(ncols_dst*8), routes.get());
+        const dim3 grid(ne01/2, ncols_dst), block(32, 8);
         const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
         const auto launch = [&](auto type) {
             ggml_cuda_kernel_launch(mul_mat_vec_q_moe<decltype(type)::value, 2, false, true>, params,

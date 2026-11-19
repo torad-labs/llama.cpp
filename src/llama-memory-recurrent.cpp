@@ -61,9 +61,8 @@ llama_memory_recurrent::llama_memory_recurrent(
     cells.resize(mem_size);
 
     // spare rows (n_stage in the header): rs_stage moves a row through an f32 tensor, as rs_relocate does
-    if (const char * value = getenv("LLAMA_RS_STAGE_ROWS"); value != nullptr && n_seq_devices == 1 &&
-            type_r == GGML_TYPE_F32 && type_s == GGML_TYPE_F32) {
-        n_stage = (uint32_t) std::clamp(atoi(value), 0, 64);
+    if (n_seq_devices == 1 && type_r == GGML_TYPE_F32 && type_s == GGML_TYPE_F32) {
+        n_stage = (uint32_t) ggml_env_int("LLAMA_RS_STAGE_ROWS");
     }
     r_stage.assign(n_stage, std::vector<ggml_tensor *>(n_layer, nullptr));
     s_stage.assign(n_stage, std::vector<ggml_tensor *>(n_layer, nullptr));

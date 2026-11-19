@@ -1,5 +1,7 @@
 #include "llama-host-threads.h"
 
+#include "ggml.h"
+
 #include <atomic>
 #include <cstdlib>
 
@@ -8,11 +10,9 @@ static std::atomic<int> g_host_threads_last {1};
 
 static int llama_host_threads_default() {
     static const int n = []() {
-        if (const char * env = std::getenv("LLAMA_HOST_THREADS")) {
-            const int v = std::atoi(env);
-            if (v > 0) {
-                return v;
-            }
+        const int v = (int) ggml_env_int_or("LLAMA_HOST_THREADS", 0);
+        if (v > 0) {
+            return v;
         }
         const unsigned hw = std::thread::hardware_concurrency();
         return std::clamp((int) (hw/2), 1, 16);

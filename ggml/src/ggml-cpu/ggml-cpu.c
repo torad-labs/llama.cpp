@@ -4001,10 +4001,7 @@ void ggml_cpu_init(void) {
         ggml_init_riscv_arch_features();
 #endif
 
-        {
-            const char * env = getenv("GGML_CPU_DISABLE_FUSION");
-            ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
-        }
+        ggml_cpu_disable_fusion = ggml_env_switch("GGML_CPU_DISABLE_FUSION");
 
         is_first_call = false;
     }
