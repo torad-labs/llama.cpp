@@ -64,3 +64,22 @@ Use `--dry-run` to inspect the route commands before loading any weights. For a 
 The restore phase also records the original and independently computed resident prefix distributions before either continuation. To compare the RAM transfer against a blocking file restore, add `--restore-reference-dir /path/to/local/scratch`. The 262,144-token F16 snapshot needs about 9 GiB before periodic checkpoints. Allow at least 12 GiB of temporary disk space with the default 32,768-token checkpoint interval. The runner snapshots the original prefix, displaces it, continues the RAM-restored session, then reloads the snapshot into the same destination slot and repeats the suffix with the other sessions untouched. It removes the reference file after use. Both the original cross-slot comparison and the file control must pass the existing tolerance.
 
 `identity.json` and `topology.txt` describe the assets, executable, loaded-library candidates, four GPUs and peer-access matrices. Every route/attempt retains its startup log, GPU memory snapshot, raw client evidence and per-phase PCIe RX/TX samples from `nvidia-smi dmon`. Inspect the samples for driver support. `comparison.json` tracks delivery and TTFT ratios against the host baseline, per-slot greedy divergence and cold/resident/restored top-32 differences. A failing phase retains its evidence and exits with a nonzero status. Rerunning with `--resume` creates a fresh server for unfinished phases.
+
+## Decode settings search
+
+`search.py` looks for the settings a profile decodes fastest with. A setting is a launcher option (`--draft-depth`, `--no-draft`) or a variable of `tunables.toml` (`LLAMA_SAMPLE_THREADS`, the relative decode's stream counts). Every one of them is read when the server starts, so a trial is one server start.
+
+```sh
+python3 scripts/inkling2/search.py run \
+    --profile tensor-4-draft \
+    --server "$PWD/build/bin/llama-server" \
+    --packs /models/Inkling-2-Small-abliterated-e4853745 \
+    --build "$(git rev-parse --short HEAD)" \
+    --out /results/decode-search-01
+```
+
+A trial pins one coding request to each of the profile's sessions and lets every session generate the same number of tokens with the server's own sampling. Its rate is the tokens a second delivered while all sessions decode, the median of the measured rounds after a warm round. The first trial is the profile as it launches. The search then walks one setting at a time and keeps a value only when it beats the best so far by `--gain` (2%). `--knob NAME=V1,V2` replaces the default space (`--knob=--draft-depth=2,4` for an option) and `--baseline` measures the profile alone.
+
+Each trial is a line of `trials.jsonl` with its settings, rate, the share of drafted tokens the target kept, and the server's error when it did not start. A trial folder keeps the launch plan and the server log. Rerunning the same command skips finished trials. `best.json` holds the settings kept so far.
+
+`search.py log --out DIR` sends each trial to MLflow once, as a run with its settings as parameters, from the machine that holds `MLFLOW_TRACKING_URI`, `MLFLOW_TRACKING_USERNAME` and `MLFLOW_TRACKING_PASSWORD`. `search.py apply --out DIR` writes the kept settings into `tuned.json` beside `serve.py`, which then launches the profile with them. An option on the command line still wins, and `--tuned /dev/null` launches the profile without them. `search.py load --url URL` sends the same load to a server that already runs, for a profiler to watch.

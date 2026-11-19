@@ -2,12 +2,15 @@
 """Serve Inkling 2 Small on four cards from a local abliterated pack; --dry-run prints JSON without starting a model."""
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "models/templates/thinkingmachines-Inkling-2-Small.jinja"
 TEMPLATE_SHA256 = "e9cfd8e75d1272633c2e72b3cc76e99567e2bc8912b960483aed483ad35d54c7"
+# The settings search.py kept for each profile: launcher options and variables of tunables.toml
+TUNED = Path(__file__).with_name("tuned.json")
 
 # The GLM launcher's start-up: the same asset check, dry run, file checks, overrides removed and --prompt-chunk probe
 _spec = importlib.util.spec_from_file_location("glm53_serve", ROOT / "scripts/glm53/serve.py")
@@ -128,8 +131,17 @@ def arguments(argv=None):
     parser.add_argument("--reduction-route", choices=["host", "host-sliced", "engine"],
                         help="host sends reductions on the copy engines through host memory, the route GLM Tensor 4 "
                              "read fastest on rented hosts. host-sliced stages only owned gather values. engine uses the routes it probes (tensor-4: host-sliced, otherwise host)")
+    parser.add_argument("--tuned", type=Path, default=TUNED,
+                        help="Settings a search kept, by profile; an option given here wins (default: tuned.json beside this file)")
     parser.add_argument("--dry-run", action="store_true")
+    argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(argv)
+    text = args.tuned.read_text() if args.tuned.exists() else ""
+    tuned = json.loads(text).get(args.profile, {}) if text.strip() else {}
+    # The search's options go first, so the same option on the command line replaces them
+    args = parser.parse_args([word for name, value in tuned.items() if name.startswith("--")
+                              for word in option_words(name, value)] + argv)
+    args.tuned_env = {name: value for name, value in tuned.items() if not name.startswith("--")}
     profile = PROFILES[args.profile]
     for key, fallback in (("cache_ram", 32768), ("prefix_copy", False), ("mean_mask_decode", False), ("reduction_route", "host"),
                           ("checkpoint_every", None), ("expert_row_limit", None), ("bucket_prefill_kv", False),
@@ -142,6 +154,11 @@ def arguments(argv=None):
         args.host_owner_rows = (profile.get("host_owner_rows", False) and args.reduction_route == profile["reduction_route"]
                                 and args.reduction_wire == "bf16")
     return args
+
+
+def option_words(name, value):
+    """A setting as launcher words; on and off are the two forms of a switch."""
+    return [name] if value == "on" else ["--no-" + name[2:]] if value == "off" else [name, value]
 
 
 def make_plan(args):
@@ -223,6 +240,7 @@ def make_plan(args):
                  "--spec-draft-ubatch", str(DRAFT_UBATCH_SIZE),
                  "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
     env = {
+        **args.tuned_env,
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
         # A session ends at slot-context tokens, and the graph reserved at load is sized for sessions that long
         "LLAMA_KV_SEQ_CELLS": str(slot_context),
