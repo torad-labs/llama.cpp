@@ -1,0 +1,40 @@
+/workspace/rig/jobs/dspark-g2-sweep/dspark_model.py:381: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:208.)
+  value = torch.from_numpy(np.ascontiguousarray(data, dtype=np.float32))
+18:33:53 draft: 5 layers, width 4608, heads 48/8 x 128, block 8, taps [5, 11, 17, 23, 29, 35, 41, 48], window 1024, 1711.7M parameters, 48 stored in BF16, input cast to BF16 yes; caches: 0 window f16, 1 window f16, 2 global q8_0 rot k128 v64, 3 window f16, 4 window f16
+18:33:53 the anchor's embedding is normed with epsilon 1e-06
+18:33:53 states and top-k rows pair up: the target's state names the recorded first choice in 100.00% of rows
+18:33:56 before training, on /workspace/rig/dspark/rec-pack/heldout (3s):
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K           363        2.240        2.484        4.176        5.126
+32K to 64K           16        2.453        2.585        4.559        5.191
+64K to 128K          32        2.259        2.461        4.592        4.961
+128K and over        73        2.183        2.362        4.530        5.162
+all                 484        2.240        2.468        4.270        5.122
+18:33:56 12 steps: 2 epochs of 66 requests, 256 anchors a step
+18:33:58 step 2/12 loss 0.8058 (kd 0.6266, first choice 0.6027) grad 6.53 lr 1.00e-05 context 22988, 0.98s a step, 0 min left
+18:34:01 step 4/12 loss 0.5107 (kd 0.6455, first choice 0.4786) grad 6.34 lr 9.21e-06 context 36015, 1.08s a step, 0 min left
+18:34:03 step 6/12 loss 0.9326 (kd 0.8510, first choice 0.6543) grad 7.36 lr 7.08e-06 context 36015, 1.15s a step, 0 min left
+18:34:07 after 6 steps, a small evaluation:
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K           417        2.177        2.442        4.050        4.945
+32K to 64K           43        1.916        2.061        3.091        3.463
+64K to 128K          16        2.009        2.017        4.259        4.266
+128K and over        36        2.364        2.473        4.746        5.387
+all                 512        2.163        2.399        4.025        4.830
+18:34:09 step 8/12 loss 1.0857 (kd 1.2389, first choice 1.0299) grad 11.87 lr 4.29e-06 context 19878, 1.58s a step, 0 min left
+18:34:11 step 10/12 loss 0.4246 (kd 0.3821, first choice 0.3111) grad 4.88 lr 1.73e-06 context 25365, 1.50s a step, 0 min left
+18:34:14 step 12/12 loss 0.3874 (kd 0.3532, first choice 0.2655) grad 3.65 lr 2.03e-07 context 25365, 1.44s a step, 0 min left
+18:34:14 trained 12 steps in 0 min: loss 0.8058 over the first 2 steps, 0.3874 over the last
+18:34:17 after training, on /workspace/rig/dspark/rec-pack/heldout (3s):
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K           363        2.204        2.484        4.161        5.126
+32K to 64K           16        2.308        2.585        4.550        5.191
+64K to 128K          32        2.260        2.461        4.530        4.961
+128K and over        73        2.189        2.362        4.562        5.162
+all                 484        2.208        2.468        4.259        5.122
+18:34:17 accepted a round at depth 3: 2.240 before, 2.208 after, of a ceiling of 2.468
+18:34:35 wrote /workspace/rig/dspark/trainsmoke-pack/draft-tuned.gguf: 84 tensors over a copy of the draft, read back the same
+0, 0 MiB
+1, 0 MiB
+2, 0 MiB
+3, 0 MiB

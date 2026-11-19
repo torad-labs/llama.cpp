@@ -1,0 +1,28 @@
+donor armand0e-fable:6ae0aeed-340e-4b4d-9d74-f905a74ca2fc#0, 199967 tokens; a slot keeps its first 16674 and 17819 tokens (read once instead of 292 and 1901 times over)
+2193 requests, 2193 recordable, 10 cut short at 200000 tokens, 2193 with a grammar; dropped: {}
+model turns against the sessions' own count: {'AlinCiocan/fable-5-claude-code-traces': {'equal': 19}, 'armand0e/claude-fable-5-claude-code': {'equal': 47}, 'choucsan/mimo-claude-code-traces-1k': {'equal': 1017}, 'crispwisp/wisp-claude-code-sessions': {'equal': 62}, 'liangzhidanta/claude-code-glm53-swesmith-trajectories': {'equal': 1003}, 'trace-commons/agent-traces': {'equal': 35}}
+agreement with the donor, most common lengths: [[17820, 1811], [16674, 292], [17822, 68], [17825, 13], [17824, 4], [17819, 3], [199967, 1], [18186, 1]]
+  heldout  AlinCiocan/fable-5-claude-code-traces                      cc25             1 requests     90460 tokens     73786 rows  {'16674': 1}
+  heldout  armand0e/claude-fable-5-claude-code                        cc25             2 requests    135433 tokens    102085 rows  {'16674': 2}
+  heldout  armand0e/claude-fable-5-claude-code                        cc25-system      2 requests    293728 tokens    258090 rows  {'17819': 2}
+  heldout  choucsan/mimo-claude-code-traces-1k                        cc25            22 requests    549189 tokens    182361 rows  {'16674': 22}
+  heldout  choucsan/mimo-claude-code-traces-1k                        cc25-system     56 requests   1253753 tokens    255889 rows  {'17819': 56}
+  heldout  crispwisp/wisp-claude-code-sessions                        cc25             1 requests     65031 tokens     48357 rows  {'16674': 1}
+  heldout  crispwisp/wisp-claude-code-sessions                        cc25-system     24 requests    496046 tokens     68390 rows  {'17819': 24}
+  heldout  liangzhidanta/claude-code-glm53-swesmith-trajectories      cc25-system     86 requests   2394970 tokens    862536 rows  {'17819': 86}
+  heldout  trace-commons/agent-traces                                 cc25             4 requests    446205 tokens    379509 rows  {'16674': 4}
+  train    AlinCiocan/fable-5-claude-code-traces                      cc25             6 requests    357591 tokens    257547 rows  {'16674': 6}
+  train    AlinCiocan/fable-5-claude-code-traces                      cc25-system     12 requests    610800 tokens    396972 rows  {'17819': 12}
+  train    armand0e/claude-fable-5-claude-code                        cc25            31 requests   2987476 tokens   2470582 rows  {'16674': 31}
+  train    armand0e/claude-fable-5-claude-code                        cc25-system     17 requests    813766 tokens    510843 rows  {'17819': 17}
+  train    choucsan/mimo-claude-code-traces-1k                        cc25           190 requests   4733058 tokens   1564998 rows  {'16674': 190}
+  train    choucsan/mimo-claude-code-traces-1k                        cc25-system    749 requests  16676619 tokens   3330188 rows  {'17819': 749}
+  train    crispwisp/wisp-claude-code-sessions                        cc25             6 requests    802775 tokens    702731 rows  {'16674': 6}
+  train    crispwisp/wisp-claude-code-sessions                        cc25-system     33 requests    691016 tokens    102989 rows  {'17819': 33}
+  train    liangzhidanta/claude-code-glm53-swesmith-trajectories      cc25-system    917 requests  25882060 tokens   9542037 rows  {'17819': 917}
+  train    trace-commons/agent-traces                                 cc25            29 requests   3247597 tokens   2764051 rows  {'16674': 29}
+  train    trace-commons/agent-traces                                 cc25-system      5 requests    146338 tokens     57243 rows  {'17819': 5}
+plan heldout     66 requests   1178396 rows   845 cuts of 1119 model turns, at most  235520 written, about  104.2 GB; classes {'glm': 318017, 'long': 704001, 'mimo': 156378}; kept prefix {'16674': 9, '17819': 57}; lengths {'160': 636, '640': 209}
+plan a           88 requests   1622664 rows   511 cuts of 1959 model turns, at most  141280 written, about  130.1 GB; classes {'glm': 453154, 'long': 938849, 'mimo': 230661}; kept prefix {'16674': 12, '17819': 76}; lengths {'160': 387, '640': 124}
+plan b          490 requests   8396011 rows  2732 cuts of 9340 model turns, at most  764960 written, about  675.4 GB; classes {'glm': 2555810, 'long': 4567238, 'mimo': 1272963}; kept prefix {'16674': 86, '17819': 404}; lengths {'160': 2049, '640': 683}
+plan smoke       18 requests     24002 rows    54 cuts of 55 model turns, at most   20640 written, about    3.3 GB; classes {'long': 2443, 'mimo': 21559}; kept prefix {'16674': 6, '17819': 12}; lengths {'160': 29, '640': 25}

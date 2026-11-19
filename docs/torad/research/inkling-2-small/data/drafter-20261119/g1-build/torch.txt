@@ -1,0 +1,5 @@
+torch 2.15.0+cu132, cuda 13.2, 4 cards
+card 0 NVIDIA RTX PRO 6000 Blackwell Server Edition: 94.2 of 95.0 GB free
+card 1 NVIDIA RTX PRO 6000 Blackwell Server Edition: 94.2 of 95.0 GB free
+card 2 NVIDIA RTX PRO 6000 Blackwell Server Edition: 94.2 of 95.0 GB free
+card 3 NVIDIA RTX PRO 6000 Blackwell Server Edition: 94.2 of 95.0 GB free

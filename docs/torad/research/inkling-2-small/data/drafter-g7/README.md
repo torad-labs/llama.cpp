@@ -46,5 +46,12 @@ Sources: `bench-none.txt`, `bench-stock.txt`, `bench-tuned.txt`; `bench-stock-d7
   round at depth 3 under that check against 1.92 under the first-choice one, and 3.46 against 2.95 at depth 7. The
   stock draft was not walked under it.
 - 42,580 anchors is a small set for 1.7 billion parameters. The same recording holds 299,440 more tokens in the
-  model turns of the prompts, written by the sessions' own model, with Inkling's state at each; the next round
-  trains on those too.
+  model turns of the prompts, written by the sessions' own model, with Inkling's state at each. The trainer can
+  train on those too (`--prompt-anchors`); that round was not run.
+
+## What comes next
+
+The founder decided on 2026-11-19 that Inkling 2 Small designs the pipeline that trains its own drafter, and that a
+fresh session builds from its plan. The scenario it starts from and an index of every record are in
+`../../drafter-plan/`. The other records of the day are in `../drafter-20261119/`, and the kit that made them all is
+`scripts/inkling2/drafter/`.
