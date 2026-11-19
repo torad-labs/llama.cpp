@@ -36,5 +36,5 @@ ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261
 ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261104.json:generic-api-key:939
 ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261104.json:generic-api-key:976
 
-# A GGUF tensor name in a converter unit test (key = "blk.0.ffn_gate_up_exps.weight"), not a credential.
+# The name of a GGUF tensor (blk.0.ffn_gate_up_exps.weight) in a converter unit test, not a credential.
 5c008e00085f4d3e394f9a1be649284999de1326:tests/test_conversion_fp8.py:generic-api-key:513
