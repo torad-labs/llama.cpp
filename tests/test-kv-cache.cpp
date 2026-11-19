@@ -1,7 +1,11 @@
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
+#include <algorithm>
+#include <cstdio>
+#include <memory>
 #include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -185,6 +189,124 @@ int main() {
         GGML_ASSERT(add_to(swa, 0, 8, 1) == 0);
         GGML_ASSERT(add_to(swa, 0, 9, 1) == 4);
         GGML_ASSERT(swa.seq_pos_min(1) == 1 && swa.seq_pos_max(1) == 3);
+    }
+
+    // A call cut into several micro-batches leaves every row the positions its window reads, whichever sequences
+    // share the windowed pool, and finding the cells of a call changes nothing
+    {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+        init_model(*model, 1);
+
+        struct rows { // one micro-batch
+            std::vector<llama_token>    token;
+            std::vector<llama_pos>      pos;
+            std::vector<int32_t>        n_seq_id;
+            std::vector<llama_seq_id>   seq;
+            std::vector<llama_seq_id *> seq_ptr;
+            std::vector<llama_seq_id>   seq_unq;
+        };
+
+        // as the simple split hands it to the cache: every row a sequence set of its own
+        const auto as_ubatch = [](rows & r) {
+            const uint32_t n = r.pos.size();
+            r.token.assign(n, 1);
+            r.n_seq_id.assign(n, 1);
+            for (uint32_t i = 0; i < n; ++i) {
+                r.seq_ptr.push_back(&r.seq[i]);
+                if (std::find(r.seq_unq.begin(), r.seq_unq.end(), r.seq[i]) == r.seq_unq.end()) {
+                    r.seq_unq.push_back(r.seq[i]);
+                }
+            }
+            llama_ubatch ubatch = {};
+            ubatch.n_tokens     = n;
+            ubatch.n_seq_tokens = 1;
+            ubatch.n_seqs       = n;
+            ubatch.n_seqs_unq   = r.seq_unq.size();
+            ubatch.n_pos        = 1;
+            ubatch.token        = r.token.data();
+            ubatch.pos          = r.pos.data();
+            ubatch.n_seq_id     = r.n_seq_id.data();
+            ubatch.seq_id       = r.seq_ptr.data();
+            ubatch.seq_id_unq   = r.seq_unq.data();
+            return ubatch;
+        };
+
+        // the position and owners of every cell, then the first and last position of every sequence
+        const auto snapshot = [](const llama_kv_cache & kv, uint32_t n_seq) {
+            const auto & cells = kv.get_cells(0);
+            std::vector<int64_t> ret;
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                int64_t cell = -1;
+                if (!cells.is_empty(i)) {
+                    cell = cells.pos_get(i);
+                    for (uint32_t s = 0; s < n_seq; ++s) {
+                        cell = cell*2 + cells.seq_has(i, s);
+                    }
+                }
+                ret.push_back(cell);
+            }
+            for (uint32_t s = 0; s < n_seq; ++s) {
+                ret.push_back(kv.seq_pos_min(s));
+                ret.push_back(kv.seq_pos_max(s));
+            }
+            return ret;
+        };
+
+        size_t n_calls = 0, n_rows = 0, changed = 0, lost = 0;
+        std::mt19937 rng(1234);
+        for (int round = 0; round < 400; ++round) {
+            const uint32_t n_seq = 1 + rng() % 4;
+            const uint32_t n_swa = 2 + rng() % 7;
+            const uint32_t n_ub  = 1 + rng() % 12;
+            const auto     type  = rng() % 4 ? LLAMA_SWA_TYPE_STANDARD : LLAMA_SWA_TYPE_CHUNKED;
+            // the least pool a windowed layer is given: a window a sequence and one micro-batch
+            llama_kv_cache kv(*model, false, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true,
+                    n_swa*n_seq + n_ub, n_seq, n_swa, type, nullptr, nullptr, nullptr, nullptr);
+
+            std::vector<llama_pos> next(n_seq, 0);
+            for (int call = 0; call < 10; ++call, ++n_calls) {
+                // runs of consecutive positions, a run from one sequence, cut every n_ub rows
+                std::vector<rows> parts;
+                for (uint32_t n_runs = 1 + rng() % 4; n_runs > 0; --n_runs) {
+                    const llama_seq_id s = rng() % n_seq;
+                    for (uint32_t n = 1 + rng() % (2*n_ub); n > 0; --n) {
+                        if (parts.empty() || parts.back().pos.size() == n_ub) {
+                            parts.emplace_back();
+                        }
+                        parts.back().pos.push_back(next[s]++);
+                        parts.back().seq.push_back(s);
+                    }
+                }
+                std::vector<llama_ubatch> ubatches;
+                for (auto & r : parts) {
+                    ubatches.push_back(as_ubatch(r));
+                }
+
+                const auto before = snapshot(kv, n_seq);
+                const auto sinfos = kv.prepare(ubatches);
+                GGML_ASSERT(sinfos.size() == ubatches.size());
+                changed += snapshot(kv, n_seq) != before;
+
+                for (size_t k = 0; k < ubatches.size(); ++k) {
+                    kv.apply_ubatch(sinfos[k], ubatches[k]);
+                    const auto & cells = kv.get_cells(0);
+                    for (size_t i = 0; i < parts[k].pos.size(); ++i, ++n_rows) {
+                        const auto & held = cells.seq_pos_get(parts[k].seq[i]);
+                        for (llama_pos p0 = 0; p0 <= parts[k].pos[i]; ++p0) {
+                            if (llama_hparams::is_masked_swa(n_swa, type, p0, parts[k].pos[i])) {
+                                continue;
+                            }
+                            const auto it = held.lower_bound({p0, 0});
+                            lost += it == held.end() || it->first != p0;
+                        }
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "windowed pool: %zu calls, %zu changed by finding their cells; %zu rows, %zu positions of a window lost\n",
+                n_calls, changed, n_rows, lost);
+        GGML_ASSERT(changed == 0);
+        GGML_ASSERT(lost == 0);
     }
 
     {

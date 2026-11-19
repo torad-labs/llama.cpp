@@ -326,6 +326,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     endif()
     foreach(inkling_path_device ${inkling_path_devices})
         string(TOLOWER ${inkling_path_device} inkling_path_name)
+        # sessions that share one cache, a call of several micro-batches included, against each session alone
+        llama_test(test-llama-archs NAME test-inkling-window-${inkling_path_name}
+            ARGS --inkling-window ${inkling_path_device} -s 1234)
         foreach(inkling_case prompt decode unified streams)
             llama_test(test-llama-archs NAME test-inkling-rel-${inkling_path_name}-${inkling_case}
                 ARGS --inkling-path rel/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)

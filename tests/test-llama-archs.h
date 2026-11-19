@@ -30,3 +30,6 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
 
 // --inkling-path <feature>/<case>: an optimized path of Inkling 2 against the path it replaced, on dev
 int test_inkling_path(const std::string & path, size_t seed, ggml_backend_dev_t dev);
+
+// --inkling-window <device>: sessions of Inkling 2 that share one cache against each session alone, on dev
+int test_inkling_window(size_t seed, ggml_backend_dev_t dev);
