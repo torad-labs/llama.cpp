@@ -194,7 +194,8 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 }
 
 // data_f32: one value per cell, 0 or -INFINITY for a bit-packed mask (GGML_TYPE_I16, 16 cells per element, bit set = visible)
-static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & data_f32) {
+// offset: where the values start in the tensor, in bytes, for a mask written a row at a time
+static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & data_f32, size_t offset = 0) {
     if (tensor->type == GGML_TYPE_I16) {
         std::vector<uint16_t> words(data_f32.size()/16, 0);
         for (size_t i = 0; i < data_f32.size(); i++) {
@@ -202,14 +203,14 @@ static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & 
                 words[i/16] |= (uint16_t) (1u << (i%16));
             }
         }
-        ggml_backend_tensor_set(tensor, words.data(), 0, words.size()*sizeof(uint16_t));
+        ggml_backend_tensor_set(tensor, words.data(), offset, words.size()*sizeof(uint16_t));
         return;
     }
 
     std::vector<ggml_fp16_t> data_f16(data_f32.size());
     ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f32.size());
 
-    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(tensor, data_f16.data(), offset, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
 // PQ2_0 blocks written directly: every 2-bit code (3, the +2 that the reference quantizer never emits from absmax-scaled
@@ -11702,7 +11703,9 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "m") == 0) {
                 // causal over the cells' positions, empty cells hidden; every row sees the cells before it
-                std::vector<float> f(kv*nb*n_stream, -INFINITY);
+                // Written a row at a time: a pool of millions of cells never has its whole mask as floats.
+                std::vector<float> f(kv);
+                const size_t row_bytes = ggml_nbytes(t)/(nb*n_stream);
                 for (int64_t s = 0; s < n_stream; ++s) {
                     for (int64_t i = 0; i < nb; ++i) {
                         int64_t live = 0;
@@ -11710,14 +11713,13 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                             const int32_t c = cells[s*kv + j];
                             // Disjoint runs, a shared prefix and a fully masked last row.
                             const bool owned = !n_kv_max || (i + 1 < nb && (j < 16 || (j/run)%nb == i));
-                            if (owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max)) {
-                                f[(s*nb + i)*kv + j] = 0.0f;
-                                ++live;
-                            }
+                            const bool seen = owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max);
+                            f[j] = seen ? 0.0f : -INFINITY;
+                            live += seen;
                         }
+                        set_tensor_kq_mask(t, f, (s*nb + i)*row_bytes);
                     }
                 }
-                set_tensor_kq_mask(t, f);
             } else {
                 init_tensor_uniform(t);
             }
