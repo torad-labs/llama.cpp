@@ -1012,7 +1012,7 @@
     "remaining_instance_status": "stopped"
   },
   "artifacts": {
-    "local_root": "/home/marcos/Documents/dev/infra/torad-llama.cpp/.Codex/tmp/dp-profile-20261104",
+    "local_root": ".Codex/tmp/dp-profile-20261104",
     "raw_archive_sha256": "457d5599a52893ae9cf5d5bfcffa16df5e1e24f167760e75a666ef6ba75451b2",
     "raw_archive_bytes": 12138247
   },
