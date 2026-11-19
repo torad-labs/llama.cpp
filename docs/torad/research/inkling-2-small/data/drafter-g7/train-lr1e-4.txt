@@ -1,0 +1,570 @@
+/workspace/rig/jobs/dspark-g7-round/dspark_model.py:381: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:208.)
+  value = torch.from_numpy(np.ascontiguousarray(data, dtype=np.float32))
+21:37:18 draft: 5 layers, width 4608, heads 48/8 x 128, block 8, taps [5, 11, 17, 23, 29, 35, 41, 48], window 1024, 1711.7M parameters, 48 stored in BF16, input cast to BF16 yes; caches: 0 window f16, 1 window f16, 2 global q8_0 rot k128 v64, 3 window f16, 4 window f16
+21:37:18 the anchor's embedding is normed with epsilon 1e-06
+21:37:19 states and top-k rows pair up: the target's state names the recorded first choice in 100.00% of rows
+21:37:46 before training, on /workspace/rig/dspark/rec-pack/heldout (28s):
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K          6826        2.278        2.458        4.404        5.006
+32K to 64K         1087        2.018        2.240        3.611        4.264
+64K to 128K         315        2.008        2.177        3.728        4.190
+128K and over       105        2.263        2.457        4.701        5.446
+all                8333        2.234        2.419        4.279        4.884
+21:37:47 before training, the walk in /workspace/rig/dspark/baseline-pack/walk-before.json stands, and a walk of one request runs (0s)
+21:37:47 398 steps: 2 epochs of 73 requests, 256 anchors a step
+21:37:49 step 1/398 loss 0.8781 (kd 0.7265, first choice 0.6066) grad 7.31 lr 5.26e-06 context 22845, 1.63s a step, 11 min left
+21:37:50 step 2/398 loss 0.6590 (kd 0.5455, first choice 0.4539) grad 4.83 lr 1.05e-05 context 28083, 1.44s a step, 10 min left
+21:37:51 step 3/398 loss 0.8300 (kd 0.6870, first choice 0.5721) grad 6.27 lr 1.58e-05 context 28083, 1.34s a step, 9 min left
+21:37:52 step 4/398 loss 0.4681 (kd 0.4019, first choice 0.2647) grad 3.50 lr 2.11e-05 context 28083, 1.29s a step, 8 min left
+21:37:54 step 5/398 loss 0.9292 (kd 0.7826, first choice 0.5866) grad 6.26 lr 2.63e-05 context 26857, 1.27s a step, 8 min left
+21:37:54 step 6/398 loss 0.6108 (kd 0.5035, first choice 0.4290) grad 10.88 lr 3.16e-05 context 18490, 1.21s a step, 8 min left
+21:37:55 step 7/398 loss 0.2160 (kd 0.1827, first choice 0.1334) grad 3.65 lr 3.68e-05 context 28999, 1.17s a step, 8 min left
+21:37:56 step 8/398 loss 0.1356 (kd 0.1191, first choice 0.0658) grad 1.58 lr 4.21e-05 context 28999, 1.13s a step, 7 min left
+21:37:57 step 9/398 loss 0.6698 (kd 0.5604, first choice 0.4376) grad 5.14 lr 4.74e-05 context 23150, 1.13s a step, 7 min left
+21:37:58 step 10/398 loss 0.4985 (kd 0.4318, first choice 0.2669) grad 3.22 lr 5.26e-05 context 23150, 1.13s a step, 7 min left
+21:38:00 step 11/398 loss 1.5626 (kd 1.2818, first choice 1.1233) grad 7.36 lr 5.79e-05 context 35213, 1.16s a step, 7 min left
+21:38:01 step 12/398 loss 1.1563 (kd 0.9682, first choice 0.7525) grad 4.99 lr 6.32e-05 context 35213, 1.18s a step, 8 min left
+21:38:03 step 13/398 loss 1.1143 (kd 0.9325, first choice 0.7274) grad 4.39 lr 6.84e-05 context 35213, 1.19s a step, 8 min left
+21:38:04 step 14/398 loss 1.0485 (kd 0.8909, first choice 0.6306) grad 3.89 lr 7.37e-05 context 35213, 1.21s a step, 8 min left
+21:38:05 step 15/398 loss 0.9907 (kd 0.8400, first choice 0.6029) grad 4.02 lr 7.89e-05 context 35213, 1.22s a step, 8 min left
+21:38:07 step 16/398 loss 0.9545 (kd 0.8336, first choice 0.4835) grad 3.48 lr 8.42e-05 context 35213, 1.23s a step, 8 min left
+21:38:08 step 17/398 loss 1.6343 (kd 1.3546, first choice 1.1189) grad 7.25 lr 8.95e-05 context 36151, 1.23s a step, 8 min left
+21:38:09 step 18/398 loss 1.0721 (kd 0.9080, first choice 0.6566) grad 5.12 lr 9.47e-05 context 36151, 1.22s a step, 8 min left
+21:38:10 step 19/398 loss 0.9903 (kd 0.8774, first choice 0.4515) grad 4.32 lr 1.00e-04 context 36151, 1.21s a step, 8 min left
+21:38:11 step 20/398 loss 2.4737 (kd 2.0482, first choice 1.7022) grad 13.40 lr 1.00e-04 context 33250, 1.20s a step, 8 min left
+21:38:12 step 21/398 loss 0.9493 (kd 0.7769, first choice 0.6898) grad 9.19 lr 1.00e-04 context 24682, 1.20s a step, 8 min left
+21:38:13 step 22/398 loss 0.7451 (kd 0.6016, first choice 0.5743) grad 9.27 lr 1.00e-04 context 18878, 1.18s a step, 7 min left
+21:38:15 step 23/398 loss 1.9850 (kd 1.6300, first choice 1.4200) grad 9.35 lr 1.00e-04 context 61931, 1.21s a step, 8 min left
+21:38:17 step 24/398 loss 1.5158 (kd 1.2505, first choice 1.0615) grad 6.35 lr 1.00e-04 context 61931, 1.23s a step, 8 min left
+21:38:19 step 25/398 loss 1.6185 (kd 1.3406, first choice 1.1116) grad 7.26 lr 1.00e-04 context 61931, 1.25s a step, 8 min left
+21:38:20 step 26/398 loss 1.3594 (kd 1.1465, first choice 0.8515) grad 5.35 lr 9.99e-05 context 61931, 1.27s a step, 8 min left
+21:38:22 step 27/398 loss 1.1879 (kd 1.0150, first choice 0.6916) grad 4.68 lr 9.99e-05 context 61931, 1.29s a step, 8 min left
+21:38:24 step 28/398 loss 1.1476 (kd 0.9793, first choice 0.6730) grad 4.70 lr 9.99e-05 context 61931, 1.31s a step, 8 min left
+21:38:26 step 29/398 loss 0.9885 (kd 0.8522, first choice 0.5454) grad 3.26 lr 9.99e-05 context 61931, 1.33s a step, 8 min left
+21:38:27 step 30/398 loss 0.9930 (kd 0.8716, first choice 0.4856) grad 3.67 lr 9.98e-05 context 61931, 1.34s a step, 8 min left
+21:38:29 step 31/398 loss 0.8302 (kd 0.7328, first choice 0.3894) grad 3.69 lr 9.98e-05 context 61931, 1.36s a step, 8 min left
+21:38:30 step 32/398 loss 1.2258 (kd 0.9915, first choice 0.9372) grad 7.26 lr 9.98e-05 context 31888, 1.35s a step, 8 min left
+21:38:31 step 33/398 loss 1.2346 (kd 1.0129, first choice 0.8867) grad 5.72 lr 9.97e-05 context 31888, 1.34s a step, 8 min left
+21:38:32 step 34/398 loss 0.6998 (kd 0.5988, first choice 0.4039) grad 3.71 lr 9.97e-05 context 31888, 1.33s a step, 8 min left
+21:38:34 step 35/398 loss 2.5248 (kd 2.0650, first choice 1.8392) grad 10.53 lr 9.96e-05 context 25740, 1.33s a step, 8 min left
+21:38:35 step 36/398 loss 2.0592 (kd 1.7048, first choice 1.4174) grad 6.30 lr 9.96e-05 context 25740, 1.32s a step, 8 min left
+21:38:36 step 37/398 loss 1.1122 (kd 0.9125, first choice 0.7987) grad 6.57 lr 9.95e-05 context 29457, 1.32s a step, 8 min left
+21:38:37 step 38/398 loss 0.8869 (kd 0.7403, first choice 0.5864) grad 5.03 lr 9.94e-05 context 29457, 1.31s a step, 8 min left
+21:38:38 step 39/398 loss 1.6692 (kd 1.3518, first choice 1.2695) grad 7.76 lr 9.94e-05 context 25188, 1.31s a step, 8 min left
+21:38:39 step 40/398 loss 0.5044 (kd 0.4113, first choice 0.3725) grad 11.77 lr 9.93e-05 context 19119, 1.29s a step, 8 min left
+21:38:40 step 41/398 loss 1.9498 (kd 1.6082, first choice 1.3664) grad 10.30 lr 9.92e-05 context 25310, 1.28s a step, 8 min left
+21:38:41 step 42/398 loss 1.4403 (kd 1.2065, first choice 0.9352) grad 5.89 lr 9.92e-05 context 25310, 1.28s a step, 8 min left
+21:38:42 step 43/398 loss 1.2413 (kd 1.0097, first choice 0.9262) grad 9.01 lr 9.91e-05 context 22671, 1.27s a step, 8 min left
+21:38:43 step 44/398 loss 0.7959 (kd 0.6629, first choice 0.5319) grad 4.92 lr 9.90e-05 context 22671, 1.26s a step, 7 min left
+21:38:44 step 45/398 loss 1.4261 (kd 1.1627, first choice 1.0537) grad 7.82 lr 9.89e-05 context 25311, 1.26s a step, 7 min left
+21:38:45 step 46/398 loss 0.9704 (kd 0.8009, first choice 0.6779) grad 5.52 lr 9.88e-05 context 25311, 1.26s a step, 7 min left
+21:38:46 step 47/398 loss 1.5780 (kd 1.2707, first choice 1.2294) grad 12.82 lr 9.88e-05 context 25372, 1.25s a step, 7 min left
+21:38:48 step 48/398 loss 2.7017 (kd 2.2205, first choice 1.9248) grad 9.68 lr 9.87e-05 context 81931, 1.28s a step, 7 min left
+21:38:51 step 49/398 loss 2.7834 (kd 2.2845, first choice 1.9954) grad 8.65 lr 9.86e-05 context 81931, 1.30s a step, 8 min left
+21:38:53 step 50/398 loss 2.3903 (kd 1.9694, first choice 1.6838) grad 7.61 lr 9.85e-05 context 81931, 1.32s a step, 8 min left
+21:38:55 step 51/398 loss 1.8885 (kd 1.5666, first choice 1.2873) grad 4.51 lr 9.84e-05 context 81931, 1.34s a step, 8 min left
+21:38:58 step 52/398 loss 1.8583 (kd 1.5520, first choice 1.2252) grad 5.04 lr 9.83e-05 context 81931, 1.36s a step, 8 min left
+21:39:00 step 53/398 loss 1.8486 (kd 1.5599, first choice 1.1551) grad 5.33 lr 9.81e-05 context 81931, 1.38s a step, 8 min left
+21:39:03 step 54/398 loss 1.7388 (kd 1.4514, first choice 1.1496) grad 4.58 lr 9.80e-05 context 81931, 1.40s a step, 8 min left
+21:39:05 step 55/398 loss 1.7459 (kd 1.4798, first choice 1.0646) grad 4.46 lr 9.79e-05 context 81931, 1.41s a step, 8 min left
+21:39:07 step 56/398 loss 1.4556 (kd 1.2471, first choice 0.8342) grad 3.77 lr 9.78e-05 context 81931, 1.43s a step, 8 min left
+21:39:09 step 57/398 loss 1.3280 (kd 1.1408, first choice 0.7487) grad 4.44 lr 9.77e-05 context 81931, 1.44s a step, 8 min left
+21:39:12 step 58/398 loss 1.6401 (kd 1.4172, first choice 0.8916) grad 4.27 lr 9.75e-05 context 81931, 1.46s a step, 8 min left
+21:39:14 step 59/398 loss 1.3414 (kd 1.1642, first choice 0.7085) grad 3.22 lr 9.74e-05 context 81931, 1.47s a step, 8 min left
+21:39:16 step 60/398 loss 1.4224 (kd 1.2376, first choice 0.7395) grad 2.96 lr 9.73e-05 context 81931, 1.49s a step, 8 min left
+21:39:19 step 61/398 loss 1.2663 (kd 1.1067, first choice 0.6383) grad 3.17 lr 9.71e-05 context 81931, 1.50s a step, 8 min left
+21:39:21 step 62/398 loss 1.3177 (kd 1.1642, first choice 0.6140) grad 3.89 lr 9.70e-05 context 81931, 1.51s a step, 8 min left
+21:39:23 step 63/398 loss 1.2317 (kd 1.0808, first choice 0.6037) grad 3.38 lr 9.69e-05 context 81931, 1.53s a step, 9 min left
+21:39:26 step 64/398 loss 1.0865 (kd 0.9588, first choice 0.5108) grad 3.92 lr 9.67e-05 context 81931, 1.54s a step, 9 min left
+21:39:28 step 65/398 loss 1.1702 (kd 1.0331, first choice 0.5486) grad 3.18 lr 9.66e-05 context 81931, 1.55s a step, 9 min left
+21:39:32 after 65 steps, a small evaluation:
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K           417        2.008        2.442        3.511        4.945
+32K to 64K           43        1.864        2.061        2.926        3.463
+64K to 128K          16        1.994        2.017        3.869        4.266
+128K and over        36        2.240        2.473        4.162        5.387
+all                 512        2.011        2.399        3.519        4.830
+21:39:32 step 66/398 loss 1.1838 (kd 0.9698, first choice 0.8560) grad 10.01 lr 9.64e-05 context 18306, 1.59s a step, 9 min left
+21:39:33 step 67/398 loss 0.8393 (kd 0.6655, first choice 0.6951) grad 9.10 lr 9.63e-05 context 21112, 1.58s a step, 9 min left
+21:39:34 step 68/398 loss 1.8404 (kd 1.5041, first choice 1.3453) grad 10.86 lr 9.61e-05 context 19049, 1.57s a step, 9 min left
+21:39:34 step 69/398 loss 1.3056 (kd 1.0872, first choice 0.8736) grad 6.74 lr 9.59e-05 context 19049, 1.55s a step, 9 min left
+21:39:35 step 70/398 loss 0.8992 (kd 0.7353, first choice 0.6559) grad 9.04 lr 9.58e-05 context 26276, 1.55s a step, 8 min left
+21:39:36 step 71/398 loss 1.7519 (kd 1.4385, first choice 1.2534) grad 10.22 lr 9.56e-05 context 25793, 1.54s a step, 8 min left
+21:39:37 step 72/398 loss 1.0542 (kd 0.8784, first choice 0.7034) grad 5.67 lr 9.54e-05 context 25793, 1.53s a step, 8 min left
+21:39:38 step 73/398 loss 0.7153 (kd 0.5975, first choice 0.4710) grad 5.58 lr 9.53e-05 context 23759, 1.52s a step, 8 min left
+21:39:40 step 74/398 loss 2.9090 (kd 2.3891, first choice 2.0796) grad 12.12 lr 9.51e-05 context 47637, 1.53s a step, 8 min left
+21:39:42 step 75/398 loss 2.8554 (kd 2.3355, first choice 2.0796) grad 8.28 lr 9.49e-05 context 47637, 1.53s a step, 8 min left
+21:39:44 step 76/398 loss 2.6407 (kd 2.1710, first choice 1.8792) grad 6.45 lr 9.47e-05 context 47637, 1.53s a step, 8 min left
+21:39:46 step 77/398 loss 2.1414 (kd 1.7779, first choice 1.4541) grad 5.03 lr 9.45e-05 context 47637, 1.54s a step, 8 min left
+21:39:47 step 78/398 loss 1.9669 (kd 1.6368, first choice 1.3204) grad 4.97 lr 9.43e-05 context 47637, 1.54s a step, 8 min left
+21:39:49 step 79/398 loss 1.6759 (kd 1.4015, first choice 1.0977) grad 4.02 lr 9.41e-05 context 47637, 1.54s a step, 8 min left
+21:39:51 step 80/398 loss 1.6674 (kd 1.4036, first choice 1.0553) grad 4.11 lr 9.39e-05 context 47637, 1.55s a step, 8 min left
+21:39:53 step 81/398 loss 1.4054 (kd 1.1948, first choice 0.8424) grad 4.64 lr 9.37e-05 context 47637, 1.55s a step, 8 min left
+21:39:54 step 82/398 loss 1.5985 (kd 1.3772, first choice 0.8851) grad 3.63 lr 9.35e-05 context 47637, 1.55s a step, 8 min left
+21:39:56 step 83/398 loss 1.5779 (kd 1.3640, first choice 0.8555) grad 5.38 lr 9.33e-05 context 47637, 1.55s a step, 8 min left
+21:39:58 step 84/398 loss 1.5543 (kd 1.3398, first choice 0.8583) grad 4.10 lr 9.31e-05 context 47637, 1.56s a step, 8 min left
+21:40:00 step 85/398 loss 1.2950 (kd 1.1277, first choice 0.6691) grad 3.58 lr 9.29e-05 context 47637, 1.56s a step, 8 min left
+21:40:02 step 86/398 loss 1.2900 (kd 1.1239, first choice 0.6643) grad 2.69 lr 9.27e-05 context 47637, 1.56s a step, 8 min left
+21:40:04 step 87/398 loss 2.0677 (kd 1.6824, first choice 1.5412) grad 9.57 lr 9.25e-05 context 87356, 1.58s a step, 8 min left
+21:40:07 step 88/398 loss 1.6632 (kd 1.3709, first choice 1.1689) grad 6.28 lr 9.23e-05 context 87356, 1.59s a step, 8 min left
+21:40:09 step 89/398 loss 1.2541 (kd 1.0435, first choice 0.8424) grad 5.14 lr 9.20e-05 context 87356, 1.60s a step, 8 min left
+21:40:12 step 90/398 loss 1.0755 (kd 0.9021, first choice 0.6936) grad 4.51 lr 9.18e-05 context 87356, 1.61s a step, 8 min left
+21:40:14 step 91/398 loss 1.0673 (kd 0.9035, first choice 0.6552) grad 3.62 lr 9.16e-05 context 87356, 1.62s a step, 8 min left
+21:40:17 step 92/398 loss 0.9311 (kd 0.7949, first choice 0.5446) grad 3.87 lr 9.14e-05 context 87356, 1.63s a step, 8 min left
+21:40:19 step 93/398 loss 0.7097 (kd 0.6145, first choice 0.3805) grad 2.48 lr 9.11e-05 context 87356, 1.64s a step, 8 min left
+21:40:22 step 94/398 loss 0.8415 (kd 0.7375, first choice 0.4162) grad 3.25 lr 9.09e-05 context 87356, 1.65s a step, 8 min left
+21:40:23 step 95/398 loss 1.3217 (kd 1.0698, first choice 1.0077) grad 14.68 lr 9.06e-05 context 20899, 1.64s a step, 8 min left
+21:40:24 step 96/398 loss 1.1634 (kd 0.9588, first choice 0.8183) grad 8.79 lr 9.04e-05 context 22406, 1.63s a step, 8 min left
+21:40:25 step 97/398 loss 1.9923 (kd 1.6340, first choice 1.4330) grad 10.55 lr 9.02e-05 context 22911, 1.63s a step, 8 min left
+21:40:26 step 98/398 loss 1.1433 (kd 0.9350, first choice 0.8332) grad 7.09 lr 8.99e-05 context 27488, 1.62s a step, 8 min left
+21:40:27 step 99/398 loss 0.6102 (kd 0.5096, first choice 0.4022) grad 4.94 lr 8.97e-05 context 27488, 1.61s a step, 8 min left
+21:40:28 step 100/398 loss 0.5318 (kd 0.4553, first choice 0.3060) grad 2.66 lr 8.94e-05 context 27488, 1.61s a step, 8 min left
+21:40:28 step 101/398 loss 0.7688 (kd 0.6354, first choice 0.5339) grad 9.92 lr 8.91e-05 context 31716, 1.60s a step, 8 min left
+21:40:30 step 102/398 loss 1.1385 (kd 0.9431, first choice 0.7818) grad 6.29 lr 8.89e-05 context 28870, 1.59s a step, 8 min left
+21:40:31 step 103/398 loss 0.9184 (kd 0.7634, first choice 0.6201) grad 4.51 lr 8.86e-05 context 28870, 1.59s a step, 8 min left
+21:40:32 step 104/398 loss 0.8309 (kd 0.6838, first choice 0.5883) grad 6.29 lr 8.84e-05 context 34033, 1.59s a step, 8 min left
+21:40:33 step 105/398 loss 0.5378 (kd 0.4485, first choice 0.3570) grad 3.70 lr 8.81e-05 context 34033, 1.58s a step, 8 min left
+21:40:35 step 106/398 loss 0.3923 (kd 0.3350, first choice 0.2292) grad 2.43 lr 8.78e-05 context 34033, 1.58s a step, 8 min left
+21:40:36 step 107/398 loss 1.8777 (kd 1.5394, first choice 1.3532) grad 13.84 lr 8.76e-05 context 25151, 1.57s a step, 8 min left
+21:40:36 step 108/398 loss 1.2874 (kd 1.0801, first choice 0.8295) grad 6.89 lr 8.73e-05 context 25151, 1.57s a step, 8 min left
+21:40:37 step 109/398 loss 0.6376 (kd 0.5183, first choice 0.4771) grad 10.65 lr 8.70e-05 context 23355, 1.56s a step, 8 min left
+21:40:38 step 110/398 loss 1.3847 (kd 1.1401, first choice 0.9782) grad 9.44 lr 8.67e-05 context 27700, 1.56s a step, 7 min left
+21:40:39 step 111/398 loss 0.8797 (kd 0.7432, first choice 0.5458) grad 5.01 lr 8.64e-05 context 27700, 1.55s a step, 7 min left
+21:40:40 step 112/398 loss 1.8120 (kd 1.4924, first choice 1.2784) grad 8.61 lr 8.62e-05 context 27681, 1.55s a step, 7 min left
+21:40:42 step 113/398 loss 1.1177 (kd 0.9111, first choice 0.8266) grad 6.30 lr 8.59e-05 context 28274, 1.54s a step, 7 min left
+21:40:43 step 114/398 loss 0.8791 (kd 0.7287, first choice 0.6016) grad 3.89 lr 8.56e-05 context 28274, 1.54s a step, 7 min left
+21:40:44 step 115/398 loss 0.6539 (kd 0.5549, first choice 0.3961) grad 3.25 lr 8.53e-05 context 28274, 1.54s a step, 7 min left
+21:40:45 step 116/398 loss 0.4144 (kd 0.3314, first choice 0.3317) grad 9.51 lr 8.50e-05 context 23784, 1.53s a step, 7 min left
+21:40:46 step 117/398 loss 4.0029 (kd 3.2602, first choice 2.9708) grad 18.49 lr 8.47e-05 context 19895, 1.53s a step, 7 min left
+21:40:49 step 118/398 loss 1.2383 (kd 1.0027, first choice 0.9423) grad 8.75 lr 8.44e-05 context 111824, 1.54s a step, 7 min left
+21:40:52 step 119/398 loss 1.0192 (kd 0.8269, first choice 0.7690) grad 6.17 lr 8.41e-05 context 111824, 1.55s a step, 7 min left
+21:40:55 step 120/398 loss 0.9258 (kd 0.7527, first choice 0.6923) grad 5.12 lr 8.38e-05 context 111824, 1.56s a step, 7 min left
+21:40:58 step 121/398 loss 0.7253 (kd 0.5990, first choice 0.5052) grad 4.18 lr 8.35e-05 context 111824, 1.57s a step, 7 min left
+21:41:00 step 122/398 loss 0.5692 (kd 0.4717, first choice 0.3900) grad 3.78 lr 8.32e-05 context 111824, 1.58s a step, 7 min left
+21:41:03 step 123/398 loss 0.5565 (kd 0.4669, first choice 0.3584) grad 3.06 lr 8.29e-05 context 111824, 1.59s a step, 7 min left
+21:41:06 step 124/398 loss 0.5198 (kd 0.4362, first choice 0.3345) grad 2.98 lr 8.25e-05 context 111824, 1.60s a step, 7 min left
+21:41:09 step 125/398 loss 0.5019 (kd 0.4222, first choice 0.3187) grad 3.37 lr 8.22e-05 context 111824, 1.61s a step, 7 min left
+21:41:12 step 126/398 loss 0.5497 (kd 0.4683, first choice 0.3259) grad 2.52 lr 8.19e-05 context 111824, 1.62s a step, 7 min left
+21:41:15 step 127/398 loss 0.4931 (kd 0.4211, first choice 0.2880) grad 2.73 lr 8.16e-05 context 111824, 1.63s a step, 7 min left
+21:41:18 step 128/398 loss 0.4464 (kd 0.3881, first choice 0.2332) grad 1.98 lr 8.13e-05 context 111824, 1.64s a step, 7 min left
+21:41:20 step 129/398 loss 0.3281 (kd 0.2834, first choice 0.1789) grad 2.88 lr 8.09e-05 context 111824, 1.65s a step, 7 min left
+21:41:23 step 130/398 loss 0.3873 (kd 0.3392, first choice 0.1923) grad 2.32 lr 8.06e-05 context 111824, 1.66s a step, 7 min left
+21:41:30 after 130 steps, a small evaluation:
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K           417        2.012        2.442        3.604        4.945
+32K to 64K           43        1.693        2.061        2.661        3.463
+64K to 128K          16        1.769        2.017        3.769        4.266
+128K and over        36        2.165        2.473        4.239        5.387
+all                 512        1.989        2.399        3.574        4.830
+21:41:33 step 131/398 loss 0.3917 (kd 0.3441, first choice 0.1904) grad 2.04 lr 8.03e-05 context 111824, 1.72s a step, 8 min left
+21:41:36 step 132/398 loss 0.3734 (kd 0.3267, first choice 0.1866) grad 2.24 lr 8.00e-05 context 111824, 1.73s a step, 8 min left
+21:41:37 step 133/398 loss 1.9415 (kd 1.6101, first choice 1.3255) grad 8.34 lr 7.96e-05 context 30103, 1.73s a step, 8 min left
+21:41:38 step 134/398 loss 1.9671 (kd 1.6329, first choice 1.3365) grad 6.90 lr 7.93e-05 context 30103, 1.72s a step, 8 min left
+21:41:39 step 135/398 loss 0.4933 (kd 0.4031, first choice 0.3609) grad 7.07 lr 7.90e-05 context 27319, 1.72s a step, 8 min left
+21:41:41 step 136/398 loss 1.8014 (kd 1.4692, first choice 1.3289) grad 6.92 lr 7.86e-05 context 41641, 1.72s a step, 7 min left
+21:41:42 step 137/398 loss 1.8528 (kd 1.5231, first choice 1.3190) grad 5.91 lr 7.83e-05 context 41641, 1.72s a step, 7 min left
+21:41:44 step 138/398 loss 1.5707 (kd 1.2976, first choice 1.0922) grad 5.52 lr 7.79e-05 context 41641, 1.71s a step, 7 min left
+21:41:45 step 139/398 loss 1.3051 (kd 1.0868, first choice 0.8731) grad 4.42 lr 7.76e-05 context 41641, 1.71s a step, 7 min left
+21:41:47 step 140/398 loss 1.2040 (kd 1.0168, first choice 0.7486) grad 4.03 lr 7.72e-05 context 41641, 1.71s a step, 7 min left
+21:41:48 step 141/398 loss 1.2132 (kd 1.0326, first choice 0.7227) grad 3.78 lr 7.69e-05 context 41641, 1.71s a step, 7 min left
+21:41:50 step 142/398 loss 0.9971 (kd 0.8498, first choice 0.5893) grad 3.42 lr 7.65e-05 context 41641, 1.71s a step, 7 min left
+21:41:51 step 143/398 loss 0.9971 (kd 0.8532, first choice 0.5756) grad 3.67 lr 7.62e-05 context 41641, 1.71s a step, 7 min left
+21:41:53 step 144/398 loss 0.9389 (kd 0.8204, first choice 0.4741) grad 5.27 lr 7.58e-05 context 41641, 1.70s a step, 7 min left
+21:41:54 step 145/398 loss 1.4134 (kd 1.1604, first choice 1.0122) grad 5.70 lr 7.55e-05 context 24942, 1.70s a step, 7 min left
+21:41:55 step 146/398 loss 1.4212 (kd 1.1820, first choice 0.9568) grad 5.13 lr 7.51e-05 context 24942, 1.70s a step, 7 min left
+21:41:56 step 147/398 loss 1.0773 (kd 0.9084, first choice 0.6756) grad 4.16 lr 7.48e-05 context 24942, 1.69s a step, 7 min left
+21:41:57 step 148/398 loss 0.7273 (kd 0.6312, first choice 0.3840) grad 3.71 lr 7.44e-05 context 24942, 1.69s a step, 7 min left
+21:41:58 step 149/398 loss 1.0627 (kd 0.8884, first choice 0.6969) grad 5.51 lr 7.40e-05 context 19243, 1.68s a step, 7 min left
+21:41:59 step 150/398 loss 1.3343 (kd 1.0921, first choice 0.9686) grad 6.05 lr 7.37e-05 context 37097, 1.68s a step, 7 min left
+21:42:01 step 151/398 loss 1.1019 (kd 0.9132, first choice 0.7547) grad 4.83 lr 7.33e-05 context 37097, 1.68s a step, 7 min left
+21:42:02 step 152/398 loss 0.8774 (kd 0.7395, first choice 0.5515) grad 3.01 lr 7.29e-05 context 37097, 1.68s a step, 7 min left
+21:42:03 step 153/398 loss 0.6932 (kd 0.5923, first choice 0.4037) grad 3.13 lr 7.26e-05 context 37097, 1.67s a step, 7 min left
+21:42:04 step 154/398 loss 0.9507 (kd 0.7790, first choice 0.6868) grad 7.89 lr 7.22e-05 context 18208, 1.67s a step, 7 min left
+21:42:05 step 155/398 loss 2.3001 (kd 1.8966, first choice 1.6140) grad 8.11 lr 7.18e-05 context 31569, 1.67s a step, 7 min left
+21:42:07 step 156/398 loss 1.9336 (kd 1.6050, first choice 1.3145) grad 6.16 lr 7.15e-05 context 31569, 1.66s a step, 7 min left
+21:42:08 step 157/398 loss 1.7372 (kd 1.4523, first choice 1.1395) grad 7.64 lr 7.11e-05 context 31569, 1.66s a step, 7 min left
+21:42:09 step 158/398 loss 1.7693 (kd 1.4764, first choice 1.1715) grad 6.26 lr 7.07e-05 context 31569, 1.66s a step, 7 min left
+21:42:10 step 159/398 loss 1.4496 (kd 1.2190, first choice 0.9224) grad 4.93 lr 7.03e-05 context 31569, 1.65s a step, 7 min left
+21:42:11 step 160/398 loss 1.5144 (kd 1.2818, first choice 0.9304) grad 4.90 lr 6.99e-05 context 31569, 1.65s a step, 7 min left
+21:42:13 step 161/398 loss 1.6950 (kd 1.3840, first choice 1.2443) grad 7.98 lr 6.96e-05 context 37283, 1.65s a step, 7 min left
+21:42:14 step 162/398 loss 1.3853 (kd 1.1356, first choice 0.9990) grad 6.46 lr 6.92e-05 context 37283, 1.65s a step, 6 min left
+21:42:16 step 163/398 loss 0.9646 (kd 0.7967, first choice 0.6716) grad 3.62 lr 6.88e-05 context 37283, 1.65s a step, 6 min left
+21:42:17 step 164/398 loss 1.0047 (kd 0.8425, first choice 0.6486) grad 4.19 lr 6.84e-05 context 37283, 1.65s a step, 6 min left
+21:42:19 step 165/398 loss 1.1625 (kd 0.9521, first choice 0.8416) grad 5.34 lr 6.80e-05 context 30151, 1.64s a step, 6 min left
+21:42:20 step 166/398 loss 0.7292 (kd 0.6057, first choice 0.4939) grad 4.00 lr 6.76e-05 context 30151, 1.64s a step, 6 min left
+21:42:21 step 167/398 loss 0.7794 (kd 0.6573, first choice 0.4887) grad 3.11 lr 6.73e-05 context 30151, 1.64s a step, 6 min left
+21:42:22 step 168/398 loss 0.6963 (kd 0.5747, first choice 0.4867) grad 5.86 lr 6.69e-05 context 24581, 1.64s a step, 6 min left
+21:42:23 step 169/398 loss 0.4447 (kd 0.3763, first choice 0.2739) grad 2.97 lr 6.65e-05 context 24581, 1.63s a step, 6 min left
+21:42:24 step 170/398 loss 0.8715 (kd 0.7314, first choice 0.5604) grad 5.32 lr 6.61e-05 context 31296, 1.63s a step, 6 min left
+21:42:26 step 171/398 loss 1.9008 (kd 1.5515, first choice 1.3973) grad 8.93 lr 6.57e-05 context 55351, 1.63s a step, 6 min left
+21:42:28 step 172/398 loss 1.8361 (kd 1.5107, first choice 1.3014) grad 6.21 lr 6.53e-05 context 55351, 1.63s a step, 6 min left
+21:42:29 step 173/398 loss 1.3382 (kd 1.1240, first choice 0.8568) grad 4.65 lr 6.49e-05 context 55351, 1.63s a step, 6 min left
+21:42:31 step 174/398 loss 1.0962 (kd 0.9215, first choice 0.6989) grad 4.35 lr 6.45e-05 context 55351, 1.63s a step, 6 min left
+21:42:32 step 175/398 loss 0.9847 (kd 0.8425, first choice 0.5687) grad 3.30 lr 6.41e-05 context 55351, 1.63s a step, 6 min left
+21:42:33 step 176/398 loss 2.7253 (kd 2.2270, first choice 1.9928) grad 9.65 lr 6.37e-05 context 21880, 1.63s a step, 6 min left
+21:42:34 step 177/398 loss 2.2386 (kd 1.8409, first choice 1.5907) grad 6.34 lr 6.33e-05 context 21880, 1.62s a step, 6 min left
+21:42:35 step 178/398 loss 0.7844 (kd 0.6336, first choice 0.6034) grad 16.66 lr 6.29e-05 context 24920, 1.62s a step, 6 min left
+21:42:36 step 179/398 loss 1.1314 (kd 0.9401, first choice 0.7652) grad 7.22 lr 6.25e-05 context 21923, 1.61s a step, 6 min left
+21:42:37 step 180/398 loss 1.5722 (kd 1.2810, first choice 1.1649) grad 5.74 lr 6.21e-05 context 25385, 1.61s a step, 6 min left
+21:42:38 step 181/398 loss 1.4839 (kd 1.2337, first choice 1.0008) grad 4.69 lr 6.17e-05 context 25385, 1.61s a step, 6 min left
+21:42:39 step 182/398 loss 0.5482 (kd 0.4462, first choice 0.4082) grad 5.55 lr 6.13e-05 context 34261, 1.60s a step, 6 min left
+21:42:40 step 183/398 loss 1.2929 (kd 1.0509, first choice 0.9679) grad 6.73 lr 6.09e-05 context 30067, 1.60s a step, 6 min left
+21:42:41 step 184/398 loss 1.0372 (kd 0.8568, first choice 0.7217) grad 5.62 lr 6.05e-05 context 30067, 1.60s a step, 6 min left
+21:42:42 step 185/398 loss 0.9282 (kd 0.7838, first choice 0.5775) grad 3.95 lr 6.01e-05 context 30067, 1.59s a step, 6 min left
+21:42:43 step 186/398 loss 0.1648 (kd 0.1332, first choice 0.1263) grad 5.18 lr 5.97e-05 context 20348, 1.59s a step, 6 min left
+21:42:44 step 187/398 loss 0.9393 (kd 0.7694, first choice 0.6794) grad 5.10 lr 5.93e-05 context 29789, 1.59s a step, 6 min left
+21:42:45 step 188/398 loss 0.7131 (kd 0.5975, first choice 0.4624) grad 3.92 lr 5.89e-05 context 29789, 1.59s a step, 6 min left
+21:42:46 step 189/398 loss 1.0123 (kd 0.8186, first choice 0.7746) grad 11.02 lr 5.85e-05 context 18191, 1.58s a step, 6 min left
+21:42:47 step 190/398 loss 1.3087 (kd 1.0707, first choice 0.9520) grad 8.81 lr 5.80e-05 context 25478, 1.58s a step, 5 min left
+21:42:47 step 191/398 loss 1.0729 (kd 0.8812, first choice 0.7668) grad 5.45 lr 5.76e-05 context 25478, 1.57s a step, 5 min left
+21:42:49 step 192/398 loss 1.1968 (kd 0.9717, first choice 0.9003) grad 5.92 lr 5.72e-05 context 27537, 1.57s a step, 5 min left
+21:42:50 step 193/398 loss 1.0092 (kd 0.8290, first choice 0.7208) grad 4.31 lr 5.68e-05 context 27537, 1.57s a step, 5 min left
+21:42:51 step 194/398 loss 0.7932 (kd 0.6615, first choice 0.5267) grad 3.08 lr 5.64e-05 context 27537, 1.57s a step, 5 min left
+21:42:52 step 195/398 loss 2.1346 (kd 1.7223, first choice 1.6491) grad 12.81 lr 5.60e-05 context 18201, 1.56s a step, 5 min left
+21:42:56 after 195 steps, a small evaluation:
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K           417        2.013        2.442        3.722        4.945
+32K to 64K           43        1.591        2.061        2.444        3.463
+64K to 128K          16        1.787        2.017        3.224        4.266
+128K and over        36        2.139        2.473        3.717        5.387
+all                 512        1.979        2.399        3.599        4.830
+21:42:57 step 196/398 loss 1.0971 (kd 0.8938, first choice 0.8131) grad 5.64 lr 5.56e-05 context 23307, 1.58s a step, 5 min left
+21:42:58 step 197/398 loss 0.7552 (kd 0.6203, first choice 0.5393) grad 4.17 lr 5.52e-05 context 23307, 1.58s a step, 5 min left
+21:42:59 step 198/398 loss 1.4393 (kd 1.1785, first choice 1.0432) grad 6.71 lr 5.48e-05 context 18713, 1.57s a step, 5 min left
+21:42:59 step 199/398 loss 0.3070 (kd 0.2604, first choice 0.1865) grad 6.45 lr 5.43e-05 context 35435, 1.57s a step, 5 min left
+21:43:01 step 200/398 loss 2.1884 (kd 1.8662, first choice 1.2887) grad 12.86 lr 5.39e-05 context 33250, 1.57s a step, 5 min left
+21:43:01 step 201/398 loss 0.8512 (kd 0.7293, first choice 0.4876) grad 6.55 lr 5.35e-05 context 21923, 1.56s a step, 5 min left
+21:43:02 step 202/398 loss 0.9694 (kd 0.8513, first choice 0.4726) grad 5.29 lr 5.31e-05 context 25793, 1.56s a step, 5 min left
+21:43:03 step 203/398 loss 0.7409 (kd 0.6534, first choice 0.3500) grad 3.47 lr 5.27e-05 context 25793, 1.56s a step, 5 min left
+21:43:06 step 204/398 loss 1.4860 (kd 1.2867, first choice 0.7971) grad 4.14 lr 5.23e-05 context 81931, 1.56s a step, 5 min left
+21:43:08 step 205/398 loss 1.3821 (kd 1.1943, first choice 0.7512) grad 3.28 lr 5.19e-05 context 81931, 1.56s a step, 5 min left
+21:43:10 step 206/398 loss 1.4271 (kd 1.2534, first choice 0.6947) grad 3.03 lr 5.15e-05 context 81931, 1.57s a step, 5 min left
+21:43:13 step 207/398 loss 1.0651 (kd 0.9373, first choice 0.5114) grad 2.46 lr 5.10e-05 context 81931, 1.57s a step, 5 min left
+21:43:15 step 208/398 loss 1.0937 (kd 0.9737, first choice 0.4803) grad 1.96 lr 5.06e-05 context 81931, 1.58s a step, 5 min left
+21:43:17 step 209/398 loss 1.0955 (kd 0.9864, first choice 0.4362) grad 2.15 lr 5.02e-05 context 81931, 1.58s a step, 5 min left
+21:43:19 step 210/398 loss 1.1750 (kd 1.0583, first choice 0.4668) grad 1.89 lr 4.98e-05 context 81931, 1.58s a step, 5 min left
+21:43:22 step 211/398 loss 1.1109 (kd 1.0094, first choice 0.4061) grad 1.79 lr 4.94e-05 context 81931, 1.59s a step, 5 min left
+21:43:24 step 212/398 loss 0.8844 (kd 0.8043, first choice 0.3204) grad 1.54 lr 4.90e-05 context 81931, 1.59s a step, 5 min left
+21:43:26 step 213/398 loss 1.0483 (kd 0.9499, first choice 0.3938) grad 1.56 lr 4.85e-05 context 81931, 1.59s a step, 5 min left
+21:43:29 step 214/398 loss 1.0260 (kd 0.9305, first choice 0.3824) grad 2.09 lr 4.81e-05 context 81931, 1.60s a step, 5 min left
+21:43:31 step 215/398 loss 1.0575 (kd 0.9621, first choice 0.3816) grad 1.57 lr 4.77e-05 context 81931, 1.60s a step, 5 min left
+21:43:33 step 216/398 loss 1.1042 (kd 1.0038, first choice 0.4016) grad 1.44 lr 4.73e-05 context 81931, 1.60s a step, 5 min left
+21:43:36 step 217/398 loss 0.8487 (kd 0.7740, first choice 0.2989) grad 1.45 lr 4.69e-05 context 81931, 1.61s a step, 5 min left
+21:43:38 step 218/398 loss 1.0376 (kd 0.9497, first choice 0.3516) grad 1.44 lr 4.65e-05 context 81931, 1.61s a step, 5 min left
+21:43:40 step 219/398 loss 0.9345 (kd 0.8595, first choice 0.3002) grad 1.48 lr 4.61e-05 context 81931, 1.61s a step, 5 min left
+21:43:43 step 220/398 loss 0.9419 (kd 0.8648, first choice 0.3084) grad 1.24 lr 4.57e-05 context 81931, 1.62s a step, 5 min left
+21:43:45 step 221/398 loss 0.9713 (kd 0.8972, first choice 0.2964) grad 1.02 lr 4.52e-05 context 81931, 1.62s a step, 5 min left
+21:43:46 step 222/398 loss 0.2252 (kd 0.1959, first choice 0.1172) grad 2.60 lr 4.48e-05 context 23355, 1.62s a step, 5 min left
+21:43:47 step 223/398 loss 0.6989 (kd 0.5997, first choice 0.3966) grad 3.92 lr 4.44e-05 context 28274, 1.61s a step, 5 min left
+21:43:48 step 224/398 loss 0.4939 (kd 0.4310, first choice 0.2518) grad 2.63 lr 4.40e-05 context 28274, 1.61s a step, 5 min left
+21:43:49 step 225/398 loss 0.5316 (kd 0.4739, first choice 0.2306) grad 1.63 lr 4.36e-05 context 28274, 1.61s a step, 5 min left
+21:43:50 step 226/398 loss 2.2044 (kd 1.8859, first choice 1.2739) grad 10.05 lr 4.32e-05 context 19895, 1.61s a step, 5 min left
+21:43:51 step 227/398 loss 0.9442 (kd 0.8567, first choice 0.3499) grad 3.20 lr 4.28e-05 context 25385, 1.60s a step, 5 min left
+21:43:52 step 228/398 loss 0.9739 (kd 0.8874, first choice 0.3459) grad 2.88 lr 4.24e-05 context 25385, 1.60s a step, 5 min left
+21:43:53 step 229/398 loss 0.8091 (kd 0.6860, first choice 0.4922) grad 6.67 lr 4.20e-05 context 25372, 1.60s a step, 5 min left
+21:43:54 step 230/398 loss 1.1852 (kd 1.0119, first choice 0.6932) grad 4.49 lr 4.15e-05 context 25310, 1.60s a step, 4 min left
+21:43:55 step 231/398 loss 1.0703 (kd 0.9245, first choice 0.5833) grad 3.30 lr 4.11e-05 context 25310, 1.59s a step, 4 min left
+21:43:57 step 232/398 loss 0.4986 (kd 0.4342, first choice 0.2572) grad 3.95 lr 4.07e-05 context 23759, 1.59s a step, 4 min left
+21:43:58 step 233/398 loss 0.7593 (kd 0.6513, first choice 0.4323) grad 4.86 lr 4.03e-05 context 30151, 1.59s a step, 4 min left
+21:43:59 step 234/398 loss 0.6677 (kd 0.5789, first choice 0.3552) grad 3.18 lr 3.99e-05 context 30151, 1.59s a step, 4 min left
+21:44:01 step 235/398 loss 0.5770 (kd 0.5125, first choice 0.2577) grad 1.87 lr 3.95e-05 context 30151, 1.59s a step, 4 min left
+21:44:01 step 236/398 loss 0.7661 (kd 0.6590, first choice 0.4282) grad 3.96 lr 3.91e-05 context 25478, 1.59s a step, 4 min left
+21:44:02 step 237/398 loss 0.6342 (kd 0.5619, first choice 0.2893) grad 3.25 lr 3.87e-05 context 25478, 1.58s a step, 4 min left
+21:44:04 step 238/398 loss 1.0066 (kd 0.8751, first choice 0.5260) grad 3.52 lr 3.83e-05 context 55351, 1.58s a step, 4 min left
+21:44:06 step 239/398 loss 0.8828 (kd 0.7748, first choice 0.4319) grad 3.31 lr 3.79e-05 context 55351, 1.58s a step, 4 min left
+21:44:07 step 240/398 loss 0.8935 (kd 0.7825, first choice 0.4442) grad 3.36 lr 3.75e-05 context 55351, 1.58s a step, 4 min left
+21:44:09 step 241/398 loss 0.7731 (kd 0.6922, first choice 0.3235) grad 1.89 lr 3.71e-05 context 55351, 1.58s a step, 4 min left
+21:44:10 step 242/398 loss 0.7045 (kd 0.6410, first choice 0.2542) grad 1.52 lr 3.67e-05 context 55351, 1.58s a step, 4 min left
+21:44:11 step 243/398 loss 0.4226 (kd 0.3735, first choice 0.1963) grad 7.19 lr 3.63e-05 context 19119, 1.58s a step, 4 min left
+21:44:12 step 244/398 loss 1.1110 (kd 0.9609, first choice 0.6007) grad 4.89 lr 3.59e-05 context 27681, 1.58s a step, 4 min left
+21:44:13 step 245/398 loss 0.6564 (kd 0.5739, first choice 0.3303) grad 4.16 lr 3.55e-05 context 27488, 1.57s a step, 4 min left
+21:44:14 step 246/398 loss 0.6816 (kd 0.5899, first choice 0.3669) grad 3.36 lr 3.51e-05 context 27488, 1.57s a step, 4 min left
+21:44:15 step 247/398 loss 0.4957 (kd 0.4398, first choice 0.2236) grad 2.22 lr 3.47e-05 context 27488, 1.57s a step, 4 min left
+21:44:16 step 248/398 loss 0.6590 (kd 0.5819, first choice 0.3084) grad 2.92 lr 3.43e-05 context 27700, 1.57s a step, 4 min left
+21:44:17 step 249/398 loss 0.5714 (kd 0.5059, first choice 0.2622) grad 2.43 lr 3.39e-05 context 27700, 1.56s a step, 4 min left
+21:44:18 step 250/398 loss 0.9491 (kd 0.8176, first choice 0.5261) grad 4.89 lr 3.35e-05 context 29457, 1.56s a step, 4 min left
+21:44:19 step 251/398 loss 0.8342 (kd 0.7276, first choice 0.4262) grad 4.25 lr 3.31e-05 context 29457, 1.56s a step, 4 min left
+21:44:20 step 252/398 loss 0.5418 (kd 0.4694, first choice 0.2896) grad 3.36 lr 3.27e-05 context 22671, 1.56s a step, 4 min left
+21:44:21 step 253/398 loss 0.4849 (kd 0.4262, first choice 0.2347) grad 2.53 lr 3.24e-05 context 22671, 1.56s a step, 4 min left
+21:44:21 step 254/398 loss 0.6388 (kd 0.5491, first choice 0.3586) grad 3.94 lr 3.20e-05 context 18306, 1.55s a step, 4 min left
+21:44:22 step 255/398 loss 0.4756 (kd 0.3906, first choice 0.3400) grad 8.15 lr 3.16e-05 context 24920, 1.55s a step, 4 min left
+21:44:23 step 256/398 loss 0.1413 (kd 0.1209, first choice 0.0813) grad 2.27 lr 3.12e-05 context 23784, 1.55s a step, 4 min left
+21:44:24 step 257/398 loss 1.4334 (kd 1.2215, first choice 0.8479) grad 5.20 lr 3.08e-05 context 36151, 1.54s a step, 4 min left
+21:44:25 step 258/398 loss 1.3290 (kd 1.1498, first choice 0.7165) grad 4.71 lr 3.04e-05 context 36151, 1.54s a step, 4 min left
+21:44:26 step 259/398 loss 1.1082 (kd 0.9758, first choice 0.5296) grad 3.21 lr 3.01e-05 context 36151, 1.54s a step, 4 min left
+21:44:28 step 260/398 loss 0.5149 (kd 0.4275, first choice 0.3496) grad 3.98 lr 2.97e-05 context 28083, 1.54s a step, 4 min left
+21:44:34 after 260 steps, a small evaluation:
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K           417        2.015        2.442        3.641        4.945
+32K to 64K           43        1.595        2.061        2.320        3.463
+64K to 128K          16        1.796        2.017        3.546        4.266
+128K and over        36        2.131        2.473        3.807        5.387
+all                 512        1.981        2.399        3.539        4.830
+21:44:35 step 261/398 loss 0.5792 (kd 0.4910, first choice 0.3528) grad 3.01 lr 2.93e-05 context 28083, 1.56s a step, 4 min left
+21:44:36 step 262/398 loss 0.5067 (kd 0.4405, first choice 0.2647) grad 2.00 lr 2.89e-05 context 28083, 1.56s a step, 4 min left
+21:44:37 step 263/398 loss 0.4954 (kd 0.4085, first choice 0.3475) grad 6.37 lr 2.85e-05 context 31716, 1.56s a step, 4 min left
+21:44:38 step 264/398 loss 0.3241 (kd 0.2713, first choice 0.2112) grad 4.53 lr 2.82e-05 context 34261, 1.56s a step, 3 min left
+21:44:39 step 265/398 loss 1.4384 (kd 1.2475, first choice 0.7637) grad 8.40 lr 2.78e-05 context 22911, 1.56s a step, 3 min left
+21:44:40 step 266/398 loss 1.0638 (kd 0.9028, first choice 0.6442) grad 8.19 lr 2.74e-05 context 18713, 1.55s a step, 3 min left
+21:44:42 step 267/398 loss 1.6609 (kd 1.4290, first choice 0.9274) grad 9.09 lr 2.71e-05 context 31569, 1.55s a step, 3 min left
+21:44:43 step 268/398 loss 1.4391 (kd 1.2503, first choice 0.7553) grad 6.63 lr 2.67e-05 context 31569, 1.55s a step, 3 min left
+21:44:44 step 269/398 loss 1.3753 (kd 1.1984, first choice 0.7077) grad 4.12 lr 2.63e-05 context 31569, 1.55s a step, 3 min left
+21:44:45 step 270/398 loss 1.1286 (kd 0.9925, first choice 0.5446) grad 2.86 lr 2.60e-05 context 31569, 1.55s a step, 3 min left
+21:44:47 step 271/398 loss 1.1351 (kd 1.0054, first choice 0.5187) grad 2.91 lr 2.56e-05 context 31569, 1.55s a step, 3 min left
+21:44:48 step 272/398 loss 1.1305 (kd 1.0004, first choice 0.5204) grad 3.49 lr 2.52e-05 context 31569, 1.55s a step, 3 min left
+21:44:49 step 273/398 loss 0.6564 (kd 0.5689, first choice 0.3499) grad 4.42 lr 2.49e-05 context 18208, 1.54s a step, 3 min left
+21:44:50 step 274/398 loss 0.7613 (kd 0.6526, first choice 0.4347) grad 4.33 lr 2.45e-05 context 29789, 1.54s a step, 3 min left
+21:44:51 step 275/398 loss 0.5594 (kd 0.4850, first choice 0.2978) grad 3.19 lr 2.42e-05 context 29789, 1.54s a step, 3 min left
+21:44:52 step 276/398 loss 1.0692 (kd 0.9263, first choice 0.5714) grad 6.27 lr 2.38e-05 context 25151, 1.54s a step, 3 min left
+21:44:53 step 277/398 loss 1.0934 (kd 0.9466, first choice 0.5875) grad 5.38 lr 2.35e-05 context 25151, 1.54s a step, 3 min left
+21:44:54 step 278/398 loss 0.3097 (kd 0.2607, first choice 0.1961) grad 4.06 lr 2.31e-05 context 21112, 1.53s a step, 3 min left
+21:44:55 step 279/398 loss 1.4785 (kd 1.2883, first choice 0.7608) grad 4.46 lr 2.28e-05 context 25740, 1.53s a step, 3 min left
+21:44:56 step 280/398 loss 1.5191 (kd 1.3195, first choice 0.7982) grad 4.44 lr 2.24e-05 context 25740, 1.53s a step, 3 min left
+21:44:57 step 281/398 loss 0.7564 (kd 0.6571, first choice 0.3971) grad 3.22 lr 2.21e-05 context 37283, 1.53s a step, 3 min left
+21:44:59 step 282/398 loss 0.7172 (kd 0.6319, first choice 0.3410) grad 2.40 lr 2.17e-05 context 37283, 1.53s a step, 3 min left
+21:45:00 step 283/398 loss 0.6304 (kd 0.5615, first choice 0.2759) grad 1.95 lr 2.14e-05 context 37283, 1.53s a step, 3 min left
+21:45:02 step 284/398 loss 0.6067 (kd 0.5471, first choice 0.2384) grad 1.77 lr 2.10e-05 context 37283, 1.53s a step, 3 min left
+21:45:03 step 285/398 loss 1.2398 (kd 1.0878, first choice 0.6082) grad 4.63 lr 2.07e-05 context 30103, 1.53s a step, 3 min left
+21:45:04 step 286/398 loss 1.3488 (kd 1.1779, first choice 0.6835) grad 4.75 lr 2.04e-05 context 30103, 1.53s a step, 3 min left
+21:45:05 step 287/398 loss 1.4507 (kd 1.2380, first choice 0.8506) grad 7.43 lr 2.00e-05 context 24942, 1.53s a step, 3 min left
+21:45:06 step 288/398 loss 1.2792 (kd 1.1014, first choice 0.7112) grad 6.47 lr 1.97e-05 context 24942, 1.52s a step, 3 min left
+21:45:07 step 289/398 loss 1.1016 (kd 0.9594, first choice 0.5690) grad 4.07 lr 1.94e-05 context 24942, 1.52s a step, 3 min left
+21:45:08 step 290/398 loss 0.8615 (kd 0.7567, first choice 0.4191) grad 2.84 lr 1.91e-05 context 24942, 1.52s a step, 3 min left
+21:45:09 step 291/398 loss 0.3352 (kd 0.2779, first choice 0.2293) grad 4.52 lr 1.87e-05 context 28999, 1.52s a step, 3 min left
+21:45:10 step 292/398 loss 0.3189 (kd 0.2605, first choice 0.2336) grad 3.65 lr 1.84e-05 context 28999, 1.52s a step, 3 min left
+21:45:11 step 293/398 loss 0.9813 (kd 0.8606, first choice 0.4830) grad 4.59 lr 1.81e-05 context 19049, 1.51s a step, 3 min left
+21:45:11 step 294/398 loss 0.9319 (kd 0.8062, first choice 0.5027) grad 6.07 lr 1.78e-05 context 19049, 1.51s a step, 3 min left
+21:45:13 step 295/398 loss 0.6490 (kd 0.5771, first choice 0.2876) grad 2.44 lr 1.75e-05 context 31888, 1.51s a step, 3 min left
+21:45:14 step 296/398 loss 1.1356 (kd 0.9698, first choice 0.6632) grad 4.89 lr 1.71e-05 context 31888, 1.51s a step, 3 min left
+21:45:15 step 297/398 loss 0.7342 (kd 0.6331, first choice 0.4044) grad 3.04 lr 1.68e-05 context 31888, 1.51s a step, 3 min left
+21:45:17 step 298/398 loss 0.8559 (kd 0.7459, first choice 0.4397) grad 3.06 lr 1.65e-05 context 87356, 1.51s a step, 3 min left
+21:45:20 step 299/398 loss 0.8911 (kd 0.7715, first choice 0.4783) grad 3.12 lr 1.62e-05 context 87356, 1.51s a step, 2 min left
+21:45:22 step 300/398 loss 0.8773 (kd 0.7723, first choice 0.4202) grad 2.46 lr 1.59e-05 context 87356, 1.52s a step, 2 min left
+21:45:25 step 301/398 loss 0.7831 (kd 0.6926, first choice 0.3617) grad 2.09 lr 1.56e-05 context 87356, 1.52s a step, 2 min left
+21:45:27 step 302/398 loss 0.7954 (kd 0.7066, first choice 0.3551) grad 2.11 lr 1.53e-05 context 87356, 1.52s a step, 2 min left
+21:45:30 step 303/398 loss 0.6653 (kd 0.5937, first choice 0.2863) grad 1.70 lr 1.50e-05 context 87356, 1.53s a step, 2 min left
+21:45:32 step 304/398 loss 0.7500 (kd 0.6673, first choice 0.3307) grad 1.99 lr 1.47e-05 context 87356, 1.53s a step, 2 min left
+21:45:35 step 305/398 loss 0.7065 (kd 0.6321, first choice 0.2976) grad 1.56 lr 1.44e-05 context 87356, 1.53s a step, 2 min left
+21:45:36 step 306/398 loss 0.3855 (kd 0.3231, first choice 0.2494) grad 2.70 lr 1.41e-05 context 24581, 1.53s a step, 2 min left
+21:45:37 step 307/398 loss 0.3816 (kd 0.3272, first choice 0.2178) grad 2.59 lr 1.38e-05 context 24581, 1.53s a step, 2 min left
+21:45:38 step 308/398 loss 0.5465 (kd 0.4812, first choice 0.2611) grad 2.35 lr 1.36e-05 context 28870, 1.53s a step, 2 min left
+21:45:39 step 309/398 loss 0.5328 (kd 0.4681, first choice 0.2588) grad 2.43 lr 1.33e-05 context 28870, 1.53s a step, 2 min left
+21:45:40 step 310/398 loss 0.9793 (kd 0.8375, first choice 0.5669) grad 3.58 lr 1.30e-05 context 25188, 1.53s a step, 2 min left
+21:45:41 step 311/398 loss 1.3664 (kd 1.1929, first choice 0.6941) grad 3.14 lr 1.27e-05 context 21880, 1.52s a step, 2 min left
+21:45:42 step 312/398 loss 1.3595 (kd 1.1924, first choice 0.6684) grad 3.00 lr 1.24e-05 context 21880, 1.52s a step, 2 min left
+21:45:44 step 313/398 loss 0.3779 (kd 0.3281, first choice 0.1991) grad 2.21 lr 1.22e-05 context 34033, 1.52s a step, 2 min left
+21:45:45 step 314/398 loss 0.3995 (kd 0.3396, first choice 0.2395) grad 2.52 lr 1.19e-05 context 34033, 1.52s a step, 2 min left
+21:45:46 step 315/398 loss 0.3465 (kd 0.3010, first choice 0.1820) grad 1.88 lr 1.16e-05 context 34033, 1.52s a step, 2 min left
+21:45:47 step 316/398 loss 0.8457 (kd 0.7045, first choice 0.5649) grad 4.95 lr 1.14e-05 context 22845, 1.52s a step, 2 min left
+21:45:48 step 317/398 loss 0.0969 (kd 0.0865, first choice 0.0418) grad 0.82 lr 1.11e-05 context 35435, 1.52s a step, 2 min left
+21:45:49 step 318/398 loss 0.5579 (kd 0.4915, first choice 0.2654) grad 2.56 lr 1.09e-05 context 31296, 1.52s a step, 2 min left
+21:45:50 step 319/398 loss 0.8314 (kd 0.7299, first choice 0.4059) grad 4.55 lr 1.06e-05 context 22406, 1.51s a step, 2 min left
+21:45:51 step 320/398 loss 1.0465 (kd 0.9178, first choice 0.5146) grad 3.05 lr 1.03e-05 context 35213, 1.51s a step, 2 min left
+21:45:53 step 321/398 loss 1.0040 (kd 0.8710, first choice 0.5322) grad 2.94 lr 1.01e-05 context 35213, 1.51s a step, 2 min left
+21:45:54 step 322/398 loss 0.9477 (kd 0.8297, first choice 0.4720) grad 2.64 lr 9.84e-06 context 35213, 1.51s a step, 2 min left
+21:45:56 step 323/398 loss 1.0690 (kd 0.9280, first choice 0.5642) grad 2.78 lr 9.60e-06 context 35213, 1.51s a step, 2 min left
+21:45:57 step 324/398 loss 0.9323 (kd 0.8167, first choice 0.4626) grad 2.46 lr 9.36e-06 context 35213, 1.51s a step, 2 min left
+21:45:58 step 325/398 loss 0.8797 (kd 0.7763, first choice 0.4132) grad 3.24 lr 9.12e-06 context 35213, 1.51s a step, 2 min left
+21:46:02 after 325 steps, a small evaluation:
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K           417        2.075        2.442        3.839        4.945
+32K to 64K           43        1.644        2.061        2.556        3.463
+64K to 128K          16        1.891        2.017        4.078        4.266
+128K and over        36        2.045        2.473        3.735        5.387
+all                 512        2.031        2.399        3.732        4.830
+21:46:05 step 326/398 loss 0.5548 (kd 0.4728, first choice 0.3279) grad 3.57 lr 8.88e-06 context 111824, 1.53s a step, 2 min left
+21:46:08 step 327/398 loss 0.5075 (kd 0.4320, first choice 0.3021) grad 3.50 lr 8.64e-06 context 111824, 1.53s a step, 2 min left
+21:46:11 step 328/398 loss 0.4539 (kd 0.3889, first choice 0.2599) grad 3.05 lr 8.41e-06 context 111824, 1.54s a step, 2 min left
+21:46:14 step 329/398 loss 0.5018 (kd 0.4286, first choice 0.2925) grad 3.82 lr 8.18e-06 context 111824, 1.54s a step, 2 min left
+21:46:17 step 330/398 loss 0.4565 (kd 0.3949, first choice 0.2462) grad 2.87 lr 7.96e-06 context 111824, 1.54s a step, 2 min left
+21:46:19 step 331/398 loss 0.5116 (kd 0.4321, first choice 0.3178) grad 2.62 lr 7.73e-06 context 111824, 1.55s a step, 2 min left
+21:46:22 step 332/398 loss 0.4609 (kd 0.3958, first choice 0.2602) grad 2.27 lr 7.51e-06 context 111824, 1.55s a step, 2 min left
+21:46:25 step 333/398 loss 0.3568 (kd 0.3153, first choice 0.1662) grad 1.75 lr 7.30e-06 context 111824, 1.56s a step, 2 min left
+21:46:28 step 334/398 loss 0.3821 (kd 0.3277, first choice 0.2179) grad 2.43 lr 7.08e-06 context 111824, 1.56s a step, 2 min left
+21:46:31 step 335/398 loss 0.3751 (kd 0.3299, first choice 0.1810) grad 1.69 lr 6.87e-06 context 111824, 1.56s a step, 2 min left
+21:46:34 step 336/398 loss 0.3226 (kd 0.2832, first choice 0.1574) grad 1.46 lr 6.66e-06 context 111824, 1.57s a step, 2 min left
+21:46:36 step 337/398 loss 0.3512 (kd 0.3061, first choice 0.1803) grad 1.70 lr 6.46e-06 context 111824, 1.57s a step, 2 min left
+21:46:39 step 338/398 loss 0.3101 (kd 0.2725, first choice 0.1503) grad 1.25 lr 6.26e-06 context 111824, 1.57s a step, 2 min left
+21:46:42 step 339/398 loss 0.2532 (kd 0.2233, first choice 0.1193) grad 1.05 lr 6.06e-06 context 111824, 1.58s a step, 2 min left
+21:46:45 step 340/398 loss 0.2752 (kd 0.2449, first choice 0.1210) grad 1.04 lr 5.86e-06 context 111824, 1.58s a step, 2 min left
+21:46:47 step 341/398 loss 0.9378 (kd 0.8207, first choice 0.4684) grad 2.77 lr 5.67e-06 context 41641, 1.58s a step, 2 min left
+21:46:48 step 342/398 loss 0.9131 (kd 0.8024, first choice 0.4427) grad 3.13 lr 5.48e-06 context 41641, 1.58s a step, 1 min left
+21:46:50 step 343/398 loss 1.0207 (kd 0.8995, first choice 0.4849) grad 3.22 lr 5.29e-06 context 41641, 1.58s a step, 1 min left
+21:46:51 step 344/398 loss 0.8263 (kd 0.7304, first choice 0.3833) grad 2.07 lr 5.11e-06 context 41641, 1.58s a step, 1 min left
+21:46:53 step 345/398 loss 0.8996 (kd 0.7906, first choice 0.4363) grad 2.46 lr 4.93e-06 context 41641, 1.58s a step, 1 min left
+21:46:54 step 346/398 loss 1.0245 (kd 0.9135, first choice 0.4441) grad 2.25 lr 4.75e-06 context 41641, 1.58s a step, 1 min left
+21:46:56 step 347/398 loss 0.8322 (kd 0.7396, first choice 0.3703) grad 2.24 lr 4.57e-06 context 41641, 1.58s a step, 1 min left
+21:46:57 step 348/398 loss 0.8520 (kd 0.7574, first choice 0.3786) grad 1.96 lr 4.40e-06 context 41641, 1.58s a step, 1 min left
+21:46:59 step 349/398 loss 0.7723 (kd 0.6844, first choice 0.3514) grad 2.07 lr 4.23e-06 context 41641, 1.58s a step, 1 min left
+21:47:00 step 350/398 loss 0.5824 (kd 0.4944, first choice 0.3522) grad 4.42 lr 4.07e-06 context 24682, 1.58s a step, 1 min left
+21:47:01 step 351/398 loss 0.9142 (kd 0.7922, first choice 0.4878) grad 5.41 lr 3.91e-06 context 25311, 1.58s a step, 1 min left
+21:47:02 step 352/398 loss 0.7971 (kd 0.6863, first choice 0.4434) grad 5.46 lr 3.75e-06 context 25311, 1.58s a step, 1 min left
+21:47:04 step 353/398 loss 0.9510 (kd 0.8247, first choice 0.5054) grad 4.03 lr 3.59e-06 context 26857, 1.58s a step, 1 min left
+21:47:05 step 354/398 loss 0.5368 (kd 0.4702, first choice 0.2664) grad 2.17 lr 3.44e-06 context 27537, 1.58s a step, 1 min left
+21:47:06 step 355/398 loss 0.5232 (kd 0.4555, first choice 0.2709) grad 2.09 lr 3.29e-06 context 27537, 1.57s a step, 1 min left
+21:47:07 step 356/398 loss 0.6415 (kd 0.5684, first choice 0.2924) grad 2.41 lr 3.14e-06 context 27537, 1.57s a step, 1 min left
+21:47:09 step 357/398 loss 0.7187 (kd 0.6134, first choice 0.4213) grad 4.58 lr 3.00e-06 context 23307, 1.57s a step, 1 min left
+21:47:10 step 358/398 loss 0.6800 (kd 0.5860, first choice 0.3761) grad 5.66 lr 2.86e-06 context 23307, 1.57s a step, 1 min left
+21:47:10 step 359/398 loss 0.0228 (kd 0.0211, first choice 0.0065) grad 0.18 lr 2.72e-06 context 20348, 1.57s a step, 1 min left
+21:47:11 step 360/398 loss 0.5885 (kd 0.5214, first choice 0.2683) grad 2.52 lr 2.59e-06 context 19243, 1.57s a step, 1 min left
+21:47:12 step 361/398 loss 0.2946 (kd 0.2451, first choice 0.1981) grad 1.66 lr 2.46e-06 context 20899, 1.57s a step, 1 min left
+21:47:13 step 362/398 loss 1.0396 (kd 0.8810, first choice 0.6342) grad 6.04 lr 2.33e-06 context 18201, 1.56s a step, 1 min left
+21:47:14 step 363/398 loss 0.5585 (kd 0.4875, first choice 0.2842) grad 3.60 lr 2.21e-06 context 23150, 1.56s a step, 1 min left
+21:47:15 step 364/398 loss 0.5204 (kd 0.4575, first choice 0.2515) grad 2.65 lr 2.09e-06 context 23150, 1.56s a step, 1 min left
+21:47:17 step 365/398 loss 0.7155 (kd 0.6241, first choice 0.3654) grad 2.58 lr 1.97e-06 context 37097, 1.56s a step, 1 min left
+21:47:18 step 366/398 loss 0.5291 (kd 0.4635, first choice 0.2623) grad 2.25 lr 1.86e-06 context 37097, 1.56s a step, 1 min left
+21:47:19 step 367/398 loss 0.5650 (kd 0.4965, first choice 0.2740) grad 2.18 lr 1.75e-06 context 37097, 1.56s a step, 1 min left
+21:47:21 step 368/398 loss 0.6153 (kd 0.5424, first choice 0.2917) grad 2.03 lr 1.64e-06 context 37097, 1.56s a step, 1 min left
+21:47:23 step 369/398 loss 1.0662 (kd 0.9135, first choice 0.6107) grad 4.39 lr 1.54e-06 context 61931, 1.56s a step, 1 min left
+21:47:24 step 370/398 loss 1.0917 (kd 0.9397, first choice 0.6079) grad 3.24 lr 1.44e-06 context 61931, 1.56s a step, 1 min left
+21:47:26 step 371/398 loss 1.1967 (kd 1.0276, first choice 0.6765) grad 3.76 lr 1.34e-06 context 61931, 1.56s a step, 1 min left
+21:47:28 step 372/398 loss 1.1557 (kd 0.9983, first choice 0.6297) grad 3.67 lr 1.25e-06 context 61931, 1.56s a step, 1 min left
+21:47:30 step 373/398 loss 0.9991 (kd 0.8568, first choice 0.5693) grad 3.46 lr 1.16e-06 context 61931, 1.56s a step, 1 min left
+21:47:31 step 374/398 loss 1.0953 (kd 0.9504, first choice 0.5797) grad 3.35 lr 1.07e-06 context 61931, 1.56s a step, 1 min left
+21:47:33 step 375/398 loss 1.0451 (kd 0.9050, first choice 0.5605) grad 3.18 lr 9.86e-07 context 61931, 1.56s a step, 1 min left
+21:47:35 step 376/398 loss 1.1039 (kd 0.9545, first choice 0.5976) grad 3.93 lr 9.06e-07 context 61931, 1.56s a step, 1 min left
+21:47:37 step 377/398 loss 0.9632 (kd 0.8365, first choice 0.5066) grad 2.96 lr 8.29e-07 context 61931, 1.56s a step, 1 min left
+21:47:37 step 378/398 loss 0.4197 (kd 0.3796, first choice 0.1605) grad 2.30 lr 7.56e-07 context 18878, 1.56s a step, 1 min left
+21:47:39 step 379/398 loss 0.5532 (kd 0.4550, first choice 0.3928) grad 7.92 lr 6.86e-07 context 27319, 1.56s a step, 0 min left
+21:47:40 step 380/398 loss 0.6647 (kd 0.5908, first choice 0.2957) grad 2.55 lr 6.19e-07 context 30067, 1.56s a step, 0 min left
+21:47:41 step 381/398 loss 0.6443 (kd 0.5740, first choice 0.2813) grad 2.19 lr 5.56e-07 context 30067, 1.56s a step, 0 min left
+21:47:42 step 382/398 loss 0.6997 (kd 0.6245, first choice 0.3006) grad 2.89 lr 4.96e-07 context 30067, 1.56s a step, 0 min left
+21:47:43 step 383/398 loss 0.3775 (kd 0.3326, first choice 0.1793) grad 2.73 lr 4.39e-07 context 26276, 1.55s a step, 0 min left
+21:47:45 step 384/398 loss 1.3026 (kd 1.1530, first choice 0.5987) grad 2.31 lr 3.86e-07 context 47637, 1.56s a step, 0 min left
+21:47:46 step 385/398 loss 1.3801 (kd 1.2303, first choice 0.5992) grad 2.48 lr 3.36e-07 context 47637, 1.56s a step, 0 min left
+21:47:48 step 386/398 loss 1.2898 (kd 1.1430, first choice 0.5869) grad 2.43 lr 2.90e-07 context 47637, 1.56s a step, 0 min left
+21:47:50 step 387/398 loss 1.3258 (kd 1.1802, first choice 0.5821) grad 2.30 lr 2.47e-07 context 47637, 1.56s a step, 0 min left
+21:47:52 step 388/398 loss 1.2216 (kd 1.0853, first choice 0.5454) grad 2.76 lr 2.08e-07 context 47637, 1.56s a step, 0 min left
+21:47:54 step 389/398 loss 1.4146 (kd 1.2580, first choice 0.6264) grad 2.80 lr 1.72e-07 context 47637, 1.56s a step, 0 min left
+21:47:55 step 390/398 loss 1.4065 (kd 1.2418, first choice 0.6587) grad 2.84 lr 1.39e-07 context 47637, 1.56s a step, 0 min left
+21:48:02 after 390 steps, a small evaluation:
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K           417        2.102        2.442        3.922        4.945
+32K to 64K           43        1.653        2.061        2.565        3.463
+64K to 128K          16        1.796        2.017        3.796        4.266
+128K and over        36        2.073        2.473        3.930        5.387
+all                 512        2.053        2.399        3.805        4.830
+21:48:04 step 391/398 loss 1.3417 (kd 1.1915, first choice 0.6007) grad 2.66 lr 1.10e-07 context 47637, 1.58s a step, 0 min left
+21:48:05 step 392/398 loss 1.4079 (kd 1.2484, first choice 0.6380) grad 2.63 lr 8.41e-08 context 47637, 1.58s a step, 0 min left
+21:48:07 step 393/398 loss 1.3207 (kd 1.1646, first choice 0.6244) grad 2.99 lr 6.18e-08 context 47637, 1.58s a step, 0 min left
+21:48:09 step 394/398 loss 1.2794 (kd 1.1370, first choice 0.5694) grad 2.51 lr 4.29e-08 context 47637, 1.58s a step, 0 min left
+21:48:11 step 395/398 loss 1.3982 (kd 1.2373, first choice 0.6434) grad 3.41 lr 2.75e-08 context 47637, 1.58s a step, 0 min left
+21:48:13 step 396/398 loss 1.1698 (kd 1.0341, first choice 0.5425) grad 3.05 lr 1.55e-08 context 47637, 1.58s a step, 0 min left
+21:48:14 step 397/398 loss 0.5268 (kd 0.4441, first choice 0.3305) grad 3.18 lr 6.87e-09 context 18490, 1.58s a step, 0 min left
+21:48:14 step 398/398 loss 0.3909 (kd 0.3258, first choice 0.2605) grad 3.49 lr 1.72e-09 context 18191, 1.58s a step, 0 min left
+21:48:14 trained 398 steps in 10 min: loss 0.9446 over the first 20 steps, 1.0558 over the last
+21:48:33 wrote /workspace/rig/dspark/g7-pack/lr1e-4/draft-tuned.gguf: 84 tensors over a copy of the draft, read back the same
+21:48:59 after training, on /workspace/rig/dspark/rec-pack/heldout (25s):
+context         anchors   accepted/3    ceiling/3   accepted/7    ceiling/7
+under 32K          6826        2.161        2.458        4.017        5.006
+32K to 64K         1087        1.833        2.240        3.014        4.264
+64K to 128K         315        1.798        2.177        3.105        4.190
+128K and over       105        2.093        2.457        3.982        5.446
+all                8333        2.104        2.419        3.851        4.884
+21:56:10 after training, the server's rounds walked over /workspace/rig/dspark/rec-pack/heldout (432s):
+context          rounds    kept/3  ceiling/3    kept/5  ceiling/5    kept/7  ceiling/7
+under 32K         16452     1.950      2.352     2.601      3.460     2.978      4.302
+32K to 64K        14521     1.524      2.044     1.886      2.839     2.055      3.388
+64K to 128K       12930     1.505      2.004     1.848      2.764     2.011      3.276
+128K and over      5894     1.899      2.367     2.536      3.489     2.882      4.340
+all               49797     1.704      2.178     2.177      3.100     2.421      3.761
+
+a draft that samples its rows, checked by the two chances (not in the engine for this draft): kept, by what the target's top k shows and with what the rest could add
+context           kept/3     most/3    kept/5     most/5    kept/7     most/7
+under 32K          1.997      1.999     2.640      2.643     2.991      2.995
+32K to 64K         1.605      1.610     1.987      1.996     2.146      2.155
+64K to 128K        1.627      1.632     2.006      2.015     2.177      2.187
+128K and over      1.940      1.947     2.549      2.566     2.870      2.887
+all                1.782      1.786     2.269      2.277     2.504      2.513
+what a draft row and the target's row share, row by row: 0.819-0.819 0.745-0.746 0.701-0.702 0.667-0.668 0.638-0.638 0.611-0.612 0.583-0.584
+
+under 32K: a round that stops drafting at the first row its draft gives under a floor
+depth  floor   rounds  drafted     kept  written  checked written/check
+    3   none    16452    3.000    1.950    2.950    4.000         0.737
+    3   0.30    16876    2.553    1.876    2.876    3.553         0.810
+    3   0.50    18139    1.998    1.676    2.676    2.998         0.893
+    3   0.70    20208    1.517    1.401    2.401    2.517         0.954
+    3   0.90    23321    1.100    1.079    2.079    2.100         0.990
+    5   none    13402    5.000    2.601    3.601    6.000         0.600
+    5   0.30    13907    3.781    2.471    3.471    4.781         0.726
+    5   0.50    15312    2.716    2.151    3.151    3.716         0.848
+    5   0.70    17602    1.924    1.741    2.741    2.924         0.938
+    5   0.90    21146    1.312    1.280    2.280    2.312         0.986
+    7   none    11947    7.000    2.978    3.978    8.000         0.497
+    7   0.30    12490    4.687    2.803    3.803    5.687         0.669
+    7   0.50    13971    3.154    2.395    3.395    4.154         0.817
+    7   0.70    16286    2.141    1.904    2.904    3.141         0.925
+    7   0.90    19839    1.412    1.374    2.374    2.412         0.984
+
+32K to 64K: a round that stops drafting at the first row its draft gives under a floor
+depth  floor   rounds  drafted     kept  written  checked written/check
+    3   none    14521    3.000    1.524    2.524    4.000         0.631
+    3   0.30    15091    2.184    1.429    2.429    3.184         0.763
+    3   0.50    16448    1.542    1.227    2.227    2.542         0.876
+    3   0.70    18300    1.111    1.002    2.002    2.111         0.948
+    3   0.90    21093    0.760    0.737    1.737    1.760         0.987
+    5   none    12635    5.000    1.886    2.886    6.000         0.481
+    5   0.30    13317    2.979    1.738    2.738    3.979         0.688
+    5   0.50    14801    1.931    1.463    2.463    2.931         0.840
+    5   0.70    16824    1.320    1.165    2.165    2.320         0.933
+    5   0.90    19812    0.867    0.835    1.835    1.867         0.983
+    7   none    11814    7.000    2.055    3.055    8.000         0.382
+    7   0.30    12524    3.495    1.881    2.881    4.495         0.641
+    7   0.50    14070    2.138    1.564    2.564    3.138         0.817
+    7   0.70    16141    1.420    1.233    2.233    2.420         0.923
+    7   0.90    19192    0.911    0.875    1.875    1.911         0.981
+
+64K to 128K: a round that stops drafting at the first row its draft gives under a floor
+depth  floor   rounds  drafted     kept  written  checked written/check
+    3   none    12930    3.000    1.505    2.505    4.000         0.626
+    3   0.30    13458    2.126    1.406    2.406    3.126         0.770
+    3   0.50    14683    1.512    1.204    2.204    2.512         0.877
+    3   0.70    16168    1.109    1.001    2.001    2.109         0.949
+    3   0.90    18333    0.788    0.765    1.765    1.788         0.987
+    5   none    11288    5.000    1.848    2.848    6.000         0.475
+    5   0.30    11863    2.887    1.709    2.709    3.887         0.697
+    5   0.50    13193    1.889    1.436    2.436    2.889         0.843
+    5   0.70    14797    1.323    1.172    2.172    2.323         0.935
+    5   0.90    17142    0.904    0.872    1.872    1.904         0.983
+    7   none    10565    7.000    2.011    3.011    8.000         0.376
+    7   0.30    11169    3.347    1.846    2.846    4.347         0.655
+    7   0.50    12509    2.095    1.538    2.538    3.095         0.820
+    7   0.70    14174    1.427    1.243    2.243    2.427         0.924
+    7   0.90    16564    0.955    0.917    1.917    1.955         0.980
+
+128K and over: a round that stops drafting at the first row its draft gives under a floor
+depth  floor   rounds  drafted     kept  written  checked written/check
+    3   none     5894    3.000    1.899    2.899    4.000         0.725
+    3   0.30     6057    2.376    1.821    2.821    3.376         0.836
+    3   0.50     6396    1.957    1.671    2.671    2.957         0.903
+    3   0.70     6891    1.603    1.480    2.480    2.603         0.953
+    3   0.90     7708    1.254    1.219    2.219    2.254         0.985
+    5   none     4810    5.000    2.536    3.536    6.000         0.589
+    5   0.30     5004    3.401    2.398    3.398    4.401         0.772
+    5   0.50     5391    2.635    2.157    3.157    3.635         0.868
+    5   0.70     5955    2.057    1.859    2.859    3.057         0.935
+    5   0.90     6850    1.534    1.482    2.482    2.534         0.980
+    7   none     4334    7.000    2.882    3.882    8.000         0.485
+    7   0.30     4527    4.148    2.717    3.717    5.148         0.722
+    7   0.50     4945    3.063    2.408    3.408    4.063         0.839
+    7   0.70     5515    2.318    2.054    3.054    3.318         0.921
+    7   0.90     6460    1.670    1.604    2.604    2.670         0.976
+
+all: a round that stops drafting at the first row its draft gives under a floor
+depth  floor   rounds  drafted     kept  written  checked written/check
+    3   none    49797    3.000    1.704    2.704    4.000         0.676
+    3   0.30    51482    2.312    1.616    2.616    3.312         0.790
+    3   0.50    55666    1.730    1.419    2.419    2.730         0.886
+    3   0.70    61567    1.299    1.186    2.186    2.299         0.951
+    3   0.90    70455    0.934    0.910    1.910    1.934         0.988
+    5   none    42135    5.000    2.177    3.177    6.000         0.530
+    5   0.30    44091    3.255    2.036    3.036    4.255         0.714
+    5   0.50    48697    2.244    1.749    2.749    3.244         0.847
+    5   0.70    55178    1.593    1.426    2.426    2.593         0.936
+    5   0.90    64950    1.092    1.058    2.058    2.092         0.984
+    7   none    38660    7.000    2.421    3.421    8.000         0.428
+    7   0.30    40710    3.893    2.247    3.247    4.893         0.664
+    7   0.50    45495    2.539    1.904    2.904    3.539         0.821
+    7   0.70    52116    1.742    1.532    2.532    2.742         0.923
+    7   0.90    62055    1.162    1.122    2.122    2.162         0.981
+21:56:10 accepted a round at depth 3: 2.234 before, 2.104 after, of a ceiling of 2.419

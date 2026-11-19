@@ -1,0 +1,10 @@
+lr1e-4: anchors evenly apart accept 2.2339 before, 2.1037 after; the server's rounds keep 1.9074 of a most of 2.1778 before, 1.7041 of 2.1778 after
+lr1e-4: 1.9074 before, 1.7041 after, of a ceiling of 2.4186
+lr1e-5: anchors evenly apart accept 2.2339 before, 2.2581 after; the server's rounds keep 1.9074 of a most of 2.1778 before, 1.9201 of 2.1778 after
+lr1e-5: 1.9074 before, 1.9201 after, of a ceiling of 2.4186
+lr3e-4: anchors evenly apart accept 2.2339 before, 1.8154 after; the server's rounds keep 1.9074 of a most of 2.1778 before, 1.3098 of 2.1778 after
+lr3e-4: 1.9074 before, 1.3098 after, of a ceiling of 2.4186
+lr3e-5: anchors evenly apart accept 2.2339 before, 2.2133 after; the server's rounds keep 1.9074 of a most of 2.1778 before, 1.8634 of 2.1778 after
+lr3e-5: 1.9074 before, 1.8634 after, of a ceiling of 2.4186
+best: lr1e-5
+g7-pack/lr1e-5/draft-tuned.gguf
