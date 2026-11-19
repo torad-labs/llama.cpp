@@ -522,6 +522,9 @@ llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
     -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
 set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
 
+# sequences verifying their drafts side by side, over rows of a real vocabulary's size
+llama_build_and_test(test-speculative-verify-batch.cpp  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
+
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(
     test-llama-context

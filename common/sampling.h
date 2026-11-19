@@ -109,6 +109,12 @@ llama_token common_sampler_sample_coupled(struct common_sampler * gsmpl, const l
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false,
         const std::function<void(size_t, llama_token)> & on_sample = nullptr);
 
+// as above, over rows fetched before it: the draft.size() + 1 rows idxs would name. It reads no context, so each
+// sequence of a step can verify its rows on a thread of its own.
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, const struct llama_vocab * vocab,
+        const struct llama_sampling_row * rows, const llama_tokens & draft, bool grammar_first = false,
+        const std::function<void(size_t, llama_token)> & on_sample = nullptr);
+
 // as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
 

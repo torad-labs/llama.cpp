@@ -14,6 +14,7 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -23,6 +24,8 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <system_error>
+#include <thread>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -4169,6 +4172,11 @@ int32_t common_speculative_draft_limit(
     return n_max;
 }
 
+// the draft tokens a sequence checks: all of them, or what its output limit leaves (common_speculative_sample_and_accept)
+static size_t spec_n_check(const llama_tokens & draft, int32_t n_remaining) {
+    return n_remaining > 0 ? std::min(draft.size(), (size_t) n_remaining - 1) : draft.size();
+}
+
 std::vector<llama_token> common_speculative_sample_and_accept(
         common_sampler * smpl, llama_context * ctx_tgt, const std::vector<int> & idxs, const llama_tokens & draft,
         int32_t n_remaining, const std::function<void(size_t, llama_token)> & on_sample) {
@@ -4177,16 +4185,53 @@ std::vector<llama_token> common_speculative_sample_and_accept(
     // past them roll back as rejected ones, and its cache ends where it would had it never drafted them. Kept, they
     // left the cache a token or two past the request's end, and on four PCIe cards at 36 sessions half the next
     // requests restored a checkpoint 20 tokens back (about 4.8 s each) instead of reusing the cache to the last token.
-    size_t n_check = draft.size();
-    if (n_remaining > 0) {
-        n_check = std::min(n_check, (size_t) n_remaining - 1);
-    }
+    const size_t n_check = spec_n_check(draft, n_remaining);
     if (n_check == draft.size()) {
         return common_sampler_sample_and_accept_n(smpl, ctx_tgt, idxs, draft, false, on_sample);
     }
     const std::vector<int> idxs_checked(idxs.begin(), idxs.begin() + n_check + 1);
     const llama_tokens     draft_checked(draft.begin(), draft.begin() + n_check);
     return common_sampler_sample_and_accept_n(smpl, ctx_tgt, idxs_checked, draft_checked, false, on_sample);
+}
+
+void common_speculative_sample_and_accept_batch(
+        const llama_vocab * vocab, std::vector<common_speculative_verify> & seqs, int n_threads) {
+    // A sequence is one job: its rows are sampled in order. A thread takes the next sequence nobody holds, since one
+    // sequence's draft may end at its first row and another's run to its last.
+    std::atomic<size_t> next{0};
+    const auto work = [&]() {
+        for (size_t i = next.fetch_add(1); i < seqs.size(); i = next.fetch_add(1)) {
+            auto & seq = seqs[i];
+            try {
+                GGML_ASSERT(seq.rows.size() == seq.draft->size() + 1 && "a sequence has one row more than its draft");
+                const size_t n_check = spec_n_check(*seq.draft, seq.n_remaining);
+                if (n_check == seq.draft->size()) {
+                    seq.accepted = common_sampler_sample_and_accept_n(seq.smpl, vocab, seq.rows.data(), *seq.draft);
+                } else {
+                    const llama_tokens draft_checked(seq.draft->begin(), seq.draft->begin() + n_check);
+                    seq.accepted = common_sampler_sample_and_accept_n(seq.smpl, vocab, seq.rows.data(), draft_checked);
+                }
+            } catch (...) {
+                seq.error = std::current_exception();
+            }
+        }
+    };
+
+    // this thread is one of them
+    const size_t n_workers = seqs.empty() ? 0 : std::min(seqs.size(), (size_t) std::max(n_threads, 1)) - 1;
+    std::vector<std::thread> workers;
+    workers.reserve(n_workers);
+    for (size_t i = 0; i < n_workers; ++i) {
+        try {
+            workers.emplace_back(work);
+        } catch (const std::system_error &) {
+            break; // no thread to be had: the ones started and this one take what is left
+        }
+    }
+    work();
+    for (auto & worker : workers) {
+        worker.join();
+    }
 }
 
 // initialization of the speculative decoding system
