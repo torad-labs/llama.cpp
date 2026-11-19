@@ -924,7 +924,9 @@ static bool test_split_rows(ggml_backend_dev_t dev, bool count) {
     }
 
     g_mock.copy_calls = 0;
+    const int64_t t_set = ggml_time_us();
     ggml_backend_tensor_set_n(ts.data(), src.data(), offsets.data(), sizes.data(), data_offsets.data(), n_runs);
+    const int64_t us_set = ggml_time_us() - t_set;
     const size_t set_calls = g_mock.copy_calls;
 
     for (size_t i = 0; i < n_runs; i++) {
@@ -938,12 +940,15 @@ static bool test_split_rows(ggml_backend_dev_t dev, bool count) {
     }
 
     g_mock.copy_calls = 0;
+    const int64_t t_get = ggml_time_us();
     ggml_backend_tensor_get_n(ts.data(), out.data(), offsets.data(), sizes.data(), data_offsets.data(), n_runs);
+    const int64_t us_get = ggml_time_us() - t_get;
     const size_t get_calls = g_mock.copy_calls;
 
     if (memcmp(out.data(), src.data(), host) != 0) {
         return false;
     }
+    printf("%s split rows: %zu runs set in %.2f ms, read back in %.2f ms\n", ggml_backend_dev_name(dev), n_runs, us_set/1000.0, us_get/1000.0);
 
     if (count) {
         printf("split rows: %zu runs, %zu copies to set them, %zu to get them\n", n_runs, set_calls, get_calls);

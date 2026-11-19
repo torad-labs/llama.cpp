@@ -2769,6 +2769,7 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
 // A batch of ranges goes to each device buffer as batches of the ranges of its tensors, which the buffer batches its own way.
 // A run of a few rows of a tensor split inside its rows (ggml_backend_meta_read_rows) goes the same way: a device's pieces of the rows pass through a scratch where they are side by side, so it copies them as one.
 // Any other range that is no such list (ggml_backend_meta_tensor_ranges) is copied on its own, after the ranges before it.
+// GGML_TENSOR_N_SPLIT_ROWS: the longest run of split rows that goes in a batch (8); 0: none
 // GGML_TENSOR_N_STAGE_LEGACY=1: one copy per range, as before
 template <bool write>
 static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std::conditional_t<write, const void *, void *> const * data,
@@ -2778,7 +2779,7 @@ static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std
     // a part of the batch: its lists stay small enough to be walked in the cache, however many ranges the batch has
     constexpr size_t part_ranges = 16*1024;
     constexpr size_t part_bytes  = 4*1024*1024;
-    constexpr size_t part_rows   = 8; // a longer run of split rows is one 2D copy per device
+    static const size_t part_rows = (size_t) ggml_env_int("GGML_TENSOR_N_SPLIT_ROWS"); // a longer run of split rows is one 2D copy per device
 
     // a piece of a split row that was read into a scratch, and where it goes in the caller's memory
     struct piece {
