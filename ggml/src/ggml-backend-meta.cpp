@@ -2767,7 +2767,8 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
 }
 
 // A batch of ranges goes to each device buffer as batches of the ranges of its tensors, which the buffer batches its own way.
-// A range that is no such list (ggml_backend_meta_tensor_ranges) is copied on its own, after the ranges before it.
+// A run of a few rows of a tensor split inside its rows (ggml_backend_meta_read_rows) goes the same way: a device's pieces of the rows pass through a scratch where they are side by side, so it copies them as one.
+// Any other range that is no such list (ggml_backend_meta_tensor_ranges) is copied on its own, after the ranges before it.
 // GGML_TENSOR_N_STAGE_LEGACY=1: one copy per range, as before
 template <bool write>
 static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std::conditional_t<write, const void *, void *> const * data,
@@ -2777,20 +2778,44 @@ static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std
     // a part of the batch: its lists stay small enough to be walked in the cache, however many ranges the batch has
     constexpr size_t part_ranges = 16*1024;
     constexpr size_t part_bytes  = 4*1024*1024;
+    constexpr size_t part_rows   = 8; // a longer run of split rows is one 2D copy per device
 
+    // a piece of a split row that was read into a scratch, and where it goes in the caller's memory
+    struct piece {
+        const uint8_t * scratch;
+        uintptr_t       host;
+        size_t          size;
+    };
     // the ranges of one device buffer, in their order: two devices can have one buffer type, and then their ranges would alternate in one batch
     struct batch {
-        ggml_backend_buffer_t      buffer;
+        ggml_backend_buffer_t      buffer = nullptr;
         std::vector<ggml_tensor *> tensors;
         std::vector<size_t>        offsets;
         std::vector<size_t>        sizes;
         std::vector<uintptr_t>     host;
+        std::unique_ptr<uint8_t[]> scratch; // part_bytes, where this device's pieces of split rows are side by side
+        size_t                     used = 0;
+        std::vector<piece>         pieces;
     };
     std::vector<batch> cur;
     std::vector<size_t> data_offsets;
     struct plan {
         std::vector<batch> * out;
         uintptr_t            host;
+        bool                 rows; // the range may go as pieces of split rows
+        // the batch of the device buffer a tensor is in
+        batch & of(ggml_tensor * tensor) {
+            const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+            size_t at = 0;
+            while (at < out->size() && (*out)[at].buffer != buffer) {
+                at++;
+            }
+            if (at == out->size()) {
+                out->emplace_back();
+                out->back().buffer = buffer;
+            }
+            return (*out)[at];
+        }
     };
 
     const auto flush = [&]() {
@@ -2808,10 +2833,15 @@ static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std
             } else {
                 ggml_backend_tensor_get_n(b.tensors.data(), (void *) base, b.offsets.data(), b.sizes.data(), data_offsets.data(), b.tensors.size());
             }
+            for (const piece & c : b.pieces) {
+                memcpy((void *) c.host, c.scratch, c.size);
+            }
             b.tensors.clear();
             b.offsets.clear();
             b.sizes.clear();
             b.host.clear();
+            b.pieces.clear();
+            b.used = 0;
         }
     };
 
@@ -2826,24 +2856,47 @@ static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std
             n_part = 0;
             bytes  = 0;
         }
-        plan p = { &cur, (uintptr_t) data[i] };
+        plan p = { &cur, (uintptr_t) data[i], !legacy && sizes[i] <= part_bytes };
         if (!legacy && ggml_backend_meta_tensor_ranges(tensors[i], offsets[i], sizes[i], /*read =*/ !write,
                 [](ggml_tensor * tensor, size_t offset, size_t size, size_t data_offset, void * userdata) {
                     auto * p = (plan *) userdata;
-                    const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-                    size_t at = 0;
-                    while (at < p->out->size() && (*p->out)[at].buffer != buffer) {
-                        at++;
-                    }
-                    if (at == p->out->size()) {
-                        p->out->push_back({ buffer, {}, {}, {}, {} });
-                    }
-                    batch & b = (*p->out)[at];
+                    batch & b = p->of(tensor);
                     b.tensors.push_back(tensor);
                     b.offsets.push_back(offset);
                     b.sizes.push_back(size);
                     b.host.push_back(p->host + data_offset);
                 }, &p)) {
+            n_part++;
+            bytes += sizes[i];
+            continue;
+        }
+        if (p.rows && ggml_backend_meta_read_rows(tensors[i], offsets[i], sizes[i],
+                [](ggml_tensor * tensor, size_t offset, size_t width, size_t rows, size_t pitch, size_t stride, size_t host, void * userdata) {
+                    auto * p = (plan *) userdata;
+                    p->rows = p->rows && rows <= part_rows;
+                    if (!p->rows) {
+                        return;
+                    }
+                    batch & b = p->of(tensor);
+                    if (!b.scratch) {
+                        b.scratch.reset(new uint8_t[part_bytes]);
+                    }
+                    GGML_ASSERT(b.used + rows*width <= part_bytes); // a part's ranges are no more bytes than that
+                    for (size_t r = 0; r < rows; ++r) {
+                        uint8_t * at = b.scratch.get() + b.used;
+                        const uintptr_t mem = p->host + host + r*stride;
+                        if constexpr (write) {
+                            memcpy(at, (const void *) mem, width);
+                        } else {
+                            b.pieces.push_back({ at, mem, width });
+                        }
+                        b.tensors.push_back(tensor);
+                        b.offsets.push_back(offset + r*pitch);
+                        b.sizes.push_back(width);
+                        b.host.push_back((uintptr_t) at);
+                        b.used += width;
+                    }
+                }, &p) && p.rows) {
             n_part++;
             bytes += sizes[i];
             continue;
