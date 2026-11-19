@@ -70,6 +70,49 @@ static __global__ void short_conv_4_tiled(const float * x, const float * w, cons
     }
 }
 
+// The SHORT_CONV behind a history CONCAT the evaluator skipped (ggml_cuda_short_conv_window): a thread per
+// channel and sequence streams the window's columns from the CONCAT's two sources, writes each into the joined
+// window the CONCAT would have made, and from the fourth column on writes the convolution of the last four, in
+// short_conv_f32's sum order. Strides are in floats.
+template<bool dynamic>
+static __global__ void short_conv_window_4_f32(const float * past, const int64_t sp0, const int64_t sp1,
+        const int64_t sp2, const float * rows, const int64_t sr0, const int64_t sr1, const int64_t sr2,
+        const float * w, const float * d, float * y, float * window, const int64_t channels, const int64_t n_t,
+        const int64_t sd1, const int64_t group, const float scale) {
+    const int64_t c = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t s = blockIdx.y;
+    if (c >= channels) {
+        return;
+    }
+    const float * pc  = past + c*sp1 + s*sp2;
+    const float * rc  = rows + c*sr1 + s*sr2;
+    const float * wc  = w + 4*c;
+    float *       win = window + (c + s*channels)*(n_t + 3);
+    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+    for (int64_t col = 0; col < n_t + 3; ++col) {
+        const float val = col < 3 ? pc[col*sp0] : rc[(col - 3)*sr0];
+        win[col] = val;
+        v0 = v1; v1 = v2; v2 = v3; v3 = val;
+        if (col < 3) {
+            continue;
+        }
+        const int64_t t = col - 3;
+        float acc = v3;
+        acc += v0*wc[0];
+        acc += v1*wc[1];
+        acc += v2*wc[2];
+        acc += v3*wc[3];
+        if (dynamic) {
+            const float * dt = d + (t + s*n_t)*sd1 + 4*(c/group);
+            acc += v3*dt[0];
+            acc += v2*dt[1];
+            acc += v1*dt[2];
+            acc += v0*dt[3];
+        }
+        y[(s*n_t + t)*channels + c] = scale*acc;
+    }
+}
+
 void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * w = dst->src[1];
@@ -80,6 +123,21 @@ void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int64_t n_t = dst->ne[1];
     const int64_t n_s = dst->ne[2];
     const size_t f = sizeof(float);
+    // the history CONCAT ggml_cuda_try_short_conv_window matched: src0 (the CONCAT) was never written, the kernel
+    // reads its two sources and writes it beside the convolution
+    if (const ggml_cuda_short_conv_window * win = ctx.short_conv_windows().find(dst)) {
+        const ggml_tensor * past = win->past;
+        const ggml_tensor * rows = win->rows;
+        const dim3 block(128);
+        const dim3 grid((channels + block.x - 1)/block.x, n_s);
+        auto kernel = d ? short_conv_window_4_f32<true> : short_conv_window_4_f32<false>;
+        kernel<<<grid, block, 0, ctx.stream()>>>((const float *) past->data, past->nb[0]/f, past->nb[1]/f,
+            past->nb[2]/f, (const float *) rows->data, rows->nb[0]/f, rows->nb[1]/f, rows->nb[2]/f,
+            (const float *) w->data, d ? (const float *) d->data : nullptr, (float *) dst->data,
+            (float *) win->window->data, channels, n_t, d ? d->nb[1]/f : 0, d ? channels/(d->ne[0]/4) : 1,
+            ggml_get_op_params_f32(dst, 0));
+        return;
+    }
     const int min_tiled_tokens = !d && channels >= 1024 ? 128 : 512;
     if (k == 4 && n_t >= min_tiled_tokens && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL) {
         const dim3 block(32, 8);

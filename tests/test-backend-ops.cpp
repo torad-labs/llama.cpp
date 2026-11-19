@@ -5708,6 +5708,52 @@ struct test_short_conv : public test_case {
     }
 };
 
+// GGML_OP_SHORT_CONV behind Inkling's convolve chain (inkling2.cpp): CONCAT(history rows, the transposed new rows) ->
+// SHORT_CONV, and build_conv_state_store reads the window's tail back out of the CONCAT after the conv. CUDA runs
+// the pair as one kernel that reads the CONCAT's two sources and writes the joined window itself
+// (ggml_cuda_try_short_conv_window). The output carries that tail beside the conv output: a window the kernel did
+// not write, or wrote at a wrong column, fails beside a wrong convolution. The history rows sit at a channel offset
+// inside a wider state row, as one stream of a layer's four does; with strided the new rows are a permuted view.
+struct test_short_conv_window : public test_case {
+    const int64_t channels, n_tokens, n_seqs, dynamic_heads;
+    const bool strided;
+
+    test_short_conv_window(int64_t channels, int64_t n_tokens, int64_t n_seqs, int64_t dynamic_heads, bool strided)
+        : channels(channels), n_tokens(n_tokens), n_seqs(n_seqs), dynamic_heads(dynamic_heads), strided(strided) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SHORT_CONV_WINDOW";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(channels, n_tokens, n_seqs, dynamic_heads, strided);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int k = 4;
+        auto * hist = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k - 1, channels + 7, n_seqs);
+        auto * past = ggml_view_3d(ctx, hist, k - 1, channels, n_seqs, hist->nb[1], hist->nb[2], 7*hist->nb[1]);
+        ggml_tensor * input;
+        if (strided) {
+            auto * store = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_seqs, n_tokens);
+            input = ggml_permute(ctx, store, 0, 2, 1, 3);
+        } else {
+            input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_tokens, n_seqs);
+        }
+        auto * window = ggml_concat(ctx, past, ggml_transpose(ctx, input), 0);
+        auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, channels);
+        auto * d = dynamic_heads ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k*dynamic_heads, n_tokens*n_seqs) : nullptr;
+        auto * conv = ggml_short_conv(ctx, window, w, d, 1.0f/sqrtf((d ? 2 : 1)*k + 1));
+        auto * tail = ggml_cont(ctx, ggml_view_3d(ctx, window, k - 1, channels, n_seqs,
+                window->nb[1], window->nb[2], ggml_row_size(GGML_TYPE_F32, n_tokens)));
+        return ggml_concat(ctx, ggml_reshape_1d(ctx, conv, ggml_nelements(conv)),
+                ggml_reshape_1d(ctx, tail, ggml_nelements(tail)), 0);
+    }
+};
+
 // GGML_OP_SSM_CONV + SILU behind build_conv_state's chain (delta-net-base.cpp): GET_ROWS(cache, ids) -> RESHAPE ->
 // CONCAT(state, TRANSPOSE(x)) -> a CPY of a window into the cache per rollback snapshot, which
 // CUDA runs as one kernel at the SSM_CONV (ggml_cuda_try_ssm_conv_state_update), with Qwen3.5's joint q/k L2_NORM over
@@ -14887,6 +14933,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_short_conv(1025, 129, 2, 0));
     test_cases.emplace_back(new test_short_conv(257, 513, 2, 0));
     test_cases.emplace_back(new test_short_conv(258, 513, 2, 3));
+    test_cases.emplace_back(new test_short_conv_window(66, 1, 23, 0, false));
+    test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true));
+    test_cases.emplace_back(new test_short_conv_window(256, 5, 3, 2, false));
+    test_cases.emplace_back(new test_short_conv_window(257, 16, 2, 0, true));
+    // past the fused kernel's token cap: the plain CONCAT + SHORT_CONV chain
+    test_cases.emplace_back(new test_short_conv_window(64, 17, 2, 2, false));
     for (int64_t d_conv : {3, 4, 7, 9}) {
         // 64 and 576: a rank's channels under a tensor split, which fill no whole block of 128 (one KV head of Inkling 2)
         for (int64_t d_inner: {64, 576, 1024, 1536, 2048}) {
@@ -17650,6 +17702,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_short_conv(256, n_tokens, n_seqs, 2));
         test_cases.emplace_back(new test_short_conv(1152, n_tokens, n_seqs, 0));
     }
+    // the same two decode shapes behind their history CONCAT, which the perf run times as one graph
+    test_cases.emplace_back(new test_short_conv_window(256, 1, 23, 2, false));
+    test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true));
     // Inkling Q3_K_M, 23 decode rows. TP4 splits 2304 intermediate channels in blocks of 256, with gate and up packed together.
     for (int64_t n_ff : {512, 768}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 2*n_ff, 23, 4608));

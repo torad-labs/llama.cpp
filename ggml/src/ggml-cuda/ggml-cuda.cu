@@ -6076,6 +6076,130 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
     return false;
 }
 
+// The bytes a tensor's elements span, strides included: ggml_nbytes counts elements, which is less for a strided
+// view. A repeated dimension (stride 0 with more than one element) spans what it reads once, so it adds nothing.
+static size_t ggml_cuda_tensor_span(const ggml_tensor * t) {
+    size_t span = ggml_type_size(t->type);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (t->ne[i] > 1) {
+            span += (size_t) (t->ne[i] - 1)*t->nb[i];
+        }
+    }
+    return span;
+}
+
+static bool ggml_cuda_spans_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_cuda_tensor_span(b) && b0 < a0 + ggml_cuda_tensor_span(a);
+}
+
+// Whether t is base or a view of it, through as many views as a graph stacks between a tensor and its reader.
+static bool ggml_cuda_tensor_views(const ggml_tensor * t, const ggml_tensor * base) {
+    for (int i = 0; t != nullptr && i < 8; ++i) {
+        if (t == base) {
+            return true;
+        }
+        t = t->view_src;
+    }
+    return false;
+}
+
+// Match CONCAT(history, transposed new rows) -> SHORT_CONV (inkling2.cpp convolve) and record the pair under the
+// SHORT_CONV (ggml_cuda_short_conv_window): the evaluator skips the CONCAT and the convolution's kernel reads the
+// two sources itself and writes the joined window, which the layer's state store reads after the convolution as
+// before. What goes is only the CONCAT launch. The kernel reads the sources and the taps at the SHORT_CONV, later
+// than the allocator planned their lives around the CONCAT, so nothing between the two may be allocated over them
+// or over the window, and nothing there may read the window the CONCAT no longer writes first. The two writes
+// (the window, the output) may not alias anything the kernel reads either. Any doubt keeps the chain.
+// GGML_CUDA_SHORT_CONV_WINDOW_LEGACY=1 keeps it everywhere.
+static bool ggml_cuda_try_short_conv_window(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_SHORT_CONV_WINDOW_LEGACY");
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    if (legacy || conv->op != GGML_OP_SHORT_CONV || !ctx.stream_context().concurrent_events.empty() ||
+            ctx.short_conv_windows().find(conv) != nullptr || conv->data == nullptr) {
+        return false;
+    }
+    const ggml_tensor * window = conv->src[0];
+    const ggml_tensor * w      = conv->src[1];
+    const ggml_tensor * d      = conv->src[2];
+    if (window->op != GGML_OP_CONCAT || ggml_get_op_params_i32(window, 0) != 0 || window->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(window) || (window->flags & GGML_TENSOR_FLAG_OUTPUT) || window->data == nullptr ||
+            w->ne[0] != 4 || !ggml_is_contiguous(w) || w->data == nullptr ||
+            (d && (d->type != GGML_TYPE_F32 || d->nb[0] != sizeof(float) || d->data == nullptr))) {
+        return false;
+    }
+    const ggml_tensor * past = window->src[0];
+    const ggml_tensor * rows = window->src[1];
+    const int64_t channels = conv->ne[0];
+    const int64_t n_t      = conv->ne[1];
+    const int64_t n_seqs   = conv->ne[2];
+    if (n_t < 1 || n_t > GGML_CUDA_SHORT_CONV_WINDOW_MAX_N_T || conv->ne[3] != 1 ||
+            window->ne[0] != n_t + 3 || window->ne[1] != channels || window->ne[2] != n_seqs || window->ne[3] != 1) {
+        return false;
+    }
+    const auto source_ok = [](const ggml_tensor * t, int64_t cols, int64_t channels_, int64_t n_seqs_) {
+        if (t->type != GGML_TYPE_F32 || t->data == nullptr || t->ne[0] != cols || t->ne[1] != channels_ ||
+                t->ne[2] != n_seqs_ || t->ne[3] != 1) {
+            return false;
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (t->nb[i] % sizeof(float) != 0 || (t->ne[i] > 1 && t->nb[i] == 0)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!source_ok(past, 3, channels, n_seqs) || !source_ok(rows, n_t, channels, n_seqs)) {
+        return false;
+    }
+
+    int concat_idx = -1;
+    for (int j = node_idx - 1; j >= 0; --j) {
+        if (cgraph->nodes[j] == window) {
+            concat_idx = j;
+            break;
+        }
+    }
+    if (concat_idx < 0) {
+        return false;
+    }
+
+    const ggml_tensor * reads[] = { past, rows, w, d };
+    for (const ggml_tensor * r : reads) {
+        if (r && (ggml_cuda_spans_overlap(window, r) || ggml_cuda_spans_overlap(conv, r))) {
+            return false;
+        }
+    }
+    if (ggml_cuda_spans_overlap(conv, window)) {
+        return false;
+    }
+    for (int j = concat_idx + 1; j < node_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (ggml_cuda_tensor_views(n->src[s], window)) {
+                return false;
+            }
+        }
+        if (ggml_cuda_spans_overlap(n, window)) {
+            return false;
+        }
+        for (const ggml_tensor * r : reads) {
+            if (r && ggml_cuda_spans_overlap(n, r)) {
+                return false;
+            }
+        }
+    }
+
+    auto & reg = ctx.short_conv_windows();
+    reg.windows.emplace(conv, ggml_cuda_short_conv_window{ past, rows, const_cast<ggml_tensor *>(window) });
+    reg.skipped.insert(window);
+    return true;
+}
+
 // Whether a node the evaluation reaches is folded into a later kernel and must not run: the recurrent-state gather its
 // GATED_DELTA_NET reads itself, the conv-state chain's GET_ROWS (registered for its SSM_CONV), and the CONCAT and snapshot
 // CPYs that chain skips. Asked for every node the graph loop reaches and for the nodes a fusion runs ahead of its own
@@ -6087,7 +6211,7 @@ static bool ggml_cuda_node_is_folded(ggml_backend_cuda_context & ctx, const ggml
             (ggml_cuda_try_gdn_gather_skip(ctx, cgraph, node_idx) || ggml_cuda_try_ssm_conv_state_update(ctx, cgraph, node_idx))) {
         return true;
     }
-    return ctx.ssm_conv_updates().skips(node);
+    return ctx.ssm_conv_updates().skips(node) || ctx.short_conv_windows().skips(node);
 }
 
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
@@ -9125,10 +9249,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             cuda_ctx->gdn_gathers().reset();
             cuda_ctx->ssm_conv_updates().reset();
+            cuda_ctx->short_conv_windows().reset();
             cuda_ctx->fattn_kv_live().reset();
 
             for (int j = 0; j < cgraph->n_nodes; ++j) {
                 ggml_cuda_try_ssm_conv_state_update(*cuda_ctx, cgraph, j);
+                ggml_cuda_try_short_conv_window(*cuda_ctx, cgraph, j);
             }
             const std::vector<ggml_cuda_pq2_prefetch> pq2_plan = ggml_cuda_pq2_prefetch_plan(*cuda_ctx, cgraph);
 
