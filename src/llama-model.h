@@ -1149,6 +1149,8 @@ const char * llm_type_name(llm_type type);
     const int64_t n_expert_used  = hparams.n_expert_used();  GGML_UNUSED(n_expert_used); \
     const int64_t n_ctx_train    = hparams.n_ctx_train;      GGML_UNUSED(n_ctx_train);
 
+bool llama_model_is_inkling_draft(const llama_model & model);
+
 // For internal test use
 // TODO: remove
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);

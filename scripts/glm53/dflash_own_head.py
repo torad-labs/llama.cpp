@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
 import gguf  # noqa: E402
 
 EMBD, HEAD = "token_embd.weight", "output.weight"
+EMBD_NORM = "token_embd_norm.weight"
 
 
 def main():
@@ -30,11 +31,15 @@ def main():
     draft = gguf.GGUFReader(args.draft)
     own = {tensor.name for tensor in draft.tensors}
     shards = [gguf.GGUFReader(path) for path in args.target]
-    found = {tensor.name: tensor for shard in shards for tensor in shard.tensors if tensor.name in (EMBD, HEAD)}
+    inkling = "dflash.dspark.markov_rank" in draft.fields
+    shared = (EMBD, HEAD, EMBD_NORM) if inkling else (EMBD, HEAD)
+    found = {tensor.name: tensor for shard in shards for tensor in shard.tensors if tensor.name in shared}
     if EMBD not in found:
         raise SystemExit(f"{EMBD} is in none of the target's files: give every shard")
+    if inkling and any(name not in found for name in shared):
+        raise SystemExit("Inkling2 DSpark requires the target's embedding, embedding norm and output tensors")
     # a target without an output head ties it to its embeddings, and so does the draft
-    carried = [(name, found.get(name, found[EMBD])) for name in (EMBD, HEAD) if name not in own]
+    carried = [(name, found.get(name, found[EMBD])) for name in shared if name not in own]
     if not carried:
         raise SystemExit("the draft already carries both tensors")
 

@@ -6668,7 +6668,7 @@ private:
 
     std::vector<cpu_sample_result> sample_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
         const int n_threads = std::min(params_base.cpuparams.n_threads, 4);
-        if (n_threads < 2 || n_batch_tokens < 4 || spec || !pull_k.empty() ||
+        if (n_threads < 2 || n_batch_tokens < 4 || !pull_k.empty() ||
                 llama_vocab_n_tokens(vocab) < 128*1024) {
             return {};
         }
@@ -6680,7 +6680,7 @@ private:
         };
         std::vector<job> jobs;
         for (auto & slot : slots) {
-            if (slot.state != SLOT_STATE_GENERATING || slot.i_batch < off || slot.i_batch >= off + n_batch_tokens ||
+            if (slot.state != SLOT_STATE_GENERATING || !slot.spec_draft.empty() || slot.i_batch < off || slot.i_batch >= off + n_batch_tokens ||
                     slot.backend_sampler || slot.cand_rows || slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
                 continue;
             }
