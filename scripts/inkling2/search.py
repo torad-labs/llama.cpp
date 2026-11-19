@@ -215,7 +215,7 @@ def run(args):
                 settings = {**best, name: value}
                 # The value the best already runs with is the best itself
                 unset = name not in plan(base, best)[1] and not name.startswith("--")
-                if plan(base, settings) == plan(base, best) or unset and str(registry[name]["default"]) == value:
+                if plan(base, settings) == plan(base, best) or unset and str(registry[name].get("default")) == value:
                     continue
                 try:
                     found = trial(settings)
