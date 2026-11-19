@@ -38,3 +38,10 @@ ab9351d38f83499fbaacb2baf23ce6b4978a387e:docs/torad/glm53-dp-qualification-20261
 
 # The name of a GGUF tensor (blk.0.ffn_gate_up_exps.weight) in a converter unit test, not a credential.
 5c008e00085f4d3e394f9a1be649284999de1326:tests/test_conversion_fp8.py:generic-api-key:513
+# The same tensor name as the note above first wrote it, in that commit's copy of this file and in its message.
+90ee9503853ba0cf1f1cd90e84dd6d18143078e2:.gitleaksignore:generic-api-key:39
+90ee9503853ba0cf1f1cd90e84dd6d18143078e2:.git/message:generic-api-key:4
+
+# Upstream's Granite Vision README (llama.cpp #12006) links an image by a GitHub asset URL signed on 2025-02-21 for
+# 300 seconds: the key id of GitHub's own bucket in a link that expired that day, public upstream, not a credential of ours.
+4d1051a40ffc2fdff80bc532eea5b9568b85c156:examples/llava/README-granitevision.md:aws-access-token:172
