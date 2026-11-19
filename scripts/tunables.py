@@ -9,7 +9,9 @@
 """
 
 import argparse
+import fnmatch
 import json
+import os
 import re
 import subprocess
 import sys
@@ -139,10 +141,26 @@ def render(doc, params):
     return "\n".join(lines) + "\n"
 
 
+def tree_files(*patterns):
+    """The tree's files a pattern names, as git matches one: a folder by its prefix, a * across folders.
+    Git's own list in a checkout. A tree shipped without its repository is walked, less its build folders."""
+    listed = subprocess.run(["git", "ls-files", "-z", "--", *patterns], cwd=ROOT, capture_output=True, text=True)
+    if listed.returncode == 0:
+        return [f for f in listed.stdout.split("\0") if f]
+    found = []
+    for folder, dirs, names in os.walk(ROOT):
+        top = Path(folder) == ROOT
+        dirs[:] = [d for d in dirs if not d.startswith(".") and not (top and d.startswith("build"))]
+        for name in names:
+            rel = (Path(folder) / name).relative_to(ROOT).as_posix()
+            if any(rel.startswith(pat) if pat.endswith("/") else fnmatch.fnmatchcase(rel, pat) for pat in patterns):
+                found.append(rel)
+    return found
+
+
 def scan():
     """name -> {"checked": {(reader, file)}, "raw": {file}} for every variable the source reads by name."""
-    files = subprocess.run(["git", "ls-files", "-z", "--", *SOURCE_DIRS, "ggml/src/*.c", "ggml/src/*.cpp", "ggml/src/*.h"],
-                           cwd=ROOT, check=True, capture_output=True, text=True).stdout.split("\0")
+    files = tree_files(*SOURCE_DIRS, "ggml/src/*.c", "ggml/src/*.cpp", "ggml/src/*.h")
     reads = {}
     for rel in sorted(set(files)):
         if not rel.endswith(SOURCE_EXTS) or rel == REGISTRY or (rel.startswith("ggml/src/") and rel.count("/") > 2 and not rel.startswith(SOURCE_DIRS)):
@@ -188,9 +206,7 @@ def check(doc, params):
 
     args = ARGS.read_text()
     launcher = LAUNCHER.read_text()
-    cmake = "".join((ROOT / f).read_text(errors="replace") for f in subprocess.run(
-        ["git", "ls-files", "-z", "--", "CMakeLists.txt", "*/CMakeLists.txt", "*.cmake"],
-        cwd=ROOT, check=True, capture_output=True, text=True).stdout.split("\0") if f)
+    cmake = "".join((ROOT / f).read_text(errors="replace") for f in tree_files("CMakeLists.txt", "*/CMakeLists.txt", "*.cmake"))
     for p in params:
         if p["set"] == "cli" and f'"{p["name"]}"' not in args:
             problems.append(f"{p['name']}: {ARGS.relative_to(ROOT)} has no such flag")
