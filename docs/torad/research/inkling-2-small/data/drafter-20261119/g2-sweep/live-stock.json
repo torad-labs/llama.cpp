@@ -1,0 +1,119 @@
+{
+ "depth": 3,
+ "draft": "/workspace/rig/dspark/pack/model/Inkling-2-Small-abliterated-e4853745-DSpark-BF16-own-head.gguf",
+ "rotation": [
+  "1.18.102.758 I llama_kv_cache: n_rot_k = 128, n_embd_head_k_all = 128",
+  "1.18.102.759 I llama_kv_cache: n_rot_v = 64, n_embd_head_k_all = 128",
+  "1.18.104.795 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 128",
+  "1.18.104.795 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 128",
+  "1.18.718.519 I llama_kv_cache: n_rot_k = 128, n_embd_head_k_all = 128",
+  "1.18.718.520 I llama_kv_cache: n_rot_v = 64, n_embd_head_k_all = 128",
+  "1.18.718.748 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 128",
+  "1.18.718.748 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 128"
+ ],
+ "graph": "draft: 5 layers, width 4608, heads 48/8 x 128, block 8, taps [5, 11, 17, 23, 29, 35, 41, 48], window 1024, 1711.7M parameters, 48 stored in BF16, input cast to BF16 no; caches: 0 window f16, 1 window f16, 2 global q8_0 rot k128 v64, 3 window f16, 4 window f16",
+ "best": "bf16 inputs",
+ "least": 0.9,
+ "modes": {
+  "bf16 inputs": {
+   "same": 0.987987987987988,
+   "tokens": 333,
+   "by_row": [
+    0.9819819819819819,
+    1.0,
+    0.9819819819819819
+   ],
+   "by_position": {
+    "below 4096": null,
+    "below 32768": 1.0,
+    "below 131072": 0.9838709677419355,
+    "from 131072": 0.9666666666666667
+   },
+   "margin_where_same": 14.871780395507812,
+   "margin_where_different": 0.6849210262298584,
+   "server_token_rank_where_different": 1.0,
+   "requests": [
+    {
+     "id": "mimo:session/math_problems/4a08652e#0@18200.live",
+     "cut": 18200,
+     "tokens": 24,
+     "same": 24
+    },
+    {
+     "id": "glm53:00200:encode__starlette.db5063c2.func_basic__s9zxwiy7@23329.live",
+     "cut": 23329,
+     "tokens": 93,
+     "same": 93
+    },
+    {
+     "id": "trace-commons:sessions/claude_code/0ca72c0c-ac42-400a-8ca6-cc31a787225f#0@35298.live",
+     "cut": 35298,
+     "tokens": 93,
+     "same": 93
+    },
+    {
+     "id": "armand0e-fable:32bd3eac-d079-4d7f-8f49-b34180656abd#0@81153.live",
+     "cut": 81153,
+     "tokens": 93,
+     "same": 90
+    },
+    {
+     "id": "armand0e-fable:6ae0aeed-340e-4b4d-9d74-f905a74ca2fc#0@199967.live",
+     "cut": 199967,
+     "tokens": 30,
+     "same": 29
+    }
+   ]
+  },
+  "f32 inputs": {
+   "same": 0.987987987987988,
+   "tokens": 333,
+   "by_row": [
+    0.9819819819819819,
+    1.0,
+    0.9819819819819819
+   ],
+   "by_position": {
+    "below 4096": null,
+    "below 32768": 1.0,
+    "below 131072": 0.9838709677419355,
+    "from 131072": 0.9666666666666667
+   },
+   "margin_where_same": 14.883777618408203,
+   "margin_where_different": 0.6672382950782776,
+   "server_token_rank_where_different": 1.0,
+   "requests": [
+    {
+     "id": "mimo:session/math_problems/4a08652e#0@18200.live",
+     "cut": 18200,
+     "tokens": 24,
+     "same": 24
+    },
+    {
+     "id": "glm53:00200:encode__starlette.db5063c2.func_basic__s9zxwiy7@23329.live",
+     "cut": 23329,
+     "tokens": 93,
+     "same": 93
+    },
+    {
+     "id": "trace-commons:sessions/claude_code/0ca72c0c-ac42-400a-8ca6-cc31a787225f#0@35298.live",
+     "cut": 35298,
+     "tokens": 93,
+     "same": 93
+    },
+    {
+     "id": "armand0e-fable:32bd3eac-d079-4d7f-8f49-b34180656abd#0@81153.live",
+     "cut": 81153,
+     "tokens": 93,
+     "same": 90
+    },
+    {
+     "id": "armand0e-fable:6ae0aeed-340e-4b4d-9d74-f905a74ca2fc#0@199967.live",
+     "cut": 199967,
+     "tokens": 30,
+     "same": 29
+    }
+   ]
+  }
+ }
+}

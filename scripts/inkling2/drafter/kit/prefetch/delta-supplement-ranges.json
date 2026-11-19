@@ -1,0 +1,240 @@
+{
+  "3": {
+    "path": "Inkling-2-Small-Q2_K/Inkling-2-Small-Q2_K-00001-of-00006.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q2_K/Inkling-2-Small-Q2_K-00001-of-00006.gguf",
+    "sha256": "0dfce45df7bf02fcec8f929ba670d7f12cc6fa36d5f4a3501e08c2f12b7b990a",
+    "file_size": 39954258944,
+    "qtype": "Q4_K",
+    "offset": 17328616448,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "47": {
+    "path": "Inkling-2-Small-Q2_K/Inkling-2-Small-Q2_K-00006-of-00006.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q2_K/Inkling-2-Small-Q2_K-00006-of-00006.gguf",
+    "sha256": "c48ac795acac514104f441bda19009e8c36498479fbd9a65d79493b452fe94f0",
+    "file_size": 28081907712,
+    "qtype": "Q4_K",
+    "offset": 23106041856,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "21": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "sha256": "e492c73bba2512aa62e4ee3ceee26ff83f3a52e864a550fa55427384d96b8b53",
+    "file_size": 39653240288,
+    "qtype": "Q4_K",
+    "offset": 4691743712,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "22": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "sha256": "e492c73bba2512aa62e4ee3ceee26ff83f3a52e864a550fa55427384d96b8b53",
+    "file_size": 39653240288,
+    "qtype": "Q4_K",
+    "offset": 11683792352,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "23": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "sha256": "e492c73bba2512aa62e4ee3ceee26ff83f3a52e864a550fa55427384d96b8b53",
+    "file_size": 39653240288,
+    "qtype": "Q4_K",
+    "offset": 18677094368,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "24": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "sha256": "e492c73bba2512aa62e4ee3ceee26ff83f3a52e864a550fa55427384d96b8b53",
+    "file_size": 39653240288,
+    "qtype": "Q4_K",
+    "offset": 25669143008,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "25": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00005-of-00010.gguf",
+    "sha256": "e492c73bba2512aa62e4ee3ceee26ff83f3a52e864a550fa55427384d96b8b53",
+    "file_size": 39653240288,
+    "qtype": "Q4_K",
+    "offset": 32661191648,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "26": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "sha256": "9b3793bc64786f5a43460b41819fb4b745945f608d9a0060b37a3b00ec4b7f32",
+    "file_size": 37261817728,
+    "qtype": "Q4_K",
+    "offset": 7552,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "27": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "sha256": "9b3793bc64786f5a43460b41819fb4b745945f608d9a0060b37a3b00ec4b7f32",
+    "file_size": 37261817728,
+    "qtype": "Q4_K",
+    "offset": 6992056192,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "28": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "sha256": "9b3793bc64786f5a43460b41819fb4b745945f608d9a0060b37a3b00ec4b7f32",
+    "file_size": 37261817728,
+    "qtype": "Q4_K",
+    "offset": 13984104832,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "29": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "sha256": "9b3793bc64786f5a43460b41819fb4b745945f608d9a0060b37a3b00ec4b7f32",
+    "file_size": 37261817728,
+    "qtype": "Q4_K",
+    "offset": 20977406848,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "30": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "sha256": "9b3793bc64786f5a43460b41819fb4b745945f608d9a0060b37a3b00ec4b7f32",
+    "file_size": 37261817728,
+    "qtype": "Q4_K",
+    "offset": 27969455488,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "31": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00006-of-00010.gguf",
+    "sha256": "9b3793bc64786f5a43460b41819fb4b745945f608d9a0060b37a3b00ec4b7f32",
+    "file_size": 37261817728,
+    "qtype": "Q4_K",
+    "offset": 34961504128,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "32": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00007-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00007-of-00010.gguf",
+    "sha256": "dfbd320a6e0bf64b4136ef09b556e587358a17e9e79e2a2aa364e0a59cfb2ae8",
+    "file_size": 39653240288,
+    "qtype": "Q4_K",
+    "offset": 4691743712,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "33": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00007-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00007-of-00010.gguf",
+    "sha256": "dfbd320a6e0bf64b4136ef09b556e587358a17e9e79e2a2aa364e0a59cfb2ae8",
+    "file_size": 39653240288,
+    "qtype": "Q4_K",
+    "offset": 11683792352,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "34": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00007-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00007-of-00010.gguf",
+    "sha256": "dfbd320a6e0bf64b4136ef09b556e587358a17e9e79e2a2aa364e0a59cfb2ae8",
+    "file_size": 39653240288,
+    "qtype": "Q4_K",
+    "offset": 18675840992,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  },
+  "35": {
+    "path": "Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00007-of-00010.gguf",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q4_K_S/Inkling-2-Small-Q4_K_S-00007-of-00010.gguf",
+    "sha256": "dfbd320a6e0bf64b4136ef09b556e587358a17e9e79e2a2aa364e0a59cfb2ae8",
+    "file_size": 39653240288,
+    "qtype": "Q4_K",
+    "offset": 25669143008,
+    "size": 2293235712,
+    "shape": [
+      2304,
+      4608,
+      384
+    ]
+  }
+}

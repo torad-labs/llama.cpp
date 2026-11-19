@@ -1,0 +1,72 @@
+{
+ "under 32K": {
+  "rounds_3": 15699,
+  "walked_3": 2.091024906044971,
+  "ceiling_rounds_3": 14507,
+  "walked_ceiling_3": 2.352174812159647,
+  "rounds_5": 12355,
+  "walked_5": 2.8993929583164713,
+  "ceiling_rounds_5": 10793,
+  "walked_ceiling_5": 3.459557120355786,
+  "rounds_7": 10811,
+  "walked_7": 3.4066228840995283,
+  "ceiling_rounds_7": 9013,
+  "walked_ceiling_7": 4.301675357816487
+ },
+ "32K to 64K": {
+  "rounds_3": 13316,
+  "walked_3": 1.7542805647341544,
+  "ceiling_rounds_3": 12057,
+  "walked_ceiling_3": 2.044123745542009,
+  "rounds_5": 11123,
+  "walked_5": 2.2751955407713744,
+  "ceiling_rounds_5": 9502,
+  "walked_ceiling_5": 2.838981267101663,
+  "rounds_7": 10147,
+  "walked_7": 2.5644032719030254,
+  "ceiling_rounds_7": 8264,
+  "walked_ceiling_7": 3.388189738625363
+ },
+ "64K to 128K": {
+  "rounds_3": 11873,
+  "walked_3": 1.7283753053145794,
+  "ceiling_rounds_3": 10790,
+  "walked_ceiling_3": 2.0038924930491198,
+  "rounds_5": 9950,
+  "walked_5": 2.2297487437185928,
+  "ceiling_rounds_5": 8542,
+  "walked_ceiling_5": 2.764223835167408,
+  "rounds_7": 9094,
+  "walked_7": 2.506817681988124,
+  "ceiling_rounds_7": 7485,
+  "walked_ceiling_7": 3.275885103540414
+ },
+ "128K and over": {
+  "rounds_3": 5434,
+  "walked_3": 2.1431726168568273,
+  "ceiling_rounds_3": 5077,
+  "walked_ceiling_3": 2.36694898562143,
+  "rounds_5": 4234,
+  "walked_5": 3.018894662257912,
+  "ceiling_rounds_5": 3789,
+  "walked_ceiling_5": 3.4885193982581155,
+  "rounds_7": 3695,
+  "walked_7": 3.5669824086603517,
+  "ceiling_rounds_7": 3164,
+  "walked_ceiling_7": 4.34039190897598
+ },
+ "all": {
+  "rounds_3": 46322,
+  "walked_3": 1.907387418505246,
+  "ceiling_rounds_3": 42431,
+  "walked_ceiling_3": 2.177841672362188,
+  "rounds_5": 37662,
+  "walked_5": 2.5515639105729915,
+  "ceiling_rounds_5": 32626,
+  "walked_ceiling_5": 3.1001348617666893,
+  "rounds_7": 33747,
+  "walked_7": 2.9284677156487984,
+  "ceiling_rounds_7": 27926,
+  "walked_ceiling_7": 3.7607963904605026
+ }
+}

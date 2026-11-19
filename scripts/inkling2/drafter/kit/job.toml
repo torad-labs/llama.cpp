@@ -1,0 +1,4 @@
+name = "dspark-kit"
+run = "bash run.sh"
+limit_minutes = 120
+results = ["results"]

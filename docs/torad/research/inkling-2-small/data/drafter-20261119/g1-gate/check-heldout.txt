@@ -1,0 +1,5 @@
+recording /workspace/rig/dspark/rec-pack/heldout: taps [5, 11, 17, 23, 29, 35, 41, 48], 73728 bytes a row, top 64, kept prefix 16674 and 17819
+files    ok    66 requests, 1178396 rows read, 845 continuations (479 ended by the model, 366 by length), 135293 rows written by the model
+taps     ok    rms of each recorded layer over 768 rows: 5: 5.182, 11: 3.988, 17: 4.003, 23: 2.386, 29: 1.949, 35: 1.746, 41: 2.007, 48: 3.943
+teacher  ok    768 rows, output layer Q6_K, cap 30: the same first token on 100.0%, 99.2% of the top 64 shared, logits apart by 0.0152 on average and 0.1074 at most, logsumexp apart by 0.0023 on average; cut: 256 rows, 0.0194 apart, first token 100.0%; written: 512 rows, 0.0130 apart, first token 100.0%
+all checks passed

@@ -1,0 +1,57 @@
+bench: 23 sessions of 18205 to 199967 tokens (853574 in all, none over 294592), levels [23, 8, 4, 1], 256 tokens a reply, draft /workspace/rig/dspark/pack/model/Inkling-2-Small-abliterated-e4853745-DSpark-BF16-own-head.gguf
+bench: the server was ready in 80s
+first turn, 23 at once   23 sessions  kept  2862 of  7514 offered ( 38.1%)  2.660 kept a round  72.3% of  3961 written came drafted     3.7 tok/s a session (least   2.1)      5.1 tok/s in all  read  853574 cached       0   777s
+first turn  slot 18  context  18205  kept  144 of  266 ( 54.1%)  144 of 183 written came drafted     5.2 tok/s  stop eos
+first turn  slot  2  context  19146  kept   54 of   84 ( 64.3%)   54 of  67 written came drafted     6.1 tok/s  stop eos
+first turn  slot  9  context  19473  kept   40 of   42 ( 95.2%)   40 of  47 written came drafted     8.7 tok/s  stop eos
+first turn  slot  5  context  20661  kept  136 of  357 ( 38.1%)  136 of 188 written came drafted     3.8 tok/s  stop eos
+first turn  slot 12  context  21557  kept  184 of  497 ( 37.0%)  184 of 256 written came drafted     3.5 tok/s  stop limit
+first turn  slot  0  context  22246  kept  211 of  308 ( 68.5%)  211 of 256 written came drafted     6.2 tok/s  stop limit
+first turn  slot 19  context  23611  kept  191 of  448 ( 42.6%)  191 of 256 written came drafted     3.7 tok/s  stop limit
+first turn  slot  1  context  23796  kept  125 of  469 ( 26.7%)  125 of 193 written came drafted     2.6 tok/s  stop eos
+first turn  slot 17  context  24166  kept   77 of  224 ( 34.4%)   77 of 110 written came drafted     3.2 tok/s  stop eos
+first turn  slot 11  context  24314  kept  100 of  301 ( 33.2%)  100 of 144 written came drafted     3.1 tok/s  stop eos
+first turn  slot  7  context  24948  kept   48 of   56 ( 85.7%)   48 of  57 written came drafted     6.6 tok/s  stop eos
+first turn  slot 15  context  25206  kept  205 of  350 ( 58.6%)  205 of 256 written came drafted     4.6 tok/s  stop limit
+first turn  slot  8  context  25845  kept  110 of  259 ( 42.5%)  110 of 148 written came drafted     3.8 tok/s  stop eos
+first turn  slot 14  context  28030  kept  158 of  385 ( 41.0%)  158 of 214 written came drafted     3.2 tok/s  stop eos
+first turn  slot 16  context  29833  kept   55 of  112 ( 49.1%)   55 of  72 written came drafted     3.7 tok/s  stop eos
+first turn  slot 22  context  30150  kept  187 of  476 ( 39.3%)  187 of 256 written came drafted     3.1 tok/s  stop limit
+first turn  slot 21  context  30632  kept  141 of  497 ( 28.4%)  141 of 213 written came drafted     2.6 tok/s  stop eos
+first turn  slot  6  context  33322  kept  111 of  224 ( 49.6%)  111 of 144 written came drafted     3.9 tok/s  stop eos
+first turn  slot 13  context  36015  kept   79 of  224 ( 35.3%)   79 of 112 written came drafted     3.0 tok/s  stop eos
+first turn  slot 20  context  37343  kept  147 of  399 ( 36.8%)  147 of 205 written came drafted     3.3 tok/s  stop eos
+first turn  slot  4  context  41347  kept  152 of  710 ( 21.4%)  152 of 256 written came drafted     2.3 tok/s  stop limit
+first turn  slot 10  context  93761  kept  149 of  735 ( 20.3%)  149 of 256 written came drafted     2.1 tok/s  stop limit
+first turn  slot  3  context 199967  kept   58 of   91 ( 63.7%)   58 of  72 written came drafted    48.2 tok/s  stop eos
+later turn, 23 at once   23 sessions  kept  3189 of  7644 offered ( 41.7%)  2.915 kept a round  74.1% of  4306 written came drafted    11.3 tok/s a session (least   7.0)    121.4 tok/s in all  read      92 cached  853482    35s
+later turn, 23 at once  slot 18  context  18205  kept  132 of  252 ( 52.4%)  132 of 169 written came drafted    12.5 tok/s  stop eos
+later turn, 23 at once  slot  2  context  19146  kept  140 of  476 ( 29.4%)  140 of 209 written came drafted     9.7 tok/s  stop eos
+later turn, 23 at once  slot  9  context  19473  kept   56 of   84 ( 66.7%)   56 of  69 written came drafted    14.3 tok/s  stop eos
+later turn, 23 at once  slot  5  context  20661  kept  119 of  259 ( 45.9%)  119 of 157 written came drafted    11.3 tok/s  stop eos
+later turn, 23 at once  slot 12  context  21557  kept  210 of  315 ( 66.7%)  210 of 256 written came drafted    15.7 tok/s  stop limit
+later turn, 23 at once  slot  0  context  22246  kept  190 of  455 ( 41.8%)  190 of 256 written came drafted     7.9 tok/s  stop limit
+later turn, 23 at once  slot 19  context  23611  kept  174 of  553 ( 31.5%)  174 of 256 written came drafted    11.0 tok/s  stop limit
+later turn, 23 at once  slot  1  context  23796  kept  165 of  420 ( 39.3%)  165 of 226 written came drafted    11.3 tok/s  stop eos
+later turn, 23 at once  slot 17  context  24166  kept  136 of  343 ( 39.7%)  136 of 186 written came drafted    10.7 tok/s  stop eos
+later turn, 23 at once  slot 11  context  24314  kept  160 of  413 ( 38.7%)  160 of 220 written came drafted    11.1 tok/s  stop eos
+later turn, 23 at once  slot  7  context  24948  kept   47 of   49 ( 95.9%)   47 of  55 written came drafted    19.4 tok/s  stop eos
+later turn, 23 at once  slot 15  context  25206  kept  215 of  280 ( 76.8%)  215 of 256 written came drafted    17.3 tok/s  stop limit
+later turn, 23 at once  slot  8  context  25845  kept   38 of   49 ( 77.6%)   38 of  46 written came drafted    16.1 tok/s  stop eos
+later turn, 23 at once  slot 14  context  28030  kept  160 of  336 ( 47.6%)  160 of 209 written came drafted    12.2 tok/s  stop eos
+later turn, 23 at once  slot 16  context  29833  kept   92 of  189 ( 48.7%)   92 of 120 written came drafted    11.4 tok/s  stop eos
+later turn, 23 at once  slot 22  context  30150  kept  188 of  469 ( 40.1%)  188 of 256 written came drafted    12.0 tok/s  stop limit
+later turn, 23 at once  slot 21  context  30632  kept  178 of  539 ( 33.0%)  178 of 256 written came drafted    11.3 tok/s  stop limit
+later turn, 23 at once  slot  6  context  33322  kept  104 of  245 ( 42.4%)  104 of 140 written came drafted    10.6 tok/s  stop eos
+later turn, 23 at once  slot 13  context  36015  kept  194 of  427 ( 45.4%)  194 of 256 written came drafted    12.7 tok/s  stop limit
+later turn, 23 at once  slot 20  context  37343  kept  159 of  469 ( 33.9%)  159 of 227 written came drafted    10.6 tok/s  stop eos
+later turn, 23 at once  slot  4  context  41347  kept   67 of  308 ( 21.8%)   67 of 112 written came drafted     7.0 tok/s  stop eos
+later turn, 23 at once  slot 10  context  93761  kept  179 of  532 ( 33.6%)  179 of 256 written came drafted    11.3 tok/s  stop limit
+later turn, 23 at once  slot  3  context 199967  kept   86 of  182 ( 47.3%)   86 of 113 written came drafted    11.2 tok/s  stop eos
+later turn, 8 at once    23 sessions  kept  3193 of  8363 offered ( 38.2%)  2.672 kept a round  72.4% of  4411 written came drafted    15.4 tok/s a session (least   6.9)     85.5 tok/s in all  read      92 cached  853482    52s
+later turn, 4 at once    23 sessions  kept  2719 of  6982 offered ( 38.9%)  2.724 kept a round  72.7% of  3740 written came drafted    21.1 tok/s a session (least  15.2)     67.1 tok/s in all  read      92 cached  853482    56s
+later turn, 1 at once    23 sessions  kept  2810 of  7240 offered ( 38.8%)  2.702 kept a round  72.5% of  3875 written came drafted    38.8 tok/s a session (least  22.3)     30.2 tok/s in all  read      92 cached  853482   128s
+contexts under 23796     28 sessions  kept  3606 of  8415 offered ( 42.9%)  2.990 kept a round  74.5% of  4840 written came drafted    19.5 tok/s a session (least   7.9)
+contexts 23796 to 30150  32 sessions  kept  3732 of  8114 offered ( 46.0%)  3.217 kept a round  75.8% of  4924 written came drafted    17.7 tok/s a session (least   9.4)
+contexts from 30150      32 sessions  kept  4573 of 13700 offered ( 33.4%)  2.332 kept a round  69.6% of  6568 written came drafted    19.1 tok/s a session (least   6.9)
+bench: written to /workspace/rig/jobs/dspark-g3-none/results/bench-stock-d7.json

@@ -1,0 +1,171 @@
+1.19.923.361 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+1.36.432.123 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, f_sim_best = 0.992 (> 0.100 thold), f_keep = 0.995
+1.38.212.087 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, f_sim_best = 0.881 (> 0.100 thold), f_keep = 0.994
+1.39.755.329 I slot get_availabl: id  1 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+1.42.536.471 I slot get_availabl: id  2 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+1.42.536.530 I slot share_active: id  2 | task 89 | waiting for 17820 prefix tokens from slot 1, task 85
+1.45.942.240 I slot get_availabl: id  3 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+1.45.942.313 I slot share_active: id  3 | task 94 | waiting for 17820 prefix tokens from slot 1, task 85
+1.48.499.075 I slot get_availabl: id  4 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+1.48.499.148 I slot share_active: id  4 | task 98 | waiting for 16674 prefix tokens from slot 1, task 85
+1.51.925.922 I slot get_availabl: id  5 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+1.51.925.993 I slot share_active: id  5 | task 103 | waiting for 16674 prefix tokens from slot 1, task 85
+1.54.051.373 I slot copy_active_: id  4 | task 98 | copied the prompt of active slot 1, 16674 tokens, to reuse 16674 of them
+1.54.056.092 I slot copy_active_: id  5 | task 103 | copied the prompt of active slot 1, 16674 tokens, to reuse 16674 of them
+1.55.004.979 I slot get_availabl: id  6 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+1.55.005.058 I slot share_active: id  6 | task 108 | waiting for 18285 prefix tokens from slot 1, task 85
+1.56.884.500 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, f_sim_best = 0.991 (> 0.100 thold), f_keep = 0.997
+1.56.922.818 I slot copy_active_: id  2 | task 89 | copied the prompt of active slot 1, 17820 tokens, to reuse 17820 of them
+1.56.926.873 I slot copy_active_: id  3 | task 94 | copied the prompt of active slot 1, 17820 tokens, to reuse 17820 of them
+1.58.351.108 I slot get_availabl: id  7 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+1.58.356.221 I slot copy_active_: id  7 | task 113 | copied the prompt of active slot 1, 18285 tokens, to reuse 18285 of them
+1.58.395.023 I slot copy_active_: id  6 | task 108 | copied the prompt of active slot 1, 18285 tokens, to reuse 18285 of them
+2.01.085.265 I slot get_availabl: id  8 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.01.091.065 I slot copy_active_: id  8 | task 116 | copied the prompt of active slot 1, 19053 tokens, to reuse 17820 of them
+2.03.884.342 I slot get_availabl: id  9 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.03.890.654 I slot copy_active_: id  9 | task 120 | copied the prompt of active slot 1, 20077 tokens, to reuse 17820 of them
+2.06.501.542 I slot get_availabl: id 10 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.06.507.054 I slot copy_active_: id 10 | task 124 | copied the prompt of active slot 1, 20703 tokens, to reuse 17820 of them
+2.10.027.537 I slot get_availabl: id 11 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.10.032.074 I slot copy_active_: id 11 | task 129 | copied the prompt of active slot 1, 20715 tokens, to reuse 18285 of them
+2.12.709.764 I slot get_availabl: id 12 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.12.713.485 I slot copy_active_: id 12 | task 133 | copied the prompt of active slot 1, 20727 tokens, to reuse 17820 of them
+2.15.598.313 I slot get_availabl: id 13 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.15.603.080 I slot copy_active_: id 13 | task 137 | copied the prompt of active slot 1, 20739 tokens, to reuse 18285 of them
+2.18.473.050 I slot get_availabl: id 14 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.18.477.224 I slot copy_active_: id 14 | task 141 | copied the prompt of active slot 1, 20749 tokens, to reuse 18285 of them
+2.22.049.567 I slot get_availabl: id 15 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.22.053.106 I slot copy_active_: id 15 | task 146 | copied the prompt of active slot 12, 18254 tokens, to reuse 17977 of them
+2.23.728.335 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.199 (> 0.100 thold), f_keep = 0.995
+2.23.728.420 I slot get_availabl: id  6 | task -1 | selected slot by LCP similarity, f_sim_best = 0.974 (> 0.100 thold), f_keep = 0.997
+2.23.728.444 I slot get_availabl: id  7 | task -1 | selected slot by LCP similarity, f_sim_best = 0.995 (> 0.100 thold), f_keep = 0.997
+2.24.682.982 I slot get_availabl: id 16 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.24.686.706 I slot copy_active_: id 16 | task 153 | copied the prompt of active slot 1, 20772 tokens, to reuse 18285 of them
+2.25.512.836 I slot get_availabl: id  1 | task -1 | selected slot by LCP similarity, f_sim_best = 0.991 (> 0.100 thold), f_keep = 0.997
+2.26.662.609 I slot get_availabl: id  5 | task -1 | selected slot by LCP similarity, f_sim_best = 0.895 (> 0.100 thold), f_keep = 0.995
+2.27.547.178 I slot get_availabl: id  9 | task -1 | slot keeps its prompt, f_sim = 0.876, f_keep = 0.913: an empty slot is free
+2.27.547.189 I slot get_availabl: id 17 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.27.550.161 I slot get_availabl: id 17 | task -1 | copied the prompt of slot 9, 19519 tokens, to reuse 17820 of them
+2.27.554.763 I slot copy_active_: id 17 | task 159 | copied the prompt of active slot 1, 20882 tokens, to reuse 18285 of them
+2.28.685.089 I slot get_availabl: id  4 | task -1 | selected slot by LCP similarity, f_sim_best = 0.976 (> 0.100 thold), f_keep = 0.995
+2.30.700.994 I slot get_availabl: id  9 | task -1 | slot keeps its prompt, f_sim = 0.979, f_keep = 0.913: an empty slot is free
+2.30.701.007 I slot get_availabl: id 18 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.30.704.207 I slot get_availabl: id 18 | task -1 | copied the prompt of slot 9, 19519 tokens, to reuse 17820 of them
+2.30.708.857 I slot copy_active_: id 18 | task 164 | copied the prompt of active slot 12, 18281 tokens, to reuse 17977 of them
+2.34.126.865 I slot get_availabl: id 11 | task -1 | selected slot by LCP similarity, f_sim_best = 0.981 (> 0.100 thold), f_keep = 0.997
+2.34.126.924 I slot get_availabl: id  9 | task -1 | slot keeps its prompt, f_sim = 0.979, f_keep = 0.913: an empty slot is free
+2.34.126.931 I slot get_availabl: id 19 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.34.130.012 I slot get_availabl: id 19 | task -1 | copied the prompt of slot 9, 19519 tokens, to reuse 17820 of them
+2.34.134.628 I slot copy_active_: id 19 | task 169 | copied the prompt of active slot 12, 18288 tokens, to reuse 17977 of them
+2.36.526.373 I slot get_availabl: id  9 | task -1 | slot keeps its prompt, f_sim = 0.876, f_keep = 0.913: an empty slot is free
+2.36.526.386 I slot get_availabl: id 20 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.36.529.482 I slot get_availabl: id 20 | task -1 | copied the prompt of slot 9, 19519 tokens, to reuse 17820 of them
+2.36.534.011 I slot copy_active_: id 20 | task 172 | copied the prompt of active slot 1, 20914 tokens, to reuse 18285 of them
+2.39.239.364 I slot get_availabl: id  8 | task -1 | selected slot by LCP similarity, f_sim_best = 0.868 (> 0.100 thold), f_keep = 0.996
+2.39.239.432 I slot get_availabl: id 13 | task -1 | selected slot by LCP similarity, f_sim_best = 0.995 (> 0.100 thold), f_keep = 0.997
+2.40.918.714 I slot get_availabl: id 14 | task -1 | slot keeps its prompt, f_sim = 0.898, f_keep = 0.896: an empty slot is free
+2.40.918.726 I slot get_availabl: id 21 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.40.922.798 I slot get_availabl: id 21 | task -1 | copied the prompt of slot 14, 20405 tokens, to reuse 18285 of them
+2.40.922.894 I slot get_availabl: id 14 | task -1 | selected slot by LCP similarity, f_sim_best = 0.962 (> 0.100 thold), f_keep = 0.997
+2.43.139.029 I slot get_availabl: id  9 | task -1 | slot keeps its prompt, f_sim = 0.911, f_keep = 0.854: an empty slot is free
+2.43.139.047 I slot get_availabl: id 22 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+2.43.142.226 I slot get_availabl: id 22 | task -1 | copied the prompt of slot 9, 19519 tokens, to reuse 16674 of them
+2.43.146.963 I slot copy_active_: id 22 | task 182 | copied the prompt of active slot 5, 20448 tokens, to reuse 18042 of them
+2.49.279.166 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, f_sim_best = 0.974 (> 0.100 thold), f_keep = 0.994
+2.49.279.234 I slot get_availabl: id  6 | task -1 | selected slot by LCP similarity, f_sim_best = 0.786 (> 0.100 thold), f_keep = 0.997
+2.54.229.538 I slot get_availabl: id 16 | task -1 | selected slot by LCP similarity, f_sim_best = 0.996 (> 0.100 thold), f_keep = 0.997
+2.59.200.305 I slot get_availabl: id  1 | task -1 | selected slot by LCP similarity, f_sim_best = 0.984 (> 0.100 thold), f_keep = 0.996
+2.59.200.368 I slot get_availabl: id 15 | task -1 | selected slot by LCP similarity, f_sim_best = 0.852 (> 0.100 thold), f_keep = 0.995
+3.02.351.144 I slot get_availabl: id  2 | task -1 | selected slot by LCP similarity, f_sim_best = 0.993 (> 0.100 thold), f_keep = 0.993
+3.05.350.055 I slot get_availabl: id 17 | task -1 | selected slot by LCP similarity, f_sim_best = 0.940 (> 0.100 thold), f_keep = 0.997
+3.06.566.652 I slot get_availabl: id 12 | task -1 | selected slot by LCP similarity, f_sim_best = 0.876 (> 0.100 thold), f_keep = 0.993
+3.09.910.182 I slot get_availabl: id  7 | task -1 | selected slot by LCP similarity, f_sim_best = 0.984 (> 0.100 thold), f_keep = 0.994
+3.12.287.714 I slot get_availabl: id 20 | task -1 | selected slot by LCP similarity, f_sim_best = 0.981 (> 0.100 thold), f_keep = 0.997
+3.13.574.941 I slot get_availabl: id 11 | task -1 | selected slot by LCP similarity, f_sim_best = 0.905 (> 0.100 thold), f_keep = 0.996
+3.13.575.000 I slot get_availabl: id 14 | task -1 | selected slot by LCP similarity, f_sim_best = 0.862 (> 0.100 thold), f_keep = 0.997
+3.15.500.878 I slot get_availabl: id  4 | task -1 | selected slot by LCP similarity, f_sim_best = 0.986 (> 0.100 thold), f_keep = 0.995
+3.18.385.145 I slot get_availabl: id  1 | task -1 | selected slot by LCP similarity, f_sim_best = 0.994 (> 0.100 thold), f_keep = 0.998
+3.18.385.206 I slot get_availabl: id 10 | task -1 | selected slot by LCP similarity, f_sim_best = 0.752 (> 0.100 thold), f_keep = 0.994
+3.18.385.233 I slot get_availabl: id 13 | task -1 | selected slot by LCP similarity, f_sim_best = 0.629 (> 0.100 thold), f_keep = 0.995
+3.20.492.050 I slot get_availabl: id 21 | task -1 | selected slot by LCP similarity, f_sim_best = 0.976 (> 0.100 thold), f_keep = 0.997
+3.24.906.362 I slot get_availabl: id 19 | task -1 | selected slot by LCP similarity, f_sim_best = 0.965 (> 0.100 thold), f_keep = 0.993
+3.27.433.754 I slot get_availabl: id  8 | task -1 | selected slot by LCP similarity, f_sim_best = 0.927 (> 0.100 thold), f_keep = 0.997
+3.32.397.648 I slot get_availabl: id  7 | task -1 | selected slot by LCP similarity, f_sim_best = 0.984 (> 0.100 thold), f_keep = 1.000
+3.33.947.679 I slot get_availabl: id 16 | task -1 | selected slot by LCP similarity, f_sim_best = 0.802 (> 0.100 thold), f_keep = 0.996
+3.35.778.384 I slot get_availabl: id  1 | task -1 | selected slot by LCP similarity, f_sim_best = 0.914 (> 0.100 thold), f_keep = 0.998
+3.46.431.348 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, f_sim_best = 0.991 (> 0.100 thold), f_keep = 0.994
+3.47.886.920 I slot get_availabl: id 20 | task -1 | selected slot by LCP similarity, f_sim_best = 0.976 (> 0.100 thold), f_keep = 0.997
+3.51.128.914 I slot get_availabl: id  5 | task -1 | selected slot by LCP similarity, f_sim_best = 0.989 (> 0.100 thold), f_keep = 0.994
+3.51.128.981 I slot get_availabl: id 21 | task -1 | selected slot by LCP similarity, f_sim_best = 0.909 (> 0.100 thold), f_keep = 0.997
+3.57.792.931 I slot get_availabl: id  4 | task -1 | selected slot by LCP similarity, f_sim_best = 0.556 (> 0.100 thold), f_keep = 0.996
+4.06.018.949 I slot get_availabl: id 22 | task -1 | selected slot by LCP similarity, f_sim_best = 0.890 (> 0.100 thold), f_keep = 0.993
+4.08.414.288 I slot get_availabl: id 19 | task -1 | selected slot by LCP similarity, f_sim_best = 0.879 (> 0.100 thold), f_keep = 0.996
+4.10.812.551 I slot get_availabl: id 20 | task -1 | selected slot by LCP similarity, f_sim_best = 0.753 (> 0.100 thold), f_keep = 0.998
+4.15.815.958 I slot get_availabl: id 17 | task -1 | selected slot by LCP similarity, f_sim_best = 0.985 (> 0.100 thold), f_keep = 0.994
+4.20.504.511 I slot get_availabl: id 14 | task -1 | selected slot by LCP similarity, f_sim_best = 0.964 (> 0.100 thold), f_keep = 0.998
+4.31.022.602 I slot get_availabl: id  6 | task -1 | selected slot by LCP similarity, f_sim_best = 0.968 (> 0.100 thold), f_keep = 0.995
+4.33.128.664 I slot get_availabl: id  1 | task -1 | selected slot by LCP similarity, f_sim_best = 0.981 (> 0.100 thold), f_keep = 0.996
+4.33.128.722 I slot get_availabl: id  7 | task -1 | selected slot by LCP similarity, f_sim_best = 0.873 (> 0.100 thold), f_keep = 0.994
+4.38.848.537 I slot get_availabl: id 12 | task -1 | selected slot by LCP similarity, f_sim_best = 0.965 (> 0.100 thold), f_keep = 0.994
+4.46.420.947 I slot get_availabl: id 15 | task -1 | selected slot by LCP similarity, f_sim_best = 0.895 (> 0.100 thold), f_keep = 0.994
+4.55.001.553 I slot get_availabl: id 11 | task -1 | selected slot by LCP similarity, f_sim_best = 0.990 (> 0.100 thold), f_keep = 0.994
+5.07.405.230 I slot get_availabl: id  6 | task -1 | selected slot by LCP similarity, f_sim_best = 0.866 (> 0.100 thold), f_keep = 0.998
+5.09.009.843 I slot get_availabl: id 21 | task -1 | selected slot by LCP similarity, f_sim_best = 0.930 (> 0.100 thold), f_keep = 0.994
+5.10.651.684 I slot get_availabl: id 16 | task -1 | selected slot by LCP similarity, f_sim_best = 0.907 (> 0.100 thold), f_keep = 0.997
+5.12.286.291 I slot get_availabl: id 19 | task -1 | selected slot by LCP similarity, f_sim_best = 0.909 (> 0.100 thold), f_keep = 0.997
+5.22.449.993 I slot get_availabl: id 17 | task -1 | selected slot by LCP similarity, f_sim_best = 0.967 (> 0.100 thold), f_keep = 0.994
+5.28.110.798 I slot get_availabl: id 22 | task -1 | selected slot by LCP similarity, f_sim_best = 0.889 (> 0.100 thold), f_keep = 0.994
+5.30.646.806 I slot get_availabl: id 14 | task -1 | selected slot by LCP similarity, f_sim_best = 0.931 (> 0.100 thold), f_keep = 0.995
+5.36.797.814 I slot get_availabl: id 15 | task -1 | selected slot by LCP similarity, f_sim_best = 0.993 (> 0.100 thold), f_keep = 0.998
+6.03.135.354 I slot get_availabl: id 11 | task -1 | selected slot by LCP similarity, f_sim_best = 0.992 (> 0.100 thold), f_keep = 0.995
+6.06.435.000 I slot get_availabl: id  7 | task -1 | selected slot by LCP similarity, f_sim_best = 0.983 (> 0.100 thold), f_keep = 0.995
+6.25.981.848 I slot get_availabl: id 10 | task -1 | selected slot by LCP similarity, f_sim_best = 0.533 (> 0.100 thold), f_keep = 0.995
+6.28.856.926 I slot get_availabl: id  6 | task -1 | selected slot by LCP similarity, f_sim_best = 0.978 (> 0.100 thold), f_keep = 0.997
+6.32.040.451 I slot get_availabl: id  7 | task -1 | selected slot by LCP similarity, f_sim_best = 0.996 (> 0.100 thold), f_keep = 0.998
+6.34.999.587 I slot get_availabl: id 13 | task -1 | selected slot by LCP similarity, f_sim_best = 0.957 (> 0.100 thold), f_keep = 0.997
+6.44.487.606 I slot get_availabl: id 21 | task -1 | selected slot by LCP similarity, f_sim_best = 0.874 (> 0.100 thold), f_keep = 0.995
+6.46.351.637 I slot get_availabl: id 17 | task -1 | selected slot by LCP similarity, f_sim_best = 0.986 (> 0.100 thold), f_keep = 0.994
+6.58.735.391 I slot get_availabl: id 20 | task -1 | selected slot by LCP similarity, f_sim_best = 0.867 (> 0.100 thold), f_keep = 0.995
+7.00.636.341 I slot get_availabl: id 14 | task -1 | selected slot by LCP similarity, f_sim_best = 0.983 (> 0.100 thold), f_keep = 0.996
+7.05.826.337 I slot get_availabl: id 11 | task -1 | selected slot by LCP similarity, f_sim_best = 0.991 (> 0.100 thold), f_keep = 0.994
+7.09.634.828 I slot get_availabl: id 22 | task -1 | selected slot by LCP similarity, f_sim_best = 0.870 (> 0.100 thold), f_keep = 0.994
+7.12.228.196 I slot get_availabl: id 16 | task -1 | selected slot by LCP similarity, f_sim_best = 0.988 (> 0.100 thold), f_keep = 0.995
+7.24.546.387 I slot get_availabl: id  4 | task -1 | selected slot by LCP similarity, f_sim_best = 0.984 (> 0.100 thold), f_keep = 0.997
+7.41.070.212 I slot get_availabl: id  6 | task -1 | selected slot by LCP similarity, f_sim_best = 0.977 (> 0.100 thold), f_keep = 0.996
+7.43.268.150 I slot get_availabl: id 16 | task -1 | selected slot by LCP similarity, f_sim_best = 0.990 (> 0.100 thold), f_keep = 1.000
+7.45.536.242 I slot get_availabl: id  7 | task -1 | selected slot by LCP similarity, f_sim_best = 0.993 (> 0.100 thold), f_keep = 0.995
+7.52.112.673 I slot get_availabl: id 11 | task -1 | selected slot by LCP similarity, f_sim_best = 0.987 (> 0.100 thold), f_keep = 0.997
+8.00.042.521 I slot get_availabl: id 17 | task -1 | selected slot by LCP similarity, f_sim_best = 0.964 (> 0.100 thold), f_keep = 0.995
+8.07.708.254 I slot get_availabl: id 14 | task -1 | selected slot by LCP similarity, f_sim_best = 0.991 (> 0.100 thold), f_keep = 0.996
+8.13.434.119 I slot get_availabl: id 13 | task -1 | selected slot by LCP similarity, f_sim_best = 0.961 (> 0.100 thold), f_keep = 0.996
+8.32.802.022 I slot get_availabl: id 21 | task -1 | selected slot by LCP similarity, f_sim_best = 0.965 (> 0.100 thold), f_keep = 0.995
+8.35.006.640 I slot get_availabl: id 11 | task -1 | selected slot by LCP similarity, f_sim_best = 0.981 (> 0.100 thold), f_keep = 0.997
+8.37.006.720 I slot get_availabl: id  4 | task -1 | selected slot by LCP similarity, f_sim_best = 0.940 (> 0.100 thold), f_keep = 0.997
+8.37.006.802 I slot get_availabl: id 16 | task -1 | selected slot by LCP similarity, f_sim_best = 0.979 (> 0.100 thold), f_keep = 0.997
+8.50.280.051 I slot get_availabl: id  6 | task -1 | selected slot by LCP similarity, f_sim_best = 0.995 (> 0.100 thold), f_keep = 0.997
+9.12.929.180 I slot get_availabl: id 22 | task -1 | selected slot by LCP similarity, f_sim_best = 0.975 (> 0.100 thold), f_keep = 0.995
+9.16.037.835 I slot get_availabl: id 20 | task -1 | selected slot by LCP similarity, f_sim_best = 0.916 (> 0.100 thold), f_keep = 0.996
+9.29.808.883 I slot get_availabl: id 17 | task -1 | selected slot by LCP similarity, f_sim_best = 0.988 (> 0.100 thold), f_keep = 0.995
+9.32.977.386 I slot get_availabl: id 13 | task -1 | selected slot by LCP similarity, f_sim_best = 0.990 (> 0.100 thold), f_keep = 0.996
+9.39.649.203 I slot get_availabl: id 16 | task -1 | selected slot by LCP similarity, f_sim_best = 0.985 (> 0.100 thold), f_keep = 0.997
+9.45.872.078 I slot get_availabl: id 21 | task -1 | selected slot by LCP similarity, f_sim_best = 0.984 (> 0.100 thold), f_keep = 0.996
+9.51.247.268 I slot get_availabl: id  4 | task -1 | selected slot by LCP similarity, f_sim_best = 0.943 (> 0.100 thold), f_keep = 0.997
+9.56.317.690 I slot get_availabl: id 20 | task -1 | selected slot by LCP similarity, f_sim_best = 0.961 (> 0.100 thold), f_keep = 0.997
+9.59.591.826 I slot get_availabl: id 10 | task -1 | selected slot by LCP similarity, f_sim_best = 0.948 (> 0.100 thold), f_keep = 0.998
+10.07.032.939 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.814 (> 0.100 thold), f_keep = 0.999
+10.09.322.348 I slot get_availabl: id 22 | task -1 | selected slot by LCP similarity, f_sim_best = 0.970 (> 0.100 thold), f_keep = 0.995
+10.18.229.937 I slot get_availabl: id 21 | task -1 | selected slot by LCP similarity, f_sim_best = 0.969 (> 0.100 thold), f_keep = 0.998
+10.37.000.153 I slot get_availabl: id 13 | task -1 | selected slot by LCP similarity, f_sim_best = 0.990 (> 0.100 thold), f_keep = 0.996
+10.44.817.453 I slot get_availabl: id 22 | task -1 | selected slot by LCP similarity, f_sim_best = 0.935 (> 0.100 thold), f_keep = 0.998
+10.47.176.658 I slot get_availabl: id 10 | task -1 | selected slot by LCP similarity, f_sim_best = 0.857 (> 0.100 thold), f_keep = 0.999
+11.15.368.628 I slot get_availabl: id 20 | task -1 | selected slot by LCP similarity, f_sim_best = 0.988 (> 0.100 thold), f_keep = 0.996
+11.21.033.166 I slot get_availabl: id 22 | task -1 | selected slot by LCP similarity, f_sim_best = 0.997 (> 0.100 thold), f_keep = 0.998
+11.25.055.524 I slot get_availabl: id 10 | task -1 | selected slot by LCP similarity, f_sim_best = 0.866 (> 0.100 thold), f_keep = 1.000
+11.28.506.592 I slot get_availabl: id  4 | task -1 | selected slot by LCP similarity, f_sim_best = 0.963 (> 0.100 thold), f_keep = 0.997
+11.50.071.390 I slot get_availabl: id 10 | task -1 | selected slot by LCP similarity, f_sim_best = 0.942 (> 0.100 thold), f_keep = 1.000
+11.51.116.347 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.866 (> 0.100 thold), f_keep = 0.999
+12.24.187.821 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.876 (> 0.100 thold), f_keep = 0.999
+12.50.557.713 I slot get_availabl: id 10 | task -1 | selected slot by LCP similarity, f_sim_best = 0.848 (> 0.100 thold), f_keep = 0.998
+13.12.095.044 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.951 (> 0.100 thold), f_keep = 0.999
+13.28.496.650 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.954 (> 0.100 thold), f_keep = 0.999
+13.45.351.910 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.821 (> 0.100 thold), f_keep = 0.999

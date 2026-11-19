@@ -1,0 +1,6 @@
+total 277535872
+-rw------- 1 root root 283538490336 Nov 19 16:46 Inkling-2-Small-abliterated-e4853745-Q3_K_M-imatrix.gguf
+-rw------- 1 root root          205 Nov 19 16:46 SHA256SUMS
+-rw------- 1 root root          331 Nov 19 16:46 expanded-primary.json
+-rw------- 1 root root    658222528 Nov 19 16:41 mmproj-F16.gguf
+-rw------- 1 root root          144 Nov 19 16:46 restored-model.json

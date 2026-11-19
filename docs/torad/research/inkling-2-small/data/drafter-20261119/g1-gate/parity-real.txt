@@ -1,0 +1,5 @@
+      draft: 5 layers, width 4608, heads 48/8 x 128, block 8, taps [5, 11, 17, 23, 29, 35, 41, 48], window 1024, 1711.7M parameters, 48 stored in BF16, input cast to BF16 yes; caches: 0 window f16, 1 window f16, 2 global f16, 3 window f16, 4 window f16
+      inputs cast to BF16 yes: rows differ by 2.0e-03 8.5e-03 5.9e-03 5.1e-03 5.3e-03 4.8e-03 4.4e-03 6.5e-03 of their range; 8 of 8 rows name the engine's token, the free chain 7 of 7
+      inputs cast to BF16 no : rows differ by 1.7e-03 6.1e-03 6.7e-03 3.4e-03 4.7e-03 5.8e-03 5.8e-03 4.9e-03 of their range; 8 of 8 rows name the engine's token, the free chain 7 of 7
+      f_rnn differs by 2.6e-07 of its largest value
+ok    the graph computes what the engine computed in /workspace/rig/jobs/dspark-g1-gate/parity/real-dump

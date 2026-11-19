@@ -1,0 +1,50 @@
+[
+  {
+    "path": "Inkling-2-Small-Q3_K_M-00001-of-00008.gguf",
+    "size": 39580034080,
+    "sha256": "f8264f5c3c6f2549ddb00b8b60418cf6f4d71373cb3529acc84f28c78920edec",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q3_K_M/Inkling-2-Small-Q3_K_M-00001-of-00008.gguf"
+  },
+  {
+    "path": "Inkling-2-Small-Q3_K_M-00002-of-00008.gguf",
+    "size": 37756366528,
+    "sha256": "995864afc189f0a6f9cb7ffafb36b711de485e35f8a8ceba07bdc3f1fdac4e81",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q3_K_M/Inkling-2-Small-Q3_K_M-00002-of-00008.gguf"
+  },
+  {
+    "path": "Inkling-2-Small-Q3_K_M-00003-of-00008.gguf",
+    "size": 39064872288,
+    "sha256": "c9082a02b444ed7e6a7a4b5df82a0f070d1c9fb974c68d2cbd27f9195952181d",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q3_K_M/Inkling-2-Small-Q3_K_M-00003-of-00008.gguf"
+  },
+  {
+    "path": "Inkling-2-Small-Q3_K_M-00004-of-00008.gguf",
+    "size": 38657893888,
+    "sha256": "85a27ee4668dccece328e5efa93c13c5c47fa1c054d6e3c20fdc03dbec110799",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q3_K_M/Inkling-2-Small-Q3_K_M-00004-of-00008.gguf"
+  },
+  {
+    "path": "Inkling-2-Small-Q3_K_M-00005-of-00008.gguf",
+    "size": 39333832320,
+    "sha256": "a4f103bd298a90fd2d1b879a58cc4fc6b5996485621376e868400800dd953588",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q3_K_M/Inkling-2-Small-Q3_K_M-00005-of-00008.gguf"
+  },
+  {
+    "path": "Inkling-2-Small-Q3_K_M-00006-of-00008.gguf",
+    "size": 37981955424,
+    "sha256": "6b3da57c7198edd25c4c35928a50703f98d5d4a98ac4b1dc0850eb0e152b3531",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q3_K_M/Inkling-2-Small-Q3_K_M-00006-of-00008.gguf"
+  },
+  {
+    "path": "Inkling-2-Small-Q3_K_M-00007-of-00008.gguf",
+    "size": 37756366592,
+    "sha256": "14d36e1a2a2c689eb0d1d8d8ea4b9a89cd9aac9a7eb2428ff485092adc7e0d86",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q3_K_M/Inkling-2-Small-Q3_K_M-00007-of-00008.gguf"
+  },
+  {
+    "path": "Inkling-2-Small-Q3_K_M-00008-of-00008.gguf",
+    "size": 9923660288,
+    "sha256": "7a5e3bd2049af664ae7a78f086620cae803ae281a194fe28755c3b5243a028a9",
+    "url": "https://huggingface.co/bartowski/Inkling-2-Small-GGUF/resolve/75970601c5da75212b2ffb914344e1b7dae2008d/Inkling-2-Small-Q3_K_M/Inkling-2-Small-Q3_K_M-00008-of-00008.gguf"
+  }
+]

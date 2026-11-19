@@ -1,0 +1,9 @@
+/jobs/
+/kit/uv
+/kit/*.gguf
+/kit/parity/
+/kit/sweep.name
+/kit/tuned.path
+/kit/results/
+/relay/state-*.json
+__pycache__/
