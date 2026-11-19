@@ -234,7 +234,7 @@ static void check_cells(const llama_kv_cells & cells, uint32_t n_seq) {
 static void check_inkling2_decode_masks() {
     using mode = inkling2_decode_mask;
     std::vector<uint32_t> cells(23, 8192);
-    const inkling2_mask_shapes served = {32, 8, 32, 8192, 8, 6};
+    const inkling2_mask_shapes served = {32, 8, 32, 8192, 8, 23, 262144, 6};
     auto shapes = served;
     const auto classify = [&](uint32_t pool, bool mean) {
         return inkling2_classify_decode_mask(pool, cells.size(), mean, [&](uint32_t i) { return cells[i]; }, shapes);
@@ -283,6 +283,14 @@ static void check_inkling2_decode_masks() {
     shapes.mean_pool_share = 4;
     ++cells.back();
     CHECK(classify(393216, true) == mode::low_mean, "a mean share of 4 takes rows past a sixth");
+    shapes = served;
+    cells.assign(16, 8192);
+    cells[0] = 131072;
+    CHECK(classify(196608, true) == mode::dense, "a 16-row step is dense while the low-mean class takes 23 rows");
+    shapes.mean_rows = 16;
+    CHECK(classify(196608, true) == mode::dense, "and while its pool is under the low-mean class's smallest");
+    shapes.mean_pool_min = 131072;
+    CHECK(classify(196608, true) == mode::low_mean, "16 rows in a pool the low-mean class takes are low mean");
 
     llama_kv_cells shared;
     shared.resize(32769);

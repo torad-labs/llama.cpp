@@ -11,6 +11,8 @@ struct inkling2_mask_shapes {
     uint32_t rows_max;        // and most
     uint32_t pool_min;        // bounded rows: smallest pool
     uint32_t pool_share;      // bounded rows: a row holds pool/pool_share cells or fewer
+    uint32_t mean_rows;       // low mean: the one row count it takes
+    uint32_t mean_pool_min;   // low mean: smallest pool
     uint32_t mean_pool_share; // low mean: the rows hold pool/mean_pool_share cells or fewer on average
 };
 
@@ -21,7 +23,7 @@ inline inkling2_decode_mask inkling2_classify_decode_mask(uint32_t pool, uint32_
     if (rows < shapes.rows_min || rows > shapes.rows_max) {
         return inkling2_decode_mask::dense;
     }
-    allow_mean = allow_mean && rows == 23 && pool >= 262144;
+    allow_mean = allow_mean && rows == shapes.mean_rows && pool >= shapes.mean_pool_min;
     bool bounded = pool >= shapes.pool_min;
     if (!bounded && !allow_mean) {
         return inkling2_decode_mask::dense;

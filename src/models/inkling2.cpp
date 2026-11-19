@@ -125,6 +125,8 @@ static const inkling2_mask_shapes & mask_shapes() {
         (uint32_t) ggml_env_int("LLAMA_INKLING2_BOUNDED_ROWS_MAX"),
         (uint32_t) ggml_env_int("LLAMA_INKLING2_BOUNDED_POOL_MIN"),
         (uint32_t) ggml_env_int("LLAMA_INKLING2_BOUNDED_POOL_SHARE"),
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_ROWS"),
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_POOL_MIN"),
         (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_POOL_SHARE"),
     };
     return shapes;
@@ -166,7 +168,7 @@ public:
         if (ub.n_tokens != ub.n_seqs_unq) {
             return inkling2_decode_mask::dense;
         }
-        bool allow_mean = mean_decode && i == 0 && ub.n_tokens == 23 && kv->type_k() == GGML_TYPE_F16 && kv->type_v() == GGML_TYPE_F16;
+        bool allow_mean = mean_decode && i == 0 && ub.n_tokens == mask_shapes().mean_rows && kv->type_k() == GGML_TYPE_F16 && kv->type_v() == GGML_TYPE_F16;
         if (allow_mean) {
             for (uint32_t row = 0; row < ub.n_tokens; ++row) {
                 if (ub.n_seq_id[row] != 1) {

@@ -1236,15 +1236,19 @@ static bool ggml_cuda_fattn_may_use_rel_prefill(int device, const ggml_tensor * 
         return false;
     }
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
-    // Keep bounded decode and the unmarked 23-session decode batch on their existing kernels.
-    if (q->ne[1] >= 5 && q->ne[1] <= 32 && (ggml_flash_attn_ext_get_n_kv_max(dst) > 0 ||
-            ggml_flash_attn_ext_has_low_mean_mask(dst) || (q->ne[1] == 23 && !ggml_flash_attn_ext_get_mask_prefix(dst)))) {
+    static const int64_t decode_rows_min = ggml_env_int("GGML_CUDA_FATTN_REL_DECODE_ROWS_MIN");
+    static const int64_t decode_rows_max = ggml_env_int("GGML_CUDA_FATTN_REL_DECODE_ROWS_MAX");
+    static const int64_t dense_rows      = ggml_env_int("GGML_CUDA_FATTN_REL_DECODE_DENSE_ROWS");
+    static const int64_t prefill_rows    = ggml_env_int("GGML_CUDA_FATTN_REL_PREFILL_ROWS_MAX");
+    // Keep bounded decode and the unmarked decode batch of every session (23 as served) on their existing kernels.
+    if (q->ne[1] >= decode_rows_min && q->ne[1] <= decode_rows_max && (ggml_flash_attn_ext_get_n_kv_max(dst) > 0 ||
+            ggml_flash_attn_ext_has_low_mean_mask(dst) || (q->ne[1] == dense_rows && !ggml_flash_attn_ext_get_mask_prefix(dst)))) {
         return false;
     }
     float params[3];
     memcpy(params, dst->op_params, sizeof(params));
     return ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_BLACKWELL && ggml_prec_get_acc(dst) == GGML_PREC_F32 &&
-            params[1] == 0.0f && params[2] == 0.0f && q->ne[1] <= 2048 &&
+            params[1] == 0.0f && params[2] == 0.0f && q->ne[1] <= prefill_rows &&
             (q->ne[0] == 64 || q->ne[0] == 128) && q->ne[0] == k->ne[0] && k->ne[0] == v->ne[0] &&
             q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
             k->ne[1] <= INT_MAX - 2048 && k->ne[1] % 16 == 0 && mask->type == GGML_TYPE_I16 &&
@@ -1268,12 +1272,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const auto * v = dst->src[2];
     const int n_live = ggml_flash_attn_ext_get_n_kv_max(dst);
     const bool sparse_rows = n_live > 0 && int64_t(n_live)*8 <= k->ne[1];
+    // The model picks the rows and the pool a low-mean step has (LLAMA_INKLING2_MEAN_ROWS, LLAMA_INKLING2_MEAN_POOL_MIN).
     const bool sparse_mean = ggml_flash_attn_ext_has_low_mean_mask(dst) && k->type == GGML_TYPE_F16 &&
-            v->type == GGML_TYPE_F16 && q->ne[2] == 6*k->ne[2] && q->ne[1] == 23 && k->ne[1] >= 262144;
+            v->type == GGML_TYPE_F16 && q->ne[2] == 6*k->ne[2];
     float softcap;
     memcpy(&softcap, dst->op_params + 2, sizeof(softcap));
     const auto * mask = dst->src[3];
-    const bool short_rows = q->ne[1] <= 32 && (k->ne[1] <= FATTN_KQ_STRIDE || (n_live > 0 && n_live <= 32));
+    static const int64_t short_rows_max = ggml_env_int("GGML_CUDA_FATTN_REL_SHORT_ROWS");
+    const bool short_rows = q->ne[1] <= short_rows_max && (k->ne[1] <= FATTN_KQ_STRIDE || (n_live > 0 && n_live <= 32));
     // The reference mode accumulates in double to diagnose placement-sensitive prefills.
     static const bool ordered_ref = ggml_env_switch("GGML_CUDA_FATTN_REL_ORDERED_REF");
     if (kernel != BEST_FATTN_KERNEL_NONE && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_BLACKWELL &&
