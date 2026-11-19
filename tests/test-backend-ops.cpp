@@ -7319,7 +7319,8 @@ static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool skip = fals
             for (int i = 0; i < t->ne[0]; i++) {
                 data[i] = i % n_mats;
             }
-            std::shuffle(data.begin(), data.end(), rng);
+            // A row wider than n_mats is read past its first entries (ids_offset): the rest hold each expert once.
+            std::shuffle(data.begin() + std::max<int64_t>(0, t->ne[0] - n_mats), data.end(), rng);
             if (skip) {
                 mask_skipped_ids(data, r);
             }
