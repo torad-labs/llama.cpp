@@ -15758,6 +15758,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, true,  2304, n, 4608));
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, false, 4608, n, 2304));
     }
+    // the Q3_K_M pack's products as four cards split them (gate and up packed in 1,024 rows, down to 512), the shapes whose
+    // routes GGML_CUDA_MMVQ_EXPERT_SORT_23 sorts: at the fewest tokens the sort takes, the 23 it serves and the most
+    for (int n : { 1, 23, 32 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true,  1024, n, 4608));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, n, 512));
+    }
     // past the ring's 8 tokens (8 tokens x 8 used is its 64 pairs): 9 to 16 go to mmvq.cu's mul_mat_vec_q_moe, a warp a
     // token, and 17 to MMQ. 3 slots at an MTP verify of 3 are 9 tokens, 4 slots 12
     for (int n : { 9, 12, 16, 17 }) {
@@ -17748,11 +17754,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type down : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
             test_cases.emplace_back(new test_mul_mat_id(down, GGML_TYPE_F32, 384, 8, false, 4608, 23, n_ff));
         }
-    }
-    // the same products at the fewest and the most rows the sorted routes take (GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN, _MAX)
-    for (int64_t rows : {1, 32}) {
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 1024, rows, 4608));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, rows, 512));
     }
     // Inkling 2's routed experts at their real shapes (384 experts, 8 used, hidden 4,608 to intermediate 2,304 and back) in
     // Q4_K, past the ring's 8 rows, where MUL_MAT_ID chooses between mmvq.cu's row kernel and MMQ: run once as they are

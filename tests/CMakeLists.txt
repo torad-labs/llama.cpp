@@ -655,6 +655,11 @@ if (GGML_CUDA)
     add_test(NAME test-inkling-moe-routed-rows-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
         -p "n_mats=32,n_used=8,.*m=256,n=(17|23|32),k=512,")
     set_tests_properties(test-inkling-moe-routed-rows-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
+    # the expert products of the split Q3_K_M pack with their routes sorted, at each token count the sort takes
+    add_test(NAME test-inkling-moe-sorted-routes-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
+        -p "n_mats=384,n_used=8,b=[01],m=(1024|4608),n=(1|23|32),k=(4608|512),")
+    set_tests_properties(test-inkling-moe-sorted-routes-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_EXPERT_SORT_23=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX=32")
     add_test(NAME test-inkling-norm-clip-cuda0 COMMAND test-backend-ops test -b CUDA0 -o NORM_CLIP)
     add_test(NAME test-inkling-short-conv-op-cuda0 COMMAND test-backend-ops test -b CUDA0 -o SHORT_CONV)
     set_tests_properties(test-inkling-moe-mul-mat-id-cuda0 test-inkling-moe-block-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600)
