@@ -408,10 +408,10 @@ class TestInkling2PackedConversion(unittest.TestCase):
         return gate_up.reshape(n_expert, 2, n_row // 2, n_col).transpose(1, 2).reshape(gate_up.shape)
 
     @staticmethod
-    def written_bytes(tensor, path):
+    def written_bytes(tensor, path, **kwargs):
         """Streams a lazy tensor to a file like the GGUF writer does and returns the bytes."""
         with path.open("wb") as f:
-            tensor.tofile(f)
+            tensor.tofile(f, **kwargs)
         return path.read_bytes()
 
     def nvfp4(self, shape, denominator):
@@ -508,6 +508,8 @@ class TestInkling2PackedConversion(unittest.TestCase):
                             self.assertLessEqual(load_chunk().shape[0], 128)
                         reference = gguf.quantize(expected[name], qtype)
                         self.assertEqual(self.written_bytes(info.tensor, path / "tensor.bin"), reference.tobytes(), name)
+                        if not eager and qtype == gguf.GGMLQuantizationType.BF16:
+                            self.assertEqual(self.written_bytes(info.tensor, path / "parallel.bin", workers=4), reference.tobytes(), name)
 
     def test_projection_and_companions_in_separate_shards(self):
         """A packed weight and its scale, amax and denominator can be in different safetensors shards."""

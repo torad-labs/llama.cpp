@@ -52,6 +52,9 @@ enum llm_graph_type {
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
+    LLM_FUSED_OP_FLASH_ATTN_REL_POS,
+    LLM_FUSED_OP_INKLING2_LAYER,
+    LLM_FUSED_OP_INKLING2_CONV,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
@@ -1457,6 +1460,16 @@ struct llm_graph_context {
     // attention
     //
 
+    // a relative position bias that flash attention adds inside its kernel, see ggml_flash_attn_ext_add_rel_pos
+    struct rel_pos {
+        ggml_tensor * table;  // [n_dist, n_head_q, n_tokens] f32
+        ggml_tensor * q_pos;  // [n_tokens] i32
+        ggml_tensor * kv_pos; // [n_kv, n_stream] i32, the position of each cache cell
+        ggml_tensor * sinks;  // [n_head_q, n_tokens] f32
+        int32_t n_kv_max;
+        bool low_mean_mask;
+    };
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
@@ -1470,7 +1483,8 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
                    bool   mask_is_prefix = true,  // false: kq_mask selects cells (sparse attention's top-k)
-            ggml_tensor * sparse_indices = nullptr) const;
+            ggml_tensor * sparse_indices = nullptr,
+        const rel_pos   * rel = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1571,7 +1585,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il,
-            ggml_tensor * kq_mask = nullptr) const;
+            ggml_tensor * kq_mask = nullptr,
+        const rel_pos   * rel = nullptr) const;
 
     llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
 
@@ -1685,7 +1700,7 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
-    llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+    llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa(bool allow_packed_mask = true) const;
 
     // one pooling map per ubatch (see llama-kv-cache-kpool.h); `scoring` false gives only k_idxs
     llm_graph_input_kpool * build_inp_kpool(

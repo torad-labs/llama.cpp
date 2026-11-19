@@ -463,6 +463,19 @@ static bool test_steps_kept(ggml_backend_dev_t device, bool legacy, bool count) 
         ok = ok_counts && ok;
     }
 
+    auto & observed = graphs[0];
+    std::vector<float> expected(ggml_nelements(observed.out)), actual(expected.size());
+    ggml_backend_tensor_get(observed.out, expected.data(), 0, ggml_nbytes(observed.out));
+    ggml_backend_sched_set_eval_callback(observed.sched, [](ggml_tensor * t, bool ask, void *) {
+        return !ask || t->op == GGML_OP_MUL_MAT;
+    }, nullptr);
+    GGML_ASSERT(ggml_backend_sched_graph_compute(observed.sched, observed.gf) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(observed.out, actual.data(), 0, ggml_nbytes(observed.out));
+    const bool observed_ok = std::equal(actual.begin(), actual.end(), expected.begin(),
+        [](float a, float b) { return std::abs(a - b) < 1e-6f; });
+    printf("%s observing row-parallel matmuls preserves the FFN result\n", observed_ok ? "ok  " : "FAIL");
+    ok = ok && observed_ok;
+
     for (ffn & g : graphs) {
         ggml_backend_sched_free(g.sched);
         ggml_free(g.ctx);
@@ -471,6 +484,100 @@ static bool test_steps_kept(ggml_backend_dev_t device, bool legacy, bool count) 
     ggml_free(weights);
     ggml_backend_free(meta);
     ggml_backend_free(cpu);
+    return ok;
+}
+
+static ggml_backend_meta_split_state split_hidden_rows(const ggml_tensor * t, void *) {
+    const bool up = strcmp(t->name, "up") == 0;
+    if (!up && strcmp(t->name, "down") != 0) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
+    const int64_t width = t->ne[up ? 1 : 0] / 4;
+    return {up ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0, {width, width, width, width}, {1}, 1};
+}
+
+static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs) {
+    set_env("GGML_CUDA_ALLREDUCE", "internal");
+    set_env("GGML_CUDA_AR_COPY_PEER", "0");
+    set_env("GGML_CUDA_AR_COPY_THRESHOLD", "1");
+    set_env("GGML_CUDA_AR_BF16_THRESHOLD", "1");
+    set_env("GGML_GRAPH_TRACE", "1");
+    enum variant { normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8 };
+    bool ok = true;
+    for (variant v : {normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8}) {
+        std::vector<float> baseline;
+        for (bool enabled : {false, true}) {
+            set_env("GGML_CUDA_AR_HOST_OWNER_ROWS", enabled ? "1" : "0");
+            set_env("GGML_CUDA_AR_WIRE_Q8", v == q8 ? "1" : "0");
+            set_env("GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", v == serial_receive ? "1" : "0");
+            ggml_backend_dev_t device = ggml_backend_meta_device(devs.data(), 4, split_hidden_rows, nullptr);
+            ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+            ggml_context * weights = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
+            auto * up = ggml_new_tensor_2d(weights, GGML_TYPE_F32, 16, 64);
+            auto * down = ggml_new_tensor_2d(weights, GGML_TYPE_F32, 64, 4608);
+            ggml_set_name(up, "up");
+            ggml_set_name(down, "down");
+            auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(weights, ggml_backend_dev_buffer_type(device));
+            GGML_ASSERT(buffer);
+            ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::mt19937 rng(47);
+            for (auto * w : {up, down}) {
+                std::vector<float> data(ggml_nelements(w));
+                for (float & x : data) { x = float(int(rng() % 10001) - 5000) / 7417.0f; }
+                ggml_backend_tensor_set(w, data.data(), 0, ggml_nbytes(w));
+            }
+            ggml_context * ctx = ggml_init({32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+            const int rows = v == narrower ? 22 : 23;
+            auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, rows);
+            ggml_set_input(x);
+            auto * partial = ggml_mul_mat(ctx, down, ggml_mul_mat(ctx, up, x));
+            auto * r = ggml_reshape_3d(ctx, partial, 4608, 1, rows);
+            auto * c = ggml_cont(ctx, ggml_permute(ctx, r, 2, 0, 1, 3));
+            const int64_t counts[] = {1152 + (v == unequal), 1152 - (v == unequal), 1152, 1152};
+            auto * scatter = ggml_backend_meta_scatter(ctx, c, 2, counts, 4);
+            auto * out = ggml_scale(ctx, ggml_cont(ctx, ggml_permute(ctx, scatter, 1, 2, 0, 3)), 0.5f);
+            ggml_set_output(out);
+            auto * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, out);
+            auto * extra = (v == extra_reader || v == extra_cont_reader)
+                ? ggml_scale(ctx, v == extra_reader ? partial : c, 0.25f) : nullptr;
+            if (extra) {
+                ggml_set_output(extra);
+                ggml_build_forward_expand(graph, extra);
+            }
+            auto * cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            ggml_backend_t backends[] = {backend, cpu};
+            auto * sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+            GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+            std::vector<float> actual;
+            for (int iter = 0; iter < 4; ++iter) {
+                std::vector<float> input(ggml_nelements(x));
+                for (float & a : input) { a = float(int(rng() % 2001) - 1000) / 724.0f; }
+                ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+                GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+                for (auto * result : {out, extra}) {
+                    if (!result) { continue; }
+                    const size_t at = actual.size();
+                    actual.resize(at + ggml_nelements(result));
+                    ggml_backend_tensor_get(result, actual.data() + at, 0, ggml_nbytes(result));
+                }
+            }
+            const auto owners = reductions_to_owners, full = reductions_to_all;
+            ggml_backend_sched_free(sched);
+            ggml_free(ctx);
+            ggml_backend_free(cpu);
+            ggml_backend_free(backend);
+            ggml_backend_buffer_free(buffer);
+            ggml_free(weights);
+            const bool selected = enabled && (v == normal || v == serial_receive);
+            bool pass = reductions_to_owners - owners == (selected ? 4u : 0u) && reductions_to_all - full == (selected ? 0u : 4u);
+            if (enabled) { pass = pass && actual.size() == baseline.size() && !memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)); }
+            else { baseline = std::move(actual); }
+            printf("%s hidden owner rows mode=%d enabled=%d owned=%llu full=%llu\n", pass ? "ok" : "FAIL", int(v), enabled,
+                   reductions_to_owners - owners, reductions_to_all - full);
+            ok = ok && pass;
+        }
+    }
     return ok;
 }
 
@@ -1507,6 +1614,19 @@ int main(int argc, char ** argv) {
     if (gpu == nullptr) {
         printf("no GPU for the meta backend, skipped\n");
         return argc > 1 && strncmp(argv[1], "--host-kv", 9) == 0 ? 77 : 0;
+    }
+    if (argc == 2 && (strcmp(argv[1], "--hidden-owner-logical") == 0 || strcmp(argv[1], "--hidden-owner-physical") == 0)) {
+        std::array<ggml_backend_dev_t, 4> devices = {gpu, gpu, gpu, gpu};
+        if (strcmp(argv[1], "--hidden-owner-physical") == 0) {
+            size_t count = 0;
+            for (size_t i = 0; i < ggml_backend_dev_count() && count < devices.size(); ++i) {
+                auto * d = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) { devices[count++] = d; }
+            }
+            if (count != devices.size()) { return 77; }
+        }
+        if (strncmp(ggml_backend_dev_name(devices[0]), "CUDA", 4) != 0) { return 77; }
+        return test_hidden_owner_rows(devices) ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--padded-indexer") == 0) {
         return test_owned_ops(gpu, 2, false, true) && test_owned_ops(gpu, 2, true, true) ? 0 : 1;

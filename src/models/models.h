@@ -2539,13 +2539,15 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
-        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
-        // the convolution of one stream of the layer's state, whose window (history and new columns) joins `windows`
+        // the attention residual mix and the norm clip: one op each (cparams.fused_inkling2), or their elementwise graphs
+        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query, int il);
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il);
+        // the convolution of one stream of the layer's state, whose window (history and new columns) joins `windows`: one
+        // op (cparams.fused_inkling2_conv), or its elementwise graph
         ggml_tensor * convolve(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * dynamic, ggml_tensor * history, int64_t offset,
-                std::vector<ggml_tensor *> & windows);
+                std::vector<ggml_tensor *> & windows, int il);
         ggml_tensor * convolve_hidden(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * history, int64_t offset,
-                std::vector<ggml_tensor *> & windows);
+                std::vector<ggml_tensor *> & windows, int il);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

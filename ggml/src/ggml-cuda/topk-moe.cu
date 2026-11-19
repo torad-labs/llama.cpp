@@ -10,6 +10,7 @@ struct topk_moe_config {
     bool use_sigmoid;
     bool use_sqrt_softplus;
     bool with_norm;
+    bool norm_eps;     // the sum gets clamp_val added instead of being clamped to it
     bool delayed_softmax;
     int  n_groups;
     int  n_group_used;
@@ -334,7 +335,7 @@ __global__ void topk_moe_cuda(const float *         logits,
 
     if (config.with_norm) {
         wt_sum              = warp_reduce_sum<warp_size>(wt_sum);
-        wt_sum              = max(wt_sum, clamp_val);
+        wt_sum              = config.norm_eps ? wt_sum + clamp_val : max(wt_sum, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
 
         for (int i = 0; i < experts_per_thread; i++) {
@@ -462,15 +463,18 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
 
     const bool with_norm = clamp != nullptr;
 
+    // the clamp's minimum, or the epsilon a SCALE node adds to the sum (its bias)
+    const bool norm_eps = clamp && clamp->op == GGML_OP_SCALE;
     float clamp_val = -INFINITY;
     if (clamp) {
-        clamp_val = ggml_get_op_params_f32(clamp, 0);
+        clamp_val = ggml_get_op_params_f32(clamp, norm_eps ? 1 : 0);
     }
 
     topk_moe_config config;
     config.use_sigmoid       = args.sigmoid;
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
+    config.norm_eps          = norm_eps;
     config.delayed_softmax   = args.delayed_softmax;
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;

@@ -28,6 +28,8 @@ struct ggml_cuda_mmvq_moe_args {
     float *            dst;
     ggml_glu_op        glu_op;
     float              glu_limit; // > 0: the gate clamped to [-inf, limit] and vx's product to [-limit, limit] before the GLU
+    float              glu_beta;  // GGML_GLU_OP_SITU: the gate's softcap
+    float              glu_lb;    // GGML_GLU_OP_SITU: vx's product's softcap, none when <= 0
     int64_t            ncols_x;
     int64_t            nrows_x;
     int64_t            stride_channel_x_bytes;

@@ -1489,6 +1489,7 @@ bool llm_arch_rs_by_row(const llm_arch & arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_GLM5NEXT:
+        case LLM_ARCH_INKLING2:
             return true;
         default:
             return false;

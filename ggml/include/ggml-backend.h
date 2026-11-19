@@ -521,6 +521,12 @@ extern "C" {
     GGML_API bool ggml_backend_meta_tensor_ranges(
         struct ggml_tensor * tensor, size_t offset, size_t size, bool read, ggml_backend_meta_range_fn fn, void * userdata);
 
+    // Whole rows of an inner-axis split, described once per rank and segment. Returns false without callbacks for other layouts.
+    typedef void (*ggml_backend_meta_rows_fn)(struct ggml_tensor * tensor, size_t offset, size_t width, size_t rows,
+        size_t tensor_stride, size_t data_stride, size_t data_offset, void * userdata);
+    GGML_API bool ggml_backend_meta_read_rows(
+        struct ggml_tensor * tensor, size_t offset, size_t size, ggml_backend_meta_rows_fn fn, void * userdata);
+
     //
     // Utils
     //

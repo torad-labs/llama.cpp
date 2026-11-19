@@ -160,7 +160,7 @@ static bool ggml_zdnn_supports_op(const ggml_backend_zdnn_device_context * ctx_d
             } break;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_zdnn_supports_flash_attn_ext(ctx_dev, op);
+            return op->src[5] == nullptr && op->src[6] == nullptr && ggml_zdnn_supports_flash_attn_ext(ctx_dev, op);
 
         default:
             return false;

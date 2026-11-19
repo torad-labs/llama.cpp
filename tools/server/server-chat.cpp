@@ -305,6 +305,9 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (response_body.contains("reasoning")) {
         // Only "effort" is handled so far
         const json & reasoning = response_body.at("reasoning");
+        if (!reasoning.is_null() && !reasoning.is_object()) {
+            throw std::invalid_argument("'reasoning' must be an object");
+        }
         if (reasoning.contains("effort")) {
             chatcmpl_body["reasoning_effort"] = reasoning.at("effort");
         }
@@ -708,15 +711,19 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         if (thinking_type == "enabled") {
             int budget_tokens = json_value(thinking, "budget_tokens", 10000);
             oai_body["thinking_budget_tokens"] = budget_tokens;
+        } else if (thinking_type == "disabled") {
+            oai_body["chat_template_kwargs"]["enable_thinking"] = false;
         }
     }
 
     // Handle Anthropic-specific output_config param
     if (body.contains("output_config")) {
-        json output_config = json_value(body, "output_config", json::object());
-        std::string effort = json_value(output_config, "effort", std::string());
-        if (!effort.empty()) {
-            oai_body["reasoning_effort"] = effort;
+        const json & output_config = body.at("output_config");
+        if (!output_config.is_null() && !output_config.is_object()) {
+            throw std::invalid_argument("'output_config' must be an object");
+        }
+        if (output_config.contains("effort")) {
+            oai_body["reasoning_effort"] = output_config.at("effort");
         }
     }
 

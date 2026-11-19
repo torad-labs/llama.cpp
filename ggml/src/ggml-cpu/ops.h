@@ -82,6 +82,9 @@ void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * 
 void ggml_compute_forward_argsort(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_top_k(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_top_k_candidates(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_norm_clip(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_attn_res_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_short_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);

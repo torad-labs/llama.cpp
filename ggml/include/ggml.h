@@ -439,6 +439,9 @@ extern "C" {
         GGML_OP_GLU,
         GGML_OP_FLASH_ATTN_EXT_SPARSE,
         GGML_OP_TOP_K_CANDIDATES,
+        GGML_OP_NORM_CLIP,
+        GGML_OP_ATTN_RES_MIX,
+        GGML_OP_SHORT_CONV,
 
         GGML_OP_COUNT,
     };
@@ -478,6 +481,8 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SITU,  // softcapped SiLU: beta*tanh(a/beta)*sigmoid(a) * lb*tanh(b/lb) (Inkling 2's experts)
+        GGML_GLU_OP_SIGLU, // sigmoid gate: sigmoid(a) * b
 
         GGML_GLU_OP_COUNT,
     };
@@ -1213,6 +1218,20 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             float                 limit);
+
+    // beta*tanh(a/beta)*sigmoid(a) * lb*tanh(b/lb), with b uncapped when lb <= 0
+    GGML_API struct ggml_tensor * ggml_situ_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 beta,
+            float                 lb);
+
+    // sigmoid(a) * b
+    GGML_API struct ggml_tensor * ggml_siglu_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
@@ -2257,6 +2276,43 @@ extern "C" {
             int                   k,
             int                   n_parts);
 
+    // y = a*scale (scale broadcast over a, optional), each row of y scaled down to an L2 norm of at most threshold:
+    // y * min(1, threshold/(|y| + eps))
+    GGML_API struct ggml_tensor * ggml_norm_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * scale,
+            float                 threshold,
+            float                 eps);
+
+    // the softmax-weighted mix of sources over depth (attention residuals): for each token t and query q,
+    // let z_s = rms_norm(x_s[:, t], eps); out[:, q, t] = sum_s p_s * z_s, where p = softmax over s of scale * dot(z_s, query[:, q])
+    //   query:   [n_embd, n_query] f32
+    //   sources: n_sources of [n_embd, n_tokens] f32, rows contiguous, at most GGML_MAX_SRC - 1
+    //   result:  [n_embd, n_query, n_tokens] f32
+    GGML_API struct ggml_tensor * ggml_attn_res_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * query,
+            struct ggml_tensor ** sources,
+            int                   n_sources,
+            float                 scale,
+            float                 eps);
+
+    // a depthwise short convolution with its residual, over the window of its state and the current rows: for channel c,
+    // token t and sequence s, with k taps,
+    // out[c, t, s] = scale * (x[k-1+t, c, s] + sum_j x[t+j, c, s]*w[j, c] + sum_lag x[k-1-lag+t, c, s]*d[h*k + lag, t + s*n_t])
+    // where h is the head of channel c (the channels split evenly over d's heads)
+    //   x:       [k - 1 + n_t, channels, n_s] f32, the k - 1 positions of the state then the n_t current rows
+    //   w:       [k, channels] f32, the static taps
+    //   d:       [k*heads, n_t*n_s] f32 or NULL, the dynamic taps of each token
+    //   result:  [channels, n_t, n_s] f32
+    GGML_API struct ggml_tensor * ggml_short_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * d,
+            float                 scale);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2319,6 +2375,20 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // relative position bias: adds table[d, h, i, i3] to the logit of q row i of head h at KV cell j after the mask,
+    // with d = q_pos[i, i3] - kv_pos[j, i3 % ne81] when 0 <= d < n_dist - 1, else n_dist - 1 (the sentinel entry)
+    //   table:  [n_dist, n_head, n_batch, ne3] f32
+    //   q_pos:  [n_batch, ne3] i32
+    //   kv_pos: [n_kv, ne81] i32, ne3 % ne81 == 0
+    GGML_API void ggml_flash_attn_ext_add_rel_pos(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * q_pos,
+            struct ggml_tensor * kv_pos);
+
+    // Use one sink per query [n_head, n_batch, 1, ne3]. All table entries are distances; the bias outside the table is zero.
+    GGML_API void ggml_flash_attn_ext_add_rel_pos_sinks(struct ggml_tensor * a, struct ggml_tensor * sinks);
 
     // a hint that every row of the mask attends a prefix of the KV cells (one sequence per stream, causal, no window), so a
     // backend that scans the mask for tiles to skip finds none at a decode-sized batch; the mask applies as always

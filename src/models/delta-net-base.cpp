@@ -100,13 +100,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
     if (inp->fixed_rows()) {
-        const int64_t tokens = conv_input->ne[0] - conv_states->ne[0];
-        const int64_t count = std::min<int64_t>(tokens, 1 + cparams.n_rs_seq);
-        for (int64_t snapshot = 0; snapshot < count; ++snapshot) {
-            ggml_tensor * window = ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs,
-                    conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, tokens - snapshot));
-            ggml_build_forward_expand(gf, build_rs_store_local(inp, conv_states_all, window, snapshot));
-        }
+        build_conv_state_store(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0);
         return conv_input;
     }
 

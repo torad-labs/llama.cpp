@@ -8,6 +8,7 @@
 // (LLAMA_KQ_MASK_SEQ_BITS_LEGACY) and 64 at a time from the bits - compared byte for byte, bit-packed and f16, causal
 // and not, with and without a window, with and without 2D positions.
 
+#include "../src/models/inkling2-attention.h"
 #include "../src/llama-hparams.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cells.h"
@@ -230,7 +231,48 @@ static void check_cells(const llama_kv_cells & cells, uint32_t n_seq) {
     }
 }
 
+static void check_inkling2_decode_masks() {
+    using mode = inkling2_decode_mask;
+    std::vector<uint32_t> cells(23, 8192);
+    const auto classify = [&](uint32_t pool, bool mean) {
+        return inkling2_classify_decode_mask(pool, cells.size(), mean, [&](uint32_t i) { return cells[i]; });
+    };
+    CHECK(classify(262144, false) == mode::bounded_rows, "private rows must preserve the old bound");
+    cells[0] = 262144;
+    CHECK(classify(327680, false) == mode::dense, "opt-out must keep a long reader dense");
+    CHECK(classify(327680, true) == mode::low_mean, "one long reader has low mean visibility");
+    cells.assign(23, 262144);
+    CHECK(classify(1703936, true) == mode::low_mean, "23 sessions sharing 196608 prefix cells");
+    CHECK(classify(262144, true) == mode::dense, "a fully shared pool is dense");
+    cells.assign(23, 65536);
+    CHECK(classify(393216, true) == mode::low_mean, "at one sixth mean visibility");
+    ++cells.back();
+    CHECK(classify(393216, true) == mode::dense, "crossing the mean threshold changes the reusable graph class");
+    cells.pop_back();
+    CHECK(classify(393216, true) == mode::dense, "new path is qualified for 23 query rows");
+    cells.assign(23, 262145);
+    CHECK(classify(2097152, true) == mode::low_mean, "one cell past the old max is a distinct hint");
+    cells.assign(23, 262144);
+    CHECK(classify(2097152, true) == mode::bounded_rows, "the original bounded mode takes precedence");
+
+    llama_kv_cells shared;
+    shared.resize(32769);
+    for (uint32_t i = 0; i < shared.size(); ++i) {
+        shared.pos_set(i, i);
+        shared.seq_add(i, 0);
+    }
+    shared.seq_add(32768, 1);
+    CHECK(shared.seq_n_cells(0) == 32769 && shared.seq_n_cells(1) == 1, "shared cell contributes to both sequence counts");
+    const auto shared_mode = [&]() {
+        return inkling2_classify_decode_mask(262144, 23, true, [&](uint32_t s) { return shared.seq_n_cells(s); });
+    };
+    CHECK(shared_mode() == mode::low_mean, "shared reader exceeds the per-row bound");
+    shared.seq_rm(32768, 0);
+    CHECK(shared_mode() == mode::bounded_rows, "removing one membership restores the per-row bound");
+}
+
 int main() {
+    check_inkling2_decode_masks();
     std::mt19937 rng(20260925);
 
     ggml_init_params ip = { /*.mem_size =*/ 64*1024*1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };

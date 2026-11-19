@@ -3,6 +3,8 @@
 # what the tests read is the prompt the server renders, the status it answers with and the ids it samples.
 import base64
 import json
+import random
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -96,10 +98,67 @@ def test_inkling_reasoning_effort(server, level):
 
 def test_inkling_reasoning_effort_defaults_to_high(server):
     assert "Thinking effort level: 0.9<|end_message|>" in render(server, {"messages": TURNS})
+    assert render(server, {"messages": TURNS, "reasoning_effort": None}) == render(server, {"messages": TURNS})
+
+
+def test_inkling_web_chat_off_sends_zero_effort(server):
+    off = {"chat_template_kwargs": {"enable_thinking": False}}
+    assert render(server, {"messages": TURNS, **off}) == render(server, {"messages": TURNS, "reasoning_effort": "none"})
+
+
+def test_inkling_reasoning_levels_across_clients(files, monkeypatch):
+    monkeypatch.setenv("LLAMA_SERVER_SLOTS_DEBUG", "1")
+    s = ServerProcess()
+    s.model_hf_repo = s.model_hf_file = None
+    s.model_file = files["model"]
+    s.jinja = s.offline = s.server_slots = True
+    s.chat_template_file = fx.TEMPLATE
+    s.n_ctx, s.n_slots = 1024, 2
+    s.start()
+    messages = [{"role": "user", "content": "Which part needs a test?"}]
+
+    def processed_prompt(path, fields, slot=0):
+        res = s.make_request("POST", path, data={"model": "inkling", "id_slot": slot, **fields})
+        assert res.status_code == 200, res.body
+        return next(row["prompt"] for row in s.make_request("GET", "/slots").body if row["id"] == slot)
+
+    prompts = {}
+    for level, value in EFFORT.items():
+        canonical = render(s, {"messages": messages, "reasoning_effort": level})
+        assert f"Thinking effort level: {value}<|end_message|>" in canonical
+        ids = s.make_request("POST", "/tokenize", data={"content": canonical, "parse_special": True, "add_special": True}).body["tokens"]
+        prompts[level] = s.make_request("POST", "/detokenize", data={"tokens": ids}).body["content"]
+        assert processed_prompt("/v1/chat/completions", {"messages": messages, "reasoning_effort": level, "max_tokens": 1}) == prompts[level]
+        assert processed_prompt("/v1/responses", {"input": messages, "reasoning": {"effort": level}, "max_output_tokens": 1}) == prompts[level]
+        assert processed_prompt("/v1/messages", {"messages": messages, "output_config": {"effort": level}, "max_tokens": 1}) == prompts[level]
+    assert len(set(prompts.values())) == len(set(EFFORT.values()))
+    assert processed_prompt("/v1/messages", {"messages": messages, "thinking": {"type": "disabled"}, "max_tokens": 1}) == prompts["none"]
+
+    for route, body, wrapper in (("/v1/responses", {"input": messages, "max_output_tokens": 1}, "reasoning"),
+                                 ("/v1/messages", {"messages": messages, "max_tokens": 1}, "output_config")):
+        for malformed in ("low", [], {"effort": "turbo"}, {"effort": 0.5}, {"effort": ""}):
+            res = s.make_request("POST", route, data={"model": "inkling", **body, wrapper: malformed})
+            assert res.status_code == 400 and res.body["error"]["type"] == "invalid_request_error", res.body
+        for omitted in ({}, {wrapper: None}, {wrapper: {"effort": None}}):
+            assert processed_prompt(route, {**body, **omitted}) == prompts["high"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for left, right in (("none", "max"), ("high", "low")):
+            oai = pool.submit(processed_prompt, "/v1/chat/completions", {"messages": messages, "reasoning_effort": left, "max_tokens": 1}, 0)
+            anthropic = pool.submit(processed_prompt, "/v1/messages", {"messages": messages, "thinking": {"type": "adaptive"},
+                                                                      "output_config": {"effort": right}, "max_tokens": 1}, 1)
+            assert oai.result() == prompts[left]
+            assert anthropic.result() == prompts[right]
+    assert processed_prompt("/v1/chat/completions", {"messages": messages, "max_tokens": 1}) == prompts["high"]
+    s.stop()
+    s.reasoning = "off"
+    s.start()
+    assert "Thinking effort level: 0<|end_message|>" in render(s, {"messages": messages})
+    assert "Thinking effort level: 0.9<|end_message|>" in render(s, {"messages": messages, "reasoning_effort": "high"})
 
 
 # an invalid effort however the request carries it: the OAI field, or the template's own input in chat_template_kwargs
-INVALID_EFFORT = {"field-unknown": {"reasoning_effort": "turbo"},
+INVALID_EFFORT = {"field-unknown": {"reasoning_effort": "turbo"}, "field-empty": {"reasoning_effort": ""},
                   # the field names a level; a number there is refused, in range or not, rather than dropped for the default
                   "field-number": {"reasoning_effort": 2}, "field-number-in-range": {"reasoning_effort": 0.5},
                   "kwargs-unknown": {"chat_template_kwargs": {"reasoning_effort": "extreme"}},
@@ -115,6 +174,9 @@ def test_inkling_invalid_reasoning_effort_is_a_client_error(server, effort, endp
     res = server.make_request("POST", path, data={"messages": TURNS, **INVALID_EFFORT[effort], **extra})
     assert res.status_code == 400, res.body
     assert res.body["error"]["type"] == "invalid_request_error"
+    if effort in ("field-unknown", "field-empty"):
+        levels = res.body["error"]["message"].split("supported levels: ")[1]
+        assert set(levels.split(", ")) == set(EFFORT)
     # the server is unharmed and still answers
     reply(server, {"messages": TURNS})
 
@@ -233,6 +295,135 @@ def test_inkling_sampling_stays_below_the_unpadded_vocabulary(server, files):
         assert all(0 <= i < files["unpadded"] for i in ids), sorted(set(i for i in ids if i >= files["unpadded"]))
         sampled += len(res.body["tokens"])
     assert sampled == 8 * 48
+
+
+def test_inkling_generation_at_context_limit(files):
+    s = ServerProcess()
+    s.model_hf_repo = s.model_hf_file = None
+    s.model_file = files["model"]
+    s.offline = True
+    s.n_ctx, s.n_slots = 256, 1
+    s.override_kv = f"tokenizer.ggml.eos_token_id=int:{END_ID}"
+    s.start()
+    for requested in (7, 8, 9):
+        res = s.make_request("POST", "/completion", data={
+            "prompt": [3] * 248, "n_predict": requested, "ignore_eos": True, "cache_prompt": False})
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == min(requested, 8)
+        assert res.body["truncated"] == (requested > 8)
+
+    eos = s.make_request("POST", "/completion", data={
+        "prompt": [3] * 255, "n_predict": 8, "temperature": 0, "logit_bias": [[END_ID, 1000]]})
+    assert eos.status_code == 200, eos.body
+    assert eos.body["stop_type"] == "eos" and not eos.body["truncated"]
+
+
+@pytest.mark.parametrize("shared,extend,expected_cache", [(100, True, 100), (80, True, 80), (80, False, 64)])
+def test_inkling_appends_after_async_ram_restore(files, tmp_path, monkeypatch, shared, extend, expected_cache):
+    monkeypatch.setenv("LLAMA_STATE_SAVE_ASYNC", "1")
+    monkeypatch.setenv("LLAMA_STATE_RESTORE_ASYNC", "1")
+    if shared < 100:
+        monkeypatch.setenv("LLAMA_ARG_CHECKPOINT_EVERY", "16")
+    s = ServerProcess()
+    s.model_hf_repo = s.model_hf_file = None
+    s.model_file = files["model"]
+    s.offline = s.kv_unified = s.no_cache_idle_slots = True
+    s.n_ctx, s.n_slots, s.cache_ram = 512, 2, 128
+    s.log_path = str(tmp_path / "server.log")
+    s.start()
+    rng = random.Random(17)
+
+    def complete(tokens, slot, cache=True):
+        res = s.make_request("POST", "/completion", data={
+            "prompt": tokens, "id_slot": slot, "n_predict": 1, "cache_prompt": cache, "temperature": 0,
+            "ignore_eos": True, "return_tokens": True, "n_probs": files["unpadded"]})
+        assert res.status_code == 200, res.body
+        return res.body
+
+    def logprobs(body):
+        return {p["id"]: p["logprob"] for p in body["completion_probabilities"][0]["top_logprobs"]}
+
+    saved = rng.choices(range(3, files["unpadded"]), k=100)
+    first = complete(saved, 0)
+    complete(rng.choices(range(3, files["unpadded"]), k=36), 0)
+    prompt = saved[:shared]
+    if extend:
+        next_token = first["tokens"][0] if shared == len(saved) else (4 if saved[shared] == 3 else 3)
+        prompt += [next_token] + rng.choices(range(3, files["unpadded"]), k=47)
+    restored = complete(prompt, 1)
+    assert restored["timings"]["cache_n"] == expected_cache
+    cold = complete(prompt, 0, cache=False)
+    assert cold["timings"]["cache_n"] == 0
+    s.stop()
+    log = (tmp_path / "server.log").read_text()
+    assert "cache_save reason=saved slot=0" in log
+    assert any("cache_restore reason=restored slot=1" in line and "async=1" in line for line in log.splitlines())
+    assert logprobs(restored) == pytest.approx(logprobs(cold), abs=2e-3)
+
+
+def test_inkling_ram_restore_matches_file_from_same_prefix(files, tmp_path, monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4] / "scripts/inkling2"))
+    import qualify
+
+    monkeypatch.setenv("LLAMA_STATE_SAVE_ASYNC", "1")
+    monkeypatch.setenv("LLAMA_STATE_RESTORE_ASYNC", "1")
+    server = ServerProcess()
+    server.model_hf_repo = server.model_hf_file = None
+    server.model_file = files["model"]
+    server.offline = server.kv_unified = server.no_cache_idle_slots = True
+    server.n_ctx, server.n_slots, server.cache_ram = 2048, 4, 128
+    server.slot_save_path = str(tmp_path)
+    server.override_kv = "inkling2.context_length=int:1024"
+    server.start()
+    options = SimpleNamespace(port=server.server_port, reader_tokens=352, timeout=30,
+                              restore_reference_dir=str(tmp_path), logprob_tolerance=1e-4)
+    result = qualify.workload(options, tmp_path, "restore")
+    assert result["cached_tokens"] == {"cold": 0, "resident": 352, "restored": 352}
+    reference = result["same_slot_file_control"]
+    assert reference["passed"], reference
+    assert reference["restored_vs_file"]["common_top_tokens"] == 32
+    assert result["independent_prefixes"]["comparison"]["common_top_tokens"] > 0
+    assert not list(tmp_path.glob("inkling-reference-*.bin"))
+
+
+def test_inkling_active_prefix_with_projector(files, monkeypatch):
+    monkeypatch.setenv("LLAMA_MEDIA_MARKER", MARKER)
+    pictures = [base64.b64encode(fx.png(seed=29)).decode()]
+    replies = []
+    for enabled in (False, True):
+        monkeypatch.setenv("LLAMA_SLOT_PREFIX_COPY", str(int(enabled)))
+        s = ServerProcess()
+        s.model_hf_repo = s.model_hf_file = None
+        s.model_file, s.mmproj_file = files["model"], files["mmproj"]
+        s.offline = s.kv_unified = s.no_cache_idle_slots = True
+        s.n_ctx, s.n_slots, s.n_batch, s.n_ubatch = 3072, 2, 32, 32
+        s.override_kv = "inkling2.context_length=int:1024"
+        s.start()
+        for slot in range(s.n_slots):
+            warm = s.make_request("POST", "/completion", data={"id_slot": slot, "prompt": f"Previous task {slot}.", "n_predict": 1})
+            assert warm.status_code == 200, warm.body
+        answers = []
+        for branch, media in (("same", False), ("split", False), ("image", True)):
+            prefix = branch + (MARKER if media else "") + "Public inventory record of this shipment. " * 44
+            tails = [" The red truck.", " The blue truck." if branch != "same" else " The red truck."]
+            prompts = [{"prompt_string": prefix + t, "multimodal_data": pictures if media else []} for t in tails]
+            res = s.make_request("POST", "/completion", data={"prompt": prompts, "temperature": 0,
+                                 "cache_prompt": True, "n_predict": 4, "return_tokens": True})
+            assert res.status_code == 200, res.body
+            first, second = res.body
+            assert first["id_slot"] != second["id_slot"]
+            cached = sorted(item["timings"]["cache_n"] for item in res.body)
+            if enabled and not media:
+                assert cached[0] == 0 and cached[1] >= 256
+            else:
+                assert cached == [0, 0]
+            answers.append([item["tokens"] for item in res.body])
+        s.stop()
+        replies.append(answers)
+    assert replies[0] == replies[1]
 
 
 def test_inkling_generation_ends_at_the_end_token(server):

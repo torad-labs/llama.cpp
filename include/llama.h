@@ -416,6 +416,8 @@ extern "C" {
         enum ggml_type type_s; // data type for the recurrent state cache (Gated DeltaNet / SSM S tensor):
                                // GGML_TYPE_F32 (default), F16, BF16 or Q8_0; the math stays f32, only the
                                // stored state is narrowed [EXPERIMENTAL]
+        enum ggml_type type_k_swa; // data type for the K cache of the sliding-window layers, GGML_TYPE_COUNT = type_k [EXPERIMENTAL]
+        enum ggml_type type_v_swa; // data type for the V cache of the sliding-window layers, GGML_TYPE_COUNT = type_v [EXPERIMENTAL]
         enum ggml_type type_idx; // data type for the sparse-attention indexer's cache (GLM-5.3 DSA keys and compressor
                                  // gates): GGML_TYPE_F16 (default) or Q8_0 [EXPERIMENTAL]
 

@@ -21,8 +21,12 @@ llama_model_ptr get_model(
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr,
         const std::vector<float> & tensor_split = {}, bool mtp = false);
 
+void set_env(const char * name, const char * value);
 void batch_clear(llama_batch & batch);
 void batch_add(llama_batch & batch, llama_token id, llama_pos pos, const std::vector<llama_seq_id> & seq_ids, bool logits);
 
 // --inkling-split <case>: the case of Inkling 2 run on the ranks of devs under -sm tensor and on the first alone
 int test_inkling_split(const std::string & name, size_t seed, const std::vector<ggml_backend_dev_t> & devs);
+
+// --inkling-path <feature>/<case>: an optimized path of Inkling 2 against the path it replaced, on dev
+int test_inkling_path(const std::string & path, size_t seed, ggml_backend_dev_t dev);

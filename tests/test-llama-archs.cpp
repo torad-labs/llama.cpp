@@ -314,6 +314,9 @@ static void usage(char ** argv) {
     LOG("  --inkling-split <case>   Compare Inkling 2 under -sm tensor with one device: prefill, decode, chunks, seq-cp,\n");
     LOG("                           state or rollback\n");
     LOG("  --inkling-split-device <devs>  The ranks of that split, one per name (default: CUDA0,CUDA0)\n");
+    LOG("  --inkling-path <f>/<case>  Compare an optimized path of Inkling 2 with the path it replaced: rel, fuse, conv,\n");
+    LOG("                           kv-q8_0, kv-q4_0 or kv-split, in prompt, decode, unified or streams\n");
+    LOG("  --inkling-path-device <dev>  The device of that case (default: CUDA0)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -875,8 +878,6 @@ static bool test_draft_vocab(const llm_arch arch, const size_t seed, const std::
     }
     return true;
 }
-
-static void set_env(const char * name, const char * value);
 
 // The node shapes the CUDA backend's folds match in the graphs of the two served architectures, read from the nodes a
 // one-row decode computes (TORAD.md, "Upstream v1.0.0"). A graph that computes the same values out of other nodes
@@ -1565,7 +1566,7 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
 }
 
 // set or clear an environment variable a library reads when a model or context is created
-static void set_env(const char * name, const char * value) {
+void set_env(const char * name, const char * value) {
 #ifdef _WIN32
     _putenv_s(name, value ? value : "");
 #else
@@ -4332,6 +4333,7 @@ int main(int argc, char ** argv) {
     std::string dp_device, prefill_device, shared_device;
     std::string tensor_device; // --glm-tensor-device CUDA0,CUDA1,CUDA0,CUDA1: one rank per name, repeats allowed
     std::string inkling_split, inkling_device; // --inkling-split <case> on --inkling-split-device's ranks, as above
+    std::string inkling_path, inkling_path_device; // --inkling-path <feature>/<case> on --inkling-path-device
     bool glm_alias_only = false;
     bool glm_kpool_only = false;
     bool glm_nextn_only = false;
@@ -4368,6 +4370,12 @@ int main(int argc, char ** argv) {
             const bool device = strcmp(argv[i], "--inkling-split-device") == 0;
             if (i + 1 == argc) return 1;
             (device ? inkling_device : inkling_split) = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--inkling-path") == 0 || strcmp(argv[i], "--inkling-path-device") == 0) {
+            const bool device = strcmp(argv[i], "--inkling-path-device") == 0;
+            if (i + 1 == argc) return 1;
+            (device ? inkling_path_device : inkling_path) = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--glm-shared-buffers-device") == 0) { // the tensor split's ranks, as --glm-tensor-device
@@ -4506,6 +4514,13 @@ int main(int argc, char ** argv) {
                 ranks.push_back(device);
             }
             return test_inkling_split(inkling_split, seed, ranks);
+        }
+        if (!inkling_path.empty()) {
+            ggml_backend_load_all();
+            const std::string name = inkling_path_device.empty() ? "CUDA0" : inkling_path_device;
+            const auto device = ggml_backend_dev_by_name(name.c_str());
+            if (!device) throw std::runtime_error("Inkling path device is unavailable: " + name);
+            return test_inkling_path(inkling_path, seed, device);
         }
         if (!shared_device.empty()) {
             ggml_backend_load_all();

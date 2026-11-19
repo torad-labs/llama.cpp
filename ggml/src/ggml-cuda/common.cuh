@@ -2281,6 +2281,42 @@ struct ggml_cuda_ssm_conv_update_context {
     }
 };
 
+// Inkling's short convolution (inkling2.cpp convolve): CONCAT(history, transposed new rows) -> SHORT_CONV, with the
+// state store reading the CONCAT's tail later in the layer. At one token per sequence the CONCAT's generic kernel
+// runs a 256-thread block per channel and sequence to join four columns: on four RTX PRO 6000s it measured 15.9 us
+// a hidden convolution against 1.5 us for the convolution itself. The evaluator skips the CONCAT
+// (ggml_cuda_try_short_conv_window) and records it here under the SHORT_CONV, whose kernel reads the history and
+// the new rows at their own strides and writes the joined window beside its output, so every later reader of the
+// window sees the same values the CONCAT would have written.
+#define GGML_CUDA_SHORT_CONV_WINDOW_MAX_N_T 16 // new tokens the fused kernel streams; prefill keeps the chain
+
+struct ggml_cuda_short_conv_window {
+    const ggml_tensor * past   = nullptr; // the CONCAT's first source, [k - 1, channels, n_seqs]
+    const ggml_tensor * rows   = nullptr; // the CONCAT's second source, [n_t, channels, n_seqs]
+    ggml_tensor *       window = nullptr; // the CONCAT itself, contiguous, [n_t + k - 1, channels, n_seqs]
+};
+
+// Registrations are keyed by node pointer, like ggml_cuda_ssm_conv_update_context, and cleared at the start of
+// every graph evaluation/capture.
+struct ggml_cuda_short_conv_window_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_short_conv_window> windows; // by SHORT_CONV
+    std::unordered_set<const ggml_tensor *>                              skipped; // the CONCATs
+
+    void reset() {
+        windows.clear();
+        skipped.clear();
+    }
+
+    const ggml_cuda_short_conv_window * find(const ggml_tensor * conv) const {
+        const auto it = windows.find(conv);
+        return it == windows.end() ? nullptr : &it->second;
+    }
+
+    bool skips(const ggml_tensor * node) const {
+        return skipped.count(node) != 0;
+    }
+};
+
 // Names one ggml graph across computes, to find its CUDA graph. The first node's address alone names the memory a
 // graph is built in, and graphs of different shapes built there in turn (a speculative draft context's catch-up batch
 // and its one-row draft step) would share one CUDA graph, each finding the other's capture stale on every compute and
@@ -2589,6 +2625,7 @@ struct ggml_backend_cuda_context {
     std::unique_ptr<ggml_cuda_stream_context> concurrent_stream_context;
     ggml_cuda_gdn_gather_context gdn_gather_context;
     ggml_cuda_ssm_conv_update_context ssm_conv_update_context;
+    ggml_cuda_short_conv_window_context short_conv_window_context;
     ggml_cuda_fattn_kv_live_context fattn_kv_live_context;
     ggml_cuda_pq2_prefetch pq2_next; // for the node being dispatched
     ggml_cuda_pq2_tile_counters pq2_tile_counters;
@@ -2638,6 +2675,8 @@ struct ggml_backend_cuda_context {
     ggml_cuda_gdn_gather_context & gdn_gathers() { return gdn_gather_context; }
 
     ggml_cuda_ssm_conv_update_context & ssm_conv_updates() { return ssm_conv_update_context; }
+
+    ggml_cuda_short_conv_window_context & short_conv_windows() { return short_conv_window_context; }
 
     ggml_cuda_fattn_kv_live_context & fattn_kv_live() { return fattn_kv_live_context; }
 
@@ -2705,6 +2744,8 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f; // > 0: before the GLU, the gate clamped to at most glu_limit and x to +-glu_limit (a SwiGLU limit)
+    float glu_beta  = 0.0f; // GGML_GLU_OP_SITU: the gate's softcap
+    float glu_lb    = 0.0f; // GGML_GLU_OP_SITU: x's softcap, none when <= 0
     const ggml_tensor * rms_norm = nullptr; // a weightless RMS_NORM whose input src1 is: the dot products take its scale (mmvf)
     ggml_prec prec_src1 = GGML_PREC_UNDEFINED; // src1 precision requested by the fused MUL_MATs (MMQ)
     const ggml_tensor * shared_up = nullptr;
@@ -2719,6 +2760,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    float glu_beta  = 0.0f;
+    float glu_lb    = 0.0f;
     bool  rms_norm = false;
     float rms_norm_eps = 0.0f;
     ggml_cuda_q8_layout q8_layout;

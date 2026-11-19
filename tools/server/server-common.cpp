@@ -1748,6 +1748,9 @@ json oaicompat_chat_params_parse(
         inputs.enable_thinking = true;
     } else if (enable_thinking_kwarg == "false") {
         inputs.enable_thinking = false;
+        if (caps.at("reasoning_effort_none").get<bool>()) {
+            inputs.chat_template_kwargs["reasoning_effort"] = json("none").dump();
+        }
     } else if (!enable_thinking_kwarg.empty() && enable_thinking_kwarg[0] == '"') {
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
@@ -1767,15 +1770,18 @@ json oaicompat_chat_params_parse(
             } else {
                 inputs.chat_template_kwargs.erase("reasoning_effort");
             }
-        } else if (!reasoning_effort.empty()) {
+        } else if (body.at("reasoning_effort").is_string()) {
             const auto rejected = caps.at("reasoning_effort_rejected").get<std::vector<std::string>>();
             const auto accepted = caps.at("reasoning_effort_accepted").get<std::vector<std::string>>();
             if (std::find(rejected.begin(), rejected.end(), reasoning_effort) != rejected.end() ||
                 (!accepted.empty() && std::find(accepted.begin(), accepted.end(), reasoning_effort) == accepted.end())) {
-                const auto levels = caps.at("reasoning_effort_levels").get<std::vector<std::string>>();
+                auto levels = accepted.empty() ? caps.at("reasoning_effort_levels").get<std::vector<std::string>>() : accepted;
+                levels.insert(levels.begin(), "none");
                 throw std::invalid_argument("reasoning_effort \"" + reasoning_effort + "\" is not supported by the chat template, supported levels: " + string_join(levels, ", "));
             }
-            inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+            if (!reasoning_effort.empty()) {
+                inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+            }
         }
     }
 

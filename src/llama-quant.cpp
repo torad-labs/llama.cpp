@@ -219,7 +219,7 @@ struct tensor_metadata {
     std::string     name;
     ggml_type       target_type;
     tensor_category category;
-    std::string     remapped_imatrix_name;
+    std::string     source_name;
     bool            allows_quantization;
     bool            requires_imatrix;
 };
@@ -1048,7 +1048,8 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
 // main quantization driver
 //
 
-static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
+static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params,
+        llama_quant_read_tensor reader, void * user_data) {
     llama_ftype ftype = params->ftype;
 
     int nthread = params->nthread;
@@ -1073,7 +1074,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     const llama_model_kv_override * kv_overrides = params->kv_overrides;
     std::vector<std::string> splits = {};
     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
+        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ reader ? LLAMA_LOAD_MODE_NONE : load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
 
     auto mparams = llama_model_default_params();
@@ -1238,9 +1239,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         metadata[i].requires_imatrix = tensor->type != metadata[i].target_type &&
                                        tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
 
-        if (params->imatrix) {
-            metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
-        } else if (metadata[i].allows_quantization && metadata[i].requires_imatrix) {
+        if (reader || params->imatrix) {
+            metadata[i].source_name = remap_imatrix(tensor->name, mapped);
+        }
+        if (!params->imatrix && metadata[i].allows_quantization && metadata[i].requires_imatrix) {
             if (params->dry_run) {
                 will_require_imatrix = true;
             } else {
@@ -1331,6 +1333,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             if (!ml.use_mmap && read_data.size() < size) {
                 read_data.resize(size);
             }
+            if (reader) {
+                if (!reader(tm.source_name.c_str(), offs, read_data.data(), size, user_data)) {
+                    throw std::runtime_error(format("short read of %s at offset %zu", tensor->name, offs));
+                }
+                return read_data.data();
+            }
             return ml.load_data_range(weight, offs, size, read_data.data());
         };
 
@@ -1384,7 +1392,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             } else {
                 const float * imatrix = nullptr;
                 if (imatrix_data) {
-                    auto it = imatrix_data->find(tm.remapped_imatrix_name);
+                    auto it = imatrix_data->find(tm.source_name);
                     if (it == imatrix_data->end()) {
                         LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
                     } else {
@@ -1532,8 +1540,14 @@ uint32_t llama_model_quantize(
         const char * fname_inp,
         const char * fname_out,
         const llama_model_quantize_params * params) {
+    return llama_model_quantize_with_reader(fname_inp, fname_out, params, nullptr, nullptr);
+}
+
+uint32_t llama_model_quantize_with_reader(
+        const char * fname_inp, const char * fname_out, const llama_model_quantize_params * params,
+        llama_quant_read_tensor reader, void * user_data) {
     try {
-        llama_model_quantize_impl(fname_inp, fname_out, params);
+        llama_model_quantize_impl(fname_inp, fname_out, params, reader, user_data);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to quantize: %s\n", __func__, err.what());
         return 1;

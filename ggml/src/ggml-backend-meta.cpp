@@ -1278,9 +1278,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3) {
-            return handle_batch_axes(src_ss, 3, {3, 3, 3, 3, -1, 3});
+            return handle_batch_axes(src_ss, 3, {3, 3, 3, 3, -1, 3, 3, 1, 1, 3});
         }
         GGML_ASSERT(tensor->src[5] == nullptr || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        // a relative position bias (ggml_flash_attn_ext_add_rel_pos): its table is split as q's heads are, the positions
+        // are every device's
+        if (tensor->src[6] != nullptr) {
+            GGML_ASSERT(src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            ggml_backend_meta_split_state table_ss = src_ss[6];
+            if (table_ss.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                table_ss.axis = GGML_BACKEND_SPLIT_AXIS_2; // the heads, as they are q's axis 2
+            }
+            GGML_ASSERT(split_states_equal(table_ss, src_ss[0]));
+            if (tensor->src[9]) {
+                auto sink_ss = src_ss[9];
+                if (sink_ss.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                    sink_ss.axis = GGML_BACKEND_SPLIT_AXIS_2;
+                }
+                GGML_ASSERT(split_states_equal(sink_ss, src_ss[0]));
+            }
+        }
         // A mask with a row of its own a head (ne[2] the heads of q, as a relative position bias folded into it) is split
         // as q's heads are: each device masks its heads with their rows
         const bool mask_by_heads = tensor->src[3] != nullptr && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
@@ -1589,6 +1606,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
             case GGML_OP_L2_NORM: {
                 split_state = handle_per_row(src_ss);
             } break;
+            case GGML_OP_NORM_CLIP: {
+                // per row, its scale broadcast over the rows as a MUL's src1
+                split_state = tensor->src[1] ? handle_bin_bcast(src_ss) : handle_per_row(src_ss);
+                GGML_ASSERT(split_state.axis != GGML_BACKEND_SPLIT_AXIS_0);
+            } break;
+            case GGML_OP_ATTN_RES_MIX: {
+                // a token's sources and the queries whole on every device
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID: {
                 split_state = handle_mul_mat(src_ss);
@@ -1698,7 +1724,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_SSM_CONV: {
+            case GGML_OP_SSM_CONV:
+            case GGML_OP_SHORT_CONV: {
+                // the window and the taps decide the split; the dynamic taps follow the channels' heads
                 split_state = handle_ssm_conv(src_ss);
             } break;
             case GGML_OP_SSM_SCAN:
@@ -2865,6 +2893,44 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }
 
+bool ggml_backend_meta_read_rows(ggml_tensor * tensor, size_t offset, size_t size, ggml_backend_meta_rows_fn fn, void * userdata) {
+    GGML_ASSERT(tensor != nullptr && tensor->buffer != nullptr && fn != nullptr);
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) { return false; }
+    const auto split = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    if (split.axis != GGML_BACKEND_SPLIT_AXIS_0 && split.axis != GGML_BACKEND_SPLIT_AXIS_1) { return false; }
+    if (!ggml_is_contiguous(tensor) || ggml_is_empty(tensor)) { return false; }
+    const int axis = split.axis;
+    const size_t stride = tensor->nb[axis + 1];
+    const size_t packed = ggml_row_size(tensor->type, tensor->ne[0])*(axis == 0 ? 1 : tensor->ne[1]);
+    if (stride != packed || offset % stride || size % stride) { return false; }
+    for (size_t j = 0; j < n_bufs; ++j) {
+        const ggml_tensor * child = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        if (!ggml_is_empty(child) && !ggml_is_contiguous(child)) { return false; }
+    }
+    GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
+    if (!size) { return true; }
+    const size_t block = axis == 0 ? ggml_blck_size(tensor->type) : 1;
+    size_t local[GGML_BACKEND_META_MAX_DEVICES] = {};
+    size_t host = 0;
+    for (size_t s = 0; s < split.n_segments; ++s) {
+        for (size_t r = 0; r < split.nr[s]; ++r) {
+            for (size_t j = 0; j < n_bufs; ++j) {
+                GGML_ASSERT(split.ne[s*n_bufs + j] % block == 0);
+                const size_t width = split.ne[s*n_bufs + j]/block*tensor->nb[axis];
+                if (width == 0) { continue; }
+                ggml_tensor * child = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                const size_t pitch = ggml_row_size(child->type, child->ne[0])*(axis == 0 ? 1 : child->ne[1]);
+                fn(child, offset/stride*pitch + local[j], width, size/stride, pitch, stride, host, userdata);
+                local[j] += width;
+                host += width;
+            }
+        }
+    }
+    GGML_ASSERT(host == stride);
+    return true;
+}
+
 bool ggml_backend_meta_tensor_ranges(ggml_tensor * tensor, size_t offset, size_t size, bool read, ggml_backend_meta_range_fn fn, void * userdata) {
     GGML_ASSERT(tensor != nullptr && tensor->buffer != nullptr && fn != nullptr);
     if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
@@ -3035,10 +3101,13 @@ struct ggml_backend_meta_context {
     ggml_backend_comm_allreduce_next_t   comm_allreduce_next = nullptr;
     ggml_backend_comm_allgather_tensor_t comm_allgather = nullptr; // null: the generic gather
     ggml_backend_comm_reduce_owned_tensor_t comm_reduce_owned = nullptr; // null: every reduction goes to every device
-    std::vector<bool>                    gathers; // a subgraph ends with a gather (ggml_backend_meta_is_gather)
+    ggml_backend_comm_allreduce_tensor_t comm_reduce_owned_rows = nullptr;
+    enum class collective { none, reduce, gather };
+    std::vector<collective>              collectives;
     // A subgraph's reduction whose only reader is a scatter by rows: the elements each device reads of it, else !valid
     struct owned_layout {
         bool    valid = false;
+        bool    rows = false;
         int64_t begin[GGML_BACKEND_META_MAX_DEVICES] = {};
         int64_t len[GGML_BACKEND_META_MAX_DEVICES]   = {};
     };
@@ -3057,7 +3126,7 @@ struct ggml_backend_meta_context {
         size_t                                  n_subgraphs = 0;
         std::vector<std::vector<cgraph_config>> cgraphs; // a device
         std::vector<std::vector<ggml_tensor *>> nodes;   // a device
-        std::vector<bool>                       gathers;
+        std::vector<collective>                 collectives;
         std::vector<owned_layout>               owned;
         ggml_context_ptr                        ctx;
     };
@@ -3190,7 +3259,7 @@ struct ggml_backend_meta_context {
                 kept.cgraphs[j] = std::move(backend_configs[j].cgraphs);
                 kept.nodes[j]   = std::move(backend_configs[j].nodes);
             }
-            kept.gathers = std::move(gathers);
+            kept.collectives = std::move(collectives);
             kept.owned   = std::move(owned);
             kept.ctx     = std::move(ctx_steps);
         }
@@ -3198,7 +3267,7 @@ struct ggml_backend_meta_context {
             bcj.cgraphs.clear();
             bcj.nodes.clear();
         }
-        gathers.clear();
+        collectives.clear();
         owned.clear();
         ctx_steps.reset();
         uid         = 0;
@@ -3219,7 +3288,7 @@ struct ggml_backend_meta_context {
                 backend_configs[j].cgraphs = std::move(kept.cgraphs[j]);
                 backend_configs[j].nodes   = std::move(kept.nodes[j]);
             }
-            gathers     = std::move(kept.gathers);
+            collectives = std::move(kept.collectives);
             owned       = std::move(kept.owned);
             ctx_steps   = std::move(kept.ctx);
             uid         = uid_cgraph;
@@ -3489,6 +3558,8 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_next");
             comm_allgather = (ggml_backend_comm_allgather_tensor_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allgather_tensor");
+            comm_reduce_owned_rows = (ggml_backend_comm_allreduce_tensor_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_reduce_owned_rows");
             comm_reduce_owned = (ggml_backend_comm_reduce_owned_tensor_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_reduce_owned_tensor");
             capture.allreduce_capturable = (ggml_backend_comm_allreduce_capturable_t)
@@ -3688,6 +3759,50 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
+}
+
+// A materialized transpose followed by a channel scatter reads only an equal quarter of each original row per device.
+static bool ggml_backend_meta_owned_hidden_rows(const ggml_cgraph * graph, int i, size_t n_devices) {
+    const ggml_tensor * root = graph->nodes[i];
+    if (n_devices != 4 || root->type != GGML_TYPE_F32 || root->ne[0] != 4608 || root->ne[1] != 23 ||
+            root->ne[2] != 1 || root->ne[3] != 1 || !ggml_is_contiguous(root) || root->view_src) {
+        return false;
+    }
+
+    const ggml_op ops[] = {GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_RESHAPE};
+    const ggml_tensor * chain[5] = {root};
+    int curr = i;
+    for (int k = 0; k < 4; ++k) {
+        if ((chain[k]->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(graph, curr) != 1) { return false; }
+        do { ++curr; } while (curr < graph->n_nodes && graph->nodes[curr]->src[0] != chain[k]);
+        if (curr == graph->n_nodes || graph->nodes[curr]->op != ops[k]) { return false; }
+        chain[k + 1] = graph->nodes[curr];
+    }
+    const ggml_tensor * reshape = chain[1], * perm = chain[2], * cont = chain[3], * scatter = chain[4];
+    if (reshape->view_src != root || reshape->view_offs || reshape->ne[0] != 4608 || reshape->ne[1] != 1 ||
+            reshape->ne[2] != 23 || reshape->ne[3] != 1 || !ggml_is_contiguous(reshape) ||
+            perm->view_src != root || perm->view_offs || perm->ne[0] != 1 || perm->ne[1] != 23 ||
+            perm->ne[2] != 4608 || perm->ne[3] != 1 || perm->nb[1] != root->nb[1] || perm->nb[2] != root->nb[0] ||
+            cont->view_src || !ggml_are_same_shape(cont, perm) || !ggml_is_contiguous(cont) ||
+            scatter->view_src != cont || scatter->view_offs || !(scatter->flags & GGML_TENSOR_FLAG_META) ||
+            !ggml_are_same_shape(scatter, cont) || !ggml_are_same_stride(scatter, cont)) {
+        return false;
+    }
+    const auto split = ggml_backend_meta_get_split_state(scatter, true);
+    if (split.axis != GGML_BACKEND_SPLIT_AXIS_2 || split.n_segments != 1 || split.nr[0] != 1 ||
+            !std::all_of(split.ne, split.ne + 4, [](int64_t n) { return n == 1152; })) {
+        return false;
+    }
+    // ggml flattens view_src. Only the two transform views can alias root, and every later cont alias must descend from scatter.
+    for (int j = i + 1; j < graph->n_nodes; ++j) {
+        const ggml_tensor * t = graph->nodes[j];
+        if (t->view_src == root && t != reshape && t != perm) { return false; }
+        if (t->view_src == cont) {
+            while (t != scatter && t && t->view_src == cont) { t = t->src[0]; }
+            if (t != scatter) { return false; }
+        }
+    }
+    return true;
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -3921,6 +4036,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             using owned_layout = std::remove_reference_t<decltype(backend_ctx->owned)>::value_type;
             auto get_owned = [&](const int i) -> owned_layout {
                 owned_layout owned;
+                if (backend_ctx->comm_reduce_owned_rows && ggml_backend_meta_owned_hidden_rows(cgraph, i, n_backends)) {
+                    owned.rows = true;
+                    return owned;
+                }
                 ggml_tensor * node = cgraph->nodes[i];
                 if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
                         !ggml_is_contiguous(node) || ggml_blck_size(node->type) != 1) {
@@ -3966,7 +4085,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return owned;
             };
 
-            backend_ctx->gathers.clear();
+            backend_ctx->collectives.clear();
             backend_ctx->owned.clear();
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3986,7 +4105,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 const int i_delayed = gather ? i : get_i_delayed(i);
-                backend_ctx->gathers.push_back(gather);
+                // An observation can end a graph view at a partial tensor. Its consumer still needs the sum.
+                using collective = ggml_backend_meta_context::collective;
+                backend_ctx->collectives.push_back(gather ? collective::gather : partial ? collective::reduce : collective::none);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -4342,7 +4463,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
-            if (n_backends > 1 && backend_ctx->gathers[i]) {
+            if (n_backends > 1 && backend_ctx->collectives[i] == ggml_backend_meta_context::collective::gather) {
                 bool backend_allgather_success = false;
                 if (backend_ctx->comm_ctx && backend_ctx->comm_allgather) {
                     std::vector<ggml_tensor *> nodes;
@@ -4359,7 +4480,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         return status;
                     }
                 }
-            } else if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            } else if (n_backends > 1 && backend_ctx->collectives[i] == ggml_backend_meta_context::collective::reduce) {
                 bool backend_allreduce_success = false;
                 if (backend_ctx->comm_ctx) {
                     std::vector<ggml_tensor *> nodes;
@@ -4370,13 +4491,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         auto & bcj = backend_ctx->backend_configs[j];
                         ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                         nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
-                        next.push_back(bcj.cgraphs[i + 1].cgraph_main);
+                        if (i + 1 < backend_ctx->n_subgraphs) {
+                            next.push_back(bcj.cgraphs[i + 1].cgraph_main);
+                        }
                     }
                     // a reduction read only by a scatter by rows goes to each device's rows alone, where the comm can
                     const auto & owned = backend_ctx->owned[i];
-                    backend_allreduce_success = owned.valid && backend_ctx->comm_reduce_owned &&
-                        backend_ctx->comm_reduce_owned(backend_ctx->comm_ctx, nodes.data(), owned.begin, owned.len);
-                    backend_allreduce_success = backend_allreduce_success || (backend_ctx->comm_allreduce_next
+                    backend_allreduce_success = owned.rows
+                        ? backend_ctx->comm_reduce_owned_rows(backend_ctx->comm_ctx, nodes.data())
+                        : owned.valid && backend_ctx->comm_reduce_owned &&
+                                backend_ctx->comm_reduce_owned(backend_ctx->comm_ctx, nodes.data(), owned.begin, owned.len);
+                    backend_allreduce_success = backend_allreduce_success || (backend_ctx->comm_allreduce_next && !next.empty()
                         ? backend_ctx->comm_allreduce_next(backend_ctx->comm_ctx, nodes.data(), next.data())
                         : backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data()));
                 }
@@ -4411,12 +4536,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 nodes[j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
             }
-            if (backend_ctx->gathers[i]) {
+            if (backend_ctx->collectives[i] == ggml_backend_meta_context::collective::gather) {
                 if (cap.allgather_capturable == nullptr || backend_ctx->comm_allgather == nullptr ||
                         !cap.allgather_capturable(backend_ctx->comm_ctx, nodes.data())) {
                     return refuse(i, -1, "allgather");
                 }
-            } else if (i < backend_ctx->n_subgraphs - 1 && !cap.allreduce_capturable(backend_ctx->comm_ctx, nodes.data())) {
+            } else if (backend_ctx->collectives[i] == ggml_backend_meta_context::collective::reduce && !cap.allreduce_capturable(backend_ctx->comm_ctx, nodes.data())) {
                 return refuse(i, -1, "allreduce");
             }
         }

@@ -6,7 +6,11 @@ GLM-5.3 Flash on the four-card tensor layout (Tensor 4) across four RTX PRO 6000
 target source and its consequences are recorded in
 [09-abliterated-target.md](09-abliterated-target.md).
 
-## The answer in one page
+The serving review covers the implemented fork, Q3_K_M sizing from the pinned checkpoint headers, the 262,144-token coding input workload and the four-card launch settings. [Serving review and measurements](10-serving-campaign-review.md)
+
+The four-card rental results cover the actual PCIe topology, collective and attention kernels, and serving workloads. [Four-card serving results](12-four-card-serving.md) · [Final grouped results and selected tensor-4 profile](13-batched-serving-results.md)
+
+## Original assessment on November 16
 
 Support is feasible and most of the model work already exists upstream. Upstream llama.cpp
 merged Inkling 2 text and still-image vision support on 2026-11-14 CT in commit `5c008e000`
@@ -77,9 +81,10 @@ not convert or run yet. DSpark is its own phase at the end.
 - [07-implementation-plan.md](07-implementation-plan.md) - phases, tests and the box read.
 - [08-risks-and-questions.md](08-risks-and-questions.md) - risks, unknowns and decisions.
 - [09-abliterated-target.md](09-abliterated-target.md) - the selected derivative, its pack route and target-specific qualification.
+- [10-serving-campaign-review.md](10-serving-campaign-review.md) - the current server profile and local qualification.
+- [11-pcie-blackwell-throughput.md](11-pcie-blackwell-throughput.md) - PCIe gather and Blackwell attention results, TensorFold research and remaining opportunities.
+- [12-four-card-serving.md](12-four-card-serving.md) - hardware measurements, model identity and deployment results.
 - [data/model-facts.json](data/model-facts.json) - the numbers above in structured form.
 - [data/sources.md](data/sources.md) - every source used, with what it was trusted for.
 
-Nothing in this study was measured on GPU. Every performance statement is either a cited
-measurement from vLLM or SGLang on datacenter Blackwell hardware, or an estimate derived
-from this fork's GLM tensor-layout records. The two are labeled as such wherever they appear.
+The original November 16 estimates use datacenter Blackwell reports and earlier GLM records. Chapters 10 through 12 distinguish the later fixture, single-GPU and four-card measurements.

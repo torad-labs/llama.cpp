@@ -1530,6 +1530,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         if (op->src[5] != nullptr) {
             return {false, "FLASH_ATTN_EXT with K/V row lists is not supported"};
         }
+        if (op->src[6] != nullptr) {
+            return {false, "FLASH_ATTN_EXT with relative position bias is not supported"};
+        }
 
         if (op->src[4] != nullptr) {
             return {false, "FLASH_ATTN_EXT with sinks is not supported"};

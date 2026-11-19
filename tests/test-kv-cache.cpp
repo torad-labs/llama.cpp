@@ -57,7 +57,7 @@ int main() {
                     if (type_k == type_v || (!model->hparams.is_mla() && arch != LLM_ARCH_DEEPSEEK4 && arch != LLM_ARCH_DEEPSEEK41)) {
                         GGML_ASSERT(errors.find("FP8 cache is not supported for architecture") != std::string::npos);
                     } else {
-                        GGML_ASSERT(errors.find("model does not support different K") != std::string::npos);
+                        GGML_ASSERT(errors.find("model requires matching K and V cache types") != std::string::npos);
                     }
                 }
             }
@@ -115,7 +115,7 @@ int main() {
                 false, false, true, 32, 2, 0, LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
 
         // returns the first cell that takes the tokens
-        auto add = [&](llama_seq_id seq_id, llama_pos p0, uint32_t n) {
+        auto add_to = [](llama_kv_cache & cache, llama_seq_id seq_id, llama_pos p0, uint32_t n) {
             std::vector<llama_token>    token(n, 1);
             std::vector<llama_pos>      pos(n);
             std::vector<int32_t>        n_seq_id(n, 1);
@@ -134,12 +134,14 @@ int main() {
             ubatch.seq_id       = seq_ids.data();
             ubatch.seq_id_unq   = &seq_id;
 
-            const auto sinfo = kv.find_slot(ubatch, false);
+            const auto sinfo = cache.find_slot(ubatch, false);
             GGML_ASSERT(!sinfo.empty());
-            kv.apply_ubatch(sinfo, ubatch);
+            cache.apply_ubatch(sinfo, ubatch);
 
             return sinfo.head();
         };
+
+        auto add = [&](llama_seq_id seq_id, llama_pos p0, uint32_t n) { return add_to(kv, seq_id, p0, n); };
 
         GGML_ASSERT(add(0, 0, 8) == 0);
         GGML_ASSERT(add(1, 0, 4) == 8);
@@ -173,6 +175,52 @@ int main() {
         add(0, 5, 1);
         GGML_ASSERT(kv.seq_rm(0, 5, 6));
         GGML_ASSERT(kv.seq_pos_max(0) == 4);
+
+        llama_kv_cache swa(*model, false, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
+                false, false, true, 8, 2, 4, LLAMA_SWA_TYPE_STANDARD, nullptr, nullptr, nullptr, nullptr);
+        add_to(swa, 0, 0, 4);
+        swa.seq_cp(0, 1, -1, -1);
+        add_to(swa, 0, 4, 4);
+        // Both owners have moved past cell 0. The slower owner still needs cells 1 to 3.
+        GGML_ASSERT(add_to(swa, 0, 8, 1) == 0);
+        GGML_ASSERT(add_to(swa, 0, 9, 1) == 4);
+        GGML_ASSERT(swa.seq_pos_min(1) == 1 && swa.seq_pos_max(1) == 3);
+    }
+
+    {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_INKLING2, llama_model_default_params()));
+        init_model(*model, 1);
+        for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+            for (uint32_t window : {0u, 1024u}) {
+                llama_kv_cache kv(*model, false, model->hparams, type, type, false, false, true, 43008, 1,
+                        window, window ? LLAMA_SWA_TYPE_STANDARD : LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
+                llama_seq_id seq = 0;
+                llama_seq_id * seq_ptr = &seq;
+                llama_pos pos = 0;
+                int32_t n_id = 1;
+                llama_ubatch ub = {};
+                ub.n_tokens = ub.n_seq_tokens = ub.n_seqs = ub.n_seqs_unq = ub.n_pos = 1;
+                ub.pos = &pos;
+                ub.n_seq_id = &n_id;
+                ub.seq_id = &seq_ptr;
+                ub.seq_id_unq = &seq;
+                llama_kv_cache::slot_info slot{};
+                slot.strm = {0};
+                const bool bucket = !window && type == GGML_TYPE_F16 && ggml_env_switch("LLAMA_INKLING2_BUCKET_PREFILL_KV");
+                for (uint32_t i : {1024u, 32768u, 33792u, 42752u}) {
+                    slot.idxs = {{i}};
+                    kv.apply_ubatch(slot, ub);
+                    auto prompt = ub;
+                    prompt.n_tokens = prompt.n_seq_tokens = 1024;
+                    const uint32_t narrow = i + 256;
+                    GGML_ASSERT(kv.get_n_kv(slot, &ub) == narrow);
+                    const uint32_t expected = bucket && i >= 32768 ? std::min(43008u, uint32_t(GGML_PAD(narrow, 8192))) : narrow;
+                    GGML_ASSERT(kv.get_n_kv(slot, &prompt) == expected);
+                    GGML_ASSERT(kv.get_cells(seq).seq_n_cells(seq) == uint32_t(pos + 1));
+                    ++pos;
+                }
+            }
+        }
     }
 
     llama_backend_free();

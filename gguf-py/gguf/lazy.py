@@ -1,8 +1,11 @@
 from __future__ import annotations
 from abc import ABC, ABCMeta, abstractmethod
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import numpy as np
 from numpy.typing import DTypeLike
@@ -276,17 +279,36 @@ class LazyChunkedTensor:
             raise NotImplementedError("a chunked tensor cannot be byteswapped in place")
         return LazyChunkedTensor(self._chunks, self.shape, self.dtype, self._qtype, not self._byteswap)
 
-    def tofile(self, *args, **kwargs) -> None:
+    def _read_chunk(self, load_chunk: Callable[[], np.ndarray]) -> np.ndarray:
         from .quants import quantize
 
+        chunk = load_chunk()
+        if self._qtype is not None:
+            # Chunks split on rows. A quantization block never crosses a row.
+            chunk = quantize(chunk, self._qtype)
+        if self._byteswap:
+            chunk = chunk.byteswap(inplace=False)
+        return chunk
+
+    def _ordered_chunks(self, workers: int) -> Iterator[np.ndarray]:
+        if workers < 1:
+            raise ValueError("chunk worker count must be positive")
+        if workers == 1:
+            yield from map(self._read_chunk, self._chunks)
+            return
+        chunks = iter(self._chunks)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # Include the chunk being written in the worker limit.
+            pending = deque(pool.submit(self._read_chunk, chunk) for chunk in islice(chunks, workers))
+            for chunk in chunks:
+                yield pending.popleft().result()
+                pending.append(pool.submit(self._read_chunk, chunk))
+            while pending:
+                yield pending.popleft().result()
+
+    def tofile(self, *args, workers: int = 1, **kwargs) -> None:
         written = 0
-        for load_chunk in self._chunks:
-            chunk = load_chunk()
-            if self._qtype is not None:
-                # exact only because chunks split on rows, and blocks never cross one
-                chunk = quantize(chunk, self._qtype)
-            if self._byteswap:
-                chunk = chunk.byteswap(inplace=False)
+        for chunk in self._ordered_chunks(workers):
             chunk.tofile(*args, **kwargs)
             written += chunk.nbytes
             del chunk

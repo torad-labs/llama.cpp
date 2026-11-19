@@ -15,6 +15,7 @@
 //             sequence's into a second sequence) and decoded on
 //   rollback  a draft of 4 tokens of which the last 2 are rejected (llama_memory_seq_rm with rollback snapshots), the
 //             state compared right after, then decoded on from the kept position
+//   graph-churn  23 distinct session pairs through a retained graph, then independent rollbacks on two sessions
 
 #include "test-llama-archs.h"
 
@@ -34,6 +35,7 @@ constexpr double tolerance = 1e-4;
 constexpr uint32_t n_prompt = 32;
 
 struct record {
+    int32_t reused = 0;
     std::vector<float> logits;              // every output row, in the order of the batches
     std::vector<std::vector<float>> states; // the serialized convolution state of each sequence, by step
     std::vector<std::vector<float>> memory; // all the sequence keeps, at the same steps: KV cells and the state
@@ -212,6 +214,35 @@ std::map<std::string, case_def> cases(size_t seed) {
         decode_steps(ctx, tokens(4, 2), n_prompt + 2, 0, out);
         read_state(ctx, 0, out);
     }};
+    ret["graph-churn"] = {{64, 23, 2}, [=](llama_context * ctx, record & out) {
+        constexpr int sessions = 23;
+        std::array<llama_pos, sessions> pos{};
+        std::vector<std::array<int32_t, 3>> rows;
+        for (int seq = 0; seq < sessions; ++seq) {
+            rows.push_back({tokens(1, seq)[0], pos[seq]++, seq});
+        }
+        decode(ctx, rows, out);
+        llama_perf_context_reset(ctx);
+        for (int i = 0; i < sessions; ++i) {
+            rows.clear();
+            for (int seq : {i, (i + 11) % sessions}) {
+                for (llama_token token : tokens(3, sessions*i + seq)) {
+                    rows.push_back({token, pos[seq]++, seq});
+                }
+            }
+            decode(ctx, rows, out);
+        }
+        out.reused = llama_perf_context(ctx).n_reused;
+        for (int seq : {3, 19}) {
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), seq, --pos[seq], -1)) {
+                throw std::runtime_error("inkling2: the slot rollback was refused");
+            }
+            decode(ctx, {{tokens(1, 1000 + seq)[0], pos[seq], seq}}, out);
+        }
+        for (int seq = 0; seq < sessions; ++seq) {
+            read_state(ctx, seq, out);
+        }
+    }};
     return ret;
 }
 
@@ -231,17 +262,31 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
     auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
     llama_model_ptr one = get_model(gguf.get(), nullptr, seed, 0.0f, {devs.front()}, LLAMA_SPLIT_MODE_LAYER);
     llama_model_ptr split = get_model(gguf.get(), nullptr, seed, 0.0f, devs, LLAMA_SPLIT_MODE_TENSOR);
+    const bool graph_churn = name == "graph-churn";
+    if (graph_churn) {
+        set_env("LLAMA_RS_FIXED_ROWS", "0");
+        set_env("LLAMA_GRAPH_ANY_SEQS", "0");
+    }
     record expected, actual;
     {
         auto ctx = make_context(one.get(), it->second.shape);
         it->second.run(ctx.get(), expected);
     }
     {
+        if (graph_churn) {
+            set_env("LLAMA_RS_FIXED_ROWS", "1");
+            set_env("LLAMA_GRAPH_ANY_SEQS", "1");
+        }
         auto ctx = make_context(split.get(), it->second.shape);
         it->second.run(ctx.get(), actual);
     }
     bool ok = expected.logits.size() == actual.logits.size() && !expected.logits.empty() &&
             expected.states.size() == actual.states.size() && !expected.states.empty();
+    if (graph_churn) {
+        fprintf(stderr, "inkling2 split %s: %d of 23 changed session pairs reused a graph (baseline %d)\n",
+                name.c_str(), actual.reused, expected.reused);
+        ok = ok && actual.reused == 22 && expected.reused == 0;
+    }
     const double logits_nmse = ok ? nmse(expected.logits, actual.logits) : INFINITY;
     ok = ok && logits_nmse <= tolerance;
     fprintf(stderr, "inkling2 split %s, %zu ranks: %zu logits, NMSE %g (at most %g)\n", name.c_str(), devs.size(),

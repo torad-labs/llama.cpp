@@ -18,6 +18,59 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// Relative position bias (ggml_flash_attn_ext_add_rel_pos): the logit of Q row i of head h at KV cell j gets
+// table[d, h, i, seq] with d = q_pos[i, seq] - kv_pos[j, seq % ne81]. The out-of-range bias is the sentinel or zero.
+struct fattn_rel_pos {
+    const float   * table = nullptr; // nullptr: no bias
+    const int32_t * q_pos = nullptr;
+    const int32_t * kv_pos = nullptr;
+    int32_t extent = 0;
+    int32_t sink_stride = 0;         // query-specific sinks, in floats per row
+    int32_t s_head = 0;              // table strides in floats
+    int32_t s_row = 0;
+    int64_t s_seq = 0;
+    int32_t s_q_pos = 0;             // q_pos stride of a sequence
+    int32_t s_kv_pos = 0;            // kv_pos stride of a sequence
+    int32_t ne81 = 1;                // kv_pos sequences
+    bool shift_sinks = false;
+};
+
+static inline bool ggml_cuda_fattn_shift_query_sinks() {
+    static const bool native = ggml_env_switch("GGML_CUDA_FATTN_NATIVE_SINKS");
+    return !native;
+}
+
+// The bias of one Q head of one sequence: rows and cells index it as they index the mask.
+struct fattn_rel_pos_head {
+    const float   * table = nullptr;
+    const float   * shift = nullptr;
+    const int32_t * q_pos = nullptr;
+    const int32_t * kv_pos = nullptr;
+    int32_t extent = 0;
+    int32_t sink_stride = 0;
+    int32_t s_row = 0;
+
+    __device__ __forceinline__ float operator()(const int row, const int cell) const {
+        const int32_t q = q_pos[row], k = kv_pos[cell];
+        const uint32_t d = uint32_t(q) - uint32_t(k);
+        const float * entries = table + int64_t(row)*s_row;
+        return q >= k && d < uint32_t(extent) ? entries[d] : (sink_stride ? 0.0f : entries[extent]);
+    }
+};
+
+static __device__ __forceinline__ fattn_rel_pos_head fattn_rel_pos_at(const fattn_rel_pos & rel, const int head, const int sequence) {
+    fattn_rel_pos_head r;
+    if (rel.table) {
+        r.table  = rel.table + sequence*rel.s_seq + int64_t(head)*rel.s_head;
+        r.q_pos  = rel.q_pos + int64_t(sequence)*rel.s_q_pos;
+        r.kv_pos = rel.kv_pos + int64_t(sequence % rel.ne81)*rel.s_kv_pos;
+        r.extent = rel.extent;
+        r.sink_stride = rel.sink_stride;
+        r.s_row  = rel.s_row;
+    }
+    return r;
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -42,7 +95,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int64_t nb32, const int64_t nb33,
-        const int32_t mask_packed);
+        const int32_t mask_packed,
+        const fattn_rel_pos rel);
 
 // The mask is f16 additive values or bit-packed (GGML_TYPE_I16: 16 KV cells per 16-bit word, LSB first, bit set = attend).
 // A row is nb31 bytes in both layouts, so a row stride in halves is the row stride in words.
@@ -1559,7 +1613,7 @@ void launch_fattn(
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
     const ggml_tensor * mask    = dst->src[3];
-    const ggml_tensor * sinks   = dst->src[4];
+    const ggml_tensor * sinks   = dst->src[9] ? dst->src[9] : dst->src[4];
     const ggml_tensor * direct = dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE ? dst->src[5] : nullptr;
     const ggml_tensor * sparse_shape = direct ? direct : mask;
     const ggml_tensor * kv_rows = dst->op == GGML_OP_FLASH_ATTN_EXT ? dst->src[5] : nullptr; // src[5] of a sparse op is its indices
@@ -1973,6 +2027,25 @@ void launch_fattn(
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
+    fattn_rel_pos rel;
+    if (const ggml_tensor * table = dst->op == GGML_OP_FLASH_ATTN_EXT ? dst->src[6] : nullptr) {
+        const ggml_tensor * q_pos  = dst->src[7];
+        const ggml_tensor * kv_pos = dst->src[8];
+        GGML_ASSERT(ncols2 == 1 && !kv_rows && !use_sparse); // one Q head a tile, cells as the mask's columns
+        rel.table    = (const float *) table->data;
+        rel.q_pos    = (const int32_t *) q_pos->data;
+        rel.kv_pos   = (const int32_t *) kv_pos->data;
+        rel.sink_stride = dst->src[9] ? dst->src[9]->ne[0] : 0;
+        rel.extent   = table->ne[0] - (rel.sink_stride ? 0 : 1);
+        rel.shift_sinks = rel.sink_stride && ggml_cuda_fattn_shift_query_sinks();
+        rel.s_head   = table->nb[1] / sizeof(float);
+        rel.s_row    = table->nb[2] / sizeof(float);
+        rel.s_seq    = table->nb[3] / sizeof(float);
+        rel.s_q_pos  = q_pos->nb[1] / sizeof(int32_t);
+        rel.s_kv_pos = kv_pos->nb[1] / sizeof(int32_t);
+        rel.ne81     = kv_pos->ne[1];
+    }
+
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
@@ -1992,7 +2065,8 @@ void launch_fattn(
         nb21, nb22, nb23,
         sparse_shape ? sparse_shape->ne[1] : 0, sparse_shape ? sparse_shape->ne[2] : 0, sparse_shape ? sparse_shape->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        mask_packed ? 1 : 0
+        mask_packed ? 1 : 0,
+        rel
     );
     CUDA_CHECK(cudaGetLastError());
 

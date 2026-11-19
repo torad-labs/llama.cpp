@@ -75,50 +75,83 @@ static int test_parallel_workers(int default_workers) {
     return default_workers;
 }
 
+// n uniform values in [min, max), on up to 4 threads
+static void fill_uniform(float * data, size_t n, float min, float max) {
+    static const size_t max_threads = std::max<size_t>(1, std::min<size_t>(4, N_THREADS/2));
+    const size_t n_threads = std::max<size_t>(1, std::min<size_t>(n/1024, max_threads));
+
+    auto init_thread = [&](size_t start, size_t end) {
+        thread_local std::default_random_engine gen(std::random_device{}());
+        std::uniform_real_distribution<float> distribution(min, max);
+        for (size_t i = start; i < end; i++) {
+            data[i] = distribution(gen);
+        }
+    };
+
+    if (n_threads == 1) {
+        init_thread(0, n);
+        return;
+    }
+    std::vector<std::future<void>> tasks;
+    tasks.reserve(n_threads);
+    for (size_t i = 0; i < n_threads; i++) {
+        tasks.push_back(std::async(std::launch::async, init_thread, i*n/n_threads, (i+1)*n/n_threads));
+    }
+    for (auto & t : tasks) {
+        t.get();
+    }
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
     }
 
     size_t nels = ggml_nelements(tensor);
-    std::vector<float> data(nels);
-    {
-        // parallel initialization
-        static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
-        auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
-            std::uniform_real_distribution<float> distribution(min, max);
-            for (size_t i = start; i < end; i++) {
-                data[i] = distribution(gen);
-            }
-        };
-
-        if (n_threads == 1) {
-            init_thread(0, nels);
+    if (tensor->type == GGML_TYPE_I8 || tensor->type == GGML_TYPE_I16 || tensor->type == GGML_TYPE_I64) {
+        // the float values' bytes, reinterpreted: this is going to create some weird integers though
+        std::vector<float> data(nels);
+        fill_uniform(data.data(), nels, min, max);
+        if (tensor->type == GGML_TYPE_I64) {
+            // Integers with a size of 8 bytes can be set by mirroring the float data, the specific values are again not really meaningful.
+            const size_t nbytes_half = nels * sizeof(float);
+            ggml_backend_tensor_set(tensor, data.data(), 0*nbytes_half, nbytes_half);
+            ggml_backend_tensor_set(tensor, data.data(), 1*nbytes_half, nbytes_half);
         } else {
-            std::vector<std::future<void>> tasks;
-            tasks.reserve(n_threads);
-            for (size_t i = 0; i < n_threads; i++) {
-                size_t start =     i*nels/n_threads;
-                size_t end   = (i+1)*nels/n_threads;
-                tasks.push_back(std::async(std::launch::async, init_thread, start, end));
-            }
-            for (auto & t : tasks) {
-                t.get();
-            }
+            ggml_backend_tensor_set(tensor, data.data(), 0, nels * ggml_type_size(tensor->type));
         }
+        return;
     }
 
-    if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
-        ggml_backend_tensor_set(tensor, data.data(), 0, nels * sizeof(float));
-    } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
-        GGML_ASSERT(nels % ggml_blck_size(tensor->type) == 0);
+    const bool as_float = tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32;
+    if (!as_float && !(ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16)) {
+        GGML_ABORT("fatal error");
+    }
+    const size_t blck_size = as_float ? 1 : ggml_blck_size(tensor->type);
+    GGML_ASSERT(nels % blck_size == 0);
 
-         // dummy importance matrix
-        std::vector<float> imatrix(tensor->ne[0], 1.0f);
-        const float * im = imatrix.data();
-        if (!ggml_quantize_requires_imatrix(tensor->type)) {
+    // the values are made and quantized whole rows of blocks at a time, about 16M of them: a tensor of billions of
+    // values (384 experts of 2304 x 4608) never stands whole as floats, which would take 16 GB
+    const size_t unit  = tensor->ne[0] % blck_size == 0 ? tensor->ne[0] : tensor->ne[0]*blck_size;
+    const size_t chunk = std::max<size_t>(1, (size_t(1) << 24)/unit)*unit;
+    std::vector<float> data(std::min(nels, chunk));
+    std::vector<uint8_t> dataq;
+
+    // dummy importance matrix
+    std::vector<float> imatrix(tensor->ne[0], 1.0f);
+    const float * im = imatrix.data();
+
+    for (size_t start = 0; start < nels; start += chunk) {
+        const size_t n = std::min(chunk, nels - start);
+        fill_uniform(data.data(), n, min, max);
+
+        if (as_float) {
+            ggml_backend_tensor_set(tensor, data.data(), start * sizeof(float), n * sizeof(float));
+            continue;
+        }
+
+        if (start == 0 && !ggml_quantize_requires_imatrix(tensor->type)) {
             // when the imatrix is optional, we want to test both quantization with and without imatrix
             // use one of the random numbers to decide
             if (data[0] > 0.5f*(min + max)) {
@@ -126,15 +159,14 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
 
-        std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        dataq.resize(ggml_row_size(tensor->type, n));
         {
             // parallel quantization by block
-            size_t blck_size = ggml_blck_size(tensor->type);
-            size_t n_blocks = nels / blck_size;
+            size_t n_blocks = n / blck_size;
 
-            auto quantize_thread = [&](size_t start, size_t end) {
+            auto quantize_thread = [&](size_t bstart, size_t bend) {
                 ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
-                    start * blck_size, end - start, blck_size, im);
+                    bstart * blck_size, bend - bstart, blck_size, im);
             };
 
             const size_t min_blocks_per_thread = 1;
@@ -148,26 +180,16 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
                 std::vector<std::future<void>> tasks;
                 tasks.reserve(n_quant_threads);
                 for (size_t i = 0; i < n_quant_threads; i++) {
-                    size_t start =     i*n_blocks/n_quant_threads;
-                    size_t end   = (i+1)*n_blocks/n_quant_threads;
-                    tasks.push_back(std::async(std::launch::async, quantize_thread, start, end));
+                    size_t bstart =     i*n_blocks/n_quant_threads;
+                    size_t bend   = (i+1)*n_blocks/n_quant_threads;
+                    tasks.push_back(std::async(std::launch::async, quantize_thread, bstart, bend));
                 }
                 for (auto & t : tasks) {
                     t.get();
                 }
             }
         }
-        ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
-    } else if (tensor->type == GGML_TYPE_I8 || tensor->type == GGML_TYPE_I16) {
-        // This is going to create some weird integers though.
-        ggml_backend_tensor_set(tensor, data.data(), 0, nels * ggml_type_size(tensor->type));
-    } else if (tensor->type == GGML_TYPE_I64) {
-        // Integers with a size of 8 bytes can be set by mirroring the float data, the specific values are again not really meaningful.
-        const size_t nbytes_half = nels * sizeof(float);
-        ggml_backend_tensor_set(tensor, data.data(), 0*nbytes_half, nbytes_half);
-        ggml_backend_tensor_set(tensor, data.data(), 1*nbytes_half, nbytes_half);
-    } else {
-        GGML_ABORT("fatal error");
+        ggml_backend_tensor_set(tensor, dataq.data(), ggml_row_size(tensor->type, start), dataq.size());
     }
 }
 
@@ -5626,6 +5648,114 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+struct test_norm_clip : public test_case {
+    const int width;
+    const bool scaled;
+
+    test_norm_clip(int width, bool scaled) : width(width), scaled(scaled) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(width, scaled);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * storage = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width + 3, 6, 23);
+        auto * x = ggml_view_3d(ctx, storage, width, 6, 23, storage->nb[1], storage->nb[2], sizeof(float));
+        auto * scale = scaled ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 3) : nullptr;
+        return ggml_norm_clip(ctx, x, scale, 1.5f, 1e-6f);
+    }
+};
+
+struct test_attn_res_mix : public test_case {
+    const int n_embd, n_src, n_query, n_tokens;
+    const bool strided;
+
+    test_attn_res_mix(int n_embd, int n_src, int n_query, int n_tokens, bool strided = false)
+        : n_embd(n_embd), n_src(n_src), n_query(n_query), n_tokens(n_tokens), strided(strided) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, n_src, n_query, n_tokens, strided);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_query);
+        std::vector<ggml_tensor *> sources(n_src);
+        for (int s = 0; s < n_src; ++s) {
+            const int pad = strided ? s + 1 : 0;
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + pad, n_tokens);
+            sources[s] = pad ? ggml_view_2d(ctx, x, n_embd, n_tokens, x->nb[1], sizeof(float)) : x;
+        }
+        return ggml_attn_res_mix(ctx, query, sources.data(), n_src, 1.0f/sqrtf((float) n_embd), 1e-6f);
+    }
+};
+
+struct test_short_conv : public test_case {
+    const int64_t channels, n_tokens, n_seqs, dynamic_heads;
+
+    test_short_conv(int64_t channels, int64_t n_tokens, int64_t n_seqs, int64_t dynamic_heads)
+        : channels(channels), n_tokens(n_tokens), n_seqs(n_seqs), dynamic_heads(dynamic_heads) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(channels, n_tokens, n_seqs, dynamic_heads);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int k = 4;
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_tokens + k - 1, channels, n_seqs);
+        auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, channels);
+        auto * d = dynamic_heads ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k*dynamic_heads, n_tokens*n_seqs) : nullptr;
+        return ggml_short_conv(ctx, x, w, d, 1.0f/sqrtf((d ? 2 : 1)*k + 1));
+    }
+};
+
+// GGML_OP_SHORT_CONV behind Inkling's convolve chain (inkling2.cpp): CONCAT(history rows, the transposed new rows) ->
+// SHORT_CONV, and build_conv_state_store reads the window's tail back out of the CONCAT after the conv. CUDA runs
+// the pair as one kernel that reads the CONCAT's two sources and writes the joined window itself
+// (ggml_cuda_try_short_conv_window). The output carries that tail beside the conv output: a window the kernel did
+// not write, or wrote at a wrong column, fails beside a wrong convolution. The history rows sit at a channel offset
+// inside a wider state row, as one stream of a layer's four does; with strided the new rows are a permuted view.
+struct test_short_conv_window : public test_case {
+    const int64_t channels, n_tokens, n_seqs, dynamic_heads, k;
+    const bool strided;
+
+    test_short_conv_window(int64_t channels, int64_t n_tokens, int64_t n_seqs, int64_t dynamic_heads, bool strided,
+            int64_t k = 4)
+        : channels(channels), n_tokens(n_tokens), n_seqs(n_seqs), dynamic_heads(dynamic_heads), k(k), strided(strided) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SHORT_CONV_WINDOW";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(channels, n_tokens, n_seqs, dynamic_heads, strided, k);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * hist = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k - 1, channels + 7, n_seqs);
+        auto * past = ggml_view_3d(ctx, hist, k - 1, channels, n_seqs, hist->nb[1], hist->nb[2], 7*hist->nb[1]);
+        ggml_tensor * input;
+        if (strided) {
+            auto * store = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_seqs, n_tokens);
+            input = ggml_permute(ctx, store, 0, 2, 1, 3);
+        } else {
+            input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_tokens, n_seqs);
+        }
+        auto * window = ggml_concat(ctx, past, ggml_transpose(ctx, input), 0);
+        auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, channels);
+        // the dynamic taps come out of a projection in the model, whose node graph expansion puts between the
+        // CONCAT and the SHORT_CONV; a leaf here would let the fusion match graphs the model never builds
+        auto * d = dynamic_heads ? ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k*dynamic_heads, n_tokens*n_seqs), 1.0f) : nullptr;
+        auto * conv = ggml_short_conv(ctx, window, w, d, 1.0f/sqrtf((d ? 2 : 1)*k + 1));
+        auto * tail = ggml_cont(ctx, ggml_view_3d(ctx, window, k - 1, channels, n_seqs,
+                window->nb[1], window->nb[2], ggml_row_size(GGML_TYPE_F32, n_tokens)));
+        return ggml_concat(ctx, ggml_reshape_1d(ctx, conv, ggml_nelements(conv)),
+                ggml_reshape_1d(ctx, tail, ggml_nelements(tail)), 0);
+    }
+};
+
 // GGML_OP_SSM_CONV + SILU behind build_conv_state's chain (delta-net-base.cpp): GET_ROWS(cache, ids) -> RESHAPE ->
 // CONCAT(state, TRANSPOSE(x)) -> a CPY of a window into the cache per rollback snapshot, which
 // CUDA runs as one kernel at the SSM_CONV (ggml_cuda_try_ssm_conv_state_update), with Qwen3.5's joint q/k L2_NORM over
@@ -9516,6 +9646,75 @@ struct test_topk_moe : public test_case {
     }
 };
 
+// a whole MoE block as Inkling 2 builds it: the router chain of test_topk_moe in F32 (sigmoid scores, a selection
+// bias, the sum plus an epsilon, a scale), the experts' merged gate and up projection, the softcapped SITU, the down
+// projection, and the weighted sum over the selected experts. With split, gate and up are two products over the halves
+// of the merged experts, their views placed first, as the graph builds them at few rows so that the CUDA backend runs
+// them with the SITU as one gated mat-vec
+struct test_moe : public test_topk_moe {
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const ggml_type type;
+    const bool split;
+    ggml_tensor * out {};
+    std::vector<ggml_tensor *> first;
+
+    test_moe(int64_t n_expert, int n_expert_used, int64_t n_tokens, int64_t n_embd, int64_t n_ff, ggml_type type, bool split) :
+        test_topk_moe({n_expert, n_tokens, 1, 1}, n_expert_used, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true),
+        n_embd(n_embd), n_ff(n_ff), type(type), split(split) {}
+
+    std::string vars() override { return VARS_TO_STR7(ne, n_expert_used, n_embd, n_ff, type, scale_w, split); }
+
+    std::vector<ggml_tensor *> forward_first() override { return first; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE";
+    }
+
+    // as test_mul_mat_id: the CUDA backend's F32 expert products read 2.5e-6 against the CPU, past a 1e-6 bar
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tokens = ne[1];
+        ggml_tensor * w = test_topk_moe::build_graph(ctx); // [1, n_expert_used, n_tokens]
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_tensor * gate_up_exps = ggml_new_tensor_3d(ctx, type, n_embd, 2*n_ff, ne[0]);
+        ggml_tensor * down_exps = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, ne[0]);
+        ggml_tensor * gate;
+        ggml_tensor * up;
+        if (split) {
+            const size_t nb1 = gate_up_exps->nb[1], nb2 = gate_up_exps->nb[2];
+            ggml_tensor * up_w = ggml_view_3d(ctx, gate_up_exps, n_embd, n_ff, ne[0], nb1, nb2, n_ff*nb1);
+            ggml_tensor * gate_w = ggml_view_3d(ctx, gate_up_exps, n_embd, n_ff, ne[0], nb1, nb2, 0);
+            first = { up_w, gate_w };
+            if (gf) {
+                ggml_build_forward_expand(gf, up_w);
+                ggml_build_forward_expand(gf, gate_w);
+            }
+            up = ggml_mul_mat_id(ctx, up_w, x, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            gate = ggml_mul_mat_id(ctx, gate_w, x, selected_experts);
+        } else {
+            ggml_tensor * gate_up = ggml_mul_mat_id(ctx, gate_up_exps, x, selected_experts); // [2*n_ff, n_expert_used, n_tokens]
+            gate = ggml_view_3d(ctx, gate_up, n_ff, n_expert_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
+            up = ggml_view_3d(ctx, gate_up, n_ff, n_expert_used, n_tokens, gate_up->nb[1], gate_up->nb[2],
+                    n_ff*gate_up->nb[0]);
+        }
+        ggml_tensor * h = ggml_situ_split(ctx, gate, up, 4.0f, 8.0f);
+        ggml_tensor * experts = ggml_mul(ctx, ggml_mul_mat_id(ctx, down_exps, h, selected_experts), w); // [n_embd, n_expert_used, n_tokens]
+        out = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0);
+        for (int i = 1; i < n_expert_used; ++i) {
+            out = ggml_add(ctx, out, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    double err(const float * a, const float * b, size_t n) override { return nmse(a, b, n); }
+};
+
 struct test_moe_reduce : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -11405,6 +11604,118 @@ struct test_flash_attn_ext_kv_rows : public test_case {
                 std::vector<ggml_fp16_t> h(f.size());
                 ggml_fp32_to_fp16_row(f.data(), h.data(), f.size());
                 ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_FLASH_ATTN_EXT with a relative position bias (ggml_flash_attn_ext_add_rel_pos): each logit gets the table
+// entry of its distance, q_pos - kv_pos, or the last entry when the distance is negative or past the table
+struct test_flash_attn_ext_rel_pos : public test_case {
+    const int64_t hs;
+    const int64_t nh;       // K/V heads
+    const int64_t gqa;
+    const int64_t kv;       // cells per stream
+    const int64_t nb;       // queries per stream
+    const int64_t n_stream;
+    const int64_t n_dist;   // table entries, including the sentinel for scalar sinks
+    const ggml_type type_KV;
+    const bool sinks;
+    const bool mask_bits; // bit-packed mask (GGML_TYPE_I16, 16 cells per element)
+
+    const bool query_sinks;
+    const int n_kv_max;
+
+    std::string vars() override {
+        return VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_dist, type_KV, sinks, mask_bits, query_sinks, n_kv_max);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_rel_pos(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 6, int64_t kv = 2048, int64_t nb = 32,
+                                int64_t n_stream = 1, int64_t n_dist = 1025, ggml_type type_KV = GGML_TYPE_F16, bool sinks = true,
+                                bool mask_bits = false, bool query_sinks = false, int n_kv_max = 0)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_dist(n_dist), type_KV(type_KV), sinks(sinks),
+          mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, n_stream);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, n_stream);
+        GGML_ASSERT(!mask_bits || kv % 16 == 0);
+        ggml_tensor * m = mask_bits ? ggml_new_tensor_4d(ctx, GGML_TYPE_I16, kv/16, nb, 1, n_stream)
+                                    : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, n_stream);
+        ggml_set_name(m, "m");
+        ggml_tensor * table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_dist, nh*gqa, nb, n_stream);
+        ggml_tensor * q_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nb, n_stream);
+        ggml_set_name(q_pos, "q_pos");
+        ggml_tensor * kv_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, n_stream);
+        ggml_set_name(kv_pos, "kv_pos");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        if (sinks && !query_sinks) {
+            ggml_flash_attn_ext_add_sinks(out, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh*gqa));
+        }
+        ggml_flash_attn_ext_add_rel_pos(out, table, q_pos, kv_pos);
+        if (query_sinks) {
+            auto * sink = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh*gqa, nb, 1, n_stream);
+            ggml_set_name(sink, "q_sinks");
+            ggml_flash_attn_ext_add_rel_pos_sinks(out, sink);
+        }
+        ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x7E1);
+        // per stream: the cells hold shuffled positions, a few empty (-1); the queries follow the last position, so
+        // distances run from 0 to past the table and the empty cells give negative ones
+        std::vector<int32_t> cells(kv*n_stream), queries(nb*n_stream);
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t j = 0; j < kv; ++j) {
+                cells[s*kv + j] = (j + 5*s) % 13 == 0 ? -1 : int32_t(j + s);
+            }
+            std::shuffle(cells.begin() + s*kv, cells.begin() + (s + 1)*kv, gen);
+            for (int64_t i = 0; i < nb; ++i) {
+                queries[s*nb + i] = int32_t(kv + s - nb + i);
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, queries.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "kv_pos") == 0) {
+                ggml_backend_tensor_set(t, cells.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "q_sinks") == 0) {
+                // Vary the sink's share of softmax across heads, queries and streams.
+                std::vector<float> data(ggml_nelements(t));
+                for (float & x : data) {
+                    x = logf(float(kv)) + std::uniform_real_distribution<float>(-5.0f, 5.0f)(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // causal over the cells' positions, empty cells hidden; every row sees the cells before it
+                std::vector<float> f(kv*nb*n_stream, -INFINITY);
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t i = 0; i < nb; ++i) {
+                        int64_t live = 0;
+                        for (int64_t j = 0; j < kv; ++j) {
+                            const int32_t c = cells[s*kv + j];
+                            // Disjoint runs, a shared prefix and a fully masked last row.
+                            const bool owned = !n_kv_max || (i + 1 < nb && (j < 16 || (j/16)%nb == i));
+                            if (owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max)) {
+                                f[(s*nb + i)*kv + j] = 0.0f;
+                                ++live;
+                            }
+                        }
+                    }
+                }
+                set_tensor_kq_mask(t, f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -14611,6 +14922,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int width : {16, 97, 128}) {
+        test_cases.emplace_back(new test_norm_clip(width, false));
+        test_cases.emplace_back(new test_norm_clip(width, true));
+    }
+    test_cases.emplace_back(new test_attn_res_mix(127, 3, 2, 4, true));
+    test_cases.emplace_back(new test_attn_res_mix(97, 1, 4, 3));
+    test_cases.emplace_back(new test_attn_res_mix(4608, 2, 1, 23));
+    test_cases.emplace_back(new test_attn_res_mix(4608, 5, 3, 4));
+    test_cases.emplace_back(new test_attn_res_mix(4608, 9, 3, 23, true));
+
+    test_cases.emplace_back(new test_short_conv(65, 9, 3, 0));
+    test_cases.emplace_back(new test_short_conv(66, 131, 2, 2));
+    test_cases.emplace_back(new test_short_conv(1025, 129, 2, 0));
+    test_cases.emplace_back(new test_short_conv(257, 513, 2, 0));
+    test_cases.emplace_back(new test_short_conv(258, 513, 2, 3));
+    test_cases.emplace_back(new test_short_conv_window(66, 1, 23, 0, false));
+    test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true));
+    test_cases.emplace_back(new test_short_conv_window(256, 5, 3, 2, false));
+    test_cases.emplace_back(new test_short_conv_window(257, 16, 2, 0, true));
+    // past the fused kernel's token cap: the plain CONCAT + SHORT_CONV chain
+    test_cases.emplace_back(new test_short_conv_window(64, 17, 2, 2, false));
+    // three taps, the synthetic fixture's kernel width (the real model's is four)
+    test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true, 3));
+    test_cases.emplace_back(new test_short_conv_window(256, 5, 3, 2, false, 3));
     for (int64_t d_conv : {3, 4, 7, 9}) {
         // 64 and 576: a rank's channels under a tensor split, which fill no whole block of 128 (one KV head of Inkling 2)
         for (int64_t d_inner: {64, 576, 1024, 1536, 2048}) {
@@ -15261,6 +15596,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the batches of a are padded, nb[2] is not a multiple of nb[1]
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 8, 1, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16, 16));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 8, 16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16, 16));
+    for (ggml_type type : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        for (int rows : {17, 23, 32}) {
+            for (bool broadcast : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, broadcast, 256, rows, 512, 0, true));
+            }
+        }
+    }
     // Ragged expert slices, strided routing IDs and broadcast activations.
     for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
         for (int n : {3, 17, 33}) {
@@ -15396,6 +15738,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 2, 3, 5, 8 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, true,  2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 8, false, 4096, n, 2048));
+    }
+    // Inkling 2's routed experts at their real shapes: 384 experts, 8 used, hidden 4,608 to intermediate 2,304 (a token's
+    // vector shared by its experts) and back (a vector each), in the K-quant widths of its packs: one session decoding
+    // (mmvq-moe.cu's ring), 12 rows (mmvq.cu's row kernel or MMQ, as get_mmvq_mmid_max_batch decides), a prompt's ubatch
+    // (MMQ), and Q3_K at three sessions. Each case quantizes 4.1 billion weights on the CPU, 1.5 minutes apiece: the
+    // IQ3_XXS width, whose quantizer is many times slower, is left to the cases of 8 and 32 experts around these
+    for (auto [type, n] : std::vector<std::pair<ggml_type, int>>{
+            {GGML_TYPE_Q4_K, 1}, {GGML_TYPE_Q4_K, 12}, {GGML_TYPE_Q4_K, 128}, {GGML_TYPE_Q3_K, 3}}) {
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, true,  2304, n, 4608));
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, false, 4608, n, 2304));
     }
     // past the ring's 8 tokens (8 tokens x 8 used is its 64 pairs): 9 to 16 go to mmvq.cu's mul_mat_vec_q_moe, a warp a
     // token, and 17 to MMQ. 3 slots at an MTP verify of 3 are 9 tokens, 4 slots 12
@@ -16370,6 +16722,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 4, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
+    // flash attention with a relative position bias (Inkling 2): the global table of the served model past its extent,
+    // the sliding window's short table, several streams, quantized K/V
+    for (int64_t nb : {1, 7, 64, 512}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 6, 2048, nb, 1, 1025));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 6, 2048, nb, 1, 1025, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 6, 1024, nb, 1, 1025, GGML_TYPE_Q4_0, false));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 6, 2048, nb, 1, 1025, GGML_TYPE_F16, true, true));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos( 64, 4, 2,  600, nb, 3,   17));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos( 64, 4, 2,  608, nb, 3,   17, GGML_TYPE_F16, false, true));
+    }
+
+    for (const bool packed : {false, true}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 256, 2, 1, 16, GGML_TYPE_F16, true, packed, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 2048, 2, 1, 16, GGML_TYPE_F16, true, true, true, 32));
+
+    for (int64_t nb : {1, 23, 65}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 512, nb, 2, 16, GGML_TYPE_F16, true, true, true));
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192, 23, 1, 32, type, true, true, true, 1024));
+    }
+
     // flash attention over a list of K/V rows per slice (unified KV cache)
     for (int64_t nb : {1, 3, 8, 64, 512}) {
         for (int64_t n_slices : {1, 4}) {
@@ -16910,6 +17286,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_topk_moe({8, 22, 1, 1}, 4, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
         test_cases.emplace_back(new test_topk_moe({384,  1, 1, 1}, 6, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
     }
+    // Inkling 2's router: 384 experts, top 8, weights scaled by 8
+    for (int64_t n_tokens : {1, 3, 22, 512}) {
+        test_cases.emplace_back(new test_topk_moe({384, n_tokens, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
+    }
+    // and its whole MoE block, at a small hidden size, by row count: one session decoding, three together, a prompt;
+    // split as the graph builds it at few rows (Q4_K: the SITU in the gated mat-vec's epilogue)
+    for (int64_t n_tokens : {1, 3, 64}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_moe(384, 8, n_tokens, 128, 64, type, false));
+        }
+    }
+    for (int64_t n_tokens : {1, 3, 8, 16}) {
+        for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+            test_cases.emplace_back(new test_moe(384, 8, n_tokens, 256, 256, type, true));
+        }
+    }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
@@ -17310,6 +17702,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int n_tokens : {23, 2048}) {
+        for (int n_src : {2, 5, 9}) {
+            for (int n_query : {1, 3}) {
+                test_cases.emplace_back(new test_attn_res_mix(4608, n_src, n_query, n_tokens));
+            }
+        }
+    }
+    for (int n_tokens : {1, 128, 1024, 2048}) {
+        const int n_seqs = n_tokens == 1 ? 23 : 1;
+        test_cases.emplace_back(new test_short_conv(256, n_tokens, n_seqs, 2));
+        test_cases.emplace_back(new test_short_conv(1152, n_tokens, n_seqs, 0));
+    }
+    // the same two decode shapes behind their history CONCAT, which the perf run times as one graph
+    test_cases.emplace_back(new test_short_conv_window(256, 1, 23, 2, false));
+    test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true));
+    // Inkling Q3_K_M, 23 decode rows. TP4 splits 2304 intermediate channels in blocks of 256, with gate and up packed together.
+    for (int64_t n_ff : {512, 768}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 2*n_ff, 23, 4608));
+        for (ggml_type down : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(down, GGML_TYPE_F32, 384, 8, false, 4608, 23, n_ff));
+        }
+    }
+    // Inkling 2's routed experts at their real shapes (384 experts, 8 used, hidden 4,608 to intermediate 2,304 and back) in
+    // Q4_K, past the ring's 8 rows, where MUL_MAT_ID chooses between mmvq.cu's row kernel and MMQ: run once as they are
+    // and once with GGML_CUDA_MMVQ_MMID_MAX=16, the reads set get_mmvq_mmid_max_batch_ada_plus. Each case quantizes 4.1
+    // billion weights at setup, 1.5 minutes apiece
+    for (int rows : {8, 9, 12, 16}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, true,  2304, rows, 4608));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, rows, 2304));
+    }
+    // and its MoE block, its experts merged (one product, then the SITU op) or split (the SITU in the gated mat-vec's
+    // epilogue), at the row kernel's last row count for Q4_K and past it: the reads set llama_inkling2_situ_max_rows
+    for (int64_t rows : {12, 16}) {
+        for (bool split : {false, true}) {
+            test_cases.emplace_back(new test_moe(384, 8, rows, 4608, 2304, GGML_TYPE_Q4_K, split));
+        }
+    }
     for (int64_t pools : {5700, 32768, 65536}) {
         for (int64_t rows : {3, 43}) {
             test_cases.emplace_back(new test_lightning_indexer_rows_padded(pools, rows, 23, 313));

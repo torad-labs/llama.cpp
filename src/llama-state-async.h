@@ -23,6 +23,9 @@ public:
         uint8_t *     ptr;
         size_t        size;
         size_t        offset;
+        size_t        rows = 1;
+        size_t        tensor_stride = 0;
+        size_t        data_stride = 0;
     };
 
     llama_state_async();
@@ -30,7 +33,7 @@ public:
 
     // to_device: host memory is copied to the tensors (a restore) and is only read. Otherwise the tensors are copied to host memory (a save).
     // A copy with no list of device copies (ggml_backend_meta_tensor_ranges) is made here, on the caller's thread.
-    void submit(llama_seq_id seq_id, const std::vector<copy> & copies, bool to_device);
+    void submit(llama_seq_id seq_id, const std::vector<copy> & copies, bool to_device, bool read_split = false);
 
     // seq_id == -1: any copy. A copy from spare rows no sequence holds (llama_context::state_seq_get_data_staged) has a
     // key of its own under -1, staged_key(), so a decode of the sequence does not wait for it.
@@ -43,6 +46,7 @@ private:
     struct job {
         llama_seq_id      seq_id;
         bool              to_device;
+        bool              packed_read = false;
         std::vector<copy> copies;
     };
 

@@ -64,6 +64,12 @@ LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
+// Supply input tensor bytes without storing an intermediate model. The GGUF provides the tensor descriptors.
+using llama_quant_read_tensor = bool (*)(const char * name, size_t offset, void * dst, size_t size, void * user_data);
+LLAMA_API uint32_t llama_model_quantize_with_reader(
+        const char * fname_inp, const char * fname_out, const llama_model_quantize_params * params,
+        llama_quant_read_tensor reader, void * user_data);
+
 struct quantize_state_impl;
 
 LLAMA_API quantize_state_impl * llama_quant_init(

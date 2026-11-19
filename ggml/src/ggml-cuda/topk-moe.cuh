@@ -13,6 +13,7 @@ struct ggml_cuda_topk_moe_args {
     bool delayed_softmax{};
     bool prob_bias{};
     bool norm{};
+    bool norm_eps{};     // the norm adds an epsilon to the sum (a SCALE node) instead of clamping it (a CLAMP node)
     bool scale{};
     int  n_groups{};     // > 0: pick experts only from the top n_group_used expert groups
     int  n_group_used{};

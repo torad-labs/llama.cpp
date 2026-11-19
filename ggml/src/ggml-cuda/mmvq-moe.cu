@@ -98,6 +98,8 @@ struct mmvq_moe_dev_args {
     int                ids_stride;
     int                glu_op;
     float              glu_limit;
+    float              glu_beta;
+    float              glu_lb;
     int                nslots;
     int *              tile_ctr;
     int                y_bytes;     // > 0: the tokens' vectors, [y, y + y_bytes), copied into shared memory past the ring
@@ -586,6 +588,9 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
                             case GGML_GLU_OP_SWIGLU_CLAMP:
                                 result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, a.glu_limit);
                                 break;
+                            case GGML_GLU_OP_SITU:
+                                result = ggml_cuda_op_situ_single(gate_value, result, a.glu_beta, a.glu_lb);
+                                break;
                             default:
                                 result = result * gate_value;
                                 break;
@@ -993,6 +998,8 @@ void ggml_cuda_mmvq_moe(const ggml_cuda_mmvq_moe_args & args, cudaStream_t strea
     a.ids_stride             = (int) args.ids_stride;
     a.glu_op                 = (int) args.glu_op;
     a.glu_limit              = args.glu_limit;
+    a.glu_beta               = args.glu_beta;
+    a.glu_lb                 = args.glu_lb;
     a.nslots                 = p.nslots;
     a.y_bytes                = (int) y_bytes;
     a.y_f32                  = args.y_f32;

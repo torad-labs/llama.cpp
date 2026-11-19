@@ -1162,32 +1162,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 head_cur++;
                 n_tested++;
 
-                //const llama_pos    pos    = ubatch.pos[i];
-                //const llama_seq_id seq_id = ubatch.seq_id[i][0];
-
-                // can we use this cell? either:
-                //  - the cell is empty
-                //  - the cell is occupied only by one sequence:
-                //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
-                //    - mask SWA, using current max pos for that sequence in the cache
-                //                always insert in the cell with minimum pos
                 bool can_use = cells.is_empty(idx);
-
-                if (!can_use && cells.seq_count(idx) == 1) {
-                    const llama_pos pos_cell = cells.pos_get(idx);
-
-                    // (disabled) causal mask
-                    // note: it's better to purge any "future" tokens beforehand
-                    //if (cells.seq_has(idx, seq_id)) {
-                    //    can_use = pos_cell >= pos;
-                    //}
-
-                    if (!can_use) {
-                        const llama_seq_id seq_id_cell = cells.seq_get(idx);
-
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
-                            can_use = true;
+                if (!can_use && swa_type != LLAMA_SWA_TYPE_NONE) {
+                    // A shared row can be reused once it is outside every owner's window.
+                    const llama_pos pos = cells.pos_get(idx);
+                    can_use = true;
+                    for (int owner = 0, remaining = cells.seq_count(idx); remaining > 0; ++owner) {
+                        if (!cells.seq_has(idx, owner)) {
+                            continue;
+                        }
+                        --remaining;
+                        if (!llama_hparams::is_masked_swa(n_swa, swa_type, pos, cells.seq_pos_max(owner) + 1)) {
+                            can_use = false;
+                            break;
                         }
                     }
                 }
@@ -1250,12 +1237,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const auto idx = sinfo.idxs[s][ii];
 
             if (!cells.is_empty(idx)) {
-                assert(cells.seq_count(idx) == 1);
-
-                const llama_seq_id seq_id = cells.seq_get(idx);
-                const llama_pos    pos    = cells.pos_get(idx);
-
-                seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
+                const llama_pos pos = cells.pos_get(idx);
+                for (int owner = 0, remaining = cells.seq_count(idx); remaining > 0; ++owner) {
+                    if (cells.seq_has(idx, owner)) {
+                        --remaining;
+                        seq_pos_max_rm[owner] = std::max(seq_pos_max_rm[owner], pos);
+                    }
+                }
 
                 cells.rm(idx);
             }
@@ -1498,6 +1486,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
         while (pad < result && 2*pad <= n_pad_shared && padded(2*pad) <= n_dense) {
             pad *= 2;
         }
+        result = padded(pad);
+    }
+
+    if (model.arch == LLM_ARCH_INKLING2 && n_swa == 0 && n_stream == 1 && !v_trans && ubatch &&
+            ubatch->n_seqs_unq == 1 && ubatch->n_seq_tokens >= 256 && result >= 32768 &&
+            !layers.empty() && layers[0].k && layers[0].v && type_k() == GGML_TYPE_F16 && type_v() == GGML_TYPE_F16 &&
+            ggml_env_switch("LLAMA_INKLING2_BUCKET_PREFILL_KV")) {
+        // Reuse the long reader's graph within a bucket. The mask still comes from actual cell membership.
+        pad = 8192;
         result = padded(pad);
     }
 
@@ -2368,11 +2365,11 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, cons
                 // for the bookkeeping: without a window the sequence's bits are the row there, read in one word instead of
                 // 64 cells' positions and sequence sets. The groups with a later position (the batch's own cells, the cells
                 // a rejected draft freed and the batch took) are scanned 16 cells at a time
-                if (args.seq_bits && !swa) {
+                if (args.seq_bits) {
                     for (; j0 + 64 <= n_kv; j0 += 64) {
                         const uint64_t bits = cells.seq_cells64(seq_id, j0/64);
 
-                        if (bits == 0 || cells.pos_max64(j0/64) < p_idx) {
+                        if (bits == 0 || (!swa && cells.pos_max64(j0/64) < p_idx)) {
                             for (uint32_t k = 0; k < 64; k += 16) {
                                 st.keep_n(idst + j0 + k, (uint32_t) (bits >> k) & 0xffff, 16);
                             }
@@ -2524,6 +2521,40 @@ void llama_kv_cache_set_input_kq_mask(
         causal_attn = swa_type != LLAMA_SWA_TYPE_NONE;
     }
 
+    // At the tip of a sequence only the sliding window can hide any of its cells.
+    const bool standard_window = causal_attn && swa_type == LLAMA_SWA_TYPE_STANDARD &&
+            n_swa > 0 && n_swa <= INT32_MAX && !block_uniform;
+    if (dst->type == GGML_TYPE_I16 && seq_bits && !scan_cells && !rows && !hparams.use_alibi &&
+            (swa_type == LLAMA_SWA_TYPE_NONE || standard_window) && !ubatch->is_pos_2d()) {
+        bool complete = true;
+        for (uint32_t i = 0; causal_attn && i < n_tokens; ++i) {
+            const auto seq = ubatch->seq_id[i][0];
+            if (ubatch->pos[i] < v_cells.at(seq_to_stream.at(seq)).seq_pos_max(seq)) {
+                complete = false;
+                break;
+            }
+        }
+        if (complete) {
+            auto * data = static_cast<uint16_t *>(dst->data);
+            const size_t words = dst->ne[0];
+            const auto copy_rows = [&](int64_t first, int64_t end, int) {
+                for (int64_t i = first; i < end; ++i) {
+                    const auto seq = ubatch->seq_id[i][0];
+                    const auto & cells = v_cells.at(seq_to_stream.at(seq));
+                    const llama_pos p_min = standard_window ? std::max<int64_t>(0, int64_t(ubatch->pos[i]) + 1 - n_swa) : 0;
+                    cells.copy_seq_mask(seq, data + i*words, words, p_min, n_swa);
+                }
+            };
+            if (causal_attn) {
+                // Each row is at its sequence tip. Copy the decode rows without starting a team of threads.
+                copy_rows(0, n_tokens, 0);
+            } else {
+                llama_host_rows(n_tokens, words*sizeof(uint16_t), copy_rows);
+            }
+            return;
+        }
+    }
+
     const args_set_input_attn_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
@@ -2632,6 +2663,18 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
         }
     }
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
+void llama_kv_cache::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ubatch->n_tokens % dst->ne[1] == 0);
+    const int64_t n_kv  = dst->ne[0];
+    const int64_t n_tps = ubatch->n_tokens/dst->ne[1];
+    for (int64_t s = 0; s < dst->ne[1]; ++s) {
+        // a stream of the ubatch is the stream of its first token's sequence, as in the KQ mask
+        const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[s*n_tps][0]));
+        GGML_ASSERT(n_kv <= cells.size());
+        ggml_backend_tensor_set(dst, cells.positions().data(), s*dst->nb[1], n_kv*sizeof(llama_pos));
+    }
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
@@ -3793,6 +3836,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_cell_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

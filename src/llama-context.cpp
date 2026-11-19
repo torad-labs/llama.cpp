@@ -252,6 +252,24 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_flash_attn_rel_pos_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_REL_POS,
+    /*.name             =*/ "Flash Attention with relative position bias",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_inkling2_layer_probe = {
+    /*.op               =*/ LLM_FUSED_OP_INKLING2_LAYER,
+    /*.name             =*/ "fused Inkling 2 layer ops",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_inkling2_conv_probe = {
+    /*.op               =*/ LLM_FUSED_OP_INKLING2_CONV,
+    /*.name             =*/ "fused Inkling 2 short convolution",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
     /*.name             =*/ "Lightning Indexer",
@@ -634,6 +652,19 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
         }
+
+        // Inkling 2 adds its relative position bias inside the attention kernel, from the bias table and the positions of
+        // the queries and the cache cells. LLAMA_INKLING2_REL_POS_LEGACY=1 builds the bias of every cell on the host graph
+        // and adds it to the mask instead (the oracle the tests compare against)
+        cparams.fused_rel_pos = false;
+        cparams.auto_frel     = model.arch == LLM_ARCH_INKLING2 && !ggml_env_switch("LLAMA_INKLING2_REL_POS_LEGACY");
+        // its residual depth mix, norm clips and output gate run as one op each; LLAMA_INKLING2_FUSE_LEGACY=1 builds them
+        // from elementwise ops
+        cparams.fused_inkling2 = false;
+        // and each short convolution as one op; LLAMA_INKLING2_CONV_LEGACY=1 builds it from ssm_conv and elementwise ops
+        cparams.fused_inkling2_conv = false;
+        cparams.auto_fconv = model.arch == LLM_ARCH_INKLING2 && !ggml_env_switch("LLAMA_INKLING2_CONV_LEGACY");
+        cparams.auto_finkling2 = model.arch == LLM_ARCH_INKLING2 && !ggml_env_switch("LLAMA_INKLING2_FUSE_LEGACY");
     }
 
     // initialized later
@@ -808,6 +839,8 @@ llama_context::llama_context(
             /*.n_swa_mtp =*/ cparams.n_swa_mtp,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
             /*.no_alloc  =*/ model.no_alloc(),
+            /*.type_k_swa =*/ params.type_k_swa == GGML_TYPE_COUNT ? params.type_k : params.type_k_swa,
+            /*.type_v_swa =*/ params.type_v_swa == GGML_TYPE_COUNT ? params.type_v : params.type_v_swa,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -911,10 +944,9 @@ llama_context::llama_context(
 
         sched_reserve();
 
-        if (!cparams.flash_attn) {
-            if (ggml_is_quantized(params.type_v)) {
-                throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
-            }
+        if (!cparams.flash_attn && (ggml_is_quantized(params.type_v) || (hparams.is_swa_any() &&
+                params.type_v_swa != GGML_TYPE_COUNT && ggml_is_quantized(params.type_v_swa)))) {
+            throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
         }
     }
 
@@ -1019,6 +1051,26 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.auto_fkvr = false;
     }
 
+    // the fallback adds the bias of every cell to the mask; it runs over the K/V row lists, which the kernel does not
+    if (cparams.auto_frel) {
+        cparams.fused_rel_pos = cparams.flash_attn && !cparams.fused_kv_rows;
+        resolve(llm_fused_op_flash_attn_rel_pos_probe, cparams.fused_rel_pos);
+        cparams.auto_frel = false;
+    }
+
+    // a layer whose fused ops land on another device than the layer is reported and built from elementwise ops
+    if (cparams.auto_finkling2) {
+        cparams.fused_inkling2 = true;
+        resolve(llm_fused_op_inkling2_layer_probe, cparams.fused_inkling2);
+        cparams.auto_finkling2 = false;
+    }
+
+    if (cparams.auto_fconv) {
+        cparams.fused_inkling2_conv = true;
+        resolve(llm_fused_op_inkling2_conv_probe, cparams.fused_inkling2_conv);
+        cparams.auto_fconv = false;
+    }
+
     if (cparams.auto_flid) {
         LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
         resolve(llm_fused_op_lid_probe, cparams.fused_lid);
@@ -1052,7 +1104,7 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             ggml_tensor * src = node->src[j];
             if (!src) {
-                break;
+                continue;
             }
             if (src->flags & GGML_TENSOR_FLAG_INPUT) {
                 users[src].push_back(node);
@@ -4493,10 +4545,12 @@ llm_graph_params llama_context::graph_params(
             nextn_mode, nextn_store->t, &nextn_base, &nextn_src, nextn_store->n_batch, nextn_store->n_carry,
             nextn_store->n_devices, &nextn_store->owners, &nextn_store->carry, nextn_store->n_host },
     };
-    // the hybrid memory only: its inputs check what they hold of a set (tests/test-recurrent-state-rollback.cpp), and a
-    // cache that keeps a sequence's rows by its place (DeepSeek V4's) gave another set's logits with it
-    params.any_seqs = graph_any_seqs && cparams.kv_unified && cparams.n_seq_devices == 1 &&
-                      dynamic_cast<const llama_memory_hybrid *>(memory.get()) != nullptr;
+    if (graph_any_seqs && cparams.kv_unified && cparams.n_seq_devices == 1) {
+        // Inkling reads and writes its fixed convolution rows through indices supplied with each batch.
+        const auto * iswa = dynamic_cast<const llama_memory_hybrid_iswa *>(memory.get());
+        params.any_seqs = dynamic_cast<const llama_memory_hybrid *>(memory.get()) != nullptr ||
+                          (model.arch == LLM_ARCH_INKLING2 && iswa && iswa->get_mem_recr()->is_fixed_rows());
+    }
     params.candidates_only = model.arch == LLM_ARCH_GLM5NEXT && model.output_draft &&
                              cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.n_out_candidates > 0 &&
                              sampling.samplers.empty() && n_outputs > 0 && ubatch.output && ubatch.seq_id;
@@ -6128,6 +6182,8 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.type_s                      =*/ GGML_TYPE_F32,
+        /*.type_k_swa                  =*/ GGML_TYPE_COUNT,
+        /*.type_v_swa                  =*/ GGML_TYPE_COUNT,
         /*.type_idx                    =*/ GGML_TYPE_F16,
         /*.path_kv_mean_center         =*/ nullptr,
         /*.moe_cache_size              =*/ 0,
@@ -6186,8 +6242,12 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
-        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+    const ggml_type k_swa = params.type_k_swa == GGML_TYPE_COUNT ? params.type_k : params.type_k_swa;
+    const ggml_type v_swa = params.type_v_swa == GGML_TYPE_COUNT ? params.type_v : params.type_v_swa;
+    const bool has_swa = model->hparams.is_swa_any();
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) &&
+            (params.type_k != params.type_v || (has_swa && k_swa != v_swa))) {
+        LLAMA_LOG_ERROR("%s: model requires matching K and V cache types for each attention layer\n", __func__);
         return nullptr;
     }
 
@@ -6201,7 +6261,14 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    const bool fp8_cache = params.type_k == GGML_TYPE_F8_E4M3 || params.type_v == GGML_TYPE_F8_E4M3;
+    const auto type_k_of = [&](uint32_t il) {
+        return model->hparams.is_swa(il) ? k_swa : params.type_k;
+    };
+    const auto type_v_of = [&](uint32_t il) {
+        return model->hparams.is_swa(il) ? v_swa : params.type_v;
+    };
+    const bool fp8_cache = params.type_k == GGML_TYPE_F8_E4M3 || params.type_v == GGML_TYPE_F8_E4M3 ||
+            (has_swa && (k_swa == GGML_TYPE_F8_E4M3 || v_swa == GGML_TYPE_F8_E4M3));
     // Direct cache consumers do not use the shared attention scaling helpers.
     if (fp8_cache && (model->hparams.is_mla() ||
             model->arch == LLM_ARCH_DEEPSEEK32 ||
@@ -6226,7 +6293,8 @@ llama_context * llama_init_from_model(
                 continue;
             }
 
-            for (ggml_tensor * scale : { model->layers[il].k_cache_s, model->layers[il].v_cache_s }) {
+            for (ggml_tensor * scale : { type_k_of(il) == GGML_TYPE_F8_E4M3 ? model->layers[il].k_cache_s : nullptr,
+                                         type_v_of(il) == GGML_TYPE_F8_E4M3 ? model->layers[il].v_cache_s : nullptr }) {
                 if (!scale || !scale->data) {
                     continue;
                 }
@@ -6241,7 +6309,8 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+    const bool quantized_v = ggml_is_quantized(params.type_v) || (has_swa && ggml_is_quantized(v_swa));
+    if (quantized_v && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -6252,23 +6321,23 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_k);
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
+            const uint32_t blck_size = ggml_blck_size(type_k_of(il));
+            if (ggml_is_quantized(type_k_of(il)) && model->hparams.n_embd_head_k(il) % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
-                    __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
+                    __func__, ggml_type_name(type_k_of(il)), blck_size, model->hparams.n_embd_head_k(il));
                 return nullptr;
             }
         }
     }
 
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_v);
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
+            const uint32_t blck_size = ggml_blck_size(type_v_of(il));
+            if (ggml_is_quantized(type_v_of(il)) && model->hparams.n_embd_head_v(il) % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
-                    __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
+                    __func__, ggml_type_name(type_v_of(il)), blck_size, model->hparams.n_embd_head_v(il));
                 return nullptr;
             }
         }

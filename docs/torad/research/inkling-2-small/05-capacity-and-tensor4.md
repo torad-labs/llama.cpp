@@ -117,19 +117,17 @@ convolutions that write persistent sequence state, so the 8-bit wire needs a fre
 read; and there is no indexer or latent cache, so no GLM-specific reduction settings
 carry over.
 
-## Proposed launcher profiles
+## Launcher profiles
 
-A new `scripts/inkling2/serve.py` by analogy with `scripts/glm53/serve.py`, with dry-run
-plans pinned in its own qualification tests.
+The launcher in `scripts/inkling2/serve.py` pins these plans in its dry-run tests.
 
-- `tensor-4` (default target): a locally converted Q3-class pack from the pinned
+- `tensor-4` (default): a locally converted Q3_K_M pack from the pinned
   `benthecarman/Inkling-2-Small-abliterated` revision, plus the F16 mmproj converted from
   the same source; `-sm tensor` with equal splits; flash attention on; F16 KV until the
-  Q8_0 leg reads clean; 23 reserved slots; slot context 262,144; pool starting at
-  2,359,296 tokens (nine full sessions) until the load leg justifies more; unified KV;
-  prompt cache RAM 32,768 MiB; batching, prompt step and prompt chunk starting at the GLM
-  values of 2,048, 1,024 and 128 as first reads, not conclusions; reduction wire BF16 until
-  its quality leg; sampling defaults at temperature 1.0, top-p 1.0, top-k 0, min-p 0;
+  Q8_0 leg reads clean. The 23 slots share 3,014,656 tokens. Each slot has one 294,912-token window shared across the conversation, with no separate reply quota.
+  The pool holds ten such independent sessions at once. The profile uses unified KV,
+  262,144 MiB of host prompt cache, a 2,048-token batch, a 1,024-token prompt step, 128-token
+  prompt chunks, and sliced host staging with a BF16 reduction wire. Sampling defaults to temperature 1.0, top-p 1.0, top-k 0 and min-p 0, with
   reasoning effort left to the template default of high.
 - `tensor-4-capacity`: a locally converted IQ3-class abliterated pack with Q8_0 KV and a
   larger pool, for when session depth matters more than the last quality points.

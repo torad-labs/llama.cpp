@@ -1,0 +1,10 @@
+layout,tensor_bytes,kernel,captured_launches,graph_replays,eager_calls,compared_words
+decode23,423936,host-sliced,4,3,2,2119680
+uneven-middle-empty,424028,generic,4,3,2,2120140
+empty-first-last,639132,generic,4,3,2,3195660
+cross-chunk-unaligned,2857580,generic,12,3,2,14287900
+aligned-phase-tail,2859440,host-sliced,12,3,2,14297200
+aligned-empty-first-last,1198080,host-sliced,8,3,2,5990400
+prefill2048,37748736,host-sliced,144,3,2,188743680
+middle-axis,142784,host-sliced,4,3,2,713920
+outer-axis,423936,host-sliced,4,3,2,2119680

@@ -26,7 +26,7 @@ bool ggml_cuda_ar_allreduce(
     ggml_cuda_ar_pipeline * pipeline,
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors,
-    const ggml_cgraph * const * next = nullptr);
+    const ggml_cgraph * const * next = nullptr, bool owned_rows = false);
 
 // In-place exact gather across tensors[0..n_devices-1]: each holds its device's part and zero bits elsewhere, and all end up
 // with the bitwise OR of the shares, 32-bit word by word, on the chunked or LL kernel (capturable). tensors[i] must be
@@ -35,6 +35,9 @@ bool ggml_cuda_ar_allgather(
     ggml_cuda_ar_pipeline * pipeline,
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
+
+// Equal contiguous owner ranges in rank order, in 32-bit words. Zero selects the padded gather.
+size_t ggml_cuda_ar_equal_gather_count(ggml_tensor ** tensors, size_t n_ranks);
 
 // The AllReduce's sum, delivered only to each rank's own elements [begin[i], begin[i] + len[i]) of tensors[i] (same
 // preconditions), with the bits the AllReduce gives them; a rank's other elements keep its share (zeros on an inactive
