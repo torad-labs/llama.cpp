@@ -713,6 +713,12 @@ struct server_prompt {
         return lcp >= (size_t) (n_tokens_input < 0 ? n_tokens() : std::min(n_tokens_input, n_tokens()));
     }
 
+    bool can_append(size_t lcp, size_t n_input) const {
+        return lcp == tokens.size() && lcp < n_input;
+    }
+
+    const common_prompt_checkpoint * checkpoint_before(size_t lcp, size_t n_input, llama_pos pos_next, llama_pos pos_min_thold) const;
+
     server_prompt clone() const {
         return server_prompt {
             tokens.clone(),

@@ -631,6 +631,11 @@ public:
         return chg;
     }
 
+    // Empty cells have position -1.
+    const std::vector<llama_pos> & positions() const {
+        return pos;
+    }
+
     // the cells in groups of 64, for a KQ mask row to take a group whole where no position in it can be masked
     // (llama_kv_cache_set_input_kq_mask): bit k set = cell 64*g + k holds seq_id
     uint64_t seq_cells64(llama_seq_id seq_id, uint32_t g) const {
@@ -638,6 +643,45 @@ public:
         assert(g < pos_max_g.size());
 
         return g < seq_bits[seq_id].size() ? seq_bits[seq_id][g] : 0;
+    }
+
+    // Write the packed mask of a sequence from p_min onwards. No upper bound is needed at the tip of the sequence.
+    void copy_seq_mask(llama_seq_id seq_id, uint16_t * dst, size_t n_words, llama_pos p_min, uint32_t n_swa) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ && n_words*16 <= size());
+        const auto & bits = seq_bits[seq_id];
+        if (bits.empty()) {
+            std::fill_n(dst, n_words, uint16_t(0));
+            return;
+        }
+        const auto & positions = seq_pos[seq_id];
+        if (p_min > 0 && positions.size() > 2*uint64_t(n_swa) && positions.begin()->first < p_min) {
+            // A full-size SWA cache can hold far more expired cells than the window.
+            std::fill_n(dst, n_words, uint16_t(0));
+            for (auto it = positions.lower_bound({p_min, 0}); it != positions.end(); ++it) {
+                const uint32_t cell = it->second;
+                if (cell/16 < n_words) {
+                    dst[cell/16] |= uint16_t(1u << (cell%16));
+                }
+            }
+            return;
+        }
+        const uint16_t one = 1;
+        if (*reinterpret_cast<const unsigned char *>(&one) == 1) {
+            std::memcpy(dst, bits.data(), n_words*sizeof(uint16_t));
+        } else {
+            for (size_t i = 0; i < n_words; ++i) {
+                dst[i] = uint16_t(bits[i/4] >> (16*(i%4)));
+            }
+        }
+        // In a rolling cache only its expired prefix must be cleared.
+        if (p_min > 0) {
+            for (auto it = positions.begin(); it != positions.end() && it->first < p_min; ++it) {
+                const uint32_t cell = it->second;
+                if (cell/16 < n_words) {
+                    dst[cell/16] &= uint16_t(~(1u << (cell%16)));
+                }
+            }
+        }
     }
 
     // no cell among [64*g, 64*g + 64) is at a position above pos_max64(g): raised with every position placed or moved up,

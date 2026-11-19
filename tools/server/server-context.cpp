@@ -2490,6 +2490,9 @@ private:
 
             {
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
+                if (params_base.enable_reasoning == 0 && caps.at("reasoning_effort_none").get<bool>()) {
+                    chat_params.chat_template_kwargs.emplace("enable_thinking", "false");
+                }
                 auto it = params_base.default_template_kwargs.find("preserve_reasoning");
                 bool supported = caps.at("supports_preserve_reasoning").get<bool>();
                 bool specified = params_base.preserve_reasoning_specified;
@@ -2556,7 +2559,7 @@ private:
         }
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    server_slot * get_available_slot(const server_task & task, bool & saved_prompt) {
         server_slot * ret = nullptr;
 
         // before a slot is matched by what it holds
@@ -2668,10 +2671,10 @@ private:
                     reuse_best = std::max(reuse_best, cur.second);
                 }
                 if (prefix_copy() && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
-                        !task.is_parent() && !task.is_child() && !task.is_stateless() && !task.tokens.has_mtmd) {
+                        !task.is_parent() && !task.is_child() && !task.is_stateless() && !task.tokens.has_media()) {
                     const auto lora = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
                     for (const auto & cur : held) {
-                        if (cur.second > donor_reuse && !cur.first->prompt.tokens.has_mtmd &&
+                        if (cur.second > donor_reuse && !cur.first->prompt.tokens.has_media() &&
                                 float(cur.second) / task.tokens.size() > slot_prompt_similarity &&
                                 are_lora_equal(cur.first->lora, lora)) {
                             donor = cur.first;
@@ -2763,6 +2766,7 @@ private:
                 }
                 SLT_TRC(*ret, "cache_exchange task=%d save=%s incoming=%d\n", task.id,
                         server_prompt_cache_result_name(saved), incoming != nullptr);
+                saved_prompt = !incoming && (saved == server_prompt_cache_result::saved || saved == server_prompt_cache_result::already_cached);
                 // The snapshot is consumed only when the new prompt keeps all of it (one token may be re-evaluated for
                 // the logits); a partial match restores a copy, and the snapshot stays for its own conversation.
                 const size_t incoming_lcp = incoming ? incoming->prompt.tokens.get_common_prefix(task.tokens) : 0;
@@ -2815,14 +2819,14 @@ private:
                 source.id, source.prompt.n_tokens(), n_reuse);
     }
 
-    void share_active_prefix(server_slot & recipient) {
+    void share_active_prefix(server_slot & recipient, bool saved_prompt) {
         const auto & task = *recipient.task;
         if (!prefix_copy() || slot_prompt_similarity == 0 || task.id_slot != -1 ||
                 task.type != SERVER_TASK_TYPE_COMPLETION || task.is_parent() || task.is_child() ||
-                task.is_stateless() || !task.params.cache_prompt || task.tokens.has_mtmd ||
+                task.is_stateless() || !task.params.cache_prompt || task.tokens.has_media() ||
                 task.n_tokens() < 2 || task.n_tokens() >= recipient.n_ctx ||
                 recipient.alora_invocation_start >= 0 ||
-                (!recipient.prompt.tokens.empty() && id_slot_copied != recipient.id)) {
+                (!recipient.prompt.tokens.empty() && !saved_prompt && id_slot_copied != recipient.id)) {
             return;
         }
 
@@ -2836,7 +2840,7 @@ private:
                      candidate.state != SLOT_STATE_GENERATING) ||
                     candidate.task->type != SERVER_TASK_TYPE_COMPLETION || candidate.task->is_parent() ||
                     candidate.task->is_child() || candidate.task->is_stateless() ||
-                    !candidate.task->params.cache_prompt || candidate.task->tokens.has_mtmd ||
+                    !candidate.task->params.cache_prompt || candidate.task->tokens.has_media() ||
                     candidate.task->n_tokens() < 2 || candidate.task->n_tokens() >= candidate.n_ctx ||
                     candidate.alora_invocation_start >= 0 || !are_lora_equal(candidate.lora, recipient.lora)) {
                 continue;
@@ -3246,16 +3250,6 @@ private:
             slot.has_next_token = true;
         }
 
-        // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
-            slot.truncated      = true;
-            slot.stop           = STOP_TYPE_LIMIT;
-            slot.has_next_token = false;
-
-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
-        }
-
         // check the limits
         if (slot.stats.n_gen > 0 && slot.has_next_token && !slot.has_budget()) {
             slot.stop           = STOP_TYPE_LIMIT;
@@ -3318,6 +3312,15 @@ private:
             slot.has_next_token = false;
 
             SLT_DBG(slot, "%s", "stopped by EOS\n");
+        }
+
+        if (slot.has_next_token && !params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+            slot.truncated      = true;
+            slot.stop           = STOP_TYPE_LIMIT;
+            slot.has_next_token = false;
+
+            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
+                    slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
         }
 
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
@@ -4486,7 +4489,8 @@ private:
 
                     const int id_task = task.id;
 
-                    server_slot * slot = get_available_slot(task);
+                    bool saved_prompt = false;
+                    server_slot * slot = get_available_slot(task, saved_prompt);
 
                     //
                     // slot scheduling logic
@@ -4528,7 +4532,7 @@ private:
                     }
 
                     if (!slot->task->is_parent()) {
-                        share_active_prefix(*slot);
+                        share_active_prefix(*slot, saved_prompt);
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -5963,28 +5967,13 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & ckpt) {
-                                            const auto & cur = *ckpt;
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
-                                            }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                        }
-                                    );
-
-                                    bool do_reset = it == slot.prompt.checkpoints.rend();
+                                if (pos_min >= pos_min_thold && !slot.prompt.can_append(n_past, slot.task->n_tokens())) {
+                                    const auto * checkpoint = slot.prompt.checkpoint_before(n_past, slot.task->n_tokens(), pos_next, pos_min_thold);
+                                    bool do_reset = !checkpoint;
                                     double ms_restore = 0.0;
 
                                     if (!do_reset) {
-                                        const auto & cur = **it;
+                                        const auto & cur = *checkpoint;
 
                                         // restore the context checkpoint: every slot waits while it is copied to the devices,
                                         // and the line below says how long that took
@@ -6004,7 +5993,7 @@ private:
                                     }
 
                                     if (!do_reset) {
-                                        const auto & cur = **it;
+                                        const auto & cur = *checkpoint;
 
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);

@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "llama-ext.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -17,6 +18,11 @@
 #include <unordered_map>
 #include <fstream>
 #include <filesystem>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 // result of parsing --tensor-type option
 // changes to this struct must also be reflected in src/llama-quant.cpp
@@ -124,7 +130,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
-    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
+    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size] [--tensor-stdin]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -161,6 +167,8 @@ static void usage(const char * executable) {
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("                                      override model metadata by key in the quantized model. may be specified multiple times.\n");
     printf("                                      WARNING: this is an advanced option, use with care.\n");
+    printf("  --tensor-stdin\n");
+    printf("                                      read raw tensor bytes from stdin. Each request on stdout starts with LLAMA_TENSOR and a tab.\n");
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n");
@@ -392,6 +400,15 @@ static bool parse_layer_prune(const char * data, std::vector<int> & prune_layers
 }
 
 // satisfies -Wmissing-declarations
+static bool read_stdin_tensor(const char * name, size_t offset, void * dst, size_t size, void *) {
+    if (offset == 0) {
+        if (std::printf("LLAMA_TENSOR\t%s\n", name) < 0 || std::fflush(stdout) != 0) {
+            return false;
+        }
+    }
+    return std::fread(dst, 1, size, stdin) == size;
+}
+
 int llama_quantize(int argc, char ** argv);
 
 int llama_quantize(int argc, char ** argv) {
@@ -404,13 +421,19 @@ int llama_quantize(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    bool tensor_stdin = false;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
     std::vector<int> prune_layers;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
-        if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
+        if (strcmp(argv[arg_idx], "--tensor-stdin") == 0) {
+            tensor_stdin = true;
+#ifdef _WIN32
+            _setmode(_fileno(stdin), _O_BINARY);
+#endif
+        } else if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
             params.quantize_output_tensor = false;
         } else if (strcmp(argv[arg_idx], "--output-tensor-type") == 0) {
             if (arg_idx < argc-1) {
@@ -649,7 +672,7 @@ int llama_quantize(int argc, char ** argv) {
     {
         const int64_t t_start_us = llama_time_us();
 
-        if (llama_model_quantize(fname_inp.c_str(), fname_out.c_str(), &params)) {
+        if (llama_model_quantize_with_reader(fname_inp.c_str(), fname_out.c_str(), &params, tensor_stdin ? read_stdin_tensor : nullptr, nullptr)) {
             fprintf(stderr, "%s: failed to quantize model from '%s'\n", __func__, fname_inp.c_str());
             return 1;
         }

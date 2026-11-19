@@ -665,6 +665,8 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k_swa = GGML_TYPE_COUNT; // K cache data type of the sliding-window layers, COUNT = cache_type_k
+    ggml_type cache_type_v_swa = GGML_TYPE_COUNT; // V cache data type of the sliding-window layers, COUNT = cache_type_v
     ggml_type cache_type_s = GGML_TYPE_F32; // recurrent state cache data type (Gated DeltaNet / SSM S): f32, f16, bf16, q8_0
     ggml_type cache_type_idx = GGML_TYPE_F16; // sparse-attention indexer cache data type (GLM-5.3 DSA keys and gates): f16, q8_0
 

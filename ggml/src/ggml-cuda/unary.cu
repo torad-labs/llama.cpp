@@ -555,6 +555,80 @@ void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     }
 }
 
+// situ and siglu: one output from a gate and an up value
+
+struct glu_situ_fn {
+    float beta, lb;
+    __device__ float operator()(float gate, float up) const { return ggml_cuda_op_situ_single(gate, up, beta, lb); }
+};
+
+struct glu_siglu_fn {
+    __device__ float operator()(float gate, float up) const { return up / (1.0f + expf(-gate)); }
+};
+
+template <typename T, typename F>
+static __global__ void glu_fn_kernel(const T * gate, const T * up, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, F fn) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+    dst[i] = (T) fn((float) gate[j0], (float) up[j1]);
+}
+
+template <typename T, typename F>
+static void glu_fn_cuda(const ggml_tensor * dst, const int64_t nc, F fn, cudaStream_t stream) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const T * gate = (const T *) src0->data;
+    const T * up   = (const T *) (src1 ? src1->data : src0->data);
+    if (!src1) {
+        const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+        gate += swapped ? nc : 0;
+        up   += swapped ? 0 : nc;
+    }
+    const int64_t k = ggml_nelements(dst);
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    glu_fn_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(gate, up, (T *) dst->data, k, nc,
+        src0->nb[1] / sizeof(T), (src1 ? src1->nb[1] : src0->nb[1]) / sizeof(T), fn);
+}
+
+template <typename F>
+static void ggml_cuda_op_glu_fn(ggml_backend_cuda_context & ctx, ggml_tensor * dst, F fn) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(src0->nb[0] == ggml_element_size(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == ggml_nrows(src0));
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src1->nb[0] == ggml_element_size(src1));
+        GGML_ASSERT(src1->ne[0] == nc);
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    if (src0->type == GGML_TYPE_F16) {
+        glu_fn_cuda<half>(dst, nc, fn, ctx.stream());
+    } else {
+        glu_fn_cuda<float>(dst, nc, fn, ctx.stream());
+    }
+}
+
+void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_glu_fn(ctx, dst, glu_situ_fn{ggml_get_op_params_f32(dst, 2), ggml_get_op_params_f32(dst, 3)});
+}
+
+void ggml_cuda_op_siglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_glu_fn(ctx, dst, glu_siglu_fn{});
+}
+
 /* CUDA kernel + launcher for xIELU */
 
 template <typename T>

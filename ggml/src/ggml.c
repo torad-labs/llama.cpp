@@ -1132,9 +1132,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
     "FLASH_ATTN_EXT_SPARSE",
     "TOP_K_CANDIDATES",
+    "NORM_CLIP",
+    "ATTN_RES_MIX",
+    "SHORT_CONV",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1249,9 +1252,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
     "flash_attn_ext_sparse(x)",
     "top_k_candidates(x)",
+    "norm_clip(x)",
+    "attn_res_mix(x)",
+    "short_conv(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1290,9 +1296,11 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "GEGLU_ERF",
     "GEGLU_QUICK",
     "SWIGLU_CLAMP",
+    "SITU",
+    "SIGLU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+static_assert(GGML_GLU_OP_COUNT == 9, "GGML_GLU_OP_COUNT != 9");
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
@@ -3144,6 +3152,27 @@ struct ggml_tensor * ggml_swiglu_clamp(
     ggml_set_op_params_f32(result, 3, limit);
 
     return result;
+}
+
+struct ggml_tensor * ggml_situ_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 beta,
+        float                 lb) {
+    GGML_ASSERT(beta > 0.0f);
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SITU, false);
+    ggml_set_op_params_f32(result, 2, beta);
+    ggml_set_op_params_f32(result, 3, lb);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_siglu_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SIGLU, false);
 }
 
 // ggml_norm
@@ -5434,6 +5463,89 @@ struct ggml_tensor * ggml_top_k_candidates(
     return result;
 }
 
+// ggml_norm_clip
+
+struct ggml_tensor * ggml_norm_clip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * scale,
+        float                 threshold,
+        float                 eps) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && a->nb[0] == sizeof(float));
+    GGML_ASSERT(threshold > 0.0f && eps >= 0.0f);
+    if (scale) {
+        GGML_ASSERT(scale->type == GGML_TYPE_F32 && scale->nb[0] == sizeof(float));
+        GGML_ASSERT(scale->ne[0] == a->ne[0] && ggml_can_repeat(scale, a));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+    ggml_set_op_params_f32(result, 0, threshold);
+    ggml_set_op_params_f32(result, 1, eps);
+    result->op     = GGML_OP_NORM_CLIP;
+    result->src[0] = a;
+    result->src[1] = scale;
+    return result;
+}
+
+// ggml_attn_res_mix
+
+struct ggml_tensor * ggml_attn_res_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * query,
+        struct ggml_tensor ** sources,
+        int                   n_sources,
+        float                 scale,
+        float                 eps) {
+    GGML_ASSERT(n_sources > 0 && n_sources < GGML_MAX_SRC);
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && ggml_is_contiguous(query) && query->ne[2] == 1 && query->ne[3] == 1);
+    const int64_t n_embd   = query->ne[0];
+    const int64_t n_tokens = sources[0]->ne[1];
+    for (int i = 0; i < n_sources; ++i) {
+        const struct ggml_tensor * x = sources[i];
+        GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
+        GGML_ASSERT(x->ne[0] == n_embd && x->ne[1] == n_tokens && x->ne[2] == 1 && x->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens);
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_f32(result, 1, eps);
+    result->op     = GGML_OP_ATTN_RES_MIX;
+    result->src[0] = query;
+    for (int i = 0; i < n_sources; ++i) {
+        result->src[1 + i] = sources[i];
+    }
+    return result;
+}
+
+// ggml_short_conv
+
+struct ggml_tensor * ggml_short_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * d,
+        float                 scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w));
+    GGML_ASSERT(x->nb[0] == sizeof(float) && x->ne[3] == 1);
+    const int64_t k        = w->ne[0];
+    const int64_t channels = x->ne[1];
+    const int64_t n_t      = x->ne[0] - (k - 1);
+    const int64_t n_s      = x->ne[2];
+    GGML_ASSERT(n_t > 0 && w->ne[1] == channels);
+    if (d) {
+        GGML_ASSERT(d->type == GGML_TYPE_F32 && d->nb[0] == sizeof(float));
+        GGML_ASSERT(d->ne[0] % k == 0 && channels % (d->ne[0]/k) == 0 && d->ne[1] == n_t*n_s);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_t, n_s);
+    ggml_set_op_params_f32(result, 0, scale);
+    result->op     = GGML_OP_SHORT_CONV;
+    result->src[0] = x;
+    result->src[1] = w;
+    result->src[2] = d;
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(
@@ -5578,11 +5690,39 @@ void ggml_flash_attn_ext_add_sinks(
     }
 
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
-    GGML_ASSERT(a->src[4] == NULL);
+    GGML_ASSERT(a->src[4] == NULL && a->src[9] == NULL);
     GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+void ggml_flash_attn_ext_add_rel_pos(
+        struct ggml_tensor * a,
+        struct ggml_tensor * table,
+        struct ggml_tensor * q_pos,
+        struct ggml_tensor * kv_pos) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && a->src[5] == NULL); // not over kv_rows lists
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * k = a->src[1];
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) && table->ne[0] >= 1);
+    GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[2] == q->ne[1] && table->ne[3] == q->ne[3]);
+    GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos));
+    GGML_ASSERT(q_pos->ne[0] == q->ne[1] && q_pos->ne[1] == q->ne[3] && q_pos->ne[2] == 1 && q_pos->ne[3] == 1);
+    GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_pos));
+    GGML_ASSERT(kv_pos->ne[0] == k->ne[1] && q->ne[3] % kv_pos->ne[1] == 0 && kv_pos->ne[2] == 1 && kv_pos->ne[3] == 1);
+
+    a->src[6] = table;
+    a->src[7] = q_pos;
+    a->src[8] = kv_pos;
+}
+
+void ggml_flash_attn_ext_add_rel_pos_sinks(struct ggml_tensor * a, struct ggml_tensor * sinks) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && a->src[6] && !a->src[4] && !a->src[9]);
+    const struct ggml_tensor * q = a->src[0];
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks));
+    GGML_ASSERT(sinks->ne[0] == q->ne[2] && sinks->ne[1] == q->ne[1] && sinks->ne[2] == 1 && sinks->ne[3] == q->ne[3]);
+    a->src[9] = sinks;
 }
 
 void ggml_flash_attn_ext_set_mask_prefix(

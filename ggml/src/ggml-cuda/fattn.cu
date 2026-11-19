@@ -4,6 +4,14 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-rel-decode.cuh"
+#include "fattn-rel-prefill.cuh"
+#include "ggml-attn-mask.h"
+
+// ggml_flash_attn_ext_add_rel_pos: a bias of its own a Q head, which the kernels add as they load the mask
+static bool ggml_cuda_fattn_rel_pos(const ggml_tensor * dst) {
+    return dst->op == GGML_OP_FLASH_ATTN_EXT && dst->src[6] != nullptr;
+}
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // A row with more finite cells than n_kv_max breaks ggml_flash_attn_ext_set_n_kv_max's contract, and its first n_kv_max
@@ -458,8 +466,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
     // a mask with a head dimension is not shared by the Q heads of a K/V head
+    // as is a relative position bias
     bool use_gqa_opt = (mask || dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE) && (!mask || mask->ne[2] == 1) &&
-        max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+        !ggml_cuda_fattn_rel_pos(dst) && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -555,6 +564,9 @@ static bool ggml_cuda_fattn_mma_raw(const int cc, const ggml_tensor * dst) {
 
     if (dst->src[5] != nullptr) {
         return false; // kv_rows (ggml_flash_attn_ext_rows): the f16 path reads K/V through them
+    }
+    if (ggml_cuda_fattn_rel_pos(dst)) {
+        return false; // a bias a Q head: one head a tile, not the raw kernel's GQA tiles
     }
     if (K->type != V->type || K->ne[0] != 256 || V->ne[0] != 256) {
         return false;
@@ -949,6 +961,9 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_REL_DECODE = 500,
+    BEST_FATTN_KERNEL_REL_SHORT  = 510,
+    BEST_FATTN_KERNEL_REL_PREFILL = 520,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -969,7 +984,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -1004,7 +1019,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, if the mask has a head dimension,
     //     or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && !ggml_cuda_fattn_rel_pos(dst) && max_bias == 0.0f &&
+        n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -1213,6 +1229,81 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+static bool ggml_cuda_fattn_may_use_rel_prefill(int device, const ggml_tensor * dst) {
+    static const bool enabled = ggml_env_switch("GGML_CUDA_FATTN_REL_PREFILL_F32");
+    if (!enabled || !ggml_cuda_fattn_rel_pos(dst) || !dst->src[9] || dst->src[4] || dst->src[5] || !dst->src[3]) {
+        return false;
+    }
+    const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
+    // Keep bounded decode and the unmarked 23-session decode batch on their existing kernels.
+    if (q->ne[1] >= 5 && q->ne[1] <= 32 && (ggml_flash_attn_ext_get_n_kv_max(dst) > 0 ||
+            ggml_flash_attn_ext_has_low_mean_mask(dst) || (q->ne[1] == 23 && !ggml_flash_attn_ext_get_mask_prefix(dst)))) {
+        return false;
+    }
+    float params[3];
+    memcpy(params, dst->op_params, sizeof(params));
+    return ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_BLACKWELL && ggml_prec_get_acc(dst) == GGML_PREC_F32 &&
+            params[1] == 0.0f && params[2] == 0.0f && q->ne[1] <= 2048 &&
+            (q->ne[0] == 64 || q->ne[0] == 128) && q->ne[0] == k->ne[0] && k->ne[0] == v->ne[0] &&
+            q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+            k->ne[1] <= INT_MAX - 2048 && k->ne[1] % 16 == 0 && mask->type == GGML_TYPE_I16 &&
+            mask->ne[0]*16 >= k->ne[1] && mask->ne[1] >= q->ne[1];
+}
+
+// The vector and MMA kernels add a relative position bias over a mask without ALiBi, one Q head a tile, as the mask's cells
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel_impl(device, dst);
+    if (!ggml_cuda_fattn_rel_pos(dst)) {
+        return kernel;
+    }
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    if (!dst->src[3] || max_bias != 0.0f || dst->src[5] ||
+            (ggml_flash_attn_ext_get_n_kv_max(dst) > 0 && dst->src[3]->type != GGML_TYPE_I16)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    const auto * q = dst->src[0];
+    const auto * k = dst->src[1];
+    const auto * v = dst->src[2];
+    const int n_live = ggml_flash_attn_ext_get_n_kv_max(dst);
+    const bool sparse_rows = n_live > 0 && int64_t(n_live)*8 <= k->ne[1];
+    const bool sparse_mean = ggml_flash_attn_ext_has_low_mean_mask(dst) && k->type == GGML_TYPE_F16 &&
+            v->type == GGML_TYPE_F16 && q->ne[2] == 6*k->ne[2] && q->ne[1] == 23 && k->ne[1] >= 262144;
+    float softcap;
+    memcpy(&softcap, dst->op_params + 2, sizeof(softcap));
+    const auto * mask = dst->src[3];
+    const bool short_rows = q->ne[1] <= 32 && (k->ne[1] <= FATTN_KQ_STRIDE || (n_live > 0 && n_live <= 32));
+    // The reference mode accumulates in double to diagnose placement-sensitive prefills.
+    static const bool ordered_ref = ggml_env_switch("GGML_CUDA_FATTN_REL_ORDERED_REF");
+    if (kernel != BEST_FATTN_KERNEL_NONE && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_BLACKWELL &&
+            ggml_prec_get_acc(dst) == GGML_PREC_F32 && dst->src[9] && q->ne[3] == 1 && (short_rows || ordered_ref) &&
+            k->ne[1] <= INT_MAX - 1024 && q->ne[1] <= 65535 &&
+            k->ne[1]%32 == 0 && (q->ne[0] == 64 || q->ne[0] == 128) &&
+            q->ne[0] == k->ne[0] && k->ne[0] == v->ne[0] && q->type == GGML_TYPE_F32 &&
+            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) &&
+            v->nb[0] == k->nb[0] && mask->ne[1] >= q->ne[1] && mask->ne[2] == 1 &&
+            mask->ne[0]*(mask->type == GGML_TYPE_I16 ? 16 : 1) >= k->ne[1] &&
+            (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I16) && softcap == 0.0f) {
+        return BEST_FATTN_KERNEL_REL_SHORT;
+    }
+    if (kernel != BEST_FATTN_KERNEL_NONE && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_BLACKWELL &&
+            (sparse_rows || sparse_mean) && dst->src[9] && dst->src[3]->type == GGML_TYPE_I16 &&
+            dst->src[3]->ne[0]*16 == k->ne[1] && dst->src[3]->ne[1] == q->ne[1] && dst->src[3]->ne[2] == 1 &&
+            k->ne[1] >= 8192 && k->ne[1] <= INT32_MAX && k->ne[1]%32 == 0 &&
+            q->ne[3] == 1 && q->ne[1] >= 8 && q->ne[1] <= 32 && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
+            q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == k->nb[0] &&
+            k->type == v->type && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && softcap == 0.0f) {
+        return BEST_FATTN_KERNEL_REL_DECODE;
+    }
+    if (kernel == BEST_FATTN_KERNEL_MMA_F16 && ggml_cuda_fattn_may_use_rel_prefill(device, dst) &&
+            q->ne[3] == 1 && q->ne[2] <= REL_PREFILL_MAX_HEADS && mask->ne[2] == 1 &&
+            q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == k->nb[0] &&
+            (k->view_offs | v->view_offs | k->nb[1] | v->nb[1] | k->nb[2] | v->nb[2]) % 32 == 0) {
+        return BEST_FATTN_KERNEL_REL_PREFILL;
+    }
+    return kernel == BEST_FATTN_KERNEL_VEC || kernel == BEST_FATTN_KERNEL_MMA_F16 ? kernel : BEST_FATTN_KERNEL_NONE;
+}
+
 static size_t ggml_cuda_flash_attn_ext_device_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
 
@@ -1229,6 +1320,12 @@ static size_t ggml_cuda_flash_attn_ext_device_alloc_size(int device, const ggml_
     bool need_f16_V = false;
 
     switch (kernel) {
+        case BEST_FATTN_KERNEL_REL_PREFILL:
+            return fattn_rel_prefill_alloc_size(dst);
+        case BEST_FATTN_KERNEL_REL_SHORT:
+            return ggml_nbytes(dst);
+        case BEST_FATTN_KERNEL_REL_DECODE:
+            return fattn_rel_decode_alloc_size(dst);
         case BEST_FATTN_KERNEL_TILE:
             need_f16_K = true;
             need_f16_V = true;
@@ -1255,6 +1352,15 @@ static size_t ggml_cuda_flash_attn_ext_device_alloc_size(int device, const ggml_
 static void ggml_cuda_flash_attn_ext_device(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+        case BEST_FATTN_KERNEL_REL_PREFILL:
+            ggml_cuda_flash_attn_ext_rel_prefill(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_REL_SHORT:
+            ggml_cuda_fattn_rel_short(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_REL_DECODE:
+            ggml_cuda_fattn_rel_decode(ctx, dst);
+            break;
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
@@ -1324,7 +1430,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     if (ggml_cuda_buffer_is_host_mapped(dst->src[1])) {
         return ggml_cuda_fattn_host_stage(device, dst).bytes;
     }
-    return ggml_cuda_flash_attn_ext_device_alloc_size(device, dst);
+    const size_t size = ggml_cuda_flash_attn_ext_device_alloc_size(device, dst);
+    // The meta allocator sizes the full tensor. A head or sequence shard can select relative prefill at launch.
+    if (ggml_cuda_fattn_may_use_rel_prefill(device, dst)) {
+        return std::max(size, fattn_rel_prefill_alloc_size(dst));
+    }
+    return size;
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

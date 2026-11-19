@@ -87,6 +87,8 @@ static unsigned long long last_chunked_peer = 0;
 static unsigned long long last_chunked_host = 0;
 static bool               last_split_seen = false; // and its reductions that went to owners and were gathered from them
 static unsigned long long last_split      = 0;
+static uint64_t n_host_slice_gathers = 0;
+static uint64_t n_nccl_slice_gathers = 0;
 static std::atomic<int> n_captures{0};
 static std::atomic<int> n_nccl_fallbacks{0};
 
@@ -108,6 +110,14 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/
         unsigned long long ll_bytes = 0;
         last_p2p = ll != nullptr && sscanf(ll, "LL card to card up to %llu", &ll_bytes) == 1 && ll_bytes > 0;
         fputs(text, stderr);
+    }
+    unsigned long long nccl_gathers;
+    if (strstr(text, " native NCCL slice gathers scheduled") && sscanf(text, "%*s %llu", &nccl_gathers) == 1) {
+        n_nccl_slice_gathers += nccl_gathers;
+    }
+    unsigned long long host_gathers;
+    if (strstr(text, " host-sliced gathers scheduled") && sscanf(text, "ggml_cuda_ar_pipeline_free: %llu", &host_gathers) == 1) {
+        n_host_slice_gathers += host_gathers;
     }
     if (const char * chunked = strstr(text, "on the chunked kernel ")) {
         last_chunked_seen = sscanf(chunked, "on the chunked kernel %llu card to card, %llu through host memory",
@@ -317,19 +327,27 @@ static bool same_values(const std::vector<float> & a, const std::vector<float> &
 }
 
 // Several gathers in one graph, followed by replay with new data, exercise the shared parity ring across captures.
-static bool test_gather_graph(std::vector<ggml_backend_dev_t> devices, int64_t rows, int64_t width = 4096) {
+static bool test_gather_graph(std::vector<ggml_backend_dev_t> devices, int64_t rows, int64_t width = 4096, bool striped = false, bool equal = false) {
     auto * meta = ggml_backend_meta_device(devices.data(), devices.size(), mirrored, nullptr);
     auto * backend = ggml_backend_dev_init(meta, nullptr);
     auto * ctx = ggml_init({64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
-    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, striped ? rows : width, striped ? width : rows);
     std::vector<int64_t> owned(devices.size(), 0);
-    owned.front() = 1;
-    owned.back() = rows - 1;
+    if (equal) {
+        GGML_ASSERT(input->ne[1] % devices.size() == 0);
+        std::fill(owned.begin(), owned.end(), input->ne[1]/devices.size());
+    } else {
+        owned.front() = striped ? width/4 : 1;
+        owned.back() = input->ne[1] - owned.front();
+    }
     ggml_backend_meta_split_input(input, 1, owned.data(), owned.size());
     ggml_set_input(input);
     ggml_tensor * out = input;
     for (int step = 0; step < 4; ++step) {
-        out = ggml_backend_meta_gather(ctx, ggml_scale(ctx, out, 2.0f));
+        out = ggml_scale(ctx, out, 2.0f);
+        if (striped) { out = ggml_cont(ctx, ggml_transpose(ctx, out)); }
+        out = ggml_backend_meta_gather(ctx, out);
+        if (striped) { out = ggml_cont(ctx, ggml_transpose(ctx, out)); }
         if (step != 3) {
             std::rotate(owned.begin(), owned.begin() + 1, owned.end());
             out = ggml_backend_meta_scatter(ctx, out, 1, owned.data(), owned.size());
@@ -731,6 +749,14 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                 set_env("GGML_CUDA_GRAPH_MAX", "0");
                 ok = test_gather_graph(devices, 512) && ok;
                 ok = test_gather_graph(devices, 513) && ok;
+                if (n > 2 && strcmp(route.name, "host chunked") == 0) {
+                    set_env("GGML_CUDA_AR_GATHER_HOST_SLICES", "1");
+                    const uint64_t before = n_host_slice_gathers;
+                    ok = test_gather_graph(devices, 23, 4608, true) && ok;
+                    ok = test_gather_graph(devices, 513, 4608, true) && ok;
+                    ok = n_host_slice_gathers > before && ok;
+                    set_env("GGML_CUDA_AR_GATHER_HOST_SLICES", nullptr);
+                }
                 if (owner_requested) {
                     // Ownership cuts through vector lanes and chunk boundaries, including empty owners.
                     for (int64_t width : {4093, 4095, 4097}) {
@@ -1046,6 +1072,18 @@ int main(int argc, char ** argv) {
         ok = test_gather_graph(gpus, 108, 4096) && ok;
         ok = test_gather_graph(gpus, 513, 4097) && ok;
         const bool native = strcmp(backend_name, "nccl") == 0;
+        if (native && gpus.size() == 4) {
+            set_env("GGML_CUDA_NCCL_GATHER_SLICES", "1");
+            const uint64_t before = n_nccl_slice_gathers;
+            ok = test_gather_graph(gpus, 4608, 23, false, true) && ok;
+            const uint64_t selected = n_nccl_slice_gathers - before;
+            ok = test_gather_graph(gpus, 23, 4608, true, true) && ok;
+            ok = test_gather_graph(gpus, 40, 4093) && ok;
+            const bool slices_ok = selected > 0 && n_nccl_slice_gathers == before + selected;
+            printf("%s: %llu native NCCL slice gathers, striped and uneven layouts used the fallback\n",
+                   slices_ok ? "ok" : "FAIL", (unsigned long long) selected);
+            ok = slices_ok && ok;
+        }
         const bool transport_ok = n_nccl_fallbacks == 0 && (native ? n_pipelines == 0 : n_pipelines == 3);
         printf("%s: requested %s, %d internal pipelines, %d NCCL fallbacks\n",
             transport_ok ? "ok" : "FAIL", backend_name, n_pipelines, n_nccl_fallbacks.load());

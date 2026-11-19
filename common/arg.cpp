@@ -2506,6 +2506,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"-ctks", "--cache-type-k-swa"}, "TYPE",
+        string_format(
+            "KV cache data type for K of the sliding-window layers\n"
+            "allowed values: %s\n"
+            "(default: the type of -ctk)",
+            get_all_kv_cache_types().c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_k_swa = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K_SWA"));
+    add_opt(common_arg(
+        {"-ctvs", "--cache-type-v-swa"}, "TYPE",
+        string_format(
+            "KV cache data type for V of the sliding-window layers\n"
+            "allowed values: %s\n"
+            "(default: the type of -ctv)",
+            get_all_kv_cache_types().c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_v_swa = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_V_SWA"));
+    add_opt(common_arg(
         {"-cts", "--cache-type-s"}, "TYPE",
         string_format(
             "recurrent state cache data type (Gated DeltaNet / SSM state; the update math stays f32)\n"

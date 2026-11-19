@@ -2048,6 +2048,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_candidates(params, tensor);
             } break;
+        case GGML_OP_NORM_CLIP:
+            {
+                ggml_compute_forward_norm_clip(params, tensor);
+            } break;
+        case GGML_OP_ATTN_RES_MIX:
+            {
+                ggml_compute_forward_attn_res_mix(params, tensor);
+            } break;
+        case GGML_OP_SHORT_CONV:
+            {
+                ggml_compute_forward_short_conv(params, tensor);
+            } break;
         case GGML_OP_LEAKY_RELU:
             {
                 ggml_compute_forward_leaky_relu(params, tensor);
@@ -2390,6 +2402,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
+                case GGML_GLU_OP_SITU:
+                case GGML_GLU_OP_SIGLU:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2473,6 +2487,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_TOP_K_CANDIDATES:
+        case GGML_OP_NORM_CLIP:
+        case GGML_OP_ATTN_RES_MIX:
+        case GGML_OP_SHORT_CONV:
         case GGML_OP_FLASH_ATTN_EXT_SPARSE:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:

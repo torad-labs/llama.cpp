@@ -267,7 +267,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
 endif()
 
-llama_build(test-llama-archs.cpp llama-archs-gguf.cpp test-llama-archs-inkling.cpp)
+llama_build(test-llama-archs.cpp llama-archs-gguf.cpp test-llama-archs-inkling.cpp test-llama-archs-inkling-paths.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
@@ -307,11 +307,43 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-llama-archs test-glm5next PROPERTIES TIMEOUT 3600)
     if (GGML_CUDA)
         # Inkling 2 under a two-rank tensor split on the first GPU against that GPU alone, sequence state included
-        foreach(inkling_case prefill decode chunks seq-cp state rollback)
+        foreach(inkling_case prefill decode chunks seq-cp state rollback graph-churn)
             llama_test(test-llama-archs NAME test-inkling2-split-${inkling_case}
                 ARGS --inkling-split ${inkling_case} --inkling-split-device CUDA0,CUDA0 -s 1234)
         endforeach()
     endif()
+    # Inkling 2's optimized paths against the paths they replaced, on the CPU and the GPU: the relative bias inside the
+    # attention kernel (rel), the layer's fused ops (fuse), its short convolutions (conv), and its quantized KV caches
+    # against F16 (kv)
+    set(inkling_path_devices CPU)
+    if (GGML_CUDA)
+        list(APPEND inkling_path_devices CUDA0)
+    endif()
+    foreach(inkling_path_device ${inkling_path_devices})
+        string(TOLOWER ${inkling_path_device} inkling_path_name)
+        foreach(inkling_case prompt decode unified streams)
+            llama_test(test-llama-archs NAME test-inkling-rel-${inkling_path_name}-${inkling_case}
+                ARGS --inkling-path rel/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+        endforeach()
+        foreach(inkling_case decode churn streams)
+            llama_test(test-llama-archs NAME test-inkling-rel-packed-${inkling_path_name}-${inkling_case}
+                ARGS --inkling-path rel-packed/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+        endforeach()
+        foreach(inkling_case prompt unified outputs)
+            llama_test(test-llama-archs NAME test-inkling-fuse-${inkling_path_name}-${inkling_case}
+                ARGS --inkling-path fuse/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+        endforeach()
+        foreach(inkling_case decode unified streams)
+            llama_test(test-llama-archs NAME test-inkling-conv-${inkling_path_name}-${inkling_case}
+                ARGS --inkling-path conv/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+        endforeach()
+        foreach(inkling_kv q8_0 q4_0 split)
+            foreach(inkling_case prompt unified)
+                llama_test(test-llama-archs NAME test-inkling-kv-${inkling_path_name}-${inkling_kv}-${inkling_case}
+                    ARGS --inkling-path kv-${inkling_kv}/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+            endforeach()
+        endforeach()
+    endforeach()
     llama_build_and_test(test-speculative-mtp.cpp)
     llama_test(test-speculative-mtp NAME test-speculative-mtp-dp-cpu ARGS --dp-device CPU)
 
@@ -603,6 +635,18 @@ add_test(NAME test-backend-q8-readers-canonical-cpu COMMAND test-backend-ops tes
 set_tests_properties(test-backend-q8-readers-canonical-cpu PROPERTIES LABELS "main")
 add_test(NAME test-backend-moe-prep-cpu COMMAND test-backend-ops test -b CPU -o GLM53_MOE_PREP,GLM53_MOE_ROUTES -p n_embd=256 -j 1)
 set_tests_properties(test-backend-moe-prep-cpu PROPERTIES LABELS "main")
+# Inkling 2's routed experts on the GPU against the host: the expert products at 384 experts, 8 used, hidden 4,608 and
+# intermediate 2,304, and the whole MoE block with its router and SITU, merged and split as the graph builds it
+if (GGML_CUDA)
+    add_test(NAME test-inkling-moe-mul-mat-id-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID -p "n_mats=384,n_used=8,")
+    add_test(NAME test-inkling-moe-block-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MOE)
+    add_test(NAME test-inkling-moe-routed-rows-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
+        -p "n_mats=32,n_used=8,.*m=256,n=(17|23|32),k=512,")
+    set_tests_properties(test-inkling-moe-routed-rows-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
+    add_test(NAME test-inkling-norm-clip-cuda0 COMMAND test-backend-ops test -b CUDA0 -o NORM_CLIP)
+    add_test(NAME test-inkling-short-conv-op-cuda0 COMMAND test-backend-ops test -b CUDA0 -o SHORT_CONV)
+    set_tests_properties(test-inkling-moe-mul-mat-id-cuda0 test-inkling-moe-block-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600)
+endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 

@@ -1,0 +1,120 @@
+{
+  "hardware": "NVIDIA GeForce RTX 5070 Ti, four logical CUDA tensor ranks on one physical GPU",
+  "fixture": "Three-layer synthetic mixed Q3_K_M GGUF",
+  "local_fixture_sha256": "68a48711e8cb0f8b278f1e23cd1442b30f0aee9698600189b519790ba146dd6c",
+  "fixture_metadata_overrides": {
+    "inkling2.context_length": 1048576,
+    "inkling2.attention.log_scale_floor": 128000
+  },
+  "total_context": 2359296,
+  "session_context": 294912,
+  "server_slots": 23,
+  "mixed_run": {
+    "sessions": 23,
+    "reader_input_tokens": 262144,
+    "reader_evaluated_tokens": 262144,
+    "reader_cached_tokens": 0,
+    "reader_generated_tokens": 32768,
+    "reader_ttft_ms": 15624.935986008495,
+    "peers_spanning_reader": 22,
+    "warm_median_peer_tokens_per_second": 346.9744451854931,
+    "reader_median_peer_tokens_per_second": 17.60007210565544,
+    "reader_aggregate_peer_tokens_per_second": 387.2015863244197,
+    "overlapping_delivery_gaps": {
+      "count": 6072,
+      "p95_ms": 90.22113704122603,
+      "max_ms": 122.41462501697242
+    },
+    "session_restore": {
+      "greedy_token": {
+        "restored": 117,
+        "resident": 117,
+        "cold": 117
+      },
+      "cached_tokens": {
+        "restored": 262144,
+        "resident": 262144,
+        "cold": 0
+      },
+      "comparisons": {
+        "restored_vs_cold": {
+          "same_greedy_token": true,
+          "common_top_tokens": 31,
+          "max_common_logprob_difference": 0.0628504753112793
+        },
+        "resident_vs_cold": {
+          "same_greedy_token": true,
+          "common_top_tokens": 31,
+          "max_common_logprob_difference": 0.06466293334960938
+        },
+        "restored_vs_resident": {
+          "same_greedy_token": true,
+          "common_top_tokens": 32,
+          "max_common_logprob_difference": 0.004181385040283203
+        }
+      }
+    }
+  },
+  "full_window_truncated": false,
+  "continuation_turns": [
+    {
+      "input": 262144,
+      "evaluated": 262144,
+      "cached": 0,
+      "generated": 128,
+      "returned": 128,
+      "truncated": false,
+      "stop_type": "limit"
+    },
+    {
+      "input": 270336,
+      "evaluated": 8065,
+      "cached": 262271,
+      "generated": 128,
+      "returned": 128,
+      "truncated": false,
+      "stop_type": "limit"
+    },
+    {
+      "input": 278528,
+      "evaluated": 8065,
+      "cached": 270463,
+      "generated": 128,
+      "returned": 128,
+      "truncated": false,
+      "stop_type": "limit"
+    },
+    {
+      "input": 286720,
+      "evaluated": 8065,
+      "cached": 278655,
+      "generated": 128,
+      "returned": 128,
+      "truncated": false,
+      "stop_type": "limit"
+    },
+    {
+      "input": 294655,
+      "evaluated": 7808,
+      "cached": 286847,
+      "generated": 128,
+      "returned": 128,
+      "truncated": false,
+      "stop_type": "limit"
+    }
+  ],
+  "boundary": {
+    "slot_cap": 294912,
+    "slots": 23,
+    "near_cap_prompt": 294655,
+    "near_cap_output": 256,
+    "near_cap_truncated": false,
+    "limit_error": {
+      "code": 400,
+      "message": "request (294912 tokens) exceeds the available context size (294912 tokens), try increasing it",
+      "type": "exceed_context_size_error",
+      "n_prompt_tokens": 294912,
+      "n_ctx": 294912
+    }
+  }
+}

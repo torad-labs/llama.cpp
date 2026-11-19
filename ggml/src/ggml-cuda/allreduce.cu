@@ -520,6 +520,7 @@ struct ggml_cuda_ar_owner_layout {
     int64_t begin[GGML_CUDA_MAX_DEVICES] = {};
     int64_t len[GGML_CUDA_MAX_DEVICES] = {};
     bool valid = false;
+    uint32_t host_period = 0; // words until the owner ranges repeat
 };
 
 static __device__ int ggml_cuda_ar_owner_of(const ggml_cuda_ar_owner_layout & owner, int index, int n_ranks) {
@@ -549,10 +550,35 @@ static __device__ __forceinline__ void ggml_cuda_ar_copy_owner(
 #define GGML_CUDA_AR_GRID_CONSTANT
 #endif
 
+// Count the owner's uint4 vectors before pos in a repeating row of period vectors.
+static __device__ __forceinline__ uint32_t ggml_cuda_ar_stripe_prefix(
+        uint32_t pos, uint32_t begin, uint32_t width, uint32_t period) {
+    return (pos/period)*width + min(max(pos%period, begin) - begin, width);
+}
+
+static __device__ void ggml_cuda_ar_copy_stripes(uint32_t * dst, const uint32_t * src,
+        uint32_t begin, uint32_t width, uint32_t period, uint32_t phase, uint32_t count, int tid, int stride) {
+    if (width == 0) {
+        return;
+    }
+    begin /= 4;
+    width /= 4;
+    period /= 4;
+    phase /= 4;
+    const uint32_t first = ggml_cuda_ar_stripe_prefix(phase, begin, width, period);
+    const uint32_t last = ggml_cuda_ar_stripe_prefix(phase + count/4, begin, width, period);
+    for (uint32_t i = first + tid; i < last; i += stride) {
+        const uint32_t index = (i/width)*period + begin + i%width - phase;
+        ((uint4 *) dst)[index] = ((const uint4 *) src)[index];
+    }
+}
+
+template <bool host = false>
 static __global__ void ggml_cuda_ar_owner_gather_kernel_n(
         uint32_t * data, GGML_CUDA_AR_GRID_CONSTANT const ggml_cuda_ar_rank_ptrs<uint32_t> staging,
         GGML_CUDA_AR_GRID_CONSTANT const ggml_cuda_ar_rank_ptrs<uint32_t> receives, size_t slot_elems,
-        GGML_CUDA_AR_GRID_CONSTANT const ggml_cuda_ar_owner_layout owner, int * arrival, int rank, int n_ranks, int * counter) {
+        GGML_CUDA_AR_GRID_CONSTANT const ggml_cuda_ar_owner_layout owner, int * arrival, int rank, int n_ranks, int * counter,
+        uint32_t phase = 0, uint32_t count = 0) {
     constexpr int A = GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int);
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
@@ -565,10 +591,14 @@ static __global__ void ggml_cuda_ar_owner_gather_kernel_n(
     const size_t offset = (size_t) (token & 1) * slot_elems;
     const int own_begin = (int) owner.begin[rank];
     const int own_end = own_begin + (int) owner.len[rank];
+    if constexpr (host) {
+        ggml_cuda_ar_copy_stripes(staging.ptr[rank] + offset, data, own_begin, owner.len[rank], owner.host_period, phase, count, gtid, gnt);
+    } else {
 #pragma unroll 1
-    for (int dst = 0; dst < n_ranks; ++dst) {
-        if (dst != rank) {
-            ggml_cuda_ar_copy_owner(staging.ptr[dst] + offset, data, own_begin, own_end, gtid, gnt);
+        for (int dst = 0; dst < n_ranks; ++dst) {
+            if (dst != rank) {
+                ggml_cuda_ar_copy_owner(staging.ptr[dst] + offset, data, own_begin, own_end, gtid, gnt);
+            }
         }
     }
     __threadfence_system();
@@ -595,7 +625,11 @@ static __global__ void ggml_cuda_ar_owner_gather_kernel_n(
         if (src != rank) {
             const int begin = (int) owner.begin[src];
             const int end = begin + (int) owner.len[src];
-            ggml_cuda_ar_copy_owner(data, receives.ptr[src] + offset, begin, end, gtid, gnt);
+            if constexpr (host) {
+                ggml_cuda_ar_copy_stripes(data, receives.ptr[src] + offset, begin, owner.len[src], owner.host_period, phase, count, gtid, gnt);
+            } else {
+                ggml_cuda_ar_copy_owner(data, receives.ptr[src] + offset, begin, end, gtid, gnt);
+            }
         }
     }
     if (tid == 0) {
@@ -791,17 +825,18 @@ static __global__ void ggml_cuda_ar_ll_kernel_n(
     if (tid == 0) { ggml_cuda_ar_signal_set(counter, token); }
 }
 
-template <typename T_dst, typename T_wire>
+template <typename T_dst, typename T_wire, bool owned_rows = false>
 static __global__ void ggml_cuda_ar_add_kernel_n(
         T_dst * dst, const T_wire * peers, size_t peer_elems, int count, int rank, int n_ranks) {
     for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < count; i += gridDim.x*blockDim.x) {
+        const int dst_i = owned_rows ? (i / 1152) * 4608 + rank * 1152 + i % 1152 : i;
         ggml_cuda_ar_accumulator<T_wire> sum = {};
         for (int peer = 0; peer < n_ranks; ++peer) {
             const int index = peer < rank ? peer : peer - 1;
-            const T_wire v = peer == rank ? ggml_cuda_cast<T_wire>(dst[i]) : peers[index*peer_elems + i];
+            const T_wire v = peer == rank ? ggml_cuda_cast<T_wire>(dst[dst_i]) : peers[index*peer_elems + i];
             sum = ggml_cuda_ar_accumulate<T_wire>(sum, v, peer);
         }
-        dst[i] = ggml_cuda_cast<T_dst>(sum);
+        dst[dst_i] = ggml_cuda_cast<T_dst>(sum);
     }
 }
 
@@ -920,7 +955,10 @@ struct ggml_cuda_ar_pipeline {
     size_t   p2p_max_bytes;  // wire bytes up to which the LL kernel reduces card to card; 0 when off or unavailable
     bool     copy_peer;      // copy-engine shares go card to card, into the peer's dev_tmp (ggml_cuda_ar_allreduce_copy_peer)
     bool     gather_peer;    // large captured gathers push into a separate parity ring on each peer
+    bool     host_slices;    // stage only owned gather words in host memory
+    uint64_t n_host_slice_gathers;
     bool     owner_slices;   // captured gathers write only each rank's own slice to every peer
+    bool     host_owner_rows;
     bool     reduce_owners;  // a reduce whose result each rank reads only in part sums only that part (ggml_cuda_ar_reduce_owned)
     uint64_t n_reduced_owned; // reductions summed to their owners, and to every rank, logged when the pipeline is freed
     uint64_t n_reduced_all;
@@ -1319,6 +1357,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     p->p2p_max_bytes    = std::min(ggml_cuda_ar_env_u64("GGML_CUDA_AR_P2P_MAX_BYTES", GGML_CUDA_AR_P2P_MAX_BYTES_DEFAULT),
                                    (uint64_t) GGML_CUDA_AR_MAX_BYTES);
     // Default 1: a reduce whose only reader is a scatter by rows sums each element only on the rank that reads it.
+    p->host_owner_rows  = ggml_cuda_ar_env_u64("GGML_CUDA_AR_HOST_OWNER_ROWS", 0) == 1;
     p->reduce_owners    = ggml_cuda_ar_env_u64("GGML_CUDA_AR_REDUCE_OWNERS", 1) != 0;
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
@@ -1511,6 +1550,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             GGML_LOG_WARN("%s: gather inbox allocation failed; large gathers stage through host memory\n", __func__);
         }
     }
+    p->host_slices = ggml_cuda_ar_env_u64("GGML_CUDA_AR_GATHER_HOST_SLICES", 0) != 0 && !p->gather_peer;
     p->owner_slices = ggml_cuda_ar_env_u64("GGML_CUDA_AR_GATHER_OWNER_SLICES", 1) != 0 && p->gather_peer;
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
@@ -1527,6 +1567,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             GGML_LOG_INFO("%s: copy-engine receives on a stream a peer, each as its sender stages it, from %zu bytes on the wire; "
                           "in rank order on one stream under that\n", __func__, p->recv_streams_min_bytes);
         }
+    }
+    if (p->host_slices) {
+        GGML_LOG_INFO("%s: host-staged owner-slice gather enabled\n", __func__);
     }
     if (p->owner_slices) {
         GGML_LOG_INFO("%s: owner-slice-peer gather enabled\n", __func__);
@@ -1549,6 +1592,10 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
                    (unsigned long long) p->n_chunked_peer, (unsigned long long) p->n_chunked_host);
     GGML_LOG_DEBUG("%s: %llu split reductions, to owners and gathered from them\n", __func__, (unsigned long long) p->n_split);
     GGML_LOG_DEBUG("%s: %llu reductions to every rank on the Q8 wire\n", __func__, (unsigned long long) p->n_wire_q8);
+
+    if (p->host_slices) {
+        GGML_LOG_DEBUG("%s: %llu host-sliced gathers scheduled\n", __func__, (unsigned long long) p->n_host_slice_gathers);
+    }
 
     // Drain all in-flight kernels and copies before tearing down resources.
     for (int i = 0; i < p->n_devices; ++i) {
@@ -1626,7 +1673,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // pool-wraparound sync.  On the Q8 wire the share the device sent, own, is
 // summed as its peers received it, so dst_buf is written, not added to: each
 // peer's blocks lie a whole copy_bytes apart in dev_tmp[i], in rank order.
-template <typename T_src, typename T_dst>
+template <typename T_src, typename T_dst, bool owned_rows = false>
 static void ggml_cuda_ar_copy_add(
         ggml_cuda_ar_pipeline * p, int i, int slot, cudaStream_t stream, const T_src * own, T_dst * dst_buf, int64_t ne) {
     if constexpr (std::is_same_v<T_src, ggml_cuda_ar_q8_block>) {
@@ -1634,7 +1681,8 @@ static void ggml_cuda_ar_copy_add(
     } else {
         GGML_UNUSED(own);
         const int block_size = 256;
-        int n_blocks = (int) ((ne + block_size - 1) / block_size);
+        const int count = (int) (owned_rows ? ne / 4 : ne);
+        int n_blocks = (count + block_size - 1) / block_size;
         if (n_blocks > 1024) {
             n_blocks = 1024;
         }
@@ -1642,8 +1690,8 @@ static void ggml_cuda_ar_copy_add(
             ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(
                 dst_buf, p->dev_tmp[i].as<const T_src>(), (int) ne);
         } else {
-            ggml_cuda_ar_add_kernel_n<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(
-                dst_buf, p->dev_tmp[i].as<const T_src>(), p->copy_bytes / sizeof(T_src), (int) ne, i, p->n_devices);
+            ggml_cuda_ar_add_kernel_n<T_dst, T_src, owned_rows><<<n_blocks, block_size, 0, stream>>>(
+                dst_buf, p->dev_tmp[i].as<const T_src>(), p->copy_bytes / sizeof(T_src), count, i, p->n_devices);
         }
     }
     CUDA_CHECK(cudaGetLastError());
@@ -1714,7 +1762,7 @@ static bool ggml_cuda_ar_allreduce_copy_peer(
 // (e.g. BF16 wire / F32 accumulator) the add kernel rounds dst through T_src
 // for bit-equivalence between GPUs and we skip the otherwise-needed
 // post-conversion entirely.
-template <typename T_src, typename T_dst>
+template <typename T_src, typename T_dst, bool owned_rows = false>
 static bool ggml_cuda_ar_allreduce_copy_n(
         ggml_cuda_ar_pipeline * p, ggml_backend_t * backends,
         T_src * const src_buf[GGML_CUDA_MAX_DEVICES], T_dst * const dst_buf[GGML_CUDA_MAX_DEVICES],
@@ -1726,6 +1774,18 @@ static bool ggml_cuda_ar_allreduce_copy_n(
     ggml_backend_cuda_context * contexts[GGML_CUDA_MAX_DEVICES] = {};
     // this reduction's receives through host memory: one stream in rank order, or a stream a peer
     const bool rank_order = p->recv_rank_order || nbytes < p->recv_streams_min_bytes;
+
+    auto receive = [&](int rank, int peer, int index, size_t offset, size_t bytes, cudaStream_t stream) {
+        char * dst = p->dev_tmp[rank].as<char>() + index*p->copy_bytes + offset;
+        const uint8_t * src = p->host_large[peer].host + offset;
+        if constexpr (owned_rows) {
+            GGML_ASSERT(chunks == 1);
+            constexpr size_t width = 1152 * sizeof(T_src);
+            CUDA_CHECK(cudaMemcpy2DAsync(dst, width, src + rank * width, 4 * width, width, 23, cudaMemcpyHostToDevice, stream));
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
+        }
+    };
 
     // Queue every sender's previous-call waits before recording any of this call's completion events.
     for (int i = 0; i < p->n_devices; ++i) {
@@ -1783,8 +1843,7 @@ static bool ggml_cuda_ar_allreduce_copy_n(
                     if (peer == i) { continue; }
                     const int index = peer < i ? peer : peer - 1;
                     CUDA_CHECK(cudaStreamWaitEvent(recv, p->ev_pool[peer][slot].cpy[c]));
-                    CUDA_CHECK(cudaMemcpyAsync(p->dev_tmp[i].as<char>() + index*p->copy_bytes + offset,
-                                               p->host_large[peer].host + offset, bytes, cudaMemcpyHostToDevice, recv));
+                    receive(i, peer, index, offset, bytes, recv);
                 }
             }
             CUDA_CHECK(cudaEventRecord(p->host_large_read_done[i], recv));
@@ -1805,15 +1864,14 @@ static bool ggml_cuda_ar_allreduce_copy_n(
                     const size_t offset = c*chunk_bytes;
                     const size_t bytes = std::min(chunk_bytes, nbytes - offset);
                     CUDA_CHECK(cudaStreamWaitEvent(recv, p->ev_pool[peer][slot].cpy[c]));
-                    CUDA_CHECK(cudaMemcpyAsync(p->dev_tmp[i].as<char>() + index*p->copy_bytes + offset,
-                                               p->host_large[peer].host + offset, bytes, cudaMemcpyHostToDevice, recv));
+                    receive(i, peer, index, offset, bytes, recv);
                 }
                 CUDA_CHECK(cudaEventRecord(p->recv_peer_done[i][index], recv));
                 CUDA_CHECK(cudaStreamWaitEvent(stream, p->recv_peer_done[i][index]));
             }
             CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[i][slot].cpy[chunks - 1]));
         }
-        ggml_cuda_ar_copy_add<T_src, T_dst>(p, i, slot, stream, src_buf[i], dst_buf[i], ne);
+        ggml_cuda_ar_copy_add<T_src, T_dst, owned_rows>(p, i, slot, stream, src_buf[i], dst_buf[i], ne);
     }
     p->host_large_read_done_valid = !p->copy_peer && rank_order;
     p->recv_peer_done_valid = !p->copy_peer && !rank_order;
@@ -2057,6 +2115,10 @@ static void ggml_cuda_ar_launch_kernels(
     const bool   use_ll          = use_p2p || wire_bytes <= p->ll_max_bytes;
     const bool   gather_peer     = p->gather_peer && !use_ll;
     const size_t max_chunk_elems = (gather_peer ? GGML_CUDA_AR_PEER_MAX_BYTES : p->buf_bytes) / sizeof(T_wire);
+    const bool host_sliced = owner && owner->host_period && !use_ll && !gather_peer && p->n_devices > 2 && max_chunk_elems%4 == 0;
+    if (host_sliced) {
+        ++p->n_host_slice_gathers;
+    }
     if constexpr (!std::is_same_v<T_dst, uint32_t>) {
         if (!use_ll) { (gather_peer ? p->n_chunked_peer : p->n_chunked_host)++; }
     }
@@ -2064,7 +2126,7 @@ static void ggml_cuda_ar_launch_kernels(
     for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
         const size_t remaining_elems = (size_t) (ne - chunk_start);
         const size_t chunk_elems     = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
-        const ggml_cuda_ar_owner_layout chunk_owner = owner != nullptr && owner->valid ?
+        const ggml_cuda_ar_owner_layout chunk_owner = gather_peer && owner != nullptr && owner->valid ?
             ggml_cuda_ar_chunk_owner(*owner, chunk_start, (int64_t) chunk_elems, p->n_devices) : ggml_cuda_ar_owner_layout{};
 
         for (int i = 0; i < p->n_devices; ++i) {
@@ -2119,6 +2181,15 @@ static void ggml_cuda_ar_launch_kernels(
                     ggml_cuda_ar_rank_ptrs<T_wire> staging;
                     for (int rank = 0; rank < p->n_devices; ++rank) {
                         staging.ptr[rank] = reinterpret_cast<T_wire *>(p->host_buf[rank].dev);
+                    }
+                    if constexpr (std::is_same_v<T_dst, uint32_t> && std::is_same_v<T_wire, uint32_t>) {
+                        if (host_sliced) {
+                            ggml_cuda_ar_owner_gather_kernel_n<true><<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
+                                chunk, staging, staging, max_chunk_elems, *owner, reinterpret_cast<int *>(p->arrival.dev),
+                                i, p->n_devices, p->counter[i], chunk_start%owner->host_period, chunk_elems);
+                            CUDA_CHECK(cudaGetLastError());
+                            continue;
+                        }
                     }
                     ggml_cuda_ar_kernel_n<T_dst, T_wire><<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
                         chunk, staging, staging, max_chunk_elems, (int) chunk_elems, reinterpret_cast<int *>(p->arrival.dev),
@@ -2248,7 +2319,7 @@ bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
         ggml_tensor           ** tensors,
-        const ggml_cgraph * const * next) {
+        const ggml_cgraph * const * next, bool owned_rows) {
     GGML_ASSERT(p != nullptr);
 
     const int n = p->n_devices;
@@ -2271,7 +2342,16 @@ bool ggml_cuda_ar_allreduce(
     const size_t    nbytes          = route.nbytes;
     const bool      use_copy_engine = route.use_copy_engine;
 
-    p->n_reduced_all++;
+    if (owned_rows) {
+        if (!p->host_owner_rows || !p->reduce_owners || n != 4 || p->copy_peer || p->wire_q8 || !use_copy_engine ||
+                !use_bf16 || nbytes > p->copy_bytes || tensors[0]->ne[0] != 4608 || tensors[0]->ne[1] != 23 ||
+                tensors[0]->ne[2] != 1 || tensors[0]->ne[3] != 1 || ggml_cuda_ar_capturing(backends[0])) {
+            return false;
+        }
+        ++p->n_reduced_owned;
+    } else {
+        ++p->n_reduced_all;
+    }
     if (ggml_cuda_ar_try_hc_post(p, backends, tensors, next, use_bf16, use_copy_engine)) { return true; }
 
     // The copy-engine path syncs the host on its events, which no CUDA graph
@@ -2372,8 +2452,11 @@ bool ggml_cuda_ar_allreduce(
                 src[i] = static_cast<nv_bfloat16 *>(copy_src_ptr[i]);
                 dst[i] = static_cast<float *>(tensors[i]->data);
             }
-            ok = ggml_cuda_ar_allreduce_copy_outer<nv_bfloat16, float>(
-                p, backends, src, dst, inner_compute, ne);
+            if (owned_rows) {
+                ok = ggml_cuda_ar_allreduce_copy_n<nv_bfloat16, float, true>(p, backends, src, dst, inner_compute, ne, nbytes);
+            } else {
+                ok = ggml_cuda_ar_allreduce_copy_outer<nv_bfloat16, float>(p, backends, src, dst, inner_compute, ne);
+            }
         } else {
             switch (kernel_type) {
                 case GGML_TYPE_F32: {
@@ -2458,7 +2541,7 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
-static ggml_cuda_ar_owner_layout ggml_cuda_ar_owner_layout_of(ggml_tensor ** tensors, int n_ranks) {
+static ggml_cuda_ar_owner_layout ggml_cuda_ar_owner_layout_of(ggml_tensor ** tensors, int n_ranks, bool host_slices) {
     ggml_cuda_ar_owner_layout owner;
     for (int axis = 0; axis < GGML_MAX_DIMS; ++axis) {
         ggml_cuda_ar_owner_layout candidate;
@@ -2483,8 +2566,25 @@ static ggml_cuda_ar_owner_layout ggml_cuda_ar_owner_layout_of(ggml_tensor ** ten
             candidate.len[rank] = count*words_per_count;
             total += count;
         }
-        if (candidate.valid && total == tensors[0]->ne[axis] &&
-                total*words_per_count == (int64_t) (ggml_nbytes(tensors[0]) / sizeof(uint32_t))) {
+        const int64_t period = total*words_per_count;
+        const int64_t words = ggml_nbytes(tensors[0])/sizeof(uint32_t);
+        if (host_slices && candidate.valid && period > 0 && period <= INT_MAX && words%period == 0) {
+            bool aligned = true;
+            for (int rank = 0; rank < n_ranks; ++rank) {
+                aligned &= (candidate.begin[rank]%4 == 0 && candidate.len[rank]%4 == 0 &&
+                            uintptr_t(tensors[rank]->data)%sizeof(uint4) == 0 && ggml_are_same_shape(tensors[rank], tensors[0]) &&
+                            ggml_are_same_stride(tensors[rank], tensors[0]));
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    if (d != axis && (ggml_get_op_params_i32(tensors[rank], 2*d) || ggml_get_op_params_i32(tensors[rank], 2*d + 1))) {
+                        aligned = false;
+                    }
+                }
+            }
+            if (aligned) {
+                candidate.host_period = (uint32_t) period;
+            }
+        }
+        if (candidate.valid && total == tensors[0]->ne[axis] && (period == words || candidate.host_period != 0)) {
             if (owner.valid) {
                 return {}; // ambiguous axes must retain the generic bitwise gather
             }
@@ -2492,6 +2592,24 @@ static ggml_cuda_ar_owner_layout ggml_cuda_ar_owner_layout_of(ggml_tensor ** ten
         }
     }
     return owner;
+}
+
+size_t ggml_cuda_ar_equal_gather_count(ggml_tensor ** tensors, size_t n_ranks) {
+    if (n_ranks < 2 || n_ranks > GGML_CUDA_MAX_DEVICES) {
+        return 0;
+    }
+    const auto layout = ggml_cuda_ar_owner_layout_of(tensors, int(n_ranks), true);
+    const size_t words = ggml_nbytes(tensors[0])/sizeof(uint32_t);
+    if (!layout.valid || layout.host_period != words || words % n_ranks != 0) {
+        return 0;
+    }
+    const int64_t count = words/n_ranks;
+    for (size_t i = 0; i < n_ranks; ++i) {
+        if (!(tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) || layout.len[i] != count) {
+            return 0;
+        }
+    }
+    return count;
 }
 
 bool ggml_cuda_ar_allgather(
@@ -2512,7 +2630,7 @@ bool ggml_cuda_ar_allgather(
         zero_first[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0; // a device with no part brings none
     }
     // Device counters and peer inboxes keep large gathers capturable; unsupported peers retain host staging.
-    ggml_cuda_ar_owner_layout owner = ggml_cuda_ar_owner_layout_of(tensors, p->n_devices);
+    ggml_cuda_ar_owner_layout owner = ggml_cuda_ar_owner_layout_of(tensors, p->n_devices, p->host_slices);
     ggml_cuda_ar_launch_kernels<uint32_t, uint32_t>(p, backends, data, zero_first, (int64_t) (nbytes / sizeof(uint32_t)), &owner);
     return true;
 }
@@ -2637,8 +2755,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
 }
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
-bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **, const ggml_cgraph * const *) {
+bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **, const ggml_cgraph * const *, bool) {
     return false;
+}
+size_t ggml_cuda_ar_equal_gather_count(ggml_tensor **, size_t) {
+    return 0;
 }
 bool ggml_cuda_ar_allgather(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;

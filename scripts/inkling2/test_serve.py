@@ -15,17 +15,21 @@ MMPROJ = str(PACKS / "mmproj-Inkling-2-Small-abliterated-e4853745-F16.gguf")
 HOST_ROUTE = {"GGML_CUDA_ALLREDUCE": "internal", "GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0",
               "GGML_CUDA_AR_COPY_THRESHOLD": "1", "GGML_CUDA_AR_COPY_PEER": "0", "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0"}
 ENV = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3", "LLAMA_KV_SEQ_CELLS": "262144",
+       "LLAMA_STATE_SAVE_ASYNC": "1", "LLAMA_STATE_RESTORE_ASYNC": "1",
        "LD_LIBRARY_PATH": str(serve.ROOT / "build/bin"), **HOST_ROUTE}
+TENSOR4_ENV = {**ENV, "LLAMA_KV_SEQ_CELLS": "294912", "LLAMA_SLOT_PREFIX_COPY": "1", "LLAMA_INKLING2_MEAN_MASK_DECODE": "1",
+               "GGML_CUDA_AR_GATHER_HOST_SLICES": "1", "GGML_CUDA_AR_HOST_OWNER_ROWS": "1",
+               "GGML_CUDA_MMVQ_KQUANT_MMID_MAX": "23", "LLAMA_INKLING2_BUCKET_PREFILL_KV": "1", "GGML_CUDA_MMVQ_EXPERT_SORT_23": "1"}
 
 
-def pinned(pack, kv, context):
-    return [SERVER, "-m", str(PACKS / (pack + ".gguf")), "--mmproj", MMPROJ,
+def pinned(pack, kv, context, cache_ram="32768", projector=MMPROJ):
+    return [SERVER, "-m", str(PACKS / (pack + ".gguf")), "--mmproj", projector,
             "-ngl", "99", "-sm", "tensor", "-ts", "1,1,1,1", "--jinja", "-fa", "on",
             "--cache-type-k", kv, "--cache-type-v", kv,
-            "-b", "2048", "-ub", "2048", "--prompt-step", "1024", "--prompt-chunk", "128",
+            "-b", "2048", "-ub", "2048", "--prompt-step", "1024", "--prompt-chunk", "128", "--attn-mask-bits",
             "--temp", "1.0", "--top-p", "1.0", "--top-k", "0", "--min-p", "0.0",
             "--alias", pack, "--chat-template-file", str(serve.TEMPLATE),
-            "-c", context, "-np", "23", "--kv-unified", "--cache-ram", "32768", "--no-cache-idle-slots",
+            "-c", context, "-np", "23", "--kv-unified", "--cache-ram", cache_ram, "--no-cache-idle-slots",
             "--metrics", "--host", "127.0.0.1", "--port", "8103", "--log-timestamps"]
 
 
@@ -34,10 +38,11 @@ def plan(*options):
 
 
 class ProfilePlanTest(unittest.TestCase):
-    def test_tensor_4_is_the_default_and_serves_the_q3_pack_at_f16_with_nine_full_sessions(self):
+    def test_tensor_4_defaults_to_the_qualified_q3_pack_and_pool(self):
         argv, env = plan()
-        self.assertEqual(argv, pinned("Inkling-2-Small-abliterated-e4853745-Q3_K_M-imatrix", "f16", "2359296"))
-        self.assertEqual(env, ENV)
+        self.assertEqual(argv, pinned("Inkling-2-Small-abliterated-e4853745-Q3_K_M-imatrix", "f16", "3014656",
+                                      cache_ram="262144", projector=str(PACKS / "mmproj-F16.gguf")) + ["--checkpoint-every", "32768"])
+        self.assertEqual(env, TENSOR4_ENV)
         self.assertEqual((argv, env), plan("--profile", "tensor-4"))
 
     def test_tensor_4_capacity_serves_the_iq3_pack_at_q8_0_with_every_session_full(self):
@@ -50,15 +55,33 @@ class ProfilePlanTest(unittest.TestCase):
         self.assertEqual(argv, pinned("Inkling-2-Small-abliterated-e4853745-Q4_K_M-imatrix", "f16", "524288"))
         self.assertEqual(env, ENV)
 
-    def test_every_pool_holds_whole_sessions_and_the_profiles_name_packs_of_their_own(self):
-        packs = set()
+    def test_tensor_4_can_select_plain_engine_or_q8_wire_without_bf16_ownership(self):
+        profile = ("--profile", "tensor-4")
+        _, engine = plan(*profile, "--reduction-route", "engine")
+        self.assertEqual({key for key in engine if key.startswith("GGML_CUDA")}, {"GGML_CUDA_MMVQ_KQUANT_MMID_MAX", "GGML_CUDA_MMVQ_EXPERT_SORT_23"})
+        _, q8 = plan(*profile, "--reduction-wire", "q8")
+        self.assertEqual(q8["GGML_CUDA_AR_WIRE_Q8"], "1")
+        self.assertNotIn("GGML_CUDA_AR_HOST_OWNER_ROWS", q8)
+        with self.assertRaises(ValueError):
+            plan(*profile, "--reduction-route", "engine", "--host-owner-rows")
+
+    def test_explicit_tensor_4_overrides(self):
+        argv, env = plan("--profile", "tensor-4", "--no-host-owner-rows", "--no-prefix-copy", "--no-mean-mask-decode", "--no-bucket-prefill-kv", "--no-stable-prefill", "--no-sort-expert-rows",
+                         "--cache-ram", "0", "--context", "1048576", "--slots", "8", "--slot-context", "131072",
+                         "--expert-row-limit", "auto", "--checkpoint-every", "0")
+        for flag, expected in [("--cache-ram", "0"), ("-c", "1048576"), ("-np", "8"), ("--checkpoint-every", "0")]:
+            self.assertEqual(argv[argv.index(flag)+1], expected)
+        self.assertEqual(env, {**HOST_ROUTE, "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                               "LLAMA_KV_SEQ_CELLS": "131072", "LD_LIBRARY_PATH": str(serve.ROOT / "build/bin"),
+                               "GGML_CUDA_AR_GATHER_HOST_SLICES": "1"})
+
+    def test_every_pool_holds_a_full_session_and_fits_the_combined_session_limits(self):
         for name in serve.PROFILES:
-            argv, _ = plan("--profile", name)
+            argv, env = plan("--profile", name)
             context = int(argv[argv.index("-c") + 1])
-            self.assertEqual(context % serve.SLOT_CONTEXT, 0, name)
-            self.assertLessEqual(context, serve.SLOTS * serve.SLOT_CONTEXT, name)
-            packs.add(argv[argv.index("-m") + 1])
-        self.assertEqual(len(packs), len(serve.PROFILES))
+            slot_context = int(env["LLAMA_KV_SEQ_CELLS"])
+            self.assertLessEqual(slot_context, context, name)
+            self.assertLessEqual(context, serve.SLOTS * slot_context, name)
 
     def test_no_profile_carries_glm_only_settings_or_a_stock_pack(self):
         for name in serve.PROFILES:
@@ -72,10 +95,28 @@ class ProfilePlanTest(unittest.TestCase):
 
 
 class OptionTest(unittest.TestCase):
+    def test_cross_session_prefix_copy_can_be_disabled(self):
+        self.assertEqual(plan("--prefix-copy")[1], TENSOR4_ENV)
+        self.assertNotIn("LLAMA_SLOT_PREFIX_COPY", plan("--no-prefix-copy")[1])
+
+    def test_prefill_kv_buckets_can_be_disabled(self):
+        key = "LLAMA_INKLING2_BUCKET_PREFILL_KV"
+        self.assertNotIn(key, plan("--no-bucket-prefill-kv")[1])
+        self.assertEqual(plan("--bucket-prefill-kv")[1][key], "1")
+        self.assertEqual(plan("--stable-prefill")[1]["GGML_CUDA_FATTN_REL_PREFILL_F32"], "1")
+        self.assertNotIn("GGML_CUDA_FATTN_REL_PREFILL_F32", plan("--no-stable-prefill")[1])
+        self.assertEqual(plan("--sort-expert-rows")[1]["GGML_CUDA_MMVQ_EXPERT_SORT_23"], "1")
+        self.assertNotIn("GGML_CUDA_MMVQ_EXPERT_SORT_23", plan("--no-sort-expert-rows")[1])
+
+    def test_mean_mask_decode_can_be_disabled(self):
+        key = "LLAMA_INKLING2_MEAN_MASK_DECODE"
+        self.assertNotIn(key, plan("--no-mean-mask-decode")[1])
+        self.assertEqual(plan("--mean-mask-decode")[1][key], "1")
+
     def test_packs_folder_model_and_projector_overrides(self):
         argv, _ = plan("--packs", "/data/packs")
         self.assertEqual(argv[1:5], ["-m", "/data/packs/Inkling-2-Small-abliterated-e4853745-Q3_K_M-imatrix.gguf",
-                                     "--mmproj", "/data/packs/mmproj-Inkling-2-Small-abliterated-e4853745-F16.gguf"])
+                                     "--mmproj", "/data/packs/mmproj-F16.gguf"])
         argv, _ = plan("--model", "/m/first.gguf", "--mmproj", "/m/proj.gguf")
         self.assertEqual(argv[1:5], ["-m", "/m/first.gguf", "--mmproj", "/m/proj.gguf"])
         argv, _ = plan("--text-only")
@@ -92,23 +133,92 @@ class OptionTest(unittest.TestCase):
         self.assertEqual(env["LLAMA_KV_SEQ_CELLS"], "524288")
         for options in (["--slots", "0"], ["--slots", "257"], ["--context", "262144"], ["--slot-context", "128"],
                         ["--port", "0"], ["--prompt-step", "-1"], ["--prompt-step-ms", "0"], ["--cache-ram", "-2"],
-                        ["--host", "a\nb"]):
+                        ["--host", "a\nb"], ["--ubatch-size", "0"], ["--ubatch-size", "2049"]):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 plan(*options)
 
     def test_prompt_step_controls(self):
-        argv, _ = plan("--prompt-step", "256", "--prompt-step-ms", "40")
+        argv, _ = plan("--prompt-step", "256", "--prompt-step-ms", "40", "--ubatch-size", "512")
+        self.assertEqual(argv[argv.index("-ub") + 1], "512")
+        self.assertEqual(argv[argv.index("-b") + 1], "2048")
         self.assertEqual(argv[argv.index("--prompt-step") + 1], "256")
         self.assertEqual(argv[argv.index("--prompt-step-ms") + 1], "40")
         self.assertEqual(argv[argv.index("--prompt-chunk") + 1], "128")
         self.assertNotIn("--prompt-step-ms", plan()[0])
 
+    def test_q3_pack_can_keep_sliding_kv_at_f16(self):
+        argv, _ = plan("--kv-cache", "q8_0", "--swa-kv-cache", "f16")
+        self.assertEqual(argv[argv.index("-m") + 1], plan()[0][2])
+        for side in ("k", "v"):
+            self.assertEqual(argv[argv.index("--cache-type-" + side) + 1], "q8_0")
+            self.assertEqual(argv[argv.index("--cache-type-" + side + "-swa") + 1], "f16")
+
+    def test_packed_mask_can_be_disabled(self):
+        self.assertIn("--attn-mask-bits", plan()[0])
+        self.assertNotIn("--attn-mask-bits", plan("--no-attn-mask-bits")[0])
+        self.assertIn("--attn-mask-bits", plan("--attn-mask-bits")[0])
+
+    def test_reference_sinks_keep_packed_attention(self):
+        argv, env = plan("--reference-sinks")
+        self.assertEqual(argv, plan()[0])
+        self.assertEqual(env, {**TENSOR4_ENV, "LLAMA_INKLING2_SHIFT_SINKS": "1"})
+
+    def test_graph_retention(self):
+        env = plan("--keep-graphs", "32")[1]
+        self.assertEqual(env, plan("--kept-graphs", "32")[1])
+        self.assertEqual(env["LLAMA_GRAPH_SLOTS"], "32")
+        self.assertEqual(env["GGML_META_CAPTURE_GRAPHS"], "36")
+        self.assertEqual(env["GGML_CUDA_GRAPH_NODES"], "262144")
+        self.assertEqual(env["GGML_CUDA_GRAPH_IDLE_MS"], "600000")
+        self.assertEqual(env["LLAMA_RS_FIXED_ROWS"], "1")
+        self.assertEqual(env["LLAMA_GRAPH_ANY_SEQS"], "1")
+        for count in ("0", "257"):
+            with self.assertRaises(ValueError):
+                plan("--keep-graphs", count)
+
+    def test_expert_row_limit_only_overrides_sm120_kquants(self):
+        for count in ("8", "23", "32"):
+            env = plan("--expert-row-limit", count)[1]
+            self.assertEqual(env, {**TENSOR4_ENV, "GGML_CUDA_MMVQ_KQUANT_MMID_MAX": count})
+        argv, env = plan("--profile", "tensor-4", "--expert-row-limit", "16", "--checkpoint-every", "8192")
+        self.assertEqual(env["GGML_CUDA_MMVQ_KQUANT_MMID_MAX"], "16")
+        self.assertEqual(argv[argv.index("--checkpoint-every") + 1], "8192")
+        for count in ("7", "33"):
+            with self.assertRaises(ValueError):
+                plan("--expert-row-limit", count)
+
+    def test_slot_exchange_controls(self):
+        argv, env = plan("--cache-ram", "262144", "--save-async", "--restore-async", "--ctx-checkpoints", "8", "--checkpoint-every", "8192")
+        self.assertEqual(argv[argv.index("--cache-ram") + 1], "262144")
+        self.assertEqual(argv[argv.index("--ctx-checkpoints") + 1], "8")
+        self.assertEqual(argv[argv.index("--checkpoint-every") + 1], "8192")
+        with self.assertRaises(ValueError):
+            plan("--ctx-checkpoints", "-1")
+        with self.assertRaises(ValueError):
+            plan("--checkpoint-every", "-1")
+        self.assertIn("--no-cache-idle-slots", argv)
+        self.assertEqual(env, TENSOR4_ENV)
+        self.assertNotIn("LLAMA_STATE_SAVE_ASYNC", plan("--save-sync")[1])
+        self.assertEqual(plan("--save-sync")[1]["LLAMA_STATE_RESTORE_ASYNC"], "1")
+        self.assertNotIn("LLAMA_STATE_RESTORE_ASYNC", plan("--restore-sync")[1])
+        self.assertEqual(plan("--restore-sync")[1]["LLAMA_STATE_SAVE_ASYNC"], "1")
+        for key in ("LLAMA_STATE_SAVE_ASYNC", "LLAMA_STATE_RESTORE_ASYNC"):
+            self.assertNotIn(key, plan("--cache-ram", "0")[1])
+
     def test_reduction_wire_and_route(self):
         env = plan("--reduction-wire", "q8")[1]
         self.assertEqual(env["GGML_CUDA_AR_WIRE_Q8"], "1")
+        self.assertEqual(plan("--reduction-route", "host-sliced")[1], TENSOR4_ENV)
         env = plan("--reduction-route", "engine")[1]
         for key in HOST_ROUTE:
             self.assertNotIn(key, env)
+        nccl_env = plan("--reduction-route", "engine", "--nccl-sliced-gather")[1]
+        self.assertEqual(nccl_env, {**env, "GGML_CUDA_NCCL_GATHER_SLICES": "1", "LLAMA_INKLING2_GATHER_TRANSPOSE": "1"})
+        self.assertEqual(plan("--host-owner-rows")[1], TENSOR4_ENV)
+        for incompatible in (("--nccl-sliced-gather",), ("--host-owner-rows", "--reduction-route", "engine"),
+                             ("--host-owner-rows", "--reduction-wire", "q8")):
+            with self.assertRaises(ValueError):
+                plan(*incompatible)
 
 
 class DryRunTest(unittest.TestCase):
@@ -120,8 +230,18 @@ class DryRunTest(unittest.TestCase):
     def test_dry_run_prints_the_pinned_plan_and_starts_nothing(self):
         clean = {"PATH": os.environ.get("PATH", "")}
         out = self.dry_run("--profile", "tensor-4-capacity", env=clean)
-        self.assertEqual(out, {"argv": plan("--profile", "tensor-4-capacity")[0], "env": ENV, "removed": []})
+        self.assertEqual(out, {"argv": plan("--profile", "tensor-4-capacity")[0],
+                               "env": ENV, "removed": []})
         self.assertEqual(out, self.dry_run("--profile", "tensor-4-capacity", env=clean))
+
+    def test_qualifier_dry_run_uses_tensor_4_and_honors_opt_outs(self):
+        options = ["--profile", "tensor-4", "--no-prefix-copy", "--no-mean-mask-decode", "--no-host-owner-rows", "--no-bucket-prefill-kv", "--stable-prefill",
+                   "--expert-row-limit", "auto", "--checkpoint-every", "0"]
+        run = subprocess.run([sys.executable, str(Path(serve.__file__).with_name("qualify.py")), "--dry-run", "--out", "/unused",
+                              "--routes", "host-sliced", "engine", *options], capture_output=True, text=True, check=True)
+        for route, launch in json.loads(run.stdout)["routes"].items():
+            argv, env = plan(*options, "--reduction-route", route, "--log-verbosity", "4")
+            self.assertEqual((launch["argv"], launch["settings"]), (argv, env))
 
     def test_dry_run_reports_and_exec_removes_inherited_engine_overrides(self):
         inherited = {"PATH": os.environ.get("PATH", ""), "GGML_CUDA_AR_WIRE_Q8": "1", "LLAMA_SPEC_COUPLED": "1",

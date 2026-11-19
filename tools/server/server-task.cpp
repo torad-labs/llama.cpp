@@ -1987,25 +1987,46 @@ server_prompt_cache_result server_prompt_cache::publish(server_prompt_cache_stat
     return server_prompt_cache_result::saved;
 }
 
+const common_prompt_checkpoint * server_prompt::checkpoint_before(size_t lcp, size_t n_input, llama_pos pos_next, llama_pos pos_min_thold) const {
+    const llama_pos pos_eval = pos_next - (lcp == n_input);
+    for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
+        const auto & cur = **it;
+        if (cur.n_tokens <= 0 || (size_t) cur.n_tokens > lcp || cur.pos_max > pos_next) {
+            continue;
+        }
+        if (cur.pos_min == cur.pos_max) {
+            // A recurrent checkpoint reports its last position. Resume after it when the next input can use its saved state.
+            if (cur.pos_max < pos_eval && (size_t) cur.n_tokens < n_input && tokens.pos_next(cur.n_tokens) == cur.pos_max + 1) {
+                return &cur;
+            }
+        } else if (cur.pos_min < pos_min_thold || cur.pos_min == 0) {
+            return &cur;
+        }
+    }
+    return nullptr;
+}
+
 size_t server_prompt_cache::reusable_prefix(const server_prompt & prompt, const server_tokens & tokens_new,
         llama_pos pos_min, int32_t n_swa, std::optional<size_t> lcp) {
-    size_t reused = lcp.value_or(prompt.tokens.get_common_prefix(tokens_new));
+    size_t reused = lcp ? *lcp : prompt.tokens.get_common_prefix(tokens_new);
     if (reused == 0 || pos_min < 0) {
         return 0;
     }
+    // A full prefix with a new token continues from the saved state without a rollback.
+    if (prompt.can_append(reused, tokens_new.size())) {
+        return reused;
+    }
     auto pos_next = prompt.tokens.pos_next(reused);
-    const auto pos_min_thold = std::max(0, pos_next - n_swa - (reused < tokens_new.size() ? 0 : 1));
+    const llama_pos pos_eval = pos_next - (reused == tokens_new.size());
+    const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
     if (pos_min >= pos_min_thold) {
         // Keep this aligned with checkpoint fallback during prompt preparation.
-        const auto checkpoint = std::find_if(prompt.checkpoints.rbegin(), prompt.checkpoints.rend(),
-            [&](const std::shared_ptr<const common_prompt_checkpoint> & cur) {
-                return cur->pos_max <= pos_next && (cur->pos_min < pos_min_thold || cur->pos_min == 0);
-            });
-        if (checkpoint == prompt.checkpoints.rend()) {
+        const auto * checkpoint = prompt.checkpoint_before(reused, tokens_new.size(), pos_next, pos_min_thold);
+        if (!checkpoint) {
             return 0;
         }
-        pos_next = std::min(pos_next, std::max((*checkpoint)->pos_min + 1, (*checkpoint)->pos_max));
-        reused = std::min(prompt.tokens.size_up_to_pos(pos_next), (size_t) (*checkpoint)->n_tokens);
+        pos_next = std::min(pos_next, std::max(checkpoint->pos_min + 1, checkpoint->pos_max));
+        reused = std::min(prompt.tokens.size_up_to_pos(pos_next), (size_t) checkpoint->n_tokens);
     }
     // Each request must still evaluate at least one token for logits.
     return reused == tokens_new.size() ? reused - 1 : reused;

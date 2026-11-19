@@ -57,6 +57,12 @@ struct llama_cparams {
     bool auto_ftkm;
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
+    bool fused_rel_pos;      // Inkling 2: the relative position bias inside the attention kernel (ggml_flash_attn_ext_add_rel_pos)
+    bool auto_frel;
+    bool fused_inkling2;     // Inkling 2: the residual depth mix, the norm clips and the output gate as one op each
+    bool auto_finkling2;
+    bool fused_inkling2_conv; // Inkling 2: each short convolution of a layer as one op (ggml_short_conv)
+    bool auto_fconv;
     bool no_perf;
     bool op_offload;
     bool kv_unified;

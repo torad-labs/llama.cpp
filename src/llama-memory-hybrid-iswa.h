@@ -39,7 +39,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                ggml_type   type_k_swa  = GGML_TYPE_COUNT,  // GGML_TYPE_COUNT = type_k
+                ggml_type   type_v_swa  = GGML_TYPE_COUNT); // GGML_TYPE_COUNT = type_v
 
     ~llama_memory_hybrid_iswa() = default;
 

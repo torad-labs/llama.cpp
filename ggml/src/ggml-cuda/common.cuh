@@ -2705,6 +2705,8 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f; // > 0: before the GLU, the gate clamped to at most glu_limit and x to +-glu_limit (a SwiGLU limit)
+    float glu_beta  = 0.0f; // GGML_GLU_OP_SITU: the gate's softcap
+    float glu_lb    = 0.0f; // GGML_GLU_OP_SITU: x's softcap, none when <= 0
     const ggml_tensor * rms_norm = nullptr; // a weightless RMS_NORM whose input src1 is: the dot products take its scale (mmvf)
     ggml_prec prec_src1 = GGML_PREC_UNDEFINED; // src1 precision requested by the fused MUL_MATs (MMQ)
     const ggml_tensor * shared_up = nullptr;
@@ -2719,6 +2721,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    float glu_beta  = 0.0f;
+    float glu_lb    = 0.0f;
     bool  rms_norm = false;
     float rms_norm_eps = 0.0f;
     ggml_cuda_q8_layout q8_layout;

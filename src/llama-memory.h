@@ -39,6 +39,10 @@ struct llama_memory_params {
 
     // only simulate the memory allocations
     bool no_alloc;
+
+    // the K and V cache types of the sliding-window layers (type_k and type_v unless chosen apart)
+    ggml_type type_k_swa;
+    ggml_type type_v_swa;
 };
 
 // the tensor contexts and backend buffers of a memory instance
