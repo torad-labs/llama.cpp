@@ -1,0 +1,7 @@
+# a trial a line: its name, then the trainer's words. Two passes over the recording at each rate, a card each, with
+# the same held-out evaluation before and after, a small one every 65 steps, and the parameters kept every 130. The
+# walk before training is the baseline's, made on the same held-out requests.
+lr1e-5 --lr 1e-5 --epochs 2 --eval-every 65 --save-every 130 --log-every 1 --walk --walk-before /workspace/rig/dspark/baseline-pack/walk-before.json
+lr3e-5 --lr 3e-5 --epochs 2 --eval-every 65 --save-every 130 --log-every 1 --walk --walk-before /workspace/rig/dspark/baseline-pack/walk-before.json
+lr1e-4 --lr 1e-4 --epochs 2 --eval-every 65 --save-every 130 --log-every 1 --walk --walk-before /workspace/rig/dspark/baseline-pack/walk-before.json
+lr3e-4 --lr 3e-4 --epochs 2 --eval-every 65 --save-every 130 --log-every 1 --walk --walk-before /workspace/rig/dspark/baseline-pack/walk-before.json
