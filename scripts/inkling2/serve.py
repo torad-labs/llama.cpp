@@ -21,11 +21,14 @@ execution_environment = glm53.execution_environment
 SOURCE = "Inkling-2-Small-abliterated-e4853745"
 PACKS = ROOT / "models" / SOURCE
 MMPROJ = f"mmproj-{SOURCE}-F16.gguf"
+DRAFT = f"{SOURCE}-DSpark-BF16-own-head.gguf"
 
 SLOTS = 23
 SLOT_CONTEXT = 262144
 CODING_SLOT_CONTEXT = 294912  # Shared by prompt, reasoning, tool history and generated text.
 BATCH_SIZE = 2048
+DRAFT_CONTEXT = 1572864
+DRAFT_UBATCH_SIZE = 256
 MAX_SLOTS = 256  # the engine's sequence limit (LLAMA_MAX_SEQ)
 PROFILES = {
     "tensor-4": {"pack": f"{SOURCE}-Q3_K_M-imatrix.gguf", "mmproj": "mmproj-F16.gguf",
@@ -38,6 +41,7 @@ PROFILES = {
     # Q4-class pack, about 4 GiB a card for KV: 0.54M tokens at F16. Two full sessions; a quality experiment only.
     "tensor-4-quality": {"pack": f"{SOURCE}-Q4_K_M-imatrix.gguf", "context": 2 * SLOT_CONTEXT, "kv": "f16"},
 }
+PROFILES["tensor-4-draft"] = {**PROFILES["tensor-4"], "context": DRAFT_CONTEXT}
 
 
 def expert_row_limit(value):
@@ -51,6 +55,13 @@ def arguments(argv=None):
     parser.add_argument("--packs", type=Path, default=PACKS,
                         help="Folder holding the converted packs under their recipe names (default: models/" + SOURCE + ")")
     parser.add_argument("--model", type=Path, help="A local GGUF in place of the profile's pack")
+    parser.add_argument("--draft", action=argparse.BooleanOptionalAction,
+                        help="Use the paired native DSpark draft (enabled in tensor-4-draft)")
+    parser.add_argument("--draft-model", type=Path, help="An explicit Inkling DSpark GGUF with its own vocabulary tensors")
+    parser.add_argument("--draft-depth", type=int, choices=range(1, 8), default=3,
+                        help="Maximum DSpark proposals per verification (default: 3)")
+    parser.add_argument("--draft-device", choices=["CUDA0", "CUDA1", "CUDA2", "CUDA3"], default="CUDA3",
+                        help="Device for the draft model (default: CUDA3)")
     parser.add_argument("--mmproj", type=Path, help="A local vision projector in place of the packs' F16 one")
     parser.add_argument("--text-only", action="store_true", help="Load no vision projector")
     parser.add_argument("--server", type=Path, default=ROOT / "build/bin/llama-server",
@@ -78,8 +89,8 @@ def arguments(argv=None):
                         help="Try grouped SM120 F16 global attention for 23 decoding sessions with low average KV visibility")
     parser.add_argument("--reference-sinks", action="store_true",
                         help="Use the padded, shifted relative-position table for comparison with the original attention")
-    parser.add_argument("--ubatch-size", type=int, default=BATCH_SIZE,
-                        help=f"Maximum tokens in one physical microbatch (1..{BATCH_SIZE}, default: {BATCH_SIZE})")
+    parser.add_argument("--ubatch-size", type=int,
+                        help=f"Maximum tokens in one physical microbatch (1..{BATCH_SIZE}, default: {BATCH_SIZE} or {DRAFT_UBATCH_SIZE} with a draft)")
     parser.add_argument("--keep-graphs", "--kept-graphs", type=int, metavar="N",
                         help="Keep up to N scheduler graphs (1..256) and reuse matching batch shapes across sessions "
                              "with fixed convolution rows. The default uses the engine's graph limits.")
@@ -135,14 +146,27 @@ def arguments(argv=None):
 
 def make_plan(args):
     profile = PROFILES[args.profile]
+    if args.draft_model is not None and args.draft is False:
+        raise ValueError("draft-model cannot be combined with --no-draft")
+    draft = args.draft_model
+    draft_profile = args.profile == "tensor-4-draft"
+    if draft is None and (draft_profile if args.draft is None else args.draft):
+        if args.model is not None or args.profile not in ("tensor-4", "tensor-4-draft"):
+            raise ValueError("a draft for a different target requires --draft-model")
+        draft = args.packs / DRAFT
+    draft_layout = draft is not None or draft_profile
     slots = args.slots if args.slots is not None else SLOTS
-    context = args.context if args.context is not None else profile["context"]
+    default_context = DRAFT_CONTEXT if draft_layout and args.profile == "tensor-4" else profile["context"]
+    context = args.context if args.context is not None else default_context
     slot_context = args.slot_context if args.slot_context is not None else profile.get("slot_context", SLOT_CONTEXT)
     if not 1 <= args.port <= 65535:
         raise ValueError("port must be 1..65535")
     if not 1 <= slots <= MAX_SLOTS:
         raise ValueError(f"slots must be 1..{MAX_SLOTS}")
-    if not 1 <= args.ubatch_size <= BATCH_SIZE:
+    ubatch_size = args.ubatch_size
+    if ubatch_size is None:
+        ubatch_size = DRAFT_UBATCH_SIZE if draft_layout else BATCH_SIZE
+    if not 1 <= ubatch_size <= BATCH_SIZE:
         raise ValueError(f"ubatch-size must be 1..{BATCH_SIZE}")
     if args.keep_graphs is not None and not 1 <= args.keep_graphs <= 256:
         raise ValueError("keep-graphs must be 1..256")
@@ -164,20 +188,21 @@ def make_plan(args):
         raise ValueError("host must be a nonempty address without control characters")
     server = args.server.expanduser().resolve()
     model = own_path(args.model) if args.model else own_path(args.packs / profile["pack"])
-    kv = args.kv_cache or profile["kv"]
+    kv = args.kv_cache or ("q8_0" if draft_layout else profile["kv"])
+    swa_kv = args.swa_kv_cache or ("f16" if draft_layout else None)
     argv = [str(server), "-m", model]
     if not args.text_only:
         argv += ["--mmproj", own_path(args.mmproj) if args.mmproj else own_path(args.packs / profile.get("mmproj", MMPROJ))]
     # Attention splits by heads (2 KV heads a card), so the caches split with them and are never mirrored
     argv += ["-ngl", "99", "-sm", "tensor", "-ts", "1,1,1,1", "--jinja", "-fa", "on",
              "--cache-type-k", kv, "--cache-type-v", kv,
-             "-b", str(BATCH_SIZE), "-ub", str(args.ubatch_size), "--prompt-step", str(args.prompt_step), "--prompt-chunk", "128"]
+             "-b", str(BATCH_SIZE), "-ub", str(ubatch_size), "--prompt-step", str(args.prompt_step), "--prompt-chunk", "128"]
     if args.prompt_step_ms is not None:
         argv += ["--prompt-step-ms", str(args.prompt_step_ms)]
     if args.attn_mask_bits:
         argv += ["--attn-mask-bits"]
-    if args.swa_kv_cache:
-        argv += ["--cache-type-k-swa", args.swa_kv_cache, "--cache-type-v-swa", args.swa_kv_cache]
+    if swa_kv:
+        argv += ["--cache-type-k-swa", swa_kv, "--cache-type-v-swa", swa_kv]
     # The model card's sampling defaults; reasoning effort is left to the template's default of high
     argv += ["--temp", "1.0", "--top-p", "1.0", "--top-k", "0", "--min-p", "0.0",
              "--alias", Path(profile["pack"]).stem, "--chat-template-file", str(TEMPLATE),
@@ -190,6 +215,13 @@ def make_plan(args):
         argv += ["--log-verbosity", str(args.log_verbosity)]
     if args.checkpoint_every is not None:
         argv += ["--checkpoint-every", str(args.checkpoint_every)]
+    if draft is not None:
+        argv += ["--spec-type", "draft-dspark", "--spec-draft-model", own_path(draft),
+                 "--spec-draft-n-max", str(args.draft_depth), "--spec-draft-n-min", "1",
+                 "--spec-draft-p-min", "0", "--spec-draft-sampling", "greedy",
+                 "--spec-draft-device", args.draft_device, "--spec-draft-ngl", "99",
+                 "--spec-draft-ubatch", str(DRAFT_UBATCH_SIZE),
+                 "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
     env = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
         # A session ends at slot-context tokens, and the graph reserved at load is sized for sessions that long
@@ -246,6 +278,8 @@ def main(args):
     paths = [("model", Path(argv[argv.index("-m") + 1]))]
     if "--mmproj" in argv:
         paths.append(("mmproj", Path(argv[argv.index("--mmproj") + 1])))
+    if "--spec-draft-model" in argv:
+        paths.append(("DSpark draft", Path(argv[argv.index("--spec-draft-model") + 1])))
     return glm53.launch(argv, settings, paths, args.dry_run)
 
 

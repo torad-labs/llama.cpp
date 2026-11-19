@@ -18,6 +18,22 @@ Run from the checkout on the test host. Use the server and adjacent CUDA librari
 
 At startup `tensor-4` allocates 92 GiB for the eight global KV layers and 3.91 GiB for the 40 sliding-window layers across the four GPUs. Each slot also has about 6.19 MiB of convolution state. The 23 sessions draw from the same global pool. At the 294,912-token ceiling, it holds ten independent full-length histories.
 
+### Native draft
+
+Convert the pinned Inkling `mtp.safetensors` alongside its tokenizer and configuration, then give the draft its own copies of the target's vocabulary weights. The conversion reads only the draft weights. The second command copies the embedding, embedding norm and output tensors from the exact target GGUF in the pack.
+
+```sh
+python3 convert_hf_to_gguf.py /path/to/pinned-inkling-config-and-mtp --dspark --outtype bf16 --outfile draft-bf16.gguf
+python3 scripts/glm53/dflash_own_head.py \
+    --draft draft-bf16.gguf \
+    --target "$PACKS/Inkling-2-Small-abliterated-e4853745-Q3_K_M-imatrix.gguf" \
+    --out "$PACKS/Inkling-2-Small-abliterated-e4853745-DSpark-BF16-own-head.gguf"
+```
+
+Select `--profile tensor-4-draft` to load the paired draft automatically. This profile uses a 1,572,864-token shared pool, Q8_0 global KV, F16 sliding KV and a 256-token physical microbatch. The draft runs on `CUDA3` with Q8_0 KV and proposes up to three tokens. The server verifies each proposal with the target's sampling settings. The full Tensor 4 pool ran out of memory with the paired draft on four RTX PRO 6000 GPUs. Use `tensor-4` for the qualified serving configuration.
+
+`--draft-depth` and `--draft-device` select other configurations. Use `--draft-model` when supplying a different target path. Add `--no-draft` to `tensor-4-draft` for a control with matching target settings.
+
 For repeated text prefixes, let the server choose each request's slot. When the server can fork a matching active request, the sessions share its KV cells and evaluate their own suffixes. The prefix must cover at least 256 tokens and exceed the configured similarity threshold (10% by default). Text chat can share with the vision projector loaded. The active-prefix path skips requests containing media. The pinned-slot qualification phases exercise independent sessions. Use `--no-prefix-copy` to disable prefix sharing.
 
 The host prompt cache allocates serialized states as sessions enter it. Allow host memory beyond the budget for live rollback checkpoints, spare checkpoint buffers, the process, model mapping and the operating system. An idle session can stay on its GPU slot until another request reuses the slot or the device pool comes under pressure.

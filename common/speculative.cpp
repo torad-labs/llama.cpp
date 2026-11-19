@@ -1101,6 +1101,7 @@ protected:
         bool    backend_sampling; // the block logits can be sampled on the backend
         bool    dev_features;     // the target features can come from the target's device buffer
         bool    nextn_masked;     // h_nextn is only read at the output rows
+        bool    greedy = false;  // preserve the first maximum for the recurrent head
     };
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
@@ -1172,6 +1173,10 @@ protected:
             sparams.no_perf  = false;
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            if (opt.greedy) {
+                sparams.temp = 0.0f;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+            }
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
@@ -1217,8 +1222,7 @@ protected:
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
 
-    // only LiliCorr uses this, to keep the context features for its scorer; the other heads only need the KV cache
-    // called after the host copy injection of a chunk, while h_nextn still holds the context features of batch_inject
+    // Called while h_nextn still holds the context features of batch_inject.
     virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*n_chunk*/) {}
 
 public:
@@ -1322,6 +1326,7 @@ public:
                                 __func__, rc, (int) n_chunk, (int) offset);
                         return false;
                     }
+                    store_context_features(seq_id, n_chunk);
                     continue;
                 }
 
@@ -1450,17 +1455,41 @@ public:
 struct common_speculative_impl_draft_dspark final : public common_speculative_impl_draft_dflash {
     // bonus anchor (SpecForge exports) when false: slot 0 is a bonus token, not a prediction slot
     bool sample_from_anchor = true;
+    bool inkling = false;
+    bool context_on_device = false;
+    bool cand_rows = false;
+    size_t context_rows = 0;
+    std::vector<llama_pos> context_pos;
+    std::vector<float> context_embd;
+    std::vector<float> context_tail;
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
         const llama_model * model_dft = llama_get_model(this->params.ctx_dft);
+        char rank[32] = {};
+        inkling = llama_model_meta_val_str(model_dft, "dflash.dspark.markov_rank", rank, sizeof(rank)) >= 0;
 
         {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
                 sample_from_anchor = std::strcmp(buf, "true") == 0;
             }
+        }
+
+        if (inkling) {
+            if (n_embd_tgt != n_embd_dec || sample_from_anchor || causal_attn ||
+                    target_layer_ids[target_layer_ids_n - 1] != llama_model_n_layer(llama_get_model(this->params.ctx_tgt))) {
+                throw std::runtime_error("Inkling2 DSpark target and draft do not match");
+            }
+            if (this->params.probabilistic) {
+                throw std::runtime_error("Inkling2 DSpark requires --spec-draft-sampling greedy");
+            }
+            // Keep enough rows for the accepted boundary after discarding a verification suffix.
+            context_rows = block_size + 1;
+            context_pos.assign(size_t(n_seq)*context_rows, -1);
+            context_embd.resize(context_pos.size()*n_embd_dec);
+            context_tail.resize(context_rows*n_embd_dec);
         }
 
         if (this->params.p_min > 0.0f) {
@@ -1478,10 +1507,85 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         // anchor-first DSpark yields a full block_size draft tokens
         init({
             /* .n_draft_max      = */ sample_from_anchor ? block_size : block_size - 1,
-            /* .backend_sampling = */ true,
+            /* .backend_sampling = */ !inkling,
             /* .dev_features     = */ true,
-            /* .nextn_masked     = */ true,
+            /* .nextn_masked     = */ !inkling,
+            /* .greedy          = */ inkling,
         });
+        if (inkling) {
+            context_on_device = llama_set_embeddings_nextn_dev(this->params.ctx_dft, true);
+            cand_rows = this->params.backend_sampling && !common_output_candidates_legacy();
+            if (cand_rows) {
+                llama_set_output_candidates(this->params.ctx_dft, 1);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    llama_set_seq_candidates(this->params.ctx_dft, seq_id, true);
+                }
+            }
+        }
+    }
+
+    ~common_speculative_impl_draft_dspark() override {
+        if (cand_rows) {
+            llama_set_output_candidates(params.ctx_dft, 0);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                llama_set_seq_candidates(params.ctx_dft, seq_id, false);
+            }
+        }
+    }
+
+    void store_context_features(llama_seq_id seq_id, int32_t n_chunk) override {
+        if (!inkling) {
+            return;
+        }
+        const int32_t keep = std::min<int32_t>(n_chunk, context_rows);
+        const int32_t start = n_chunk - keep;
+        const float * tail = nullptr;
+        if (context_on_device) {
+            if (llama_get_embeddings_nextn_rows(params.ctx_dft, start, keep, context_tail.data())) {
+                tail = context_tail.data();
+            }
+        } else if (const float * rows = llama_get_embeddings_nextn(params.ctx_dft)) {
+            tail = rows + size_t(start)*n_embd_dec;
+        }
+        for (int32_t i = 0; i < keep; ++i) {
+            const llama_pos pos = batch_inject.tokens[start + i].pos[0];
+            if (pos < 0) {
+                continue;
+            }
+            const size_t row = size_t(seq_id)*context_rows + size_t(pos)%context_rows;
+            context_pos[row] = tail ? pos : -1;
+            if (tail) {
+                std::memcpy(context_embd.data() + row*n_embd_dec, tail + size_t(i)*n_embd_dec, n_embd_dec*sizeof(float));
+            }
+        }
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (!inkling || seq_id < 0 || (uint32_t) seq_id >= n_seq) {
+            return false;
+        }
+        const size_t row = size_t(seq_id)*context_rows;
+        const size_t pos_bytes = context_rows*sizeof(llama_pos);
+        const size_t embd_bytes = context_rows*n_embd_dec*sizeof(float);
+        data.resize(pos_bytes + embd_bytes);
+        std::memcpy(data.data(), context_pos.data() + row, pos_bytes);
+        std::memcpy(data.data() + pos_bytes, context_embd.data() + row*n_embd_dec, embd_bytes);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (!inkling || seq_id < 0 || (uint32_t) seq_id >= n_seq) {
+            return;
+        }
+        const size_t row = size_t(seq_id)*context_rows;
+        const size_t pos_bytes = context_rows*sizeof(llama_pos);
+        const size_t embd_bytes = context_rows*n_embd_dec*sizeof(float);
+        if (data.size() == pos_bytes + embd_bytes) {
+            std::memcpy(context_pos.data() + row, data.data(), pos_bytes);
+            std::memcpy(context_embd.data() + row*n_embd_dec, data.data() + pos_bytes, embd_bytes);
+        } else {
+            std::fill_n(context_pos.data() + row, context_rows, -1);
+        }
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -1503,13 +1607,27 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
+            size_t context_row = 0;
+            if (inkling) {
+                if (n <= 0) {
+                    continue;
+                }
+                const llama_pos pos = n - 1;
+                context_row = size_t(seq_id)*context_rows + size_t(pos)%context_rows;
+                if (context_pos[context_row] != pos) {
+                    continue;
+                }
+            }
 
-            const int32_t n_draft = params.n_max;
-            const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);
+            const int32_t n_block_tokens = inkling ? block_size : params.n_max + (sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                const bool output = !inkling || i <= params.n_max;
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
+                if (inkling) {
+                    batch.set_embd_state(idx, {context_embd.data() + context_row*n_embd_dec, 1, size_t(n_embd_dec)});
+                }
             }
         }
 
@@ -1541,13 +1659,19 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
             // bonus-anchor drafts read the mask positions only, like DFlash
             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-            for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+            const int32_t n_draft_end = inkling ? std::min(n_block_tokens, std::min(params.n_max, dp.n_max < 0 ? params.n_max : dp.n_max) + 1)
+                                               : n_block_tokens;
+            for (int32_t i = i_draft_beg; i < n_draft_end; ++i) {
                 const int32_t idx = beg + i;
 
                 if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
                     break;
                 }
 
+                if (inkling) {
+                    result.push_back(common_sampler_sample(smpl, ctx_dft, idx, true));
+                    continue;
+                }
                 common_sampler_sample(smpl, ctx_dft, idx, true);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -3960,6 +4084,20 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+
+        char inkling_rank[32] = {};
+        if (llama_model_meta_val_str(model_dft, "dflash.dspark.markov_rank", inkling_rank, sizeof(inkling_rank)) >= 0) {
+            const uint32_t n_seq = std::max(1, params.n_parallel);
+            const uint32_t block_rows = 8u*n_seq;
+            const uint32_t output_rows = std::clamp(params.speculative.draft.n_max, 1, 7) + 1;
+            if (block_rows > cparams.n_batch) {
+                LOG_ERR("%s: Inkling2 DSpark needs at least %u draft batch rows\n", __func__, block_rows);
+                return;
+            }
+            cparams.n_ubatch = std::max(cparams.n_ubatch, block_rows);
+            cparams.n_outputs_max = output_rows*n_seq;
+            cparams.n_outputs_max_per_seq = output_rows;
+        }
 
         if (spec_mtp && !common_mtp_set_vocab(model_dft, params.speculative.draft.mtp_vocab)) {
             return;

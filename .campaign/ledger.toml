@@ -369,3 +369,22 @@ checks = [
 notes = [
   '2026-11-17 13:38 CT: added; 1 of 1 checks fail, as they should before the work',
 ]
+
+[[row]]
+id = 'inkling-tensor4-dspark'
+title = 'Tensor 4 serves Inkling with its native draft'
+status = 'in_flight'
+owner = 'codex-inkling-dspark'
+blocked_by = []
+guard = false
+spec = 'A Tensor 4 plan with the pinned native Inkling draft enables drafting automatically, preserves the target sampler and restored session state, and produces four-card per-session decode and draft acceptance evidence. End each Vast test window once its traces and metrics are collected. Compare the same target and KV configuration with drafting disabled.'
+checks = [
+  'cd scripts/inkling2 && python3 -B -m unittest test_serve.ProfilePlanTest.test_tensor_4_auto_draft',
+]
+inputs = [
+  'scripts/inkling2',
+]
+notes = [
+  '2026-11-18 20:22 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-18 20:22 CT codex-inkling-dspark: claimed',
+]
