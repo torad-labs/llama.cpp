@@ -25,6 +25,7 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <map>
 #include <cstddef>
@@ -33,6 +34,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <future>
 #include <random>
 #include <utility>
 #include <fstream>
@@ -5255,7 +5257,7 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
-                post_decode(n_tokens, off);
+                post_decode(n_tokens, off, trace_id);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -6659,7 +6661,72 @@ private:
         return true;
     }
 
-    void post_decode(int32_t n_batch_tokens, int32_t off) {
+    struct cpu_sample_result {
+        llama_token token = LLAMA_TOKEN_NULL;
+        std::exception_ptr error;
+    };
+
+    std::vector<cpu_sample_result> sample_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
+        const int n_threads = std::min(params_base.cpuparams.n_threads, 4);
+        if (n_threads < 2 || n_batch_tokens < 4 || spec || !pull_k.empty() ||
+                llama_vocab_n_tokens(vocab) < 128*1024) {
+            return {};
+        }
+
+        struct job {
+            int32_t slot;
+            common_sampler * sampler;
+            llama_sampling_row row;
+        };
+        std::vector<job> jobs;
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_GENERATING || slot.i_batch < off || slot.i_batch >= off + n_batch_tokens ||
+                    slot.backend_sampler || slot.cand_rows || slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+                continue;
+            }
+            const auto & sampling = slot.task->params.sampling;
+            if (sampling.top_k > 0 || sampling.temp <= 0.0f || sampling.n_probs > 0 ||
+                    !common_sampler_backend_passive(slot.smpl.get())) {
+                continue;
+            }
+            const auto row = llama_get_sampling_row_ith(ctx_tgt, slot.i_batch - off);
+            if (row.logits && row.token == LLAMA_TOKEN_NULL) {
+                jobs.push_back({slot.id, slot.smpl.get(), row});
+            }
+        }
+        if (jobs.size() < 4) {
+            return {};
+        }
+
+        common_decode_trace::range trace([&] {
+            return "stage=cpu_sample iteration=" + std::to_string(trace_id) +
+                    " rows=" + std::to_string(jobs.size()) + " threads=" + std::to_string(n_threads);
+        });
+        std::vector<cpu_sample_result> results(slots.size());
+        // Each worker reads a completed logit row and changes only its slot's sampler.
+        auto sample = [&](size_t start) {
+            for (size_t i = start; i < jobs.size(); i += n_threads) {
+                const auto & entry = jobs[i];
+                auto & result = results[entry.slot];
+                try {
+                    result.token = common_sampler_sample(entry.sampler, vocab, entry.row);
+                } catch (...) {
+                    result.error = std::current_exception();
+                }
+            }
+        };
+        std::array<std::future<void>, 3> workers;
+        for (int i = 1; i < n_threads; ++i) {
+            workers[i - 1] = std::async(std::launch::async | std::launch::deferred, sample, i);
+        }
+        sample(0);
+        for (int i = 1; i < n_threads; ++i) {
+            workers[i - 1].get();
+        }
+        return results;
+    }
+
+    void post_decode(int32_t n_batch_tokens, int32_t off, uint64_t trace_id) {
         pull_recs.clear(); // the records are per decode: batch indices repeat across decodes
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -6682,6 +6749,7 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        const auto sampled = sample_cpu_batch(off, n_batch_tokens, trace_id);
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -6739,8 +6807,15 @@ private:
 
             pull_eval(slot, tok_idx);
 
-            llama_token id;
-            {
+            llama_token id = LLAMA_TOKEN_NULL;
+            if (!sampled.empty()) {
+                const auto & result = sampled[slot.id];
+                if (result.error) {
+                    std::rethrow_exception(result.error);
+                }
+                id = result.token;
+            }
+            if (id == LLAMA_TOKEN_NULL) {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }

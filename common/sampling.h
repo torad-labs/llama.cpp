@@ -72,6 +72,10 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// Sample a previously fetched row while its output storage remains valid.
+llama_token common_sampler_sample(struct common_sampler * gsmpl, const struct llama_vocab * vocab,
+        const struct llama_sampling_row & row, bool grammar_first = false);
+
 // A drafter's token as this sampler's chain would draw it from the drafter's candidates (any order): the chain's
 // penalties, cuts and temperature over them, then the coupled dist sampler's noise for the sample that follows the
 // tokens the drafter proposed before it this round (proposed, accepted into a copy of the chain). The target draws

@@ -368,15 +368,10 @@ struct common_sampler {
     }
 
     // top_k > 0: the candidates are the top_k largest logits, sorted, instead of every token's
-    void set_logits(struct llama_context * ctx, const llama_sampling_row & row, int32_t top_k = 0) {
+    void set_logits(int32_t n_vocab, const llama_sampling_row & row, int32_t top_k = 0) {
         const float *       sampled_probs  = row.sampled_probs;
         const float *       sampled_logits = row.sampled_logits;
         const llama_token * sampled_ids    = row.candidates;
-
-        const llama_model * model = llama_get_model(ctx);
-        const llama_vocab * vocab = llama_model_get_vocab(model);
-
-        const int n_vocab = llama_vocab_n_tokens(vocab);
 
         if (sampled_probs) {
             const uint32_t sampled_probs_count = row.n_sampled_probs;
@@ -1001,9 +996,17 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     const auto row = llama_get_sampling_row_ith(ctx, idx);
+    if (row.token == LLAMA_TOKEN_NULL) {
+        LOG_DBG("%s: no backend-sampled token at idx %d: the CPU samplers run\n", __func__, idx);
+    }
+    return common_sampler_sample(gsmpl, llama_model_get_vocab(llama_get_model(ctx)), row, grammar_first);
+}
 
+llama_token common_sampler_sample(struct common_sampler * gsmpl, const struct llama_vocab * vocab,
+        const llama_sampling_row & row, bool grammar_first) {
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
 
     llama_token id = LLAMA_TOKEN_NULL;
 
@@ -1017,7 +1020,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     const bool every_token = (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) ||
         (grammar_first && grammar_should_apply(gsmpl));
 
-    gsmpl->set_logits(ctx, row, every_token ? 0 : gsmpl->n_candidates);
+    gsmpl->set_logits(n_vocab, row, every_token ? 0 : gsmpl->n_candidates);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -1039,8 +1042,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
             return id;
         }
-
-        LOG_DBG("%s: no backend-sampled token at idx %d: the CPU samplers run\n", __func__, idx);
     }
 
     // a row a backend cut to its top k holds no other token: as for a sampled token, a grammar or reasoning budget that
@@ -1078,7 +1079,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, row);
+    gsmpl->set_logits(n_vocab, row);
 
     llama_sampler_apply(rbudget,  &cur_p);
 
