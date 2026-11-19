@@ -474,6 +474,7 @@ struct mock_config {
     int  set_n_calls;
     int  get_n_calls;
     int  cpy_n_calls;
+    int  copy_calls; // every set and get a buffer is asked for: one range, the rows of a 2D copy, or a batch
 };
 
 static mock_config g_mock = {};
@@ -486,6 +487,7 @@ static void mock_config_reset(bool set_n, bool get_n, bool cpy_n, bool cpy_n_res
     g_mock.set_n_calls = 0;
     g_mock.get_n_calls = 0;
     g_mock.cpy_n_calls = 0;
+    g_mock.copy_calls = 0;
 }
 
 static void mock_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -503,13 +505,35 @@ static void mock_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_
 }
 
 static void mock_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    g_mock.copy_calls++;
     memcpy((char *) tensor->data + offset, data, size);
 
     GGML_UNUSED(buffer);
 }
 
 static void mock_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    g_mock.copy_calls++;
     memcpy(data, (const char *) tensor->data + offset, size);
+
+    GGML_UNUSED(buffer);
+}
+
+static void mock_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
+        size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    g_mock.copy_calls++;
+    for (size_t i = 0; i < n_copies; i++) {
+        memcpy((char *) tensor->data + offset + i*stride_tensor, (const char *) data + i*stride_data, size);
+    }
+
+    GGML_UNUSED(buffer);
+}
+
+static void mock_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size,
+        size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    g_mock.copy_calls++;
+    for (size_t i = 0; i < n_copies; i++) {
+        memcpy((char *) data + i*stride_data, (const char *) tensor->data + offset + i*stride_tensor, size);
+    }
 
     GGML_UNUSED(buffer);
 }
@@ -527,6 +551,7 @@ static void mock_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
 
 static void mock_buffer_set_tensor_n(ggml_backend_buffer_t buffer, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
     g_mock.set_n_calls++;
+    g_mock.copy_calls++;
     for (size_t i = 0; i < n_tensors; i++) {
         memcpy((char *) tensors[i]->data + offsets[i], data[i], sizes[i]);
     }
@@ -536,6 +561,7 @@ static void mock_buffer_set_tensor_n(ggml_backend_buffer_t buffer, struct ggml_t
 
 static void mock_buffer_get_tensor_n(ggml_backend_buffer_t buffer, const struct ggml_tensor * const * tensors, void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
     g_mock.get_n_calls++;
+    g_mock.copy_calls++;
     for (size_t i = 0; i < n_tensors; i++) {
         memcpy(data[i], (const char *) tensors[i]->data + offsets[i], sizes[i]);
     }
@@ -575,8 +601,8 @@ static ggml_backend_buffer_t mock_buft_alloc_buffer(ggml_backend_buffer_type_t b
         /* .memset_tensor   = */ mock_buffer_memset_tensor,
         /* .set_tensor      = */ mock_buffer_set_tensor,
         /* .get_tensor      = */ mock_buffer_get_tensor,
-        /* .set_tensor_2d   = */ NULL,
-        /* .get_tensor_2d   = */ NULL,
+        /* .set_tensor_2d   = */ mock_buffer_set_tensor_2d,
+        /* .get_tensor_2d   = */ mock_buffer_get_tensor_2d,
         /* .cpy_tensor      = */ mock_buffer_cpy_tensor,
         /* .clear           = */ mock_buffer_clear,
         /* .reset           = */ NULL,
@@ -592,7 +618,7 @@ static ggml_backend_buffer_t mock_buft_alloc_buffer(ggml_backend_buffer_type_t b
 }
 
 static size_t mock_buft_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 32;
+    return alignof(max_align_t); // what malloc gives: the tensors of an exact fit start at the buffer's base
 
     GGML_UNUSED(buft);
 }
@@ -780,6 +806,160 @@ static bool test_mock() {
         test_mock_grouping();
 }
 
+// A device of the mock buffer type: a tensor split over it twice counts the copies each device is asked for.
+static const char * mock_dev_get_name(ggml_backend_dev_t dev) {
+    return "MOCK";
+
+    GGML_UNUSED(dev);
+}
+
+static ggml_backend_buffer_type_t mock_dev_get_buffer_type(ggml_backend_dev_t dev) {
+    return mock_buft();
+
+    GGML_UNUSED(dev);
+}
+
+static ggml_backend_dev_t mock_dev(void) {
+    static struct ggml_backend_device dev = {};
+    dev.iface.get_name        = mock_dev_get_name;
+    dev.iface.get_description = mock_dev_get_name;
+    dev.iface.get_buffer_type = mock_dev_get_buffer_type;
+    return &dev;
+}
+
+// "rows" has each row in two uneven parts, "segments" has each row as two segments of two repeats each.
+static ggml_backend_meta_split_state split_rows(const ggml_tensor * tensor, void * userdata) {
+    if (strcmp(tensor->name, "rows") == 0) {
+        return { GGML_BACKEND_SPLIT_AXIS_0, { 96, 160 }, { 1 }, 1 };
+    }
+    if (strcmp(tensor->name, "segments") == 0) {
+        return { GGML_BACKEND_SPLIT_AXIS_0, { 32, 32, 16, 48 }, { 2, 2 }, 2 };
+    }
+    return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1 };
+
+    GGML_UNUSED(userdata);
+}
+
+// A state copy of tensors split along their rows over a device twice: runs of a few rows with gaps between them, as a sequence's cells are in a cache it shares, a stretch of them out of order and a few long ones.
+// Only those rows change, and they read back as written. With count (the mock device), the copies the devices are asked for must not follow the number of runs.
+static bool test_split_rows(ggml_backend_dev_t dev, bool count) {
+    const int64_t n_embd = 256;
+    const int64_t n_rows = 16384;
+
+    ggml_backend_dev_t devs[] = { dev, dev };
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ggml_backend_meta_device(devs, 2, split_rows, nullptr));
+
+    ggml_init_params params = {};
+    params.mem_size = ggml_tensor_overhead()*2;
+    params.no_alloc = true;
+
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * tensors[2] = {
+        ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, n_embd, n_rows),
+        ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, n_embd, n_rows),
+    };
+    ggml_set_name(tensors[0], "rows");
+    ggml_set_name(tensors[1], "segments");
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buf) {
+        return false;
+    }
+
+    const size_t row     = ggml_row_size(GGML_TYPE_F16, n_embd);
+    const size_t n_bytes = row*n_rows;
+
+    uint32_t state = 4321;
+    const auto next = [&]() {
+        state = state*1664525u + 1013904223u;
+        return state >> 8;
+    };
+
+    std::vector<ggml_tensor *> ts;
+    std::vector<size_t> offsets, sizes, data_offsets;
+    size_t host = 0;
+    for (ggml_tensor * t : tensors) {
+        size_t at = 0;
+        for (size_t i = 0; ; i++) {
+            // one to three rows, and now and then eight, nine or forty
+            const size_t len = i % 1500 == 700 ? 40 : i % 1009 == 500 ? 9 : i % 97 == 48 ? 8 : 1 + next() % 3;
+            at += 1 + next() % 3;
+            if (at + len > (size_t) n_rows) {
+                break;
+            }
+            ts.push_back(t);
+            offsets.push_back(at*row);
+            sizes.push_back(len*row);
+            data_offsets.push_back(host);
+            at   += len;
+            host += len*row;
+        }
+    }
+    const size_t n_runs = ts.size();
+    if (n_runs < 4000) {
+        return false;
+    }
+    // a stretch of the runs in the opposite order
+    for (size_t i = 0; i < 500; i++) {
+        std::swap(ts[1000 + i], ts[1999 - i]);
+        std::swap(offsets[1000 + i], offsets[1999 - i]);
+        std::swap(sizes[1000 + i], sizes[1999 - i]);
+        std::swap(data_offsets[1000 + i], data_offsets[1999 - i]);
+    }
+
+    std::vector<uint8_t> expected[2], now(n_bytes), src(host), out(host, 0);
+    for (size_t k = 0; k < 2; k++) {
+        expected[k].resize(n_bytes);
+        for (size_t i = 0; i < n_bytes; i++) {
+            expected[k][i] = (uint8_t) (i*7 + 3 + k);
+        }
+        ggml_backend_tensor_set(tensors[k], expected[k].data(), 0, n_bytes);
+    }
+    for (size_t i = 0; i < host; i++) {
+        src[i] = (uint8_t) next();
+    }
+
+    g_mock.copy_calls = 0;
+    const int64_t t_set = ggml_time_us();
+    ggml_backend_tensor_set_n(ts.data(), src.data(), offsets.data(), sizes.data(), data_offsets.data(), n_runs);
+    const int64_t us_set = ggml_time_us() - t_set;
+    const size_t set_calls = g_mock.copy_calls;
+
+    for (size_t i = 0; i < n_runs; i++) {
+        memcpy(expected[ts[i] == tensors[1]].data() + offsets[i], src.data() + data_offsets[i], sizes[i]);
+    }
+    for (size_t k = 0; k < 2; k++) {
+        ggml_backend_tensor_get(tensors[k], now.data(), 0, n_bytes);
+        if (memcmp(now.data(), expected[k].data(), n_bytes) != 0) {
+            return false;
+        }
+    }
+
+    g_mock.copy_calls = 0;
+    const int64_t t_get = ggml_time_us();
+    ggml_backend_tensor_get_n(ts.data(), out.data(), offsets.data(), sizes.data(), data_offsets.data(), n_runs);
+    const int64_t us_get = ggml_time_us() - t_get;
+    const size_t get_calls = g_mock.copy_calls;
+
+    if (memcmp(out.data(), src.data(), host) != 0) {
+        return false;
+    }
+    printf("%s split rows: %zu runs set in %.2f ms, read back in %.2f ms\n", ggml_backend_dev_name(dev), n_runs, us_set/1000.0, us_get/1000.0);
+
+    if (count) {
+        printf("split rows: %zu runs, %zu copies to set them, %zu to get them\n", n_runs, set_calls, get_calls);
+        if (set_calls*20 > n_runs || get_calls*20 > n_runs) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -820,10 +1000,24 @@ int main() {
         meta_ok = meta_ok && ok;
     }
 
+    // a state copy of row-split tensors, over each device twice
+    bool rows_ok = true;
+    for (size_t i = 0; i < n_devs; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const bool ok = test_split_rows(dev, false);
+        printf("%s split rows %s\n", ggml_backend_dev_name(dev), ok ? "PASSED" : "FAILED");
+        rows_ok = rows_ok && ok;
+    }
+
     // run the unified test set and the dispatch tests on the mock buffer type
     mock_config_reset(true, true, true, true);
     const bool mock_ok = test_buft(mock_buft()) && test_mock();
     printf("MOCK %s\n", mock_ok ? "PASSED" : "FAILED");
 
-    return n_ok == n_devs && meta_ok && mock_ok ? 0 : 1;
+    // the same state copy over the mock device twice, where the copies are counted
+    mock_config_reset(true, true, false, true);
+    const bool mock_rows_ok = test_split_rows(mock_dev(), true);
+    printf("MOCK split rows %s\n", mock_rows_ok ? "PASSED" : "FAILED");
+
+    return n_ok == n_devs && meta_ok && rows_ok && mock_ok && mock_rows_ok ? 0 : 1;
 }

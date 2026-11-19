@@ -55,6 +55,11 @@ void llama_state_async::submit(llama_seq_id seq_id, const std::vector<copy> & co
     job next;
     next.seq_id    = seq_id;
     next.to_device = to_device;
+    // copies with no list of device copies: one batched call here, which a split buffer makes as few copies per device
+    std::vector<ggml_tensor *> tensors;
+    std::vector<size_t>        offsets;
+    std::vector<size_t>        sizes;
+    std::vector<uint8_t *>     ptrs;
     for (const auto & c : copies) {
         llama_state_copy_plan p = {next.copies, c.ptr};
         const bool ok = ggml_backend_meta_tensor_ranges(c.tensor, c.offset, c.size, /*read =*/ !to_device,
@@ -69,10 +74,21 @@ void llama_state_async::submit(llama_seq_id seq_id, const std::vector<copy> & co
             next.packed_read = true;
             continue;
         }
+        tensors.push_back(c.tensor);
+        offsets.push_back(c.offset);
+        sizes.push_back(c.size);
+        ptrs.push_back(c.ptr);
+    }
+    if (!tensors.empty()) {
+        uint8_t * base = *std::min_element(ptrs.begin(), ptrs.end());
+        std::vector<size_t> data_offsets(ptrs.size());
+        for (size_t i = 0; i < ptrs.size(); ++i) {
+            data_offsets[i] = ptrs[i] - base;
+        }
         if (to_device) {
-            ggml_backend_tensor_set(c.tensor, c.ptr, c.offset, c.size);
+            ggml_backend_tensor_set_n(tensors.data(), base, offsets.data(), sizes.data(), data_offsets.data(), tensors.size());
         } else {
-            ggml_backend_tensor_get(c.tensor, c.ptr, c.offset, c.size);
+            ggml_backend_tensor_get_n(tensors.data(), base, offsets.data(), sizes.data(), data_offsets.data(), tensors.size());
         }
     }
     if (next.copies.empty()) {
