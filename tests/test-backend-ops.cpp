@@ -5715,11 +5715,12 @@ struct test_short_conv : public test_case {
 // not write, or wrote at a wrong column, fails beside a wrong convolution. The history rows sit at a channel offset
 // inside a wider state row, as one stream of a layer's four does; with strided the new rows are a permuted view.
 struct test_short_conv_window : public test_case {
-    const int64_t channels, n_tokens, n_seqs, dynamic_heads;
+    const int64_t channels, n_tokens, n_seqs, dynamic_heads, k;
     const bool strided;
 
-    test_short_conv_window(int64_t channels, int64_t n_tokens, int64_t n_seqs, int64_t dynamic_heads, bool strided)
-        : channels(channels), n_tokens(n_tokens), n_seqs(n_seqs), dynamic_heads(dynamic_heads), strided(strided) {}
+    test_short_conv_window(int64_t channels, int64_t n_tokens, int64_t n_seqs, int64_t dynamic_heads, bool strided,
+            int64_t k = 4)
+        : channels(channels), n_tokens(n_tokens), n_seqs(n_seqs), dynamic_heads(dynamic_heads), k(k), strided(strided) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5729,11 +5730,10 @@ struct test_short_conv_window : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR5(channels, n_tokens, n_seqs, dynamic_heads, strided);
+        return VARS_TO_STR6(channels, n_tokens, n_seqs, dynamic_heads, strided, k);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int k = 4;
         auto * hist = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k - 1, channels + 7, n_seqs);
         auto * past = ggml_view_3d(ctx, hist, k - 1, channels, n_seqs, hist->nb[1], hist->nb[2], 7*hist->nb[1]);
         ggml_tensor * input;
@@ -5745,7 +5745,9 @@ struct test_short_conv_window : public test_case {
         }
         auto * window = ggml_concat(ctx, past, ggml_transpose(ctx, input), 0);
         auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, channels);
-        auto * d = dynamic_heads ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k*dynamic_heads, n_tokens*n_seqs) : nullptr;
+        // the dynamic taps come out of a projection in the model, whose node graph expansion puts between the
+        // CONCAT and the SHORT_CONV; a leaf here would let the fusion match graphs the model never builds
+        auto * d = dynamic_heads ? ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k*dynamic_heads, n_tokens*n_seqs), 1.0f) : nullptr;
         auto * conv = ggml_short_conv(ctx, window, w, d, 1.0f/sqrtf((d ? 2 : 1)*k + 1));
         auto * tail = ggml_cont(ctx, ggml_view_3d(ctx, window, k - 1, channels, n_seqs,
                 window->nb[1], window->nb[2], ggml_row_size(GGML_TYPE_F32, n_tokens)));
@@ -14941,6 +14943,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_short_conv_window(257, 16, 2, 0, true));
     // past the fused kernel's token cap: the plain CONCAT + SHORT_CONV chain
     test_cases.emplace_back(new test_short_conv_window(64, 17, 2, 2, false));
+    // three taps, the synthetic fixture's kernel width (the real model's is four)
+    test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true, 3));
+    test_cases.emplace_back(new test_short_conv_window(256, 5, 3, 2, false, 3));
     for (int64_t d_conv : {3, 4, 7, 9}) {
         // 64 and 576: a rank's channels under a tensor split, which fill no whole block of 128 (one KV head of Inkling 2)
         for (int64_t d_inner: {64, 576, 1024, 1536, 2048}) {

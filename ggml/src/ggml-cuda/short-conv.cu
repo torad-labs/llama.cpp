@@ -72,10 +72,10 @@ static __global__ void short_conv_4_tiled(const float * x, const float * w, cons
 
 // The SHORT_CONV behind a history CONCAT the evaluator skipped (ggml_cuda_short_conv_window): a thread per
 // channel and sequence streams the window's columns from the CONCAT's two sources, writes each into the joined
-// window the CONCAT would have made, and from the fourth column on writes the convolution of the last four, in
+// window the CONCAT would have made, and from the Kth column on writes the convolution of the last K, in
 // short_conv_f32's sum order. Strides are in floats.
-template<bool dynamic>
-static __global__ void short_conv_window_4_f32(const float * past, const int64_t sp0, const int64_t sp1,
+template<int K, bool dynamic>
+static __global__ void short_conv_window_f32(const float * past, const int64_t sp0, const int64_t sp1,
         const int64_t sp2, const float * rows, const int64_t sr0, const int64_t sr1, const int64_t sr2,
         const float * w, const float * d, float * y, float * window, const int64_t channels, const int64_t n_t,
         const int64_t sd1, const int64_t group, const float scale) {
@@ -86,28 +86,32 @@ static __global__ void short_conv_window_4_f32(const float * past, const int64_t
     }
     const float * pc  = past + c*sp1 + s*sp2;
     const float * rc  = rows + c*sr1 + s*sr2;
-    const float * wc  = w + 4*c;
-    float *       win = window + (c + s*channels)*(n_t + 3);
-    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
-    for (int64_t col = 0; col < n_t + 3; ++col) {
-        const float val = col < 3 ? pc[col*sp0] : rc[(col - 3)*sr0];
+    const float * wc  = w + K*c;
+    float *       win = window + (c + s*channels)*(n_t + K - 1);
+    float v[K] = {};
+    for (int64_t col = 0; col < n_t + K - 1; ++col) {
+        const float val = col < K - 1 ? pc[col*sp0] : rc[(col - (K - 1))*sr0];
         win[col] = val;
-        v0 = v1; v1 = v2; v2 = v3; v3 = val;
-        if (col < 3) {
+        #pragma unroll
+        for (int j = 0; j < K - 1; ++j) {
+            v[j] = v[j + 1];
+        }
+        v[K - 1] = val;
+        if (col < K - 1) {
             continue;
         }
-        const int64_t t = col - 3;
-        float acc = v3;
-        acc += v0*wc[0];
-        acc += v1*wc[1];
-        acc += v2*wc[2];
-        acc += v3*wc[3];
+        const int64_t t = col - (K - 1);
+        float acc = v[K - 1];
+        #pragma unroll
+        for (int j = 0; j < K; ++j) {
+            acc += v[j]*wc[j];
+        }
         if (dynamic) {
-            const float * dt = d + (t + s*n_t)*sd1 + 4*(c/group);
-            acc += v3*dt[0];
-            acc += v2*dt[1];
-            acc += v1*dt[2];
-            acc += v0*dt[3];
+            const float * dt = d + (t + s*n_t)*sd1 + K*(c/group);
+            #pragma unroll
+            for (int lag = 0; lag < K; ++lag) {
+                acc += v[K - 1 - lag]*dt[lag];
+            }
         }
         y[(s*n_t + t)*channels + c] = scale*acc;
     }
@@ -130,12 +134,23 @@ void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const ggml_tensor * rows = win->rows;
         const dim3 block(128);
         const dim3 grid((channels + block.x - 1)/block.x, n_s);
-        auto kernel = d ? short_conv_window_4_f32<true> : short_conv_window_4_f32<false>;
-        kernel<<<grid, block, 0, ctx.stream()>>>((const float *) past->data, past->nb[0]/f, past->nb[1]/f,
-            past->nb[2]/f, (const float *) rows->data, rows->nb[0]/f, rows->nb[1]/f, rows->nb[2]/f,
-            (const float *) w->data, d ? (const float *) d->data : nullptr, (float *) dst->data,
-            (float *) win->window->data, channels, n_t, d ? d->nb[1]/f : 0, d ? channels/(d->ne[0]/4) : 1,
-            ggml_get_op_params_f32(dst, 0));
+        const float * dp = d ? (const float *) d->data : nullptr;
+        const int64_t sd1 = d ? d->nb[1]/f : 0;
+        const int64_t group = d ? channels/(d->ne[0]/k) : 1;
+        const float scale = ggml_get_op_params_f32(dst, 0);
+        if (k == 4) {
+            auto kernel = d ? short_conv_window_f32<4, true> : short_conv_window_f32<4, false>;
+            kernel<<<grid, block, 0, ctx.stream()>>>((const float *) past->data, past->nb[0]/f, past->nb[1]/f,
+                past->nb[2]/f, (const float *) rows->data, rows->nb[0]/f, rows->nb[1]/f, rows->nb[2]/f,
+                (const float *) w->data, dp, (float *) dst->data, (float *) win->window->data, channels, n_t,
+                sd1, group, scale);
+        } else {
+            auto kernel = d ? short_conv_window_f32<3, true> : short_conv_window_f32<3, false>;
+            kernel<<<grid, block, 0, ctx.stream()>>>((const float *) past->data, past->nb[0]/f, past->nb[1]/f,
+                past->nb[2]/f, (const float *) rows->data, rows->nb[0]/f, rows->nb[1]/f, rows->nb[2]/f,
+                (const float *) w->data, dp, (float *) dst->data, (float *) win->window->data, channels, n_t,
+                sd1, group, scale);
+        }
         return;
     }
     const int min_tiled_tokens = !d && channels >= 1024 ? 128 : 512;

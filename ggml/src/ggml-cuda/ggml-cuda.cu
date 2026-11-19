@@ -6095,12 +6095,12 @@ static bool ggml_cuda_spans_overlap(const ggml_tensor * a, const ggml_tensor * b
 }
 
 // Whether t is base or a view of it, through as many views as a graph stacks between a tensor and its reader.
+// A view's source is always an older tensor, so the chain ends.
 static bool ggml_cuda_tensor_views(const ggml_tensor * t, const ggml_tensor * base) {
-    for (int i = 0; t != nullptr && i < 8; ++i) {
+    for (; t != nullptr; t = t->view_src) {
         if (t == base) {
             return true;
         }
-        t = t->view_src;
     }
     return false;
 }
@@ -6108,9 +6108,10 @@ static bool ggml_cuda_tensor_views(const ggml_tensor * t, const ggml_tensor * ba
 // Match CONCAT(history, transposed new rows) -> SHORT_CONV (inkling2.cpp convolve) and record the pair under the
 // SHORT_CONV (ggml_cuda_short_conv_window): the evaluator skips the CONCAT and the convolution's kernel reads the
 // two sources itself and writes the joined window, which the layer's state store reads after the convolution as
-// before. What goes is only the CONCAT launch. The kernel reads the sources and the taps at the SHORT_CONV, later
-// than the allocator planned their lives around the CONCAT, so nothing between the two may be allocated over them
-// or over the window, and nothing there may read the window the CONCAT no longer writes first. The two writes
+// before. What goes is only the CONCAT launch. The kernel reads the two sources at the SHORT_CONV, later than
+// the allocator planned their lives around the CONCAT (the taps it also reads there are the convolution's own
+// sources on both paths, so their lives already reach it), so nothing between the two may be allocated over the
+// sources or over the window, and nothing there may read the window the CONCAT no longer writes first. The two writes
 // (the window, the output) may not alias anything the kernel reads either. Any doubt keeps the chain.
 // GGML_CUDA_SHORT_CONV_WINDOW_LEGACY=1 keeps it everywhere.
 static bool ggml_cuda_try_short_conv_window(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -6123,9 +6124,10 @@ static bool ggml_cuda_try_short_conv_window(ggml_backend_cuda_context & ctx, con
     const ggml_tensor * window = conv->src[0];
     const ggml_tensor * w      = conv->src[1];
     const ggml_tensor * d      = conv->src[2];
+    const int64_t       k      = w->ne[0];
     if (window->op != GGML_OP_CONCAT || ggml_get_op_params_i32(window, 0) != 0 || window->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(window) || (window->flags & GGML_TENSOR_FLAG_OUTPUT) || window->data == nullptr ||
-            w->ne[0] != 4 || !ggml_is_contiguous(w) || w->data == nullptr ||
+            (k != 3 && k != 4) || !ggml_is_contiguous(w) || w->data == nullptr ||
             (d && (d->type != GGML_TYPE_F32 || d->nb[0] != sizeof(float) || d->data == nullptr))) {
         return false;
     }
@@ -6135,7 +6137,7 @@ static bool ggml_cuda_try_short_conv_window(ggml_backend_cuda_context & ctx, con
     const int64_t n_t      = conv->ne[1];
     const int64_t n_seqs   = conv->ne[2];
     if (n_t < 1 || n_t > GGML_CUDA_SHORT_CONV_WINDOW_MAX_N_T || conv->ne[3] != 1 ||
-            window->ne[0] != n_t + 3 || window->ne[1] != channels || window->ne[2] != n_seqs || window->ne[3] != 1) {
+            window->ne[0] != n_t + k - 1 || window->ne[1] != channels || window->ne[2] != n_seqs || window->ne[3] != 1) {
         return false;
     }
     const auto source_ok = [](const ggml_tensor * t, int64_t cols, int64_t channels_, int64_t n_seqs_) {
@@ -6150,7 +6152,7 @@ static bool ggml_cuda_try_short_conv_window(ggml_backend_cuda_context & ctx, con
         }
         return true;
     };
-    if (!source_ok(past, 3, channels, n_seqs) || !source_ok(rows, n_t, channels, n_seqs)) {
+    if (!source_ok(past, k - 1, channels, n_seqs) || !source_ok(rows, n_t, channels, n_seqs)) {
         return false;
     }
 
@@ -6165,9 +6167,21 @@ static bool ggml_cuda_try_short_conv_window(ggml_backend_cuda_context & ctx, con
         return false;
     }
 
-    const ggml_tensor * reads[] = { past, rows, w, d };
-    for (const ggml_tensor * r : reads) {
-        if (r && (ggml_cuda_spans_overlap(window, r) || ggml_cuda_spans_overlap(conv, r))) {
+    // only the two sources end their planned lives at the CONCAT: the taps are read at the SHORT_CONV on both
+    // paths, so the allocator already keeps them (and their producer, which graph expansion puts between the
+    // CONCAT and the convolution) clear of everything between the two
+    const ggml_tensor * reads[] = { past, rows };
+    // The allocator often puts the output over the new rows' storage, dead after the CONCAT: safe here when it
+    // is the transposed contiguous input itself, since each thread then reads the very element it later writes,
+    // in that order, and no other thread touches it. Any other overlap of a write with a source refuses.
+    const bool rows_alias = conv->data == rows->data && ggml_is_contiguous(conv) &&
+        (channels == 1 || rows->nb[1] == sizeof(float)) &&
+        (n_t      == 1 || rows->nb[0] == (size_t) channels*sizeof(float)) &&
+        (n_seqs   == 1 || rows->nb[2] == (size_t) channels*n_t*sizeof(float));
+    for (int ri = 0; ri < 2; ++ri) {
+        const ggml_tensor * r = reads[ri];
+        const bool conv_over = ggml_cuda_spans_overlap(conv, r) && !(ri == 1 && rows_alias);
+        if (ggml_cuda_spans_overlap(window, r) || conv_over) {
             return false;
         }
     }
@@ -6179,8 +6193,15 @@ static bool ggml_cuda_try_short_conv_window(ggml_backend_cuda_context & ctx, con
         if (ggml_cuda_is_view_or_noop(n)) {
             continue;
         }
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            if (ggml_cuda_tensor_views(n->src[s], window)) {
+        // another fold's anchor writes more than its own output (its snapshots, its own joined window), and one
+        // of those writes could sit over a source whose planned life ended at this CONCAT
+        if (ctx.ssm_conv_updates().find(n) || ctx.short_conv_windows().find(n)) {
+            return false;
+        }
+        for (int s_ = 0; s_ < GGML_MAX_SRC; ++s_) {
+            const ggml_tensor * src = n->src[s_];
+            if (ggml_cuda_tensor_views(src, window) ||
+                    (src && src->data && ggml_cuda_spans_overlap(src, window))) {
                 return false;
             }
         }
@@ -6188,7 +6209,7 @@ static bool ggml_cuda_try_short_conv_window(ggml_backend_cuda_context & ctx, con
             return false;
         }
         for (const ggml_tensor * r : reads) {
-            if (r && ggml_cuda_spans_overlap(n, r)) {
+            if (ggml_cuda_spans_overlap(n, r)) {
                 return false;
             }
         }
