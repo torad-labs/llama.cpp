@@ -521,7 +521,13 @@ struct ggml_cuda_ar_owner_layout {
     int64_t len[GGML_CUDA_MAX_DEVICES] = {};
     bool valid = false;
     uint32_t host_period = 0; // words until the owner ranges repeat
+    int64_t period = 0;       // the reduction to owners: elements until the ranges repeat, 0 when they do not
 };
+
+// An element's place in the owner ranges, which repeat every owner.period elements when it is set.
+static __device__ __forceinline__ int ggml_cuda_ar_owner_pos(const ggml_cuda_ar_owner_layout & owner, int index) {
+    return owner.period > 0 ? index % (int) owner.period : index;
+}
 
 static __device__ int ggml_cuda_ar_owner_of(const ggml_cuda_ar_owner_layout & owner, int index, int n_ranks) {
     for (int peer = 0; peer < n_ranks; ++peer) {
@@ -670,8 +676,9 @@ static __global__ void ggml_cuda_ar_owner_reduce_kernel_n(
     const size_t offset = (size_t) (token & 1) * slot_elems;
     for (int i = gtid; i < nv; i += gnt) {
         const int first = i*V;
-        const int peer = ggml_cuda_ar_owner_of(owner, first, n_ranks);
-        if (peer >= 0 && first + V <= owner.begin[peer] + owner.len[peer]) {
+        const int pos = ggml_cuda_ar_owner_pos(owner, first);
+        const int peer = ggml_cuda_ar_owner_of(owner, pos, n_ranks);
+        if (peer >= 0 && pos + V <= owner.begin[peer] + owner.len[peer]) {
             if (peer != rank) {
                 T_wire wire[V];
 #pragma unroll
@@ -682,12 +689,12 @@ static __global__ void ggml_cuda_ar_owner_reduce_kernel_n(
         }
 #pragma unroll
         for (int k = 0; k < V; ++k) {
-            const int dst = ggml_cuda_ar_owner_of(owner, first + k, n_ranks);
+            const int dst = ggml_cuda_ar_owner_of(owner, ggml_cuda_ar_owner_pos(owner, first + k), n_ranks);
             if (dst >= 0 && dst != rank) { sends.ptr[dst][offset + first + k] = ggml_cuda_cast<T_wire>(data[first + k]); }
         }
     }
     if (bid == 0 && tid < count - tail) {
-        const int dst = ggml_cuda_ar_owner_of(owner, tail + tid, n_ranks);
+        const int dst = ggml_cuda_ar_owner_of(owner, ggml_cuda_ar_owner_pos(owner, tail + tid), n_ranks);
         if (dst >= 0 && dst != rank) { sends.ptr[dst][offset + tail + tid] = ggml_cuda_cast<T_wire>(data[tail + tid]); }
     }
     __threadfence_system();
@@ -711,8 +718,11 @@ static __global__ void ggml_cuda_ar_owner_reduce_kernel_n(
     __threadfence_system();
     for (int i = gtid; i < nv; i += gnt) {
         const int first = i*V;
-        if (first + V <= own_begin || first >= own_end) { continue; }
-        if (first >= own_begin && first + V <= own_end) {
+        const int pos = ggml_cuda_ar_owner_pos(owner, first);
+        // a vector that runs past the period's end goes element by element
+        const bool wraps = owner.period > 0 && pos + V > owner.period;
+        if (!wraps && (pos + V <= own_begin || pos >= own_end)) { continue; }
+        if (pos >= own_begin && pos + V <= own_end) {
             ggml_cuda_ar_accumulator<T_wire> sum[V] = {};
             for (int peer = 0; peer < n_ranks; ++peer) {
                 T_wire wire[V];
@@ -732,7 +742,8 @@ static __global__ void ggml_cuda_ar_owner_reduce_kernel_n(
 #pragma unroll
         for (int k = 0; k < V; ++k) {
             const int index = first + k;
-            if (index < own_begin || index >= own_end) { continue; }
+            const int at = ggml_cuda_ar_owner_pos(owner, index);
+            if (at < own_begin || at >= own_end) { continue; }
             ggml_cuda_ar_accumulator<T_wire> sum = {};
             for (int peer = 0; peer < n_ranks; ++peer) {
                 const T_wire v = peer == rank ? ggml_cuda_cast<T_wire>(data[index]) : receives.ptr[peer][offset + index];
@@ -741,7 +752,8 @@ static __global__ void ggml_cuda_ar_owner_reduce_kernel_n(
             data[index] = ggml_cuda_cast<T_dst>(sum);
         }
     }
-    if (bid == 0 && tid < count - tail && tail + tid >= own_begin && tail + tid < own_end) {
+    const int tail_pos = ggml_cuda_ar_owner_pos(owner, tail + tid);
+    if (bid == 0 && tid < count - tail && tail_pos >= own_begin && tail_pos < own_end) {
         const int index = tail + tid;
         ggml_cuda_ar_accumulator<T_wire> sum = {};
         for (int peer = 0; peer < n_ranks; ++peer) {
@@ -2331,7 +2343,14 @@ bool ggml_cuda_ar_allreduce(
         if (!p->host_owner_rows || !p->reduce_owners || n != 4 || p->copy_peer || p->wire_q8 || !use_copy_engine ||
                 !use_bf16 || nbytes > p->copy_bytes || tensors[0]->ne[0] != 4608 || tensors[0]->ne[1] != 23 ||
                 tensors[0]->ne[2] != 1 || tensors[0]->ne[3] != 1 || ggml_cuda_ar_capturing(backends[0])) {
-            return false;
+            // off the host route the chunked kernel sums each rank's equal part of every row
+            const int64_t width = tensors[0]->ne[0];
+            int64_t begin[GGML_CUDA_MAX_DEVICES], len[GGML_CUDA_MAX_DEVICES];
+            for (int rank = 0; rank < n; ++rank) {
+                begin[rank] = rank*(width/n);
+                len[rank]   = width/n;
+            }
+            return width % n == 0 && ggml_cuda_ar_reduce_owned(p, backends, tensors, begin, len, width);
         }
         ++p->n_reduced_owned;
     } else {
@@ -2628,10 +2647,14 @@ static void ggml_cuda_ar_launch_owner_reduce(
         ggml_cuda_ar_pipeline * p, ggml_backend_t * backends, void * const * data, const bool * zero_first, int64_t ne,
         const ggml_cuda_ar_owner_layout & owner) {
     const size_t max_chunk_elems = (p->gather_peer ? GGML_CUDA_AR_PEER_MAX_BYTES : p->buf_bytes) / sizeof(T_wire);
+    // a chunk of ranges that repeat holds whole periods, so each chunk starts where the ranges do
+    const int64_t step = (int64_t) max_chunk_elems - (owner.period > 0 ? (int64_t) max_chunk_elems % owner.period : 0);
+    GGML_ASSERT(step > 0);
     (p->gather_peer ? p->n_chunked_peer : p->n_chunked_host)++;
-    for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
-        const int64_t chunk_elems = std::min(ne - chunk_start, (int64_t) max_chunk_elems);
-        const ggml_cuda_ar_owner_layout chunk_owner = ggml_cuda_ar_chunk_owner(owner, chunk_start, chunk_elems, p->n_devices);
+    for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += step) {
+        const int64_t chunk_elems = std::min(ne - chunk_start, step);
+        const ggml_cuda_ar_owner_layout chunk_owner = owner.period > 0 ? owner :
+            ggml_cuda_ar_chunk_owner(owner, chunk_start, chunk_elems, p->n_devices);
         for (int i = 0; i < p->n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
             auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
@@ -2664,7 +2687,8 @@ bool ggml_cuda_ar_reduce_owned(
         ggml_backend_t        * backends,
         ggml_tensor           ** tensors,
         const int64_t         * begin,
-        const int64_t         * len) {
+        const int64_t         * len,
+        int64_t                 period) {
     GGML_ASSERT(p != nullptr);
     const int n = p->n_devices;
     // Two ranks take kernels of their own. The LL kernels pace a rank by the packets it receives, so one that owns
@@ -2685,10 +2709,16 @@ bool ggml_cuda_ar_reduce_owned(
     if (route.use_copy_engine || route.nbytes <= p->p2p_max_bytes || route.nbytes <= p->ll_max_bytes) {
         return false;
     }
+    // ranges that repeat lie in their first period, and a chunk holds at least one
+    const size_t chunk_bytes = p->gather_peer ? GGML_CUDA_AR_PEER_MAX_BYTES : p->buf_bytes;
+    if (period < 0 || period > ne || period > (int64_t) (chunk_bytes / ggml_type_size(route.kernel_type))) {
+        return false;
+    }
     ggml_cuda_ar_owner_layout owner;
     owner.valid = true;
+    owner.period = period;
     for (int rank = 0; rank < n; ++rank) {
-        if (begin[rank] < 0 || len[rank] < 0 || begin[rank] + len[rank] > ne) {
+        if (begin[rank] < 0 || len[rank] < 0 || begin[rank] + len[rank] > (period > 0 ? period : ne)) {
             return false;
         }
         for (int other = 0; other < rank; ++other) {
@@ -2749,7 +2779,7 @@ size_t ggml_cuda_ar_equal_gather_count(ggml_tensor **, size_t) {
 bool ggml_cuda_ar_allgather(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;
 }
-bool ggml_cuda_ar_reduce_owned(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **, const int64_t *, const int64_t *) {
+bool ggml_cuda_ar_reduce_owned(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **, const int64_t *, const int64_t *, int64_t) {
     return false;
 }
 bool ggml_cuda_ar_capturable(const ggml_cuda_ar_pipeline *, const ggml_tensor *) {

@@ -2383,7 +2383,7 @@ static bool ggml_backend_cuda_comm_reduce_owned_tensor(
             ggml_nelements(tensors[0]) == 0 || !ggml_backend_cuda_comm_internal_supports(comm_ctx, tensors)) {
         return false;
     }
-    return ggml_cuda_ar_reduce_owned(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, begin, len);
+    return ggml_cuda_ar_reduce_owned(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, begin, len, 0);
 }
 
 static bool ggml_backend_cuda_comm_reduce_owned_rows(void * comm_ctx_v, ggml_tensor ** tensors) {
@@ -11376,7 +11376,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_comm_allgather_tensor;
     }
     if (strcmp(name, "ggml_backend_comm_reduce_owned_rows") == 0) {
-        return ggml_env_switch("GGML_CUDA_AR_HOST_OWNER_ROWS") ? (void *) ggml_backend_cuda_comm_reduce_owned_rows : nullptr;
+        // through host memory (GGML_CUDA_AR_HOST_OWNER_ROWS) or on the chunked kernel (GGML_CUDA_AR_REDUCE_OWNERS)
+        return ggml_env_switch("GGML_CUDA_AR_HOST_OWNER_ROWS") || ggml_env_switch("GGML_CUDA_AR_REDUCE_OWNERS") ?
+            (void *) ggml_backend_cuda_comm_reduce_owned_rows : nullptr;
     }
     if (strcmp(name, "ggml_backend_comm_reduce_owned_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_reduce_owned_tensor;
