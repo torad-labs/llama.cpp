@@ -498,18 +498,19 @@ static ggml_backend_meta_split_state split_hidden_rows(const ggml_tensor * t, vo
     return {up ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0, {width, width, width, width}, {1}, 1};
 }
 
-// A 23-row hidden state whose every rank reads a quarter of each row is summed only where it is read, with the bits of
-// the sum on every rank. Through host memory GGML_CUDA_AR_HOST_OWNER_ROWS selects it; card to card it rides the chunked
-// kernel, which a captured step replays, and GGML_CUDA_AR_REDUCE_OWNERS=0 turns it off.
+// A hidden state whose every rank reads a quarter of each row is summed only where it is read, with the bits of the
+// sum on every rank. Through host memory GGML_CUDA_AR_HOST_OWNER_ROWS selects it for 23 rows; card to card it rides
+// the chunked kernel for any rows, which a captured step replays, and GGML_CUDA_AR_REDUCE_OWNERS=0 turns it off.
 static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool card) {
     set_env("GGML_CUDA_ALLREDUCE", "internal");
     set_env("GGML_CUDA_AR_COPY_PEER", card ? nullptr : "0");
     set_env("GGML_CUDA_AR_COPY_THRESHOLD", card ? nullptr : "1");
     set_env("GGML_CUDA_AR_BF16_THRESHOLD", "1");
     set_env("GGML_GRAPH_TRACE", "1");
-    enum variant { normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8 };
+    // grouped: 24 rows that are 2 tokens of 12 sequences
+    enum variant { normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8, grouped };
     bool ok = true;
-    for (variant v : {normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8}) {
+    for (variant v : {normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8, grouped}) {
         std::vector<float> baseline;
         for (bool enabled : {false, true}) {
             set_env("GGML_CUDA_AR_HOST_OWNER_ROWS", enabled && !card ? "1" : "0");
@@ -533,11 +534,11 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool 
                 ggml_backend_tensor_set(w, data.data(), 0, ggml_nbytes(w));
             }
             ggml_context * ctx = ggml_init({32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
-            const int rows = v == narrower ? 22 : 23;
+            const int rows = v == narrower ? 22 : v == grouped ? 24 : 23;
             auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, rows);
             ggml_set_input(x);
             auto * partial = ggml_mul_mat(ctx, down, ggml_mul_mat(ctx, up, x));
-            auto * r = ggml_reshape_3d(ctx, partial, 4608, 1, rows);
+            auto * r = ggml_reshape_3d(ctx, partial, 4608, v == grouped ? 2 : 1, v == grouped ? rows/2 : rows);
             auto * c = ggml_cont(ctx, ggml_permute(ctx, r, 2, 0, 1, 3));
             const int64_t counts[] = {1152 + (v == unequal), 1152 - (v == unequal), 1152, 1152};
             auto * scatter = ggml_backend_meta_scatter(ctx, c, 2, counts, 4);
@@ -577,8 +578,8 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool 
             ggml_backend_free(backend);
             ggml_backend_buffer_free(buffer);
             ggml_free(weights);
-            // the Q8 wire and the receive order belong to the host route; a replayed evaluation queues no reduction
-            const bool selected = enabled && (v == normal || v == serial_receive || (card && v == q8));
+            // the Q8 wire, the receive order and the 23 rows belong to the host route; a replayed evaluation queues no reduction
+            const bool selected = enabled && (v == normal || v == serial_receive || (card && (v == q8 || v == narrower || v == grouped)));
             const bool same = !enabled || (actual.size() == baseline.size() && !memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)));
             const bool pass = same && reductions_to_owners - owners == (selected ? queued : 0u) && reductions_to_all - full == (selected ? 0u : queued);
             if (!enabled) { baseline = std::move(actual); }
