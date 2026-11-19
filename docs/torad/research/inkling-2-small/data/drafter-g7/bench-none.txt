@@ -1,0 +1,57 @@
+bench: 23 sessions of 18205 to 199967 tokens (853574 in all, none over 294592), levels [23, 8, 4, 1], 256 tokens a reply, draft none
+bench: the server was ready in 80s
+first turn, 23 at once   23 sessions  kept     0 of     0 offered (  0.0%)  0.000 kept a round   0.0% of  3793 written came drafted     1.1 tok/s a session (least   1.0)      5.5 tok/s in all  read  853574 cached       0   687s
+first turn  slot 18  context  18205  kept    0 of    0 (  0.0%)    0 of 183 written came drafted     1.1 tok/s  stop eos
+first turn  slot  2  context  19146  kept    0 of    0 (  0.0%)    0 of  67 written came drafted     1.2 tok/s  stop eos
+first turn  slot  9  context  19473  kept    0 of    0 (  0.0%)    0 of  47 written came drafted     1.2 tok/s  stop eos
+first turn  slot  5  context  20661  kept    0 of    0 (  0.0%)    0 of 142 written came drafted     1.1 tok/s  stop eos
+first turn  slot 12  context  21557  kept    0 of    0 (  0.0%)    0 of 256 written came drafted     1.1 tok/s  stop limit
+first turn  slot  0  context  22246  kept    0 of    0 (  0.0%)    0 of 256 written came drafted     1.1 tok/s  stop limit
+first turn  slot 19  context  23611  kept    0 of    0 (  0.0%)    0 of 202 written came drafted     1.1 tok/s  stop eos
+first turn  slot  1  context  23796  kept    0 of    0 (  0.0%)    0 of 235 written came drafted     1.1 tok/s  stop eos
+first turn  slot 17  context  24166  kept    0 of    0 (  0.0%)    0 of 123 written came drafted     1.0 tok/s  stop eos
+first turn  slot 11  context  24314  kept    0 of    0 (  0.0%)    0 of 256 written came drafted     1.0 tok/s  stop limit
+first turn  slot  7  context  24948  kept    0 of    0 (  0.0%)    0 of  57 written came drafted     1.1 tok/s  stop eos
+first turn  slot 15  context  25206  kept    0 of    0 (  0.0%)    0 of 256 written came drafted     1.0 tok/s  stop limit
+first turn  slot  8  context  25845  kept    0 of    0 (  0.0%)    0 of 143 written came drafted     1.0 tok/s  stop eos
+first turn  slot 14  context  28030  kept    0 of    0 (  0.0%)    0 of 154 written came drafted     1.1 tok/s  stop eos
+first turn  slot 16  context  29833  kept    0 of    0 (  0.0%)    0 of  72 written came drafted     1.0 tok/s  stop eos
+first turn  slot 22  context  30150  kept    0 of    0 (  0.0%)    0 of 256 written came drafted     1.0 tok/s  stop limit
+first turn  slot 21  context  30632  kept    0 of    0 (  0.0%)    0 of 178 written came drafted     1.0 tok/s  stop eos
+first turn  slot  6  context  33322  kept    0 of    0 (  0.0%)    0 of 149 written came drafted     1.1 tok/s  stop eos
+first turn  slot 13  context  36015  kept    0 of    0 (  0.0%)    0 of 156 written came drafted     1.1 tok/s  stop eos
+first turn  slot 20  context  37343  kept    0 of    0 (  0.0%)    0 of 198 written came drafted     1.0 tok/s  stop eos
+first turn  slot  4  context  41347  kept    0 of    0 (  0.0%)    0 of  79 written came drafted     1.1 tok/s  stop eos
+first turn  slot 10  context  93761  kept    0 of    0 (  0.0%)    0 of 256 written came drafted     2.1 tok/s  stop limit
+first turn  slot  3  context 199967  kept    0 of    0 (  0.0%)    0 of  72 written came drafted    15.2 tok/s  stop eos
+later turn, 23 at once   23 sessions  kept     0 of     0 offered (  0.0%)  0.000 kept a round   0.0% of  4253 written came drafted    12.4 tok/s a session (least   7.4)    120.3 tok/s in all  read      92 cached  853482    35s
+later turn, 23 at once  slot 18  context  18205  kept    0 of    0 (  0.0%)    0 of 142 written came drafted    10.8 tok/s  stop eos
+later turn, 23 at once  slot  2  context  19146  kept    0 of    0 (  0.0%)    0 of 132 written came drafted    10.5 tok/s  stop eos
+later turn, 23 at once  slot  9  context  19473  kept    0 of    0 (  0.0%)    0 of  69 written came drafted     9.8 tok/s  stop eos
+later turn, 23 at once  slot  5  context  20661  kept    0 of    0 (  0.0%)    0 of 212 written came drafted    12.6 tok/s  stop eos
+later turn, 23 at once  slot 12  context  21557  kept    0 of    0 (  0.0%)    0 of 256 written came drafted    13.5 tok/s  stop limit
+later turn, 23 at once  slot  0  context  22246  kept    0 of    0 (  0.0%)    0 of 256 written came drafted     7.4 tok/s  stop limit
+later turn, 23 at once  slot 19  context  23611  kept    0 of    0 (  0.0%)    0 of 256 written came drafted    13.5 tok/s  stop limit
+later turn, 23 at once  slot  1  context  23796  kept    0 of    0 (  0.0%)    0 of 245 written came drafted    13.5 tok/s  stop eos
+later turn, 23 at once  slot 17  context  24166  kept    0 of    0 (  0.0%)    0 of 156 written came drafted    11.2 tok/s  stop eos
+later turn, 23 at once  slot 11  context  24314  kept    0 of    0 (  0.0%)    0 of 208 written came drafted    12.6 tok/s  stop eos
+later turn, 23 at once  slot  7  context  24948  kept    0 of    0 (  0.0%)    0 of  55 written came drafted     9.8 tok/s  stop eos
+later turn, 23 at once  slot 15  context  25206  kept    0 of    0 (  0.0%)    0 of 256 written came drafted    13.5 tok/s  stop limit
+later turn, 23 at once  slot  8  context  25845  kept    0 of    0 (  0.0%)    0 of  46 written came drafted    10.0 tok/s  stop eos
+later turn, 23 at once  slot 14  context  28030  kept    0 of    0 (  0.0%)    0 of 232 written came drafted    13.2 tok/s  stop eos
+later turn, 23 at once  slot 16  context  29833  kept    0 of    0 (  0.0%)    0 of 206 written came drafted    12.6 tok/s  stop eos
+later turn, 23 at once  slot 22  context  30150  kept    0 of    0 (  0.0%)    0 of 256 written came drafted    13.5 tok/s  stop limit
+later turn, 23 at once  slot 21  context  30632  kept    0 of    0 (  0.0%)    0 of 196 written came drafted    12.4 tok/s  stop eos
+later turn, 23 at once  slot  6  context  33322  kept    0 of    0 (  0.0%)    0 of 144 written came drafted    10.8 tok/s  stop eos
+later turn, 23 at once  slot 13  context  36015  kept    0 of    0 (  0.0%)    0 of 172 written came drafted    11.7 tok/s  stop eos
+later turn, 23 at once  slot 20  context  37343  kept    0 of    0 (  0.0%)    0 of 256 written came drafted    13.5 tok/s  stop limit
+later turn, 23 at once  slot  4  context  41347  kept    0 of    0 (  0.0%)    0 of 127 written came drafted    10.3 tok/s  stop eos
+later turn, 23 at once  slot 10  context  93761  kept    0 of    0 (  0.0%)    0 of 256 written came drafted    13.5 tok/s  stop limit
+later turn, 23 at once  slot  3  context 199967  kept    0 of    0 (  0.0%)    0 of 119 written came drafted    10.1 tok/s  stop eos
+later turn, 8 at once    23 sessions  kept     0 of     0 offered (  0.0%)  0.000 kept a round   0.0% of  4333 written came drafted    12.3 tok/s a session (least   8.2)     72.7 tok/s in all  read      92 cached  853482    60s
+later turn, 4 at once    23 sessions  kept     0 of     0 offered (  0.0%)  0.000 kept a round   0.0% of  3942 written came drafted    12.2 tok/s a session (least   7.0)     41.4 tok/s in all  read      92 cached  853482    95s
+later turn, 1 at once    23 sessions  kept     0 of     0 offered (  0.0%)  0.000 kept a round   0.0% of  3872 written came drafted    24.3 tok/s a session (least  20.0)     20.2 tok/s in all  read      92 cached  853482   192s
+contexts under 23796     28 sessions  kept     0 of     0 offered (  0.0%)  0.000 kept a round   0.0% of  5003 written came drafted    12.6 tok/s a session (least   7.0)
+contexts 23796 to 30150  32 sessions  kept     0 of     0 offered (  0.0%)  0.000 kept a round   0.0% of  5038 written came drafted    13.5 tok/s a session (least   7.4)
+contexts from 30150      32 sessions  kept     0 of     0 offered (  0.0%)  0.000 kept a round   0.0% of  6359 written came drafted    13.5 tok/s a session (least  10.1)
+bench: written to /workspace/rig/jobs/dspark-g3-none/results/bench-none.json

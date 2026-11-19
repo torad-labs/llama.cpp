@@ -1,0 +1,314 @@
+{
+ "draft": "/workspace/rig/dspark/pack/model/Inkling-2-Small-abliterated-e4853745-DSpark-BF16-own-head.gguf",
+ "paired": 1.0,
+ "arguments": {
+  "draft": "/workspace/rig/dspark/pack/model/Inkling-2-Small-abliterated-e4853745-DSpark-BF16-own-head.gguf",
+  "vocab": "",
+  "target": "/workspace/rig/dspark/pack/model/Inkling-2-Small-abliterated-e4853745-Q3_K_M-imatrix.gguf",
+  "tok_norm_eps": null,
+  "gguf_py": "/workspace/rig/dspark/src-7b262d27f1c55a0f96842a2163823dbb620013a7/gguf-py",
+  "train": [
+   "/workspace/rig/dspark/rec-pack/a"
+  ],
+  "eval": "/workspace/rig/dspark/rec-pack/heldout",
+  "out": "/workspace/rig/dspark/g7-pack/lr1e-5",
+  "epochs": 2,
+  "anchors": 256,
+  "max_anchors_per_request": 0,
+  "max_steps": 0,
+  "lr": 1e-05,
+  "warmup": 0.05,
+  "clip": 1.0,
+  "mode_weight": 0.25,
+  "tail_weight": 0.25,
+  "eval_requests": 0,
+  "eval_anchors": 128,
+  "eval_every": 65,
+  "eval_small_requests": 8,
+  "eval_small_anchors": 64,
+  "save_every": 130,
+  "init": "",
+  "eval_only": false,
+  "walk": true,
+  "walk_before": "/workspace/rig/dspark/baseline-pack/walk-before.json",
+  "kv_type": "q8_0",
+  "kv_type_swa": "f16",
+  "kv_rot": "auto",
+  "no_gemm": false,
+  "cells": 2500000,
+  "max_batch": 64,
+  "chunk": 4096,
+  "one_graph": false,
+  "log_every": 1,
+  "seed": 20261119,
+  "device": "cuda:0",
+  "feats_device": ""
+ },
+ "before": {
+  "anchors": 8333,
+  "accepted_3": 2.233921498632454,
+  "accepted_7": 4.278801599295503,
+  "ceiling_3": 2.418579197231782,
+  "ceiling_7": 4.883746641424399,
+  "counted_3": 2.2371294851794072,
+  "counted_7": 4.284651386055442,
+  "row_accepted": [
+   0.8446237764895842,
+   0.7370528453583479,
+   0.6522448767845218,
+   0.5839763119714853,
+   0.5314528127542338,
+   0.48561616633728916,
+   0.44383480960004085
+  ],
+  "row_names_first_choice": [
+   0.9005160206408256,
+   0.8709948397935917,
+   0.8372734909396375,
+   0.8168726749069963,
+   0.8012720508820352,
+   0.7757110284411376,
+   0.7544701788071523
+  ],
+  "cross_entropy": 1.1743955445105112
+ },
+ "walked_before": {
+  "rounds_3": 46322,
+  "walked_3": 1.907387418505246,
+  "ceiling_rounds_3": 42431,
+  "walked_ceiling_3": 2.177841672362188,
+  "rounds_5": 37662,
+  "walked_5": 2.5515639105729915,
+  "ceiling_rounds_5": 32626,
+  "walked_ceiling_5": 3.1001348617666893,
+  "rounds_7": 33747,
+  "walked_7": 2.9284677156487984,
+  "ceiling_rounds_7": 27926,
+  "walked_ceiling_7": 3.7607963904605026,
+  "floors": [
+   {
+    "depth": 3,
+    "floor": 0.3,
+    "rounds": 46846,
+    "kept": 1.8747598514280834,
+    "drafted": 2.7477479400589164
+   },
+   {
+    "depth": 3,
+    "floor": 0.5,
+    "rounds": 49536,
+    "kept": 1.7177406330749354,
+    "drafted": 2.1958979328165373
+   },
+   {
+    "depth": 3,
+    "floor": 0.7,
+    "rounds": 54195,
+    "kept": 1.483734661869176,
+    "drafted": 1.6825168373466186
+   },
+   {
+    "depth": 3,
+    "floor": 0.9,
+    "rounds": 60749,
+    "kept": 1.2153286473851421,
+    "drafted": 1.2785395644372748
+   },
+   {
+    "depth": 5,
+    "floor": 0.3,
+    "rounds": 38228,
+    "kept": 2.4989536465418016,
+    "drafted": 4.334309929894318
+   },
+   {
+    "depth": 5,
+    "floor": 0.5,
+    "rounds": 41151,
+    "kept": 2.249811669218245,
+    "drafted": 3.1563509999756993
+   },
+   {
+    "depth": 5,
+    "floor": 0.7,
+    "rounds": 46365,
+    "kept": 1.883705381214278,
+    "drafted": 2.2337323412056507
+   },
+   {
+    "depth": 5,
+    "floor": 0.9,
+    "rounds": 53596,
+    "kept": 1.492779311888947,
+    "drafted": 1.5966490036569894
+   },
+   {
+    "depth": 7,
+    "floor": 0.3,
+    "rounds": 34312,
+    "kept": 2.8634297038936816,
+    "drafted": 5.729569829797155
+   },
+   {
+    "depth": 7,
+    "floor": 0.5,
+    "rounds": 37319,
+    "kept": 2.5493716337522443,
+    "drafted": 3.8535598488705487
+   },
+   {
+    "depth": 7,
+    "floor": 0.7,
+    "rounds": 42609,
+    "kept": 2.1045788448449856,
+    "drafted": 2.585322349738318
+   },
+   {
+    "depth": 7,
+    "floor": 0.9,
+    "rounds": 50036,
+    "kept": 1.639279718602606,
+    "drafted": 1.7795587177232393
+   }
+  ]
+ },
+ "steps": 398,
+ "seconds": 623.57501745224,
+ "loss_first": 1.0515814395159497,
+ "loss_last": 0.8701902290879158,
+ "tuned": "/workspace/rig/dspark/g7-pack/lr1e-5/draft-tuned.gguf",
+ "after": {
+  "anchors": 8333,
+  "accepted_3": 2.258091699700817,
+  "accepted_7": 4.3217239924822195,
+  "ceiling_3": 2.418579197231782,
+  "ceiling_7": 4.883746641424399,
+  "counted_3": 2.2584903396135845,
+  "counted_7": 4.327253090123605,
+  "row_accepted": [
+   0.8559725528989078,
+   0.7439851501001454,
+   0.6581339967017641,
+   0.5895322242926738,
+   0.5323378537634792,
+   0.4879652847766476,
+   0.45379692994860144
+  ],
+  "row_names_first_choice": [
+   0.9119164766590664,
+   0.8685947437897515,
+   0.8366734669386775,
+   0.8175927037081483,
+   0.796471858874355,
+   0.7707908316332653,
+   0.7548301932077283
+  ],
+  "cross_entropy": 0.9480234079561493
+ },
+ "walked_after": {
+  "rounds_3": 46147,
+  "walked_3": 1.9201464883957786,
+  "ceiling_rounds_3": 42431,
+  "walked_ceiling_3": 2.177841672362188,
+  "walked_sampled_3": 2.1842179893179563,
+  "walked_sampled_most_3": 2.1895225244419194,
+  "rounds_5": 37455,
+  "walked_5": 2.573568281938326,
+  "ceiling_rounds_5": 32626,
+  "walked_ceiling_5": 3.1001348617666893,
+  "walked_sampled_5": 2.980649188514357,
+  "walked_sampled_most_5": 2.9913564424309262,
+  "rounds_7": 33601,
+  "walked_7": 2.9455968572363918,
+  "ceiling_rounds_7": 27926,
+  "walked_ceiling_7": 3.7607963904605026,
+  "walked_sampled_7": 3.4572871087176034,
+  "walked_sampled_most_7": 3.4694228822139723,
+  "floors": [
+   {
+    "depth": 3,
+    "floor": 0.3,
+    "rounds": 47029,
+    "kept": 1.8654021986433902,
+    "drafted": 2.591826319930256
+   },
+   {
+    "depth": 3,
+    "floor": 0.5,
+    "rounds": 50306,
+    "kept": 1.677851548523039,
+    "drafted": 2.022542042698684
+   },
+   {
+    "depth": 3,
+    "floor": 0.7,
+    "rounds": 55534,
+    "kept": 1.4246767745885403,
+    "drafted": 1.5471062772355675
+   },
+   {
+    "depth": 3,
+    "floor": 0.9,
+    "rounds": 63166,
+    "kept": 1.1310198524522685,
+    "drafted": 1.1553209004844378
+   },
+   {
+    "depth": 5,
+    "floor": 0.3,
+    "rounds": 38479,
+    "kept": 2.478702668988279,
+    "drafted": 3.873905247017854
+   },
+   {
+    "depth": 5,
+    "floor": 0.5,
+    "rounds": 42193,
+    "kept": 2.1727300737089092,
+    "drafted": 2.76157182471026
+   },
+   {
+    "depth": 5,
+    "floor": 0.7,
+    "rounds": 48048,
+    "kept": 1.78492340992341,
+    "drafted": 1.9786463536463537
+   },
+   {
+    "depth": 5,
+    "floor": 0.9,
+    "rounds": 56398,
+    "kept": 1.3703322812865704,
+    "drafted": 1.4068583992340153
+   },
+   {
+    "depth": 7,
+    "floor": 0.3,
+    "rounds": 34643,
+    "kept": 2.825881130387091,
+    "drafted": 4.849147013826747
+   },
+   {
+    "depth": 7,
+    "floor": 0.5,
+    "rounds": 38492,
+    "kept": 2.4394419619661227,
+    "drafted": 3.2405434895562713
+   },
+   {
+    "depth": 7,
+    "floor": 0.7,
+    "rounds": 44511,
+    "kept": 1.9693783559120217,
+    "drafted": 2.2203500258363102
+   },
+   {
+    "depth": 7,
+    "floor": 0.9,
+    "rounds": 52968,
+    "kept": 1.4892954236520164,
+    "drafted": 1.5366636459749283
+   }
+  ]
+ }
+}

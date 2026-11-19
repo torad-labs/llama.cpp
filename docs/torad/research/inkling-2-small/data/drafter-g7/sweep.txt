@@ -1,0 +1,4 @@
+lr1e-5: trained 398 steps in 10 min: loss 1.0516 over the first 20 steps, 0.8702 over the last;accepted a round at depth 3: 2.234 before, 2.258 after, of a ceiling of 2.419;
+lr3e-5: trained 398 steps in 10 min: loss 0.9428 over the first 20 steps, 0.8924 over the last;accepted a round at depth 3: 2.234 before, 2.213 after, of a ceiling of 2.419;
+lr1e-4: trained 398 steps in 10 min: loss 0.9446 over the first 20 steps, 1.0558 over the last;accepted a round at depth 3: 2.234 before, 2.104 after, of a ceiling of 2.419;
+lr3e-4: trained 398 steps in 10 min: loss 1.2546 over the first 20 steps, 1.3688 over the last;accepted a round at depth 3: 2.234 before, 1.815 after, of a ceiling of 2.419;
