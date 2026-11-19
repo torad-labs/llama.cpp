@@ -11701,12 +11701,14 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                 std::vector<float> f(kv*nb*n_stream, -INFINITY);
                 for (int64_t s = 0; s < n_stream; ++s) {
                     for (int64_t i = 0; i < nb; ++i) {
+                        int64_t live = 0;
                         for (int64_t j = 0; j < kv; ++j) {
                             const int32_t c = cells[s*kv + j];
                             // Disjoint runs, a shared prefix and a fully masked last row.
                             const bool owned = !n_kv_max || (i + 1 < nb && (j < 16 || (j/16)%nb == i));
-                            if (owned && c >= 0 && c <= queries[s*nb + i]) {
+                            if (owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max)) {
                                 f[(s*nb + i)*kv + j] = 0.0f;
+                                ++live;
                             }
                         }
                     }
@@ -16725,6 +16727,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos( 64, 4, 2,  600, nb, 3,   17));
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos( 64, 4, 2,  608, nb, 3,   17, GGML_TYPE_F16, false, true));
     }
+
+    for (const bool packed : {false, true}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 256, 2, 1, 16, GGML_TYPE_F16, true, packed, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 2048, 2, 1, 16, GGML_TYPE_F16, true, true, true, 32));
 
     for (int64_t nb : {1, 23, 65}) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 512, nb, 2, 16, GGML_TYPE_F16, true, true, true));
