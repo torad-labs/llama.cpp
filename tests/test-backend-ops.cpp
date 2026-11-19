@@ -11627,9 +11627,11 @@ struct test_flash_attn_ext_rel_pos : public test_case {
 
     const bool query_sinks;
     const int n_kv_max;
+    const int64_t run; // cells in each run a row owns when n_kv_max bounds it: 1 as decode lays a pool out
 
     std::string vars() override {
-        return VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_dist, type_KV, sinks, mask_bits, query_sinks, n_kv_max);
+        const std::string base = VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_dist, type_KV, sinks, mask_bits, query_sinks, n_kv_max);
+        return run == 16 ? base : base + "," + VAR_TO_STR(run);
     }
 
     double max_nmse_err() override {
@@ -11638,9 +11640,9 @@ struct test_flash_attn_ext_rel_pos : public test_case {
 
     test_flash_attn_ext_rel_pos(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 6, int64_t kv = 2048, int64_t nb = 32,
                                 int64_t n_stream = 1, int64_t n_dist = 1025, ggml_type type_KV = GGML_TYPE_F16, bool sinks = true,
-                                bool mask_bits = false, bool query_sinks = false, int n_kv_max = 0)
+                                bool mask_bits = false, bool query_sinks = false, int n_kv_max = 0, int64_t run = 16)
         : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_dist(n_dist), type_KV(type_KV), sinks(sinks),
-          mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max) {}
+          mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max), run(run) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -11707,7 +11709,7 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                         for (int64_t j = 0; j < kv; ++j) {
                             const int32_t c = cells[s*kv + j];
                             // Disjoint runs, a shared prefix and a fully masked last row.
-                            const bool owned = !n_kv_max || (i + 1 < nb && (j < 16 || (j/16)%nb == i));
+                            const bool owned = !n_kv_max || (i + 1 < nb && (j < 16 || (j/run)%nb == i));
                             if (owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max)) {
                                 f[(s*nb + i)*kv + j] = 0.0f;
                                 ++live;
@@ -16746,6 +16748,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192, 23, 1, 32, type, true, true, true, 1024));
     }
 
+    // decode over a shared pool: a session's cells one at a time, in short runs and in whole blocks, a pool that is not
+    // a whole number of 512-cell chunks, and 2 to 8 query heads a KV head
+    for (int64_t run : {1, 16, 4096}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 65536, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 8192, run));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192 + 5*32, 23, 1, 32, GGML_TYPE_F16, true, true, true, 1024, 1));
+    for (int64_t gqa : {2, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, gqa, 8192, 8, 1, 32, GGML_TYPE_F16, true, true, true, 1024));
+    }
+
     // flash attention over a list of K/V rows per slice (unified KV cache)
     for (int64_t nb : {1, 3, 8, 64, 512}) {
         for (int64_t n_slices : {1, 4}) {
@@ -17809,6 +17821,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, false, false, 0, 0, /*mask_bits=*/true));
         }
     }
+
+    // Inkling 2's attention on one rank of the tensor-4 profile (2 KV heads at GQA 6, 23 sessions, F16 K/V in a shared
+    // pool, a bit-packed mask, a sink a query): the global layers with every session's cells one at a time, as decode
+    // lays them, or in blocks, as a prompt does, and a sliding layer's 1,024 cells a session in the full pool
+    for (int64_t kv : { 262144, 1048576, 3014656 }) {
+        for (int64_t run : { 1, 4096 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 23, 1, 1025, GGML_TYPE_F16, true, true, true, kv/8, run));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 3014656, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 1024, 1));
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));

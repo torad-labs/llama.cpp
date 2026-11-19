@@ -5,6 +5,7 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 #include "fattn-rel-decode.cuh"
+#include "fattn-rel-mma.cuh"
 #include "fattn-rel-prefill.cuh"
 #include "ggml-attn-mask.h"
 
@@ -1325,7 +1326,8 @@ static size_t ggml_cuda_flash_attn_ext_device_alloc_size(int device, const ggml_
         case BEST_FATTN_KERNEL_REL_SHORT:
             return ggml_nbytes(dst);
         case BEST_FATTN_KERNEL_REL_DECODE:
-            return fattn_rel_decode_alloc_size(dst);
+            // K and V have no address yet, and the launch takes the one-cell kernel when they are not aligned.
+            return std::max(fattn_rel_decode_alloc_size(dst), fattn_rel_mma_alloc_size(dst));
         case BEST_FATTN_KERNEL_TILE:
             need_f16_K = true;
             need_f16_V = true;
@@ -1359,7 +1361,11 @@ static void ggml_cuda_flash_attn_ext_device(ggml_backend_cuda_context & ctx, ggm
             ggml_cuda_fattn_rel_short(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_DECODE:
-            ggml_cuda_fattn_rel_decode(ctx, dst);
+            if (fattn_rel_mma_shapes(dst) && fattn_rel_mma_aligned(dst)) {
+                ggml_cuda_fattn_rel_mma(ctx, dst);
+            } else {
+                ggml_cuda_fattn_rel_decode(ctx, dst);
+            }
             break;
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
