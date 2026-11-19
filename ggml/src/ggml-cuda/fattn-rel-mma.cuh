@@ -17,13 +17,13 @@ static int fattn_rel_mma_streams(const ggml_tensor * dst) {
 }
 
 // F16 K/V shared by 2 to 8 query heads a KV head. The one-cell kernel keeps Q8_0 and the other ratios.
-static bool fattn_rel_mma_shapes(const ggml_tensor * dst) {
+static bool fattn_rel_mma_shapes(const int device, const ggml_tensor * dst) {
     static const bool legacy = ggml_env_switch("GGML_CUDA_FATTN_REL_DECODE_LEGACY");
     const auto * q = dst->src[0];
     const auto * k = dst->src[1];
     const auto * v = dst->src[2];
     const int64_t gqa = q->ne[2]/k->ne[2];
-    return !legacy && ampere_mma_available(GGML_CUDA_CC_BLACKWELL) && k->type == GGML_TYPE_F16 &&
+    return !legacy && ampere_mma_available(ggml_cuda_info().devices[device].cc) && k->type == GGML_TYPE_F16 &&
         q->ne[2] == gqa*k->ne[2] && gqa >= 2 && gqa <= 8 &&
         k->nb[1]%16 == 0 && k->nb[2]%16 == 0 && v->nb[1]%16 == 0 && v->nb[2]%16 == 0;
 }
@@ -34,8 +34,8 @@ static bool fattn_rel_mma_aligned(const ggml_tensor * dst) {
 }
 
 // Each stream stores what a part of the one-cell kernel stores, so one merge reads both.
-static size_t fattn_rel_mma_alloc_size(const ggml_tensor * dst) {
-    return fattn_rel_mma_shapes(dst) ?
+static size_t fattn_rel_mma_alloc_size(const int device, const ggml_tensor * dst) {
+    return fattn_rel_mma_shapes(device, dst) ?
         GGML_PAD(ggml_nbytes(dst), 128) + size_t(dst->ne[1])*dst->ne[2]*fattn_rel_mma_streams(dst)*130*sizeof(float) : 0;
 }
 
