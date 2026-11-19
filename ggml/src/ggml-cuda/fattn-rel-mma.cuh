@@ -9,11 +9,15 @@
 constexpr int fattn_rel_mma_cells = 16;
 constexpr int fattn_rel_mma_words = 4;
 
-// GGML_CUDA_FATTN_REL_DECODE_STREAMS: most warps the cells of one query and KV head are split across.
+// GGML_CUDA_FATTN_REL_DECODE_STREAMS, GGML_CUDA_FATTN_REL_DECODE_MEAN_STREAMS: most warps the cells of one query and KV head
+// are split across, where every row is bounded and in a low-mean step, where one row may read the whole pool.
 // Every stream keeps a mask word a lane.
 static int fattn_rel_mma_streams(const ggml_tensor * dst) {
-    static const int streams_max = (int) ggml_env_int("GGML_CUDA_FATTN_REL_DECODE_STREAMS");
-    return std::max<int64_t>(1, std::min<int64_t>(streams_max, dst->src[1]->ne[1]/(32*WARP_SIZE)));
+    static const int streams_rows = (int) ggml_env_int("GGML_CUDA_FATTN_REL_DECODE_STREAMS");
+    static const int streams_mean = (int) ggml_env_int("GGML_CUDA_FATTN_REL_DECODE_MEAN_STREAMS");
+    const int64_t n_kv = dst->src[1]->ne[1], n_live = ggml_flash_attn_ext_get_n_kv_max(dst);
+    const bool bounded = n_live > 0 && n_live*8 <= n_kv;
+    return std::max<int64_t>(1, std::min<int64_t>(bounded ? streams_rows : streams_mean, n_kv/(32*WARP_SIZE)));
 }
 
 // GGML_CUDA_FATTN_REL_DECODE_RUN_WORDS: the mask words a stream reads side by side before the next stream's begin.
