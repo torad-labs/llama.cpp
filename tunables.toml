@@ -75,7 +75,7 @@ param = [
   { name = "LLAMA_INKLING2_REL_POS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "inkling2", layer = "llama", about = "builds the relative bias of every cell on the host and adds it to the mask (the tests' oracle)" },
   { name = "GGML_CUDA_FATTN_REL_ORDERED_REF", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "inkling2", layer = "cuda", about = "relative attention sums its short rows in double, as the reference" },
 
-  # ---- Shared: knobs read from the environment (65)
+  # ---- Shared: knobs read from the environment (66)
   { name = "GGML_CUDA_ALLREDUCE", available = true, set = "env", type = "str", values = ["nccl", "internal-nccl-gather", "internal", "none"], kind = "knob", scope = "shared", layer = "cuda", about = "who sums the cards' shares: NCCL, the engine's own kernels, or the engine with NCCL for the gather (unset: nccl on Linux, internal elsewhere)" },
   { name = "GGML_CUDA_AR_BF16_THRESHOLD", available = true, set = "env", type = "int", default = 1, min = 0, max = 1099511627776, kind = "knob", scope = "shared", layer = "cuda", output = "rounding", about = "elements from which a share crosses as BF16 (0: never)" },
   { name = "GGML_CUDA_AR_COPY_CHUNK_BYTES", available = true, set = "env", type = "int", default = 0, min = 0, max = 33554432, kind = "knob", scope = "shared", layer = "cuda", about = "chunk of the copy engine in bytes (0: chosen per call)" },
@@ -130,6 +130,7 @@ param = [
   { name = "LLAMA_GRAPH_REUSE_DISABLE", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "shared", layer = "llama", about = "builds the graph again every step" },
   { name = "LLAMA_GRAPH_SLOTS", available = true, set = "env", type = "int", default = 3, min = 1, max = 1024, kind = "knob", scope = "shared", layer = "llama", output = "same", launcher = "--keep-graphs", about = "compute graphs a context keeps for reuse" },
   { name = "LLAMA_HOST_THREADS", available = true, set = "env", type = "int", default = "auto", min = 0, max = 1024, kind = "knob", scope = "shared", layer = "llama", output = "same", about = "host threads for the engine's own work (unset: half the cores, 1 to 16)" },
+  { name = "LLAMA_KV_PAD_SHARED", available = false, set = "env", type = "int", kind = "knob", scope = "shared", layer = "llama", about = "fewest cells the pool that sequences share is padded to (the next power of two; unset: 256 a sequence): the padded length shapes the decode graphs, so a wider pad builds and captures them less often" },
   { name = "LLAMA_KV_ROWS", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "shared", layer = "llama", about = "upstream's attention over each sequence's own rows of a unified cache (the fork's unified paths then do not run)" },
   { name = "LLAMA_KV_ROWS_DISABLE", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "shared", layer = "llama", about = "never the row attention above, whatever asks for it" },
   { name = "LLAMA_KV_SEQ_CELLS", available = true, set = "env", type = "int", default = 0, min = 0, max = 2147483647, kind = "knob", scope = "shared", layer = "llama", launcher = "--slot-context", about = "cells one sequence may hold in a unified pool, which sizes the worst-case graph (0: the whole pool)" },
@@ -267,7 +268,7 @@ param = [
   { name = "FATTN_KQ_STRIDE", available = false, set = "code", type = "int", default = 256, kind = "knob", scope = "shared", layer = "cuda", where = "ggml/src/ggml-cuda/fattn-common.cuh", about = "cells a fused attention kernel scores in one tile" },
   { name = "graph_slot_max_tokens", available = false, set = "code", type = "int", default = 32, kind = "knob", scope = "shared", layer = "llama", where = "src/llama-context.h", about = "largest step whose graph a context keeps" },
 
-  # ---- Shared: earlier paths, kept behind a switch (98)
+  # ---- Shared: earlier paths, kept behind a switch (100)
   { name = "GGML_CUDA_AR_COPY_TAIL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
@@ -341,6 +342,8 @@ param = [
   { name = "LLAMA_KQ_MASK_SCAN_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_KQ_MASK_SEQ_BITS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_KV_CELL_CAPACITY_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
+  { name = "LLAMA_KV_PAD_DENSE_LEGACY", available = false, set = "env", type = "bool", kind = "legacy", scope = "shared", layer = "llama", about = "a shared pool that reads densely is padded to 256 cells instead of powers of two up to its shared pad" },
+  { name = "LLAMA_KV_PAD_SHARED_LEGACY", available = false, set = "env", type = "bool", kind = "legacy", scope = "shared", layer = "llama", about = "a pool that sequences share is padded to 256 cells whatever it holds, so 23 sessions change every decode graph's shape each 11 steps" },
   { name = "LLAMA_KV_PARTIAL_STATE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_KV_RESTORE_PER_CELL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_OUTPUT_ROWS_WHOLE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
@@ -412,7 +415,7 @@ param = [
   { name = "LLAMA_SERVER_ROUTER_PORT", available = false, set = "env", type = "int", kind = "setup", scope = "shared", layer = "server", indirect = true },
   { name = "LLAMA_CACHE", available = false, set = "env", type = "str", kind = "setup", scope = "shared", layer = "common", about = "the download cache directory" },
 
-  # ---- Other models and backends (116)
+  # ---- Other models and backends (113)
   { name = "GGML_CUDA_AR_HC_POST", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "other", layer = "cuda" },
   { name = "GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "other", layer = "cuda" },
   { name = "GGML_CUDA_GB10_DUAL_RMS_Q8", available = false, set = "env", type = "bool", kind = "knob", scope = "other", layer = "cuda" },
@@ -454,7 +457,6 @@ param = [
   { name = "LLAMA_KPOOL_DIRECT_ROW_CAP", available = false, set = "env", type = "int", kind = "knob", scope = "other", layer = "llama" },
   { name = "LLAMA_KV_HOST", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "other", layer = "llama" },
   { name = "LLAMA_KV_PAD_PREFILL", available = false, set = "env", type = "int", kind = "knob", scope = "other", layer = "llama" },
-  { name = "LLAMA_KV_PAD_SHARED", available = false, set = "env", type = "int", kind = "knob", scope = "other", layer = "llama" },
   { name = "LLAMA_MTP_DEVICE_H_MIN_ROWS", available = false, set = "env", type = "int", kind = "knob", scope = "other", layer = "llama" },
   { name = "LLAMA_PROMPT_SHAPES", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "other", layer = "llama" },
   { name = "LLAMA_PROMPT_SHAPE_ROWS", available = false, set = "env", type = "int", kind = "knob", scope = "other", layer = "llama" },
@@ -516,8 +518,6 @@ param = [
   { name = "LLAMA_KPOOL_SELECTION_HOST_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "other", layer = "llama" },
   { name = "LLAMA_KPOOL_SHARED_CELLS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "other", layer = "llama" },
   { name = "LLAMA_KPOOL_SHARED_VIEWS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "other", layer = "llama" },
-  { name = "LLAMA_KV_PAD_DENSE_LEGACY", available = false, set = "env", type = "bool", kind = "legacy", scope = "other", layer = "llama" },
-  { name = "LLAMA_KV_PAD_SHARED_LEGACY", available = false, set = "env", type = "bool", kind = "legacy", scope = "other", layer = "llama" },
   { name = "LLAMA_MTP_KEEP_WAIT_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "other", layer = "llama" },
   { name = "LLAMA_MTP_INDEX_SHARE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "other", layer = "common" },
   { name = "LLAMA_MTP_PENDING_H_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "other", layer = "common" },

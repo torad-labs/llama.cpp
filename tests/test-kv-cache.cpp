@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -344,6 +345,54 @@ int main() {
                 }
             }
         }
+    }
+
+    // Inkling 2 sessions that share a pool each add a cell a step, and the padded length shapes every decode graph: it
+    // holds for a power of two while the pool is small and for 256 cells a session after. LLAMA_KV_PAD_SHARED_LEGACY=1: 256
+    {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_INKLING2, llama_model_default_params()));
+        init_model(*model, 1);
+        const uint32_t n_seq = 23, size = 65536, n_steps = 2048;
+        llama_kv_cache kv(*model, false, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, size, n_seq,
+                0, LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
+        std::vector<llama_seq_id> seq(n_seq);
+        std::iota(seq.begin(), seq.end(), 0);
+        std::vector<llama_seq_id *> seq_ptr(n_seq);
+        std::vector<llama_pos> pos(n_seq);
+        std::vector<int32_t> n_id(n_seq, 1);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            seq_ptr[i] = &seq[i];
+        }
+        llama_ubatch ub = {};
+        ub.n_tokens = ub.n_seqs = ub.n_seqs_unq = n_seq;
+        ub.n_seq_tokens = ub.n_pos = 1;
+        ub.pos = pos.data();
+        ub.n_seq_id = n_id.data();
+        ub.seq_id = seq_ptr.data();
+        ub.seq_id_unq = seq.data();
+        llama_kv_cache::slot_info slot{};
+        slot.strm = {0};
+        slot.idxs.resize(1);
+        const char * legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
+        const bool narrow = legacy && atoi(legacy) == 1;
+        uint32_t lengths = 0, last = 0;
+        for (uint32_t step = 0; step < n_steps; ++step) {
+            slot.idxs[0].clear();
+            for (uint32_t i = 0; i < n_seq; ++i) {
+                slot.idxs[0].push_back(step*n_seq + i);
+                pos[i] = step;
+            }
+            kv.apply_ubatch(slot, ub);
+            const uint32_t cells = (step + 1)*n_seq, n_kv = kv.get_n_kv(slot, &ub);
+            GGML_ASSERT(n_kv >= cells && n_kv <= size && n_kv % 256 == 0);
+            // the empty cells the padding adds stay under 8,192, the next power of two over 256 a session
+            GGML_ASSERT(n_kv - cells < (narrow ? 256u : 8192u));
+            lengths += n_kv != last;
+            last = n_kv;
+        }
+        fprintf(stderr, "shared Inkling 2 pool: %u padded lengths in %u steps of %u sessions\n", lengths, n_steps, n_seq);
+        // 47,104 cells: 256 to 8,192 by powers of two, then every 8,192; or every 256
+        GGML_ASSERT(lengths == (narrow ? 184u : 11u));
     }
 
     llama_backend_free();
