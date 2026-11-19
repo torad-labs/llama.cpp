@@ -62,11 +62,19 @@ def post(url, route, body, timeout=60):
         return json.load(response)
 
 
-def prompts(url, sessions):
-    """One coding request a session, as the template renders it: text the model continues, so drafts are kept as in use."""
+def prompts(url, sessions, context=0):
+    """One coding request a session, as the template renders it: text the model continues, so drafts are kept as in use.
+    With a context, the request follows about that many tokens of this repository's own scripts, a session its own part."""
+    source = "\n".join(path.read_text() for path in sorted((serve.ROOT / "scripts/glm53").glob("*.py"))) if context else ""
     rows = []
     for slot in range(sessions):
         ask = f"Write a Python function that {SUBJECTS[slot % len(SUBJECTS)]}, with a docstring and three unit tests."
+        if context:
+            # Cut the part by how many characters this tokenizer spends a token on
+            part = (source[slot * len(source) // sessions:] + source) * (1 + context * 8 // len(source))
+            sample = part[:20000]
+            per_token = len(sample) / len(post(url, "/tokenize", {"content": sample})["tokens"])
+            ask = "Here is a module of the project.\n\n" + part[:int(context * per_token)] + "\n\n" + ask
         text = post(url, "/apply-template", {"messages": [{"role": "user", "content": ask}]})["prompt"]
         rows.append(post(url, "/tokenize", {"content": text, "add_special": False, "parse_special": True})["tokens"])
     return rows
@@ -77,11 +85,12 @@ def read_round(url, rows, tokens, timeout, sampling):
     gate = threading.Barrier(len(rows))
 
     def client(slot):
-        body = dict(prompt=rows[slot], id_slot=slot, seed=slot, cache_prompt=False, ignore_eos=True, n_predict=tokens,
+        # The slot keeps its prompt between rounds, so a round after the first decodes without reading it again
+        body = dict(prompt=rows[slot], id_slot=slot, seed=slot, cache_prompt=True, ignore_eos=True, n_predict=tokens,
                     stream=True, return_tokens=True, **sampling)
         gate.wait(timeout=60)
         with mixed_prefill.post(url, "/completion", body, timeout) as response:
-            row = glm_measure.read_completion_stream(response, tokens, len(rows[slot]))
+            row = glm_measure.read_completion_stream(response, tokens)
         row["slot"] = slot
         return row
 
@@ -103,13 +112,13 @@ def read_round(url, rows, tokens, timeout, sampling):
 def measure(url, sessions, args):
     """A warm round the rate does not count, then the measured rounds; the trial's rate is their median."""
     sampling = {} if args.temperature is None else {"temperature": args.temperature}
-    rows = prompts(url, sessions)
+    rows = prompts(url, sessions, args.context)
     for _ in range(args.warm_rounds):
         read_round(url, rows, args.tokens, args.timeout, sampling)
     rounds = [read_round(url, rows, args.tokens, args.timeout, sampling) for _ in range(args.rounds)]
     middle = sorted(rounds, key=lambda r: r["tokens_per_second"])[len(rounds) // 2]
     return {**middle, "tokens_per_second": statistics.median(r["tokens_per_second"] for r in rounds),
-            "rounds": [r["tokens_per_second"] for r in rounds]}
+            "rounds": [r["tokens_per_second"] for r in rounds], "prompt_tokens": statistics.median(len(row) for row in rows)}
 
 
 def plan(base, settings):
@@ -256,7 +265,7 @@ def send(out, experiment):
         name = " ".join(f"{k.lstrip('-')}={v}" for k, v in trial["settings"].items()) or "as it launches"
         run_id = call("runs/create", {"experiment_id": experiment_id, "start_time": now, "run_name": name})["run"]["info"]["run_id"]
         metrics = [{"key": key, "value": trial[key], "timestamp": now, "step": 0}
-                   for key in ("tokens_per_second", "wall_tokens_per_second", "draft_accepted", "startup_seconds")
+                   for key in ("tokens_per_second", "wall_tokens_per_second", "draft_accepted", "startup_seconds", "prompt_tokens")
                    if trial.get(key) is not None]
         metrics += [{"key": "round_tokens_per_second", "value": value, "timestamp": now, "step": step}
                     for step, value in enumerate(trial.get("rounds", []), 1)]
@@ -307,6 +316,8 @@ def arguments(argv=None):
             sub.add_argument("--warm-rounds", type=int, default=1, help="Rounds before them that the rate does not count (default: 1)")
             sub.add_argument("--temperature", type=float, help="Sampling temperature (default: the server's, the model card's 1.0)")
             sub.add_argument("--timeout", type=float, default=900, help="Seconds a session's stream may take (default: 900)")
+            sub.add_argument("--context", type=int, default=0,
+                             help="Tokens of source text each session's request follows, about (default: the request alone)")
         return sub
 
     sub = verb("run", rounds=True)

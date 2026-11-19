@@ -78,7 +78,7 @@ python3 scripts/inkling2/search.py run \
     --out /results/decode-search-01
 ```
 
-A trial pins one coding request to each of the profile's sessions and lets every session generate the same number of tokens with the server's own sampling. Its rate is the tokens a second delivered while all sessions decode, the median of the measured rounds after a warm round. The first trial is the profile as it launches. The search then walks one setting at a time and keeps a value only when it beats the best so far by `--gain` (2%). `--knob NAME=V1,V2` replaces the default space (`--knob=--draft-depth=2,4` for an option) and `--baseline` measures the profile alone.
+A trial pins one coding request to each of the profile's sessions and lets every session generate the same number of tokens with the server's own sampling. Its rate is the tokens a second delivered while all sessions decode, the median of the measured rounds after a warm round. The first trial is the profile as it launches. The search then walks one setting at a time and keeps a value only when it beats the best so far by `--gain` (2%). `--context N` puts about N tokens of this repository's scripts before each request, for the settings whose effect grows with the context a session decodes over; a search folder holds the trials of one context. `--knob NAME=V1,V2` replaces the default space (`--knob=--draft-depth=2,4` for an option) and `--baseline` measures the profile alone.
 
 Each trial is a line of `trials.jsonl` with its settings, rate, the share of drafted tokens the target kept, and the server's error when it did not start. A trial folder keeps the launch plan and the server log. Rerunning the same command skips finished trials. `best.json` holds the settings kept so far.
 

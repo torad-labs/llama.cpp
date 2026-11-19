@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import tomllib
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -189,6 +190,29 @@ class SearchRuns(unittest.TestCase):
         self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], "2")
         _, env = serve.make_plan(serve.arguments(["--profile", "tensor-4", "--tuned", str(self.tuned)]))
         self.assertNotIn("LLAMA_SAMPLE_THREADS", env)
+
+
+class SearchLoad(unittest.TestCase):
+    def test_a_session_decodes_over_the_context_the_load_was_asked_for(self):
+        with tempfile.TemporaryDirectory() as folder:
+            server = Path(folder) / "llama-server"
+            server.write_text(STAND_IN)
+            server.chmod(0o755)
+            running = subprocess.Popen([str(server), "--port", "18104"],
+                                       env={**os.environ, "STAND_IN_LAUNCHES": str(Path(folder) / "launches")})
+            self.addCleanup(running.wait)
+            self.addCleanup(running.kill)
+            words = [sys.executable, search.__file__, "load", "--url", "http://127.0.0.1:18104", "--sessions", "3",
+                     "--tokens", "8", "--rounds", "1"]
+            for _ in range(100):
+                plain = subprocess.run(words, capture_output=True, text=True)
+                if plain.returncode == 0:
+                    break
+                time.sleep(0.05)
+            long = subprocess.run(words + ["--context", "300"], capture_output=True, text=True)
+        self.assertEqual((plain.returncode, long.returncode), (0, 0), plain.stderr + long.stderr)
+        self.assertLess(json.loads(plain.stdout)["prompt_tokens"], 60)
+        self.assertTrue(300 <= json.loads(long.stdout)["prompt_tokens"] < 400, long.stdout)
 
 
 class SearchSpace(unittest.TestCase):
