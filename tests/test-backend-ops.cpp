@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "../ggml/src/ggml-attn-mask.h"
 
 #include <algorithm>
 #include <atomic>
@@ -194,7 +195,8 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 }
 
 // data_f32: one value per cell, 0 or -INFINITY for a bit-packed mask (GGML_TYPE_I16, 16 cells per element, bit set = visible)
-static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & data_f32) {
+// offset: where the values start in the tensor, in bytes, for a mask written a row at a time
+static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & data_f32, size_t offset = 0) {
     if (tensor->type == GGML_TYPE_I16) {
         std::vector<uint16_t> words(data_f32.size()/16, 0);
         for (size_t i = 0; i < data_f32.size(); i++) {
@@ -202,14 +204,14 @@ static void set_tensor_kq_mask(ggml_tensor * tensor, const std::vector<float> & 
                 words[i/16] |= (uint16_t) (1u << (i%16));
             }
         }
-        ggml_backend_tensor_set(tensor, words.data(), 0, words.size()*sizeof(uint16_t));
+        ggml_backend_tensor_set(tensor, words.data(), offset, words.size()*sizeof(uint16_t));
         return;
     }
 
     std::vector<ggml_fp16_t> data_f16(data_f32.size());
     ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f32.size());
 
-    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(tensor, data_f16.data(), offset, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
 // PQ2_0 blocks written directly: every 2-bit code (3, the +2 that the reference quantizer never emits from absmax-scaled
@@ -7317,7 +7319,8 @@ static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool skip = fals
             for (int i = 0; i < t->ne[0]; i++) {
                 data[i] = i % n_mats;
             }
-            std::shuffle(data.begin(), data.end(), rng);
+            // A row wider than n_mats is read past its first entries (ids_offset): the rest hold each expert once.
+            std::shuffle(data.begin() + std::max<int64_t>(0, t->ne[0] - n_mats), data.end(), rng);
             if (skip) {
                 mask_skipped_ids(data, r);
             }
@@ -11627,9 +11630,12 @@ struct test_flash_attn_ext_rel_pos : public test_case {
 
     const bool query_sinks;
     const int n_kv_max;
+    const int64_t run; // cells in each run a row owns when n_kv_max bounds it: 1 as decode lays a pool out
+    const bool low_mean; // ggml_flash_attn_ext_set_low_mean_mask, a hint only: the first row reads the pool, the others a run each
 
     std::string vars() override {
-        return VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_dist, type_KV, sinks, mask_bits, query_sinks, n_kv_max);
+        const std::string base = VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_dist, type_KV, sinks, mask_bits, query_sinks, n_kv_max);
+        return (run == 16 ? base : base + "," + VAR_TO_STR(run)) + (low_mean ? "," + VAR_TO_STR(low_mean) : "");
     }
 
     double max_nmse_err() override {
@@ -11638,9 +11644,10 @@ struct test_flash_attn_ext_rel_pos : public test_case {
 
     test_flash_attn_ext_rel_pos(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 6, int64_t kv = 2048, int64_t nb = 32,
                                 int64_t n_stream = 1, int64_t n_dist = 1025, ggml_type type_KV = GGML_TYPE_F16, bool sinks = true,
-                                bool mask_bits = false, bool query_sinks = false, int n_kv_max = 0)
+                                bool mask_bits = false, bool query_sinks = false, int n_kv_max = 0, int64_t run = 16,
+                                bool low_mean = false)
         : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_dist(n_dist), type_KV(type_KV), sinks(sinks),
-          mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max) {}
+          mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max), run(run), low_mean(low_mean) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -11667,6 +11674,7 @@ struct test_flash_attn_ext_rel_pos : public test_case {
             ggml_flash_attn_ext_add_rel_pos_sinks(out, sink);
         }
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        ggml_flash_attn_ext_set_low_mean_mask(out, low_mean);
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -11700,22 +11708,24 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "m") == 0) {
                 // causal over the cells' positions, empty cells hidden; every row sees the cells before it
-                std::vector<float> f(kv*nb*n_stream, -INFINITY);
+                // Written a row at a time: a pool of millions of cells never has its whole mask as floats.
+                std::vector<float> f(kv);
+                const size_t row_bytes = ggml_nbytes(t)/(nb*n_stream);
                 for (int64_t s = 0; s < n_stream; ++s) {
                     for (int64_t i = 0; i < nb; ++i) {
                         int64_t live = 0;
                         for (int64_t j = 0; j < kv; ++j) {
                             const int32_t c = cells[s*kv + j];
                             // Disjoint runs, a shared prefix and a fully masked last row.
-                            const bool owned = !n_kv_max || (i + 1 < nb && (j < 16 || (j/16)%nb == i));
-                            if (owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max)) {
-                                f[(s*nb + i)*kv + j] = 0.0f;
-                                ++live;
-                            }
+                            const bool runs = n_kv_max || (low_mean && i > 0);
+                            const bool owned = !runs || (i + 1 < nb && (j < 16 || (j/run)%nb == i));
+                            const bool seen = owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max);
+                            f[j] = seen ? 0.0f : -INFINITY;
+                            live += seen;
                         }
+                        set_tensor_kq_mask(t, f, (s*nb + i)*row_bytes);
                     }
                 }
-                set_tensor_kq_mask(t, f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -15749,6 +15759,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, true,  2304, n, 4608));
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, false, 4608, n, 2304));
     }
+    // the Q3_K_M pack's products as four cards split them (gate and up packed in 1,024 rows, down to 512), the shapes whose
+    // routes GGML_CUDA_MMVQ_EXPERT_SORT_23 sorts: at the fewest tokens the sort takes, the 23 it serves and the most
+    for (int n : { 1, 23, 32 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true,  1024, n, 4608));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, n, 512));
+    }
     // past the ring's 8 tokens (8 tokens x 8 used is its 64 pairs): 9 to 16 go to mmvq.cu's mul_mat_vec_q_moe, a warp a
     // token, and 17 to MMQ. 3 slots at an MTP verify of 3 are 9 tokens, 4 slots 12
     for (int n : { 9, 12, 16, 17 }) {
@@ -16744,6 +16760,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192, 23, 1, 32, type, true, true, true, 1024));
+    }
+
+    // decode over a shared pool: a session's cells one at a time, in short runs and in whole blocks, a pool that is not
+    // a whole number of 512-cell chunks, and 2 to 8 query heads a KV head
+    for (int64_t run : {1, 16, 4096}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 65536, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 8192, run));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192 + 5*32, 23, 1, 32, GGML_TYPE_F16, true, true, true, 1024, 1));
+    for (int64_t gqa : {2, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, gqa, 8192, 8, 1, 32, GGML_TYPE_F16, true, true, true, 1024));
+    }
+    // a low-mean step: one session reads the whole pool and the others their own cells, so the hint alone routes it, at
+    // the shape as served and at rows and pools the model's knobs can pick (LLAMA_INKLING2_MEAN_ROWS, _MEAN_POOL_MIN)
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 262144, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 0, 1, true));
+    for (int64_t kv : {8192, 65536}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 16, 1, 1025, GGML_TYPE_F16, true, true, true, 0, 1, true));
     }
 
     // flash attention over a list of K/V rows per slice (unified KV cache)
@@ -17808,6 +17840,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
                 GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, false, false, 0, 0, /*mask_bits=*/true));
         }
+    }
+
+    // Inkling 2's attention on one rank of the tensor-4 profile (2 KV heads at GQA 6, 23 sessions, F16 K/V in a shared
+    // pool, a bit-packed mask, a sink a query): the global layers with every session's cells one at a time, as decode
+    // lays them, or in blocks, as a prompt does, and a sliding layer's 1,024 cells a session in the full pool
+    for (int64_t kv : { 262144, 1048576, 3014656 }) {
+        for (int64_t run : { 1, 4096 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 23, 1, 1025, GGML_TYPE_F16, true, true, true, kv/8, run));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 3014656, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 1024, 1));
+    // and its low-mean step: one session reads the whole pool
+    for (int64_t kv : { 262144, 3014656 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 0, 1, true));
     }
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {

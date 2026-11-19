@@ -3164,10 +3164,7 @@ struct ggml_backend_meta_context {
         };
         // scheduler graphs kept, not individual splits: 4, or GGML_META_CAPTURE_GRAPHS (a context that retains a graph
         // for each count of sequences, LLAMA_GRAPH_ANY_SEQS with LLAMA_GRAPH_SLOTS, needs one for each of them)
-        const size_t n_graphs_max = [] {
-            const char * s = getenv("GGML_META_CAPTURE_GRAPHS");
-            return s != nullptr && atoi(s) >= 2 ? (size_t) atoi(s) : (size_t) 4;
-        }();
+        const size_t n_graphs_max = (size_t) ggml_env_int("GGML_META_CAPTURE_GRAPHS");
         std::unordered_map<uint64_t, graph>      graphs;
         std::unordered_map<uint64_t, generation> generations;
         uint64_t                                 t_now = 0; // the evaluations so far, t_used's clock
@@ -3402,10 +3399,7 @@ struct ggml_backend_meta_context {
 
     // launch a captured evaluation on every device; GGML_META_CAPTURE_THREADS=0: the calling thread launches them in turn
     void capture_launch(const capture_state::graph & g) {
-        static const bool threads_off = [] {
-            const char * s = getenv("GGML_META_CAPTURE_THREADS");
-            return s != nullptr && atoi(s) == 0;
-        }();
+        static const bool threads_off = !ggml_env_switch("GGML_META_CAPTURE_THREADS");
         if (threads_off) {
             for (size_t j = 0; j < backend_configs.size(); j++) {
                 capture.launch(backend_configs[j].backend, g.execs[j]);

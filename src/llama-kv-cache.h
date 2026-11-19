@@ -299,7 +299,8 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // purge: also remove the lower positions of a sequence that lost a cell to the slot, wherever their cells are
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool purge = true);
 
     //
     // input API

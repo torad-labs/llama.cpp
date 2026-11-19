@@ -645,8 +645,7 @@ llama_context::llama_context(
         // Upstream's attention over each sequence's own cells of a unified cache (ggml_flash_attn_ext_rows) is opt-in
         // here, LLAMA_KV_ROWS=1: CUDA reads K/V through the row lists on its f16 kernel only, so with it the fork's
         // paths for a unified cache do not run (quantized K/V read in place, the mask's live-tile range and scan)
-        const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
-        if (!LLAMA_KV_ROWS_DISABLE) {
+        if (!ggml_env_switch("LLAMA_KV_ROWS_DISABLE")) {
             cparams.auto_fkvr = cparams.kv_unified && ggml_env_switch("LLAMA_KV_ROWS");
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
@@ -672,8 +671,7 @@ llama_context::llama_context(
     cparams.training = false;
 
     {
-        const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
-        graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
+        graph_reuse_disable = ggml_env_switch("LLAMA_GRAPH_REUSE_DISABLE");
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
@@ -711,8 +709,7 @@ llama_context::llama_context(
     // larger than the reserve is allocated when it comes, the context's kept graphs are evicted for the room, and the
     // decode returns -2 when the device has none
     if (cparams.kv_unified) {
-        const char * seq_cells = getenv("LLAMA_KV_SEQ_CELLS");
-        const long   val       = seq_cells ? strtol(seq_cells, nullptr, 10) : 0;
+        const int64_t val = ggml_env_int("LLAMA_KV_SEQ_CELLS");
 
         if (val > 0 && (uint64_t) val < cparams.n_ctx) {
             cparams.n_seq_cells = GGML_PAD((uint32_t) val, 256);

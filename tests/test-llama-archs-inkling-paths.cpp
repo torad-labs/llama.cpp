@@ -28,6 +28,9 @@
 //   decode    24 tokens one at a time after a prompt of 1012, crossing distance 1024 to the first keys
 //   unified   three sequences in one unified cache, prompts of 40, 56 and 72 tokens, then 8 steps of all three together
 //   streams   the same with a cache stream per sequence
+//
+// --inkling-window <device> is a check of another kind in this file for its helpers: sessions that share one cache give
+// each session the logits it has alone (test_inkling_window).
 
 #include "test-llama-archs.h"
 
@@ -40,6 +43,8 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <numeric>
+#include <random>
 #include <stdexcept>
 
 namespace {
@@ -315,5 +320,124 @@ int test_inkling_path(const std::string & path, size_t seed, ggml_backend_dev_t 
         ok = ok && dh <= f.vs_host;
     }
     fprintf(stderr, "%s inkling2 %s\n", ok ? "OK" : "FAIL", path.c_str());
+    return ok ? 0 : 1;
+}
+
+// Sessions that share one cache, where a sliding layer holds a window a session and one micro-batch, give each session
+// the logits it has alone. In every round each session adds a run of 8 to 64 rows. The rows go to a cache a run a call
+// (one micro-batch), to another in calls of a micro-batch's rows, and to a third a round a call. The equal split cuts a
+// call whose sessions bring runs of different lengths into several micro-batches, as it does a draft's verification
+// beside other sessions, and the cells of them all are found before the first runs.
+int test_inkling_window(size_t seed, ggml_backend_dev_t dev) {
+    constexpr uint32_t n_sessions = 6, n_rounds = 6, n_ubatch = 64;
+    using rows_t = std::vector<std::array<int32_t, 3>>;
+    using logits_t = std::map<std::pair<int32_t, int32_t>, std::vector<float>>; // by session and position
+
+    const bool on_host = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+    gguf_set_val_u32(gguf.get(), llama_arch_kv_name(LLM_ARCH_INKLING2, LLM_KV_CONTEXT_LENGTH).c_str(), 8192);
+    llama_model_ptr model = get_model(gguf.get(), nullptr, seed, 0.1f, on_host ? std::vector<ggml_backend_dev_t>{} :
+            std::vector<ggml_backend_dev_t>{dev});
+    const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+
+    std::mt19937 rng(seed);
+    std::vector<std::vector<llama_token>> tokens;
+    for (uint32_t s = 0; s < n_sessions; ++s) {
+        tokens.push_back(get_tokens(n_rounds*n_ubatch, 128, seed + s));
+    }
+    std::vector<rows_t> rounds(n_rounds);
+    std::vector<int32_t> next(n_sessions, 0);
+    for (auto & round : rounds) {
+        std::vector<int32_t> order(n_sessions);
+        std::iota(order.begin(), order.end(), 0);
+        for (uint32_t i = n_sessions - 1; i > 0; --i) {
+            std::swap(order[i], order[rng() % (i + 1)]);
+        }
+        for (const int32_t s : order) {
+            for (uint32_t n = 8 + rng() % 57; n > 0; --n, ++next[s]) {
+                round.push_back({tokens[s][next[s]], next[s], s});
+            }
+        }
+    }
+
+    const auto context = [&](uint32_t n_seq_max) {
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = n_rounds*n_ubatch*n_seq_max;
+        params.n_batch = n_sessions*n_ubatch;
+        params.n_ubatch = n_ubatch;
+        params.n_seq_max = n_seq_max;
+        params.kv_unified = true;
+        params.swa_full = false; // as served: the sliding layers keep a window a session
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.n_threads = params.n_threads_batch = 4;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+        if (!ctx) {
+            throw std::runtime_error("inkling2: the context was not created");
+        }
+        return ctx;
+    };
+    // rows in calls of n_call, as sequence 0 when the session has the context alone
+    const auto feed = [&](llama_context * ctx, const rows_t & rows, size_t n_call, bool is_alone, logits_t & out) {
+        for (size_t i0 = 0; i0 < rows.size(); i0 += n_call) {
+            const rows_t call(rows.begin() + i0, rows.begin() + std::min(rows.size(), i0 + n_call));
+            rows_t in = call;
+            for (auto & row : in) {
+                row[2] = is_alone ? 0 : row[2];
+            }
+            std::vector<float> logits;
+            decode(ctx, in, logits);
+            for (size_t i = 0; i < call.size(); ++i) {
+                out[{call[i][2], call[i][1]}].assign(logits.begin() + i*n_vocab, logits.begin() + (i + 1)*n_vocab);
+            }
+        }
+    };
+
+    // a round's runs, each a session's, in the round's order
+    const auto runs_of = [](const rows_t & round) {
+        std::vector<rows_t> runs;
+        for (const auto & row : round) {
+            if (runs.empty() || runs.back().back()[2] != row[2]) {
+                runs.emplace_back();
+            }
+            runs.back().push_back(row);
+        }
+        return runs;
+    };
+
+    logits_t alone, by_run, by_ubatch, by_round;
+    {
+        std::vector<llama_context_ptr> ctx_alone;
+        for (uint32_t s = 0; s < n_sessions; ++s) {
+            ctx_alone.push_back(context(1));
+        }
+        const auto ctx_run = context(n_sessions), ctx_ubatch = context(n_sessions), ctx_round = context(n_sessions);
+        for (const auto & round : rounds) {
+            for (const auto & run : runs_of(round)) {
+                feed(ctx_alone[run[0][2]].get(), run, run.size(), true, alone);
+                feed(ctx_run.get(), run, run.size(), false, by_run);
+            }
+            feed(ctx_ubatch.get(), round, n_ubatch, false, by_ubatch);
+            feed(ctx_round.get(), round, round.size(), false, by_round);
+        }
+    }
+
+    const auto far_rows = [&](const char * name, const logits_t & got) {
+        size_t far = 0;
+        double worst = 0.0;
+        for (const auto & [key, row] : alone) {
+            const auto it = got.find(key);
+            const double d = it == got.end() ? INFINITY : nmse(row, it->second);
+            far += !(d <= tolerance);
+            worst = std::max(worst, d);
+        }
+        fprintf(stderr, "inkling2 window, %s: %zu rows, %zu far from the session alone, worst NMSE %g (at most %g)\n",
+                name, alone.size(), far, worst, tolerance);
+        return far;
+    };
+    const size_t far_run = far_rows("a run a call", by_run);
+    const size_t far_ubatch = far_rows("a micro-batch's rows a call", by_ubatch);
+    const size_t far_round = far_rows("a round a call", by_round);
+    const bool ok = !alone.empty() && far_run == 0 && far_ubatch == 0 && far_round == 0;
+    fprintf(stderr, "%s inkling2 window on %s\n", ok ? "OK" : "FAIL", ggml_backend_dev_name(dev));
     return ok ? 0 : 1;
 }
