@@ -207,6 +207,7 @@ int main() {
                 llama_kv_cache::slot_info slot{};
                 slot.strm = {0};
                 const bool bucket = !window && type == GGML_TYPE_F16 && ggml_env_switch("LLAMA_INKLING2_BUCKET_PREFILL_KV");
+                const uint32_t cells = (uint32_t) ggml_env_int("LLAMA_INKLING2_BUCKET_CELLS");
                 for (uint32_t i : {1024u, 32768u, 33792u, 42752u}) {
                     slot.idxs = {{i}};
                     kv.apply_ubatch(slot, ub);
@@ -214,7 +215,7 @@ int main() {
                     prompt.n_tokens = prompt.n_seq_tokens = 1024;
                     const uint32_t narrow = i + 256;
                     GGML_ASSERT(kv.get_n_kv(slot, &ub) == narrow);
-                    const uint32_t expected = bucket && i >= 32768 ? std::min(43008u, uint32_t(GGML_PAD(narrow, 8192))) : narrow;
+                    const uint32_t expected = bucket && i >= 32768 ? std::min(43008u, uint32_t(GGML_PAD(narrow, cells))) : narrow;
                     GGML_ASSERT(kv.get_n_kv(slot, &prompt) == expected);
                     GGML_ASSERT(kv.get_cells(seq).seq_n_cells(seq) == uint32_t(pos + 1));
                     ++pos;

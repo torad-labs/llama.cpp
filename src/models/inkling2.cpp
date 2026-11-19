@@ -117,6 +117,19 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const 
     return std::make_unique<graph>(params);
 }
 
+// the shapes a decode step's mask is classed by, read once (tunables.toml)
+static const inkling2_mask_shapes & mask_shapes() {
+    static const inkling2_mask_shapes shapes = {
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_SHORT_ROWS_CELLS"),
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_BOUNDED_ROWS_MIN"),
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_BOUNDED_ROWS_MAX"),
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_BOUNDED_POOL_MIN"),
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_BOUNDED_POOL_SHARE"),
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_POOL_SHARE"),
+    };
+    return shapes;
+}
+
 // the positions the relative bias is looked up by, for the global cache (0) and the window cache (1): with the bias inside
 // the attention kernel the position of each cell, from which the kernel derives the distances, and with
 // LLAMA_INKLING2_REL_POS_LEGACY=1 the distance of every query to every cell
@@ -139,7 +152,7 @@ public:
             bool short_rows = true;
             for (uint32_t i = 0; i < ub.n_seqs_unq && short_rows; ++i) {
                 const auto seq = ub.seq_id_unq[i];
-                short_rows = kv->get_kv()->get_cells(seq).seq_n_cells(seq) <= 32;
+                short_rows = kv->get_kv()->get_cells(seq).seq_n_cells(seq) <= mask_shapes().short_cells;
             }
             if (short_rows) {
                 for (uint32_t i = 0; i < ub.n_tokens && short_rows; ++i) {
@@ -165,7 +178,7 @@ public:
         return inkling2_classify_decode_mask(kv->get_n_kv(), ub.n_tokens, allow_mean, [&](uint32_t row) {
             const auto seq = ub.seq_id[row][0];
             return kv->get_kv()->get_cells(seq).seq_n_cells(seq);
-        });
+        }, mask_shapes());
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -334,7 +347,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     bool low_mean[2];
     for (int i = 0; i < 2; ++i) {
         const auto mode = rel->mask_mode[i] = fused_rel ? rel->classify_mask(params, i) : inkling2_decode_mask::dense;
-        n_kv_max[i] = mode == inkling2_decode_mask::short_rows ? 32 : mode == inkling2_decode_mask::bounded_rows ? rel->cache[i]->get_n_kv()/8 : 0;
+        n_kv_max[i] = mode == inkling2_decode_mask::short_rows ? mask_shapes().short_cells :
+                mode == inkling2_decode_mask::bounded_rows ? rel->cache[i]->get_n_kv()/mask_shapes().pool_share : 0;
         low_mean[i] = mode == inkling2_decode_mask::low_mean;
         rel_pos[i] = rel->pos[i] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, rel->cache[i]->get_n_kv(), rel->cells ? n_stream : n_tokens);
         ggml_set_input(rel_pos[i]);

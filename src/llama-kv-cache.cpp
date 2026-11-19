@@ -1492,7 +1492,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
             !layers.empty() && layers[0].k && layers[0].v && type_k() == GGML_TYPE_F16 && type_v() == GGML_TYPE_F16 &&
             ggml_env_switch("LLAMA_INKLING2_BUCKET_PREFILL_KV")) {
         // Reuse the long reader's graph within a bucket. The mask still comes from actual cell membership.
-        pad = 8192;
+        pad = (uint32_t) ggml_env_int("LLAMA_INKLING2_BUCKET_CELLS");
         result = padded(pad);
     }
 
