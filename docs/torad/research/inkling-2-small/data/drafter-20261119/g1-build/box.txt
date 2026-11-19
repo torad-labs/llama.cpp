@@ -1,0 +1,7 @@
+cores 224
+Mem:            1511          23        1484           0           9        1488
+overlay         1.5T  993M  1.5T   1% /
+g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+cmake version 3.28.3
+Build cuda_13.0.r13.0/compiler.36424714_0
+Python 3.12.3

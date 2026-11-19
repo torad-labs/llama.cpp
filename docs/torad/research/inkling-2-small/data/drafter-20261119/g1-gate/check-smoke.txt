@@ -1,0 +1,10 @@
+recording /workspace/rig/dspark/rec-pack/smoke: taps [5, 11, 17, 23, 29, 35, 41, 48], 73728 bytes a row, top 64, kept prefix 16674 and 17819
+files    ok    18 requests, 24002 rows read, 54 continuations (46 ended by the model, 8 by length), 6707 rows written by the model
+taps     ok    rms of each recorded layer over 768 rows: 5: 5.525, 11: 4.323, 17: 4.484, 23: 2.633, 29: 2.124, 35: 1.893, 41: 2.116, 48: 3.802
+teacher  ok    768 rows, output layer Q6_K, cap 30: the same first token on 100.0%, 99.4% of the top 64 shared, logits apart by 0.0147 on average and 0.0972 at most, logsumexp apart by 0.0021 on average; cut: 54 rows, 0.0204 apart, first token 100.0%; written: 714 rows, 0.0143 apart, first token 100.0%
+files    ok    18 requests, 24002 rows read, 0 continuations (0 ended by the model, 0 by length), 0 rows written by the model
+files    ok    18 requests, 24002 rows read, 0 continuations (0 ended by the model, 0 by length), 0 rows written by the model
+files    ok    54 requests, 67458 rows read, 0 continuations (0 ended by the model, 0 by length), 0 rows written by the model
+read     ok    rows the run read against one session reading alone: 0 of 41821 rows far (over 6.52), median 1.06e-01, 99% 8.52e-01, most 2.56e+00 over 41821 rows; farthest in mimo:session/api_integration/a7ca39cc#0; the shared prefix, 17819 rows: most 2.12e+00. Two one-session reads against each other, on the rows their batches split differently: median 6.09e-02, 99% 6.26e-01, most 1.63e+00 over 9922 rows
+written  ok    rows the model wrote against the same tokens read back as a prompt: 0 of 6707 rows far (over 6.52), median 4.93e-02, 99% 5.64e-01, most 1.18e+00 over 6707 rows; farthest in mimo:session/debugging/e9ed4380#0@18250. Two one-session reads against each other, on the rows their batches split differently: median 6.09e-02, 99% 6.26e-01, most 1.63e+00 over 9922 rows
+all checks passed

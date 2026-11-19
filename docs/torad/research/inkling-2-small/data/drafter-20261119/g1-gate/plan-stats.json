@@ -1,0 +1,405 @@
+{
+ "seed": 20261119,
+ "donor": "armand0e-fable:6ae0aeed-340e-4b4d-9d74-f905a74ca2fc#0",
+ "donor_tokens": 199967,
+ "k_tools": 16674,
+ "k_sys": 17819,
+ "saved_by_k_tools": 4868808,
+ "saved_by_k_sys": 33873919,
+ "requests": 2193,
+ "recordable": 2193,
+ "dropped": {},
+ "model_turns_against_sessions": {
+  "AlinCiocan/fable-5-claude-code-traces": {
+   "equal": 19
+  },
+  "armand0e/claude-fable-5-claude-code": {
+   "equal": 47
+  },
+  "choucsan/mimo-claude-code-traces-1k": {
+   "equal": 1017
+  },
+  "crispwisp/wisp-claude-code-sessions": {
+   "equal": 62
+  },
+  "liangzhidanta/claude-code-glm53-swesmith-trajectories": {
+   "equal": 1003
+  },
+  "trace-commons/agent-traces": {
+   "equal": 35
+  }
+ },
+ "truncated": 10,
+ "with_grammar": 2193,
+ "tokens_of_all": 62673911,
+ "rows_of_all": 23931184,
+ "costly": 349,
+ "plans": {
+  "heldout": {
+   "requests": 66,
+   "rows": 1178396,
+   "cuts": 845,
+   "generated_at_most": 235520,
+   "by_class": {
+    "glm": 318017,
+    "long": 704001,
+    "mimo": 156378
+   },
+   "by_shared_len": {
+    "16674": 9,
+    "17819": 57
+   },
+   "by_source": {
+    "armand0e/claude-fable-5-claude-code": 3,
+    "choucsan/mimo-claude-code-traces-1k": 23,
+    "crispwisp/wisp-claude-code-sessions": 7,
+    "liangzhidanta/claude-code-glm53-swesmith-trajectories": 30,
+    "trace-commons/agent-traces": 3
+   },
+   "by_g_max": {
+    "160": 636,
+    "640": 209
+   },
+   "model_turns": 1119,
+   "gb_at_eight_taps": 104.2
+  },
+  "a": {
+   "requests": 88,
+   "rows": 1622664,
+   "cuts": 511,
+   "generated_at_most": 141280,
+   "by_class": {
+    "glm": 453154,
+    "long": 938849,
+    "mimo": 230661
+   },
+   "by_shared_len": {
+    "16674": 12,
+    "17819": 76
+   },
+   "by_source": {
+    "AlinCiocan/fable-5-claude-code-traces": 2,
+    "armand0e/claude-fable-5-claude-code": 6,
+    "choucsan/mimo-claude-code-traces-1k": 34,
+    "crispwisp/wisp-claude-code-sessions": 1,
+    "liangzhidanta/claude-code-glm53-swesmith-trajectories": 41,
+    "trace-commons/agent-traces": 4
+   },
+   "by_g_max": {
+    "160": 387,
+    "640": 124
+   },
+   "model_turns": 1959,
+   "gb_at_eight_taps": 130.1
+  },
+  "b": {
+   "requests": 490,
+   "rows": 8396011,
+   "cuts": 2732,
+   "generated_at_most": 764960,
+   "by_class": {
+    "glm": 2555810,
+    "long": 4567238,
+    "mimo": 1272963
+   },
+   "by_shared_len": {
+    "16674": 86,
+    "17819": 404
+   },
+   "by_source": {
+    "AlinCiocan/fable-5-claude-code-traces": 11,
+    "armand0e/claude-fable-5-claude-code": 29,
+    "choucsan/mimo-claude-code-traces-1k": 190,
+    "crispwisp/wisp-claude-code-sessions": 7,
+    "liangzhidanta/claude-code-glm53-swesmith-trajectories": 232,
+    "trace-commons/agent-traces": 21
+   },
+   "by_g_max": {
+    "160": 2049,
+    "640": 683
+   },
+   "model_turns": 9340,
+   "gb_at_eight_taps": 675.4
+  },
+  "smoke": {
+   "requests": 18,
+   "rows": 24002,
+   "cuts": 54,
+   "generated_at_most": 20640,
+   "by_class": {
+    "long": 2443,
+    "mimo": 21559
+   },
+   "by_shared_len": {
+    "16674": 6,
+    "17819": 12
+   },
+   "by_source": {
+    "choucsan/mimo-claude-code-traces-1k": 15,
+    "crispwisp/wisp-claude-code-sessions": 3
+   },
+   "by_g_max": {
+    "160": 29,
+    "640": 25
+   },
+   "model_turns": 55,
+   "gb_at_eight_taps": 3.3
+  }
+ },
+ "lcp_most_common": [
+  [
+   17820,
+   1811
+  ],
+  [
+   16674,
+   292
+  ],
+  [
+   17822,
+   68
+  ],
+  [
+   17825,
+   13
+  ],
+  [
+   17824,
+   4
+  ],
+  [
+   17819,
+   3
+  ],
+  [
+   199967,
+   1
+  ],
+  [
+   18186,
+   1
+  ]
+ ],
+ "by_source": [
+  {
+   "split": "heldout",
+   "source": "AlinCiocan/fable-5-claude-code-traces",
+   "prefix": "cc25",
+   "requests": 1,
+   "tokens": 90460,
+   "rows": 73786,
+   "shared_len": {
+    "16674": 1
+   }
+  },
+  {
+   "split": "heldout",
+   "source": "armand0e/claude-fable-5-claude-code",
+   "prefix": "cc25",
+   "requests": 2,
+   "tokens": 135433,
+   "rows": 102085,
+   "shared_len": {
+    "16674": 2
+   }
+  },
+  {
+   "split": "heldout",
+   "source": "armand0e/claude-fable-5-claude-code",
+   "prefix": "cc25-system",
+   "requests": 2,
+   "tokens": 293728,
+   "rows": 258090,
+   "shared_len": {
+    "17819": 2
+   }
+  },
+  {
+   "split": "heldout",
+   "source": "choucsan/mimo-claude-code-traces-1k",
+   "prefix": "cc25",
+   "requests": 22,
+   "tokens": 549189,
+   "rows": 182361,
+   "shared_len": {
+    "16674": 22
+   }
+  },
+  {
+   "split": "heldout",
+   "source": "choucsan/mimo-claude-code-traces-1k",
+   "prefix": "cc25-system",
+   "requests": 56,
+   "tokens": 1253753,
+   "rows": 255889,
+   "shared_len": {
+    "17819": 56
+   }
+  },
+  {
+   "split": "heldout",
+   "source": "crispwisp/wisp-claude-code-sessions",
+   "prefix": "cc25",
+   "requests": 1,
+   "tokens": 65031,
+   "rows": 48357,
+   "shared_len": {
+    "16674": 1
+   }
+  },
+  {
+   "split": "heldout",
+   "source": "crispwisp/wisp-claude-code-sessions",
+   "prefix": "cc25-system",
+   "requests": 24,
+   "tokens": 496046,
+   "rows": 68390,
+   "shared_len": {
+    "17819": 24
+   }
+  },
+  {
+   "split": "heldout",
+   "source": "liangzhidanta/claude-code-glm53-swesmith-trajectories",
+   "prefix": "cc25-system",
+   "requests": 86,
+   "tokens": 2394970,
+   "rows": 862536,
+   "shared_len": {
+    "17819": 86
+   }
+  },
+  {
+   "split": "heldout",
+   "source": "trace-commons/agent-traces",
+   "prefix": "cc25",
+   "requests": 4,
+   "tokens": 446205,
+   "rows": 379509,
+   "shared_len": {
+    "16674": 4
+   }
+  },
+  {
+   "split": "train",
+   "source": "AlinCiocan/fable-5-claude-code-traces",
+   "prefix": "cc25",
+   "requests": 6,
+   "tokens": 357591,
+   "rows": 257547,
+   "shared_len": {
+    "16674": 6
+   }
+  },
+  {
+   "split": "train",
+   "source": "AlinCiocan/fable-5-claude-code-traces",
+   "prefix": "cc25-system",
+   "requests": 12,
+   "tokens": 610800,
+   "rows": 396972,
+   "shared_len": {
+    "17819": 12
+   }
+  },
+  {
+   "split": "train",
+   "source": "armand0e/claude-fable-5-claude-code",
+   "prefix": "cc25",
+   "requests": 31,
+   "tokens": 2987476,
+   "rows": 2470582,
+   "shared_len": {
+    "16674": 31
+   }
+  },
+  {
+   "split": "train",
+   "source": "armand0e/claude-fable-5-claude-code",
+   "prefix": "cc25-system",
+   "requests": 17,
+   "tokens": 813766,
+   "rows": 510843,
+   "shared_len": {
+    "17819": 17
+   }
+  },
+  {
+   "split": "train",
+   "source": "choucsan/mimo-claude-code-traces-1k",
+   "prefix": "cc25",
+   "requests": 190,
+   "tokens": 4733058,
+   "rows": 1564998,
+   "shared_len": {
+    "16674": 190
+   }
+  },
+  {
+   "split": "train",
+   "source": "choucsan/mimo-claude-code-traces-1k",
+   "prefix": "cc25-system",
+   "requests": 749,
+   "tokens": 16676619,
+   "rows": 3330188,
+   "shared_len": {
+    "17819": 749
+   }
+  },
+  {
+   "split": "train",
+   "source": "crispwisp/wisp-claude-code-sessions",
+   "prefix": "cc25",
+   "requests": 6,
+   "tokens": 802775,
+   "rows": 702731,
+   "shared_len": {
+    "16674": 6
+   }
+  },
+  {
+   "split": "train",
+   "source": "crispwisp/wisp-claude-code-sessions",
+   "prefix": "cc25-system",
+   "requests": 33,
+   "tokens": 691016,
+   "rows": 102989,
+   "shared_len": {
+    "17819": 33
+   }
+  },
+  {
+   "split": "train",
+   "source": "liangzhidanta/claude-code-glm53-swesmith-trajectories",
+   "prefix": "cc25-system",
+   "requests": 917,
+   "tokens": 25882060,
+   "rows": 9542037,
+   "shared_len": {
+    "17819": 917
+   }
+  },
+  {
+   "split": "train",
+   "source": "trace-commons/agent-traces",
+   "prefix": "cc25",
+   "requests": 29,
+   "tokens": 3247597,
+   "rows": 2764051,
+   "shared_len": {
+    "16674": 29
+   }
+  },
+  {
+   "split": "train",
+   "source": "trace-commons/agent-traces",
+   "prefix": "cc25-system",
+   "requests": 5,
+   "tokens": 146338,
+   "rows": 57243,
+   "shared_len": {
+    "17819": 5
+   }
+  }
+ ]
+}

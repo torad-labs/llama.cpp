@@ -1,0 +1,322 @@
+7.04.837.647 I slot print_timing: id  2 | task 4 |      acc per pos = (1.000, 0.789, 0.684)
+7.04.837.680 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =    3     36     63, #gen drafts =     65, #acc drafts =    57, #gen tokens =    195, #acc tokens =   154, #mean acc len = 3.44, #acc rate/pos = (0.905, 0.794, 0.746), dur(b,g,a) = 0.003, 1231.197, 0.020 ms
+7.07.644.747 I slot print_timing: id  9 | task 8 |      acc per pos = (0.923, 0.846, 0.769)
+7.07.644.766 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =    3     39     70, #gen drafts =     71, #acc drafts =    63, #gen tokens =    213, #acc tokens =   169, #mean acc len = 3.41, #acc rate/pos = (0.900, 0.786, 0.729), dur(b,g,a) = 0.003, 1334.323, 0.021 ms
+7.22.258.050 I slot print_timing: id 18 | task 19 |      acc per pos = (0.870, 0.759, 0.741)
+7.22.258.069 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =    5     54    106, #gen drafts =    106, #acc drafts =    87, #gen tokens =    318, #acc tokens =   230, #mean acc len = 3.17, #acc rate/pos = (0.821, 0.698, 0.651), dur(b,g,a) = 0.005, 1843.428, 0.024 ms
+7.44.334.191 I slot print_timing: id  5 | task 3 |      acc per pos = (0.759, 0.759, 0.724)
+7.44.334.213 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =    6     77    164, #gen drafts =    165, #acc drafts =   139, #gen tokens =    495, #acc tokens =   374, #mean acc len = 3.28, #acc rate/pos = (0.848, 0.750, 0.683), dur(b,g,a) = 0.006, 2645.324, 0.038 ms
+8.20.645.887 I slot print_timing: id  0 | task 0 |      acc per pos = (0.889, 0.847, 0.806)
+8.20.645.915 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   10    112    266, #gen drafts =    271, #acc drafts =   224, #gen tokens =    813, #acc tokens =   593, #mean acc len = 3.23, #acc rate/pos = (0.842, 0.733, 0.654), dur(b,g,a) = 0.011, 3885.397, 0.055 ms
+8.40.433.056 I slot print_timing: id  7 | task 5 |      acc per pos = (0.933, 0.933, 0.867)
+8.40.433.076 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   13    130    385, #gen drafts =    391, #acc drafts =   305, #gen tokens =   1173, #acc tokens =   794, #mean acc len = 3.06, #acc rate/pos = (0.792, 0.681, 0.590), dur(b,g,a) = 0.015, 4568.771, 0.069 ms
+8.56.380.852 I slot print_timing: id 17 | task 15 |      acc per pos = (0.897, 0.718, 0.513)
+8.56.380.871 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   13    145    495, #gen drafts =    496, #acc drafts =   391, #gen tokens =   1488, #acc tokens =   992, #mean acc len = 3.00, #acc rate/pos = (0.790, 0.655, 0.560), dur(b,g,a) = 0.015, 5121.380, 0.083 ms
+9.00.111.021 I slot print_timing: id  8 | task 9 |      acc per pos = (0.773, 0.545, 0.500)
+9.00.111.041 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   14    148    510, #gen drafts =    515, #acc drafts =   404, #gen tokens =   1545, #acc tokens =  1018, #mean acc len = 3.00, #acc rate/pos = (0.792, 0.651, 0.553), dur(b,g,a) = 0.016, 5229.418, 0.085 ms
+9.04.143.707 I slot print_timing: id 12 | task 11 |      acc per pos = (0.795, 0.648, 0.455)
+9.04.143.727 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   14    152    536, #gen drafts =    539, #acc drafts =   423, #gen tokens =   1617, #acc tokens =  1059, #mean acc len = 2.98, #acc rate/pos = (0.789, 0.642, 0.545), dur(b,g,a) = 0.016, 5367.862, 0.087 ms
+9.21.328.422 I slot print_timing: id 19 | task 20 |      acc per pos = (0.750, 0.574, 0.471)
+9.21.328.446 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   15    167    617, #gen drafts =    617, #acc drafts =   489, #gen tokens =   1851, #acc tokens =  1231, #mean acc len = 3.00, #acc rate/pos = (0.793, 0.653, 0.549), dur(b,g,a) = 0.017, 5890.660, 0.097 ms
+9.46.055.789 I slot print_timing: id  1 | task 2 |      acc per pos = (0.690, 0.517, 0.368)
+9.46.055.810 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   17    186    742, #gen drafts =    748, #acc drafts =   588, #gen tokens =   2244, #acc tokens =  1497, #mean acc len = 3.02, #acc rate/pos = (0.792, 0.660, 0.565), dur(b,g,a) = 0.019, 6603.893, 0.106 ms
+9.48.135.283 I slot print_timing: id 16 | task 16 |      acc per pos = (0.750, 0.625, 0.583)
+9.48.135.305 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   17    188    758, #gen drafts =    760, #acc drafts =   601, #gen tokens =   2280, #acc tokens =  1532, #mean acc len = 3.02, #acc rate/pos = (0.793, 0.664, 0.565), dur(b,g,a) = 0.019, 6677.736, 0.107 ms
+9.59.034.782 I slot print_timing: id 15 | task 14 |      acc per pos = (0.855, 0.776, 0.724)
+9.59.034.804 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   19    195    801, #gen drafts =    803, #acc drafts =   631, #gen tokens =   2409, #acc tokens =  1597, #mean acc len = 2.99, #acc rate/pos = (0.788, 0.655, 0.551), dur(b,g,a) = 0.021, 6942.961, 0.113 ms
+10.07.796.005 I slot print_timing: id 11 | task 10 |      acc per pos = (0.705, 0.547, 0.432)
+10.07.796.024 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   20    203    854, #gen drafts =    859, #acc drafts =   676, #gen tokens =   2577, #acc tokens =  1712, #mean acc len = 3.00, #acc rate/pos = (0.792, 0.659, 0.554), dur(b,g,a) = 0.023, 7246.353, 0.117 ms
+10.27.847.993 I slot print_timing: id 14 | task 13 |      acc per pos = (0.753, 0.616, 0.534)
+10.27.848.018 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   21    220    964, #gen drafts =    967, #acc drafts =   758, #gen tokens =   2901, #acc tokens =  1908, #mean acc len = 2.98, #acc rate/pos = (0.786, 0.649, 0.544), dur(b,g,a) = 0.024, 7887.385, 0.129 ms
+10.41.463.499 I slot print_timing: id 13 | task 17 |      acc per pos = (0.690, 0.524, 0.429)
+10.41.463.521 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   21    233   1042, #gen drafts =   1045, #acc drafts =   814, #gen tokens =   3135, #acc tokens =  2028, #mean acc len = 2.95, #acc rate/pos = (0.781, 0.637, 0.528), dur(b,g,a) = 0.024, 8362.916, 0.136 ms
+10.48.793.887 I slot print_timing: id  6 | task 6 |      acc per pos = (0.735, 0.592, 0.429)
+10.48.793.905 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   21    240   1077, #gen drafts =   1080, #acc drafts =   840, #gen tokens =   3240, #acc tokens =  2092, #mean acc len = 2.94, #acc rate/pos = (0.780, 0.637, 0.526), dur(b,g,a) = 0.024, 8619.371, 0.139 ms
+11.06.499.308 I slot print_timing: id 22 | task 23 |      acc per pos = (0.789, 0.611, 0.433)
+11.06.499.330 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   21    257   1148, #gen drafts =   1148, #acc drafts =   898, #gen tokens =   3444, #acc tokens =  2241, #mean acc len = 2.95, #acc rate/pos = (0.782, 0.641, 0.529), dur(b,g,a) = 0.024, 9230.903, 0.146 ms
+11.09.614.416 I slot print_timing: id 21 | task 22 |      acc per pos = (0.758, 0.593, 0.451)
+11.09.614.435 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   21    260   1157, #gen drafts =   1157, #acc drafts =   904, #gen tokens =   3471, #acc tokens =  2259, #mean acc len = 2.95, #acc rate/pos = (0.781, 0.641, 0.530), dur(b,g,a) = 0.024, 9336.385, 0.147 ms
+11.11.507.941 I slot print_timing: id  4 | task 7 |      acc per pos = (0.723, 0.553, 0.489)
+11.11.507.960 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   21    261   1158, #gen drafts =   1159, #acc drafts =   905, #gen tokens =   3477, #acc tokens =  2262, #mean acc len = 2.95, #acc rate/pos = (0.782, 0.642, 0.530), dur(b,g,a) = 0.024, 9370.493, 0.148 ms
+11.35.500.911 I slot print_timing: id 20 | task 21 |      acc per pos = (0.770, 0.621, 0.529)
+11.35.500.931 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   21    282   1180, #gen drafts =   1180, #acc drafts =   922, #gen tokens =   3540, #acc tokens =  2305, #mean acc len = 2.95, #acc rate/pos = (0.781, 0.641, 0.531), dur(b,g,a) = 0.024, 10094.698, 0.155 ms
+14.19.667.049 I slot print_timing: id 10 | task 12 |      acc per pos = (0.569, 0.325, 0.179)
+14.19.667.071 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   23    405   1319, #gen drafts =   1319, #acc drafts =  1006, #gen tokens =   3957, #acc tokens =  2475, #mean acc len = 2.88, #acc rate/pos = (0.763, 0.613, 0.500), dur(b,g,a) = 0.027, 14445.200, 0.187 ms
+14.20.211.980 I slot print_timing: id  3 | task 18 |      acc per pos = (0.905, 0.810, 0.667)
+14.20.211.999 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   23    410   1324, #gen drafts =   1324, #acc drafts =  1011, #gen tokens =   3972, #acc tokens =  2487, #mean acc len = 2.88, #acc rate/pos = (0.764, 0.614, 0.501), dur(b,g,a) = 0.027, 14624.070, 0.188 ms
+14.37.050.665 I slot print_timing: id  8 | task 669 |      acc per pos = (0.917, 0.917, 0.917)
+14.37.050.685 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    423   1587, #gen drafts =   1601, #acc drafts =  1197, #gen tokens =   4803, #acc tokens =  2921, #mean acc len = 2.84, #acc rate/pos = (0.754, 0.601, 0.485), dur(b,g,a) = 0.038, 15215.832, 0.209 ms
+14.37.704.804 I slot print_timing: id  7 | task 667 |      acc per pos = (1.000, 0.929, 0.929)
+14.37.704.823 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    425   1631, #gen drafts =   1645, #acc drafts =  1226, #gen tokens =   4935, #acc tokens =  2989, #mean acc len = 2.83, #acc rate/pos = (0.752, 0.598, 0.483), dur(b,g,a) = 0.038, 15309.870, 0.209 ms
+14.38.931.507 I slot print_timing: id  9 | task 666 |      acc per pos = (0.833, 0.722, 0.667)
+14.38.931.528 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    429   1716, #gen drafts =   1729, #acc drafts =  1287, #gen tokens =   5187, #acc tokens =  3129, #mean acc len = 2.82, #acc rate/pos = (0.750, 0.595, 0.478), dur(b,g,a) = 0.038, 15493.512, 0.212 ms
+14.44.186.672 I slot print_timing: id  3 | task 678 |      acc per pos = (0.778, 0.722, 0.611)
+14.44.186.690 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    447   2073, #gen drafts =   2089, #acc drafts =  1561, #gen tokens =   6267, #acc tokens =  3804, #mean acc len = 2.84, #acc rate/pos = (0.753, 0.597, 0.485), dur(b,g,a) = 0.038, 16323.374, 0.228 ms
+14.44.542.449 I slot print_timing: id 18 | task 680 |      acc per pos = (0.703, 0.676, 0.622)
+14.44.542.471 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    448   2104, #gen drafts =   2108, #acc drafts =  1586, #gen tokens =   6324, #acc tokens =  3872, #mean acc len = 2.84, #acc rate/pos = (0.754, 0.598, 0.488), dur(b,g,a) = 0.038, 16369.421, 0.229 ms
+14.45.888.780 I slot print_timing: id  4 | task 664 |      acc per pos = (0.714, 0.429, 0.310)
+14.45.888.800 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    453   2184, #gen drafts =   2198, #acc drafts =  1649, #gen tokens =   6594, #acc tokens =  4037, #mean acc len = 2.85, #acc rate/pos = (0.755, 0.603, 0.491), dur(b,g,a) = 0.038, 16594.193, 0.237 ms
+14.47.933.867 I slot print_timing: id  5 | task 665 |      acc per pos = (0.720, 0.580, 0.500)
+14.47.933.888 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    461   2321, #gen drafts =   2334, #acc drafts =  1751, #gen tokens =   7002, #acc tokens =  4287, #mean acc len = 2.85, #acc rate/pos = (0.754, 0.601, 0.491), dur(b,g,a) = 0.038, 16932.163, 0.245 ms
+14.48.529.956 I slot print_timing: id 16 | task 675 |      acc per pos = (0.769, 0.712, 0.558)
+14.48.529.978 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    463   2361, #gen drafts =   2366, #acc drafts =  1785, #gen tokens =   7098, #acc tokens =  4375, #mean acc len = 2.85, #acc rate/pos = (0.756, 0.604, 0.493), dur(b,g,a) = 0.038, 17021.483, 0.248 ms
+14.49.031.788 I slot print_timing: id  2 | task 663 |      acc per pos = (0.667, 0.537, 0.426)
+14.49.031.807 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    465   2384, #gen drafts =   2396, #acc drafts =  1805, #gen tokens =   7188, #acc tokens =  4424, #mean acc len = 2.86, #acc rate/pos = (0.757, 0.605, 0.494), dur(b,g,a) = 0.038, 17111.130, 0.249 ms
+14.49.045.073 I slot print_timing: id 11 | task 670 |      acc per pos = (0.833, 0.630, 0.407)
+14.49.045.080 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    465   2387, #gen drafts =   2396, #acc drafts =  1808, #gen tokens =   7188, #acc tokens =  4432, #mean acc len = 2.86, #acc rate/pos = (0.757, 0.605, 0.494), dur(b,g,a) = 0.038, 17111.130, 0.249 ms
+14.49.566.097 I slot print_timing: id 17 | task 676 |      acc per pos = (0.804, 0.536, 0.429)
+14.49.566.118 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    467   2418, #gen drafts =   2422, #acc drafts =  1836, #gen tokens =   7266, #acc tokens =  4506, #mean acc len = 2.86, #acc rate/pos = (0.759, 0.608, 0.496), dur(b,g,a) = 0.038, 17198.290, 0.250 ms
+14.52.399.156 I slot print_timing: id 15 | task 677 |      acc per pos = (0.914, 0.871, 0.857)
+14.52.399.177 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    481   2586, #gen drafts =   2590, #acc drafts =  1971, #gen tokens =   7770, #acc tokens =  4827, #mean acc len = 2.87, #acc rate/pos = (0.762, 0.608, 0.497), dur(b,g,a) = 0.038, 17788.197, 0.264 ms
+14.53.217.686 I slot print_timing: id 13 | task 672 |      acc per pos = (0.716, 0.527, 0.486)
+14.53.217.706 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    485   2629, #gen drafts =   2634, #acc drafts =  2001, #gen tokens =   7902, #acc tokens =  4897, #mean acc len = 2.86, #acc rate/pos = (0.761, 0.606, 0.496), dur(b,g,a) = 0.038, 17945.237, 0.265 ms
+14.53.651.250 I slot print_timing: id 21 | task 683 |      acc per pos = (0.750, 0.553, 0.395)
+14.53.651.277 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    487   2653, #gen drafts =   2654, #acc drafts =  2018, #gen tokens =   7962, #acc tokens =  4938, #mean acc len = 2.86, #acc rate/pos = (0.761, 0.606, 0.495), dur(b,g,a) = 0.038, 18028.597, 0.267 ms
+14.53.849.376 I slot print_timing: id 14 | task 673 |      acc per pos = (0.740, 0.532, 0.481)
+14.53.849.396 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    488   2660, #gen drafts =   2663, #acc drafts =  2023, #gen tokens =   7989, #acc tokens =  4951, #mean acc len = 2.86, #acc rate/pos = (0.761, 0.606, 0.495), dur(b,g,a) = 0.038, 18069.754, 0.267 ms
+14.54.527.653 I slot print_timing: id  6 | task 668 |      acc per pos = (0.728, 0.568, 0.481)
+14.54.527.673 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    492   2690, #gen drafts =   2695, #acc drafts =  2045, #gen tokens =   8085, #acc tokens =  5003, #mean acc len = 2.86, #acc rate/pos = (0.760, 0.605, 0.495), dur(b,g,a) = 0.038, 18232.635, 0.270 ms
+14.54.894.146 I slot print_timing: id 12 | task 671 |      acc per pos = (0.831, 0.675, 0.566)
+14.54.894.169 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    494   2706, #gen drafts =   2709, #acc drafts =  2059, #gen tokens =   8127, #acc tokens =  5037, #mean acc len = 2.86, #acc rate/pos = (0.761, 0.606, 0.495), dur(b,g,a) = 0.038, 18310.741, 0.271 ms
+14.55.552.963 I slot print_timing: id 20 | task 681 |      acc per pos = (0.816, 0.609, 0.506)
+14.55.552.983 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    498   2732, #gen drafts =   2733, #acc drafts =  2080, #gen tokens =   8199, #acc tokens =  5096, #mean acc len = 2.87, #acc rate/pos = (0.761, 0.607, 0.497), dur(b,g,a) = 0.038, 18466.261, 0.273 ms
+14.55.852.348 I slot print_timing: id  0 | task 660 |      acc per pos = (0.756, 0.622, 0.456)
+14.55.852.366 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    500   2739, #gen drafts =   2743, #acc drafts =  2086, #gen tokens =   8229, #acc tokens =  5111, #mean acc len = 2.87, #acc rate/pos = (0.762, 0.608, 0.497), dur(b,g,a) = 0.038, 18543.352, 0.273 ms
+14.55.855.228 I slot print_timing: id  1 | task 662 |      acc per pos = (0.753, 0.607, 0.506)
+14.55.855.233 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    500   2740, #gen drafts =   2743, #acc drafts =  2087, #gen tokens =   8229, #acc tokens =  5112, #mean acc len = 2.87, #acc rate/pos = (0.762, 0.607, 0.497), dur(b,g,a) = 0.038, 18543.352, 0.273 ms
+14.56.111.678 I slot print_timing: id 19 | task 679 |      acc per pos = (0.758, 0.582, 0.462)
+14.56.111.695 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    502   2748, #gen drafts =   2749, #acc drafts =  2092, #gen tokens =   8247, #acc tokens =  5121, #mean acc len = 2.86, #acc rate/pos = (0.761, 0.607, 0.496), dur(b,g,a) = 0.038, 18617.417, 0.273 ms
+14.56.116.877 I slot print_timing: id 22 | task 682 |      acc per pos = (0.736, 0.615, 0.451)
+14.56.116.881 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    502   2749, #gen drafts =   2749, #acc drafts =  2093, #gen tokens =   8247, #acc tokens =  5124, #mean acc len = 2.86, #acc rate/pos = (0.761, 0.607, 0.496), dur(b,g,a) = 0.038, 18617.417, 0.273 ms
+14.58.262.094 I slot print_timing: id 10 | task 674 |      acc per pos = (0.625, 0.402, 0.250)
+14.58.262.115 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   46    523   2770, #gen drafts =   2770, #acc drafts =  2108, #gen tokens =   8309, #acc tokens =  5158, #mean acc len = 2.86, #acc rate/pos = (0.761, 0.606, 0.495), dur(b,g,a) = 0.038, 19333.394, 0.276 ms
+15.12.693.528 I slot print_timing: id  7 | task 806 |      acc per pos = (1.000, 0.929, 0.929)
+15.12.693.560 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   62    538   2987, #gen drafts =   2995, #acc drafts =  2261, #gen tokens =   8984, #acc tokens =  5528, #mean acc len = 2.85, #acc rate/pos = (0.757, 0.603, 0.491), dur(b,g,a) = 0.044, 19981.244, 0.285 ms
+15.12.703.434 I slot print_timing: id  9 | task 805 |      acc per pos = (1.000, 1.000, 0.857)
+15.12.703.443 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   62    538   2989, #gen drafts =   2995, #acc drafts =  2263, #gen tokens =   8984, #acc tokens =  5534, #mean acc len = 2.85, #acc rate/pos = (0.757, 0.603, 0.491), dur(b,g,a) = 0.044, 19981.244, 0.285 ms
+15.15.074.654 I slot print_timing: id  8 | task 804 |      acc per pos = (0.722, 0.667, 0.556)
+15.15.074.673 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   64    542   3049, #gen drafts =   3057, #acc drafts =  2304, #gen tokens =   9170, #acc tokens =  5626, #mean acc len = 2.85, #acc rate/pos = (0.756, 0.601, 0.489), dur(b,g,a) = 0.046, 20155.150, 0.288 ms
+15.21.984.026 I slot print_timing: id 13 | task 811 |      acc per pos = (0.750, 0.568, 0.477)
+15.21.984.048 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   65    568   3467, #gen drafts =   3472, #acc drafts =  2614, #gen tokens =  10415, #acc tokens =  6338, #mean acc len = 2.83, #acc rate/pos = (0.754, 0.592, 0.482), dur(b,g,a) = 0.047, 21295.718, 0.309 ms
+15.24.845.259 I slot print_timing: id 14 | task 810 |      acc per pos = (0.769, 0.673, 0.519)
+15.24.845.283 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   66    576   3594, #gen drafts =   3599, #acc drafts =  2712, #gen tokens =  10796, #acc tokens =  6582, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.594, 0.483), dur(b,g,a) = 0.048, 21652.622, 0.315 ms
+15.27.906.920 I slot print_timing: id 18 | task 835 |      acc per pos = (0.854, 0.707, 0.634)
+15.27.906.942 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   67    584   3724, #gen drafts =   3726, #acc drafts =  2820, #gen tokens =  11177, #acc tokens =  6860, #mean acc len = 2.84, #acc rate/pos = (0.757, 0.598, 0.487), dur(b,g,a) = 0.049, 22002.443, 0.321 ms
+15.29.340.864 I slot print_timing: id 16 | task 829 |      acc per pos = (0.745, 0.489, 0.362)
+15.29.340.886 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   67    586   3753, #gen drafts =   3756, #acc drafts =  2842, #gen tokens =  11267, #acc tokens =  6918, #mean acc len = 2.84, #acc rate/pos = (0.757, 0.598, 0.488), dur(b,g,a) = 0.049, 22092.177, 0.323 ms
+15.31.156.561 I slot print_timing: id 11 | task 808 |      acc per pos = (0.831, 0.646, 0.523)
+15.31.156.582 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    589   3796, #gen drafts =   3803, #acc drafts =  2876, #gen tokens =  11408, #acc tokens =  6999, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.598, 0.488), dur(b,g,a) = 0.052, 22226.590, 0.325 ms
+15.31.683.119 I slot print_timing: id  2 | task 800 |      acc per pos = (0.701, 0.537, 0.478)
+15.31.683.137 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    591   3821, #gen drafts =   3833, #acc drafts =  2895, #gen tokens =  11498, #acc tokens =  7045, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.598, 0.488), dur(b,g,a) = 0.052, 22318.668, 0.327 ms
+15.32.444.240 I slot print_timing: id  5 | task 802 |      acc per pos = (0.800, 0.671, 0.614)
+15.32.444.259 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    594   3866, #gen drafts =   3875, #acc drafts =  2931, #gen tokens =  11624, #acc tokens =  7132, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.599, 0.488), dur(b,g,a) = 0.052, 22452.491, 0.331 ms
+15.33.161.028 I slot print_timing: id  1 | task 799 |      acc per pos = (0.740, 0.616, 0.548)
+15.33.161.047 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    597   3903, #gen drafts =   3914, #acc drafts =  2960, #gen tokens =  11741, #acc tokens =  7205, #mean acc len = 2.85, #acc rate/pos = (0.758, 0.599, 0.489), dur(b,g,a) = 0.052, 22581.396, 0.333 ms
+15.33.658.234 I slot print_timing: id 15 | task 809 |      acc per pos = (0.853, 0.827, 0.720)
+15.33.658.253 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    599   3933, #gen drafts =   3938, #acc drafts =  2984, #gen tokens =  11813, #acc tokens =  7259, #mean acc len = 2.85, #acc rate/pos = (0.759, 0.599, 0.488), dur(b,g,a) = 0.052, 22667.230, 0.333 ms
+15.35.678.806 I slot print_timing: id 17 | task 830 |      acc per pos = (0.771, 0.529, 0.443)
+15.35.678.826 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    609   4044, #gen drafts =   4048, #acc drafts =  3065, #gen tokens =  12143, #acc tokens =  7448, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.596, 0.487), dur(b,g,a) = 0.052, 23088.622, 0.341 ms
+15.36.090.405 I slot print_timing: id  0 | task 797 |      acc per pos = (0.750, 0.636, 0.511)
+15.36.090.424 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    611   4059, #gen drafts =   4068, #acc drafts =  3078, #gen tokens =  12203, #acc tokens =  7480, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.597, 0.488), dur(b,g,a) = 0.052, 23149.216, 0.342 ms
+15.36.101.466 I slot print_timing: id 12 | task 807 |      acc per pos = (0.816, 0.609, 0.506)
+15.36.101.475 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    611   4064, #gen drafts =   4068, #acc drafts =  3081, #gen tokens =  12203, #acc tokens =  7484, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.596, 0.487), dur(b,g,a) = 0.052, 23149.216, 0.342 ms
+15.37.165.165 I slot print_timing: id  6 | task 803 |      acc per pos = (0.774, 0.516, 0.452)
+15.37.165.183 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    617   4111, #gen drafts =   4116, #acc drafts =  3116, #gen tokens =  12347, #acc tokens =  7572, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.596, 0.487), dur(b,g,a) = 0.052, 23384.348, 0.345 ms
+15.37.984.149 I slot print_timing: id 19 | task 862 |      acc per pos = (0.868, 0.755, 0.698)
+15.37.984.167 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    622   4148, #gen drafts =   4151, #acc drafts =  3143, #gen tokens =  12452, #acc tokens =  7625, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.595, 0.486), dur(b,g,a) = 0.052, 23581.015, 0.346 ms
+15.38.901.201 I slot print_timing: id  4 | task 801 |      acc per pos = (0.712, 0.433, 0.308)
+15.38.901.220 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    628   4183, #gen drafts =   4187, #acc drafts =  3172, #gen tokens =  12560, #acc tokens =  7691, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.595, 0.485), dur(b,g,a) = 0.052, 23817.326, 0.347 ms
+15.40.857.800 I slot print_timing: id 21 | task 881 |      acc per pos = (0.750, 0.589, 0.411)
+15.40.857.818 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    642   4256, #gen drafts =   4257, #acc drafts =  3230, #gen tokens =  12770, #acc tokens =  7828, #mean acc len = 2.84, #acc rate/pos = (0.759, 0.596, 0.485), dur(b,g,a) = 0.052, 24357.139, 0.355 ms
+15.41.151.413 I slot print_timing: id  3 | task 813 |      acc per pos = (0.600, 0.358, 0.167)
+15.41.151.433 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    644   4262, #gen drafts =   4265, #acc drafts =  3234, #gen tokens =  12794, #acc tokens =  7837, #mean acc len = 2.84, #acc rate/pos = (0.759, 0.595, 0.485), dur(b,g,a) = 0.052, 24433.791, 0.356 ms
+15.41.285.698 I slot print_timing: id 10 | task 812 |      acc per pos = (0.587, 0.322, 0.198)
+15.41.285.717 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    645   4266, #gen drafts =   4268, #acc drafts =  3236, #gen tokens =  12803, #acc tokens =  7842, #mean acc len = 2.84, #acc rate/pos = (0.759, 0.595, 0.484), dur(b,g,a) = 0.052, 24471.024, 0.356 ms
+15.43.371.028 I slot print_timing: id 20 | task 871 |      acc per pos = (0.802, 0.640, 0.523)
+15.43.371.047 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    663   4303, #gen drafts =   4304, #acc drafts =  3267, #gen tokens =  12911, #acc tokens =  7919, #mean acc len = 2.84, #acc rate/pos = (0.759, 0.596, 0.485), dur(b,g,a) = 0.052, 25105.971, 0.361 ms
+15.44.066.639 I slot print_timing: id 22 | task 883 |      acc per pos = (0.829, 0.720, 0.561)
+15.44.066.658 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   69    669   4310, #gen drafts =   4310, #acc drafts =  3272, #gen tokens =  12928, #acc tokens =  7931, #mean acc len = 2.84, #acc rate/pos = (0.759, 0.597, 0.484), dur(b,g,a) = 0.052, 25316.465, 0.362 ms
+15.54.046.112 I slot print_timing: id  7 | task 972 |      acc per pos = (0.850, 0.750, 0.750)
+15.54.046.134 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   77    690   4471, #gen drafts =   4471, #acc drafts =  3392, #gen tokens =  13411, #acc tokens =  8222, #mean acc len = 2.84, #acc rate/pos = (0.759, 0.596, 0.484), dur(b,g,a) = 0.056, 26149.575, 0.372 ms
+15.54.224.582 I slot print_timing: id  5 | task 971 |      acc per pos = (0.952, 0.905, 0.857)
+15.54.224.603 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   77    691   4477, #gen drafts =   4478, #acc drafts =  3396, #gen tokens =  13432, #acc tokens =  8231, #mean acc len = 2.84, #acc rate/pos = (0.759, 0.596, 0.484), dur(b,g,a) = 0.056, 26189.468, 0.372 ms
+15.56.405.011 I slot print_timing: id  6 | task 973 |      acc per pos = (0.828, 0.690, 0.621)
+15.56.405.040 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   79    699   4538, #gen drafts =   4540, #acc drafts =  3443, #gen tokens =  13618, #acc tokens =  8343, #mean acc len = 2.84, #acc rate/pos = (0.759, 0.596, 0.484), dur(b,g,a) = 0.057, 26509.255, 0.380 ms
+15.59.142.400 I slot print_timing: id  9 | task 999 |      acc per pos = (1.000, 1.000, 0.867)
+15.59.142.421 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   80    707   4601, #gen drafts =   4602, #acc drafts =  3491, #gen tokens =  13804, #acc tokens =  8455, #mean acc len = 2.84, #acc rate/pos = (0.759, 0.596, 0.483), dur(b,g,a) = 0.058, 26830.531, 0.383 ms
+16.00.836.201 I slot print_timing: id  8 | task 998 |      acc per pos = (0.900, 0.800, 0.750)
+16.00.836.221 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   81    712   4638, #gen drafts =   4640, #acc drafts =  3516, #gen tokens =  13918, #acc tokens =  8516, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.595, 0.483), dur(b,g,a) = 0.059, 27033.308, 0.385 ms
+16.03.456.757 I slot print_timing: id  4 | task 974 |      acc per pos = (0.788, 0.558, 0.385)
+16.03.456.776 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   82    722   4716, #gen drafts =   4719, #acc drafts =  3574, #gen tokens =  14155, #acc tokens =  8653, #mean acc len = 2.83, #acc rate/pos = (0.758, 0.594, 0.483), dur(b,g,a) = 0.060, 27437.054, 0.392 ms
+16.05.603.734 I slot print_timing: id  2 | task 970 |      acc per pos = (0.847, 0.712, 0.559)
+16.05.603.755 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   83    729   4769, #gen drafts =   4774, #acc drafts =  3617, #gen tokens =  14320, #acc tokens =  8754, #mean acc len = 2.84, #acc rate/pos = (0.758, 0.594, 0.483), dur(b,g,a) = 0.061, 27715.083, 0.395 ms
+16.07.931.655 I slot print_timing: id  1 | task 969 |      acc per pos = (0.794, 0.603, 0.485)
+16.07.931.673 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   84    738   4839, #gen drafts =   4845, #acc drafts =  3666, #gen tokens =  14533, #acc tokens =  8876, #mean acc len = 2.83, #acc rate/pos = (0.758, 0.594, 0.483), dur(b,g,a) = 0.062, 28074.779, 0.404 ms
+16.12.719.620 I slot print_timing: id 11 | task 1018 |      acc per pos = (0.849, 0.623, 0.491)
+16.12.719.639 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   85    762   5032, #gen drafts =   5036, #acc drafts =  3804, #gen tokens =  15106, #acc tokens =  9223, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.594, 0.483), dur(b,g,a) = 0.064, 29002.992, 0.415 ms
+16.13.911.749 I slot print_timing: id  0 | task 967 |      acc per pos = (0.695, 0.568, 0.421)
+16.13.911.768 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   86    764   5044, #gen drafts =   5051, #acc drafts =  3813, #gen tokens =  15151, #acc tokens =  9250, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.594, 0.484), dur(b,g,a) = 0.065, 29084.129, 0.415 ms
+16.16.087.584 I slot print_timing: id 13 | task 1034 |      acc per pos = (0.714, 0.571, 0.510)
+16.16.087.602 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   87    772   5110, #gen drafts =   5114, #acc drafts =  3862, #gen tokens =  15340, #acc tokens =  9362, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.593, 0.483), dur(b,g,a) = 0.066, 29401.238, 0.421 ms
+16.19.397.100 I slot print_timing: id 14 | task 1042 |      acc per pos = (0.741, 0.552, 0.448)
+16.19.397.121 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   88    788   5237, #gen drafts =   5241, #acc drafts =  3948, #gen tokens =  15721, #acc tokens =  9565, #mean acc len = 2.83, #acc rate/pos = (0.754, 0.591, 0.481), dur(b,g,a) = 0.067, 30035.819, 0.429 ms
+16.22.149.437 I slot print_timing: id 12 | task 1023 |      acc per pos = (0.782, 0.609, 0.540)
+16.22.149.455 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   89    800   5331, #gen drafts =   5336, #acc drafts =  4016, #gen tokens =  16006, #acc tokens =  9731, #mean acc len = 2.83, #acc rate/pos = (0.753, 0.591, 0.481), dur(b,g,a) = 0.068, 30501.754, 0.440 ms
+16.23.576.825 I slot print_timing: id 16 | task 1077 |      acc per pos = (0.667, 0.487, 0.385)
+16.23.576.844 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   90    802   5347, #gen drafts =   5351, #acc drafts =  4026, #gen tokens =  16051, #acc tokens =  9754, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.591, 0.480), dur(b,g,a) = 0.070, 30582.154, 0.443 ms
+16.24.993.128 I slot print_timing: id  3 | task 975 |      acc per pos = (0.463, 0.261, 0.179)
+16.24.993.147 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   91    804   5359, #gen drafts =   5366, #acc drafts =  4035, #gen tokens =  16096, #acc tokens =  9775, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.591, 0.480), dur(b,g,a) = 0.071, 30662.329, 0.444 ms
+16.26.726.147 I slot print_timing: id 10 | task 1009 |      acc per pos = (0.617, 0.430, 0.336)
+16.26.726.165 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   92    808   5390, #gen drafts =   5397, #acc drafts =  4056, #gen tokens =  16189, #acc tokens =  9826, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.591, 0.480), dur(b,g,a) = 0.072, 30822.357, 0.445 ms
+16.27.597.414 I slot print_timing: id 17 | task 1080 |      acc per pos = (0.837, 0.592, 0.408)
+16.27.597.432 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   92    814   5434, #gen drafts =   5439, #acc drafts =  4091, #gen tokens =  16315, #acc tokens =  9909, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.591, 0.480), dur(b,g,a) = 0.072, 31055.144, 0.449 ms
+16.27.755.508 I slot print_timing: id 15 | task 1052 |      acc per pos = (0.842, 0.776, 0.737)
+16.27.755.528 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   92    815   5440, #gen drafts =   5445, #acc drafts =  4094, #gen tokens =  16333, #acc tokens =  9918, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.591, 0.480), dur(b,g,a) = 0.072, 31094.234, 0.450 ms
+16.30.298.806 I slot print_timing: id 18 | task 1089 |      acc per pos = (0.750, 0.672, 0.531)
+16.30.298.825 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   92    837   5551, #gen drafts =   5555, #acc drafts =  4177, #gen tokens =  16663, #acc tokens = 10110, #mean acc len = 2.82, #acc rate/pos = (0.752, 0.590, 0.479), dur(b,g,a) = 0.072, 31917.115, 0.459 ms
+16.32.912.137 I slot print_timing: id 19 | task 1106 |      acc per pos = (0.792, 0.667, 0.542)
+16.32.912.156 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   92    861   5648, #gen drafts =   5651, #acc drafts =  4255, #gen tokens =  16951, #acc tokens = 10307, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.591, 0.481), dur(b,g,a) = 0.072, 32775.701, 0.465 ms
+16.33.470.846 I slot print_timing: id 20 | task 1119 |      acc per pos = (0.785, 0.600, 0.431)
+16.33.470.866 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   92    866   5664, #gen drafts =   5666, #acc drafts =  4269, #gen tokens =  16996, #acc tokens = 10339, #mean acc len = 2.83, #acc rate/pos = (0.754, 0.591, 0.481), dur(b,g,a) = 0.072, 32961.080, 0.468 ms
+16.36.416.703 I slot print_timing: id 21 | task 1122 |      acc per pos = (0.722, 0.578, 0.433)
+16.36.416.721 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   92    893   5719, #gen drafts =   5720, #acc drafts =  4313, #gen tokens =  17158, #acc tokens = 10437, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.072, 33921.085, 0.475 ms
+16.37.361.211 I slot print_timing: id 22 | task 1125 |      acc per pos = (0.750, 0.490, 0.417)
+16.37.361.231 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   92    901   5728, #gen drafts =   5728, #acc drafts =  4320, #gen tokens =  17180, #acc tokens = 10453, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.072, 34198.854, 0.476 ms
+16.44.984.612 I slot print_timing: id  3 | task 1227 |      acc per pos = (0.839, 0.710, 0.710)
+16.44.984.633 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   96    933   5853, #gen drafts =   5853, #acc drafts =  4419, #gen tokens =  17555, #acc tokens = 10701, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.592, 0.481), dur(b,g,a) = 0.074, 35369.504, 0.483 ms
+16.46.520.515 I slot print_timing: id  1 | task 1225 |      acc per pos = (0.943, 0.800, 0.686)
+16.46.520.535 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   97    937   5865, #gen drafts =   5867, #acc drafts =  4427, #gen tokens =  17597, #acc tokens = 10720, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.592, 0.481), dur(b,g,a) = 0.075, 35516.018, 0.483 ms
+16.48.559.399 I slot print_timing: id  5 | task 1266 |      acc per pos = (0.800, 0.600, 0.600)
+16.48.559.418 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   98    949   5913, #gen drafts =   5913, #acc drafts =  4463, #gen tokens =  17735, #acc tokens = 10807, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.592, 0.481), dur(b,g,a) = 0.077, 35952.925, 0.487 ms
+16.51.043.349 I slot print_timing: id  2 | task 1226 |      acc per pos = (0.780, 0.559, 0.441)
+16.51.043.367 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =   99    961   5957, #gen drafts =   5959, #acc drafts =  4492, #gen tokens =  17873, #acc tokens = 10871, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.078, 36387.141, 0.494 ms
+16.52.675.571 I slot print_timing: id  6 | task 1279 |      acc per pos = (0.842, 0.737, 0.632)
+16.52.675.590 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  100    970   5993, #gen drafts =   5994, #acc drafts =  4516, #gen tokens =  17978, #acc tokens = 10932, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.079, 36699.553, 0.501 ms
+16.54.672.049 I slot print_timing: id  8 | task 1302 |      acc per pos = (1.000, 1.000, 0.909)
+16.54.672.070 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  101    983   6044, #gen drafts =   6044, #acc drafts =  4559, #gen tokens =  18128, #acc tokens = 11030, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.080, 37172.607, 0.509 ms
+16.56.865.196 I slot print_timing: id  0 | task 1223 |      acc per pos = (0.680, 0.536, 0.412)
+16.56.865.216 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  102    998   6099, #gen drafts =   6102, #acc drafts =  4598, #gen tokens =  18302, #acc tokens = 11123, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.590, 0.479), dur(b,g,a) = 0.081, 37718.670, 0.516 ms
+16.58.624.542 I slot print_timing: id  7 | task 1291 |      acc per pos = (0.846, 0.667, 0.590)
+16.58.624.560 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  103   1001   6110, #gen drafts =   6112, #acc drafts =  4607, #gen tokens =  18332, #acc tokens = 11146, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.082, 37831.942, 0.518 ms
+17.00.820.285 I slot print_timing: id  9 | task 1316 |      acc per pos = (0.815, 0.704, 0.593)
+17.00.820.305 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  104   1012   6153, #gen drafts =   6155, #acc drafts =  4642, #gen tokens =  18461, #acc tokens = 11233, #mean acc len = 2.83, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.083, 38235.178, 0.521 ms
+17.03.922.452 I slot print_timing: id  4 | task 1261 |      acc per pos = (0.608, 0.412, 0.268)
+17.03.922.471 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  105   1032   6231, #gen drafts =   6234, #acc drafts =  4699, #gen tokens =  18698, #acc tokens = 11365, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.590, 0.479), dur(b,g,a) = 0.084, 38962.506, 0.530 ms
+17.06.615.932 I slot print_timing: id 11 | task 1335 |      acc per pos = (0.800, 0.667, 0.578)
+17.06.615.951 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  106   1047   6290, #gen drafts =   6292, #acc drafts =  4747, #gen tokens =  18872, #acc tokens = 11481, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.591, 0.479), dur(b,g,a) = 0.085, 39507.515, 0.536 ms
+17.11.480.960 I slot print_timing: id 13 | task 1369 |      acc per pos = (0.800, 0.580, 0.520)
+17.11.480.980 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  107   1084   6438, #gen drafts =   6439, #acc drafts =  4854, #gen tokens =  19313, #acc tokens = 11740, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.479), dur(b,g,a) = 0.087, 40852.874, 0.555 ms
+17.13.739.878 I slot print_timing: id 12 | task 1347 |      acc per pos = (0.829, 0.707, 0.573)
+17.13.739.896 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  108   1095   6479, #gen drafts =   6481, #acc drafts =  4885, #gen tokens =  19439, #acc tokens = 11820, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.088, 41259.805, 0.561 ms
+17.15.569.548 I slot print_timing: id 14 | task 1384 |      acc per pos = (0.709, 0.473, 0.345)
+17.15.569.568 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  109   1103   6510, #gen drafts =   6512, #acc drafts =  4905, #gen tokens =  19532, #acc tokens = 11870, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.591, 0.479), dur(b,g,a) = 0.090, 41549.936, 0.568 ms
+17.16.706.872 I slot print_timing: id 10 | task 1332 |      acc per pos = (0.638, 0.476, 0.314)
+17.16.706.892 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  110   1105   6516, #gen drafts =   6519, #acc drafts =  4909, #gen tokens =  19553, #acc tokens = 11879, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.591, 0.479), dur(b,g,a) = 0.092, 41622.534, 0.568 ms
+17.21.097.288 I slot print_timing: id 18 | task 1447 |      acc per pos = (0.812, 0.750, 0.719)
+17.21.097.307 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  111   1139   6653, #gen drafts =   6653, #acc drafts =  5019, #gen tokens =  19955, #acc tokens = 12157, #mean acc len = 2.83, #acc rate/pos = (0.754, 0.592, 0.481), dur(b,g,a) = 0.093, 42815.766, 0.579 ms
+17.23.648.622 I slot print_timing: id 15 | task 1423 |      acc per pos = (0.915, 0.859, 0.817)
+17.23.648.641 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  112   1157   6720, #gen drafts =   6723, #acc drafts =  5072, #gen tokens =  20165, #acc tokens = 12289, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.592, 0.482), dur(b,g,a) = 0.095, 43213.563, 0.586 ms
+17.24.724.416 I slot print_timing: id 17 | task 1443 |      acc per pos = (0.796, 0.593, 0.500)
+17.24.724.435 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  112   1158   6725, #gen drafts =   6726, #acc drafts =  5076, #gen tokens =  20174, #acc tokens = 12300, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.593, 0.482), dur(b,g,a) = 0.095, 43249.753, 0.587 ms
+17.29.496.900 I slot print_timing: id 16 | task 1434 |      acc per pos = (0.726, 0.547, 0.411)
+17.29.496.918 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  114   1191   6854, #gen drafts =   6857, #acc drafts =  5173, #gen tokens =  20567, #acc tokens = 12521, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.592, 0.480), dur(b,g,a) = 0.097, 44402.411, 0.604 ms
+17.35.760.471 I slot print_timing: id 19 | task 1482 |      acc per pos = (0.670, 0.510, 0.370)
+17.35.760.490 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  115   1241   7052, #gen drafts =   7055, #acc drafts =  5330, #gen tokens =  21161, #acc tokens = 12883, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.591, 0.480), dur(b,g,a) = 0.098, 46056.908, 0.621 ms
+17.36.003.182 I slot print_timing: id 21 | task 1502 |      acc per pos = (0.810, 0.571, 0.369)
+17.36.003.201 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  115   1243   7060, #gen drafts =   7061, #acc drafts =  5338, #gen tokens =  21179, #acc tokens = 12902, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.592, 0.480), dur(b,g,a) = 0.098, 46130.857, 0.621 ms
+17.36.272.253 I slot print_timing: id 20 | task 1500 |      acc per pos = (0.805, 0.609, 0.517)
+17.36.272.272 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  115   1245   7064, #gen drafts =   7065, #acc drafts =  5342, #gen tokens =  21191, #acc tokens = 12910, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.592, 0.479), dur(b,g,a) = 0.098, 46184.770, 0.621 ms
+17.39.024.027 I slot print_timing: id 22 | task 1537 |      acc per pos = (0.877, 0.704, 0.568)
+17.39.024.046 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  115   1274   7094, #gen drafts =   7094, #acc drafts =  5369, #gen tokens =  21277, #acc tokens = 12986, #mean acc len = 2.83, #acc rate/pos = (0.757, 0.593, 0.481), dur(b,g,a) = 0.098, 47019.548, 0.624 ms
+17.47.150.175 I slot print_timing: id  1 | task 1622 |      acc per pos = (0.741, 0.586, 0.500)
+17.47.150.195 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  117   1333   7211, #gen drafts =   7211, #acc drafts =  5454, #gen tokens =  21628, #acc tokens = 13197, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.593, 0.481), dur(b,g,a) = 0.101, 48650.149, 0.637 ms
+17.51.770.944 I slot print_timing: id  0 | task 1620 |      acc per pos = (0.720, 0.548, 0.473)
+17.51.770.962 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  118   1367   7276, #gen drafts =   7277, #acc drafts =  5499, #gen tokens =  21826, #acc tokens = 13301, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.592, 0.480), dur(b,g,a) = 0.102, 49844.184, 0.640 ms
+17.54.647.799 I slot print_timing: id  2 | task 1683 |      acc per pos = (0.756, 0.578, 0.533)
+17.54.647.819 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  119   1380   7300, #gen drafts =   7301, #acc drafts =  5519, #gen tokens =  21898, #acc tokens = 13356, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.592, 0.481), dur(b,g,a) = 0.103, 50263.770, 0.648 ms
+17.58.465.399 I slot print_timing: id  3 | task 1718 |      acc per pos = (0.750, 0.667, 0.583)
+17.58.465.419 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  120   1405   7348, #gen drafts =   7349, #acc drafts =  5545, #gen tokens =  22042, #acc tokens = 13418, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.591, 0.480), dur(b,g,a) = 0.104, 51146.692, 0.653 ms
+18.04.276.218 I slot print_timing: id  5 | task 1758 |      acc per pos = (0.778, 0.733, 0.622)
+18.04.276.236 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  121   1452   7441, #gen drafts =   7441, #acc drafts =  5605, #gen tokens =  22318, #acc tokens = 13558, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.590, 0.479), dur(b,g,a) = 0.106, 52798.945, 0.664 ms
+18.07.516.325 I slot print_timing: id  4 | task 1732 |      acc per pos = (0.545, 0.341, 0.284)
+18.07.516.344 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  122   1470   7474, #gen drafts =   7475, #acc drafts =  5634, #gen tokens =  22420, #acc tokens = 13635, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.108, 53428.330, 0.666 ms
+18.09.983.910 I slot print_timing: id  7 | task 1825 |      acc per pos = (1.000, 0.929, 0.929)
+18.09.983.927 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  123   1486   7505, #gen drafts =   7505, #acc drafts =  5665, #gen tokens =  22510, #acc tokens = 13722, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.592, 0.482), dur(b,g,a) = 0.110, 53962.831, 0.671 ms
+18.12.302.661 I slot print_timing: id  6 | task 1806 |      acc per pos = (0.851, 0.766, 0.617)
+18.12.302.678 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  124   1501   7532, #gen drafts =   7533, #acc drafts =  5689, #gen tokens =  22594, #acc tokens = 13788, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.593, 0.482), dur(b,g,a) = 0.112, 54488.749, 0.675 ms
+18.13.257.462 I slot print_timing: id  8 | task 1842 |      acc per pos = (0.875, 0.750, 0.750)
+18.13.257.482 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  125   1504   7536, #gen drafts =   7537, #acc drafts =  5691, #gen tokens =  22606, #acc tokens = 13792, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.593, 0.482), dur(b,g,a) = 0.113, 54594.402, 0.676 ms
+18.15.890.512 I slot print_timing: id  9 | task 1858 |      acc per pos = (1.000, 0.917, 0.833)
+18.15.890.530 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  126   1515   7556, #gen drafts =   7557, #acc drafts =  5708, #gen tokens =  22666, #acc tokens = 13833, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.593, 0.483), dur(b,g,a) = 0.115, 54984.037, 0.678 ms
+18.24.219.743 I slot print_timing: id 11 | task 1874 |      acc per pos = (0.746, 0.642, 0.493)
+18.24.219.762 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  127   1584   7693, #gen drafts =   7693, #acc drafts =  5792, #gen tokens =  23074, #acc tokens = 14022, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.591, 0.479), dur(b,g,a) = 0.117, 57403.717, 0.697 ms
+18.31.242.448 I slot print_timing: id 10 | task 1862 |      acc per pos = (0.515, 0.303, 0.114)
+18.31.242.467 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  128   1638   7798, #gen drafts =   7799, #acc drafts =  5862, #gen tokens =  23392, #acc tokens = 14178, #mean acc len = 2.82, #acc rate/pos = (0.752, 0.589, 0.477), dur(b,g,a) = 0.119, 59317.922, 0.712 ms
+18.35.893.257 I slot print_timing: id 12 | task 1944 |      acc per pos = (0.788, 0.682, 0.529)
+18.35.893.278 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  129   1671   7862, #gen drafts =   7863, #acc drafts =  5912, #gen tokens =  23584, #acc tokens = 14299, #mean acc len = 2.82, #acc rate/pos = (0.752, 0.589, 0.477), dur(b,g,a) = 0.120, 60451.219, 0.719 ms
+18.38.787.572 I slot print_timing: id 13 | task 1999 |      acc per pos = (0.863, 0.608, 0.549)
+18.38.787.591 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  130   1691   7900, #gen drafts =   7901, #acc drafts =  5944, #gen tokens =  23698, #acc tokens = 14374, #mean acc len = 2.82, #acc rate/pos = (0.752, 0.589, 0.478), dur(b,g,a) = 0.122, 60993.373, 0.726 ms
+18.43.826.044 I slot print_timing: id 14 | task 2033 |      acc per pos = (0.870, 0.630, 0.593)
+18.43.826.062 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  131   1727   7970, #gen drafts =   7971, #acc drafts =  6005, #gen tokens =  23908, #acc tokens = 14527, #mean acc len = 2.82, #acc rate/pos = (0.753, 0.590, 0.479), dur(b,g,a) = 0.124, 62253.565, 0.730 ms
+18.49.187.468 I slot print_timing: id 15 | task 2054 |      acc per pos = (0.880, 0.800, 0.720)
+18.49.187.487 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  132   1768   8050, #gen drafts =   8051, #acc drafts =  6070, #gen tokens =  24148, #acc tokens = 14695, #mean acc len = 2.83, #acc rate/pos = (0.754, 0.591, 0.480), dur(b,g,a) = 0.125, 63682.443, 0.738 ms
+18.52.392.036 I slot print_timing: id 16 | task 2091 |      acc per pos = (0.678, 0.525, 0.390)
+18.52.392.055 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  133   1788   8088, #gen drafts =   8089, #acc drafts =  6097, #gen tokens =  24262, #acc tokens = 14754, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.591, 0.479), dur(b,g,a) = 0.126, 64379.584, 0.741 ms
+18.57.238.161 I slot print_timing: id 17 | task 2133 |      acc per pos = (0.842, 0.561, 0.421)
+18.57.238.181 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  134   1827   8164, #gen drafts =   8165, #acc drafts =  6161, #gen tokens =  24490, #acc tokens = 14914, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.592, 0.480), dur(b,g,a) = 0.127, 65528.940, 0.753 ms
+18.58.846.061 I slot print_timing: id 18 | task 2154 |      acc per pos = (0.791, 0.721, 0.605)
+18.58.846.079 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  135   1833   8174, #gen drafts =   8175, #acc drafts =  6168, #gen tokens =  24520, #acc tokens = 14932, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.592, 0.480), dur(b,g,a) = 0.128, 65739.335, 0.755 ms
+19.06.646.908 I slot print_timing: id 19 | task 2194 |      acc per pos = (0.800, 0.643, 0.486)
+19.06.646.929 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  136   1899   8304, #gen drafts =   8305, #acc drafts =  6273, #gen tokens =  24910, #acc tokens = 15184, #mean acc len = 2.83, #acc rate/pos = (0.755, 0.592, 0.481), dur(b,g,a) = 0.129, 67619.324, 0.770 ms
+19.10.147.516 I slot print_timing: id 20 | task 2201 |      acc per pos = (0.802, 0.616, 0.547)
+19.10.147.534 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  137   1921   8346, #gen drafts =   8347, #acc drafts =  6308, #gen tokens =  25036, #acc tokens = 15266, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.592, 0.481), dur(b,g,a) = 0.131, 68388.206, 0.772 ms
+19.19.471.602 I slot print_timing: id 21 | task 2268 |      acc per pos = (0.779, 0.526, 0.379)
+19.19.471.619 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  138   1996   8494, #gen drafts =   8495, #acc drafts =  6423, #gen tokens =  25480, #acc tokens = 15531, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.592, 0.480), dur(b,g,a) = 0.133, 71019.412, 0.796 ms
+19.20.871.984 I slot print_timing: id 22 | task 2291 |      acc per pos = (0.816, 0.598, 0.517)
+19.20.872.004 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  138   2010   8509, #gen drafts =   8509, #acc drafts =  6437, #gen tokens =  25522, #acc tokens = 15561, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.592, 0.480), dur(b,g,a) = 0.133, 71498.066, 0.798 ms
+19.31.243.613 I slot print_timing: id  0 | task 2380 |      acc per pos = (0.723, 0.543, 0.447)
+19.31.243.632 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  139   2104   8603, #gen drafts =   8603, #acc drafts =  6505, #gen tokens =  25802, #acc tokens = 15722, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.591, 0.480), dur(b,g,a) = 0.134, 74712.893, 0.811 ms
+19.39.650.998 I slot print_timing: id  1 | task 2476 |      acc per pos = (0.720, 0.600, 0.493)
+19.39.651.017 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  140   2179   8678, #gen drafts =   8678, #acc drafts =  6559, #gen tokens =  26027, #acc tokens = 15858, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.591, 0.480), dur(b,g,a) = 0.136, 77254.391, 0.821 ms
+19.44.085.245 I slot print_timing: id  2 | task 2553 |      acc per pos = (0.806, 0.500, 0.444)
+19.44.085.263 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  141   2215   8714, #gen drafts =   8714, #acc drafts =  6588, #gen tokens =  26135, #acc tokens = 15921, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.591, 0.480), dur(b,g,a) = 0.137, 78487.902, 0.826 ms
+19.57.574.771 I slot print_timing: id  3 | task 2591 |      acc per pos = (0.500, 0.286, 0.230)
+19.57.574.792 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  142   2341   8840, #gen drafts =   8840, #acc drafts =  6651, #gen tokens =  26513, #acc tokens = 16049, #mean acc len = 2.82, #acc rate/pos = (0.752, 0.587, 0.476), dur(b,g,a) = 0.138, 82673.500, 0.843 ms
+20.09.365.106 I slot print_timing: id  4 | task 2720 |      acc per pos = (0.646, 0.372, 0.230)
+20.09.365.126 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  143   2454   8953, #gen drafts =   8953, #acc drafts =  6724, #gen tokens =  26852, #acc tokens = 16190, #mean acc len = 2.81, #acc rate/pos = (0.751, 0.584, 0.473), dur(b,g,a) = 0.139, 86205.165, 0.865 ms
+20.13.997.908 I slot print_timing: id  5 | task 2836 |      acc per pos = (0.905, 0.762, 0.690)
+20.13.997.926 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  144   2496   8995, #gen drafts =   8995, #acc drafts =  6762, #gen tokens =  26978, #acc tokens = 16289, #mean acc len = 2.81, #acc rate/pos = (0.752, 0.585, 0.474), dur(b,g,a) = 0.141, 87401.324, 0.873 ms
+20.18.436.384 I slot print_timing: id  6 | task 2880 |      acc per pos = (0.667, 0.583, 0.556)
+20.18.436.403 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  145   2532   9031, #gen drafts =   9031, #acc drafts =  6786, #gen tokens =  27086, #acc tokens = 16354, #mean acc len = 2.81, #acc rate/pos = (0.751, 0.585, 0.475), dur(b,g,a) = 0.142, 88442.210, 0.885 ms
+20.24.373.085 I slot print_timing: id  7 | task 2918 |      acc per pos = (0.789, 0.649, 0.526)
+20.24.373.104 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  146   2589   9088, #gen drafts =   9088, #acc drafts =  6831, #gen tokens =  27257, #acc tokens = 16466, #mean acc len = 2.81, #acc rate/pos = (0.752, 0.585, 0.475), dur(b,g,a) = 0.143, 90054.891, 0.898 ms
+20.26.233.635 I slot print_timing: id  8 | task 2977 |      acc per pos = (0.917, 0.917, 0.833)
+20.26.233.655 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  147   2601   9100, #gen drafts =   9100, #acc drafts =  6842, #gen tokens =  27293, #acc tokens = 16498, #mean acc len = 2.81, #acc rate/pos = (0.752, 0.586, 0.475), dur(b,g,a) = 0.144, 90445.041, 0.900 ms
+20.28.013.566 I slot print_timing: id  9 | task 2991 |      acc per pos = (0.923, 0.846, 0.769)
+20.28.013.591 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  148   2614   9113, #gen drafts =   9113, #acc drafts =  6854, #gen tokens =  27332, #acc tokens = 16531, #mean acc len = 2.81, #acc rate/pos = (0.752, 0.586, 0.476), dur(b,g,a) = 0.146, 90750.450, 0.903 ms
+20.39.227.679 I slot print_timing: id 10 | task 3006 |      acc per pos = (0.682, 0.430, 0.271)
+20.39.227.700 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  149   2721   9220, #gen drafts =   9220, #acc drafts =  6927, #gen tokens =  27651, #acc tokens = 16679, #mean acc len = 2.81, #acc rate/pos = (0.751, 0.584, 0.473), dur(b,g,a) = 0.148, 93880.562, 0.930 ms
+20.45.329.650 I slot print_timing: id 11 | task 3115 |      acc per pos = (0.893, 0.696, 0.554)
+20.45.329.671 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  150   2777   9276, #gen drafts =   9276, #acc drafts =  6977, #gen tokens =  27819, #acc tokens = 16799, #mean acc len = 2.81, #acc rate/pos = (0.752, 0.585, 0.474), dur(b,g,a) = 0.149, 95386.146, 0.949 ms
+20.54.232.900 I slot print_timing: id 12 | task 3173 |      acc per pos = (0.782, 0.644, 0.506)
+20.54.232.918 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  151   2864   9363, #gen drafts =   9363, #acc drafts =  7045, #gen tokens =  28079, #acc tokens = 16967, #mean acc len = 2.81, #acc rate/pos = (0.752, 0.585, 0.474), dur(b,g,a) = 0.150, 97573.118, 0.975 ms
+21.01.429.910 I slot print_timing: id 13 | task 3262 |      acc per pos = (0.847, 0.653, 0.569)
+21.01.429.930 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  152   2936   9435, #gen drafts =   9435, #acc drafts =  7106, #gen tokens =  28295, #acc tokens = 17116, #mean acc len = 2.81, #acc rate/pos = (0.753, 0.586, 0.475), dur(b,g,a) = 0.152, 99099.713, 0.988 ms
+21.09.969.449 I slot print_timing: id 14 | task 3336 |      acc per pos = (0.795, 0.699, 0.578)
+21.09.969.469 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  153   3019   9518, #gen drafts =   9518, #acc drafts =  7172, #gen tokens =  28543, #acc tokens = 17288, #mean acc len = 2.82, #acc rate/pos = (0.754, 0.587, 0.476), dur(b,g,a) = 0.153, 101498.665, 1.004 ms
+21.17.484.687 I slot print_timing: id 15 | task 3421 |      acc per pos = (0.928, 0.884, 0.870)
+21.17.484.709 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  154   3088   9587, #gen drafts =   9587, #acc drafts =  7236, #gen tokens =  28750, #acc tokens = 17473, #mean acc len = 2.82, #acc rate/pos = (0.755, 0.589, 0.479), dur(b,g,a) = 0.154, 103437.718, 1.013 ms
+21.24.455.390 I slot print_timing: id 16 | task 3493 |      acc per pos = (0.846, 0.662, 0.477)
+21.24.455.407 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  155   3153   9652, #gen drafts =   9652, #acc drafts =  7291, #gen tokens =  28945, #acc tokens = 17602, #mean acc len = 2.82, #acc rate/pos = (0.755, 0.590, 0.479), dur(b,g,a) = 0.155, 105463.392, 1.020 ms
+21.28.254.801 I slot print_timing: id 17 | task 3560 |      acc per pos = (0.793, 0.621, 0.552)
+21.28.254.819 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  156   3182   9681, #gen drafts =   9681, #acc drafts =  7314, #gen tokens =  29032, #acc tokens = 17659, #mean acc len = 2.82, #acc rate/pos = (0.756, 0.590, 0.479), dur(b,g,a) = 0.157, 106451.308, 1.024 ms
+21.32.478.653 I slot print_timing: id 18 | task 3591 |      acc per pos = (0.806, 0.694, 0.611)
+21.32.478.670 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  157   3218   9717, #gen drafts =   9717, #acc drafts =  7343, #gen tokens =  29140, #acc tokens = 17735, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.590, 0.479), dur(b,g,a) = 0.159, 107574.747, 1.033 ms
+21.40.258.845 I slot print_timing: id 19 | task 3629 |      acc per pos = (0.740, 0.616, 0.534)
+21.40.258.863 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  158   3291   9790, #gen drafts =   9790, #acc drafts =  7397, #gen tokens =  29359, #acc tokens = 17873, #mean acc len = 2.83, #acc rate/pos = (0.756, 0.590, 0.480), dur(b,g,a) = 0.160, 109835.899, 1.040 ms
+21.47.752.019 I slot print_timing: id 20 | task 3704 |      acc per pos = (0.944, 0.847, 0.750)
+21.47.752.038 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  159   3363   9862, #gen drafts =   9862, #acc drafts =  7465, #gen tokens =  29575, #acc tokens = 18056, #mean acc len = 2.83, #acc rate/pos = (0.757, 0.592, 0.482), dur(b,g,a) = 0.161, 111715.505, 1.044 ms
+21.55.080.036 I slot print_timing: id 21 | task 3778 |      acc per pos = (0.718, 0.563, 0.451)
+21.55.080.055 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  160   3434   9933, #gen drafts =   9933, #acc drafts =  7516, #gen tokens =  29788, #acc tokens = 18179, #mean acc len = 2.83, #acc rate/pos = (0.757, 0.592, 0.482), dur(b,g,a) = 0.162, 113514.205, 1.049 ms
+22.03.969.863 I slot print_timing: id 22 | task 3851 |      acc per pos = (0.829, 0.720, 0.549)
+22.03.969.883 I spec common_specu: statistics     draft-dspark: #calls(b,g,a) =  161   3516  10015, #gen drafts =  10015, #acc drafts =  7584, #gen tokens =  30034, #acc tokens = 18351, #mean acc len = 2.83, #acc rate/pos = (0.757, 0.593, 0.482), dur(b,g,a) = 0.164, 116081.858, 1.058 ms

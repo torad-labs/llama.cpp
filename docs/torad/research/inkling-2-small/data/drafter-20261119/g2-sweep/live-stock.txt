@@ -1,0 +1,10 @@
+/workspace/rig/jobs/dspark-g2-sweep/dspark_model.py:381: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:208.)
+  value = torch.from_numpy(np.ascontiguousarray(data, dtype=np.float32))
+draft: 5 layers, width 4608, heads 48/8 x 128, block 8, taps [5, 11, 17, 23, 29, 35, 41, 48], window 1024, 1711.7M parameters, 48 stored in BF16, input cast to BF16 yes; caches: 0 window f16, 1 window f16, 2 global q8_0 rot k128 v64, 3 window f16, 4 window f16
+bf16 inputs: the copy names the server's draft token in 98.80% of 333 (rows 98.2 100.0 98.2)
+    by position: below 4096 -, below 32768 100.0%, below 131072 98.4%, from 131072 96.7%
+    the copy's lead over its second choice: 14.871780395507812 where the same, 0.6849210262298584 where different (the server's token then its choice number 1.0)
+f32 inputs: the copy names the server's draft token in 98.80% of 333 (rows 98.2 100.0 98.2)
+    by position: below 4096 -, below 32768 100.0%, below 131072 98.4%, from 131072 96.7%
+    the copy's lead over its second choice: 14.883777618408203 where the same, 0.6672382950782776 where different (the server's token then its choice number 1.0)
+live: closest with bf16 inputs, 98.80% the same (90% asked)

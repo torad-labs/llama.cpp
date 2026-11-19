@@ -1,0 +1,38 @@
+trace: 3775 iterations with a target evaluation, 3062 of them only writing; a sampled row costs 1.16 ms
+by the sequences in the batch:
+23 sequences      12 iterations    92 rows  before   46.8  target  173.9  feed  10.4  sample  73.5 ( 63 rows)  between  0.0  in all  304.6 ms  2.67 tokens a sequence an iteration,   8.8 tok/s a sequence
+20 sequences      18 iterations    80 rows  before   46.2  target  163.6  feed   9.1  sample  68.5 ( 58 rows)  between  0.0  in all  287.4 ms  2.88 tokens a sequence an iteration,  10.0 tok/s a sequence
+17 sequences       8 iterations    68 rows  before   43.9  target  138.4  feed   7.8  sample  58.1 ( 50 rows)  between  0.0  in all  248.2 ms  2.90 tokens a sequence an iteration,  11.7 tok/s a sequence
+16 sequences      60 iterations    64 rows  before   44.4  target  138.2  feed   7.9  sample  52.6 ( 45 rows)  between  0.0  in all  243.1 ms  2.79 tokens a sequence an iteration,  11.5 tok/s a sequence
+12 sequences      16 iterations    48 rows  before   41.9  target  109.2  feed   5.7  sample  41.8 ( 36 rows)  between  0.0  in all  198.6 ms  2.92 tokens a sequence an iteration,  14.7 tok/s a sequence
+11 sequences      14 iterations    44 rows  before   42.1  target  113.7  feed   5.5  sample  34.6 ( 30 rows)  between  0.0  in all  195.9 ms  2.66 tokens a sequence an iteration,  13.6 tok/s a sequence
+8 sequences      131 iterations    32 rows  before   40.0  target   88.5  feed   4.2  sample  25.7 ( 22 rows)  between  0.0  in all  158.5 ms  2.75 tokens a sequence an iteration,  17.4 tok/s a sequence
+7 sequences       16 iterations    28 rows  before   39.6  target   98.8  feed   3.8  sample  22.4 ( 19 rows)  between  0.0  in all  164.6 ms  2.78 tokens a sequence an iteration,  16.9 tok/s a sequence
+6 sequences       11 iterations    24 rows  before   39.0  target   97.4  feed   3.2  sample  23.9 ( 20 rows)  between  0.0  in all  163.6 ms  2.95 tokens a sequence an iteration,  18.1 tok/s a sequence
+5 sequences       38 iterations    20 rows  before   38.0  target   58.4  feed   2.6  sample  16.2 ( 14 rows)  between  0.0  in all  115.1 ms  2.79 tokens a sequence an iteration,  24.3 tok/s a sequence
+4 sequences      335 iterations    16 rows  before   36.5  target   52.6  feed   2.0  sample  13.9 ( 12 rows)  between  0.0  in all  104.9 ms  2.87 tokens a sequence an iteration,  27.4 tok/s a sequence
+3 sequences       21 iterations    12 rows  before   36.5  target   78.7  feed   1.9  sample   9.3 (  7 rows)  between  0.1  in all  126.5 ms  2.44 tokens a sequence an iteration,  19.3 tok/s a sequence
+2 sequences      742 iterations     8 rows  before   35.3  target   64.6  feed   0.9  sample   6.9 (  6 rows)  between  0.0  in all  107.7 ms  2.81 tokens a sequence an iteration,  26.1 tok/s a sequence
+1 sequences     1610 iterations     4 rows  before   34.4  target   58.9  feed   0.5  sample   4.2 (  3 rows)  between  0.0  in all   97.9 ms  2.87 tokens a sequence an iteration,  29.3 tok/s a sequence
+the target evaluation by the rows in the batch:
+2 to 4 rows             1610 iterations     4 rows     1 sequences  target   58.9 ms
+5 to 8 rows              742 iterations     8 rows     2 sequences  target   64.6 ms
+9 to 16 rows             356 iterations    16 rows     4 sequences  target   52.7 ms
+17 to 32 rows            196 iterations    32 rows     8 sequences  target   88.3 ms
+33 to 64 rows            108 iterations    64 rows    16 sequences  target  138.0 ms
+65 to 128 rows            50 iterations    80 rows    20 sequences  target  169.2 ms
+one call to draft, by the sequences writing (the middle one of the iterations between two totals):
+23 sequences              13 calls    45.5 ms a call
+20 sequences              19 calls    46.1 ms a call
+17 sequences               8 calls    42.2 ms a call
+16 sequences              66 calls    43.8 ms a call
+12 sequences              16 calls    42.2 ms a call
+11 sequences              14 calls    41.3 ms a call
+8 sequences              149 calls    39.6 ms a call
+7 sequences               14 calls    39.0 ms a call
+6 sequences               10 calls    39.2 ms a call
+5 sequences               38 calls    37.9 ms a call
+4 sequences              366 calls    34.9 ms a call
+3 sequences               10 calls    37.3 ms a call
+2 sequences              889 calls    33.6 ms a call
+1 sequences             1592 calls    29.8 ms a call
