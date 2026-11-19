@@ -10,10 +10,20 @@ constexpr int fattn_rel_mma_cells = 16;
 constexpr int fattn_rel_mma_words = 4;
 
 // GGML_CUDA_FATTN_REL_DECODE_STREAMS: most warps the cells of one query and KV head are split across.
+// Every stream keeps a mask word a lane.
 static int fattn_rel_mma_streams(const ggml_tensor * dst) {
     static const int streams_max = (int) ggml_env_int("GGML_CUDA_FATTN_REL_DECODE_STREAMS");
-    const int64_t step_cells = 32*32*fattn_rel_mma_words;
-    return std::max<int64_t>(1, std::min<int64_t>(streams_max, dst->src[1]->ne[1]/step_cells));
+    return std::max<int64_t>(1, std::min<int64_t>(streams_max, dst->src[1]->ne[1]/(32*WARP_SIZE)));
+}
+
+// GGML_CUDA_FATTN_REL_DECODE_RUN_WORDS: the mask words a stream reads side by side before the next stream's begin.
+static int fattn_rel_mma_run_log2() {
+    static const int run_words = (int) ggml_env_int("GGML_CUDA_FATTN_REL_DECODE_RUN_WORDS");
+    int run_log2 = 0;
+    while ((2 << run_log2) <= run_words) {
+        ++run_log2;
+    }
+    return run_log2;
 }
 
 // F16 K/V shared by 2 to 8 query heads a KV head. The one-cell kernel keeps Q8_0 and the other ratios.
@@ -40,12 +50,18 @@ static size_t fattn_rel_mma_alloc_size(const int device, const ggml_tensor * dst
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// The mask word a lane reads at place own of its stream. The streams take the runs of words in turn, so the cells one
+// sequence holds side by side are spread over all of them.
+static __device__ __forceinline__ int fattn_rel_mma_word(int own, int lane, int stream, int n_streams, int run_log2) {
+    return (((own + (lane >> run_log2))*n_streams + stream) << run_log2) + (lane & ((1 << run_log2) - 1));
+}
+
 // One warp gathers 16 visible KV rows into a tile and multiplies it by all the query heads of its KV head on the tensor cores.
 // Each row is read once a KV head. Masked cells are never read, so they cannot change how the visible ones are rounded.
 static __global__ void fattn_rel_mma_rows(
         const char * q, const char * k, const char * v, const uint32_t * mask, const float * table,
         const int32_t * q_pos, const int32_t * kv_pos, const float * shift, float * partial, float scale, int n_kv, int n_dist, int gqa,
-        size_t q_row, size_t q_head, size_t k_row, size_t k_head, size_t v_row, size_t v_head) {
+        int run_log2, size_t q_row, size_t q_head, size_t k_row, size_t k_head, size_t v_row, size_t v_head) {
 #ifdef AMPERE_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
     constexpr int cells = fattn_rel_mma_cells, words = fattn_rel_mma_words;
@@ -93,15 +109,18 @@ static __global__ void fattn_rel_mma_rows(
     const int pos = q_pos[query];
 
     const int n_words = n_kv/32;
-    const int step = n_streams*32*words;
+    // A load reads runs_load runs of the stream's n_own, each run 2^run_log2 words.
+    const int runs_load = WARP_SIZE >> run_log2;
+    const int n_runs = (n_words + (1 << run_log2) - 1) >> run_log2;
+    const int n_own = (n_runs - stream + n_streams - 1)/n_streams;
     mask += int64_t(query)*n_words;
     int fill = 0;
-    for (int base = stream*32*words; base < n_words; base += step) {
-        const bool last = base + step >= n_words;
+    for (int base = 0; base < n_own; base += runs_load*words) {
+        const bool last = base + runs_load*words >= n_own;
         uint32_t live[words], any = 0;
 #pragma unroll
         for (int i = 0; i < words; ++i) {
-            const int word = base + 32*i + lane;
+            const int word = fattn_rel_mma_word(base + runs_load*i, lane, stream, n_streams, run_log2);
             live[i] = word < n_words ? mask[word] : 0;
             any |= live[i];
         }
@@ -127,8 +146,9 @@ static __global__ void fattn_rel_mma_rows(
                 }
                 const int total = __shfl_sync(0xffffffff, end, WARP_SIZE - 1, WARP_SIZE);
                 int at = fill + end - count;
+                const int word = fattn_rel_mma_word(base + runs_load*i, lane, stream, n_streams, run_log2);
                 for (uint32_t bits = cur; bits; bits &= bits - 1) {
-                    list[at++] = 32*(base + 32*i + lane) + __ffs(bits) - 1;
+                    list[at++] = 32*word + __ffs(bits) - 1;
                 }
                 __syncwarp();
                 fill += total;
@@ -259,7 +279,7 @@ static __global__ void fattn_rel_mma_rows(
         }
     }
 #else
-    GGML_UNUSED_VARS(q, k, v, mask, table, q_pos, kv_pos, shift, partial, scale, n_kv, n_dist, gqa,
+    GGML_UNUSED_VARS(q, k, v, mask, table, q_pos, kv_pos, shift, partial, scale, n_kv, n_dist, gqa, run_log2,
         q_row, q_head, k_row, k_head, v_row, v_head);
     NO_DEVICE_CODE;
 #endif // AMPERE_MMA_AVAILABLE
@@ -281,7 +301,8 @@ static void ggml_cuda_fattn_rel_mma(ggml_backend_cuda_context & ctx, ggml_tensor
             (const char *) q->data, (const char *) k->data, (const char *) v->data,
             (const uint32_t *) dst->src[3]->data, (const float *) dst->src[6]->data,
             (const int32_t *) dst->src[7]->data, (const int32_t *) dst->src[8]->data, shift ? sinks : nullptr, partial,
-            scale, k->ne[1], dst->src[6]->ne[0], q->ne[2]/k->ne[2], q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2]);
+            scale, k->ne[1], dst->src[6]->ne[0], q->ne[2]/k->ne[2], fattn_rel_mma_run_log2(),
+            q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2]);
     fattn_rel_decode_merge<<<dim3(q->ne[2], q->ne[1]), 128, 0, ctx.stream()>>>(
             partial, shift ? nullptr : sinks, (float *) dst->data, n_streams);
     CUDA_CHECK(cudaGetLastError());
