@@ -437,6 +437,12 @@ static bool slot_prefix_copy() {
     return copy;
 }
 
+// LLAMA_SAMPLE_THREADS: the most threads that sample a step's rows on the CPU side by side (4 when unset)
+static int sample_threads_max() {
+    static const int n = (int) ggml_env_int("LLAMA_SAMPLE_THREADS");
+    return n;
+}
+
 // LLAMA_SLOT_VICTIM_LRU_LEGACY=1: the idle slot whose conversation is cut for a request is the least recently used one, whatever it holds
 static bool slot_victim_lru_legacy() {
     static const bool legacy = ggml_env_switch("LLAMA_SLOT_VICTIM_LRU_LEGACY");
@@ -6663,7 +6669,7 @@ private:
     };
 
     std::vector<cpu_sample_result> sample_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
-        const int n_threads = std::min(params_base.cpuparams.n_threads, 4);
+        const int n_threads = std::min(params_base.cpuparams.n_threads, sample_threads_max());
         if (n_threads < 2 || n_batch_tokens < 4 || !pull_k.empty() ||
                 llama_vocab_n_tokens(vocab) < 128*1024) {
             return {};
@@ -6711,13 +6717,94 @@ private:
                 }
             }
         };
-        std::array<std::future<void>, 3> workers;
+        std::vector<std::future<void>> workers(n_threads - 1);
         for (int i = 1; i < n_threads; ++i) {
             workers[i - 1] = std::async(std::launch::async | std::launch::deferred, sample, i);
         }
         sample(0);
         for (int i = 1; i < n_threads; ++i) {
             workers[i - 1].get();
+        }
+        return results;
+    }
+
+    struct spec_verify_result {
+        bool                     done = false;
+        common_sampler_ptr       smpl_save; // the sampler as it was before its rows, when a restore may read it
+        std::vector<llama_token> accepted;
+        std::exception_ptr       error;
+    };
+
+    // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
+    bool spec_uses_ckpt_tgt(size_t n_draft) const {
+        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+            (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+    }
+
+    // The slots that verify a draft by sampling its rows and matching do it side by side. Every row is a sample over the
+    // whole vocabulary on the CPU, and slot after slot they were a quarter of a round at 23 sessions (74 ms of 305 on
+    // four cards, 2026-11-19). A slot left out here verifies in post_decode as before.
+    std::vector<spec_verify_result> verify_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
+        const int n_threads = std::min(params_base.cpuparams.n_threads, sample_threads_max());
+        if (n_threads < 2 || !spec || !pull_k.empty() || llama_vocab_n_tokens(vocab) < 128*1024 ||
+                !common_speculative_get_synth_probs(spec.get()).empty()) {
+            return {};
+        }
+
+        std::vector<spec_verify_result> results(slots.size());
+        std::vector<int32_t> ids;
+        std::vector<common_speculative_verify> seqs;
+        size_t n_rows = 0;
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty() || slot.spec_i_batch.empty() ||
+                    slot.spec_i_batch.front() < off || slot.spec_i_batch.front() >= off + n_batch_tokens ||
+                    slot.backend_sampler || slot.cand_rows || slot.task->params.sampling.n_probs > 0 ||
+                    !common_sampler_backend_passive(slot.smpl.get())) {
+                continue;
+            }
+            // a replay or a draft that came with its distribution is verified by rejection
+            if (slot.use_spec_rejection() && (slot.spec_is_replay || !slot.spec_draft_q.empty())) {
+                continue;
+            }
+            common_speculative_verify seq;
+            seq.smpl        = slot.smpl.get();
+            seq.draft       = &slot.spec_draft;
+            seq.n_remaining = slot.n_remaining();
+            for (const auto idx : slot.spec_i_batch) {
+                const auto row = llama_get_sampling_row_ith(ctx_tgt, idx - off);
+                if (!row.logits || row.token != LLAMA_TOKEN_NULL) {
+                    break;
+                }
+                seq.rows.push_back(row);
+            }
+            if (seq.rows.size() != slot.spec_draft.size() + 1) {
+                continue;
+            }
+            n_rows += seq.rows.size();
+            ids.push_back(slot.id);
+            seqs.push_back(std::move(seq));
+        }
+        if (seqs.size() < 2) {
+            return {};
+        }
+        // a worker changes the sampler: the copy a checkpoint restore rewinds to is taken first
+        for (const auto id : ids) {
+            auto & slot = slots[id];
+            if (spec_uses_ckpt_tgt(slot.spec_draft.size())) {
+                results[id].smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+            }
+        }
+
+        common_decode_trace::range trace([&] {
+            return "stage=cpu_verify iteration=" + std::to_string(trace_id) + " sequences=" + std::to_string(seqs.size()) +
+                    " rows=" + std::to_string(n_rows) + " threads=" + std::to_string(n_threads);
+        });
+        common_speculative_sample_and_accept_batch(vocab, seqs, n_threads);
+        for (size_t i = 0; i < seqs.size(); ++i) {
+            auto & result = results[ids[i]];
+            result.done     = true;
+            result.accepted = std::move(seqs[i].accepted);
+            result.error    = seqs[i].error;
         }
         return results;
     }
@@ -6856,6 +6943,7 @@ private:
         });
 
         // speculative decoding - main model sample and accept
+        auto verified = verify_cpu_batch(off, n_batch_tokens, trace_id);
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty() || !is_inside_view(slot.spec_i_batch.front())) {
@@ -6885,10 +6973,15 @@ private:
                 // never on a recurrent context whose rollback copies cover the whole draft. The clone copies
                 // the grammar's rules and stacks: 15 ms a step with a tool grammar (perf on the live 27B head,
                 // 2026-09-21), so it is taken only when that restore can happen.
-                const bool may_restore =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
-                common_sampler_ptr smpl_save(may_restore ? common_sampler_clone(slot.smpl.get()) : nullptr);
+                // a slot verify_cpu_batch took has sampled its rows: its copy was taken there
+                spec_verify_result batched;
+                if (!verified.empty()) {
+                    batched = std::move(verified[slot.id]);
+                }
+                const bool may_restore = spec_uses_ckpt_tgt(n_draft);
+                common_sampler_ptr smpl_save(
+                        batched.done ? batched.smpl_save.release() :
+                        may_restore  ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -6912,7 +7005,12 @@ private:
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
                 std::vector<llama_token> accepted;
-                if (!synth_probs.empty()) {
+                if (batched.done) {
+                    if (batched.error) {
+                        std::rethrow_exception(batched.error);
+                    }
+                    accepted = std::move(batched.accepted);
+                } else if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
@@ -6944,10 +7042,7 @@ private:
                             " replay=" + std::to_string(slot.spec_is_replay));
                 }
 
-                // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
-                const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                const bool use_ckpt_tgt = spec_uses_ckpt_tgt(n_draft);
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
