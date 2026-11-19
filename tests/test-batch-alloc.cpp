@@ -6,6 +6,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-hparams.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-model.h"
 #include "../src/llama-vocab.h"
 
 #include <cstdlib>
@@ -1563,7 +1564,8 @@ static void test_compat(testing & t) {
 
 static void test_mtp_embd_width(testing & t) {
     t.test("mtp_keeps_n_embd_inp_and_takes_state_at_n_embd_out", [&](testing & t) {
-        llama_hparams hparams = {};
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+        llama_hparams & hparams = model->hparams;
         hparams.n_embd             = 64;
         hparams.n_deepstack_layers = 2;   // makes n_embd_inp() = 64 + 64*2 = 192
         hparams.n_embd_out_impl    = 96;  // makes n_embd_out() = 96
@@ -1575,18 +1577,19 @@ static void test_mtp_embd_width(testing & t) {
                 (size_t) 192, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_LLAMA, hparams));
 
         t.assert_equal("MTP context takes the target hidden state at n_embd_out",
-                (size_t) 96, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_MTP, hparams));
+                (size_t) 96, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_MTP, *model));
 
         t.assert_equal("default context takes no state",
-                (size_t) 0, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_DEFAULT, hparams));
+                (size_t) 0, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_DEFAULT, *model));
     });
 
     t.test("mtp_state_falls_back_to_n_embd_when_no_override", [&](testing & t) {
-        llama_hparams hparams = {};
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+        llama_hparams & hparams = model->hparams;
         hparams.n_embd = 64; // no deepstack, no n_embd_out_impl override
 
         t.assert_equal((size_t) 64, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_LLAMA, hparams));
-        t.assert_equal((size_t) 64, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_MTP, hparams));
+        t.assert_equal((size_t) 64, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_MTP, *model));
     });
 
     t.test("dflash_uses_n_embd_inp_enc", [&](testing & t) {
