@@ -84,7 +84,11 @@ not convert or run yet. DSpark is its own phase at the end.
 - [10-serving-campaign-review.md](10-serving-campaign-review.md) - the current server profile and local qualification.
 - [11-pcie-blackwell-throughput.md](11-pcie-blackwell-throughput.md) - PCIe gather and Blackwell attention results, TensorFold research and remaining opportunities.
 - [12-four-card-serving.md](12-four-card-serving.md) - hardware measurements, model identity and deployment results.
+- [13-batched-serving-results.md](13-batched-serving-results.md) - the selected four-card profile, its kernel and cache assessment and its fidelity checks.
+- [14-decode-stalls-and-knob-search.md](14-decode-stalls-and-knob-search.md) - where a four-card decode step goes, the graph-capture stall, and what every knob is worth.
 - [data/model-facts.json](data/model-facts.json) - the numbers above in structured form.
 - [data/sources.md](data/sources.md) - every source used, with what it was trusted for.
+- [data/four-card-knob-trials-20261119.csv](data/four-card-knob-trials-20261119.csv) - every search trial of 2026-11-19, with its build, settings and token hash.
+- [data/four-card-decode-kernels-20261119.csv](data/four-card-decode-kernels-20261119.csv) - every decode kernel's cost per step per card, CUDA graphs off.
 
 The original November 16 estimates use datacenter Blackwell reports and earlier GLM records. Chapters 10 through 12 distinguish the later fixture, single-GPU and four-card measurements.

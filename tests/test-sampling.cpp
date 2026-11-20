@@ -666,11 +666,171 @@ static void test_dist_coupled() {
     llama_sampler_free(bare);
 }
 
+// llama_sampler_chain_sample_row: on a chain it takes, each draw is the token whose share of the row's probability holds
+// the draw, to rounding, and never a token a bias removed; a chain it does not take keeps its generator
+static void test_chain_sample_row() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    const bool takes = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && getenv("LLAMA_SAMPLING_ONE_PASS_LEGACY") == nullptr;
+#else
+    const bool takes = false;
+#endif
+    const uint32_t seed = 4321;
+
+    struct shape {
+        const char * name;
+        int32_t      n_vocab;
+        float        temp;
+        bool         bias;
+        bool         ext; // the temperature as llama_sampler_init_temp_ext sets it, as common's chain does
+    };
+    const shape shapes[] = {
+        { "dist",             201088, 1.0f, false, false },
+        { "temp, dist",       201088, 0.7f, false, false },
+        { "bias, temp, dist", 201088, 0.7f, true,  true  },
+        { "bias, dist",         4099, 1.0f, true,  false }, // a last block that is not whole
+        { "temp, dist",           13, 1.3f, false, true  },
+    };
+
+    std::mt19937 rng(77);
+    std::normal_distribution<float>       bulk(-3.0f, 2.5f);
+    std::uniform_real_distribution<float> likely(6.0f, 16.0f);
+    std::vector<llama_token_data> cur;
+
+    for (const auto & s : shapes) {
+        // tokens removed, the first and the last of the vocabulary among them, one biased twice, two outside the vocabulary
+        std::vector<llama_logit_bias> biases;
+        if (s.bias) {
+            biases.push_back({ 300, 4.0f });
+            for (llama_token t = 0; t < s.n_vocab; t += 97) {
+                biases.push_back({ t, -INFINITY });
+            }
+            biases.push_back({ s.n_vocab - 1, -INFINITY });
+            biases.push_back({ s.n_vocab + 3, 50.0f });
+            biases.push_back({ 300, 3.5f });
+            biases.push_back({ -2, 50.0f });
+            biases.push_back({ 5, 9.5f });
+        }
+        const auto make = [&]() {
+            llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(s.n_vocab, (int32_t) biases.size(), biases.data()));
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(0));
+            llama_sampler_chain_add(chain, s.ext ? llama_sampler_init_temp_ext(s.temp, 0.0f, 1.0f) : llama_sampler_init_temp(s.temp));
+            llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+            return chain;
+        };
+        llama_sampler * by_row   = make();
+        llama_sampler * by_chain = make();
+        // the dist sampler's generator: one draw a sample
+        std::mt19937 mirror(seed);
+        std::uniform_real_distribution<double> uni(0.0f, 1.0f);
+
+        const int n_rows = 48;
+        int     n_same  = 0;
+        int64_t t_row   = 0;
+        int64_t t_chain = 0;
+        std::vector<float>  logits(s.n_vocab);
+        std::vector<double> cum(s.n_vocab);
+        for (int r = 0; r < n_rows; ++r) {
+            for (auto & l : logits) {
+                l = bulk(rng);
+            }
+            // a few likely tokens, as a model's row has
+            for (int k = 0; k < 12; ++k) {
+                logits[rng() % s.n_vocab] = likely(rng);
+            }
+
+            int64_t t0 = ggml_time_us();
+            const llama_token id = llama_sampler_chain_sample_row(by_row, logits.data(), s.n_vocab);
+            t_row += ggml_time_us() - t0;
+            GGML_ASSERT((id != LLAMA_TOKEN_NULL) == takes);
+            if (!takes) {
+                continue;
+            }
+            GGML_ASSERT(id >= 0 && id < s.n_vocab);
+
+            t0 = ggml_time_us();
+            cur.resize(s.n_vocab);
+            for (llama_token t = 0; t < s.n_vocab; ++t) {
+                cur[t] = llama_token_data{ t, logits[t], 0.0f };
+            }
+            llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+            llama_sampler_apply(by_chain, &cur_p);
+            t_chain += ggml_time_us() - t0;
+            n_same += cur_p.data[cur_p.selected].id == id;
+
+            // the row's probabilities as the chain forms them, summed in double
+            std::vector<float> x = logits;
+            for (const auto & lb : biases) {
+                if (lb.token >= 0 && lb.token < s.n_vocab) {
+                    x[lb.token] += lb.bias;
+                }
+            }
+            float max_l = -INFINITY;
+            for (auto & l : x) {
+                l /= s.temp;
+                max_l = std::max(max_l, l);
+            }
+            double sum = 0.0;
+            for (llama_token t = 0; t < s.n_vocab; ++t) {
+                sum += std::exp((double) x[t] - (double) max_l);
+                cum[t] = sum;
+            }
+            const double tgt = sum*uni(mirror);
+            const double tol = 1e-6*sum;
+            const double beg = id > 0 ? cum[id - 1] : 0.0;
+            GGML_ASSERT(cum[id] > beg && "a token of probability 0 was drawn");
+            GGML_ASSERT(beg <= tgt + tol && cum[id] >= tgt - tol && "the draw is outside the token's share");
+        }
+        if (takes) {
+            printf("one-pass row draw, %s, vocabulary %d: %d of %d rows as the chain's, %.3f ms a row against %.3f\n", s.name, s.n_vocab,
+                    n_same, n_rows, t_row/1000.0/n_rows, t_chain/1000.0/n_rows);
+            // rounding moves a draw to the next token once in many thousand rows
+            GGML_ASSERT(n_same >= n_rows - 1);
+        }
+        llama_sampler_free(by_row);
+        llama_sampler_free(by_chain);
+    }
+
+    // not taken, and nothing drawn: a chain that cuts, a coupled one, a temperature of 0 or one that moves with the row, a
+    // single sampler
+    const int32_t n_vocab = 64;
+    std::vector<float> logits(n_vocab);
+    for (auto & l : logits) {
+        l = bulk(rng);
+    }
+    llama_sampler * cuts   = coupled_chain(n_vocab, 99, false);
+    llama_sampler * twin   = coupled_chain(n_vocab, 99, false);
+    llama_sampler * tied   = coupled_chain(n_vocab, 99);
+    llama_sampler * greedy = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(greedy, llama_sampler_init_temp(0.0f));
+    llama_sampler_chain_add(greedy, llama_sampler_init_dist(99));
+    llama_sampler * moves  = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(moves, llama_sampler_init_temp_ext(0.8f, 0.5f, 1.0f));
+    llama_sampler_chain_add(moves, llama_sampler_init_dist(99));
+    llama_sampler * bare   = llama_sampler_init_dist(99);
+    GGML_ASSERT(llama_sampler_chain_sample_row(cuts, logits.data(), n_vocab) == LLAMA_TOKEN_NULL &&
+                llama_sampler_chain_sample_row(moves, logits.data(), n_vocab) == LLAMA_TOKEN_NULL &&
+                llama_sampler_chain_sample_row(tied, logits.data(), n_vocab) == LLAMA_TOKEN_NULL &&
+                llama_sampler_chain_sample_row(greedy, logits.data(), n_vocab) == LLAMA_TOKEN_NULL &&
+                llama_sampler_chain_sample_row(bare, logits.data(), n_vocab) == LLAMA_TOKEN_NULL &&
+                llama_sampler_chain_sample_row(nullptr, logits.data(), n_vocab) == LLAMA_TOKEN_NULL);
+    for (int i = 0; i < 16; ++i) {
+        GGML_ASSERT(draw_from(cuts, logits, cur) == draw_from(twin, logits, cur));
+    }
+    llama_sampler_free(cuts);
+    llama_sampler_free(twin);
+    llama_sampler_free(tied);
+    llama_sampler_free(greedy);
+    llama_sampler_free(moves);
+    llama_sampler_free(bare);
+}
+
 int main(void) {
     ggml_time_init();
 
     test_dist_singleton_rng();
     test_dist_coupled();
+    test_chain_sample_row();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

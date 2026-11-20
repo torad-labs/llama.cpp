@@ -36,6 +36,7 @@ static unsigned long long reductions_to_owners = 0; // the internal AllReduce's,
 static unsigned long long reductions_to_all = 0;
 static int steps_built = 0; // the meta backend made a cgraph's steps (graph_trace layer=meta event=steps)
 static int steps_kept = 0;  // it took back the steps it kept for the cgraph
+static int replays = 0;     // evaluations it replayed from a capture (graph_trace layer=meta event=replay)
 static ggml_backend_dev_t peer = nullptr;
 static std::array<ggml_backend_dev_t, 4> host_devices = {};
 
@@ -55,6 +56,7 @@ static void set_env(const char * name, const char * value) {
 
 static void log_cb(ggml_log_level level, const char * text, void *) {
     if (strstr(text, "ggml_backend_cuda_capture_end") && strstr(text, " nodes, ")) { ++captured; }
+    if (strstr(text, "layer=meta event=replay")) { ++replays; }
     if (strstr(text, "layer=meta event=steps")) {
         ++(strstr(text, "source=kept") ? steps_kept : steps_built);
         return;
@@ -496,18 +498,23 @@ static ggml_backend_meta_split_state split_hidden_rows(const ggml_tensor * t, vo
     return {up ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0, {width, width, width, width}, {1}, 1};
 }
 
-static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs) {
+// A hidden state whose every rank reads a quarter of each row is summed only where it is read, with the bits of the
+// sum on every rank. Through host memory GGML_CUDA_AR_HOST_OWNER_ROWS selects it for 23 rows; card to card it rides
+// the chunked kernel for any rows, which a captured step replays, and GGML_CUDA_AR_REDUCE_OWNERS=0 turns it off.
+static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool card) {
     set_env("GGML_CUDA_ALLREDUCE", "internal");
-    set_env("GGML_CUDA_AR_COPY_PEER", "0");
-    set_env("GGML_CUDA_AR_COPY_THRESHOLD", "1");
+    set_env("GGML_CUDA_AR_COPY_PEER", card ? nullptr : "0");
+    set_env("GGML_CUDA_AR_COPY_THRESHOLD", card ? nullptr : "1");
     set_env("GGML_CUDA_AR_BF16_THRESHOLD", "1");
     set_env("GGML_GRAPH_TRACE", "1");
-    enum variant { normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8 };
+    // grouped: 24 rows that are 2 tokens of 12 sequences
+    enum variant { normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8, grouped };
     bool ok = true;
-    for (variant v : {normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8}) {
+    for (variant v : {normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8, grouped}) {
         std::vector<float> baseline;
         for (bool enabled : {false, true}) {
-            set_env("GGML_CUDA_AR_HOST_OWNER_ROWS", enabled ? "1" : "0");
+            set_env("GGML_CUDA_AR_HOST_OWNER_ROWS", enabled && !card ? "1" : "0");
+            set_env("GGML_CUDA_AR_REDUCE_OWNERS", card && !enabled ? "0" : nullptr);
             set_env("GGML_CUDA_AR_WIRE_Q8", v == q8 ? "1" : "0");
             set_env("GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", v == serial_receive ? "1" : "0");
             ggml_backend_dev_t device = ggml_backend_meta_device(devs.data(), 4, split_hidden_rows, nullptr);
@@ -527,11 +534,11 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs) {
                 ggml_backend_tensor_set(w, data.data(), 0, ggml_nbytes(w));
             }
             ggml_context * ctx = ggml_init({32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
-            const int rows = v == narrower ? 22 : 23;
+            const int rows = v == narrower ? 22 : v == grouped ? 24 : 23;
             auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, rows);
             ggml_set_input(x);
             auto * partial = ggml_mul_mat(ctx, down, ggml_mul_mat(ctx, up, x));
-            auto * r = ggml_reshape_3d(ctx, partial, 4608, 1, rows);
+            auto * r = ggml_reshape_3d(ctx, partial, 4608, v == grouped ? 2 : 1, v == grouped ? rows/2 : rows);
             auto * c = ggml_cont(ctx, ggml_permute(ctx, r, 2, 0, 1, 3));
             const int64_t counts[] = {1152 + (v == unequal), 1152 - (v == unequal), 1152, 1152};
             auto * scatter = ggml_backend_meta_scatter(ctx, c, 2, counts, 4);
@@ -550,6 +557,7 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs) {
             auto * sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
             GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
             std::vector<float> actual;
+            const int replayed = replays;
             for (int iter = 0; iter < 4; ++iter) {
                 std::vector<float> input(ggml_nelements(x));
                 for (float & a : input) { a = float(int(rng() % 2001) - 1000) / 724.0f; }
@@ -563,18 +571,20 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs) {
                 }
             }
             const auto owners = reductions_to_owners, full = reductions_to_all;
+            const unsigned queued = 4 - (replays - replayed);
             ggml_backend_sched_free(sched);
             ggml_free(ctx);
             ggml_backend_free(cpu);
             ggml_backend_free(backend);
             ggml_backend_buffer_free(buffer);
             ggml_free(weights);
-            const bool selected = enabled && (v == normal || v == serial_receive);
-            bool pass = reductions_to_owners - owners == (selected ? 4u : 0u) && reductions_to_all - full == (selected ? 0u : 4u);
-            if (enabled) { pass = pass && actual.size() == baseline.size() && !memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)); }
-            else { baseline = std::move(actual); }
-            printf("%s hidden owner rows mode=%d enabled=%d owned=%llu full=%llu\n", pass ? "ok" : "FAIL", int(v), enabled,
-                   reductions_to_owners - owners, reductions_to_all - full);
+            // the Q8 wire, the receive order and the 23 rows belong to the host route; a replayed evaluation queues no reduction
+            const bool selected = enabled && (v == normal || v == serial_receive || (card && (v == q8 || v == narrower || v == grouped)));
+            const bool same = !enabled || (actual.size() == baseline.size() && !memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)));
+            const bool pass = same && reductions_to_owners - owners == (selected ? queued : 0u) && reductions_to_all - full == (selected ? 0u : queued);
+            if (!enabled) { baseline = std::move(actual); }
+            printf("%s hidden owner rows route=%s mode=%d enabled=%d owned=%llu full=%llu replays=%u same=%d\n", pass ? "ok" : "FAIL",
+                   card ? "card" : "host", int(v), enabled, reductions_to_owners - owners, reductions_to_all - full, 4 - queued, same);
             ok = ok && pass;
         }
     }
@@ -1626,7 +1636,8 @@ int main(int argc, char ** argv) {
             if (count != devices.size()) { return 77; }
         }
         if (strncmp(ggml_backend_dev_name(devices[0]), "CUDA", 4) != 0) { return 77; }
-        return test_hidden_owner_rows(devices) ? 0 : 1;
+        const bool host = test_hidden_owner_rows(devices, false);
+        return test_hidden_owner_rows(devices, true) && host ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--padded-indexer") == 0) {
         return test_owned_ops(gpu, 2, false, true) && test_owned_ops(gpu, 2, true, true) ? 0 : 1;

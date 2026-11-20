@@ -3809,10 +3809,11 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
-// A materialized transpose followed by a channel scatter reads only an equal quarter of each original row per device.
+// A materialized transpose followed by a channel scatter reads only an equal quarter of each original row per device,
+// whatever tokens and sequences the rows are.
 static bool ggml_backend_meta_owned_hidden_rows(const ggml_cgraph * graph, int i, size_t n_devices) {
     const ggml_tensor * root = graph->nodes[i];
-    if (n_devices != 4 || root->type != GGML_TYPE_F32 || root->ne[0] != 4608 || root->ne[1] != 23 ||
+    if (n_devices != 4 || root->type != GGML_TYPE_F32 || root->ne[0] != 4608 ||
             root->ne[2] != 1 || root->ne[3] != 1 || !ggml_is_contiguous(root) || root->view_src) {
         return false;
     }
@@ -3827,10 +3828,11 @@ static bool ggml_backend_meta_owned_hidden_rows(const ggml_cgraph * graph, int i
         chain[k + 1] = graph->nodes[curr];
     }
     const ggml_tensor * reshape = chain[1], * perm = chain[2], * cont = chain[3], * scatter = chain[4];
-    if (reshape->view_src != root || reshape->view_offs || reshape->ne[0] != 4608 || reshape->ne[1] != 1 ||
-            reshape->ne[2] != 23 || reshape->ne[3] != 1 || !ggml_is_contiguous(reshape) ||
-            perm->view_src != root || perm->view_offs || perm->ne[0] != 1 || perm->ne[1] != 23 ||
-            perm->ne[2] != 4608 || perm->ne[3] != 1 || perm->nb[1] != root->nb[1] || perm->nb[2] != root->nb[0] ||
+    if (reshape->view_src != root || reshape->view_offs || reshape->ne[0] != 4608 ||
+            reshape->ne[1]*reshape->ne[2] != root->ne[1] || reshape->ne[3] != 1 || !ggml_is_contiguous(reshape) ||
+            perm->view_src != root || perm->view_offs || perm->ne[0] != reshape->ne[1] || perm->ne[1] != reshape->ne[2] ||
+            perm->ne[2] != 4608 || perm->ne[3] != 1 || perm->nb[0] != reshape->nb[1] || perm->nb[1] != reshape->nb[2] ||
+            perm->nb[2] != root->nb[0] ||
             cont->view_src || !ggml_are_same_shape(cont, perm) || !ggml_is_contiguous(cont) ||
             scatter->view_src != cont || scatter->view_offs || !(scatter->flags & GGML_TENSOR_FLAG_META) ||
             !ggml_are_same_shape(scatter, cont) || !ggml_are_same_stride(scatter, cont)) {

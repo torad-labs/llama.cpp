@@ -64,8 +64,9 @@ depth offered. `eval-*.json` holds the cross-entropy and the first-choice agreem
   (`<name>-summary.txt`, `<name>-window.json`, `<name>-server.log`, `<name>.nsys-rep`, `<name>.sqlite.zst`, and the
   setting searches' `trials.jsonl` and `best.json`). The engine seat collects them to
   `~/.local/share/rig/local/jobs/speed-data1/results/` and `…/speed-data2/results/` and puts the text under
-  `docs/torad/research/inkling-2-small/`. When this page was written (5:20 PM CT) they had not arrived on this
-  machine yet.
+  `docs/torad/research/inkling-2-small/`. They arrived at 5:43 and 5:59 PM CT, with a `speed-data4` to follow,
+  and what they show is chapter 14 with its two data files; the `padplain` timeline, taken after the shared
+  pool's padding was fixed, is the one to read for the host route as it now stands.
 - **nsys of the four-card engine work of 2026-11-18**:
   `~/Documents/dev/infra/rig/local-nvme/research/inkling2-tp4-20261118/` (21 GB): `nsys-direct-native/`,
   `nsys-direct-work/`, `nsys-derivative-native/`, `nsys-derivative-work/` and `nsys-window2-production/` each hold

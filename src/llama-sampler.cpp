@@ -7,6 +7,12 @@
 
 #include "ggml-cpp.h"
 
+// llama_sampler_chain_sample_row draws with AVX2 and FMA where the CPU has them: its functions are built for them alone
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define LLAMA_SAMPLER_ROW_VEC __attribute__((target("avx2,fma")))
+#endif
+
 #include <array>
 #include <algorithm>
 #include <cassert>
@@ -4202,6 +4208,9 @@ struct llama_sampler_logit_bias : public llama_sampler_backend {
 
     const std::vector<llama_logit_bias> logit_bias;
 
+    // logit_bias by token, a token's entries in the order they are added (llama_sampler_chain_sample_row)
+    const std::vector<llama_logit_bias> by_token;
+
     std::vector<llama_logit_bias> to_search;
 
     struct ggml_tensor * inp_logit_bias;
@@ -4369,12 +4378,18 @@ struct llama_sampler * llama_sampler_init_logit_bias(
         return llama_sampler_init_empty("?logit-bias");
     }
 
+    std::vector<llama_logit_bias> by_token(logit_bias, logit_bias + n_logit_bias);
+    std::stable_sort(by_token.begin(), by_token.end(), [](const llama_logit_bias & a, const llama_logit_bias & b) {
+        return a.token < b.token;
+    });
+
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_logit_bias_i,
         /* .ctx   = */ new llama_sampler_logit_bias {
             ("logit-bias"),
             /* .n_vocab        = */ n_vocab,
             /* .logit_bias     = */ std::vector<llama_logit_bias>(logit_bias, logit_bias + n_logit_bias),
+            /* .by_token       = */ std::move(by_token),
             /* .to_search      = */ {},
             /* .inp_logit_bias = */ nullptr,
             /* .inp_logit_idxs = */ nullptr,
@@ -4409,6 +4424,230 @@ bool llama_sampler_chain_coupled(const struct llama_sampler * chain) {
         }
     }
     return true;
+}
+
+// one-pass draws
+
+#ifdef LLAMA_SAMPLER_ROW_VEC
+
+// LLAMA_SAMPLING_ONE_PASS_LEGACY=1: llama_sampler_chain_sample_row takes no chain, so every row is sampled through its
+// candidates and the chain's samplers (the behaviour before the one-pass vector draw)
+static bool sampling_one_pass_legacy() {
+    static const bool legacy = ggml_env_switch("LLAMA_SAMPLING_ONE_PASS_LEGACY");
+    return legacy;
+}
+
+// tokens whose probabilities are summed as one; a multiple of 8
+static constexpr int32_t LLAMA_SAMPLER_ROW_BLOCK = 256;
+
+// a row of every token's logit, the biases a chain adds to it (by token) and the temperature it divides by
+struct llama_sampler_row {
+    const float *            logits;
+    int32_t                  n;
+    const llama_logit_bias * bias;
+    size_t                   n_bias;
+    float                    temp;
+};
+
+// Block b of the row with its biases added, n_b tokens, padded with -inf (probability 0) to whole groups of eight. The
+// row's own storage for a whole block no bias falls in, else buf.
+static const float * llama_sampler_row_block(const llama_sampler_row & row, int32_t b, float * buf, int32_t & n_b) {
+    const int32_t beg = b*LLAMA_SAMPLER_ROW_BLOCK;
+    n_b = std::min(LLAMA_SAMPLER_ROW_BLOCK, row.n - beg);
+
+    const llama_logit_bias * end = row.bias + row.n_bias;
+    const llama_logit_bias * lb  = std::lower_bound(row.bias, end, beg, [](const llama_logit_bias & a, int32_t token) {
+        return a.token < token;
+    });
+    if (n_b == LLAMA_SAMPLER_ROW_BLOCK && (lb == end || lb->token >= beg + n_b)) {
+        return row.logits + beg;
+    }
+
+    std::copy(row.logits + beg, row.logits + beg + n_b, buf);
+    std::fill(buf + n_b, buf + LLAMA_SAMPLER_ROW_BLOCK, -INFINITY);
+    for (; lb != end && lb->token < beg + n_b; ++lb) {
+        buf[lb->token - beg] += lb->bias;
+    }
+    return buf;
+}
+
+// ggml_v_expf of ggml-cpu/vec.h for AVX2 and FMA: exp of eight floats, 0 for -inf
+LLAMA_SAMPLER_ROW_VEC static inline __m256 llama_sampler_row_expf(__m256 x) {
+    const __m256 r = _mm256_set1_ps(0x1.8p23f);
+    const __m256 z = _mm256_fmadd_ps(x, _mm256_set1_ps(0x1.715476p+0f), r);
+    const __m256 n = _mm256_sub_ps(z, r);
+    const __m256 b = _mm256_fnmadd_ps(n, _mm256_set1_ps(0x1.7f7d1cp-20f), _mm256_fnmadd_ps(n, _mm256_set1_ps(0x1.62e4p-1f), x));
+    const __m256i e = _mm256_slli_epi32(_mm256_castps_si256(z), 23);
+    const __m256 k = _mm256_castsi256_ps(_mm256_add_epi32(e, _mm256_castps_si256(_mm256_set1_ps(1))));
+    const __m256i c = _mm256_castps_si256(_mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n), _mm256_set1_ps(126), _CMP_GT_OQ));
+    const __m256 u = _mm256_mul_ps(b, b);
+    const __m256 j = _mm256_fmadd_ps(
+            _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_set1_ps(0x1.0e4020p-7f), b, _mm256_set1_ps(0x1.573e2ep-5f)), u,
+                            _mm256_fmadd_ps(_mm256_set1_ps(0x1.555e66p-3f), b, _mm256_set1_ps(0x1.fffdb6p-2f))),
+            u, _mm256_mul_ps(_mm256_set1_ps(0x1.ffffecp-1f), b));
+    if (!_mm256_movemask_ps(_mm256_castsi256_ps(c))) {
+        return _mm256_fmadd_ps(j, k, k);
+    }
+    const __m256i g = _mm256_and_si256(_mm256_castps_si256(_mm256_cmp_ps(n, _mm256_setzero_ps(), _CMP_LE_OQ)), _mm256_set1_epi32(0x82000000u));
+    const __m256 s1 = _mm256_castsi256_ps(_mm256_add_epi32(g, _mm256_set1_epi32(0x7f000000u)));
+    const __m256 s2 = _mm256_castsi256_ps(_mm256_sub_epi32(e, g));
+    const __m256i d = _mm256_castps_si256(_mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n), _mm256_set1_ps(192), _CMP_GT_OQ));
+    return _mm256_or_ps(
+            _mm256_and_ps(_mm256_castsi256_ps(d), _mm256_mul_ps(s1, s1)),
+            _mm256_andnot_ps(_mm256_castsi256_ps(d),
+                    _mm256_or_ps(_mm256_and_ps(_mm256_castsi256_ps(c), _mm256_mul_ps(_mm256_fmadd_ps(s2, j, s2), s1)),
+                                 _mm256_andnot_ps(_mm256_castsi256_ps(c), _mm256_fmadd_ps(k, j, k)))));
+}
+
+// the largest of m's lanes and a block's logits
+LLAMA_SAMPLER_ROW_VEC static __m256 llama_sampler_row_block_max(const float * x, int32_t n_b, __m256 m) {
+    for (int32_t i = 0; i < n_b; i += 8) {
+        m = _mm256_max_ps(m, _mm256_loadu_ps(x + i));
+    }
+    return m;
+}
+
+// p[i] = exp(x[i]/temp - max_l) over a block's logits, and their sum
+LLAMA_SAMPLER_ROW_VEC static double llama_sampler_row_block_probs(const float * x, int32_t n_b, float temp, float max_l, float * p) {
+    const __m256 v_temp = _mm256_set1_ps(temp);
+    const __m256 v_max  = _mm256_set1_ps(max_l);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    for (int32_t i = 0; i < n_b; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        if (temp != 1.0f) {
+            v = _mm256_div_ps(v, v_temp);
+        }
+        v = llama_sampler_row_expf(_mm256_sub_ps(v, v_max));
+        _mm256_storeu_ps(p + i, v);
+        acc0 = _mm256_add_pd(acc0, _mm256_cvtps_pd(_mm256_castps256_ps128(v)));
+        acc1 = _mm256_add_pd(acc1, _mm256_cvtps_pd(_mm256_extractf128_ps(v, 1)));
+    }
+    alignas(32) double lanes[4];
+    _mm256_store_pd(lanes, _mm256_add_pd(acc0, acc1));
+    return (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+}
+
+// The token the row gives at draw rnd of [0, 1): each block's probabilities summed in one pass, then a walk over the
+// block the draw lands in.
+LLAMA_SAMPLER_ROW_VEC static llama_token llama_sampler_row_draw(const llama_sampler_row & row, double rnd) {
+    const int32_t n_blocks = (row.n + LLAMA_SAMPLER_ROW_BLOCK - 1)/LLAMA_SAMPLER_ROW_BLOCK;
+
+    alignas(32) float buf[LLAMA_SAMPLER_ROW_BLOCK];
+    alignas(32) float p[LLAMA_SAMPLER_ROW_BLOCK];
+    int32_t n_b = 0;
+
+    // max logit for numerical stability: the largest quotient is the quotient of the largest
+    __m256 v_max = _mm256_set1_ps(-INFINITY);
+    for (int32_t b = 0; b < n_blocks; ++b) {
+        const float * x = llama_sampler_row_block(row, b, buf, n_b);
+        v_max = llama_sampler_row_block_max(x, n_b, v_max);
+    }
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, v_max);
+    float max_l = *std::max_element(lanes, lanes + 8);
+    if (row.temp != 1.0f) {
+        max_l /= row.temp;
+    }
+
+    std::vector<double> sums(n_blocks);
+    double sum_cum = 0.0;
+    for (int32_t b = 0; b < n_blocks; ++b) {
+        const float * x = llama_sampler_row_block(row, b, buf, n_b);
+        sums[b] = llama_sampler_row_block_probs(x, n_b, row.temp, max_l, p);
+        sum_cum += sums[b];
+    }
+
+    const double sum_tgt = sum_cum*rnd;
+          double sum_run = 0.0;
+
+    int32_t b = 0;
+    while (b + 1 < n_blocks && sum_run + sums[b] < sum_tgt) {
+        sum_run += sums[b++];
+    }
+    // a block's sum is not its tokens added one by one: the walk goes on into the next block when rounding leaves it short
+    for (; b < n_blocks; ++b) {
+        const float * x = llama_sampler_row_block(row, b, buf, n_b);
+        llama_sampler_row_block_probs(x, n_b, row.temp, max_l, p);
+        for (int32_t i = 0; i < n_b; ++i) {
+            sum_run += p[i];
+            if (sum_run >= sum_tgt) {
+                return b*LLAMA_SAMPLER_ROW_BLOCK + i;
+            }
+        }
+    }
+    return row.n - 1;
+}
+
+#endif // LLAMA_SAMPLER_ROW_VEC
+
+llama_token llama_sampler_chain_sample_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab) {
+#ifdef LLAMA_SAMPLER_ROW_VEC
+    static const bool cpu_draws = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    if (!cpu_draws || sampling_one_pass_legacy() || chain == nullptr || chain->iface != &llama_sampler_chain_i || logits == nullptr ||
+            n_vocab < 2) {
+        return LLAMA_TOKEN_NULL;
+    }
+    auto * p = (llama_sampler_chain *) chain->ctx;
+
+    // The chains taken: a logit bias, then a temperature, then the dist sampler, each at most once, among samplers that
+    // change nothing. Backend samplers at the head of an attached chain are skipped as llama_sampler_apply skips them.
+    const llama_sampler_logit_bias * bias = nullptr;
+    llama_sampler_dist *             dist = nullptr;
+    float temp     = 1.0f;
+    bool  has_temp = false;
+    bool  is_backend = p->is_init;
+    for (const auto & s : p->samplers) {
+        if (is_backend && s.is_backend) {
+            continue;
+        }
+        is_backend = false;
+
+        const auto * iface = s.ptr->iface;
+        if (dist != nullptr) {
+            return LLAMA_TOKEN_NULL;
+        }
+        if (iface == &llama_sampler_empty_i) {
+            continue;
+        }
+        if (iface == &llama_sampler_logit_bias_i && bias == nullptr && !has_temp) {
+            bias = (const llama_sampler_logit_bias *) s.ptr->ctx;
+        } else if (iface == &llama_sampler_temp_i && !has_temp) {
+            temp     = ((const llama_sampler_temp *) s.ptr->ctx)->temp;
+            has_temp = true;
+        } else if (iface == &llama_sampler_temp_ext_i && !has_temp && ((const llama_sampler_temp_ext *) s.ptr->ctx)->delta <= 0.0f) {
+            temp     = ((const llama_sampler_temp_ext *) s.ptr->ctx)->temp;
+            has_temp = true;
+        } else if (iface == &llama_sampler_dist_i && !((const llama_sampler_dist *) s.ptr->ctx)->coupled) {
+            dist = (llama_sampler_dist *) s.ptr->ctx;
+        } else {
+            return LLAMA_TOKEN_NULL;
+        }
+    }
+    // a temperature of 0 or less keeps the largest logit alone
+    if (dist == nullptr || !(temp > 0.0f)) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    time_meas tm(p->t_sample_us, p->params.no_perf);
+
+    llama_sampler_row row = { logits, n_vocab, nullptr, 0, temp };
+    if (bias != nullptr) {
+        row.bias   = bias->by_token.data();
+        row.n_bias = bias->by_token.size();
+    }
+
+    // one draw a sample, as llama_sampler_dist_apply takes it
+    std::uniform_real_distribution<double> uni(0.0f, 1.0f);
+    const double rnd = uni(dist->rng);
+
+    return llama_sampler_row_draw(row, rnd);
+#else
+    (void) chain;
+    (void) logits;
+    (void) n_vocab;
+    return LLAMA_TOKEN_NULL;
+#endif
 }
 
 // infill

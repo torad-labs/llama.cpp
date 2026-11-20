@@ -138,7 +138,11 @@ llama_kv_cache::llama_kv_cache(
     // card the crossing step and the one after it took 76 ms more than a 31 ms step. Padded to 256 cells a sequence, the
     // pool crosses as often a step as one sequence does; the next power of two, which GGML_PAD and the pool padding
     // derived from it (llama_kpool_pool_pad) take. LLAMA_KV_PAD_SHARED_LEGACY=1: 256, whatever the pool holds
-    if (hparams.indexer_kpool > 0 && n_stream < n_seq_max) {
+    // Inkling 2 has no indexer, and a pool its sequences share shapes every decode graph the same way: its masks and
+    // positions are as long as the padded pool. 23 sessions crossed 256 cells every 11 steps, and each crossing ran a
+    // step's graphs uncaptured and captured them again (four RTX PRO 6000, -sm tensor, 16K-token sessions, Nov 19, 2026:
+    // 10 of 110 steps captured every graph again). It reads densely at every length, so it pads as a dense pool does
+    if ((hparams.indexer_kpool > 0 || model.arch == LLM_ARCH_INKLING2) && n_stream < n_seq_max) {
         const char * legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
 
         if (!legacy || atoi(legacy) != 1) {
@@ -1473,7 +1477,9 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
     // its top-k picks, so the empty cells it adds are never read. A step of any length in a pool that sequences share is
     // padded to at least n_pad_shared on the same terms. One sequence's decode step, and a step that reads densely in a
     // pool of its own, keep 256
-    const bool scores = n_pad_prefill + n_pad_shared > 0 && result > hparams.indexer_top_k + hparams.indexer_kpool - 1;
+    // the most cells a pool reads densely; a cache with no indexer reads densely at every length
+    const uint32_t n_dense = hparams.indexer_kpool > 0 ? hparams.indexer_top_k + hparams.indexer_kpool - 1 : UINT32_MAX;
+    const bool scores = n_pad_prefill + n_pad_shared > 0 && result > n_dense;
     const uint32_t pad_scoring = std::max(ubatch && ubatch->n_tokens >= 256 ? n_pad_prefill : 0, n_pad_shared);
     if (scores && pad_scoring > pad) {
         pad    = pad_scoring;
@@ -1482,7 +1488,6 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
 
     // a shared pool that reads densely: the next power of two that holds its cells and still reads densely
     if (!scores && pad_dense_shared) {
-        const uint32_t n_dense = hparams.indexer_top_k + hparams.indexer_kpool - 1;
         while (pad < result && 2*pad <= n_pad_shared && padded(2*pad) <= n_dense) {
             pad *= 2;
         }
