@@ -6669,8 +6669,8 @@ private:
     };
 
     std::vector<cpu_sample_result> sample_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
-        const int n_threads = std::min(params_base.cpuparams.n_threads, sample_threads_max());
-        if (n_threads < 2 || n_batch_tokens < 4 || !pull_k.empty() ||
+        const int n_threads_max = std::min(params_base.cpuparams.n_threads, sample_threads_max());
+        if (n_threads_max < 2 || n_batch_tokens < 4 || !pull_k.empty() ||
                 llama_vocab_n_tokens(vocab) < 128*1024) {
             return {};
         }
@@ -6699,6 +6699,9 @@ private:
         if (jobs.size() < 4) {
             return {};
         }
+        // One thread a row, so every row is sampled in one round: 23 sessions on four RTX PRO 6000 measured
+        // 571.0 tokens/s at 23 threads against 560.3 at 32, 554.4 at 16 and 491.8 at the former default of 4
+        const int n_threads = std::min<int>(jobs.size(), n_threads_max);
 
         common_decode_trace::range trace([&] {
             return "stage=cpu_sample iteration=" + std::to_string(trace_id) +
