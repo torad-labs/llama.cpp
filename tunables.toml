@@ -75,7 +75,7 @@ param = [
   { name = "LLAMA_INKLING2_REL_POS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "inkling2", layer = "llama", about = "builds the relative bias of every cell on the host and adds it to the mask (the tests' oracle)" },
   { name = "GGML_CUDA_FATTN_REL_ORDERED_REF", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "inkling2", layer = "cuda", about = "relative attention sums its short rows in double, as the reference" },
 
-  # ---- Shared: knobs read from the environment (66)
+  # ---- Shared: knobs read from the environment (68)
   { name = "GGML_CUDA_ALLREDUCE", available = true, set = "env", type = "str", values = ["nccl", "internal-nccl-gather", "internal", "none"], kind = "knob", scope = "shared", layer = "cuda", about = "who sums the cards' shares: NCCL, the engine's own kernels, or the engine with NCCL for the gather (unset: nccl on Linux, internal elsewhere)" },
   { name = "GGML_CUDA_AR_BF16_THRESHOLD", available = true, set = "env", type = "int", default = 1, min = 0, max = 1099511627776, kind = "knob", scope = "shared", layer = "cuda", output = "rounding", about = "elements from which a share crosses as BF16 (0: never)" },
   { name = "GGML_CUDA_AR_COPY_CHUNK_BYTES", available = true, set = "env", type = "int", default = 0, min = 0, max = 33554432, kind = "knob", scope = "shared", layer = "cuda", about = "chunk of the copy engine in bytes (0: chosen per call)" },
@@ -84,6 +84,7 @@ param = [
   { name = "GGML_CUDA_AR_COPY_THRESHOLD", available = true, set = "env", type = "int", default = 1048576, min = 0, max = 1099511627776, kind = "knob", scope = "shared", layer = "cuda", about = "bytes on the wire from which the copy engine takes a reduction over from the chunked kernel" },
   { name = "GGML_CUDA_AR_GATHER_HOST_SLICES", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "shared", layer = "cuda", launcher = "--reduction-route", about = "a gather moves its slices through the host (when cards do not copy to their peer)" },
   { name = "GGML_CUDA_AR_GATHER_OWNER_SLICES", available = true, set = "env", type = "bool", default = true, kind = "knob", scope = "shared", layer = "cuda", about = "a gather copies each owner's slice card to card (when cards copy to their peer)" },
+  { name = "GGML_CUDA_AR_GATHER_BLOCKS", available = true, set = "env", type = "int", default = 8, min = 1, max = 64, kind = "knob", scope = "shared", layer = "cuda", output = "same", about = "blocks of 256 threads the gather of each rank's own quarter launches with: more of them read the peers' quarters in fewer round trips a thread. More than 8 are for ranks on cards of their own: ranks that share one card can stop (four did at 12 blocks each)" },
   { name = "GGML_CUDA_AR_HOST_OWNER_ROWS", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "shared", layer = "cuda", launcher = "--host-owner-rows", about = "the host route sends each row only to the rank that reads it" },
   { name = "GGML_CUDA_AR_LL_MAX_BYTES", available = true, set = "env", type = "int", default = 16384, min = 0, max = 1048576, kind = "knob", scope = "shared", layer = "cuda", about = "largest reduction the host low-latency path takes (0: off)" },
   { name = "GGML_CUDA_AR_P2P_MAX_BYTES", available = true, set = "env", type = "int", default = 131072, min = 0, max = 1048576, kind = "knob", scope = "shared", layer = "cuda", about = "largest reduction the card-to-card low-latency kernel takes (0: off)" },
@@ -352,8 +353,8 @@ param = [
   { name = "LLAMA_SAMPLER_ATTACH_RESERVE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_SAMPLER_DETACH_RESERVE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_SAMPLING_TIES_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
-  { name = "LLAMA_CHECKPOINT_DEDUP_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },
   { name = "LLAMA_SAMPLING_ONE_PASS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
+  { name = "LLAMA_CHECKPOINT_DEDUP_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },
   { name = "LLAMA_CHECKPOINT_NEAR_END_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },
   { name = "LLAMA_CHECKPOINT_POOL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },
   { name = "LLAMA_CHECKPOINT_SPARE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },

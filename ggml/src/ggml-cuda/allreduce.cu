@@ -80,6 +80,10 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 // slot so multiple SMs can pump PCIe stores in parallel.
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 
+// Arrival slots a rank has in the ring: the most blocks a kernel may launch with. Every kernel indexes the ring by
+// this, so one that launches with more blocks (GGML_CUDA_AR_GATHER_BLOCKS) never lands on another's slots.
+static constexpr int GGML_CUDA_AR_ARRIVAL_BLOCKS = 64;
+
 // A device's value and its peer's: summed in float, each rounded through T_wire first so both devices get the same
 // bits; 32-bit words (ggml_cuda_ar_allgather) are ORed, which keeps every bit of a part the peer has zeros for.
 template <typename T_dst, typename T_wire>
@@ -177,8 +181,8 @@ static __global__ void ggml_cuda_ar_kernel(
     const int slot  = token & 1;
     host_mine  += slot * slot_elems;
     host_other += slot * slot_elems;
-    int       * arrival_mine  = arrival + (size_t) (slot*2 + rank)     * GGML_CUDA_AR_KERNEL_BLOCKS * ARRIVAL_INTS;
-    const int * arrival_other = arrival + (size_t) (slot*2 + 1 - rank) * GGML_CUDA_AR_KERNEL_BLOCKS * ARRIVAL_INTS;
+    int       * arrival_mine  = arrival + (size_t) (slot*2 + rank)     * GGML_CUDA_AR_ARRIVAL_BLOCKS * ARRIVAL_INTS;
+    const int * arrival_other = arrival + (size_t) (slot*2 + 1 - rank) * GGML_CUDA_AR_ARRIVAL_BLOCKS * ARRIVAL_INTS;
 
     // Phase 1: cast sendbuf (T_dst) -> host_mine (T_wire) and store as vectors.
     {
@@ -465,12 +469,12 @@ static __global__ void ggml_cuda_ar_kernel_n(
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
-        int * slots = arrival + (size_t) (token & 1) * n_ranks * GGML_CUDA_AR_KERNEL_BLOCKS * A;
-        ggml_cuda_ar_signal_set(slots + (rank*GGML_CUDA_AR_KERNEL_BLOCKS + bid)*A, token);
+        int * slots = arrival + (size_t) (token & 1) * n_ranks * GGML_CUDA_AR_ARRIVAL_BLOCKS * A;
+        ggml_cuda_ar_signal_set(slots + (rank*GGML_CUDA_AR_ARRIVAL_BLOCKS + bid)*A, token);
         __threadfence_system();
         for (int peer = 0; peer < n_ranks; ++peer) {
             if (peer == rank) { continue; }
-            while (ggml_cuda_ar_signal_get(slots + (peer*GGML_CUDA_AR_KERNEL_BLOCKS + bid)*A) != token) {
+            while (ggml_cuda_ar_signal_get(slots + (peer*GGML_CUDA_AR_ARRIVAL_BLOCKS + bid)*A) != token) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
                 __nanosleep(100);
 #else
@@ -610,12 +614,12 @@ static __global__ void ggml_cuda_ar_owner_gather_kernel_n(
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
-        int * slots = arrival + (size_t) (token & 1) * n_ranks * GGML_CUDA_AR_KERNEL_BLOCKS * A;
-        ggml_cuda_ar_signal_set(slots + (rank*GGML_CUDA_AR_KERNEL_BLOCKS + bid)*A, token);
+        int * slots = arrival + (size_t) (token & 1) * n_ranks * GGML_CUDA_AR_ARRIVAL_BLOCKS * A;
+        ggml_cuda_ar_signal_set(slots + (rank*GGML_CUDA_AR_ARRIVAL_BLOCKS + bid)*A, token);
         __threadfence_system();
         for (int peer = 0; peer < n_ranks; ++peer) {
             if (peer == rank) { continue; }
-            while (ggml_cuda_ar_signal_get(slots + (peer*GGML_CUDA_AR_KERNEL_BLOCKS + bid)*A) != token) {
+            while (ggml_cuda_ar_signal_get(slots + (peer*GGML_CUDA_AR_ARRIVAL_BLOCKS + bid)*A) != token) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
                 __nanosleep(100);
 #else
@@ -700,12 +704,12 @@ static __global__ void ggml_cuda_ar_owner_reduce_kernel_n(
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
-        int * slots = arrival + (size_t) (token & 1) * n_ranks * GGML_CUDA_AR_KERNEL_BLOCKS * A;
-        ggml_cuda_ar_signal_set(slots + (rank*GGML_CUDA_AR_KERNEL_BLOCKS + bid)*A, token);
+        int * slots = arrival + (size_t) (token & 1) * n_ranks * GGML_CUDA_AR_ARRIVAL_BLOCKS * A;
+        ggml_cuda_ar_signal_set(slots + (rank*GGML_CUDA_AR_ARRIVAL_BLOCKS + bid)*A, token);
         __threadfence_system();
         for (int peer = 0; peer < n_ranks; ++peer) {
             if (peer == rank) { continue; }
-            while (ggml_cuda_ar_signal_get(slots + (peer*GGML_CUDA_AR_KERNEL_BLOCKS + bid)*A) != token) {
+            while (ggml_cuda_ar_signal_get(slots + (peer*GGML_CUDA_AR_ARRIVAL_BLOCKS + bid)*A) != token) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
                 __nanosleep(100);
 #else
@@ -967,6 +971,7 @@ struct ggml_cuda_ar_pipeline {
     uint64_t n_host_slice_gathers;
     bool     owner_slices;   // captured gathers write only each rank's own slice to every peer
     bool     host_owner_rows;
+    int      gather_blocks;  // blocks the owner gather launches with (GGML_CUDA_AR_GATHER_BLOCKS)
     bool     reduce_owners;  // a reduce whose result each rank reads only in part sums only that part (ggml_cuda_ar_reduce_owned)
     uint64_t n_reduced_owned; // reductions summed to their owners, and to every rank, logged when the pipeline is freed
     uint64_t n_reduced_all;
@@ -1024,7 +1029,7 @@ struct ggml_cuda_ar_pipeline {
     bool                     dev_tmp_kernel_done_valid;
 
     // Arrival ring: ARRIVAL_STRIDE bytes between adjacent ints, a block of
-    // KERNEL_BLOCKS ints per (slot, rank) in that order (ggml_cuda_ar_kernel
+    // ARRIVAL_BLOCKS ints per (slot, rank) in that order (ggml_cuda_ar_kernel
     // indexes it).  Mapped pinned memory; CPU never reads/writes -- only the
     // kernel and cudaMemset.
     ggml_cuda_ar_host_mapping arrival;
@@ -1356,6 +1361,12 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // Default 1: a reduce whose only reader is a scatter by rows sums each element only on the rank that reads it.
     p->host_owner_rows  = ggml_env_switch("GGML_CUDA_AR_HOST_OWNER_ROWS");
     p->reduce_owners    = ggml_env_switch("GGML_CUDA_AR_REDUCE_OWNERS");
+    // Each thread of the gather reads its share of the peers' quarters one vector after another, and every read of the
+    // mapped memory is a round trip on the bus: more blocks make fewer in a row. Every block waits for the same block of
+    // every peer, so ranks that share one card (the logical ranks of a test) hold it while they wait: on a card of 36 SMs
+    // four ranks stopped in some runs at 12 blocks each and in most at 16, the card not starting the last rank's queued
+    // kernels under the other three's waiting blocks. More than 8 are for ranks on cards of their own.
+    p->gather_blocks    = (int) std::clamp<int64_t>(ggml_env_int("GGML_CUDA_AR_GATHER_BLOCKS"), 1, GGML_CUDA_AR_ARRIVAL_BLOCKS);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -1417,7 +1428,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // Arrival ring: cache-line padded so each GPU's int is on its own line.
     const size_t arrival_bytes =
         (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
-        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+        GGML_CUDA_AR_ARRIVAL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     if (p->arrival.alloc(arrival_bytes) != cudaSuccess) {
         GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes)\n",
                        __func__, arrival_bytes);
@@ -2142,7 +2153,7 @@ static void ggml_cuda_ar_launch_kernels(
                 ggml_cuda_ar_peer_inboxes<T_wire>(p, i, max_chunk_elems, sends, receives);
                 if constexpr (std::is_same_v<T_dst, uint32_t> && std::is_same_v<T_wire, uint32_t>) {
                     if (p->owner_slices && chunk_owner.valid) {
-                        ggml_cuda_ar_owner_gather_kernel_n<<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
+                        ggml_cuda_ar_owner_gather_kernel_n<<<p->gather_blocks, 256, 0, stream>>>(
                             chunk, sends, receives, max_chunk_elems, chunk_owner,
                             reinterpret_cast<int *>(p->arrival.dev), i, p->n_devices, p->counter[i]);
                         CUDA_CHECK(cudaGetLastError());
@@ -2181,7 +2192,7 @@ static void ggml_cuda_ar_launch_kernels(
                     }
                     if constexpr (std::is_same_v<T_dst, uint32_t> && std::is_same_v<T_wire, uint32_t>) {
                         if (host_sliced) {
-                            ggml_cuda_ar_owner_gather_kernel_n<true><<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
+                            ggml_cuda_ar_owner_gather_kernel_n<true><<<p->gather_blocks, 256, 0, stream>>>(
                                 chunk, staging, staging, max_chunk_elems, *owner, reinterpret_cast<int *>(p->arrival.dev),
                                 i, p->n_devices, p->counter[i], chunk_start%owner->host_period, chunk_elems);
                             CUDA_CHECK(cudaGetLastError());
