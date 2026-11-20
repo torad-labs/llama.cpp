@@ -239,7 +239,8 @@ def load(args):
 def send(out, experiment):
     """One MLflow run a trial, over the tracking server's REST API; mlflow.json keeps which trials it already holds."""
     site = os.environ["MLFLOW_TRACKING_URI"].rstrip("/") + "/api/2.0/mlflow/"
-    headers = {"Content-Type": "application/json"}
+    # A client with a name: a tracking server behind a proxy can refuse urllib's own
+    headers = {"Content-Type": "application/json", "User-Agent": "inkling2-search"}
     if os.environ.get("MLFLOW_TRACKING_USERNAME"):
         login = os.environ["MLFLOW_TRACKING_USERNAME"] + ":" + os.environ.get("MLFLOW_TRACKING_PASSWORD", "")
         headers["Authorization"] = "Basic " + base64.b64encode(login.encode()).decode()

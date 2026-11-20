@@ -23,22 +23,29 @@ parser.add_argument("--after", type=int, default=24, help="Tokens every session 
 parser.add_argument("--seconds", type=float, default=6)
 parser.add_argument("--session", required=True, help="The nsys session the server was launched in")
 parser.add_argument("--output", required=True)
+parser.add_argument("--same", action="store_true", help="Every session sends the first one's request and seed, so a step "
+                    "routes 23 copies of one token: the expert kernels do the same arithmetic over 8 experts' weights")
 args = parser.parse_args()
 
 rows = search.prompts(args.url, args.sessions, args.context)
+if args.same:
+    rows = rows[:1] * args.sessions
 counts = [0] * args.sessions
+ids = [None] * args.sessions
 
 
 def client(slot):
-    body = dict(prompt=rows[slot], id_slot=slot, seed=slot, cache_prompt=True, ignore_eos=True, n_predict=args.tokens,
-                stream=True, return_tokens=True)
+    body = dict(prompt=rows[slot], id_slot=slot, seed=0 if args.same else slot, cache_prompt=True, ignore_eos=True,
+                n_predict=args.tokens, stream=True, return_tokens=True)
 
     def seen(item):
         if isinstance(item["event"], dict):
             counts[slot] += len(item["event"].get("tokens") or [])
 
     with search.mixed_prefill.post(args.url, "/completion", body, 7200) as response:
-        return search.glm_measure.read_completion_stream(response, args.tokens, on_event=seen)["response"]["timings"]
+        stream = search.glm_measure.read_completion_stream(response, args.tokens, on_event=seen)
+    ids[slot] = tuple(stream["token_ids"])
+    return stream["response"]["timings"]
 
 
 def nsys(*words):
@@ -70,5 +77,5 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=args.sessions) as pool:
             timings.append(stream.result())
         except Exception as error:  # a stream that failed still leaves the window's own numbers
             timings.append({"error": str(error)})
-    print(json.dumps({"timings": timings}), flush=True)
+    print(json.dumps({"timings": timings, "distinct_streams": len(set(ids))}), flush=True)
 sys.exit(0 if result["start"]["exit"] == 0 and result["stop"]["exit"] == 0 else 1)
