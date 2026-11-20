@@ -1,0 +1,27 @@
+job,stage,build,profile,settings,at,tokens_per_second,wall_tokens_per_second,draft_accepted,rounds,tokens_sha256
+speed-data1,draft,93b78330b,tensor-4-draft,{},2026-11-19T23:08:20+0000,361.1,307.9,0.4402748414376321,3,d8c46e3de7c5bb7f
+speed-data1,draft,93b78330b,tensor-4-draft,"{""LLAMA_SAMPLE_THREADS"": ""1""}",2026-11-19T23:10:45+0000,302.9,262.2,0.4427359490986214,3,16f026c24e415901
+speed-data1,draft,93b78330b,tensor-4-draft,"{""LLAMA_SAMPLE_THREADS"": ""8""}",2026-11-19T23:13:13+0000,373.4,316.9,0.44144620811287477,3,134b09762394d4f5
+speed-data1,draft,93b78330b,tensor-4-draft,"{""LLAMA_SAMPLE_THREADS"": ""16""}",2026-11-19T23:15:28+0000,386.0,319.4,0.4349422875131165,3,f1608d86af9d41b5
+speed-data1,draft,93b78330b,tensor-4-draft,"{""--draft-depth"": ""1"", ""LLAMA_SAMPLE_THREADS"": ""16""}",2026-11-19T23:17:42+0000,393.7,354.5,0.6918335901386748,3,821b63ec4295b831
+speed-data1,draft,93b78330b,tensor-4-draft,"{""--draft-depth"": ""2"", ""LLAMA_SAMPLE_THREADS"": ""16""}",2026-11-19T23:19:53+0000,389.2,334.7,0.5409952606635071,3,2e099d580f2fbe6a
+speed-data1,draft,93b78330b,tensor-4-draft,"{""--draft-depth"": ""4"", ""LLAMA_SAMPLE_THREADS"": ""16""}",2026-11-19T23:22:13+0000,366.4,312.4,0.37320845749964526,3,b70f00a27ad67e96
+speed-data1,draft,93b78330b,tensor-4-draft,"{""--draft"": ""off"", ""LLAMA_SAMPLE_THREADS"": ""16""}",2026-11-19T23:24:32+0000,509.1,474.4,,3,d6544c6e2b8218c0
+speed-data1,engine,93b78330b+owner-rows,tensor-4-draft,{},2026-11-19T22:28:41+0000,424.4,410.0,,3,72be81cfbab7383f
+speed-data1,engine,93b78330b+owner-rows,tensor-4-draft,"{""GGML_CUDA_AR_REDUCE_OWNERS"": ""0""}",2026-11-19T22:30:46+0000,413.2,391.0,,3,af453d2ff5dc51a4
+speed-data1,engine,93b78330b+owner-rows,tensor-4-draft,"{""GGML_CUDA_AR_P2P_MAX_BYTES"": ""262144""}",2026-11-19T22:32:51+0000,386.1,365.8,,3,14535aa0956fd47b
+speed-data1,engine,93b78330b+owner-rows,tensor-4-draft,"{""GGML_CUDA_AR_P2P_MAX_BYTES"": ""1048576""}",2026-11-19T22:35:00+0000,347.9,327.8,,3,c3dd23a680b11ecc
+speed-data1,plain,93b78330b,tensor-4-draft,{},2026-11-19T22:39:00+0000,469.7,440.9,,3,7a536205a7c6a9e1
+speed-data1,plain,93b78330b,tensor-4-draft,"{""--sort-expert-rows"": ""off""}",2026-11-19T22:41:08+0000,465.9,432.9,,3,f7fe5fd004051504
+speed-data1,plain,93b78330b,tensor-4-draft,"{""--expert-row-limit"": ""8""}",2026-11-19T22:43:10+0000,467.6,439.1,,3,c6b7b0849e1fed10
+speed-data1,plain,93b78330b,tensor-4-draft,"{""--expert-row-limit"": ""32""}",2026-11-19T22:45:11+0000,478.7,462.6,,3,e3aff80adb89365e
+speed-data1,plain,93b78330b,tensor-4-draft,"{""--host-owner-rows"": ""off""}",2026-11-19T22:47:12+0000,464.4,430.8,,3,8c24519af8e684fe
+speed-data1,plain,93b78330b,tensor-4-draft,"{""GGML_TENSOR_N_SPLIT_ROWS"": ""0""}",2026-11-19T22:49:14+0000,472.5,438.1,,3,b6ad196b6ef71bf7
+speed-data1,plain,93b78330b,tensor-4-draft,"{""GGML_TENSOR_N_SPLIT_ROWS"": ""64""}",2026-11-19T22:51:15+0000,468.1,436.6,,3,cca057426595495a
+speed-data2,enginedraft,93b78330b+owner-rows-any+pad-shared,tensor-4-draft,{},2026-11-19T23:38:06+0000,372.8,311.5,0.4260027662517289,3,2ce8e5873dab974f
+speed-data2,enginedraft,93b78330b+owner-rows-any+pad-shared,tensor-4-draft,"{""GGML_CUDA_AR_REDUCE_OWNERS"": ""0""}",2026-11-19T23:40:23+0000,360.5,318.9,0.4397887323943662,3,68aa661d51094622
+speed-data2,enginepad,93b78330b+owner-rows-any+pad-shared,tensor-4-draft,{},2026-11-19T23:31:26+0000,481.0,452.1,,3,ca0b50b58457f60c
+speed-data2,pad,93b78330b+owner-rows-any+pad-shared,tensor-4-draft,{},2026-11-19T23:27:27+0000,496.7,464.0,,3,7ec3d938b16d532f
+speed-data2,pad,93b78330b+owner-rows-any+pad-shared,tensor-4-draft,"{""LLAMA_KV_PAD_SHARED_LEGACY"": ""1""}",2026-11-19T23:29:25+0000,474.9,438.9,,3,b2ce0bd28134d980
+speed-data2,paddraft,93b78330b+owner-rows-any+pad-shared,tensor-4-draft,{},2026-11-19T23:33:26+0000,376.1,315.4,0.44879786286731965,3,493eed9981f0f9e8
+speed-data2,paddraft,93b78330b+owner-rows-any+pad-shared,tensor-4-draft,"{""LLAMA_KV_PAD_SHARED_LEGACY"": ""1""}",2026-11-19T23:35:49+0000,370.9,314.6,0.4739937511486859,3,d4fc301212a04ff8
