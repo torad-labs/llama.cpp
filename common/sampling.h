@@ -70,11 +70,15 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // if grammar_first is true, the grammar is applied before the samplers (slower)
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+// token_only: the caller reads the token and no candidate (common_sampler_get_candidates). A row of every token's logit
+// is then drawn in one pass, with no candidates built, where the chain is one llama_sampler_chain_sample_row takes.
+//
+llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false,
+        bool token_only = false);
 
 // Sample a previously fetched row while its output storage remains valid.
 llama_token common_sampler_sample(struct common_sampler * gsmpl, const struct llama_vocab * vocab,
-        const struct llama_sampling_row & row, bool grammar_first = false);
+        const struct llama_sampling_row & row, bool grammar_first = false, bool token_only = false);
 
 // A drafter's token as this sampler's chain would draw it from the drafter's candidates (any order): the chain's
 // penalties, cuts and temperature over them, then the coupled dist sampler's noise for the sample that follows the
@@ -110,7 +114,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         const std::function<void(size_t, llama_token)> & on_sample = nullptr);
 
 // as above, over rows fetched before it: the draft.size() + 1 rows idxs would name. It reads no context, so each
-// sequence of a step can verify its rows on a thread of its own.
+// sequence of a step can verify its rows on a thread of its own. Its samples are token-only (common_sampler_sample):
+// the candidates of a row are not there to read afterwards.
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, const struct llama_vocab * vocab,
         const struct llama_sampling_row * rows, const llama_tokens & draft, bool grammar_first = false,
         const std::function<void(size_t, llama_token)> & on_sample = nullptr);

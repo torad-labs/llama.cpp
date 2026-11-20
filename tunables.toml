@@ -268,7 +268,7 @@ param = [
   { name = "FATTN_KQ_STRIDE", available = false, set = "code", type = "int", default = 256, kind = "knob", scope = "shared", layer = "cuda", where = "ggml/src/ggml-cuda/fattn-common.cuh", about = "cells a fused attention kernel scores in one tile" },
   { name = "graph_slot_max_tokens", available = false, set = "code", type = "int", default = 32, kind = "knob", scope = "shared", layer = "llama", where = "src/llama-context.h", about = "largest step whose graph a context keeps" },
 
-  # ---- Shared: earlier paths, kept behind a switch (100)
+  # ---- Shared: earlier paths, kept behind a switch (101)
   { name = "GGML_CUDA_AR_COPY_TAIL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
@@ -353,6 +353,7 @@ param = [
   { name = "LLAMA_SAMPLER_DETACH_RESERVE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_SAMPLING_TIES_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_CHECKPOINT_DEDUP_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },
+  { name = "LLAMA_SAMPLING_ONE_PASS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_CHECKPOINT_NEAR_END_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },
   { name = "LLAMA_CHECKPOINT_POOL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },
   { name = "LLAMA_CHECKPOINT_SPARE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },

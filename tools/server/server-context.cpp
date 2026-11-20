@@ -6714,7 +6714,7 @@ private:
                 const auto & entry = jobs[i];
                 auto & result = results[entry.slot];
                 try {
-                    result.token = common_sampler_sample(entry.sampler, vocab, entry.row);
+                    result.token = common_sampler_sample(entry.sampler, vocab, entry.row, false, true);
                 } catch (...) {
                     result.error = std::current_exception();
                 }
@@ -6903,7 +6903,8 @@ private:
             }
             if (id == LLAMA_TOKEN_NULL) {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                // the candidates are read for a request that asked for probabilities, and for no other
+                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx, false, slot.task->params.sampling.n_probs == 0);
             }
 
             slot.i_batch = -1;

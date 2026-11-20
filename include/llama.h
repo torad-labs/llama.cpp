@@ -1643,6 +1643,13 @@ extern "C" {
     /// own state: a copy of it applied to another model's logits draws with the noise of the chain's next sample.
     LLAMA_API bool llama_sampler_chain_coupled(const struct llama_sampler * chain);
 
+    /// The token the chain draws from a row of every token's logit (logits[id], n_vocab of them), as llama_sampler_apply
+    /// over all of them as candidates draws it, in one vector pass that builds no candidates. Taken: a chain of a logit
+    /// bias, a fixed temperature above 0 and a dist sampler that is not coupled, on a CPU with AVX2 and FMA. For any
+    /// other chain or CPU it returns LLAMA_TOKEN_NULL and draws nothing: the caller applies the chain. It sums the
+    /// probabilities 256 tokens a block, so a draw within rounding of the edge between two tokens can give the other.
+    LLAMA_API llama_token llama_sampler_chain_sample_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);
