@@ -630,8 +630,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
-        // the MTP store of the target's hidden rows (llama_set_nextn_source): a whole copy on every card, as the rows are
-        if (tensor_name == "mtp_h_store") {
+        // the MTP store of the target's hidden rows (llama_set_nextn_source): a whole copy on every card, as the rows are.
+        // The same for the layer inputs a DFlash/DSpark draft reads (layer_inp_dev): a draft on one card reads its copy
+        if (tensor_name == "mtp_h_store" || tensor_name == "layer_inp_dev") {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (is_inkling2 && std::regex_match(tensor_name, pattern_s_cache)) {

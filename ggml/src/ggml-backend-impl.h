@@ -129,6 +129,10 @@ extern "C" {
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
+    // The copy on dev of a tensor that a meta buffer holds whole on every device (GGML_BACKEND_SPLIT_AXIS_MIRRORED).
+    // Another backend of dev can read it. NULL for a tensor of another layout or buffer, or no copy on dev.
+    GGML_API struct ggml_tensor * ggml_backend_meta_mirrored_tensor(const struct ggml_tensor * tensor, ggml_backend_dev_t dev);
+
     //
     // Backend (stream)
     //

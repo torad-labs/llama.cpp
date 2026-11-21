@@ -2011,6 +2011,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     return ggml_backend_meta_cached_split(tensor, assume_sync).first;
 }
 
+ggml_tensor * ggml_backend_meta_mirrored_tensor(const ggml_tensor * tensor, ggml_backend_dev_t dev) {
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer) ||
+            ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return nullptr;
+    }
+    for (size_t j = 0; j < ggml_backend_meta_buffer_n_bufs(tensor->buffer); ++j) {
+        ggml_backend_buffer_t simple = ggml_backend_meta_buffer_simple_buffer(tensor->buffer, j);
+        if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(simple)) == dev) {
+            return ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        }
+    }
+    return nullptr;
+}
+
 // A pad along the axis its source is split by gathers the source. Each device pads its own slice out to the whole
 // tensor, with zeros where the other devices' slices go (ggml_backend_meta_buffer_make_simple_tensors); the gather after
 // it (the backends' allgather, or ggml_backend_meta_graph_compute's own) puts every slice on every device, bit for bit,
