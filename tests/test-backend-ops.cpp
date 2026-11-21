@@ -14964,6 +14964,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_short_conv(258, 513, 2, 3));
     test_cases.emplace_back(new test_short_conv_window(66, 1, 23, 0, false));
     test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true));
+    test_cases.emplace_back(new test_short_conv_window(4608, 1, 23, 0, false)); // a hidden stream whole, as -sm tensor convolves it
     test_cases.emplace_back(new test_short_conv_window(256, 5, 3, 2, false));
     test_cases.emplace_back(new test_short_conv_window(257, 16, 2, 0, true));
     // past the fused kernel's token cap: the plain CONCAT + SHORT_CONV chain
@@ -17782,6 +17783,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the same two decode shapes behind their history CONCAT, which the perf run times as one graph
     test_cases.emplace_back(new test_short_conv_window(256, 1, 23, 2, false));
     test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true));
+    // a hidden stream under -sm tensor on four cards: its whole 4,608 channels on every card after one all-reduce, against
+    // one card's 1,152 of a scattered shard (LLAMA_INKLING2_HIDDEN_CONV_LEGACY), at 23 rows and a drafted step's 4 a session
+    test_cases.emplace_back(new test_short_conv_window(4608, 1, 23, 0, false));
+    test_cases.emplace_back(new test_short_conv_window(1152, 4, 23, 0, true));
+    test_cases.emplace_back(new test_short_conv_window(4608, 4, 23, 0, false));
     // Inkling Q3_K_M, 23 decode rows. TP4 splits 2304 intermediate channels in blocks of 256, with gate and up packed together.
     for (int64_t n_ff : {512, 768}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 2*n_ff, 23, 4608));

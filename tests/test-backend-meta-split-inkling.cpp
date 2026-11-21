@@ -3,7 +3,9 @@
 // attention shape (48 query and 8 KV heads of 128, n_embd 4608, five sliding layers to a global one, kernel 4) is
 // created over the meta backend with no data, with its caches, and every tensor of the model and of its memory is
 // looked up by name: a name the table below does not know fails, and so does a tensor split another way than its
-// heads are, or mirrored where it should be split. The KV caches and the convolution state are split by KV heads.
+// heads are, or mirrored where it should be split. The KV caches and K's and V's convolution state are split by KV
+// heads; the hidden streams' state (the S state) and kernels are whole on every rank, or, with
+// LLAMA_INKLING2_HIDDEN_CONV_LEGACY, in the conv row split by channel as the KV heads are.
 //
 // The split is over two and four ranks evenly and over two at 3:7. Each layer's heads are those its attn_k is split
 // into, and a query head goes with its KV head: a tensor per query head has n_head/n_head_kv of them a KV head.
@@ -38,6 +40,8 @@ constexpr uint32_t n_expert  = 8;
 
 // LLAMA_INKLING2_EXPERT_SPLIT: each rank holds its share of the experts whole
 bool by_expert = false;
+// LLAMA_INKLING2_HIDDEN_CONV_LEGACY: the hidden streams' state shares the conv row and splits by channel
+bool hidden_legacy = false;
 
 gguf_context_ptr inkling_gguf() {
     gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
@@ -106,11 +110,16 @@ bool expect(const std::string & name, const llama_hparams & hp, const std::vecto
     } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.attn_(k|v)_conv_proj\\.weight"))) {
         out = {1, {times(kv, kernel)}};
     } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.(attn|ffn)_post_conv\\.weight"))) {
-        out = {1, {times(kv, channels)}};
+        // the hidden streams' kernels: whole on every rank, as their state (cache_s) is, or split as the legacy row
+        out = hidden_legacy ? expected{1, {times(kv, channels)}} : expected{GGML_BACKEND_SPLIT_AXIS_MIRRORED, {}};
     } else if (std::regex_match(name, std::regex("cache_r_l\\d+"))) {
-        // the state's streams: K, V, the attention's and the feed-forward's hidden stream, kernel - 1 columns each
-        out = {0, {times(kv, (kernel - 1)*head_dim), times(kv, (kernel - 1)*head_dim),
-                   times(kv, (kernel - 1)*channels), times(kv, (kernel - 1)*channels)}};
+        // the state's streams: K, V, and in the legacy row the attention's and the feed-forward's hidden stream, kernel - 1
+        // columns each
+        out = {0, {times(kv, (kernel - 1)*head_dim), times(kv, (kernel - 1)*head_dim)}};
+        if (hidden_legacy) {
+            out.segments.push_back(times(kv, (kernel - 1)*channels));
+            out.segments.push_back(times(kv, (kernel - 1)*channels));
+        }
     } else if (by_expert && std::regex_match(name, std::regex("blk\\.\\d+\\.ffn_(gate_up|down)_exps\\.weight"))) {
         out = {2, {std::vector<int64_t>(kv.size(), n_expert/kv.size())}};
     } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.ffn_gate_up_exps\\.weight|output\\.weight"))) {
@@ -144,7 +153,9 @@ bool check(const ggml_tensor * t, const llama_meta_device_get_split_state_userda
     expected want;
     bool ok = expect(t->name, ud.model->hparams, kv, q, want);
     if (ok && std::regex_match(t->name, std::regex("cache_s_l\\d+"))) {
-        ok = ggml_nelements(t) == 0; // the recurrent memory's S state, which Inkling has none of
+        // the recurrent memory's S state: the two hidden streams' last kernel - 1 positions, none in the legacy row
+        const int64_t width = hidden_legacy ? 0 : 2*int64_t(n_embd)*(ud.model->hparams.n_shortconv_l_cache - 1);
+        ok = t->ne[0] == width;
     }
     if (ok && want.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
         ok = s.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
@@ -280,8 +291,9 @@ bool test_split(ggml_backend_dev_t gpu, size_t n_ranks, const std::vector<float>
     if (!tensor_split.empty()) {
         split = std::to_string(int(tensor_split[0])) + ":" + std::to_string(int(tensor_split[1]));
     }
-    printf("%s inkling2 tensor split, %zu ranks %s%s: %d weights and %d caches as their heads are split\n",
-            ok ? "ok  " : "FAIL", n_ranks, split.c_str(), by_expert ? ", experts whole" : "", n_weights, n_caches);
+    printf("%s inkling2 tensor split, %zu ranks %s%s%s: %d weights and %d caches as their heads are split\n",
+            ok ? "ok  " : "FAIL", n_ranks, split.c_str(), by_expert ? ", experts whole" : "",
+            hidden_legacy ? ", hidden state in the conv row" : "", n_weights, n_caches);
     return ok;
 }
 
@@ -298,5 +310,10 @@ bool test_inkling_split_decisions(ggml_backend_dev_t gpu) {
     ok = test_split(gpu, 4, {}) && ok;
     unsetenv("LLAMA_INKLING2_EXPERT_SPLIT");
     by_expert = false;
+    setenv("LLAMA_INKLING2_HIDDEN_CONV_LEGACY", "1", 1);
+    hidden_legacy = true;
+    ok = test_split(gpu, 4, {}) && ok;
+    unsetenv("LLAMA_INKLING2_HIDDEN_CONV_LEGACY");
+    hidden_legacy = false;
     return ok;
 }
