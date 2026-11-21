@@ -6744,7 +6744,7 @@ private:
             (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
     }
 
-    // The slots that verify a draft by sampling its rows and matching do it side by side. Every row is a sample over the
+    // The slots that verify a draft by sampling its rows, matching or by rejection, do it side by side. Every row is a sample over the
     // whole vocabulary on the CPU, and slot after slot they were a quarter of a round at 23 sessions (74 ms of 305 on
     // four cards, 2026-11-19). A slot left out here verifies in post_decode as before.
     std::vector<spec_verify_result> verify_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
@@ -6765,14 +6765,18 @@ private:
                     !common_sampler_backend_passive(slot.smpl.get())) {
                 continue;
             }
-            // a replay or a draft that came with its distribution is verified by rejection
-            if (slot.use_spec_rejection() && (slot.spec_is_replay || !slot.spec_draft_q.empty())) {
+            // a replay is verified in post_decode, and a draft that came with its distribution by rejection here.
+            // LLAMA_SPEC_REJECT_SERIAL_LEGACY=1: by rejection in post_decode, slot after slot
+            static const bool reject_serial = ggml_env_switch("LLAMA_SPEC_REJECT_SERIAL_LEGACY");
+            const bool reject = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+            if (slot.use_spec_rejection() && (slot.spec_is_replay || (reject && reject_serial))) {
                 continue;
             }
             common_speculative_verify seq;
             seq.smpl        = slot.smpl.get();
             seq.draft       = &slot.spec_draft;
             seq.n_remaining = slot.n_remaining();
+            seq.draft_q     = reject ? &slot.spec_draft_q : nullptr;
             for (const auto idx : slot.spec_i_batch) {
                 const auto row = llama_get_sampling_row_ith(ctx_tgt, idx - off);
                 if (!row.logits || row.token != LLAMA_TOKEN_NULL) {

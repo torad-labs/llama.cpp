@@ -1234,13 +1234,24 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
 
 // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
 // Preserves the target distribution exactly, and accepts more often than matching does when the
-// draft samples instead of taking its argmax.
-std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
-    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+// draft samples instead of taking its argmax. row(i) is the row of draft token i, and at draft.size() the row after it.
+// A row of every token's logit, with no grammar or forcing budget, is checked in one vector pass where the chain allows
+// it (llama_sampler_chain_reject_row); any other row is sampled through its candidates.
+template <typename row_fn>
+static std::vector<llama_token> sample_and_accept_n_rejection(struct common_sampler * gsmpl, const struct llama_vocab * vocab,
+        const row_fn & row, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q,
+        bool grammar_first, bool token_only) {
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const auto one_pass = [&](const llama_sampling_row & r) {
+        return r.token == LLAMA_TOKEN_NULL && r.logits != nullptr && r.sampled_logits == nullptr && r.sampled_probs == nullptr &&
+            !grammar_should_apply(gsmpl) &&
+            !(gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING);
+    };
+
     std::vector<llama_token> result;
-    result.reserve(idxs.size());
+    result.reserve(draft.size() + 1);
 
     // draws come from the sampler's own stream, so they stay independent of what was drafted
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
@@ -1249,13 +1260,34 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
 
+    std::vector<uint64_t> in_q; // a bit a token of q, so the residual looks q up only for the tokens it holds
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
+        const auto & q = draft_q[i];
+
+        const llama_sampling_row r = row(i);
+        if (one_pass(r)) {
+            const double u_accept   = uni(gsmpl->rng);
+            const double u_residual = uni(gsmpl->rng);
+            const llama_token id = llama_sampler_chain_reject_row(gsmpl->chain, r.logits, n_vocab, draft[i], q.data(), q.size(),
+                    u_accept, u_residual);
+            if (id != LLAMA_TOKEN_NULL) {
+                // no candidates were built for this row
+                gsmpl->cur_p = { nullptr, 0, -1, true };
+                common_sampler_accept(gsmpl, id, true);
+                result.push_back(id);
+                if (id == draft[i]) {
+                    continue;
+                }
+                break;
+            }
+        }
+
         // leaves the target distribution in the candidate array
-        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id_tgt = common_sampler_sample(gsmpl, vocab, r, grammar_first);
 
         const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
-        const auto & q     = draft_q[i];
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
         if (masked) {
@@ -1301,10 +1333,22 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         }
 
         // rejected: tokens outside q's support keep all of p
+        llama_token q_max = 0;
+        for (const auto & e : q) {
+            q_max = std::max(q_max, e.id);
+        }
+        in_q.assign(q_max/64 + 1, 0);
+        for (const auto & e : q) {
+            in_q[e.id/64] |= 1ull << (e.id%64);
+        }
+        const auto q_of = [&](llama_token id) {
+            return id >= 0 && id <= q_max && (in_q[id/64] >> (id%64) & 1) ? prob_of(q.data(), q.size(), id) : 0.0f;
+        };
+
         residual.clear();
         float sum = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            const float r = p_of(k) - q_of(cur_p->data[k].id);
             if (r > 0.0f) {
                 residual.push_back({ cur_p->data[k].id, 0.0f, r });
                 sum += r;
@@ -1331,7 +1375,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = common_sampler_sample(gsmpl, vocab, row(i), grammar_first, token_only);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -1339,6 +1383,23 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     }
 
     return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    const auto row = [&](size_t i) {
+        return llama_get_sampling_row_ith(ctx, idxs[i]);
+    };
+    return sample_and_accept_n_rejection(gsmpl, llama_model_get_vocab(llama_get_model(ctx)), row, draft, draft_q, grammar_first, false);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, const struct llama_vocab * vocab,
+        const struct llama_sampling_row * rows, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q,
+        bool grammar_first) {
+    const auto row = [&](size_t i) {
+        return rows[i];
+    };
+    return sample_and_accept_n_rejection(gsmpl, vocab, row, draft, draft_q, grammar_first, true);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {

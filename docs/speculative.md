@@ -132,6 +132,10 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 acceptance (from the draft's confidence head) falls below `P` (default 0 = disabled).
 Values above 0 require a draft with a confidence head.
 
+With `--spec-draft-sampling probabilistic`, an Inkling 2 DSpark draft samples each block position at the
+request's temperature from its `LLAMA_SPEC_DSPARK_DRAW_K` (default 64) largest logits, and the Markov head's
+next step reads the sampled token in the graph. The target verifies the draft by rejection sampling.
+
 Currently only drafts with a Qwen3 backbone are supported; support for other backbones
 (e.g. Gemma4) is planned.
 

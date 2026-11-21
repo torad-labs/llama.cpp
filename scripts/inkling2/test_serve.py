@@ -50,12 +50,14 @@ class ProfilePlanTest(unittest.TestCase):
             auto, _ = plan("--packs", root, "--profile", "tensor-4-draft")
             for flag, value in {
                 "--spec-type": "draft-dspark", "--spec-draft-model": str(draft),
-                "--spec-draft-n-max": "3", "--spec-draft-sampling": "greedy",
+                "--spec-draft-n-max": "3", "--spec-draft-sampling": "probabilistic",
                 "--spec-draft-device": "CUDA3", "--spec-draft-type-k": "q8_0",
                 "--cache-type-k": "q8_0", "--cache-type-k-swa": "f16", "-c": "1572864", "-ub": "256",
             }.items():
                 self.assertEqual(auto[auto.index(flag) + 1], value)
             self.assertEqual(auto, plan("--packs", root, "--draft")[0])
+            greedy, _ = plan("--packs", root, "--draft", "--draft-sampling", "greedy")
+            self.assertEqual(greedy[greedy.index("--spec-draft-sampling") + 1], "greedy")
             override, _ = plan("--packs", root, "--draft", "--ubatch-size", "512")
             self.assertEqual(override[override.index("-ub") + 1], "512")
             self.assertEqual(plain, plan("--packs", root, "--no-draft")[0])

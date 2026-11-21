@@ -1,6 +1,8 @@
+import math
 import pytest
 from concurrent.futures import ThreadPoolExecutor
 from utils import *
+import inkling_fixture as fx
 
 # We use a F16 MOE gguf as main model, and q4_0 as draft model
 
@@ -402,4 +404,130 @@ def test_mtp_vocab_without_draft_mtp_is_refused(tmp_path):
     server.spec_draft_mtp_vocab = str(vocab)
     with pytest.raises(RuntimeError, match="Server process died"):
         server.start()
+
+
+# The synthetic Inkling 2 target (128 tokens) and a DSpark draft of random weights for it, small enough to sample
+# thousands of replies
+INKLING_PROMPT = [5, 17, 42, 9, 77, 3, 61, 28]
+
+
+@pytest.fixture(scope="module")
+def inkling_pair(tmp_path_factory):
+    folder = tmp_path_factory.mktemp("inkling-dspark")
+    target = fx.write_model(str(folder))
+    draft = str(folder / "draft.gguf")
+    fx.write_dspark_draft(draft, target)
+    return target, draft
+
+
+def create_inkling_server(pair: tuple[str, str], sampling: str) -> ServerProcess:
+    s = ServerProcess()
+    s.model_hf_repo = None
+    s.model_hf_file = None
+    s.model_file, s.model_draft = pair
+    s.spec_type = "draft-dspark"
+    s.spec_draft_n_max = 3
+    s.spec_draft_n_min = 1
+    s.spec_draft_p_min = 0
+    s.spec_draft_sampling = sampling
+    s.n_ctx = 256
+    s.n_slots = 1
+    s.n_gpu_layer = int(os.environ.get("N_GPU_LAYERS", 99))
+    s.spec_draft_n_gpu_layer = s.n_gpu_layer
+    s.server_metrics = True
+    return s
+
+
+def inkling_reply(s: ServerProcess, seed: int, temperature: float, n_probs: int = 0) -> dict:
+    res = s.make_request("POST", "/completion", data={
+        "prompt": INKLING_PROMPT,
+        "temperature": temperature,
+        "top_k": 0,
+        "top_p": 1.0,
+        "min_p": 0.0,
+        "seed": seed,
+        "n_predict": 4,
+        "n_probs": n_probs,
+        "return_tokens": True,
+    })
+    assert res.status_code == 200
+    return res.body
+
+
+def spec_counts(s: ServerProcess) -> tuple[float, float, float]:
+    body = s.make_request("GET", "/metrics").body
+    values = []
+    for name in ("draft_tokens", "accepted_tokens", "drafts"):
+        m = re.search(rf"^llamacpp:spec_decode_num_{name}_total (\S+)$", body, re.MULTILINE)
+        assert m is not None
+        values.append(float(m.group(1)))
+    return values[0], values[1], values[2]
+
+
+def test_inkling_dspark_sampled_draft_keeps_the_target_distribution(inkling_pair):
+    # Every reply token is a sample of the target's distribution given the tokens before it, whether the draft proposed
+    # it or not: over many replies, the count of each token at a position matches the sum of the probabilities the
+    # target gave it there (each reply's n_probs rows, read from the verified rows), within a chi-square bound
+    s = create_inkling_server(inkling_pair, "probabilistic")
+    s.start()
+    n_replies = int(os.environ.get("INKLING_DSPARK_REPLIES", 4000))
+    expected = [{} for _ in range(4)]
+    observed = [{} for _ in range(4)]
+    try:
+        for seed in range(n_replies):
+            body = inkling_reply(s, seed, 1.0, n_probs=128)
+            for i, tok in enumerate(body["completion_probabilities"]):
+                observed[i][tok["id"]] = observed[i].get(tok["id"], 0) + 1
+                for cand in tok["top_logprobs"]:
+                    expected[i][cand["id"]] = expected[i].get(cand["id"], 0.0) + math.exp(cand["logprob"])
+        drafted, accepted, _ = spec_counts(s)
+    finally:
+        s.stop()
+    assert drafted > 0 and accepted > 0
+    for i in range(4):
+        # cells under 5 expected are pooled into one
+        chi2, cells, pooled_e, pooled_o = 0.0, 0, 0.0, 0
+        for tok, e in expected[i].items():
+            o = observed[i].get(tok, 0)
+            if e < 5.0:
+                pooled_e += e
+                pooled_o += o
+                continue
+            chi2 += (o - e)**2/e
+            cells += 1
+        if pooled_e >= 5.0:
+            chi2 += (pooled_o - pooled_e)**2/pooled_e
+            cells += 1
+        dof = cells - 1
+        bound = dof + 6.0*math.sqrt(2.0*dof)
+        print(f"INKLING_DSPARK_EXACT position {i}: chi-square {chi2:.1f} over {dof} dof (bound {bound:.1f}), "
+              f"drafted {drafted:.0f} accepted {accepted:.0f}")
+        assert chi2 < bound, f"position {i}: chi-square {chi2:.1f} over {dof} dof"
+
+
+def test_inkling_dspark_sampled_draft_acceptance(inkling_pair):
+    # the same replies at temperature 1, drafted greedily and verified by matching, then sampled and verified by
+    # rejection; at temperature 0 the sampled draft's graph keeps the greedy chain, so both draft and keep alike
+    n_replies = int(os.environ.get("INKLING_DSPARK_REPLIES", 4000)) // 4
+    rates = {}
+    at_zero = {}
+    for sampling in ("greedy", "probabilistic"):
+        s = create_inkling_server(inkling_pair, sampling)
+        s.start()
+        try:
+            for seed in range(n_replies):
+                inkling_reply(s, seed, 1.0)
+            drafted, accepted, drafts = spec_counts(s)
+            for seed in range(16):
+                inkling_reply(s, seed, 0.0)
+            after = spec_counts(s)
+        finally:
+            s.stop()
+        rates[sampling] = (accepted/drafted, 1.0 + accepted/drafts)
+        at_zero[sampling] = (after[0] - drafted, after[1] - accepted)
+        print(f"INKLING_DSPARK_ACCEPT {sampling}: drafted {drafted:.0f} accepted {accepted:.0f} rounds {drafts:.0f} "
+              f"accept rate {rates[sampling][0]:.4f} tokens a round {rates[sampling][1]:.4f}; "
+              f"at temperature 0 drafted {at_zero[sampling][0]:.0f} accepted {at_zero[sampling][1]:.0f}")
+    assert rates["greedy"][0] > 0 and rates["probabilistic"][0] > 0
+    assert at_zero["greedy"] == at_zero["probabilistic"]
 

@@ -698,6 +698,31 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
     return ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, logits, 1.0f/cap)), cap);
 }
 
+// Draws the token of each column of logits [vocab, nb] from its k largest at the column's inverse temperature: the k in
+// token id order, the first whose cumulative probability is above the column's uniform. An inverse temperature of 0 keeps
+// first, the column's first maximum. The host draws the same way from the same k candidates (common/speculative.cpp,
+// dspark_draw), so the token a step conditions on is the token the host proposes.
+static ggml_tensor * build_inkling2_draw(ggml_context * ctx0, ggml_tensor * logits, ggml_tensor * first,
+        ggml_tensor * uniform, ggml_tensor * inv_temp, int64_t k) {
+    const int64_t vocab = logits->ne[0];
+    const int64_t nb = logits->ne[1];
+    auto * top = ggml_top_k(ctx0, logits, k);
+    auto * order = ggml_argsort(ctx0, ggml_cast(ctx0, top, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);
+    auto * ids = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, top, 1, k, nb), order);
+    auto * vals = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, vocab, nb), ggml_reshape_2d(ctx0, ids, k, nb));
+    auto * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, ggml_reshape_2d(ctx0, vals, k, nb), inv_temp));
+    auto * cdf = ggml_cumsum(ctx0, probs);
+    // the uniform is scaled to the sum the round-off leaves, so the token drawn always has a probability above 0
+    auto * total = ggml_cont(ctx0, ggml_view_2d(ctx0, cdf, 1, nb, cdf->nb[1], (k - 1)*cdf->nb[0]));
+    auto * above = ggml_step(ctx0, ggml_sub(ctx0, cdf, ggml_mul(ctx0, uniform, total)));
+    auto * pick = ggml_scale_bias(ctx0, ggml_clamp(ctx0, ggml_sum_rows(ctx0, above), 1.0f, (float) k), -1.0f, (float) k);
+    auto * drawn = ggml_get_rows(ctx0, ggml_cast(ctx0, ids, GGML_TYPE_F32), ggml_cast(ctx0, pick, GGML_TYPE_I32));
+    drawn = ggml_reshape_2d(ctx0, drawn, 1, nb);
+    auto * first_f = ggml_reshape_2d(ctx0, ggml_cast(ctx0, first, GGML_TYPE_F32), 1, nb);
+    auto * token = ggml_add(ctx0, first_f, ggml_mul(ctx0, ggml_step(ctx0, inv_temp), ggml_sub(ctx0, drawn, first_f)));
+    return ggml_reshape_1d(ctx0, ggml_cast(ctx0, token, GGML_TYPE_I32), nb);
+}
+
 static int64_t inkling2_draft_rows(const llama_ubatch & ubatch, int64_t n_outputs) {
     const int64_t n_seq = ubatch.n_seqs_unq;
     const int64_t block = ubatch.n_tokens/n_seq;
@@ -840,6 +865,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     auto * logits = column(base, 0, head_rows);
     auto * context = column(f_rnn, 0, block);
     ggml_tensor * tie_rank = nullptr;
+    const int64_t n_draw = std::min<int64_t>(cparams.n_out_candidates, hparams.n_vocab_unpadded);
     auto * prev = ids;
     for (int64_t i = 1; i < head_rows; ++i) {
         auto * col = build_inkling2_head(*this, draft, output, output_s, prev, state,
@@ -859,6 +885,14 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         auto * below = ggml_sub(ctx0, ggml_repeat(ctx0, ggml_reshape_2d(ctx0, maximum, 1, nb), valid), valid);
         auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, below), -1.0f, 1.0f);
         prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
+        // the host reads k > 1 candidates a row when it samples the draft: a block row past the anchor carries its
+        // step's uniform and the sequence's inverse temperature in the first two values of its state
+        if (n_draw > 1) {
+            const auto draw_in = [&](int64_t j) {
+                return ggml_cont(ctx0, ggml_view_2d(ctx0, f_rnn, 1, nb, block*f_rnn->nb[1], i*f_rnn->nb[1] + j*f_rnn->nb[0]));
+            };
+            prev = build_inkling2_draw(ctx0, valid, prev, draw_in(0), draw_in(1), n_draw);
+        }
     }
     logits = ggml_reshape_3d(ctx0, logits, logits->ne[0], nb, head_rows);
     logits = ggml_cont_2d(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3), logits->ne[0], head_rows*nb);

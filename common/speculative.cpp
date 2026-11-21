@@ -1535,6 +1535,49 @@ public:
     }
 };
 
+// Draws a row of the Inkling DSpark draft from its candidates (its k largest logits) as the draft graph draws a step's
+// token (build_inkling2_draw, src/models/dflash.cpp): in token id order at inverse temperature inv_temp, the first whose
+// cumulative probability is above u. q gets the distribution the token was drawn from, for rejection sampling.
+static llama_token dspark_draw(const llama_sampling_row & row, float inv_temp, float u, std::vector<llama_token_data> & q) {
+    GGML_ASSERT(row.candidates && row.sampled_logits && row.n_candidates > 0 && "a sampled DSpark draft reads candidate rows");
+
+    q.clear();
+    for (uint32_t k = 0; k < row.n_candidates; ++k) {
+        q.push_back({ row.candidates[k], row.sampled_logits[k], 0.0f });
+    }
+    std::sort(q.begin(), q.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
+
+    float max_l = -INFINITY;
+    for (const auto & c : q) {
+        max_l = std::max(max_l, c.logit*inv_temp);
+    }
+    float sum = 0.0f;
+    for (auto & c : q) {
+        c.p = expf(c.logit*inv_temp - max_l);
+        sum += c.p;
+    }
+    float total = 0.0f;
+    for (auto & c : q) {
+        c.p /= sum;
+        total += c.p;
+    }
+
+    // u is scaled to the sum the round-off leaves, so the token drawn always has a probability above 0
+    float cdf = 0.0f;
+    for (const auto & c : q) {
+        cdf += c.p;
+        if (cdf > u*total) {
+            return c.id;
+        }
+    }
+    for (auto it = q.rbegin(); it != q.rend(); ++it) {
+        if (it->p > 0.0f) {
+            return it->id;
+        }
+    }
+    return q.back().id;
+}
+
 // DSpark: a semi-autoregressive Markov head (+ Confidence head) on the block, anchor-first block layout
 struct common_speculative_impl_draft_dspark final : public common_speculative_impl_draft_dflash {
     // bonus anchor (SpecForge exports) when false: slot 0 is a bonus token, not a prediction slot
@@ -1546,6 +1589,13 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     std::vector<llama_pos> context_pos;
     std::vector<float> context_embd;
     std::vector<float> context_tail;
+
+    // Inkling sampled drafting: the k candidates a row is drawn from (0: greedy), a generator a sequence and the seed it was
+    // seeded with (-1: reseed), and the state rows that carry each step's uniform and inverse temperature to the graph
+    int32_t draw_k = 0;
+    std::vector<std::mt19937> draw_rng;
+    std::vector<int64_t> draw_seed;
+    std::vector<float> draw_state;
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
@@ -1565,9 +1615,6 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             if (n_embd_tgt != n_embd_dec || sample_from_anchor || causal_attn ||
                     target_layer_ids[target_layer_ids_n - 1] != llama_model_n_layer(llama_get_model(this->params.ctx_tgt))) {
                 throw std::runtime_error("Inkling2 DSpark target and draft do not match");
-            }
-            if (this->params.probabilistic) {
-                throw std::runtime_error("Inkling2 DSpark requires --spec-draft-sampling greedy");
             }
             // Keep enough rows for the accepted boundary after discarding a verification suffix.
             context_rows = block_size + 1;
@@ -1599,8 +1646,19 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         if (inkling) {
             context_on_device = llama_set_embeddings_nextn_dev(this->params.ctx_dft, true);
             cand_rows = this->params.backend_sampling && !common_output_candidates_legacy();
+            // the graph draws each step from the k candidates the host reads, so a sampled draft needs them
+            if (this->params.probabilistic && !cand_rows) {
+                throw std::runtime_error("Inkling2 DSpark --spec-draft-sampling probabilistic needs draft backend sampling and output candidates");
+            }
+            if (this->params.probabilistic) {
+                draw_k = (int32_t) ggml_env_int("LLAMA_SPEC_DSPARK_DRAW_K");
+                draw_rng.resize(n_seq);
+                draw_seed.assign(n_seq, -1);
+                draw_state.assign(size_t(n_seq)*block_size*n_embd_dec, 0.0f);
+                LOG_INF("%s: - Inkling2 DSpark samples its draft from the %d largest logits a row\n", __func__, draw_k);
+            }
             if (cand_rows) {
-                llama_set_output_candidates(this->params.ctx_dft, 1);
+                llama_set_output_candidates(this->params.ctx_dft, std::max(1, draw_k));
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     llama_set_seq_candidates(this->params.ctx_dft, seq_id, true);
                 }
@@ -1619,6 +1677,15 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 
     // the device copy of the context rows is placed by batch row; the host copy follows the micro-batches' order
     bool feed_together() const override { return !inkling || context_on_device; }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (seq_id >= 0 && (size_t) seq_id < draw_seed.size()) {
+            // reseed per request rather than per round, or two identical requests differ
+            draw_seed[seq_id] = -1;
+        }
+
+        common_speculative_impl_draft_dflash::begin(seq_id, prompt);
+    }
 
     void store_context_features(llama_seq_id seq_id, int32_t first, int32_t n_chunk) override {
         if (!inkling) {
@@ -1706,6 +1773,25 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
                 }
             }
 
+            // a block row past the anchor carries its draw to the graph: the row's uniform and the inverse temperature,
+            // which is 0 for a sequence the target samples greedily (the graph then keeps the first maximum)
+            float * draw = nullptr;
+            if (draw_k > 0) {
+                draw = draw_state.data() + size_t(seq_id)*block_size*n_embd_dec;
+                const bool sample = samples(dp);
+                if (sample && draw_seed[seq_id] != dp.seed) {
+                    draw_seed[seq_id] = dp.seed;
+                    // the default seed means random; mixed so it differs from the target's, as in spec_retune
+                    draw_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                }
+                std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+                for (int32_t i = 1; i < block_size; ++i) {
+                    draw[size_t(i)*n_embd_dec + 0] = sample && i <= params.n_max ?
+                        std::min(uniform(draw_rng[seq_id]), std::nextafter(1.0f, 0.0f)) : 0.0f;
+                    draw[size_t(i)*n_embd_dec + 1] = sample ? 1.0f/dp.temp : 0.0f;
+                }
+            }
+
             const int32_t n_block_tokens = inkling ? block_size : params.n_max + (sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
@@ -1713,7 +1799,8 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
                 const bool output = !inkling || i <= params.n_max;
                 const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
                 if (inkling) {
-                    batch.set_embd_state(idx, {context_embd.data() + context_row*n_embd_dec, 1, size_t(n_embd_dec)});
+                    const float * state = draw && i > 0 ? draw + size_t(i)*n_embd_dec : context_embd.data() + context_row*n_embd_dec;
+                    batch.set_embd_state(idx, {state, 1, size_t(n_embd_dec)});
                 }
             }
         }
@@ -1755,6 +1842,11 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
                     break;
                 }
 
+                if (inkling && samples(dp)) {
+                    const float * draw = draw_state.data() + (size_t(seq_id)*block_size + i)*n_embd_dec;
+                    result.push_back(dspark_draw(llama_get_sampling_row_ith(ctx_dft, idx), draw[1], draw[0], dp.result_q->emplace_back()));
+                    continue;
+                }
                 if (inkling) {
                     result.push_back(common_sampler_sample(smpl, ctx_dft, idx, true));
                     continue;
@@ -1778,8 +1870,16 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (samples(dp)) {
+                    dp.result_q->clear();
+                }
             }
         }
+    }
+
+private:
+    bool samples(const common_speculative_draft_params & dp) const {
+        return draw_k > 0 && dp.result_q && dp.temp > 0.0f;
     }
 };
 
@@ -4289,7 +4389,10 @@ void common_speculative_sample_and_accept_batch(
             try {
                 GGML_ASSERT(seq.rows.size() == seq.draft->size() + 1 && "a sequence has one row more than its draft");
                 const size_t n_check = spec_n_check(*seq.draft, seq.n_remaining);
-                if (n_check == seq.draft->size()) {
+                if (seq.draft_q) {
+                    // the whole draft, as the server's own rejection verify checks it
+                    seq.accepted = common_sampler_sample_and_accept_n_rejection(seq.smpl, vocab, seq.rows.data(), *seq.draft, *seq.draft_q);
+                } else if (n_check == seq.draft->size()) {
                     seq.accepted = common_sampler_sample_and_accept_n(seq.smpl, vocab, seq.rows.data(), *seq.draft);
                 } else {
                     const llama_tokens draft_checked(seq.draft->begin(), seq.draft->begin() + n_check);

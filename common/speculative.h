@@ -123,12 +123,16 @@ struct common_speculative_verify {
     std::vector<llama_sampling_row> rows;
     int32_t                         n_remaining = -1;
 
+    // the draft's distribution per token: the sequence is verified by rejection sampling, else by sampling and matching
+    const std::vector<std::vector<llama_token_data>> * draft_q = nullptr;
+
     std::vector<llama_token> accepted; // what common_speculative_sample_and_accept returns for it
     std::exception_ptr       error;    // or what it threw
 };
 
-// common_speculative_sample_and_accept for the sequences of a step side by side, on n_threads threads or fewer. Each
-// keeps the tokens it keeps verified alone: a thread reads fetched rows and changes only its sequence's sampler.
+// common_speculative_sample_and_accept (or, with draft_q, common_sampler_sample_and_accept_n_rejection) for the
+// sequences of a step side by side, on n_threads threads or fewer. Each keeps the tokens it keeps verified alone: a
+// thread reads fetched rows and changes only its sequence's sampler.
 void common_speculative_sample_and_accept_batch(
         const llama_vocab * vocab, std::vector<common_speculative_verify> & seqs, int n_threads);
 
