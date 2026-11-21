@@ -3743,6 +3743,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_flash_attn_ext_add_rel_pos_sinks(cur, ggml_reshape_4d(ctx0, rel->sinks, q->ne[2], n_tps, 1, n_stream));
             }
             ggml_flash_attn_ext_set_low_mean_mask(cur, rel->low_mean_mask);
+            // a sequence's rows lie side by side in an equal split: a token and its drafts read the same cells
+            ggml_flash_attn_ext_set_query_group(cur, cparams.rel_query_group && ubatch.equal_seqs() ? int(ubatch.n_seq_tokens) : 1);
             n_kv_max = rel->n_kv_max;
         }
 

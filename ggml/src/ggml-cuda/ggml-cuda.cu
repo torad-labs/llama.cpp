@@ -2397,7 +2397,7 @@ static bool ggml_backend_cuda_comm_reduce_owned_rows(void * comm_ctx_v, ggml_ten
     for (size_t rank = 0; rank < comm->backends.size(); ++rank) {
         if (!ggml_are_same_shape(tensors[0], tensors[rank]) || !ggml_is_contiguous(tensors[rank])) { return false; }
     }
-    // through host memory only GGML_CUDA_AR_HOST_OWNER_ROWS_N rows, card to card any number the chunked kernel takes
+    // through host memory or card to card, any number of rows: a step of 23 sessions and its drafted steps alike
     return ggml_cuda_ar_allreduce(comm->ar_pipeline, comm->backends.data(), tensors, nullptr, true);
 }
 
@@ -10709,6 +10709,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         case GGML_TYPE_IQ4_XS:
                         case GGML_TYPE_Q2_K:
                         case GGML_TYPE_Q3_K:
+                        // Inkling 2's experts split by expert (LLAMA_INKLING2_EXPERT_SPLIT) and its fixtures
+                        case GGML_TYPE_Q4_0:
+                        case GGML_TYPE_Q4_1:
+                        case GGML_TYPE_Q5_0:
+                        case GGML_TYPE_Q5_1:
+                        case GGML_TYPE_Q4_K:
+                        case GGML_TYPE_Q5_K:
+                        case GGML_TYPE_Q6_K:
                             break;
                         default:
                             return false;

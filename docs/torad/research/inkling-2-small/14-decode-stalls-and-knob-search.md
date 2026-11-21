@@ -116,9 +116,34 @@ step's rows on `min(--threads, LLAMA_SAMPLE_THREADS)` threads and the registry d
 rows went through in about six series at 1.37 ms a row over the 201,088-token vocabulary. Raising it
 is worth about 8% with the draft and without it.
 
-The DSpark draft as it stands costs about a quarter of the throughput at this batch: 386.0 with it
-against 509.1 without, both at 16 sampling threads. Shallower drafts are better than the profile's
-depth of 3. That is the drafter's domain, not this chapter's.
+With the draft the total was 386.0 against 509.1 without, both at 16 sampling threads. That gap is
+not what a draft costs. It is what a drafted step cost on this engine, because the step's shape took
+it off the paths the plain step runs on. A traced drafted round of 23 sessions took 304.6 ms: 45.5 ms
+in the draft's own call, 173.9 ms in the target's step over 92 rows (each session's token and its
+three drafts), 10.4 ms feeding the draft and 73.5 ms sampling. The draft kept 1.82 to 1.83 tokens a
+round at about 61% acceptance, so a session decoded at 12.0 to 12.1 tokens/s against 12.4 without a
+draft. The plain step's 23 rows take 54.6 ms. What the 92 rows left behind:
+
+- Relative attention. Inkling 2 classed any step with more rows than sequences as dense, which
+  gives no row a bound on its cells, so the drafted step ran the prompt kernel over the shared pool.
+  The decode kernel also read each row's cells alone, where a token and its three drafts see the
+  same cells.
+- The reduction of a hidden state. Through host memory each card receives only the quarter of every
+  row it reads, but that route took exactly 23 rows, so 92 rows went to the full reduction, every
+  row to every card.
+- The draft's feed: one session a decode, 23 decodes and 23 waits a step.
+- The draft's attention converted the whole q8_0 K and V of the shared pool to f16 before each
+  call, every session's cells.
+- DSpark's Markov head read the whole LM head, 1.85 GB, on each of a draft call's three steps for a
+  correction of rank 256.
+
+The expert products are not on that list. Past 32 rows they leave the vector kernel for the matrix
+one, and on an RTX 5060 Ti the per-card slice of gate and up takes 996 us at 23 rows and 2,255 at
+92 while the experts those rows name go from about 147 of 384 to about 328: both read their weights
+at about 295 GB/s. A drafted step's expert products cost what the experts it touches weigh.
+
+Each item of the list has a change in the fork's table (`TORAD.md`, after `def362b71`). None of
+them has been measured on four cards yet, so this chapter gives them no number.
 
 ## Timelines
 

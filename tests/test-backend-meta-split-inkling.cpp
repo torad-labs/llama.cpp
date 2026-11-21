@@ -19,6 +19,7 @@
 #include "../src/llama-model.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <numeric>
 #include <regex>
@@ -33,6 +34,10 @@ constexpr uint32_t n_head_kv = 8;
 constexpr uint32_t head_dim  = 128;
 constexpr uint32_t n_layer   = 6;
 constexpr uint32_t n_ff_exp  = 2304;
+constexpr uint32_t n_expert  = 8;
+
+// LLAMA_INKLING2_EXPERT_SPLIT: each rank holds its share of the experts whole
+bool by_expert = false;
 
 gguf_context_ptr inkling_gguf() {
     gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
@@ -44,6 +49,7 @@ gguf_context_ptr inkling_gguf() {
     ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     head_dim);
     ms.add_kv(LLM_KV_BLOCK_COUNT,                n_layer);
     ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, n_ff_exp);
+    ms.add_kv(LLM_KV_EXPERT_COUNT,               n_expert);
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,          uint32_t(4)); // the fixture's shared tail sets 3
     std::vector<uint8_t> swa(n_layer);
     for (uint32_t il = 0; il < n_layer; ++il) {
@@ -105,6 +111,8 @@ bool expect(const std::string & name, const llama_hparams & hp, const std::vecto
         // the state's streams: K, V, the attention's and the feed-forward's hidden stream, kernel - 1 columns each
         out = {0, {times(kv, (kernel - 1)*head_dim), times(kv, (kernel - 1)*head_dim),
                    times(kv, (kernel - 1)*channels), times(kv, (kernel - 1)*channels)}};
+    } else if (by_expert && std::regex_match(name, std::regex("blk\\.\\d+\\.ffn_(gate_up|down)_exps\\.weight"))) {
+        out = {2, {std::vector<int64_t>(kv.size(), n_expert/kv.size())}};
     } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.ffn_gate_up_exps\\.weight|output\\.weight"))) {
         out = {1, {}};
     } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.ffn_down_exps\\.weight"))) {
@@ -272,8 +280,8 @@ bool test_split(ggml_backend_dev_t gpu, size_t n_ranks, const std::vector<float>
     if (!tensor_split.empty()) {
         split = std::to_string(int(tensor_split[0])) + ":" + std::to_string(int(tensor_split[1]));
     }
-    printf("%s inkling2 tensor split, %zu ranks %s: %d weights and %d caches as their heads are split\n",
-            ok ? "ok  " : "FAIL", n_ranks, split.c_str(), n_weights, n_caches);
+    printf("%s inkling2 tensor split, %zu ranks %s%s: %d weights and %d caches as their heads are split\n",
+            ok ? "ok  " : "FAIL", n_ranks, split.c_str(), by_expert ? ", experts whole" : "", n_weights, n_caches);
     return ok;
 }
 
@@ -284,5 +292,11 @@ bool test_inkling_split_decisions(ggml_backend_dev_t gpu) {
     bool ok = test_split(gpu, 2, {});
     ok = test_split(gpu, 4, {}) && ok;
     ok = test_split(gpu, 2, {3.0f, 7.0f}) && ok;
+    setenv("LLAMA_INKLING2_EXPERT_SPLIT", "1", 1);
+    by_expert = true;
+    ok = test_split(gpu, 2, {}) && ok;
+    ok = test_split(gpu, 4, {}) && ok;
+    unsetenv("LLAMA_INKLING2_EXPERT_SPLIT");
+    by_expert = false;
     return ok;
 }

@@ -1776,7 +1776,8 @@ static bool ggml_cuda_ar_allreduce_copy_n(
         T_src * const src_buf[GGML_CUDA_MAX_DEVICES], T_dst * const dst_buf[GGML_CUDA_MAX_DEVICES],
         const bool compute[GGML_CUDA_MAX_DEVICES], int64_t ne, size_t nbytes) {
     const int slot = ggml_cuda_ar_acquire_slot(p);
-    const size_t chunk_bytes = ggml_cuda_ar_chunk_bytes(p, nbytes);
+    // owned rows go in one piece: each rank takes its quarter of every row, which a byte range of the rows does not hold
+    const size_t chunk_bytes = owned_rows ? nbytes : ggml_cuda_ar_chunk_bytes(p, nbytes);
     const size_t chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
     GGML_ASSERT(chunks > 0 && chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
     ggml_backend_cuda_context * contexts[GGML_CUDA_MAX_DEVICES] = {};
@@ -1787,9 +1788,9 @@ static bool ggml_cuda_ar_allreduce_copy_n(
         char * dst = p->dev_tmp[rank].as<char>() + index*p->copy_bytes + offset;
         const uint8_t * src = p->host_large[peer].host + offset;
         if constexpr (owned_rows) {
-            GGML_ASSERT(chunks == 1);
+            GGML_ASSERT(chunks == 1 && ne % 4608 == 0);
             constexpr size_t width = 1152 * sizeof(T_src);
-            CUDA_CHECK(cudaMemcpy2DAsync(dst, width, src + rank * width, 4 * width, width, 23, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(dst, width, src + rank * width, 4 * width, width, ne / 4608, cudaMemcpyHostToDevice, stream));
         } else {
             CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
         }
@@ -2352,7 +2353,7 @@ bool ggml_cuda_ar_allreduce(
 
     if (owned_rows) {
         if (!p->host_owner_rows || !p->reduce_owners || n != 4 || p->copy_peer || p->wire_q8 || !use_copy_engine ||
-                !use_bf16 || nbytes > p->copy_bytes || tensors[0]->ne[0] != 4608 || tensors[0]->ne[1] != 23 ||
+                !use_bf16 || nbytes > p->copy_bytes || tensors[0]->ne[0] != 4608 ||
                 tensors[0]->ne[2] != 1 || tensors[0]->ne[3] != 1 || ggml_cuda_ar_capturing(backends[0])) {
             // off the host route the chunked kernel sums each rank's equal part of every row
             const int64_t width = tensors[0]->ne[0];

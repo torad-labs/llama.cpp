@@ -165,6 +165,21 @@ public:
                 return inkling2_decode_mask::short_rows;
             }
         }
+        // A drafted step holds each sequence's token and its drafts: 2 to 4 rows a sequence side by side (an equal
+        // split), which see their sequence's cells and which the decode kernel reads together. Classed by its sequences,
+        // as a step of one row a sequence is by its rows (cparams.rel_query_group, LLAMA_INKLING2_REL_GROUP_LEGACY)
+        const uint32_t per_seq = ub.equal_seqs() ? ub.n_seq_tokens : 1;
+        if (per_seq >= 2 && per_seq <= 4 && ub.n_tokens == ub.n_seqs_unq*per_seq && params.cparams.rel_query_group) {
+            for (uint32_t row = 0; row < ub.n_tokens; ++row) {
+                if (ub.n_seq_id[row] != 1 || ub.seq_id[row][0] != ub.seq_id[row - row % per_seq][0]) {
+                    return inkling2_decode_mask::dense;
+                }
+            }
+            return inkling2_classify_decode_mask(kv->get_n_kv(), ub.n_seqs_unq, false, [&](uint32_t s) {
+                const auto seq = ub.seq_id[s*per_seq][0];
+                return kv->get_kv()->get_cells(seq).seq_n_cells(seq);
+            }, mask_shapes());
+        }
         if (ub.n_tokens != ub.n_seqs_unq) {
             return inkling2_decode_mask::dense;
         }
@@ -460,6 +475,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cur = build_moe_ffn(cur, l.ffn_gate_inp, nullptr, nullptr, l.ffn_down_exps, l.ffn_exp_probs_b,
                 hparams.n_expert, hparams.n_expert_used(il), LLM_FFN_SITU, true, hparams.expert_weights_scale,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, nullptr, l.ffn_gate_up_exps);
+        if (model.experts_split_by_expert()) {
+            // each card's sum holds only its own experts: summed across the cards as the split rows' sums are
+            cur = ggml_backend_meta_reduce(ctx0, cur);
+        }
         cur = convolve_hidden(cur, l.ffn_post_conv, history, 2*kv + n_embd, windows, il);
         // the layer's new state in one store of its whole row: under -sm tensor the row is split by the KV heads in four
         // segments, one a stream, and each device's windows are its part of every segment in the same order

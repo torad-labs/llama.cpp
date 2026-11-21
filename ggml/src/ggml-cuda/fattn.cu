@@ -569,7 +569,10 @@ static bool ggml_cuda_fattn_mma_raw(const int cc, const ggml_tensor * dst) {
     if (ggml_cuda_fattn_rel_pos(dst)) {
         return false; // a bias a Q head: one head a tile, not the raw kernel's GQA tiles
     }
-    if (K->type != V->type || K->ne[0] != 256 || V->ne[0] != 256) {
+    // head size 256, and 128 for q8_0 alone (GGML_CUDA_FATTN_RAW_D128_LEGACY=1: the f16 copy there)
+    static const bool legacy_d128 = ggml_env_switch("GGML_CUDA_FATTN_RAW_D128_LEGACY");
+    const bool d128 = K->ne[0] == 128 && K->type == GGML_TYPE_Q8_0 && !legacy_d128;
+    if (K->type != V->type || (K->ne[0] != 256 && !d128) || V->ne[0] != K->ne[0]) {
         return false;
     }
     switch (K->type) {
@@ -596,8 +599,10 @@ static bool ggml_cuda_fattn_mma_raw(const int cc, const ggml_tensor * dst) {
         return false;
     }
     for (const ggml_tensor * t : {Q, K, V, mask}) {
+        // q8_0 rows of head size 128 are 136 bytes, copied in 8 byte chunks
+        const size_t align = d128 && (t == K || t == V) ? 8 : 16;
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
-            if (t->nb[i] % 16 != 0) {
+            if (t->nb[i] % align != 0) {
                 return false; // Q and mask as in use_gqa_opt, q4_0 rows are copied in 16 byte chunks
             }
         }
@@ -664,7 +669,9 @@ static void ggml_cuda_flash_attn_ext_mma_raw_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
 
-    GGML_ASSERT((uintptr_t) dst->src[1]->data % 16 == 0 && (uintptr_t) dst->src[2]->data % 16 == 0);
+    // the raw tiles are copied in 16 byte chunks, or in 8 where a row is not a multiple of 16 (q8_0, head size 128)
+    constexpr size_t align = (DKQ/QK8_0)*sizeof(block_q8_0) % 16 == 0 || type_KV != GGML_TYPE_Q8_0 ? 16 : 8;
+    GGML_ASSERT((uintptr_t) dst->src[1]->data % align == 0 && (uintptr_t) dst->src[2]->data % align == 0);
 
     // An 8 head tile pads GQA 6 with 2 empty heads, a quarter of its work. With 32 or more tokens a 32 token x 2 head
     // tile of the same width has no padding, and every K/V tile it reads serves 64 Q columns instead of 48.
@@ -722,6 +729,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             break;
         case 128:
             GGML_ASSERT(V->ne[0] == 128);
+            if (ggml_cuda_fattn_mma_raw(cc, dst)) {
+                ggml_cuda_flash_attn_ext_mma_raw_switch_ncols1<128, 128, GGML_TYPE_Q8_0>(ctx, dst);
+                break;
+            }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128>(ctx, dst);
             break;
         case 192: {
@@ -1297,7 +1308,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (sparse_rows || sparse_mean) && dst->src[9] && dst->src[3]->type == GGML_TYPE_I16 &&
             dst->src[3]->ne[0]*16 == k->ne[1] && dst->src[3]->ne[1] == q->ne[1] && dst->src[3]->ne[2] == 1 &&
             k->ne[1] >= 8192 && k->ne[1] <= INT32_MAX && k->ne[1]%32 == 0 &&
-            q->ne[3] == 1 && q->ne[1] >= 8 && q->ne[1] <= 32 && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
+            q->ne[3] == 1 && q->ne[1] >= 8 && q->ne[1] <= 32*fattn_rel_decode_group(dst) && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
             q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == k->nb[0] &&
             k->type == v->type && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && softcap == 0.0f) {
         return BEST_FATTN_KERNEL_REL_DECODE;
@@ -1367,7 +1378,8 @@ static void ggml_cuda_flash_attn_ext_device(ggml_backend_cuda_context & ctx, ggm
             ggml_cuda_fattn_rel_short(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_DECODE:
-            if (fattn_rel_mma_shapes(ctx.device, dst) && fattn_rel_mma_aligned(dst)) {
+            // a sequence's rows read together on the one-cell kernel, which the tile kernel does not do
+            if (fattn_rel_decode_group(dst) == 1 && fattn_rel_mma_shapes(ctx.device, dst) && fattn_rel_mma_aligned(dst)) {
                 ggml_cuda_fattn_rel_mma(ctx, dst);
             } else {
                 ggml_cuda_fattn_rel_decode(ctx, dst);

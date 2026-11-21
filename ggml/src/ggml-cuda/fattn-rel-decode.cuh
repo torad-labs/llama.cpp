@@ -1,6 +1,13 @@
 #pragma once
 
 #include "common.cuh"
+#include "ggml-attn-mask.h"
+
+// The rows a block reads each cell once for: the hint's rows a sequence when the queries divide into them, else 1
+static int fattn_rel_decode_group(const ggml_tensor * dst) {
+    const int hint = ggml_flash_attn_ext_get_query_group(dst);
+    return hint >= 2 && hint <= 4 && dst->src[0]->ne[1] % hint == 0 ? hint : 1;
+}
 
 static int fattn_rel_decode_parts(const ggml_tensor * dst) {
     return std::min<int64_t>(64, std::max<int64_t>(1, dst->src[1]->ne[1]/1024));
@@ -89,100 +96,125 @@ static __device__ __forceinline__ float fattn_rel_decode_value(const char * row,
     }
 }
 
-template <ggml_type type, int heads>
+// A block reads each visible KV row once for `group` consecutive query rows, which see nearly the same cells when
+// they are one sequence's rows (a token and its drafts): each row still takes only the cells its own mask holds.
+template <ggml_type type, int heads, int group>
 static __global__ void fattn_rel_decode_rows(
         const char * q, const char * k, const char * v, const uint32_t * mask, const float * table,
         const int32_t * q_pos, const int32_t * kv_pos, const float * shift, float * partial, float scale, int n_kv, int n_dist, int gqa,
         size_t q_row, size_t q_head, size_t k_row, size_t k_head, size_t v_row, size_t v_head) {
     constexpr int warps = 4;
-    static_assert(heads <= warps, "one warp merges each head");
     const int lane = threadIdx.x, warp = threadIdx.y;
-    const int head0 = blockIdx.y*heads, query = blockIdx.z, kv_head = head0/gqa;
+    const int head0 = blockIdx.y*heads, query0 = blockIdx.z*group, kv_head = head0/gqa;
     const int n_heads = gridDim.y*heads;
-    const int64_t row0 = int64_t(query)*n_heads + head0;
-    float query_value[heads][4], sum[heads][4] = {};
-    float maximum[heads], denominator[heads] = {}, sink_shift[heads];
+    float query_value[group][heads][4], sum[group][heads][4] = {};
+    float maximum[group][heads], denominator[group][heads] = {}, sink_shift[group][heads];
+    int64_t q_position[group];
 
 #pragma unroll
-    for (int h = 0; h < heads; ++h) {
-        const float * q_ptr = (const float *) (q + query*q_row + (head0 + h)*q_head);
+    for (int g = 0; g < group; ++g) {
+        const int64_t row0 = int64_t(query0 + g)*n_heads + head0;
+        q_position[g] = q_pos[query0 + g];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            query_value[h][i] = q_ptr[32*i + lane]*scale;
+        for (int h = 0; h < heads; ++h) {
+            const float * q_ptr = (const float *) (q + (query0 + g)*q_row + (head0 + h)*q_head);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                query_value[g][h][i] = q_ptr[32*i + lane]*scale;
+            }
+            maximum[g][h] = -FLT_MAX;
+            sink_shift[g][h] = shift ? shift[row0 + h] : 0.0f;
         }
-        maximum[h] = -FLT_MAX;
-        sink_shift[h] = shift ? shift[row0 + h] : 0.0f;
     }
-    table += row0*n_dist;
-    mask  += int64_t(query)*(n_kv/32);
+    const float * tables = table + (int64_t(query0)*n_heads + head0)*n_dist;
+    const int64_t table_query = int64_t(n_heads)*n_dist;
+    mask += int64_t(query0)*(n_kv/32);
 
-    // A warp shares each visible KV row across query heads in the same GQA group.
+    // A warp shares each visible KV row across query heads in the same GQA group, and across the group's queries.
     for (int word = blockIdx.x*warps + warp; word < n_kv/32; word += gridDim.x*warps) {
-        uint32_t live = mask[word];
+        uint32_t own[group], live = 0;
+#pragma unroll
+        for (int g = 0; g < group; ++g) {
+            own[g] = mask[g*(n_kv/32) + word];
+            live |= own[g];
+        }
         while (live) {
-            const int cell = 32*word + __ffs(live) - 1;
+            const int bit = __ffs(live) - 1;
+            const int cell = 32*word + bit;
             live &= live - 1;
             const char * key = k + cell*k_row + kv_head*k_head;
             const char * value = v + cell*v_row + kv_head*v_head;
-            const int64_t distance = int64_t(q_pos[query]) - kv_pos[cell];
             float key_value[4], val[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 key_value[i] = fattn_rel_decode_value<type>(key, 32*i + lane);
                 val[i] = fattn_rel_decode_value<type>(value, 32*i + lane);
             }
+            const int64_t cell_position = kv_pos[cell];
 #pragma unroll
-            for (int h = 0; h < heads; ++h) {
-                float dot = 0.0f;
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    dot += query_value[h][i]*key_value[i];
+            for (int g = 0; g < group; ++g) {
+                if (!(own[g] >> bit & 1)) {
+                    continue;
                 }
-                dot = warp_reduce_sum<32>(dot);
-                const float bias = distance >= 0 && distance < n_dist ? table[h*n_dist + distance] : 0.0f;
-                dot += shift ? __half2float(__float2half(bias - sink_shift[h])) : bias;
-                const float next = fmaxf(maximum[h], dot);
-                const float old_weight = expf(maximum[h] - next);
-                const float weight = expf(dot - next);
+                const int64_t distance = q_position[g] - cell_position;
 #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    sum[h][i] = sum[h][i]*old_weight + weight*val[i];
+                for (int h = 0; h < heads; ++h) {
+                    float dot = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        dot += query_value[g][h][i]*key_value[i];
+                    }
+                    dot = warp_reduce_sum<32>(dot);
+                    const float bias = distance >= 0 && distance < n_dist ? tables[g*table_query + h*n_dist + distance] : 0.0f;
+                    dot += shift ? __half2float(__float2half(bias - sink_shift[g][h])) : bias;
+                    const float next = fmaxf(maximum[g][h], dot);
+                    const float old_weight = expf(maximum[g][h] - next);
+                    const float weight = expf(dot - next);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        sum[g][h][i] = sum[g][h][i]*old_weight + weight*val[i];
+                    }
+                    denominator[g][h] = denominator[g][h]*old_weight + weight;
+                    maximum[g][h] = next;
                 }
-                denominator[h] = denominator[h]*old_weight + weight;
-                maximum[h] = next;
             }
         }
     }
 
-    __shared__ float maxima[heads][warps], denominators[heads][warps], sums[heads][warps][128];
+    __shared__ float maxima[group*heads][warps], denominators[group*heads][warps], sums[group*heads][warps][128];
 #pragma unroll
-    for (int h = 0; h < heads; ++h) {
-        if (lane == 0) {
-            maxima[h][warp] = maximum[h];
-            denominators[h][warp] = denominator[h];
-        }
+    for (int g = 0; g < group; ++g) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            sums[h][warp][32*i + lane] = sum[h][i];
+        for (int h = 0; h < heads; ++h) {
+            if (lane == 0) {
+                maxima[g*heads + h][warp] = maximum[g][h];
+                denominators[g*heads + h][warp] = denominator[g][h];
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                sums[g*heads + h][warp][32*i + lane] = sum[g][h][i];
+            }
         }
     }
     __syncthreads();
 
-    if (warp < heads) {
-        const int h = warp;
-        float * out = partial + ((row0 + h)*gridDim.x + blockIdx.x)*130;
+    // one warp merges each of the group's query heads
+    for (int gh = warp; gh < group*heads; gh += warps) {
+        const int g = gh/heads, h = gh % heads;
+        const int64_t row = int64_t(query0 + g)*n_heads + head0 + h;
+        float * out = partial + (row*gridDim.x + blockIdx.x)*130;
         float max_all = -FLT_MAX, denom_all = 0.0f, sum_all[4] = {};
 #pragma unroll
         for (int w = 0; w < warps; ++w) {
-            max_all = fmaxf(max_all, maxima[h][w]);
+            max_all = fmaxf(max_all, maxima[gh][w]);
         }
 #pragma unroll
         for (int w = 0; w < warps; ++w) {
-            const float weight = expf(maxima[h][w] - max_all);
-            denom_all += weight*denominators[h][w];
+            const float weight = expf(maxima[gh][w] - max_all);
+            denom_all += weight*denominators[gh][w];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                sum_all[i] += weight*sums[h][w][32*i + lane];
+                sum_all[i] += weight*sums[gh][w][32*i + lane];
             }
         }
         if (lane == 0) {
@@ -224,13 +256,22 @@ static void ggml_cuda_fattn_rel_decode(ggml_backend_cuda_context & ctx, ggml_ten
     memcpy(&scale, dst->op_params, sizeof(scale));
     const int gqa = q->ne[2]/k->ne[2];
     const bool group_heads = gqa == 6 && k->ne[1] >= 65536;
-    const dim3 blocks(n_parts, q->ne[2]/(group_heads ? 3 : 1), q->ne[1]);
     const auto * sinks = (const float *) dst->src[9]->data;
     const bool shift = ggml_cuda_fattn_shift_query_sinks();
-    auto kernel = k->type == GGML_TYPE_Q8_0 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, 1> : fattn_rel_decode_rows<GGML_TYPE_F16, 1>;
-    if (group_heads) {
-        kernel = k->type == GGML_TYPE_Q8_0 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, 3> : fattn_rel_decode_rows<GGML_TYPE_F16, 3>;
-    }
+    const int group = fattn_rel_decode_group(dst);
+    using kernel_t = decltype(&fattn_rel_decode_rows<GGML_TYPE_F16, 1, 1>);
+    const auto pick = [&](auto heads) -> kernel_t {
+        constexpr int H = decltype(heads)::value;
+        const bool q8 = k->type == GGML_TYPE_Q8_0;
+        switch (group) {
+            case 2:  return q8 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, H, 2> : fattn_rel_decode_rows<GGML_TYPE_F16, H, 2>;
+            case 3:  return q8 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, H, 3> : fattn_rel_decode_rows<GGML_TYPE_F16, H, 3>;
+            case 4:  return q8 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, H, 4> : fattn_rel_decode_rows<GGML_TYPE_F16, H, 4>;
+            default: return q8 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, H, 1> : fattn_rel_decode_rows<GGML_TYPE_F16, H, 1>;
+        }
+    };
+    const kernel_t kernel = group_heads ? pick(std::integral_constant<int, 3>{}) : pick(std::integral_constant<int, 1>{});
+    const dim3 blocks(n_parts, q->ne[2]/(group_heads ? 3 : 1), q->ne[1]/group);
     kernel<<<blocks, dim3(32, 4), 0, ctx.stream()>>>(
             (const char *) q->data, (const char *) k->data, (const char *) v->data,
             (const uint32_t *) dst->src[3]->data, (const float *) dst->src[6]->data,

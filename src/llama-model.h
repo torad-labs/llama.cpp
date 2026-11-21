@@ -1008,6 +1008,8 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    // under -sm tensor Inkling 2's routed experts are split by expert, not by their hidden rows (LLAMA_INKLING2_EXPERT_SPLIT)
+    bool experts_split_by_expert() const;
     bool no_alloc() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
@@ -1110,6 +1112,7 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+    void load_tensors_dspark_head();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

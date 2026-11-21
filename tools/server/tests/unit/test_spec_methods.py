@@ -3,7 +3,7 @@ import re
 from dataclasses import dataclass
 
 import pytest
-from utils import ServerProcess, download_file
+from utils import ServerProcess, download_file, parallel_function_calls
 
 # Runs each speculative method greedily and checks that it still drafts and accepts as expected.
 # accept rate = accepted / drafted, accept len = 1 + accepted / verification steps (from /metrics).
@@ -108,13 +108,13 @@ def model_path(file: str) -> str:
     )
 
 
-def make_server(case: SpecCase) -> ServerProcess:
+def make_server(case: SpecCase, n_slots: int = 1) -> ServerProcess:
     server = ServerProcess()
     server.model_hf_repo = None
     server.model_hf_file = None
     server.model_file = model_path(case.target)
-    server.n_ctx = 1024
-    server.n_slots = 1
+    server.n_ctx = 1024*n_slots
+    server.n_slots = n_slots
     server.n_gpu_layer = int(os.environ.get("N_GPU_LAYERS", 99))
     server.fa = "on"
     server.temperature = 0.0
@@ -128,25 +128,26 @@ def make_server(case: SpecCase) -> ServerProcess:
     return server
 
 
+def complete(server: ServerProcess, prompt: str) -> list[int]:
+    res = server.make_request(
+        "POST",
+        "/completion",
+        data={
+            "prompt": prompt,
+            "temperature": 0.0,
+            "top_k": 1,
+            "seed": 42,
+            "n_predict": N_PREDICT,
+            "cache_prompt": False,
+            "return_tokens": True,
+        },
+    )
+    assert res.status_code == 200
+    return res.body["tokens"]
+
+
 def generate(server: ServerProcess) -> list[list[int]]:
-    outputs = []
-    for prompt in PROMPTS:
-        res = server.make_request(
-            "POST",
-            "/completion",
-            data={
-                "prompt": prompt,
-                "temperature": 0.0,
-                "top_k": 1,
-                "seed": 42,
-                "n_predict": N_PREDICT,
-                "cache_prompt": False,
-                "return_tokens": True,
-            },
-        )
-        assert res.status_code == 200
-        outputs.append(res.body["tokens"])
-    return outputs
+    return [complete(server, prompt) for prompt in PROMPTS]
 
 
 def spec_metrics(server: ServerProcess) -> dict[str, float]:
@@ -210,3 +211,36 @@ def test_spec_method(case: SpecCase):
     assert (
         accept_len >= case.min_accept_len
     ), f"{case.name}: accept length {accept_len:.3f} < {case.min_accept_len}"
+
+
+# Every prompt at once in its own slot: a draft fed every sequence's rows of a step together (one decode for all of them)
+# keeps each sequence's own context. Greedy tokens are not compared: a batch of several sequences may round the target's
+# logits otherwise than one sequence alone, and which sequences share a step changes from run to run, so the acceptance
+# does too (DSpark: 3.10 to 3.56 tokens a step over 24 runs, the same with one decode a sequence). The floor is
+# PARALLEL_FLOOR of the single-slot one; a draft fed another sequence's rows fails its requests after the first step.
+PARALLEL_FLOOR = 0.9
+
+
+@pytest.mark.heavy
+@pytest.mark.slow
+@pytest.mark.parametrize("case", selected_cases(), ids=lambda c: c.name)
+def test_spec_method_parallel(case: SpecCase):
+    server = make_server(case, n_slots=len(PROMPTS))
+    try:
+        server.start(timeout_seconds=1800)
+        outputs = parallel_function_calls([(complete, (server, prompt)) for prompt in PROMPTS])
+        m = spec_metrics(server)
+    finally:
+        server.stop()
+
+    accept_rate = m["accepted_tokens"] / m["draft_tokens"] if m["draft_tokens"] else 0.0
+    accept_len = 1.0 + m["accepted_tokens"] / m["drafts"] if m["drafts"] else 1.0
+    print(
+        f"SPEC_PARALLEL {case.name}: drafted={m['draft_tokens']:.0f} accepted={m['accepted_tokens']:.0f} "
+        f"steps={m['drafts']:.0f} accept_rate={accept_rate:.4f} accept_len={accept_len:.4f}"
+    )
+
+    assert all(outputs), f"{case.name}: a parallel request returned no tokens"
+    min_rate, min_len = PARALLEL_FLOOR * case.min_accept_rate, PARALLEL_FLOOR * case.min_accept_len
+    assert accept_rate >= min_rate, f"{case.name}: parallel accept rate {accept_rate:.3f} < {min_rate:.3f}"
+    assert accept_len >= min_len, f"{case.name}: parallel accept length {accept_len:.3f} < {min_len:.3f}"

@@ -30,7 +30,7 @@ ignore_prefixes = ["LLAMA_ARG_", "LLAMA_TEST_", "GGML_TEST_", "LLAMA_EVAL_", "LL
 
 param = [
 
-  # ---- Inkling 2: knobs (11)
+  # ---- Inkling 2: knobs (12)
   { name = "GGML_CUDA_FATTN_NATIVE_SINKS", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "cuda", about = "turns off the sink shift inside the relative attention kernels" },
   { name = "GGML_CUDA_FATTN_REL_DECODE_MEAN_STREAMS", available = true, set = "env", type = "int", default = 256, min = 1, max = 1024, kind = "knob", scope = "inkling2", layer = "cuda", output = "rounding", about = "most warps the visible cells of one query and KV head are split across in a low-mean step of that decode, where one row may read the whole pool and wants more warps than a bounded row; never more than the pool has cells/1024" },
   { name = "GGML_CUDA_FATTN_REL_DECODE_RUN_WORDS", available = true, set = "env", type = "int", default = 4, values = [1, 2, 4, 8, 16, 32], kind = "knob", scope = "inkling2", layer = "cuda", output = "rounding", about = "the 32-cell mask words a stream of that decode reads side by side before the next stream's begin: fewer spread the cells a prompt wrote in one run over more warps, more read the mask in longer runs" },
@@ -38,6 +38,7 @@ param = [
   { name = "GGML_CUDA_FATTN_REL_PREFILL_F32", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "cuda", output = "rounding", launcher = "--stable-prefill", about = "relative attention reads a prompt on the f32 prefill kernel; bounded decode and the 23-session decode batch keep their kernels" },
   { name = "GGML_CUDA_MMVQ_EXPERT_SORT_23", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "cuda", output = "same", launcher = "--sort-expert-rows", about = "sorts the routes of an expert step so adjacent warps read the same expert rows (Blackwell, 384 experts top 8, Q3_K or Q4_K): a step of 23 tokens unless GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN and _MAX say otherwise" },
   { name = "GGML_CUDA_MMVQ_KQUANT_MMID_MAX", available = true, set = "env", type = "int", default = 8, min = 8, max = 32, kind = "knob", scope = "inkling2", layer = "cuda", launcher = "--expert-row-limit", about = "most tokens a Q3_K, Q4_K or Q5_K expert product takes on the row kernel before MMQ (Blackwell); the tensor-4 profile sets 23" },
+  { name = "LLAMA_INKLING2_EXPERT_SPLIT", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "llama", output = "rounding", about = "under -sm tensor each card holds its share of the routed experts whole instead of a share of every expert's hidden rows, which 2,304 = 9 blocks gives out 3/2/2/2; the expert sums are then reduced across the cards as before" },
   { name = "LLAMA_INKLING2_GATHER_TRANSPOSE", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "model", about = "transposes the short convolution's result so each rank's channels are one block for the gather" },
   { name = "LLAMA_INKLING2_MEAN_MASK_DECODE", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "model", launcher = "--mean-mask-decode", about = "a decode of LLAMA_INKLING2_MEAN_ROWS rows that hold a pool/LLAMA_INKLING2_MEAN_POOL_SHARE share or less on average takes the low-mean mask kernel instead of the dense one (pool of LLAMA_INKLING2_MEAN_POOL_MIN or more, f16 K/V)" },
   { name = "LLAMA_INKLING2_SHIFT_SINKS", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "model", launcher = "--reference-sinks", about = "shifts the attention sinks with graph ops, as the reference does, instead of inside the fused relative attention" },
@@ -64,14 +65,12 @@ param = [
   { name = "GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN", available = true, set = "env", type = "int", default = 23, min = 1, max = 32, kind = "knob", scope = "inkling2", layer = "cuda", output = "same", about = "with GGML_CUDA_MMVQ_EXPERT_SORT_23 on, an expert step has its routes sorted from this many tokens: the session count, 23 as served" },
   { name = "GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX", available = true, set = "env", type = "int", default = 23, min = 1, max = 32, kind = "knob", scope = "inkling2", layer = "cuda", output = "same", about = "and up to this many tokens (the sort holds 32 tokens of 8 experts)" },
 
-  # ---- Inkling 2: the shape one reduction is built for, fixed in the code today (1)
-  { name = "GGML_CUDA_AR_HOST_OWNER_ROWS_N", available = false, set = "code", type = "int", default = 23, kind = "knob", scope = "inkling2", layer = "cuda", where = "ggml/src/ggml-cuda/ggml-cuda.cu ggml_backend_cuda_comm_reduce_owned_rows", about = "the one row count the owned-rows reduction takes (4608 wide, f32, four cards; GGML_CUDA_AR_HOST_OWNER_ROWS)" },
-
-  # ---- Inkling 2: earlier paths and diagnostics (6)
+  # ---- Inkling 2: earlier paths and diagnostics (7)
   { name = "GGML_CUDA_FATTN_REL_DECODE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "inkling2", layer = "cuda", output = "rounding", about = "the 23-session relative decode keeps the kernel that reads one KV row at a time, with no tensor cores" },
   { name = "GGML_CUDA_SHORT_CONV_WINDOW_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "inkling2", layer = "cuda", about = "the short convolution's window as a CONCAT chain everywhere, with no window fusion" },
   { name = "LLAMA_INKLING2_CONV_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "inkling2", layer = "llama", about = "the short convolution from ssm_conv and elementwise ops" },
   { name = "LLAMA_INKLING2_FUSE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "inkling2", layer = "llama", about = "residual depth mix, norm clips and output gate from elementwise ops" },
+  { name = "LLAMA_INKLING2_REL_GROUP_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "inkling2", layer = "llama", output = "rounding", about = "a drafted step's mask is classed dense and its rows take the prefill kernel, each reading its cells alone, instead of a sequence's token and drafts reading each cell of the relative decode once together" },
   { name = "LLAMA_INKLING2_REL_POS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "inkling2", layer = "llama", about = "builds the relative bias of every cell on the host and adds it to the mask (the tests' oracle)" },
   { name = "GGML_CUDA_FATTN_REL_ORDERED_REF", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "inkling2", layer = "cuda", about = "relative attention sums its short rows in double, as the reference" },
 
@@ -85,7 +84,7 @@ param = [
   { name = "GGML_CUDA_AR_GATHER_HOST_SLICES", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "shared", layer = "cuda", launcher = "--reduction-route", about = "a gather moves its slices through the host (when cards do not copy to their peer)" },
   { name = "GGML_CUDA_AR_GATHER_OWNER_SLICES", available = true, set = "env", type = "bool", default = true, kind = "knob", scope = "shared", layer = "cuda", about = "a gather copies each owner's slice card to card (when cards copy to their peer)" },
   { name = "GGML_CUDA_AR_GATHER_BLOCKS", available = true, set = "env", type = "int", default = 8, min = 1, max = 64, kind = "knob", scope = "shared", layer = "cuda", output = "same", about = "blocks of 256 threads the gather of each rank's own quarter launches with: more of them read the peers' quarters in fewer round trips a thread. More than 8 are for ranks on cards of their own: ranks that share one card can stop (four did at 12 blocks each)" },
-  { name = "GGML_CUDA_AR_HOST_OWNER_ROWS", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "shared", layer = "cuda", launcher = "--host-owner-rows", about = "the host route sends each row only to the rank that reads it" },
+  { name = "GGML_CUDA_AR_HOST_OWNER_ROWS", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "shared", layer = "cuda", launcher = "--host-owner-rows", about = "the host route sends each row only to the rank that reads it, at any row count: a step of 23 sessions and its drafted steps" },
   { name = "GGML_CUDA_AR_LL_MAX_BYTES", available = true, set = "env", type = "int", default = 16384, min = 0, max = 1048576, kind = "knob", scope = "shared", layer = "cuda", about = "largest reduction the host low-latency path takes (0: off)" },
   { name = "GGML_CUDA_AR_P2P_MAX_BYTES", available = true, set = "env", type = "int", default = 131072, min = 0, max = 1048576, kind = "knob", scope = "shared", layer = "cuda", about = "largest reduction the card-to-card low-latency kernel takes (0: off)" },
   { name = "GGML_CUDA_AR_RECV_STREAMS_MIN_BYTES", available = true, set = "env", type = "int", default = 65536, min = 0, max = 1099511627776, kind = "knob", scope = "shared", layer = "cuda", about = "bytes from which a receive uses its own streams" },
@@ -269,7 +268,7 @@ param = [
   { name = "FATTN_KQ_STRIDE", available = false, set = "code", type = "int", default = 256, kind = "knob", scope = "shared", layer = "cuda", where = "ggml/src/ggml-cuda/fattn-common.cuh", about = "cells a fused attention kernel scores in one tile" },
   { name = "graph_slot_max_tokens", available = false, set = "code", type = "int", default = 32, kind = "knob", scope = "shared", layer = "llama", where = "src/llama-context.h", about = "largest step whose graph a context keeps" },
 
-  # ---- Shared: earlier paths, kept behind a switch (101)
+  # ---- Shared: earlier paths, kept behind a switch (104)
   { name = "GGML_CUDA_AR_COPY_TAIL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
@@ -281,6 +280,7 @@ param = [
   { name = "GGML_CUDA_FATTN_LIVE_TILES_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_FATTN_MASK_PREFIX_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_FATTN_Q4_0_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
+  { name = "GGML_CUDA_FATTN_RAW_D128_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda", output = "rounding", about = "q8_0 K/V of head size 128 (GQA over 4) is copied to f16 before the MMA attention reads it, instead of read in place" },
   { name = "GGML_CUDA_FATTN_Q8_0_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_FWHT_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_FWHT_PDL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
@@ -371,6 +371,8 @@ param = [
   { name = "LLAMA_SAMPLING_TOP_K_PENALTIES_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "common" },
   { name = "LLAMA_TOP_K_HEAP_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "common" },
   { name = "LLAMA_TOP_K_PREFILTER_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "common" },
+  { name = "LLAMA_DSPARK_HEAD_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama", output = "rounding", about = "each step of a DSpark Markov head multiplies the whole LM head by its correction, instead of the product of the head and the correction's weights made once at load" },
+  { name = "LLAMA_SPEC_FEED_PER_SEQ_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "common", output = "rounding", about = "a DFlash or DSpark draft is fed the target rows of a decode step one sequence at a time, a decode and a wait each, instead of every sequence in one decode" },
 
   # ---- Shared: diagnostics (31)
   { name = "GGML_CUDA_COUNT_INFLIGHT", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "shared", layer = "cuda" },

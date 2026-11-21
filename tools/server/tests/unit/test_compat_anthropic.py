@@ -90,6 +90,63 @@ def test_anthropic_messages_with_system():
     assert len(res.body["content"]) > 0
 
 
+CLIENT_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude. " + "Answer the user in one short sentence. " * 24
+
+
+def billing_header(prompt_id: str, turn: int) -> str:
+    """The billing header a client puts first in its system prompt: its fields change with every user message"""
+    return ("x-anthropic-billing-header: cc_version=2.1.330.273; cc_entrypoint=sdk-cli; cch=0cbe7; "
+            f"cc_prompt_id={prompt_id}; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index={turn};")
+
+
+def test_anthropic_billing_header_is_not_part_of_the_prompt():
+    """A client's billing header is request metadata: the prompt is the one without it, whatever its fields say"""
+    server.start()
+
+    def count(system) -> int:
+        res = server.make_request("POST", "/v1/messages/count_tokens", data={
+            "model": "test",
+            "system": system,
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+        assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+        return res.body["input_tokens"]
+
+    plain = count(CLIENT_SYSTEM)
+    # the header and the prompt in one block
+    assert count("x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch=a5145;" + CLIENT_SYSTEM) == plain
+    assert count([{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch=7c2d0;" + CLIENT_SYSTEM}]) == plain
+    # the header as a block of its own
+    for prompt_id, turn in [("0d0c6a52-5e3f-4c0e-9a0b-0f6f3a1d2b11", 1), ("9b1f8e77-2a4d-4b6c-8d3e-5c7a9e0f4d22", 7)]:
+        blocks = [{"type": "text", "text": billing_header(prompt_id, turn)}, {"type": "text", "text": CLIENT_SYSTEM}]
+        assert count(blocks) == plain
+    # a system prompt that only mentions the header keeps every word
+    mention = "Explain what an x-anthropic-billing-header: cch=a5145; is."
+    assert count(mention) > count("Explain what an is.")
+
+
+def test_anthropic_billing_header_change_reads_the_prompt_from_cache():
+    """Two requests that differ only in their billing header's fields are one prompt: the second reads it from cache"""
+    server.start()
+
+    def ask(prompt_id: str, turn: int) -> dict:
+        res = server.make_request("POST", "/v1/messages", data={
+            "model": "test",
+            "max_tokens": 4,
+            "system": [{"type": "text", "text": billing_header(prompt_id, turn)}, {"type": "text", "text": CLIENT_SYSTEM}],
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+        assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+        return res.body["usage"]
+
+    first = ask("0d0c6a52-5e3f-4c0e-9a0b-0f6f3a1d2b11", 1)
+    second = ask("9b1f8e77-2a4d-4b6c-8d3e-5c7a9e0f4d22", 2)
+    n_prompt = first["input_tokens"] + first["cache_read_input_tokens"]
+    assert n_prompt > 100
+    assert second["input_tokens"] + second["cache_read_input_tokens"] == n_prompt
+    assert second["input_tokens"] <= 4, f"the second request read {second['input_tokens']} of {n_prompt} prompt tokens again"
+
+
 def test_anthropic_messages_multipart_content():
     """Test messages with multipart content blocks"""
     server.start()

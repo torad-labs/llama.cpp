@@ -1225,8 +1225,12 @@ protected:
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
 
-    // Called while h_nextn still holds the context features of batch_inject.
-    virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*n_chunk*/) {}
+    // Called while h_nextn still holds the context features of batch_inject: the sequence's n_chunk rows begin at row first.
+    virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*first*/, int32_t /*n_chunk*/) {}
+
+    // Whether a decode may feed several sequences at once: the context rows a draft keeps must then be read by their row
+    // in the batch, which the host copy of a micro-batch split by sequences does not keep.
+    virtual bool feed_together() const { return true; }
 
 public:
     ~common_speculative_impl_draft_dflash() override {
@@ -1297,8 +1301,62 @@ public:
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // A decode step's rows from the device buffer: every sequence whose rows fit one draft ubatch is fed in one
+        // decode with the others, then each one's context rows are read from it. A decode a sequence made 23 decodes and
+        // 23 waits a step at 23 sessions. LLAMA_SPEC_FEED_PER_SEQ_LEGACY=1: one decode a sequence
+        static const bool feed_per_seq = ggml_env_switch("LLAMA_SPEC_FEED_PER_SEQ_LEGACY");
+        std::vector<bool> fed(n_seq, false);
+        if (use_dev_features && !feed_per_seq && feed_together()) {
+            struct span { llama_seq_id seq_id; int32_t first, n_rows; };
+            std::vector<span> spans;
+            const auto flush = [&]() {
+                if (spans.empty()) {
+                    return true;
+                }
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, sequences=%zu)\n",
+                            __func__, rc, (int) batch_inject.size(), spans.size());
+                    return false;
+                }
+                for (const auto & sp : spans) {
+                    store_context_features(sp.seq_id, sp.first, sp.n_rows);
+                }
+                spans.clear();
+                return true;
+            };
+            batch_inject.clear();
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+                const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
+                if (n_rows > n_ubatch || (has_embeddings && n_rows > 1 && pos_pinned)) {
+                    continue; // a prompt longer than a ubatch, or a pinned image: the loop below
+                }
+                if ((int32_t) batch_inject.size() + n_rows > n_ubatch) {
+                    if (!flush()) {
+                        return false;
+                    }
+                    batch_inject.clear();
+                }
+                spans.push_back({seq_id, (int32_t) batch_inject.size(), n_rows});
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const int32_t   row        = i_batch_beg[seq_id] + i;
+                    const llama_pos p          = batch_in.tokens[row].pos[0];
+                    const llama_pos pos_arr[4] = { p, p, p, 0 };
+                    batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                }
+                fed[seq_id] = true;
+            }
+            if (!flush()) {
+                return false;
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_beg[seq_id] < 0) {
+            if (i_batch_beg[seq_id] < 0 || fed[seq_id]) {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
@@ -1329,7 +1387,7 @@ public:
                                 __func__, rc, (int) n_chunk, (int) offset);
                         return false;
                     }
-                    store_context_features(seq_id, n_chunk);
+                    store_context_features(seq_id, 0, n_chunk);
                     continue;
                 }
 
@@ -1360,7 +1418,7 @@ public:
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
-                store_context_features(seq_id, n_chunk);
+                store_context_features(seq_id, 0, n_chunk);
             }
         }
 
@@ -1536,12 +1594,15 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         }
     }
 
-    void store_context_features(llama_seq_id seq_id, int32_t n_chunk) override {
+    // the device copy of the context rows is placed by batch row; the host copy follows the micro-batches' order
+    bool feed_together() const override { return !inkling || context_on_device; }
+
+    void store_context_features(llama_seq_id seq_id, int32_t first, int32_t n_chunk) override {
         if (!inkling) {
             return;
         }
         const int32_t keep = std::min<int32_t>(n_chunk, context_rows);
-        const int32_t start = n_chunk - keep;
+        const int32_t start = first + n_chunk - keep;
         const float * tail = nullptr;
         if (context_on_device) {
             if (llama_get_embeddings_nextn_rows(params.ctx_dft, start, keep, context_tail.data())) {
@@ -1892,7 +1953,7 @@ struct common_speculative_impl_draft_lilicorr final : public common_speculative_
     }
 
 protected:
-    void store_context_features(llama_seq_id seq_id, int32_t n_chunk) override {
+    void store_context_features(llama_seq_id seq_id, int32_t /*first*/, int32_t n_chunk) override {
         // Ordinary DFlash can write to the KV cache, but LiliCorr needs to store embeddings across sequences.
         const float * projected = llama_get_embeddings_nextn(params.ctx_dft);
         if (projected) {
