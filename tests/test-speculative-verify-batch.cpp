@@ -241,8 +241,8 @@ static void test_rejection_side_by_side_keeps_what_each_keeps_alone() {
         qs.assign(seqs.size(), {});
         for (size_t s = 0; s < seqs.size(); ++s) {
             for (size_t i = 0; i < seqs[s].draft.size(); ++i) {
-                // a draft that has its own idea: the k largest logits of a row it did not see
-                qs[s].push_back(top_k_q(*seqs[s].rows[(i + 1) % seqs[s].rows.size()], 16));
+                // a draft near the target: the 16 largest logits of the row, so it is kept often and rejected now and then
+                qs[s].push_back(top_k_q(*seqs[s].rows[i], 16));
                 seqs[s].draft[i] = draw_from(qs[s].back(), draw);
             }
         }
