@@ -680,8 +680,15 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
     auto * candidate = ggml_tanh(ctx0, chunk(1));
     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
     auto * latent = ggml_tanh(ctx0, chunk(2));
-    auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    auto * bias = g.build_lora_mm(output, correction, output_s);
+    ggml_tensor * bias;
+    if (model.dspark_head_out && output == model.output && g.loras->empty()) {
+        // head x (W x latent + b) as (head x [W | b]) x [latent; 1], made at load (load_tensors_dspark_head)
+        auto * ones = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, latent->ne[1]), 1.0f);
+        bias = ggml_mul_mat(ctx0, model.dspark_head_out, ggml_concat(ctx0, latent, ones, 0));
+    } else {
+        auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
+        bias = g.build_lora_mm(output, correction, output_s);
+    }
     ggml_prec_set_acc(bias, GGML_PREC_F32);
     if (bias->ne[0] != base->ne[0]) {
         bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));

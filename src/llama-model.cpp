@@ -2491,8 +2491,72 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    load_tensors_dspark_head();
 
     return true;
+}
+
+// DSpark's Markov head adds head x (W x latent + b) to a block's logits on each of its steps (dflash.cpp
+// build_inkling2_head), which reads the whole LM head a step (1.85 GB in BF16 for Inkling 2) for a rank-256 correction.
+// The product head x [W | b] is made once here on the head's device, [rank + 1, n_vocab] in F16, and a step reads it (about
+// 100 MB) against [latent; 1]. LLAMA_DSPARK_HEAD_LEGACY=1: every step multiplies by the head.
+void llama_model_base::load_tensors_dspark_head() {
+    auto * draft = dynamic_cast<llama_model_dflash *>(this);
+    if (draft == nullptr || draft->dspark_markov_rank == 0 || !draft->dspark_hidden_out || !draft->dspark_hidden_out_b ||
+            !output || output_s || !output->buffer || hdmd.weight_blocks.count("output.weight") ||
+            ggml_env_switch("LLAMA_DSPARK_HEAD_LEGACY")) {
+        return;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_buft_is_host(buft)) {
+        return; // a head the CPU holds keeps its product a step
+    }
+    const int64_t rank = draft->dspark_markov_rank, n_embd = output->ne[0], n_vocab = output->ne[1];
+    GGML_ASSERT(draft->dspark_hidden_out->ne[0] == rank && draft->dspark_hidden_out->ne[1] == n_embd);
+
+    ggml_init_params params = { ggml_tensor_overhead(), NULL, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    ggml_tensor * head_out = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, rank + 1, n_vocab);
+    ggml_set_name(head_out, "dspark_head_out.weight");
+    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    ggml_backend_ptr backend { ggml_backend_dev_init(dev, nullptr) };
+    if (!buffer || !backend) {
+        LLAMA_LOG_WARN("%s: no room for the DSpark head's product on %s: every step multiplies by the head\n", __func__,
+                ggml_backend_buft_name(buft));
+        return;
+    }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // the head's rows a pass, so its rows' F32 product stays a few hundred MB on the card
+    const int64_t rows_pass = 16384;
+    for (int64_t v0 = 0; v0 < n_vocab; v0 += rows_pass) {
+        const int64_t nv = std::min(rows_pass, n_vocab - v0);
+        ggml_init_params gparams = { 32*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
+        ggml_context_ptr gctx { ggml_init(gparams) };
+        ggml_context * g = gctx.get();
+        ggml_tensor * w  = ggml_cont(g, ggml_transpose(g, ggml_cast(g, draft->dspark_hidden_out, GGML_TYPE_F32))); // [n_embd, rank]
+        ggml_tensor * b  = ggml_reshape_2d(g, ggml_cast(g, draft->dspark_hidden_out_b, GGML_TYPE_F32), n_embd, 1);
+        ggml_tensor * wb = ggml_concat(g, w, b, 1);                                                                // [n_embd, rank + 1]
+        ggml_tensor * rows = ggml_view_2d(g, output, n_embd, nv, output->nb[1], v0*output->nb[1]);
+        ggml_tensor * product = ggml_mul_mat(g, rows, wb);                                                         // [nv, rank + 1]
+        ggml_prec_set_acc(product, GGML_PREC_F32);
+        ggml_tensor * dst = ggml_view_2d(g, head_out, rank + 1, nv, head_out->nb[1], v0*head_out->nb[1]);
+        ggml_tensor * out = ggml_cpy(g, ggml_cont(g, ggml_transpose(g, product)), dst);
+        ggml_cgraph * gf = ggml_new_graph(g);
+        ggml_build_forward_expand(gf, out);
+        ggml_gallocr_ptr galloc { ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())) };
+        if (!ggml_gallocr_alloc_graph(galloc.get(), gf) || ggml_backend_graph_compute(backend.get(), gf) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("DSpark: the head's product with the Markov correction failed");
+        }
+    }
+    ggml_backend_synchronize(backend.get());
+    LLAMA_LOG_INFO("%s: %12s DSpark head product = %8.2f MiB\n", __func__, ggml_backend_buft_name(buft),
+            ggml_backend_buffer_get_size(buffer.get())/1024.0/1024.0);
+    draft->dspark_head_out = head_out;
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(std::move(buffer));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)

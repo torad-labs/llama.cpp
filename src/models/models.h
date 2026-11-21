@@ -1661,6 +1661,7 @@ struct llama_model_dflash : public llama_model_base {
     ggml_tensor * dspark_norm         = nullptr;
     ggml_tensor * dspark_hidden_out   = nullptr;
     ggml_tensor * dspark_hidden_out_b = nullptr;
+    ggml_tensor * dspark_head_out     = nullptr; // output x [hidden_out | hidden_out_b], made at load (load_tensors_dspark_head)
 
     void load_hparams_lilicorr(llama_model_loader & ml);
     void load_hparams_dsv4(llama_model_loader & ml);
