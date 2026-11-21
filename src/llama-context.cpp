@@ -2689,8 +2689,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
     }
+    // A DFlash/DSpark draft decodes two step shapes in turn, its feed (sessions x verified rows) and its block (sessions x
+    // block rows), both past graph_slot_max_tokens at 23 sessions: on the main scheduler, which holds one graph, each
+    // round built both again. Its graphs stay in the slots. LLAMA_DRAFT_GRAPH_SLOTS_LEGACY=1: the main scheduler
+    static const bool draft_slots_legacy = ggml_env_switch("LLAMA_DRAFT_GRAPH_SLOTS_LEGACY");
+    const bool draft_shape = model.arch == LLM_ARCH_DFLASH && !draft_slots_legacy;
     const bool use_slots = !graph_reuse_disable &&
-        (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape || prompt_shape || prompt_kept) && sampling_can_retain();
+        (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape || prompt_shape || prompt_kept || draft_shape) && sampling_can_retain();
 
     bool reuse = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
     for (size_t i = 0; !reuse && use_slots && i < graph_slots.size(); ++i) {
