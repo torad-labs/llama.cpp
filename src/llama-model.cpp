@@ -512,12 +512,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
 
     const bool is_inkling2 = ud->model->arch == LLM_ARCH_INKLING2;
+    // the hidden streams' state is the S state (hparams.n_sconv_hidden): it and their kernels are whole on every device,
+    // which convolves each hidden stream after one all-reduce of it
+    const bool inkling2_hidden_apart = is_inkling2 && hparams.n_sconv_hidden > 0;
+    if (inkling2_hidden_apart && std::regex_match(tensor_name, pattern_ink_hidden_conv)) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
     if (is_inkling2 && (std::regex_match(tensor_name, pattern_ink_hidden_conv) || std::regex_match(tensor_name, pattern_r_cache))) {
-        // Each layer's convolution state holds the last positions of four streams one after the other: K, V, and the
-        // two hidden streams (the attention output and the experts' sum, after their reductions). K and V split by the
-        // layer's KV heads, as attn_k does. The hidden streams split by channel in the same ratio, n_embd/n_head_kv
-        // channels a KV head: the graph's views and stores into the state scale their offsets by one ratio for all
-        // four, and the hidden kernels split as the state they read.
+        // Each layer's convolution state holds the last positions of its streams one after the other: K, V, and, with
+        // LLAMA_INKLING2_HIDDEN_CONV_LEGACY, the two hidden streams (the attention output and the experts' sum, after
+        // their reductions). K and V split by the layer's KV heads, as attn_k does. The legacy hidden streams split by
+        // channel in the same ratio, n_embd/n_head_kv channels a KV head: the graph's views and stores into the state
+        // scale their offsets by one ratio for all four, and the hidden kernels split as the state they read.
         const bool cache = tensor_name.rfind("cache_", 0) == 0;
         const uint32_t il = std::stoul(cache ? tensor_name.substr(tensor_name.find("_l", 6) + 2) : tensor_name.substr(4));
         const ggml_tensor * k = ud->model->get_tensor(("blk." + std::to_string(il) + ".attn_k.weight").c_str());
@@ -529,9 +535,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         GGML_ASSERT(hparams.n_embd % n_head_kv == 0);
         const int64_t channels_per_head[4] = {head_dim, head_dim, hparams.n_embd / n_head_kv, hparams.n_embd / n_head_kv};
         const int64_t n_cols = cache ? hparams.n_shortconv_l_cache - 1 : 1;
-        GGML_ASSERT(!cache || tensor->ne[0] == n_cols*(2*n_head_kv*head_dim + 2*int64_t(hparams.n_embd)));
+        const int64_t n_streams = inkling2_hidden_apart ? 2 : 4;
+        GGML_ASSERT(!cache || tensor->ne[0] == n_cols*(2*n_head_kv*head_dim + (inkling2_hidden_apart ? 0 : 2*int64_t(hparams.n_embd))));
         ggml_backend_meta_split_state split = {cache ? GGML_BACKEND_SPLIT_AXIS_0 : GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
-        split.n_segments = cache ? 4 : 1;
+        split.n_segments = cache ? n_streams : 1;
         for (size_t s = 0; s < split.n_segments; ++s) {
             split.nr[s] = 1;
             for (size_t j = 0; j < ud->n_devices; ++j) {
@@ -628,8 +635,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (is_inkling2 && std::regex_match(tensor_name, pattern_s_cache)) {
-            // the recurrent memory's S state, which Inkling has none of: an empty tensor
-            GGML_ASSERT(ggml_nelements(tensor) == 0);
+            // the recurrent memory's S state: the hidden streams' convolution state whole on every device, or empty
+            GGML_ASSERT(ggml_nelements(tensor) == 0 || inkling2_hidden_apart);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (is_inkling2 && tensor_name.rfind("cache_", 0) != 0 && !std::regex_match(tensor_name, pattern_ink_standard)) {
@@ -3794,7 +3801,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ params.type_s,
+                            /* recurrent_type_s  */ arch == LLM_ARCH_INKLING2 ? GGML_TYPE_F32 : params.type_s, // Inkling's is a conv state, as R
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,

@@ -44,6 +44,10 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     hparams.expert_router_f32 = true;
     hparams.expert_weights_norm_eps = 1e-20f;
     hparams.rope_pattern.fill(false);
+    // The two hidden streams' convolution state is the S state, a row apart from K's and V's, so that -sm tensor can
+    // hold it whole on every card while K and V split by heads (llama_meta_device_get_split_state).
+    // LLAMA_INKLING2_HIDDEN_CONV_LEGACY=1: all four streams in one row, the hidden ones split by channel as K and V are
+    const bool hidden_apart = !ggml_env_switch("LLAMA_INKLING2_HIDDEN_CONV_LEGACY");
     uint64_t max_channels = 0;
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         if (!hparams.n_head_kv(il) || hparams.n_head(il) % hparams.n_head_kv(il) ||
@@ -51,12 +55,14 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
             hparams.n_expert_used(il) > hparams.n_expert || !hparams.n_ff_exp(il)) {
             throw std::runtime_error("inkling2: invalid attention or expert dimensions");
         }
-        max_channels = std::max<uint64_t>(max_channels, 2ull * hparams.n_embd_k_gqa(il) + 2ull * hparams.n_embd);
+        max_channels = std::max<uint64_t>(max_channels, 2ull * hparams.n_embd_k_gqa(il) + (hidden_apart ? 0 : 2ull * hparams.n_embd));
     }
-    if (max_channels * (hparams.n_shortconv_l_cache - 1) > UINT32_MAX) {
+    const uint64_t hidden_channels = hidden_apart ? 2ull * hparams.n_embd : 0;
+    if (std::max(max_channels, hidden_channels) * (hparams.n_shortconv_l_cache - 1) > UINT32_MAX) {
         throw std::runtime_error("inkling2: convolution state is too large");
     }
     hparams.n_sconv_channels = max_channels;
+    hparams.n_sconv_hidden = hidden_channels;
     type = LLM_TYPE_UNKNOWN;
 }
 
@@ -319,12 +325,14 @@ static ggml_tensor * gather_channels(ggml_context * ctx, ggml_tensor * x) {
     return ggml_cont(ctx, ggml_transpose(ctx, x));
 }
 
-// -sm tensor: a hidden stream comes out of its reduction whole on every device, while the kernel and the state of its
-// convolution are split by channel (llama_meta_device_get_split_state). Each device convolves its own channels, which
-// a scatter gives it with the channels outermost so that they are one run of the tensor, and the result is gathered.
+// -sm tensor: a hidden stream comes out of its reduction whole on every device. Its state is the S state, whole on every
+// device with its kernel, so each device convolves every channel after one all-reduce. With
+// LLAMA_INKLING2_HIDDEN_CONV_LEGACY the kernel and the state are split by channel (llama_meta_device_get_split_state):
+// each device convolves its own channels, which a scatter gives it with the channels outermost so that they are one run
+// of the tensor, and the result is gathered, two collectives a stream.
 ggml_tensor * llama_model_inkling2::graph::convolve_hidden(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * history,
         int64_t offset, std::vector<ggml_tensor *> & windows, int il) {
-    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || hparams.n_sconv_hidden > 0) {
         return convolve(cur, weight, nullptr, history, offset, windows, il);
     }
     auto ud = model.get_split_state_ud;
@@ -390,6 +398,16 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         auto * state = recr->mctx->get_r_l(il);
         auto * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
         history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+        // the hidden streams' state: the S state, or the conv row after K and V (LLAMA_INKLING2_HIDDEN_CONV_LEGACY)
+        const bool hidden_apart = hparams.n_sconv_hidden > 0;
+        auto * hidden_state = hidden_apart ? recr->mctx->get_s_l(il) : state;
+        auto * hidden = history;
+        if (hidden_apart) {
+            hidden = build_rs(recr, hidden_state, hparams.n_embd_s(), ubatch.n_seqs);
+            hidden = ggml_reshape_3d(ctx0, hidden, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_hidden, ubatch.n_seqs);
+        }
+        const int64_t hidden_offset = hidden_apart ? 0 : 2*kv;
+        std::vector<ggml_tensor *> hidden_windows;
         res->t_layer_inp[il] = cur;
         auto * residual = cur;
         ggml_tensor * inputs[3] = {cur, cur, cur};
@@ -408,8 +426,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             inputs[2] = build_norm(inputs[2], l.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
         }
         auto * q = build_lora_mm(l.wq, inputs[0]);
-        // the windows of the state's streams, K, V and the two hidden streams, in the order of the state's channels
+        // the windows of the state's streams in the order of its channels: K, V, and the two hidden streams when they
+        // share the row
         std::vector<ggml_tensor *> windows;
+        auto & hwindows = hidden_apart ? hidden_windows : windows;
         auto * k = convolve(build_lora_mm(l.wk, inputs[1]), l.attn_k_conv,
                 swa ? nullptr : build_lora_mm(l.attn_k_conv_proj, inputs[1]), history, 0, windows, il);
         auto * v = convolve(build_lora_mm(l.wv, inputs[2]), l.attn_v_conv,
@@ -463,7 +483,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         } else {
             cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
         }
-        cur = convolve_hidden(build_lora_mm(l.wo, cur), l.attn_post_conv, history, 2*kv, windows, il);
+        cur = convolve_hidden(build_lora_mm(l.wo, cur), l.attn_post_conv, hidden, hidden_offset, hwindows, il);
         if (il % hparams.attn_res_block_size == 0) {
             blocks.push_back(residual);
         } else {
@@ -479,14 +499,20 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             // each card's sum holds only its own experts: summed across the cards as the split rows' sums are
             cur = ggml_backend_meta_reduce(ctx0, cur);
         }
-        cur = convolve_hidden(cur, l.ffn_post_conv, history, 2*kv + n_embd, windows, il);
-        // the layer's new state in one store of its whole row: under -sm tensor the row is split by the KV heads in four
-        // segments, one a stream, and each device's windows are its part of every segment in the same order
-        auto * window = windows[0];
-        for (size_t i = 1; i < windows.size(); ++i) {
-            window = ggml_concat(ctx0, window, windows[i], 1);
+        cur = convolve_hidden(cur, l.ffn_post_conv, hidden, hidden_offset + n_embd, hwindows, il);
+        // the layer's new state in one store of each whole row: under -sm tensor the conv row is split by the KV heads in
+        // a segment a stream, and each device's windows are its part of every segment in the same order
+        auto store = [&](ggml_tensor * dst, const std::vector<ggml_tensor *> & parts) {
+            auto * window = parts[0];
+            for (size_t i = 1; i < parts.size(); ++i) {
+                window = ggml_concat(ctx0, window, parts[i], 1);
+            }
+            build_conv_state_store(recr, dst, window, hparams.n_shortconv_l_cache - 1, 0);
+        };
+        store(state, windows);
+        if (hidden_apart) {
+            store(hidden_state, hidden_windows);
         }
-        build_conv_state_store(recr, state, window, hparams.n_shortconv_l_cache - 1, 0);
         cur = ggml_add(ctx0, residual, cur);
         cb(cur, "l_out", il);
     }
@@ -521,15 +547,24 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         }
     }
     res->t_embd = cur;
-    cur = build_lora_mm(model.output, cur);
+    // -sm tensor splits the padded vocabulary. The head's rows of the unpadded vocabulary are a view of each device's
+    // rows, so each device keeps the logits of its share and the host reads every share where it lies (logits_gather).
+    // LLAMA_INKLING2_LOGITS_GATHER_LEGACY=1: the padded logits gathered whole to every device, then sliced
+    static const bool logits_gather_legacy = ggml_env_switch("LLAMA_INKLING2_LOGITS_GATHER_LEGACY");
+    const bool split_vocab = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !logits_gather_legacy;
+    cur = split_vocab ?
+        build_lora_mm(ggml_view_2d(ctx0, model.output, n_embd, hparams.n_vocab_unpadded, model.output->nb[1], 0), cur) :
+        build_lora_mm(model.output, cur);
     ggml_prec_set_acc(cur, GGML_PREC_F32);
     const float cap = hparams.f_final_logit_softcapping;
     cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
-    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        // -sm tensor splits the padded vocabulary, which the slice below cuts in no ratio of the split: slice it whole
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !split_vocab) {
+        // the slice below cuts the padded vocabulary in no ratio of the split: slice it whole
         cur = gather_channels(ctx0, cur);
     }
-    cur = ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0);
+    if (cur->ne[0] != hparams.n_vocab_unpadded) {
+        cur = ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0);
+    }
     if (cparams.pipeline_parallel || !ggml_is_contiguous(cur)) {
         cur = ggml_cont(ctx0, cur);
     }
