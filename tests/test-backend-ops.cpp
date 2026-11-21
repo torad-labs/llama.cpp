@@ -11633,11 +11633,14 @@ struct test_flash_attn_ext_rel_pos : public test_case {
     const int64_t run; // cells in each run a row owns when n_kv_max bounds it: 1 as decode lays a pool out
     const bool low_mean; // ggml_flash_attn_ext_set_low_mean_mask, a hint only: the first row reads the pool, the others a run each
     const int group;     // ggml_flash_attn_ext_set_query_group, a hint only: runs of rows that read each cell once together
+    // the cells the first row's session holds, spread over the pool in runs; the other runs go in turn to 22 more sessions
+    // (23 as served), whose own the step's other rows see while the rest sit idle. 0: the layouts above
+    const int64_t lead;
 
     std::string vars() override {
         const std::string base = VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_dist, type_KV, sinks, mask_bits, query_sinks, n_kv_max);
         return (run == 16 ? base : base + "," + VAR_TO_STR(run)) + (low_mean ? "," + VAR_TO_STR(low_mean) : "") +
-            (group ? "," + VAR_TO_STR(group) : "");
+            (group ? "," + VAR_TO_STR(group) : "") + (lead ? "," + VAR_TO_STR(lead) : "");
     }
 
     double max_nmse_err() override {
@@ -11647,9 +11650,10 @@ struct test_flash_attn_ext_rel_pos : public test_case {
     test_flash_attn_ext_rel_pos(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 6, int64_t kv = 2048, int64_t nb = 32,
                                 int64_t n_stream = 1, int64_t n_dist = 1025, ggml_type type_KV = GGML_TYPE_F16, bool sinks = true,
                                 bool mask_bits = false, bool query_sinks = false, int n_kv_max = 0, int64_t run = 16,
-                                bool low_mean = false, int group = 0)
+                                bool low_mean = false, int group = 0, int64_t lead = 0)
         : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_dist(n_dist), type_KV(type_KV), sinks(sinks),
-          mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max), run(run), low_mean(low_mean), group(group) {}
+          mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max), run(run), low_mean(low_mean), group(group),
+          lead(lead) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -11713,6 +11717,12 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                 // causal over the cells' positions, empty cells hidden; every row sees the cells before it
                 // Written a row at a time: a pool of millions of cells never has its whole mask as floats.
                 std::vector<float> f(kv);
+                // with a lead, the session of each run: the lead's runs evenly over the pool, the others' in turn
+                const int64_t n_runs = (kv + run - 1)/run, n_lead = lead/run, n_sessions = std::max<int64_t>(23, group ? nb/group : nb);
+                std::vector<int32_t> owner(lead ? n_runs : 0);
+                for (int64_t r = 0, other = 0; r < int64_t(owner.size()); ++r) {
+                    owner[r] = (r + 1)*n_lead/n_runs > r*n_lead/n_runs ? 0 : int32_t(1 + other++ % (n_sessions - 1));
+                }
                 const size_t row_bytes = ggml_nbytes(t)/(nb*n_stream);
                 for (int64_t s = 0; s < n_stream; ++s) {
                     for (int64_t i = 0; i < nb; ++i) {
@@ -11723,7 +11733,8 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                             const bool runs = n_kv_max || (low_mean && i > 0);
                             // with a query group the runs are a sequence's, shared by its rows as a token's and its drafts'
                             const int64_t seq = group ? i/group : i, n_seq = group ? nb/group : nb;
-                            const bool owned = !runs || (i + 1 < nb && (j < 16 || (j/run)%n_seq == seq));
+                            const bool owned = lead ? j < 16 || owner[j/run] == seq :
+                                    !runs || (i + 1 < nb && (j < 16 || (j/run)%n_seq == seq));
                             const bool seen = owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max);
                             f[j] = seen ? 0.0f : -INFINITY;
                             live += seen;
@@ -16811,6 +16822,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t kv : {8192, 65536}) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 16, 1, 1025, GGML_TYPE_F16, true, true, true, 0, 1, true));
     }
+    // a decode step at any row count reads only its rows' cells (LLAMA_INKLING2_DECODE_POOL_READS): one session holding a
+    // quarter of the pool or most of it among 22 short ones, with 1 to 23 of them decoding or 1, 4 and 23 verifying a
+    // token and two drafts each; and rows under 8 that are each bounded to an eighth of the pool
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t kv : {65536, 262144}) {
+            for (int64_t lead : {kv/4, kv*7/8}) {
+                for (int64_t nb : {1, 4, 7, 8, 23}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, nb, 1, 1025, type, true, true, true, 0, 1, true, 0, lead));
+                }
+            }
+            for (int64_t nb : {1, 4, 23}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 3*nb, 1, 1025, type, true, true, true, 0, 1, true, 3, kv/4));
+            }
+            for (int64_t nb : {1, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, nb, 1, 1025, type, true, true, true, kv/8, 1, false, 0, kv/10));
+            }
+        }
+    }
 
     // flash attention over a list of K/V rows per slice (unified KV cache)
     for (int64_t nb : {1, 3, 8, 64, 512}) {
@@ -17901,6 +17930,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // and its low-mean step: one session reads the whole pool
     for (int64_t kv : { 262144, 3014656 }) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 0, 1, true));
+    }
+    // a long session among short ones (G7: 199,967 of 853,574 cells, 23 sessions): 1, 4 and 23 of them decoding, and 23
+    // verifying a token and two drafts each, on either global layout, as a low-mean step and as the dense step that
+    // LLAMA_INKLING2_DECODE_CLASS_LEGACY=1 makes of it
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (bool low_mean : { false, true }) {
+            for (int64_t nb : { 1, 4, 23 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 860160, nb, 1, 1025, type, true, true, true, 0, 1, low_mean, 0, 200000));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 860160, 69, 1, 1025, type, true, true, true, 0, 1, low_mean, 3, 200000));
+        }
+        // and 1 or 4 sessions that each hold a tenth of it, bounded rows
+        for (int64_t nb : { 1, 4 }) {
+            for (int n_kv_max : { 0, 860160/8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 860160, nb, 1, 1025, type, true, true, true, n_kv_max, 1, false, 0, 86016));
+            }
+        }
     }
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {

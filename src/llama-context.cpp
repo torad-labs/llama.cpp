@@ -660,6 +660,9 @@ llama_context::llama_context(
         // a drafted step's rows of a sequence read each cell once together, and its mask is classed by its sequences;
         // LLAMA_INKLING2_REL_GROUP_LEGACY=1: each row reads its cells alone, and a drafted step's mask is dense
         cparams.rel_query_group = !ggml_env_switch("LLAMA_INKLING2_REL_GROUP_LEGACY");
+        // a decode step of any row count reads only its rows' cells; LLAMA_INKLING2_DECODE_CLASS_LEGACY=1: fewer than 8
+        // rows, a drafted step with a long sequence and a low mean outside LLAMA_INKLING2_MEAN_ROWS are dense
+        cparams.rel_decode_rows = !ggml_env_switch("LLAMA_INKLING2_DECODE_CLASS_LEGACY");
         // its residual depth mix, norm clips and output gate run as one op each; LLAMA_INKLING2_FUSE_LEGACY=1 builds them
         // from elementwise ops
         cparams.fused_inkling2 = false;
