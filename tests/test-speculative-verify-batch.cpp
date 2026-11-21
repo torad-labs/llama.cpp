@@ -291,9 +291,10 @@ static void test_rejection_side_by_side_keeps_what_each_keeps_alone() {
 }
 
 // The token a row keeps is a sample of the target's distribution, whatever the draft proposed: a draft over its own top
-// k (part of it outside what the target can sample) checked by rejection, against the target's top-k chain. A chi-square
-// over the target's support, and the same check catches a draft that proposes from another distribution than its q.
-static void test_rejection_keeps_the_target_distribution() {
+// k (part of it outside what the target can sample) checked by rejection. A chi-square over the target's support, and
+// the same check catches a draft that proposes from another distribution than its q. top_k 5: the chain cuts the row and
+// the row is sampled through its candidates; 0: the whole row at temperature 1, checked in one vector pass.
+static void test_rejection_keeps_the_target_distribution(int32_t top_k) {
     const int32_t n_live = 6;
     std::vector<float> target(g_n_vocab, -1000.0f), draft(g_n_vocab, -1000.0f);
     const float target_live[n_live] = { 1.0f, 0.5f, 0.0f, -0.5f, -1.0f, -2.0f };
@@ -302,20 +303,20 @@ static void test_rejection_keeps_the_target_distribution() {
         target[1000 + 7*t] = target_live[t];
         draft [1000 + 7*t] = draft_live[t];
     }
-    draft[50000] = 0.9f; // the target's top-k chain never samples it
+    draft[50000] = 0.9f; // the target never samples it
 
-    // the chain samples the 5 largest, so the target's 6th live token is out of its support too
+    // a chain that samples the 5 largest leaves the target's 6th live token out of its support too
     common_params_sampling params;
     params.seed  = 5;
     params.temp  = 1.0f;
-    params.top_k = 5;
+    params.top_k = top_k;
     params.top_p = 1.0f;
     params.min_p = 0.0f;
     common_sampler_ptr smpl(common_sampler_init(g_model, params));
 
     double p_sum = 0.0;
     std::vector<double> p(n_live, 0.0);
-    for (int32_t t = 0; t < 5; ++t) {
+    for (int32_t t = 0; t < (top_k > 0 ? top_k : n_live); ++t) {
         p[t] = std::exp((double) target_live[t]);
         p_sum += p[t];
     }
@@ -352,11 +353,11 @@ static void test_rejection_keeps_the_target_distribution() {
         return x2;
     };
 
-    // 4 degrees of freedom: 30 is beyond the 1e-5 tail (25.4)
-    const double x2      = chi2(q, 40000);
-    const double x2_skew = chi2(q_skew, 40000);
-    printf("rejection keeps the target's distribution: chi-square %.2f (4 dof), a draft drawing from another q %.2f\n",
-            x2, x2_skew);
+    // 4 or 5 degrees of freedom: 30 is beyond the 1e-5 tail of either (25.4, 28.5)
+    const double x2      = chi2(q, 20000);
+    const double x2_skew = chi2(q_skew, 20000);
+    printf("rejection keeps the target's distribution (top-k %d): chi-square %.2f, a draft drawing from another q %.2f\n",
+            top_k, x2, x2_skew);
     assert(x2 < 30.0);
     assert(x2_skew > 30.0);
 }
@@ -383,7 +384,8 @@ int main(int argc, char ** argv) {
     test_what_a_sequence_keeps();
     test_side_by_side_keeps_what_each_keeps_alone();
     test_rejection_side_by_side_keeps_what_each_keeps_alone();
-    test_rejection_keeps_the_target_distribution();
+    test_rejection_keeps_the_target_distribution(5);
+    test_rejection_keeps_the_target_distribution(0);
 
     printf("OK speculative verify batch\n");
     return 0;

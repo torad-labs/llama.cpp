@@ -1650,6 +1650,14 @@ extern "C" {
     /// probabilities 256 tokens a block, so a draw within rounding of the edge between two tokens can give the other.
     LLAMA_API llama_token llama_sampler_chain_sample_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab);
 
+    /// Rejection sampling of a drafted token against the row the chain would sample, for the chains and CPUs
+    /// llama_sampler_chain_sample_row takes: the draft is kept with probability min(1, p/q) (u_accept against p/q), else
+    /// the token is drawn from max(0, p - q) at u_residual of its mass. q is the draft's distribution, n_q tokens (any
+    /// order, the draft among them). The row is read in one vector pass and the draws come from the caller, not the
+    /// chain. LLAMA_TOKEN_NULL for any other chain or CPU.
+    LLAMA_API llama_token llama_sampler_chain_reject_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab,
+            llama_token draft, const llama_token_data * q, size_t n_q, double u_accept, double u_residual);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

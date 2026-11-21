@@ -356,7 +356,7 @@ param = [
   { name = "LLAMA_SAMPLER_ATTACH_RESERVE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_SAMPLER_DETACH_RESERVE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_SAMPLING_TIES_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
-  { name = "LLAMA_SAMPLING_ONE_PASS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
+  { name = "LLAMA_SAMPLING_ONE_PASS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama", about = "a row is sampled through its candidates and the chain, and a drafted token is checked by rejection the same way, instead of in one vector pass over the row" },
   { name = "LLAMA_CHECKPOINT_DEDUP_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },
   { name = "LLAMA_CHECKPOINT_NEAR_END_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },
   { name = "LLAMA_CHECKPOINT_POOL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server" },

@@ -4581,12 +4581,14 @@ LLAMA_SAMPLER_ROW_VEC static llama_token llama_sampler_row_draw(const llama_samp
 
 #endif // LLAMA_SAMPLER_ROW_VEC
 
-llama_token llama_sampler_chain_sample_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab) {
 #ifdef LLAMA_SAMPLER_ROW_VEC
+// The row a chain llama_sampler_chain_sample_row takes samples, and its dist sampler; nullptr for any other chain or CPU
+static llama_sampler_dist * llama_sampler_chain_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab,
+        llama_sampler_row & row) {
     static const bool cpu_draws = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
     if (!cpu_draws || sampling_one_pass_legacy() || chain == nullptr || chain->iface != &llama_sampler_chain_i || logits == nullptr ||
             n_vocab < 2) {
-        return LLAMA_TOKEN_NULL;
+        return nullptr;
     }
     auto * p = (llama_sampler_chain *) chain->ctx;
 
@@ -4605,7 +4607,7 @@ llama_token llama_sampler_chain_sample_row(struct llama_sampler * chain, const f
 
         const auto * iface = s.ptr->iface;
         if (dist != nullptr) {
-            return LLAMA_TOKEN_NULL;
+            return nullptr;
         }
         if (iface == &llama_sampler_empty_i) {
             continue;
@@ -4621,21 +4623,141 @@ llama_token llama_sampler_chain_sample_row(struct llama_sampler * chain, const f
         } else if (iface == &llama_sampler_dist_i && !((const llama_sampler_dist *) s.ptr->ctx)->coupled) {
             dist = (llama_sampler_dist *) s.ptr->ctx;
         } else {
-            return LLAMA_TOKEN_NULL;
+            return nullptr;
         }
     }
     // a temperature of 0 or less keeps the largest logit alone
     if (dist == nullptr || !(temp > 0.0f)) {
-        return LLAMA_TOKEN_NULL;
+        return nullptr;
     }
 
-    time_meas tm(p->t_sample_us, p->params.no_perf);
-
-    llama_sampler_row row = { logits, n_vocab, nullptr, 0, temp };
+    row = { logits, n_vocab, nullptr, 0, temp };
     if (bias != nullptr) {
         row.bias   = bias->by_token.data();
         row.n_bias = bias->by_token.size();
     }
+    return dist;
+}
+
+// Rejection sampling of draft against the row (llama_sampler_chain_reject_row): one pass for the row's blocks' sums and
+// q's tokens' probabilities, and a walk of one block when the draw lands outside q's tokens
+LLAMA_SAMPLER_ROW_VEC static llama_token llama_sampler_row_reject(const llama_sampler_row & row, llama_token draft,
+        const llama_token_data * q, size_t n_q, double u_accept, double u_residual) {
+    const int32_t n_blocks = (row.n + LLAMA_SAMPLER_ROW_BLOCK - 1)/LLAMA_SAMPLER_ROW_BLOCK;
+
+    alignas(32) float buf[LLAMA_SAMPLER_ROW_BLOCK];
+    alignas(32) float p[LLAMA_SAMPLER_ROW_BLOCK];
+    int32_t n_b = 0;
+
+    __m256 v_max = _mm256_set1_ps(-INFINITY);
+    for (int32_t b = 0; b < n_blocks; ++b) {
+        const float * x = llama_sampler_row_block(row, b, buf, n_b);
+        v_max = llama_sampler_row_block_max(x, n_b, v_max);
+    }
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, v_max);
+    float max_l = *std::max_element(lanes, lanes + 8);
+    if (row.temp != 1.0f) {
+        max_l /= row.temp;
+    }
+
+    // q's tokens in id order with the row's unnormalized probability of each, taken from their blocks
+    std::vector<llama_token_data> s;
+    s.reserve(n_q);
+    for (size_t k = 0; k < n_q; ++k) {
+        if (q[k].id >= 0 && q[k].id < row.n) {
+            s.push_back({ q[k].id, 0.0f, q[k].p });
+        }
+    }
+    std::sort(s.begin(), s.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
+
+    std::vector<double> sums(n_blocks);
+    double z = 0.0;
+    size_t j = 0;
+    for (int32_t b = 0; b < n_blocks; ++b) {
+        const float * x = llama_sampler_row_block(row, b, buf, n_b);
+        sums[b] = llama_sampler_row_block_probs(x, n_b, row.temp, max_l, p);
+        z += sums[b];
+        // the block's sum without q's tokens: what the walk outside q's support reads
+        for (; j < s.size() && s[j].id < (b + 1)*LLAMA_SAMPLER_ROW_BLOCK; ++j) {
+            s[j].logit = p[s[j].id - b*LLAMA_SAMPLER_ROW_BLOCK];
+            sums[b] -= s[j].logit;
+        }
+    }
+
+    float p_x = 0.0f, q_x = 0.0f;
+    for (const auto & t : s) {
+        if (t.id == draft) {
+            p_x = (float) (t.logit/z);
+            q_x = t.p;
+        }
+    }
+    if (q_x > 0.0f && (p_x >= q_x || u_accept < p_x/q_x)) {
+        return draft;
+    }
+
+    // rejected: max(0, p - q) on q's tokens, all of p elsewhere
+    double r_in = 0.0, p_in = 0.0;
+    for (const auto & t : s) {
+        r_in += std::max(0.0, t.logit/z - t.p);
+        p_in += t.logit/z;
+    }
+    const double r_out = std::max(0.0, 1.0 - p_in);
+    double target = u_residual*(r_in + r_out);
+    if (target < r_in || r_out == 0.0) {
+        for (const auto & t : s) {
+            target -= std::max(0.0, t.logit/z - t.p);
+            if (target < 0.0) {
+                return t.id;
+            }
+        }
+        target = 0.0;
+    } else {
+        target -= r_in;
+    }
+
+    // the draw lands outside q's tokens: the blocks' sums without them, then a walk of one block skipping them
+    const double sum_tgt = target*z;
+    double sum_run = 0.0;
+    int32_t b = 0;
+    while (b + 1 < n_blocks && sum_run + sums[b] < sum_tgt) {
+        sum_run += sums[b++];
+    }
+    llama_token last = LLAMA_TOKEN_NULL;
+    j = std::lower_bound(s.begin(), s.end(), b*LLAMA_SAMPLER_ROW_BLOCK,
+            [](const llama_token_data & t, int32_t id) { return t.id < id; }) - s.begin();
+    for (; b < n_blocks; ++b) {
+        const float * x = llama_sampler_row_block(row, b, buf, n_b);
+        llama_sampler_row_block_probs(x, n_b, row.temp, max_l, p);
+        for (int32_t i = 0; i < n_b; ++i) {
+            const llama_token id = b*LLAMA_SAMPLER_ROW_BLOCK + i;
+            if (j < s.size() && s[j].id == id) {
+                ++j;
+                continue;
+            }
+            if (p[i] > 0.0f) {
+                last = id;
+            }
+            sum_run += p[i];
+            if (sum_run >= sum_tgt && p[i] > 0.0f) {
+                return id;
+            }
+        }
+    }
+    // rounding past the end: the last token the walk could give
+    return last != LLAMA_TOKEN_NULL ? last : s.empty() ? row.n - 1 : s.back().id;
+}
+#endif // LLAMA_SAMPLER_ROW_VEC
+
+llama_token llama_sampler_chain_sample_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab) {
+#ifdef LLAMA_SAMPLER_ROW_VEC
+    llama_sampler_row row;
+    llama_sampler_dist * dist = llama_sampler_chain_row(chain, logits, n_vocab, row);
+    if (dist == nullptr) {
+        return LLAMA_TOKEN_NULL;
+    }
+    auto * p = (llama_sampler_chain *) chain->ctx;
+    time_meas tm(p->t_sample_us, p->params.no_perf);
 
     // one draw a sample, as llama_sampler_dist_apply takes it
     std::uniform_real_distribution<double> uni(0.0f, 1.0f);
@@ -4646,6 +4768,30 @@ llama_token llama_sampler_chain_sample_row(struct llama_sampler * chain, const f
     (void) chain;
     (void) logits;
     (void) n_vocab;
+    return LLAMA_TOKEN_NULL;
+#endif
+}
+
+llama_token llama_sampler_chain_reject_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab,
+        llama_token draft, const llama_token_data * q, size_t n_q, double u_accept, double u_residual) {
+#ifdef LLAMA_SAMPLER_ROW_VEC
+    llama_sampler_row row;
+    if (q == nullptr || n_q == 0 || llama_sampler_chain_row(chain, logits, n_vocab, row) == nullptr) {
+        return LLAMA_TOKEN_NULL;
+    }
+    auto * p = (llama_sampler_chain *) chain->ctx;
+    time_meas tm(p->t_sample_us, p->params.no_perf);
+
+    return llama_sampler_row_reject(row, draft, q, n_q, u_accept, u_residual);
+#else
+    (void) chain;
+    (void) logits;
+    (void) n_vocab;
+    (void) draft;
+    (void) q;
+    (void) n_q;
+    (void) u_accept;
+    (void) u_residual;
     return LLAMA_TOKEN_NULL;
 #endif
 }
