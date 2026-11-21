@@ -109,6 +109,28 @@ static void test_what_a_sequence_keeps() {
     for (size_t i = 0; i < seqs.size(); ++i) {
         assert(common_sampler_last(seqs[i].smpl.get()) == kept[i].back());
     }
+
+    // by rejection too, no more than the request may still emit: a draft proposed with certainty the target agrees with
+    for (const int32_t n_remaining : {2, 1, -1}) {
+        const llama_tokens draft = {a, b, c};
+        std::vector<std::vector<llama_token_data>> q;
+        for (const auto t : draft) {
+            q.push_back({ { t, 0.0f, 1.0f } });
+        }
+        auto smpl = sampler(17);
+        common_speculative_verify job;
+        job.smpl        = smpl.get();
+        job.draft       = &draft;
+        job.draft_q     = &q;
+        job.n_remaining = n_remaining;
+        for (const auto * logits : {&row_a, &row_b, &row_c, &row_d}) {
+            job.rows.push_back(row_of(*logits));
+        }
+        std::vector<common_speculative_verify> jobs = { job };
+        common_speculative_sample_and_accept_batch(g_vocab, jobs, 1);
+        assert(!jobs[0].error);
+        assert(jobs[0].accepted == (n_remaining == 2 ? llama_tokens({a, b}) : n_remaining == 1 ? llama_tokens({a}) : llama_tokens({a, b, c, d})));
+    }
 }
 
 // rows a drafter guesses right six times in ten: logits of unit noise, and one token holding 0.6 of the probability
@@ -327,6 +349,40 @@ static void test_rejection_keeps_the_target_distribution(int32_t top_k) {
     const auto q      = top_k_q(draft, 4);
     const auto q_skew = top_k_q(target, 4); // what a draft that says q but draws this would propose
     const llama_sampling_row rows[2] = { row_of(target), row_of(target) };
+
+    // the whole row at temperature 1 is checked in the vector pass wherever the CPU has AVX2 and FMA
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    const bool cpu_vec = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && !ggml_env_switch("LLAMA_SAMPLING_ONE_PASS_LEGACY");
+#else
+    const bool cpu_vec = false;
+#endif
+    llama_sampler * chain = common_sampler_get(smpl.get());
+    assert(llama_sampler_chain_takes_row(chain) == (top_k == 0 && cpu_vec));
+    if (top_k == 0 && cpu_vec) {
+        for (const auto & c : q) {
+            assert(llama_sampler_chain_reject_row(chain, target.data(), g_n_vocab, c.id, q.data(), q.size(), 0.5, 0.5) != LLAMA_TOKEN_NULL);
+        }
+        // a row whose mass is all on q's tokens, drawn at the end of the residual (u_residual 1): rounding leaves nothing
+        // outside q, and the token is one with residual mass, never the rejected draft (50000, q's last token by id,
+        // which the target never samples)
+        std::vector<float> on_q(g_n_vocab, -1000.0f);
+        for (const auto & c : q) {
+            on_q[c.id] = c.id == 50000 ? -1000.0f : target[c.id];
+        }
+        double z = 0.0;
+        for (const auto & c : q) {
+            z += c.id == 50000 ? 0.0 : std::exp((double) target[c.id]);
+        }
+        const llama_token id = llama_sampler_chain_reject_row(chain, on_q.data(), g_n_vocab, 50000, q.data(), q.size(), 1.0, 1.0);
+        double p_id = 0.0, q_id = 0.0;
+        for (const auto & c : q) {
+            if (c.id == id) {
+                p_id = std::exp((double) on_q[c.id])/z;
+                q_id = c.p;
+            }
+        }
+        assert(id != 50000 && p_id > q_id);
+    }
 
     const auto chi2 = [&](const std::vector<llama_token_data> & proposals, int n_trials) {
         std::mt19937 rng(77);

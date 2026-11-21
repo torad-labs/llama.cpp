@@ -1658,6 +1658,10 @@ extern "C" {
     LLAMA_API llama_token llama_sampler_chain_reject_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab,
             llama_token draft, const llama_token_data * q, size_t n_q, double u_accept, double u_residual);
 
+    /// Whether llama_sampler_chain_sample_row and llama_sampler_chain_reject_row take the chain on this CPU: then they
+    /// return a token for any row of n_vocab >= 2 logits (and a non-empty q), else LLAMA_TOKEN_NULL
+    LLAMA_API bool llama_sampler_chain_takes_row(struct llama_sampler * chain);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

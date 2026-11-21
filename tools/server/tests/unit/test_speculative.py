@@ -464,6 +464,14 @@ def spec_counts(s: ServerProcess) -> tuple[float, float, float]:
     return values[0], values[1], values[2]
 
 
+def spec_reject_rows(s: ServerProcess) -> float:
+    # draft rows verified by rejection: 0 where a sampled draft fell back to sample-and-match
+    body = s.make_request("GET", "/metrics").body
+    m = re.search(r"^llamacpp:spec_decode_num_reject_rows_total (\S+)$", body, re.MULTILINE)
+    assert m is not None
+    return float(m.group(1))
+
+
 def test_inkling_dspark_sampled_draft_keeps_the_target_distribution(inkling_pair):
     # Every reply token is a sample of the target's distribution given the tokens before it, whether the draft proposed
     # it or not: over many replies, the count of each token at a position matches the sum of the probabilities the
@@ -481,9 +489,10 @@ def test_inkling_dspark_sampled_draft_keeps_the_target_distribution(inkling_pair
                 for cand in tok["top_logprobs"]:
                     expected[i][cand["id"]] = expected[i].get(cand["id"], 0.0) + math.exp(cand["logprob"])
         drafted, accepted, _ = spec_counts(s)
+        reject_rows = spec_reject_rows(s)
     finally:
         s.stop()
-    assert drafted > 0 and accepted > 0
+    assert drafted > 0 and accepted > 0 and reject_rows > 0
     for i in range(4):
         # cells under 5 expected are pooled into one
         chi2, cells, pooled_e, pooled_o = 0.0, 0, 0.0, 0
@@ -511,6 +520,7 @@ def test_inkling_dspark_sampled_draft_acceptance(inkling_pair):
     n_replies = int(os.environ.get("INKLING_DSPARK_REPLIES", 4000)) // 4
     rates = {}
     at_zero = {}
+    reject_rows = {}
     for sampling in ("greedy", "probabilistic"):
         s = create_inkling_server(inkling_pair, sampling)
         s.start()
@@ -518,6 +528,7 @@ def test_inkling_dspark_sampled_draft_acceptance(inkling_pair):
             for seed in range(n_replies):
                 inkling_reply(s, seed, 1.0)
             drafted, accepted, drafts = spec_counts(s)
+            reject_rows[sampling] = spec_reject_rows(s)
             for seed in range(16):
                 inkling_reply(s, seed, 0.0)
             after = spec_counts(s)
@@ -530,4 +541,35 @@ def test_inkling_dspark_sampled_draft_acceptance(inkling_pair):
               f"at temperature 0 drafted {at_zero[sampling][0]:.0f} accepted {at_zero[sampling][1]:.0f}")
     assert rates["greedy"][0] > 0 and rates["probabilistic"][0] > 0
     assert at_zero["greedy"] == at_zero["probabilistic"]
+    assert reject_rows["greedy"] == 0 and reject_rows["probabilistic"] > 0
+
+
+def test_inkling_dspark_sampled_drafts_of_different_lengths(inkling_pair):
+    # Sessions at temperature 1 verify sampled drafts in one step: a draft cut at an end-of-generation token and padded
+    # to the step's rows keeps one distribution a row, and every request finishes. The fixture's vocabulary has no
+    # end token, so one is named; the requests ignore it, so the target never samples it and the draft proposes it
+    s = create_inkling_server(inkling_pair, "probabilistic")
+    s.n_slots = 4
+    s.n_ctx = 4*256
+    s.override_kv = "tokenizer.ggml.eos_token_id=int:7"
+    s.start()
+    try:
+        for wave in range(int(os.environ.get("INKLING_DSPARK_WAVES", 8))):
+            tasks = [(s.make_request, ("POST", "/completion", {
+                "prompt": INKLING_PROMPT[:4 + i],
+                "temperature": 1.0,
+                "top_k": 0,
+                "top_p": 1.0,
+                "min_p": 0.0,
+                "seed": 100*wave + i,
+                "n_predict": 32 + 7*i,
+                "ignore_eos": True,
+            })) for i in range(4)]
+            for res in parallel_function_calls(tasks):
+                assert res.status_code == 200
+        drafted, _, _ = spec_counts(s)
+        assert drafted > 0
+        assert spec_reject_rows(s) > 0
+    finally:
+        s.stop()
 

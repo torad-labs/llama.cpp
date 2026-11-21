@@ -115,6 +115,15 @@ std::vector<llama_token> common_speculative_sample_and_accept(
         common_sampler * smpl, llama_context * ctx_tgt, const std::vector<int> & idxs, const llama_tokens & draft,
         int32_t n_remaining, const std::function<void(size_t, llama_token)> & on_sample = nullptr);
 
+// common_speculative_sample_and_accept for a draft that came with its distribution of each token (draft_q): the tokens
+// it checks are kept by rejection sampling (common_sampler_sample_and_accept_n_rejection)
+std::vector<llama_token> common_speculative_sample_and_accept_rejection(
+        common_sampler * smpl, llama_context * ctx_tgt, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_q, int32_t n_remaining);
+
+// the draft tokens a sequence checks: all n_draft, or the n_remaining - 1 its output limit leaves
+size_t common_speculative_n_check(size_t n_draft, int32_t n_remaining);
+
 // One sequence of common_speculative_sample_and_accept_batch: its sampler, its draft, and its draft.size() + 1
 // verification rows as llama_get_sampling_row_ith gave them before the call.
 struct common_speculative_verify {
@@ -130,7 +139,7 @@ struct common_speculative_verify {
     std::exception_ptr       error;    // or what it threw
 };
 
-// common_speculative_sample_and_accept (or, with draft_q, common_sampler_sample_and_accept_n_rejection) for the
+// common_speculative_sample_and_accept (or, with draft_q, common_speculative_sample_and_accept_rejection) for the
 // sequences of a step side by side, on n_threads threads or fewer. Each keeps the tokens it keeps verified alone: a
 // thread reads fetched rows and changes only its sequence's sampler.
 void common_speculative_sample_and_accept_batch(

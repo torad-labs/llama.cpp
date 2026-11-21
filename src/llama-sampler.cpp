@@ -4582,12 +4582,11 @@ LLAMA_SAMPLER_ROW_VEC static llama_token llama_sampler_row_draw(const llama_samp
 #endif // LLAMA_SAMPLER_ROW_VEC
 
 #ifdef LLAMA_SAMPLER_ROW_VEC
-// The row a chain llama_sampler_chain_sample_row takes samples, and its dist sampler; nullptr for any other chain or CPU
-static llama_sampler_dist * llama_sampler_chain_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab,
-        llama_sampler_row & row) {
+// The dist sampler of a chain llama_sampler_chain_sample_row takes, and the bias and temperature of the rows it samples
+// (no logits yet); nullptr for any other chain or CPU
+static llama_sampler_dist * llama_sampler_chain_row_dist(struct llama_sampler * chain, llama_sampler_row & row) {
     static const bool cpu_draws = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
-    if (!cpu_draws || sampling_one_pass_legacy() || chain == nullptr || chain->iface != &llama_sampler_chain_i || logits == nullptr ||
-            n_vocab < 2) {
+    if (!cpu_draws || sampling_one_pass_legacy() || chain == nullptr || chain->iface != &llama_sampler_chain_i) {
         return nullptr;
     }
     auto * p = (llama_sampler_chain *) chain->ctx;
@@ -4631,11 +4630,23 @@ static llama_sampler_dist * llama_sampler_chain_row(struct llama_sampler * chain
         return nullptr;
     }
 
-    row = { logits, n_vocab, nullptr, 0, temp };
+    row = { nullptr, 0, nullptr, 0, temp };
     if (bias != nullptr) {
         row.bias   = bias->by_token.data();
         row.n_bias = bias->by_token.size();
     }
+    return dist;
+}
+
+// The row a chain llama_sampler_chain_sample_row takes samples, and its dist sampler; nullptr for any other chain or CPU
+static llama_sampler_dist * llama_sampler_chain_row(struct llama_sampler * chain, const float * logits, int32_t n_vocab,
+        llama_sampler_row & row) {
+    if (logits == nullptr || n_vocab < 2) {
+        return nullptr;
+    }
+    llama_sampler_dist * dist = llama_sampler_chain_row_dist(chain, row);
+    row.logits = logits;
+    row.n      = n_vocab;
     return dist;
 }
 
@@ -4697,24 +4708,28 @@ LLAMA_SAMPLER_ROW_VEC static llama_token llama_sampler_row_reject(const llama_sa
     }
 
     // rejected: max(0, p - q) on q's tokens, all of p elsewhere
+    // last_in: the last of q's tokens with residual mass, never the draft, whose p is below its q here
     double r_in = 0.0, p_in = 0.0;
+    llama_token last_in = LLAMA_TOKEN_NULL;
     for (const auto & t : s) {
-        r_in += std::max(0.0, t.logit/z - t.p);
+        if (t.logit/z - t.p > 0.0) {
+            r_in   += t.logit/z - t.p;
+            last_in = t.id;
+        }
         p_in += t.logit/z;
     }
     const double r_out = std::max(0.0, 1.0 - p_in);
     double target = u_residual*(r_in + r_out);
-    if (target < r_in || r_out == 0.0) {
+    if (target < r_in || (r_out == 0.0 && last_in != LLAMA_TOKEN_NULL)) {
         for (const auto & t : s) {
             target -= std::max(0.0, t.logit/z - t.p);
             if (target < 0.0) {
                 return t.id;
             }
         }
-        target = 0.0;
-    } else {
-        target -= r_in;
+        return last_in; // rounding past r_in
     }
+    target -= r_in;
 
     // the draw lands outside q's tokens: the blocks' sums without them, then a walk of one block skipping them
     const double sum_tgt = target*z;
@@ -4744,8 +4759,9 @@ LLAMA_SAMPLER_ROW_VEC static llama_token llama_sampler_row_reject(const llama_sa
             }
         }
     }
-    // rounding past the end: the last token the walk could give
-    return last != LLAMA_TOKEN_NULL ? last : s.empty() ? row.n - 1 : s.back().id;
+    // rounding past the end: the last token outside q, else in q, with residual mass. With none anywhere, a rejection
+    // had probability 0 and the draft is kept
+    return last != LLAMA_TOKEN_NULL ? last : last_in != LLAMA_TOKEN_NULL ? last_in : draft;
 }
 #endif // LLAMA_SAMPLER_ROW_VEC
 
@@ -4793,6 +4809,16 @@ llama_token llama_sampler_chain_reject_row(struct llama_sampler * chain, const f
     (void) u_accept;
     (void) u_residual;
     return LLAMA_TOKEN_NULL;
+#endif
+}
+
+bool llama_sampler_chain_takes_row(struct llama_sampler * chain) {
+#ifdef LLAMA_SAMPLER_ROW_VEC
+    llama_sampler_row row;
+    return llama_sampler_chain_row_dist(chain, row) != nullptr;
+#else
+    (void) chain;
+    return false;
 #endif
 }
 

@@ -4356,9 +4356,8 @@ int32_t common_speculative_draft_limit(
     return n_max;
 }
 
-// the draft tokens a sequence checks: all of them, or what its output limit leaves (common_speculative_sample_and_accept)
-static size_t spec_n_check(const llama_tokens & draft, int32_t n_remaining) {
-    return n_remaining > 0 ? std::min(draft.size(), (size_t) n_remaining - 1) : draft.size();
+size_t common_speculative_n_check(size_t n_draft, int32_t n_remaining) {
+    return n_remaining > 0 ? std::min(n_draft, (size_t) n_remaining - 1) : n_draft;
 }
 
 std::vector<llama_token> common_speculative_sample_and_accept(
@@ -4369,13 +4368,26 @@ std::vector<llama_token> common_speculative_sample_and_accept(
     // past them roll back as rejected ones, and its cache ends where it would had it never drafted them. Kept, they
     // left the cache a token or two past the request's end, and on four PCIe cards at 36 sessions half the next
     // requests restored a checkpoint 20 tokens back (about 4.8 s each) instead of reusing the cache to the last token.
-    const size_t n_check = spec_n_check(draft, n_remaining);
+    const size_t n_check = common_speculative_n_check(draft.size(), n_remaining);
     if (n_check == draft.size()) {
         return common_sampler_sample_and_accept_n(smpl, ctx_tgt, idxs, draft, false, on_sample);
     }
     const std::vector<int> idxs_checked(idxs.begin(), idxs.begin() + n_check + 1);
     const llama_tokens     draft_checked(draft.begin(), draft.begin() + n_check);
     return common_sampler_sample_and_accept_n(smpl, ctx_tgt, idxs_checked, draft_checked, false, on_sample);
+}
+
+std::vector<llama_token> common_speculative_sample_and_accept_rejection(
+        common_sampler * smpl, llama_context * ctx_tgt, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_q, int32_t n_remaining) {
+    const size_t n_check = common_speculative_n_check(draft.size(), n_remaining);
+    if (n_check == draft.size()) {
+        return common_sampler_sample_and_accept_n_rejection(smpl, ctx_tgt, idxs, draft, draft_q);
+    }
+    const std::vector<int>                           idxs_checked(idxs.begin(), idxs.begin() + n_check + 1);
+    const llama_tokens                               draft_checked(draft.begin(), draft.begin() + n_check);
+    const std::vector<std::vector<llama_token_data>> q_checked(draft_q.begin(), draft_q.begin() + n_check);
+    return common_sampler_sample_and_accept_n_rejection(smpl, ctx_tgt, idxs_checked, draft_checked, q_checked);
 }
 
 void common_speculative_sample_and_accept_batch(
@@ -4388,10 +4400,13 @@ void common_speculative_sample_and_accept_batch(
             auto & seq = seqs[i];
             try {
                 GGML_ASSERT(seq.rows.size() == seq.draft->size() + 1 && "a sequence has one row more than its draft");
-                const size_t n_check = spec_n_check(*seq.draft, seq.n_remaining);
-                if (seq.draft_q) {
-                    // the whole draft, as the server's own rejection verify checks it
+                const size_t n_check = common_speculative_n_check(seq.draft->size(), seq.n_remaining);
+                if (seq.draft_q && n_check == seq.draft->size()) {
                     seq.accepted = common_sampler_sample_and_accept_n_rejection(seq.smpl, vocab, seq.rows.data(), *seq.draft, *seq.draft_q);
+                } else if (seq.draft_q) {
+                    const llama_tokens                               draft_checked(seq.draft->begin(), seq.draft->begin() + n_check);
+                    const std::vector<std::vector<llama_token_data>> q_checked(seq.draft_q->begin(), seq.draft_q->begin() + n_check);
+                    seq.accepted = common_sampler_sample_and_accept_n_rejection(seq.smpl, vocab, seq.rows.data(), draft_checked, q_checked);
                 } else if (n_check == seq.draft->size()) {
                     seq.accepted = common_sampler_sample_and_accept_n(seq.smpl, vocab, seq.rows.data(), *seq.draft);
                 } else {

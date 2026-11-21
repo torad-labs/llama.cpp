@@ -1607,6 +1607,10 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "spec_decode_num_reject_rows_total",
+            "Speculative: Total draft rows verified by rejection sampling",
+            (double) metrics.n_draft_reject_rows
         },
     };
 
