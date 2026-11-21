@@ -740,9 +740,11 @@ template<ggml_type type, int D, int nwarps, int nbatch_fa>
 static __device__ __forceinline__ void flash_attn_ext_raw_load(
         const char * const __restrict__ KV, char * const __restrict__ tile_raw, const int stride_KV) {
     constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
-    constexpr int chunks_per_row = fattn_raw_row_bytes<type, D>()/16;
+    // 16 byte copies where the row is a multiple of 16 bytes, else 8 (q8_0 of head size 128: 136 bytes)
+    constexpr int chunk          = fattn_raw_row_bytes<type, D>() % 16 == 0 ? 16 : 8;
+    constexpr int chunks_per_row = fattn_raw_row_bytes<type, D>()/chunk;
     constexpr int nchunks        = nbatch_fa*chunks_per_row;
-    static_assert(fattn_raw_row_bytes<type, D>() > 0 && fattn_raw_row_bytes<type, D>() % 16 == 0, "bad row size");
+    static_assert(fattn_raw_row_bytes<type, D>() > 0 && fattn_raw_row_bytes<type, D>() % 8 == 0, "bad row size");
 
     const unsigned int tile_raw_32 = ggml_cuda_cvta_generic_to_shared(tile_raw);
 
@@ -756,7 +758,11 @@ static __device__ __forceinline__ void flash_attn_ext_raw_load(
 
         const int i = c / chunks_per_row;
         const int k = c % chunks_per_row;
-        cp_async_cg_16<64>(tile_raw_32 + c*16, KV + int64_t(i)*stride_KV + k*16);
+        if constexpr (chunk == 16) {
+            cp_async_cg_16<64>(tile_raw_32 + c*16, KV + int64_t(i)*stride_KV + k*16);
+        } else {
+            cp_async_ca_8(tile_raw_32 + c*8, KV + int64_t(i)*stride_KV + k*8);
+        }
     }
 }
 
@@ -3074,6 +3080,11 @@ extern DECL_FATTN_MMA_RAW_CASE(256, 256,  2, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(256, 256,  4, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(256, 256,  8, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(256, 256, 32, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+// and q8_0 of head size 128 (the DSpark draft over a shared pool):
+extern DECL_FATTN_MMA_RAW_CASE(128, 128,  2, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128,  4, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128,  8, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128, 32, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 
 // GLM-5.3's sparse launch on a q4_0 or q8_0 latent cache, read in place (flash_attn_ext_deq_load_tile):
 extern DECL_FATTN_MMA_RAW_CASE(512, 512,  1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);

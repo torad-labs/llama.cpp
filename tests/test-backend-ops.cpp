@@ -16637,6 +16637,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GQA 6 with a q8_0 cache of head size 128 (the DSpark draft): read in place from 3 tokens on, a block of 8 a sequence
+    // (8, 64 and 184 rows), the 32 x 2 tile at 32 and more
+    for (int kv : { 4096, 8192, }) {
+        for (int nb : { 1, 3, 8, 13, 32, 64, 184, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+
     // bit-packed mask: the served head's shape through every kernel choice (vec at nb 1 with an f16 cache, q4_0 mma, mma prefill),
     // two sequences (the KV-max scan), and an unpadded KV (the out-of-bounds tile loader, no GQA path)
     for (int nb : { 1, 3, 32, 512, }) {

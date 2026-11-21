@@ -268,7 +268,7 @@ param = [
   { name = "FATTN_KQ_STRIDE", available = false, set = "code", type = "int", default = 256, kind = "knob", scope = "shared", layer = "cuda", where = "ggml/src/ggml-cuda/fattn-common.cuh", about = "cells a fused attention kernel scores in one tile" },
   { name = "graph_slot_max_tokens", available = false, set = "code", type = "int", default = 32, kind = "knob", scope = "shared", layer = "llama", where = "src/llama-context.h", about = "largest step whose graph a context keeps" },
 
-  # ---- Shared: earlier paths, kept behind a switch (101)
+  # ---- Shared: earlier paths, kept behind a switch (102)
   { name = "GGML_CUDA_AR_COPY_TAIL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
@@ -280,6 +280,7 @@ param = [
   { name = "GGML_CUDA_FATTN_LIVE_TILES_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_FATTN_MASK_PREFIX_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_FATTN_Q4_0_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
+  { name = "GGML_CUDA_FATTN_RAW_D128_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda", output = "rounding", about = "q8_0 K/V of head size 128 (GQA over 4) is copied to f16 before the MMA attention reads it, instead of read in place" },
   { name = "GGML_CUDA_FATTN_Q8_0_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_FWHT_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_FWHT_PDL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
