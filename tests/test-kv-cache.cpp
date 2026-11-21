@@ -1,5 +1,6 @@
 #include "llama-kv-cache.h"
 #include "llama-model.h"
+#include "models/models.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -348,10 +349,15 @@ int main() {
     }
 
     // Inkling 2 sessions that share a pool each add a cell a step, and the padded length shapes every decode graph: it
-    // holds for a power of two while the pool is small and for 256 cells a session after. LLAMA_KV_PAD_SHARED_LEGACY=1: 256
-    {
-        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_INKLING2, llama_model_default_params()));
+    // holds for a power of two while the pool is small and for 256 cells a session after. LLAMA_KV_PAD_SHARED_LEGACY=1: 256.
+    // The pool of its DSpark draft pads the same
+    for (const bool draft : { false, true }) {
+        std::unique_ptr<llama_model> model(llama_model_create(draft ? LLM_ARCH_DFLASH : LLM_ARCH_INKLING2, llama_model_default_params()));
         init_model(*model, 1);
+        if (draft) {
+            static_cast<llama_model_dflash &>(*model).dspark_markov_rank = 1;
+            GGML_ASSERT(llama_model_is_inkling_draft(*model));
+        }
         const uint32_t n_seq = 23, size = 65536, n_steps = 2048;
         llama_kv_cache kv(*model, false, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, size, n_seq,
                 0, LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
@@ -390,7 +396,7 @@ int main() {
             lengths += n_kv != last;
             last = n_kv;
         }
-        fprintf(stderr, "shared Inkling 2 pool: %u padded lengths in %u steps of %u sessions\n", lengths, n_steps, n_seq);
+        fprintf(stderr, "shared Inkling 2%s pool: %u padded lengths in %u steps of %u sessions\n", draft ? " draft" : "", lengths, n_steps, n_seq);
         // 47,104 cells: 256 to 8,192 by powers of two, then every 8,192; or every 256
         GGML_ASSERT(lengths == (narrow ? 184u : 11u));
     }

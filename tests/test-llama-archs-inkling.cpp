@@ -16,10 +16,14 @@
 //   rollback  a draft of 4 tokens of which the last 2 are rejected (llama_memory_seq_rm with rollback snapshots), the
 //             state compared right after, then decoded on from the kept position
 //   graph-churn  23 distinct session pairs through a retained graph, then independent rollbacks on two sessions
+//   layer-inp  a prefill and decode steps with the layer inputs a DFlash/DSpark draft reads written to the device buffer
+//             (layer_inp_dev): under the split, the copy on each rank holds the rows the one device writes
 
 #include "test-llama-archs.h"
 
 #include "llama-archs-gguf.h"
+#include "../src/llama-context.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
 #include <array>
@@ -39,6 +43,7 @@ struct record {
     std::vector<float> logits;              // every output row, in the order of the batches
     std::vector<std::vector<float>> states; // the serialized convolution state of each sequence, by step
     std::vector<std::vector<float>> memory; // all the sequence keeps, at the same steps: KV cells and the state
+    std::vector<std::vector<float>> layer_rows; // the layer input rows of the device buffer, a copy a rank, by step
 };
 
 struct context_shape {
@@ -114,6 +119,25 @@ void read_state(llama_context * ctx, llama_seq_id seq, record & out) {
     out.memory.push_back(state_words(ctx, seq, 0));
 }
 
+// the first n_rows rows of the layer input device buffer as a draft on each of devs reads them: a split context's copy on
+// that device, or the buffer of a context on one device
+void read_layer_rows(llama_context * ctx, const std::vector<ggml_backend_dev_t> & devs, int64_t n_rows, record & out) {
+    ggml_tensor * t = ctx->get_layer_inp_dev();
+    if (t == nullptr) {
+        throw std::runtime_error("inkling2: the layer inputs have no device buffer");
+    }
+    llama_synchronize(ctx);
+    for (ggml_backend_dev_t dev : devs) {
+        ggml_tensor * copy = ggml_backend_buffer_is_meta(t->buffer) ? ggml_backend_meta_mirrored_tensor(t, dev) : t;
+        if (copy == nullptr) {
+            throw std::runtime_error(std::string("inkling2: no copy of the layer inputs on ") + ggml_backend_dev_name(dev));
+        }
+        std::vector<float> rows(size_t(t->ne[0])*n_rows);
+        ggml_backend_tensor_get(copy, rows.data(), 0, rows.size()*sizeof(float));
+        out.layer_rows.push_back(std::move(rows));
+    }
+}
+
 // NMSE of two serialized states: the words of the counts and positions must be equal bit for bit, the rows within
 // the tolerance; a state of another size, or a non-finite value, is infinitely far
 double state_nmse(const std::vector<float> & a, const std::vector<float> & b) {
@@ -150,7 +174,7 @@ struct case_def {
     inkling_case run;
 };
 
-std::map<std::string, case_def> cases(size_t seed) {
+std::map<std::string, case_def> cases(size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
     const auto tokens = [seed](uint32_t n, size_t salt) { return get_tokens(n, 128, seed + salt); };
     std::map<std::string, case_def> ret;
     ret["prefill"] = {{}, [=](llama_context * ctx, record & out) {
@@ -243,6 +267,21 @@ std::map<std::string, case_def> cases(size_t seed) {
             read_state(ctx, seq, out);
         }
     }};
+    ret["layer-inp"] = {{}, [=](llama_context * ctx, record & out) {
+        // a middle layer's input and the output tap, as a DSpark draft takes them
+        const uint32_t n_layer = llama_model_n_layer(llama_get_model(ctx));
+        llama_set_embeddings_layer_inp(ctx, n_layer/2, true);
+        llama_set_embeddings_layer_inp(ctx, n_layer, true);
+        llama_set_embeddings_layer_inp_dev(ctx, true);
+        decode_span(ctx, tokens(n_prompt, 0), 0, 0, out);
+        read_layer_rows(ctx, devs, n_prompt, out);
+        const auto steps = tokens(4, 1);
+        for (uint32_t i = 0; i < steps.size(); ++i) {
+            decode(ctx, {{steps[i], int32_t(n_prompt + i), 0}}, out);
+            read_layer_rows(ctx, devs, 1, out);
+        }
+        read_state(ctx, 0, out);
+    }};
     return ret;
 }
 
@@ -253,7 +292,7 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
         fprintf(stderr, "inkling2 split %s: a tensor split needs two ranks, %zu given\n", name.c_str(), devs.size());
         return 1;
     }
-    const auto all = cases(seed);
+    const auto all = cases(seed, devs);
     const auto it = all.find(name);
     if (it == all.end()) {
         fprintf(stderr, "inkling2 split: no case %s\n", name.c_str());
@@ -302,6 +341,13 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
         ok = ok && m <= tolerance;
         fprintf(stderr, "inkling2 split %s: sequence memory %zu, %zu words, NMSE %g\n", name.c_str(), i,
                 expected.memory[i].size(), m);
+    }
+    ok = ok && expected.layer_rows.size() == actual.layer_rows.size();
+    for (size_t i = 0; i < expected.layer_rows.size() && i < actual.layer_rows.size(); ++i) {
+        const double d = nmse(expected.layer_rows[i], actual.layer_rows[i]);
+        ok = ok && largest(expected.layer_rows[i]) > 1e-6f && d <= tolerance;
+        fprintf(stderr, "inkling2 split %s: layer input rows %zu (rank %zu), %zu values, NMSE %g\n", name.c_str(),
+                i/devs.size(), i%devs.size(), expected.layer_rows[i].size(), d);
     }
     fprintf(stderr, "%s inkling2 split %s\n", ok ? "OK" : "FAIL", name.c_str());
     return ok ? 0 : 1;

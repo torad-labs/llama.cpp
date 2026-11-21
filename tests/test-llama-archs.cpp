@@ -312,7 +312,7 @@ static void usage(char ** argv) {
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --inkling-split <case>   Compare Inkling 2 under -sm tensor with one device: prefill, decode, chunks, seq-cp,\n");
-    LOG("                           state or rollback\n");
+    LOG("                           state, rollback, graph-churn or layer-inp\n");
     LOG("  --inkling-split-device <devs>  The ranks of that split, one per name (default: CUDA0,CUDA0)\n");
     LOG("  --inkling-path <f>/<case>  Compare an optimized path of Inkling 2 with the path it replaced: rel, fuse, conv,\n");
     LOG("                           kv-q8_0, kv-q4_0 or kv-split, in prompt, decode, unified or streams\n");
