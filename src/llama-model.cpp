@@ -961,6 +961,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {{tensor->ne[axis], 1}};
     };
 
+    // whether the devices take equal shares (no -ts, or every ratio the same)
+    auto split_is_even = [&]() -> bool {
+        const float * ts = ud->model->tensor_split();
+        if (ts == nullptr) {
+            return true;
+        }
+        for (size_t j = 1; j < ud->n_devices; j++) {
+            if (ts[j] != ts[0]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
         // glm5next's attention splits by whole heads: a KDA head is n_embd_head_kda channels (its state n_embd_head_kda
         // squared, its conv state d_conv - 1 a channel), a DSA head n_embd_head_k_mla rows of q_b and n_embd_head_v_mla
@@ -1181,6 +1195,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
+            // where 128 leaves the devices uneven, a finer granularity of whole blocks of 32 or more that splits the
+            // width evenly: Inkling 2's 2,304 over four devices is 576 = 9 x 64 each, not 512/640/512/640
+            const int64_t n_ff  = segments[0].first;
+            const int64_t share = n_ff / (int64_t) ud->n_devices;
+            if (split_is_even() && n_ff % (int64_t) ud->n_devices == 0 && share % blck_size_perf != 0 &&
+                    share % std::max<int64_t>(blck_size, 32) == 0 && !ggml_env_switch("LLAMA_SPLIT_FFN_EVEN_LEGACY")) {
+                return {std::gcd(share, blck_size_perf)};
+            }
             return {blck_size_perf};
         }
 
@@ -2955,8 +2977,31 @@ llama_split_mode llama_model::split_mode() const {
 }
 
 bool llama_model::experts_split_by_expert() const {
-    return params.split_mode == LLAMA_SPLIT_MODE_TENSOR && arch == LLM_ARCH_INKLING2 &&
-        ggml_env_switch("LLAMA_INKLING2_EXPERT_SPLIT");
+    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR || arch != LLM_ARCH_INKLING2) {
+        return false;
+    }
+    if (ggml_env_switch("LLAMA_INKLING2_EXPERT_SPLIT")) {
+        return true;
+    }
+    if (ggml_env_switch("LLAMA_INKLING2_EXPERT_SPLIT_LEGACY")) {
+        return false;
+    }
+    // by expert where the cards cannot share the hidden width evenly in down's blocks: 2,304 is 9 K-quant blocks of 256,
+    // which four cards share 3/2/2/2, and every layer waits for the card with 3
+    const int64_t n_dev = get_split_state_ud.n_devices;
+    const float * ts = tensor_split();
+    for (int64_t j = 1; ts != nullptr && j < n_dev; ++j) {
+        if (ts[j] != ts[0]) {
+            return false;
+        }
+    }
+    for (const auto & layer : layers) {
+        const ggml_tensor * down = layer.ffn_down_exps;
+        if (down != nullptr && n_dev > 1 && (down->ne[0] % n_dev != 0 || down->ne[0]/n_dev % ggml_blck_size(down->type) != 0)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool llama_model::no_alloc() const {

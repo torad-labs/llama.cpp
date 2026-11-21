@@ -231,7 +231,10 @@ static int get_mmvq_mmid_max_batch_ada_plus(ggml_type type, int cc) {
         return forced;
     }
     // Compare the row kernel with MMQ at serving batch sizes on SM120 without changing the default crossover.
-    if (cc == GGML_CUDA_CC_BLACKWELL && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) {
+    // and the types in blocks of 32 an Inkling pack's down projections take so that four cards split them evenly
+    if (cc == GGML_CUDA_CC_BLACKWELL && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+            type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 ||
+            type == GGML_TYPE_Q5_1)) {
         static const int kquant_max = (int) ggml_env_int("GGML_CUDA_MMVQ_KQUANT_MMID_MAX");
         return kquant_max;
     }
@@ -1131,10 +1134,8 @@ static __global__ void mul_mat_vec_q_moe(
         }
     }
 
-    uint32_t token_idx = threadIdx.y;
-    if constexpr (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
-        token_idx += blockIdx.z * blockDim.y;
-    }
+    // past 16 tokens the launch splits them in two along z (mul_mat_vec_q_moe_launch), whatever the type
+    uint32_t token_idx = threadIdx.y + blockIdx.z * blockDim.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
@@ -2105,12 +2106,20 @@ void ggml_cuda_mul_mat_vec_q(
     static const bool sort_experts = ggml_env_switch("GGML_CUDA_MMVQ_EXPERT_SORT_23");
     static const int sort_rows_min = ggml_env_int("GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN");
     static const int sort_rows_max = ggml_env_int("GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX");
+    // Inkling 2's expert products on one of four cards: a share of every expert's hidden width of 2,304 (512 or 768 in
+    // K-quant blocks, 576 in blocks of 32), or 96 of the 384 experts whole (LLAMA_INKLING2_EXPERT_SPLIT)
+    const bool down_32 = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
+        src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1;
+    const bool inkling_rows = ne02 == 384 &&
+        ((src0->type == GGML_TYPE_Q3_K && ne00 == 4608 && (ne01 == 1024 || ne01 == 1152 || ne01 == 1536)) ||
+         (src0->type == GGML_TYPE_Q4_K && (ne00 == 512 || ne00 == 768) && ne01 == 4608) ||
+         (down_32 && ne00 == 576 && ne01 == 4608));
+    const bool inkling_experts = ne02 == 96 && ne01 == 4608 &&
+        ((src0->type == GGML_TYPE_Q3_K && ne00 == 4608) || (src0->type == GGML_TYPE_Q4_K && ne00 == 2304));
     // Adjacent warps read the same expert rows when their tokens share a route.
     if (sort_experts && ids && !fusion && ncols_dst >= sort_rows_min && ncols_dst <= sort_rows_max && nchannels_dst == 8 &&
-            ne02 == 384 && ne03 == 1 && ne3 == 1 &&
-            ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL &&
-            ((src0->type == GGML_TYPE_Q3_K && ne00 == 4608 && (ne01 == 1024 || ne01 == 1536)) ||
-             (src0->type == GGML_TYPE_Q4_K && (ne00 == 512 || ne00 == 768) && ne01 == 4608))) {
+            ne03 == 1 && ne3 == 1 && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL &&
+            (inkling_rows || inkling_experts)) {
         ggml_cuda_pool_alloc<int32_t> routes(ctx.pool(), ncols_dst*8);
         mmvq_sort_routes<<<1, 256, 0, stream>>>(ids_d, ids_stride, uint32_t(ncols_dst*8), routes.get());
         const dim3 grid(ne01/2, ncols_dst), block(32, 8);
@@ -2121,10 +2130,15 @@ void ggml_cuda_mul_mat_vec_q(
                 uint32_t(ne01), uint32_t(s01), uint32_t(stride_col_y), uint32_t(stride_col_dst), uint32_t(s02),
                 uint32_t(stride_channel_y), uint32_t(stride_channel_dst), uint32_t(ncols_dst), uint32_t(ids_stride));
         };
-        if (src0->type == GGML_TYPE_Q3_K) {
-            launch(std::integral_constant<ggml_type, GGML_TYPE_Q3_K>{});
-        } else {
-            launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_K>{});
+        switch (src0->type) {
+            case GGML_TYPE_Q3_K:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q3_K>{});   break;
+            case GGML_TYPE_Q4_K:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_K>{});   break;
+            case GGML_TYPE_IQ4_NL: launch(std::integral_constant<ggml_type, GGML_TYPE_IQ4_NL>{}); break;
+            case GGML_TYPE_Q4_0:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{});   break;
+            case GGML_TYPE_Q4_1:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_1>{});   break;
+            case GGML_TYPE_Q5_0:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q5_0>{});   break;
+            case GGML_TYPE_Q5_1:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q5_1>{});   break;
+            default: GGML_ABORT("unsorted type %s", ggml_type_name(src0->type));
         }
         return;
     }

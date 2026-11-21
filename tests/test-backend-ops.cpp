@@ -7521,6 +7521,9 @@ struct test_mul_mat_id_partition : public test_mul_mat_id {
 
     void initialize_tensors(ggml_context * ctx) override {
         test_mul_mat_id::initialize_tensors(ctx);
+        if (routing == 3) {
+            return; // the random routes of every MUL_MAT_ID case, a token's experts distinct
+        }
         ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
         std::vector<int32_t> values(n_mats*n);
         for (int64_t row = 0; row < n; ++row) {
@@ -13649,6 +13652,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // and at their real widths, the 23 rows whose routes GGML_CUDA_MMVQ_EXPERT_SORT_23 sorts: gate and up 4,608 to 4,608,
+    // down 2,304 to 4,608
+    test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_Q3_K, true,  23, 288, 384, 8, 96, 4608, 4608, false, 3));
+    test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_Q4_K, false, 23, 288, 384, 8, 96, 4608, 2304, false, 3));
     for (int local : {72, 144}) {
         test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, 512, 288 - local, 288, 8, local, 2048, 4096));
         test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, false, 512, 0, 288, 8, local, 4096, 2048));
@@ -15792,6 +15799,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true,  1024, n, 4608));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, n, 512));
     }
+    // and as four cards split them evenly when down is in blocks of 32: 576 = 9 x 64 of the hidden width each, gate and
+    // up in 1,152 rows, down from 576, at one session, the 23 served and a drafted step's 92
+    for (int n : { 1, 23, 92 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 1152, n, 4608));
+        for (ggml_type down : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(down, GGML_TYPE_F32, 384, 8, false, 4608, n, 576));
+        }
+    }
     // past the ring's 8 tokens (8 tokens x 8 used is its 64 pairs): 9 to 16 go to mmvq.cu's mul_mat_vec_q_moe, a warp a
     // token, and 17 to MMQ. 3 slots at an MTP verify of 3 are 9 tokens, 4 slots 12
     for (int n : { 9, 12, 16, 17 }) {
@@ -17837,6 +17852,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 2*n_ff, rows, 4608));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, rows, n_ff));
         }
+    }
+    // the even split a down in blocks of 32 allows, 576 of the hidden width a card, and the split by expert (96 of the
+    // 384 whole on a card), at 23 rows and a drafted step's 92
+    for (int64_t rows : {23, 92}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 1152, rows, 4608));
+        for (ggml_type down : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(down, GGML_TYPE_F32, 384, 8, false, 4608, rows, 576));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_Q3_K, true, rows, 0, 384, 8, 96, 4608, 4608, false, 3));
+        test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_Q4_K, false, rows, 0, 384, 8, 96, 4608, 2304, false, 3));
     }
     // Inkling 2's routed experts at their real shapes (384 experts, 8 used, hidden 4,608 to intermediate 2,304 and back) in
     // Q4_K, past the ring's 8 rows, where MUL_MAT_ID chooses between mmvq.cu's row kernel and MMQ: run once as they are

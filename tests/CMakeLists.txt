@@ -672,6 +672,17 @@ if (GGML_CUDA)
         -p "n_mats=384,n_used=8,b=[01],m=(1024|4608),n=(1|23|32),k=(4608|512),")
     set_tests_properties(test-inkling-moe-sorted-routes-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
         ENVIRONMENT "GGML_CUDA_MMVQ_EXPERT_SORT_23=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX=32")
+    # the same, split evenly (a down in blocks of 32: 576 of the hidden width a card) or by expert (96 whole a card), on
+    # the row kernel up to 32 rows and MMQ at a drafted step's 92
+    add_test(NAME test-inkling-moe-even-split-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID,MUL_MAT_ID_PARTITION
+        -p "n_mats=384,n_used=8,b=[01],(m=1152,n=(1|23|92),k=4608,|m=4608,n=(1|23|92),k=576,|m=4608,n=23,k=(4608|2304),.*first=288,local=96,)")
+    set_tests_properties(test-inkling-moe-even-split-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_EXPERT_SORT_23=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX=32;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
+    # and in the routes' own order, past 16 tokens in two halves of the row kernel's grid
+    add_test(NAME test-inkling-moe-even-split-rows-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
+        -p "n_mats=384,n_used=8,b=0,m=4608,n=23,k=576,")
+    set_tests_properties(test-inkling-moe-even-split-rows-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
     add_test(NAME test-inkling-norm-clip-cuda0 COMMAND test-backend-ops test -b CUDA0 -o NORM_CLIP)
     add_test(NAME test-inkling-short-conv-op-cuda0 COMMAND test-backend-ops test -b CUDA0 -o SHORT_CONV)
     set_tests_properties(test-inkling-moe-mul-mat-id-cuda0 test-inkling-moe-block-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600)

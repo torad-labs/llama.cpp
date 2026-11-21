@@ -19,6 +19,15 @@ from conversion.inkling2 import Inkling2Model
 REVISION = "e4853745aa9cb4587e8959d3c80b92e1bef99a4a"
 REPO = "benthecarman/Inkling-2-Small-abliterated"
 STOCK_IMATRIX = "7e7897f261bbf80526484e41aa1e1d3627ddb1fdbb7f0e9f099b03b0852d4810"
+# The routed down projections' types, the first three layers' (Q3_K_M gives them more bits) and the rest. Four cards split
+# an expert's hidden width of 2,304, the down projection's K: in K-quant blocks of 256 that is 512/512/512/768 and every
+# layer waits for the card with 768, in blocks of 32 it is 576 each.
+EXPERT_DOWN = {
+    "k-quant": (),
+    "iq4_nl": (r"blk\.[0-2]\.ffn_down_exps=q5_0", "ffn_down_exps=iq4_nl"),
+    "q4_0": (r"blk\.[0-2]\.ffn_down_exps=q5_0", "ffn_down_exps=q4_0"),
+    "q4_1": (r"blk\.[0-2]\.ffn_down_exps=q5_1", "ffn_down_exps=q4_1"),
+}
 
 
 def file_checksum(path, git_blob=False):
@@ -114,6 +123,10 @@ def main():
     parser.add_argument("--producer-workers", type=int, default=1,
                         help="number of packed expert row chunks to prepare concurrently (default: 1)")
     parser.add_argument("--buffer-mib", type=int, default=256, help="maximum native row-slab workspace in MiB")
+    parser.add_argument("--expert-down", choices=EXPERT_DOWN, default="k-quant",
+                        help="routed down projections in Q3_K_M's Q5_K/Q4_K (k-quant, the default), which four cards "
+                             "split 512/512/512/768, or in blocks of 32, which they split evenly; README.md gives "
+                             "each one's quality, size and KV pool cost")
     args = parser.parse_args()
     if args.output.exists() or args.threads < 0 or args.buffer_mib <= 0 or args.producer_workers < 1:
         parser.error("output must be a new file, threads nonnegative and buffer size and producer worker count positive")
@@ -140,7 +153,8 @@ def main():
         writer.add_string("quantize.imatrix.source", args.calibration)
         writer.add_string("quantize.imatrix.sha256", digest)
         write_descriptors(writer, descriptor)
-        command = [str(args.quantizer.resolve()), "--tensor-stdin", "--imatrix", str(args.imatrix),
+        overrides = [arg for pattern in EXPERT_DOWN[args.expert_down] for arg in ("--tensor-type", pattern)]
+        command = [str(args.quantizer.resolve()), "--tensor-stdin", "--imatrix", str(args.imatrix), *overrides,
                    "--max-buffer-size", str(args.buffer_mib), str(descriptor), str(pack), "Q3_K_M", str(args.threads)]
         stream_quantize(command, tensors, args.producer_workers)
         os.link(pack, args.output)
