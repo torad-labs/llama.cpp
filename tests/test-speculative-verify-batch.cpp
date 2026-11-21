@@ -353,11 +353,12 @@ static void test_rejection_keeps_the_target_distribution() {
     };
 
     // 4 degrees of freedom: 30 is beyond the 1e-5 tail (25.4)
-    const double x2 = chi2(q, 40000);
+    const double x2      = chi2(q, 40000);
+    const double x2_skew = chi2(q_skew, 40000);
     printf("rejection keeps the target's distribution: chi-square %.2f (4 dof), a draft drawing from another q %.2f\n",
-            x2, chi2(q_skew, 40000));
+            x2, x2_skew);
     assert(x2 < 30.0);
-    assert(chi2(q_skew, 40000) > 30.0);
+    assert(x2_skew > 30.0);
 }
 
 int main(int argc, char ** argv) {

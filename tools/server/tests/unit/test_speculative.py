@@ -2,6 +2,7 @@ import math
 import pytest
 from concurrent.futures import ThreadPoolExecutor
 from utils import *
+import inkling_fixture as fx
 
 # We use a F16 MOE gguf as main model, and q4_0 as draft model
 
@@ -405,19 +406,25 @@ def test_mtp_vocab_without_draft_mtp_is_refused(tmp_path):
         server.start()
 
 
-# An Inkling 2 target and its DSpark draft, small enough to sample thousands of replies: a folder holding target.gguf
-# and draft.gguf (the drafter kit's rehearsal fixture, a 128-token vocabulary). The tests are skipped without it.
-INKLING_DSPARK_FIXTURE = os.environ.get("INKLING_DSPARK_FIXTURE")
+# The synthetic Inkling 2 target (128 tokens) and a DSpark draft of random weights for it, small enough to sample
+# thousands of replies
 INKLING_PROMPT = [5, 17, 42, 9, 77, 3, 61, 28]
 
 
-def create_inkling_server(sampling: str) -> ServerProcess:
-    assert INKLING_DSPARK_FIXTURE
+@pytest.fixture(scope="module")
+def inkling_pair(tmp_path_factory):
+    folder = tmp_path_factory.mktemp("inkling-dspark")
+    target = fx.write_model(str(folder))
+    draft = str(folder / "draft.gguf")
+    fx.write_dspark_draft(draft, target)
+    return target, draft
+
+
+def create_inkling_server(pair: tuple[str, str], sampling: str) -> ServerProcess:
     s = ServerProcess()
     s.model_hf_repo = None
     s.model_hf_file = None
-    s.model_file = os.path.join(INKLING_DSPARK_FIXTURE, "target.gguf")
-    s.model_draft = os.path.join(INKLING_DSPARK_FIXTURE, "draft.gguf")
+    s.model_file, s.model_draft = pair
     s.spec_type = "draft-dspark"
     s.spec_draft_n_max = 3
     s.spec_draft_n_min = 1
@@ -457,12 +464,11 @@ def spec_counts(s: ServerProcess) -> tuple[float, float, float]:
     return values[0], values[1], values[2]
 
 
-@pytest.mark.skipif(not INKLING_DSPARK_FIXTURE, reason="needs INKLING_DSPARK_FIXTURE")
-def test_inkling_dspark_sampled_draft_keeps_the_target_distribution():
+def test_inkling_dspark_sampled_draft_keeps_the_target_distribution(inkling_pair):
     # Every reply token is a sample of the target's distribution given the tokens before it, whether the draft proposed
     # it or not: over many replies, the count of each token at a position matches the sum of the probabilities the
     # target gave it there (each reply's n_probs rows, read from the verified rows), within a chi-square bound
-    s = create_inkling_server("probabilistic")
+    s = create_inkling_server(inkling_pair, "probabilistic")
     s.start()
     n_replies = int(os.environ.get("INKLING_DSPARK_REPLIES", 4000))
     expected = [{} for _ in range(4)]
@@ -499,15 +505,14 @@ def test_inkling_dspark_sampled_draft_keeps_the_target_distribution():
         assert chi2 < bound, f"position {i}: chi-square {chi2:.1f} over {dof} dof"
 
 
-@pytest.mark.skipif(not INKLING_DSPARK_FIXTURE, reason="needs INKLING_DSPARK_FIXTURE")
-def test_inkling_dspark_sampled_draft_acceptance():
+def test_inkling_dspark_sampled_draft_acceptance(inkling_pair):
     # the same replies at temperature 1, drafted greedily and verified by matching, then sampled and verified by
     # rejection; at temperature 0 the sampled draft's graph keeps the greedy chain, so both draft and keep alike
     n_replies = int(os.environ.get("INKLING_DSPARK_REPLIES", 4000)) // 4
     rates = {}
     at_zero = {}
     for sampling in ("greedy", "probabilistic"):
-        s = create_inkling_server(sampling)
+        s = create_inkling_server(inkling_pair, sampling)
         s.start()
         try:
             for seed in range(n_replies):
