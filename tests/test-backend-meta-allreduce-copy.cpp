@@ -948,13 +948,16 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                             if (captured) {
                                 runner.run(execs, count);
                             } else {
-                                // The copy-engine reduction synchronizes the host and cannot join a whole-evaluation capture.
+                                // The copy-engine reduction waits across devices and cannot join a whole-evaluation
+                                // capture: a sample queues `count` evaluations, each a small kernel and its reduction.
                                 for (int i = 0; i < count; ++i) { queue(); }
                                 for (auto backend : backends) { ggml_backend_synchronize(backend); }
                             }
                         };
                         const int samples = counter_run ? 1 : 20;
-                        const int replays = counter_run ? 1 : 16;
+                        // GGML_TEST_COLLECTIVE_REPLAYS: evaluations a sample, 96 for a decode step's reductions
+                        const char * replays_env = getenv("GGML_TEST_COLLECTIVE_REPLAYS");
+                        const int replays = counter_run ? 1 : replays_env ? std::max(1, atoi(replays_env)) : 16;
                         std::vector<double> us;
                         if (counter_run) {
                             const auto start = ggml_time_us();
