@@ -96,7 +96,11 @@ def main():
         parser.error("output must be a new file")
 
     reader = gguf.GGUFReader(args.source)
-    arch = reader.get_field(gguf.Keys.General.ARCHITECTURE).contents()
+    if not any(converts(tensor) for tensor in reader.tensors):
+        downs = sorted({t.tensor_type.name for t in reader.tensors if t.name.endswith(".ffn_down_exps.weight")})
+        sys.exit(f"{args.source}: no ffn_down_exps tensor is Q4_K or Q5_K (down types: {', '.join(downs) or 'none'}), "
+                 "so there is nothing to convert")
+    arch =reader.get_field(gguf.Keys.General.ARCHITECTURE).contents()
     writer = gguf.GGUFWriter(args.output, arch=arch, endianess=reader.endianess)
     alignment = reader.get_field(gguf.Keys.General.ALIGNMENT)
     if alignment is not None:
