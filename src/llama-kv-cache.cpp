@@ -141,8 +141,10 @@ llama_kv_cache::llama_kv_cache(
     // Inkling 2 has no indexer, and a pool its sequences share shapes every decode graph the same way: its masks and
     // positions are as long as the padded pool. 23 sessions crossed 256 cells every 11 steps, and each crossing ran a
     // step's graphs uncaptured and captured them again (four RTX PRO 6000, -sm tensor, 16K-token sessions, Nov 19, 2026:
-    // 10 of 110 steps captured every graph again). It reads densely at every length, so it pads as a dense pool does
-    if ((hparams.indexer_kpool > 0 || model.arch == LLM_ARCH_INKLING2) && n_stream < n_seq_max) {
+    // 10 of 110 steps captured every graph again). It reads densely at every length, so it pads as a dense pool does.
+    // Its DSpark draft's pool too: 23 sessions crossed 256 cells every ~5 drafted rounds, each crossing a round that ran
+    // the draft's graphs uncaptured, one that captured them and one that destroyed them (four RTX PRO 6000, Nov 20, 2026)
+    if ((hparams.indexer_kpool > 0 || model.arch == LLM_ARCH_INKLING2 || llama_model_is_inkling_draft(model)) && n_stream < n_seq_max) {
         const char * legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
 
         if (!legacy || atoi(legacy) != 1) {
