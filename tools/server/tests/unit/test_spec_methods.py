@@ -214,8 +214,13 @@ def test_spec_method(case: SpecCase):
 
 
 # Every prompt at once in its own slot: a draft fed every sequence's rows of a step together (one decode for all of them)
-# keeps each sequence's own context, so its acceptance holds the single-slot floor. Greedy tokens are not compared: a
-# batch of several sequences may round the target's logits otherwise than one sequence alone.
+# keeps each sequence's own context. Greedy tokens are not compared: a batch of several sequences may round the target's
+# logits otherwise than one sequence alone, and which sequences share a step changes from run to run, so the acceptance
+# does too (DSpark: 3.10 to 3.56 tokens a step over 24 runs, the same with one decode a sequence). The floor is
+# PARALLEL_FLOOR of the single-slot one; a draft fed another sequence's rows fails its requests after the first step.
+PARALLEL_FLOOR = 0.9
+
+
 @pytest.mark.heavy
 @pytest.mark.slow
 @pytest.mark.parametrize("case", selected_cases(), ids=lambda c: c.name)
@@ -236,9 +241,6 @@ def test_spec_method_parallel(case: SpecCase):
     )
 
     assert all(outputs), f"{case.name}: a parallel request returned no tokens"
-    assert (
-        accept_rate >= case.min_accept_rate
-    ), f"{case.name}: parallel accept rate {accept_rate:.3f} < {case.min_accept_rate}"
-    assert (
-        accept_len >= case.min_accept_len
-    ), f"{case.name}: parallel accept length {accept_len:.3f} < {case.min_accept_len}"
+    min_rate, min_len = PARALLEL_FLOOR * case.min_accept_rate, PARALLEL_FLOOR * case.min_accept_len
+    assert accept_rate >= min_rate, f"{case.name}: parallel accept rate {accept_rate:.3f} < {min_rate:.3f}"
+    assert accept_len >= min_len, f"{case.name}: parallel accept length {accept_len:.3f} < {min_len:.3f}"
