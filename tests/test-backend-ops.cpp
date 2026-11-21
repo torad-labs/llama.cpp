@@ -17858,6 +17858,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {154880, nrows, 1, 1}, k));
         }
     }
+    // the Inkling 2 DSpark draft's sampled draw: a Markov step takes the k largest of each of 23 sessions' rows
+    for (int k : {32, 64, 128}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {201088, 23, 1, 1}, k));
+    }
 
     // GLM-5.3 Flash's KDA conv-state concat (24576 channels) on one data-parallel rank of 36 sessions over four: 9
     // sequences of a decode row or an MTP verify's 3, one plane each, and one sequence's for comparison

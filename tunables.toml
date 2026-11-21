@@ -30,7 +30,7 @@ ignore_prefixes = ["LLAMA_ARG_", "LLAMA_TEST_", "GGML_TEST_", "LLAMA_EVAL_", "LL
 
 param = [
 
-  # ---- Inkling 2: knobs (12)
+  # ---- Inkling 2: knobs (13)
   { name = "GGML_CUDA_FATTN_NATIVE_SINKS", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "cuda", about = "turns off the sink shift inside the relative attention kernels" },
   { name = "GGML_CUDA_FATTN_REL_DECODE_MEAN_STREAMS", available = true, set = "env", type = "int", default = 256, min = 1, max = 1024, kind = "knob", scope = "inkling2", layer = "cuda", output = "rounding", about = "most warps the visible cells of one query and KV head are split across in a low-mean step of that decode, where one row may read the whole pool and wants more warps than a bounded row; never more than the pool has cells/1024" },
   { name = "GGML_CUDA_FATTN_REL_DECODE_RUN_WORDS", available = true, set = "env", type = "int", default = 4, values = [1, 2, 4, 8, 16, 32], kind = "knob", scope = "inkling2", layer = "cuda", output = "rounding", about = "the 32-cell mask words a stream of that decode reads side by side before the next stream's begin: fewer spread the cells a prompt wrote in one run over more warps, more read the mask in longer runs" },
@@ -43,6 +43,7 @@ param = [
   { name = "LLAMA_INKLING2_MEAN_MASK_DECODE", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "model", launcher = "--mean-mask-decode", about = "a decode of LLAMA_INKLING2_MEAN_ROWS rows that hold a pool/LLAMA_INKLING2_MEAN_POOL_SHARE share or less on average takes the low-mean mask kernel instead of the dense one (pool of LLAMA_INKLING2_MEAN_POOL_MIN or more, f16 K/V)" },
   { name = "LLAMA_INKLING2_SHIFT_SINKS", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "model", launcher = "--reference-sinks", about = "shifts the attention sinks with graph ops, as the reference does, instead of inside the fused relative attention" },
   { name = "LLAMA_INKLING2_BUCKET_PREFILL_KV", available = true, set = "env", type = "bool", default = false, kind = "knob", scope = "inkling2", layer = "llama", launcher = "--bucket-prefill-kv", about = "pads the cells one long prompt reads to a multiple of LLAMA_INKLING2_BUCKET_CELLS so its graph is reused within a bucket (one sequence of 256 tokens or more, f16 K/V, pool of 32768 or more)" },
+  { name = "LLAMA_SPEC_DSPARK_DRAW_K", available = true, set = "env", type = "int", default = 64, min = 2, max = 1024, kind = "knob", scope = "inkling2", layer = "common", output = "model", about = "with --spec-draft-sampling probabilistic, the Inkling DSpark draft samples each row from its k largest logits, in the graph for the token the next Markov step reads and on the host for the token and distribution it proposes; the target's top 64 held nearly all the overlap in the offline walk" },
 
   # ---- Inkling 2: the shapes a decode step's mask is classed by, and the long reader's bucket (9)
   { name = "LLAMA_INKLING2_SHORT_ROWS_CELLS", available = true, set = "env", type = "int", default = 32, min = 1, max = 32, kind = "knob", scope = "inkling2", layer = "model", about = "short-rows mask: every sequence of the step holds this many cells or fewer (32 tokens or fewer, pool over 256); the short-rows kernel takes 32 at most" },
@@ -270,7 +271,7 @@ param = [
   { name = "FATTN_KQ_STRIDE", available = false, set = "code", type = "int", default = 256, kind = "knob", scope = "shared", layer = "cuda", where = "ggml/src/ggml-cuda/fattn-common.cuh", about = "cells a fused attention kernel scores in one tile" },
   { name = "graph_slot_max_tokens", available = false, set = "code", type = "int", default = 32, kind = "knob", scope = "shared", layer = "llama", where = "src/llama-context.h", about = "largest step whose graph a context keeps" },
 
-  # ---- Shared: earlier paths, kept behind a switch (106)
+  # ---- Shared: earlier paths, kept behind a switch (107)
   { name = "GGML_CUDA_AR_COPY_TAIL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_AR_RECV_RANK_ORDER_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
@@ -377,6 +378,7 @@ param = [
   { name = "LLAMA_SPEC_FEED_PER_SEQ_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "common", output = "rounding", about = "a DFlash or DSpark draft is fed the target rows of a decode step one sequence at a time, a decode and a wait each, instead of every sequence in one decode" },
   { name = "LLAMA_DRAFT_GRAPH_SLOTS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama", about = "a DFlash or DSpark draft keeps its graphs past 32 rows on the main scheduler, so its feed and its block, decoded in turn, build each other's graph again every round" },
   { name = "LLAMA_SPEC_FEED_WAIT_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "common", about = "a DFlash or DSpark draft reads the context rows of a feed right after it, so the host waits for the draft's decode before it samples the verified rows" },
+  { name = "LLAMA_SPEC_REJECT_SERIAL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server", output = "same", about = "a draft that came with its distribution is verified by rejection in post_decode, slot after slot, instead of side by side with the other slots' verification" },
 
   # ---- Shared: diagnostics (31)
   { name = "GGML_CUDA_COUNT_INFLIGHT", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "shared", layer = "cuda" },
