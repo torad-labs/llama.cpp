@@ -2397,7 +2397,7 @@ static bool ggml_backend_cuda_comm_reduce_owned_rows(void * comm_ctx_v, ggml_ten
     for (size_t rank = 0; rank < comm->backends.size(); ++rank) {
         if (!ggml_are_same_shape(tensors[0], tensors[rank]) || !ggml_is_contiguous(tensors[rank])) { return false; }
     }
-    // through host memory only GGML_CUDA_AR_HOST_OWNER_ROWS_N rows, card to card any number the chunked kernel takes
+    // through host memory or card to card, any number of rows: a step of 23 sessions and its drafted steps alike
     return ggml_cuda_ar_allreduce(comm->ar_pipeline, comm->backends.data(), tensors, nullptr, true);
 }
 
