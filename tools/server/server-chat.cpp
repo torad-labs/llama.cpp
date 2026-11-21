@@ -1,6 +1,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 
+#include <cctype>
 #include <sstream>
 
 json server_chat_convert_responses_tools(const json & tools) {
@@ -355,40 +356,41 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     return chatcmpl_body;
 }
 
-// Edits the cch section of an "x-anthropic-billing-header" system prompt.
-// Does nothing to any other prompt.
-//
-// This is a claude message with a "cch=ef01a" attribute that breaks prefix caching.
-// The cch stamp is a whitebox end-to-end integrity hint. It's not meaningful as a
-// system prompt data, particularly to llama.cpp, but its presence means the prefix
-// cache will not get past it: It changes on each request.
-//
+// Takes a client's billing header off the front of a system prompt, and does nothing to any other prompt. The header
+// is request metadata, "x-anthropic-billing-header:" and then "key=value;" fields, some new on every request or every
+// user message (cch, cc_prompt_id, cc_turn_index), so a prompt that kept it would miss the prefix cache from its first
+// tokens on. It comes with the prompt in one block or as a block of its own:
+//   x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch=a5145;You are Claude Code, ...
+//   x-anthropic-billing-header: cc_version=2.1.330.273; cc_entrypoint=sdk-cli; cch=0cbe7; cc_prompt_id=<uuid>; cc_turn_index=1;
 // Reference: https://github.com/ggml-org/llama.cpp/pull/21793
-// Example header:
-// ```
-// x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch=a5145;You are Claude Code, Anthropic's official CLI for Claude.
-//                                                                            ^^^^^
-// ```
-static void normalize_anthropic_billing_header(std::string & system_text) {
-    if (system_text.rfind("x-anthropic-billing-header:", 0) != 0) {
+static void strip_anthropic_billing_header(std::string & system_text) {
+    static const std::string prefix = "x-anthropic-billing-header:";
+    if (system_text.compare(0, prefix.size(), prefix) != 0) {
         return;
     }
-
-    const size_t header_prefix_length = strlen("x-anthropic-billing-header:");
-    const size_t cch_length = 5;
-    const size_t index_cch = system_text.find("cch=", header_prefix_length);
-    if (index_cch == std::string::npos) {
-        return;
-    }
-
-    const size_t index_replace = index_cch + 4;
-    if (index_replace + cch_length < system_text.length() && system_text[index_replace + cch_length] == ';') {
-        for (size_t i = 0; i < cch_length; ++i) {
-            system_text[index_replace + i] = 'f';
+    const auto is_key = [](char c) { return std::isalnum((unsigned char) c) || c == '_' || c == '-'; };
+    size_t end = prefix.size(); // past the last field
+    for (;;) {
+        size_t i = end;
+        while (i < system_text.size() && system_text[i] == ' ') {
+            ++i;
         }
-    } else {
-        LOG_ERR("anthropic string not as expected: %s", system_text.c_str());
+        const size_t key = i;
+        while (i < system_text.size() && is_key(system_text[i])) {
+            ++i;
+        }
+        if (i == key || i >= system_text.size() || system_text[i] != '=') {
+            break;
+        }
+        while (i < system_text.size() && system_text[i] != ';' && !std::isspace((unsigned char) system_text[i])) {
+            ++i;
+        }
+        if (i >= system_text.size() || system_text[i] != ';') {
+            break;
+        }
+        end = i + 1;
     }
+    system_text.erase(0, end);
 }
 
 // A block the server cannot represent is kept as text in its place, so a session that carries one goes on: a client
@@ -412,12 +414,12 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
 
         if (system_param.is_string()) {
             system_content = system_param.get<std::string>();
-            normalize_anthropic_billing_header(system_content);
+            strip_anthropic_billing_header(system_content);
         } else if (system_param.is_array()) {
             for (const auto & block : system_param) {
                 if (json_value(block, "type", std::string()) == "text") {
                     auto system_text = json_value(block, "text", std::string());
-                    normalize_anthropic_billing_header(system_text);
+                    strip_anthropic_billing_header(system_text);
                     system_content += system_text;
                 } else {
                     throw std::invalid_argument("Anthropic system content only supports text blocks");
