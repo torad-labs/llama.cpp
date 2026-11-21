@@ -17789,6 +17789,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(down, GGML_TYPE_F32, 384, 8, false, 4608, 23, n_ff));
         }
     }
+    // the same slices in a drafted step of 23 sessions at depths 1, 2 and 3 (46, 69 and 92 rows), past the row kernel's 32:
+    // MUL_MAT_ID takes MMQ there, and the rows touch more of the 384 experts
+    for (int64_t rows : {46, 69, 92}) {
+        for (int64_t n_ff : {512, 768}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 2*n_ff, rows, 4608));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, rows, n_ff));
+        }
+    }
     // Inkling 2's routed experts at their real shapes (384 experts, 8 used, hidden 4,608 to intermediate 2,304 and back) in
     // Q4_K, past the ring's 8 rows, where MUL_MAT_ID chooses between mmvq.cu's row kernel and MMQ: run once as they are
     // and once with GGML_CUDA_MMVQ_MMID_MAX=16, the reads set get_mmvq_mmid_max_batch_ada_plus. Each case quantizes 4.1
