@@ -4083,7 +4083,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
+    // from a per-type number of src1 columns up to GGML_CUDA_MMQ_FEW_MAX_COLS, few-row MMQ is faster than MMVQ and MMQ
     const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, cc);
     if (!use_mmq_few && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
