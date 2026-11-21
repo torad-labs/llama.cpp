@@ -3,10 +3,18 @@
 #include "unary.cuh"
 #include <cstdint>
 
-template <int block_size>
-static __global__ void norm_f32(
-        const float * x, float * dst, const int ncols, const int nchannels, const int nsamples,
-        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+template <int block_size, bool do_multiply = false, bool do_add = false>
+static __global__ void norm_f32(const float * x,
+                                float *       dst,
+                                const int     ncols,
+                                const int     nchannels,
+                                const int     nsamples,
+                                const int64_t stride_row,
+                                const int64_t stride_channel,
+                                const int64_t stride_sample,
+                                const float   eps,
+                                const float * mul,
+                                const float * add) {
     const int nrows = gridDim.x;
     const int row   = blockIdx.x;
     const int tid   = threadIdx.x;
@@ -37,7 +45,14 @@ static __global__ void norm_f32(
             const float inv_std = rsqrtf(var + eps);
 
             for (int col = tid; col < ncols; col += block_size) {
-                dstc[col] = (xc[col] - mean) * inv_std;
+                float v = (xc[col] - mean) * inv_std;
+                if constexpr (do_multiply) {
+                    v *= mul[col];
+                }
+                if constexpr (do_add) {
+                    v += add[col];
+                }
+                dstc[col] = v;
             }
 
             if constexpr (block_size > WARP_SIZE) {
@@ -621,16 +636,33 @@ static __global__ void l2_norm_f32(
     }
 }
 
-static void norm_f32_cuda(
-        const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
-        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+template <bool do_multiply = false, bool do_add = false>
+static void norm_f32_cuda(const float * x,
+                          float *       dst,
+                          const int     ncols,
+                          const int     nrows,
+                          const int     nchannels,
+                          const int     nsamples,
+                          const int64_t stride_row,
+                          const int64_t stride_channel,
+                          const int64_t stride_sample,
+                          const float   eps,
+                          cudaStream_t  stream,
+                          const float * mul = nullptr,
+                          const float * add = nullptr) {
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
-    if (ncols < 1024) {
+    if (do_multiply && ncols <= 2048) {
+        const dim3 block_dims(256, 1, 1);
+        norm_f32<256, do_multiply, do_add><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
+            x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, add);
+    } else if (!do_multiply && ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        norm_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps);
+        norm_f32<WARP_SIZE, do_multiply, do_add><<<blocks_num, block_dims, 0, stream>>>(
+            x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, add);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        norm_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps);
+        norm_f32<1024, do_multiply, do_add><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
+            x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, add);
     }
 }
 
@@ -691,7 +723,7 @@ static void rms_norm_f32_dispatch(
         return !env || std::atoi(env) != 0;
     }();
     const bool use_rms128 = !do_add && !do_scale &&
-        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK && ncols <= 128 && rms128_enabled;
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_GB10 && ncols <= 128 && rms128_enabled;
 
     const int n4 = ncols / 4;
     if (use_rms128) {
@@ -857,10 +889,10 @@ static void l2_norm_f32_cuda(
     }
 }
 
-void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul, ggml_tensor * add) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;
-    float * dst_d = (float *) dst->data;
+    float *             dst_d  = (float *) (add ? add : mul ? mul : dst)->data;
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
@@ -878,7 +910,19 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    if (mul) {
+        const ggml_tensor * weight   = mul->src[0] == dst ? mul->src[1] : mul->src[0];
+        const float *       weight_d = (const float *) weight->data;
+        if (add) {
+            const ggml_tensor * bias = add->src[0] == mul ? add->src[1] : add->src[0];
+            norm_f32_cuda<true, true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, weight_d,
+                                      (const float *) bias->data);
+        } else {
+            norm_f32_cuda<true, false>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, weight_d);
+        }
+    } else {
+        norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    }
 }
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1238,7 +1282,7 @@ void ggml_cuda_op_rms_norm_mul_gate_fused(
         const char * env = getenv("GGML_CUDA_GB10_RMS128");
         return !env || std::atoi(env) != 0;
     }();
-    const bool use_rms128 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+    const bool use_rms128 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_GB10 &&
         ncols <= 128 && rms128_enabled;
     cudaStream_t stream = ctx.stream();
     if (use_rms128) {

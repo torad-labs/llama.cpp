@@ -680,6 +680,8 @@ llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-kv-restore-runs.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-kv-restore-runs PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-sleep.cpp LINK ggml)
+llama_build_and_test(test-backend-sched.cpp LINK ggml)
 
 if (BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
@@ -764,7 +766,7 @@ endif()
 # libmtmd
 llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 
-llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)
+llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd llama-common)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

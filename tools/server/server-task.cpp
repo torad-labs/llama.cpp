@@ -1327,11 +1327,17 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
 }
 
 json server_task_result_cmpl_partial::to_json_oaicompat_asr() {
-    json event = json {
-        {"type", "transcript.text.delta"},
-        {"delta", content.text},
-    };
-    return event;
+    // only the parsed content is the transcript, e.g. the "language XXX" prefix of Qwen3-ASR is reasoning
+    json events = json::array();
+    for (const auto & diff : oaicompat_msg_diffs) {
+        if (!diff.content_delta.empty()) {
+            events.push_back({
+                {"type", "transcript.text.delta"},
+                {"delta", diff.content_delta},
+            });
+        }
+    }
+    return events;
 }
 
 json server_task_result_cmpl_partial::to_json_anthropic() {
@@ -1839,7 +1845,7 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
     // Only deduplicate an exact state with at least the same checkpoint coverage.
     for (const auto & state : states) {
         if (state.data->main.empty() || (ctx_dft && state.data->drft.empty()) ||
-                state.prompt.tokens.size() != prompt.tokens.size() ||
+                state.prompt.tokens.size() != prompt.tokens.size() || !are_lora_equal(state.prompt.lora, prompt.lora) ||
                 state.prompt.tokens.get_common_prefix(prompt.tokens) != prompt.tokens.size() || state.pos_min > pos_min) {
             continue;
         }
@@ -1966,6 +1972,7 @@ server_prompt_cache_result server_prompt_cache::publish(server_prompt_cache_stat
     const auto & tokens = saved->prompt.tokens;
     for (auto it = states.begin(); &*it != saved;) {
         if (&*it != protect && it->prompt.tokens.size() == tokens.size() &&
+                are_lora_equal(it->prompt.lora, saved->prompt.lora) &&
                 it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
             it = erase_state(it);
         } else {
@@ -2033,11 +2040,18 @@ size_t server_prompt_cache::reusable_prefix(const server_prompt & prompt, const 
 }
 
 server_prompt_cache_state * server_prompt_cache::find_best(const server_prompt & prompt,
-        const server_tokens & tokens_new, llama_pos pos_min, int32_t n_swa, std::optional<size_t> resident_reuse) {
-    size_t best_reuse = resident_reuse ? *resident_reuse : reusable_prefix(prompt, tokens_new, pos_min, n_swa);
+        const server_tokens & tokens_new, llama_pos pos_min, int32_t n_swa, std::optional<size_t> resident_reuse,
+        const std::vector<common_adapter_lora_info> * lora_new) {
+    // a prompt made with another lora config is cleared before the new one starts, so it keeps nothing
+    const bool lora_clash = lora_new && lora_should_clear_cache(prompt.lora, *lora_new);
+    size_t best_reuse = resident_reuse ? *resident_reuse : lora_clash ? 0 : reusable_prefix(prompt, tokens_new, pos_min, n_swa);
     server_prompt_cache_state * best = nullptr;
     for (auto & state : states) {
         if (state.data->main.empty()) {
+            continue;
+        }
+        if (lora_new && lora_should_clear_cache(state.prompt.lora, *lora_new)) {
+            SRV_TRC("cache_candidate tokens=%d skipped, other lora config\n", state.prompt.n_tokens());
             continue;
         }
         const size_t lcp = state.prompt.tokens.get_common_prefix(tokens_new);

@@ -57,7 +57,7 @@ static void scale_f32_cuda(const T * x, T * dst, const float scale, const float 
         // GeForce Blackwell takes the float4 path too; GGML_CUDA_SCALE_VEC4_SM120_LEGACY=1 keeps it on GB10 only.
         static const bool sm120_legacy = ggml_env_switch("GGML_CUDA_SCALE_VEC4_SM120_LEGACY");
         // the float4 path reads both tensors flat, so it only takes fully contiguous ones
-        if ((cc == GGML_CUDA_CC_DGX_SPARK || (cc == GGML_CUDA_CC_BLACKWELL && !sm120_legacy)) &&
+        if ((cc == GGML_CUDA_CC_GB10 || (cc == GGML_CUDA_CC_BLACKWELL && !sm120_legacy)) &&
                 ggml_is_contiguous(src0) && ggml_is_contiguous(t) &&
                 nelements >= 1024 && nelements % 4 == 0 &&
                 (uintptr_t(x) & 0x0F) == 0 && (uintptr_t(dst) & 0x0F) == 0) {

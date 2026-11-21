@@ -656,7 +656,7 @@ llama_context::llama_context(
         // the queries and the cache cells. LLAMA_INKLING2_REL_POS_LEGACY=1 builds the bias of every cell on the host graph
         // and adds it to the mask instead (the oracle the tests compare against)
         cparams.fused_rel_pos = false;
-        cparams.auto_frel     = model.arch == LLM_ARCH_INKLING2 && !ggml_env_switch("LLAMA_INKLING2_REL_POS_LEGACY");
+        cparams.auto_frel     = (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) && !ggml_env_switch("LLAMA_INKLING2_REL_POS_LEGACY");
         // a drafted step's rows of a sequence read each cell once together, and its mask is classed by its sequences;
         // LLAMA_INKLING2_REL_GROUP_LEGACY=1: each row reads its cells alone, and a drafted step's mask is dense
         cparams.rel_query_group = !ggml_env_switch("LLAMA_INKLING2_REL_GROUP_LEGACY");
@@ -665,8 +665,8 @@ llama_context::llama_context(
         cparams.fused_inkling2 = false;
         // and each short convolution as one op; LLAMA_INKLING2_CONV_LEGACY=1 builds it from ssm_conv and elementwise ops
         cparams.fused_inkling2_conv = false;
-        cparams.auto_fconv = model.arch == LLM_ARCH_INKLING2 && !ggml_env_switch("LLAMA_INKLING2_CONV_LEGACY");
-        cparams.auto_finkling2 = model.arch == LLM_ARCH_INKLING2 && !ggml_env_switch("LLAMA_INKLING2_FUSE_LEGACY");
+        cparams.auto_fconv = (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) && !ggml_env_switch("LLAMA_INKLING2_CONV_LEGACY");
+        cparams.auto_finkling2 = (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) && !ggml_env_switch("LLAMA_INKLING2_FUSE_LEGACY");
     }
 
     // initialized later
@@ -678,6 +678,15 @@ llama_context::llama_context(
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+        }
+    }
+
+    {
+        const char * LLAMA_MOE_RANDOM_ROUTING = getenv("LLAMA_MOE_RANDOM_ROUTING");
+        cparams.moe_random_routing = LLAMA_MOE_RANDOM_ROUTING ? (atoi(LLAMA_MOE_RANDOM_ROUTING) != 0) : false;
+
+        if (cparams.moe_random_routing && hparams.n_expert > 0) {
+            LLAMA_LOG_WARN("%s: MoE random routing enabled - the output is not valid, use for benchmarks only\n", __func__);
         }
     }
 
@@ -3052,7 +3061,11 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     const llama_ubatch ubatch = balloc->split_simple(n_tokens);
 
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
-    GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
+    if (n_tokens > cparams.n_ubatch) {
+        LLAMA_LOG_ERROR("%s: the encoder reads the batch in one pass, n_tokens = %u > n_ubatch = %u, increase n_ubatch (-ub)\n",
+                __func__, n_tokens, cparams.n_ubatch);
+        return -1;
+    }
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
@@ -4333,41 +4346,17 @@ uint32_t llama_context::graph_max_nodes() const {
         // (n_tokens: the ubatch the scheduler is reserved for, as in sched_reserve)
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
-    } else if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
-        model.arch == LLM_ARCH_HRM_TEXT) {
-        res = std::max<uint32_t>(1024u, 64u * model.n_tensors());
-    } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
-        model.arch == LLM_ARCH_KIMI_LINEAR ||
-        model.arch == LLM_ARCH_METIS16 ||
-        model.arch == LLM_ARCH_BAILINGMOE3 ||
-        model.arch == LLM_ARCH_QWEN35 ||
-        model.arch == LLM_ARCH_QWEN35MOE ||
-        model.arch == LLM_ARCH_ZONOS3 ||
-        model.arch == LLM_ARCH_CLEF ||
-        model.arch == LLM_ARCH_CLOVER_MOE ||
-        model.arch == LLM_ARCH_QWEN4EXP ||
-        model.arch == LLM_ARCH_DEEPSEEK4 ||
-        model.arch == LLM_ARCH_DEEPSEEK41 ||
-        model.arch == LLM_ARCH_XING4_0 ||
-        (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
-        model.arch == LLM_ARCH_NANBEIGE ||
-        model.arch == LLM_ARCH_MINIMAX_01 ||
-        model.arch == LLM_ARCH_MINIMAX_M3 ||
-        model.arch == LLM_ARCH_HY_V4 ||
-        model.arch == LLM_ARCH_INKLING2 || llama_model_is_inkling_draft(model)) {
-        res = std::max<uint32_t>(1024u, 32u * model.n_tensors());
-    } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
-        // DFlash2's convolutions and selector are shape work rather than matmuls,
-        // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft.
-        // The selector lattice scales with the draft block size; 12u was calibrated
-        // on block-8 drafters, so scale the budget for larger blocks (e.g. Ripple's 16).
-        const uint32_t block_scale = std::max<uint32_t>(1u, model.hparams.dflash_block_size/8u);
-        res = std::max<uint32_t>(1024u, 12u*block_scale*model.n_tensors());
     } else {
-        res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-        for (const auto & lora : model.loras) {
-            res += lora->get_n_nodes();
-        }
+        res = std::max<uint32_t>(1024u, model.graph_nodes_per_tensor()*model.n_tensors());
+    }
+    for (const auto & lora : model.loras) {
+        res += lora->get_n_nodes();
+    }
+
+    // the MoE cache adds a lookup to each MoE layer, and a second expert path with a CPU share (up to ~16 tensors per layer),
+    // which the per-tensor estimates above do not cover for models with few tensors per layer
+    if (cparams.moe_cache_size > 0) {
+        res += 32u*model.hparams.n_layer_all;
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
@@ -4537,7 +4526,6 @@ llm_graph_params llama_context::graph_params(
     }
     llm_graph_params params = {
         /*.model       =*/ &model,
-        /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
@@ -4548,8 +4536,6 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
-        /*.prec_policy =*/ &model.prec_policy,
-        /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.layer_inp_dev =*/ layer_inp_dev,
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
