@@ -341,6 +341,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         endforeach()
         llama_test(test-llama-archs NAME test-inkling-group-${inkling_path_name}-drafted
             ARGS --inkling-path group/drafted --inkling-path-device ${inkling_path_device} -s 1234)
+        llama_test(test-llama-archs NAME test-inkling-decode-rows-${inkling_path_name}-long
+            ARGS --inkling-path decode-rows/long --inkling-path-device ${inkling_path_device} -s 1234)
         foreach(inkling_case prompt unified outputs)
             llama_test(test-llama-archs NAME test-inkling-fuse-${inkling_path_name}-${inkling_case}
                 ARGS --inkling-path fuse/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)

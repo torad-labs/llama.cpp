@@ -134,8 +134,22 @@ static const inkling2_mask_shapes & mask_shapes() {
         (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_ROWS"),
         (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_POOL_MIN"),
         (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_POOL_SHARE"),
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_DECODE_POOL_READS"),
     };
     return shapes;
+}
+
+// without cparams.rel_decode_rows (LLAMA_INKLING2_DECODE_CLASS_LEGACY=1) a decode step of fewer than 8 rows, a drafted step
+// with a long sequence and a low mean anywhere but at LLAMA_INKLING2_MEAN_ROWS rows of F16 K/V
+// (LLAMA_INKLING2_MEAN_MASK_DECODE) are dense, as before
+template<typename Cells>
+static inkling2_decode_mask classify_decode(bool decode_rows, uint32_t pool, uint32_t n_rows, bool allow_mean, Cells cells) {
+    if (!decode_rows) {
+        auto shapes = mask_shapes();
+        shapes.rows_min = std::max<uint32_t>(shapes.rows_min, 8);
+        return inkling2_classify_decode_mask(pool, n_rows, allow_mean, cells, shapes);
+    }
+    return inkling2_classify_decode_rows(pool, n_rows, allow_mean, cells, mask_shapes());
 }
 
 // the positions the relative bias is looked up by, for the global cache (0) and the window cache (1): with the bias inside
@@ -153,6 +167,7 @@ public:
     inkling2_decode_mask classify_mask(const llm_graph_params & params, int i) const {
         const auto & ub = params.ubatch;
         const auto * kv = cache[i];
+        const bool decode_rows = params.cparams.rel_decode_rows;
         if (!params.cparams.attn_mask_bits || !params.cparams.kv_unified || kv->is_full()) {
             return inkling2_decode_mask::dense;
         }
@@ -181,15 +196,16 @@ public:
                     return inkling2_decode_mask::dense;
                 }
             }
-            return inkling2_classify_decode_mask(kv->get_n_kv(), ub.n_seqs_unq, false, [&](uint32_t s) {
+            return classify_decode(decode_rows, kv->get_n_kv(), ub.n_seqs_unq, mean_decode && decode_rows, [&](uint32_t s) {
                 const auto seq = ub.seq_id[s*per_seq][0];
                 return kv->get_kv()->get_cells(seq).seq_n_cells(seq);
-            }, mask_shapes());
+            });
         }
         if (ub.n_tokens != ub.n_seqs_unq) {
             return inkling2_decode_mask::dense;
         }
-        bool allow_mean = mean_decode && i == 0 && ub.n_tokens == mask_shapes().mean_rows && kv->type_k() == GGML_TYPE_F16 && kv->type_v() == GGML_TYPE_F16;
+        bool allow_mean = mean_decode && (decode_rows || (i == 0 && ub.n_tokens == mask_shapes().mean_rows &&
+                kv->type_k() == GGML_TYPE_F16 && kv->type_v() == GGML_TYPE_F16));
         if (allow_mean) {
             for (uint32_t row = 0; row < ub.n_tokens; ++row) {
                 if (ub.n_seq_id[row] != 1) {
@@ -198,10 +214,10 @@ public:
                 }
             }
         }
-        return inkling2_classify_decode_mask(kv->get_n_kv(), ub.n_tokens, allow_mean, [&](uint32_t row) {
+        return classify_decode(decode_rows, kv->get_n_kv(), ub.n_tokens, allow_mean, [&](uint32_t row) {
             const auto seq = ub.seq_id[row][0];
             return kv->get_kv()->get_cells(seq).seq_n_cells(seq);
-        }, mask_shapes());
+        });
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -365,7 +381,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     rel->extent[0] = hparams.n_relative_extent;
     rel->extent[1] = hparams.n_swa;
     rel->cells = fused_rel;
-    rel->mean_decode = direct_sinks && ggml_env_switch("LLAMA_INKLING2_MEAN_MASK_DECODE");
+    // the low-mean hint takes the decode kernels' sink a query
+    rel->mean_decode = direct_sinks && (cparams.rel_decode_rows || ggml_env_switch("LLAMA_INKLING2_MEAN_MASK_DECODE"));
     const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
     ggml_tensor * rel_pos[2];
     int32_t n_kv_max[2];
