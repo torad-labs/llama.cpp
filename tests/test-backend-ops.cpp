@@ -11632,10 +11632,12 @@ struct test_flash_attn_ext_rel_pos : public test_case {
     const int n_kv_max;
     const int64_t run; // cells in each run a row owns when n_kv_max bounds it: 1 as decode lays a pool out
     const bool low_mean; // ggml_flash_attn_ext_set_low_mean_mask, a hint only: the first row reads the pool, the others a run each
+    const int group;     // ggml_flash_attn_ext_set_query_group, a hint only: runs of rows that read each cell once together
 
     std::string vars() override {
         const std::string base = VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_dist, type_KV, sinks, mask_bits, query_sinks, n_kv_max);
-        return (run == 16 ? base : base + "," + VAR_TO_STR(run)) + (low_mean ? "," + VAR_TO_STR(low_mean) : "");
+        return (run == 16 ? base : base + "," + VAR_TO_STR(run)) + (low_mean ? "," + VAR_TO_STR(low_mean) : "") +
+            (group ? "," + VAR_TO_STR(group) : "");
     }
 
     double max_nmse_err() override {
@@ -11645,9 +11647,9 @@ struct test_flash_attn_ext_rel_pos : public test_case {
     test_flash_attn_ext_rel_pos(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 6, int64_t kv = 2048, int64_t nb = 32,
                                 int64_t n_stream = 1, int64_t n_dist = 1025, ggml_type type_KV = GGML_TYPE_F16, bool sinks = true,
                                 bool mask_bits = false, bool query_sinks = false, int n_kv_max = 0, int64_t run = 16,
-                                bool low_mean = false)
+                                bool low_mean = false, int group = 0)
         : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_dist(n_dist), type_KV(type_KV), sinks(sinks),
-          mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max), run(run), low_mean(low_mean) {}
+          mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max), run(run), low_mean(low_mean), group(group) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -11675,6 +11677,7 @@ struct test_flash_attn_ext_rel_pos : public test_case {
         }
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_flash_attn_ext_set_low_mean_mask(out, low_mean);
+        ggml_flash_attn_ext_set_query_group(out, group);
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -11718,7 +11721,9 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                             const int32_t c = cells[s*kv + j];
                             // Disjoint runs, a shared prefix and a fully masked last row.
                             const bool runs = n_kv_max || (low_mean && i > 0);
-                            const bool owned = !runs || (i + 1 < nb && (j < 16 || (j/run)%nb == i));
+                            // with a query group the runs are a sequence's, shared by its rows as a token's and its drafts'
+                            const int64_t seq = group ? i/group : i, n_seq = group ? nb/group : nb;
+                            const bool owned = !runs || (i + 1 < nb && (j < 16 || (j/run)%n_seq == seq));
                             const bool seen = owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max);
                             f[j] = seen ? 0.0f : -INFINITY;
                             live += seen;
@@ -16778,6 +16783,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 65536, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 8192, run));
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192 + 5*32, 23, 1, 32, GGML_TYPE_F16, true, true, true, 1024, 1));
+    // a sequence's token and its drafts read each cell once: 23 sessions at depths 1, 2 and 3 in a pool of 8,192 and one of
+    // 65,536 cells (three query heads a block), and 8 sessions whose runs are a cell wide
+    for (int group : {2, 3, 4}) {
+        for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+            for (int64_t kv : {8192, 65536}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 23*group, 1, 1025, type, true, true, true, kv/8, 16, false, group));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192, 8*group, 1, 32, type, true, true, true, 1024, 1, false, group));
+        }
+    }
     for (int64_t gqa : {2, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, gqa, 8192, 8, 1, 32, GGML_TYPE_F16, true, true, true, 1024));
     }

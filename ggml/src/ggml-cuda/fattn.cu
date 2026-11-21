@@ -1297,7 +1297,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (sparse_rows || sparse_mean) && dst->src[9] && dst->src[3]->type == GGML_TYPE_I16 &&
             dst->src[3]->ne[0]*16 == k->ne[1] && dst->src[3]->ne[1] == q->ne[1] && dst->src[3]->ne[2] == 1 &&
             k->ne[1] >= 8192 && k->ne[1] <= INT32_MAX && k->ne[1]%32 == 0 &&
-            q->ne[3] == 1 && q->ne[1] >= 8 && q->ne[1] <= 32 && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
+            q->ne[3] == 1 && q->ne[1] >= 8 && q->ne[1] <= 32*fattn_rel_decode_group(dst) && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
             q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == k->nb[0] &&
             k->type == v->type && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && softcap == 0.0f) {
         return BEST_FATTN_KERNEL_REL_DECODE;
@@ -1367,7 +1367,8 @@ static void ggml_cuda_flash_attn_ext_device(ggml_backend_cuda_context & ctx, ggm
             ggml_cuda_fattn_rel_short(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_DECODE:
-            if (fattn_rel_mma_shapes(ctx.device, dst) && fattn_rel_mma_aligned(dst)) {
+            // a sequence's rows read together on the one-cell kernel, which the tile kernel does not do
+            if (fattn_rel_decode_group(dst) == 1 && fattn_rel_mma_shapes(ctx.device, dst) && fattn_rel_mma_aligned(dst)) {
                 ggml_cuda_fattn_rel_mma(ctx, dst);
             } else {
                 ggml_cuda_fattn_rel_decode(ctx, dst);

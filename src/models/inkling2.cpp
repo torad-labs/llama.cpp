@@ -165,6 +165,21 @@ public:
                 return inkling2_decode_mask::short_rows;
             }
         }
+        // A drafted step holds each sequence's token and its drafts: 2 to 4 rows a sequence side by side (an equal
+        // split), which see their sequence's cells and which the decode kernel reads together. Classed by its sequences,
+        // as a step of one row a sequence is by its rows (cparams.rel_query_group, LLAMA_INKLING2_REL_GROUP_LEGACY)
+        const uint32_t per_seq = ub.equal_seqs() ? ub.n_seq_tokens : 1;
+        if (per_seq >= 2 && per_seq <= 4 && ub.n_tokens == ub.n_seqs_unq*per_seq && params.cparams.rel_query_group) {
+            for (uint32_t row = 0; row < ub.n_tokens; ++row) {
+                if (ub.n_seq_id[row] != 1 || ub.seq_id[row][0] != ub.seq_id[row - row % per_seq][0]) {
+                    return inkling2_decode_mask::dense;
+                }
+            }
+            return inkling2_classify_decode_mask(kv->get_n_kv(), ub.n_seqs_unq, false, [&](uint32_t s) {
+                const auto seq = ub.seq_id[s*per_seq][0];
+                return kv->get_kv()->get_cells(seq).seq_n_cells(seq);
+            }, mask_shapes());
+        }
         if (ub.n_tokens != ub.n_seqs_unq) {
             return inkling2_decode_mask::dense;
         }

@@ -657,6 +657,9 @@ llama_context::llama_context(
         // and adds it to the mask instead (the oracle the tests compare against)
         cparams.fused_rel_pos = false;
         cparams.auto_frel     = model.arch == LLM_ARCH_INKLING2 && !ggml_env_switch("LLAMA_INKLING2_REL_POS_LEGACY");
+        // a drafted step's rows of a sequence read each cell once together, and its mask is classed by its sequences;
+        // LLAMA_INKLING2_REL_GROUP_LEGACY=1: each row reads its cells alone, and a drafted step's mask is dense
+        cparams.rel_query_group = !ggml_env_switch("LLAMA_INKLING2_REL_GROUP_LEGACY");
         // its residual depth mix, norm clips and output gate run as one op each; LLAMA_INKLING2_FUSE_LEGACY=1 builds them
         // from elementwise ops
         cparams.fused_inkling2 = false;

@@ -6,6 +6,8 @@
 //   rel    the relative position bias added inside flash attention (ggml_flash_attn_ext_add_rel_pos) against the bias
 //          gathered for every cell and added to the mask (LLAMA_INKLING2_REL_POS_LEGACY=1)
 //   rel-packed   the same comparison with packed masks requested, including on the legacy path
+//   group  with packed masks, a drafted step classed by its sequences, whose rows of a sequence read each cell once
+//          together on the decode kernel, against a dense step on the prefill kernel (LLAMA_INKLING2_REL_GROUP_LEGACY=1)
 //   fuse   the residual depth mix, the norm clips, the attention output gate and the experts' SITU as one op each
 //          against their elementwise graphs (LLAMA_INKLING2_FUSE_LEGACY=1)
 //   conv   each short convolution as one op (ggml_short_conv) against ssm_conv and its elementwise taps and residual
@@ -28,6 +30,7 @@
 //   decode    24 tokens one at a time after a prompt of 1012, crossing distance 1024 to the first keys
 //   unified   three sequences in one unified cache, prompts of 40, 56 and 72 tokens, then 8 steps of all three together
 //   streams   the same with a cache stream per sequence
+//   drafted   eight sequences of 1,030 cells in one unified cache, then 4 steps of a token and 3 drafts a sequence
 //
 // --inkling-window <device> is a check of another kind in this file for its helpers: sessions that share one cache give
 // each session the logits it has alone (test_inkling_window).
@@ -35,6 +38,7 @@
 #include "test-llama-archs.h"
 
 #include "llama-archs-gguf.h"
+#include "../ggml/src/ggml-attn-mask.h"
 
 #include <optional>
 #include <algorithm>
@@ -89,6 +93,14 @@ const std::map<std::string, feature> & features() {
         }}},
         {"rel-packed", {"LLAMA_INKLING2_REL_POS_LEGACY", {"packed attention with the bias"}, [](const ggml_tensor * t) {
             return t->op == GGML_OP_FLASH_ATTN_EXT && t->src[6] && t->src[3]->type == GGML_TYPE_I16 ? "packed attention with the bias" : "";
+        }, [](llama_context_params & params, bool) {
+            params.attn_mask_bits = true;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        }}},
+        {"group", {"LLAMA_INKLING2_REL_GROUP_LEGACY", {"bounded drafted rows"}, [](const ggml_tensor * t) {
+            return t->op == GGML_OP_FLASH_ATTN_EXT && t->src[6] && t->src[3]->type == GGML_TYPE_I16 &&
+                ggml_flash_attn_ext_get_n_kv_max(t) > 0 && ggml_flash_attn_ext_get_query_group(t) > 1 ?
+                "bounded drafted rows" : "";
         }, [](llama_context_params & params, bool) {
             params.attn_mask_bits = true;
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
@@ -237,6 +249,22 @@ std::map<std::string, std::pair<shape, path_case>> cases(size_t seed) {
         rows.insert(rows.end(), second.begin(), second.end());
         decode(ctx, rows, out, std::vector<size_t>{3, 159, 267, 319});
         decode(ctx, {{11, 460, 0}, {22, 160, 1}}, out);
+    }};
+    // 8 sequences of 1,030 cells, about an eighth of the pool each, then 4 steps of a token and 3 drafts a sequence:
+    // with a packed mask a drafted step is classed by its sequences (bounded rows) on the global layers, and the
+    // decode kernel reads a sequence's 4 rows together
+    ret["drafted"] = {{8, true}, [=](llama_context * ctx, std::vector<float> & out) {
+        for (int s = 0; s < 8; ++s) {
+            decode(ctx, span(tokens(1030, 30 + s), 0, s), out, std::vector<size_t>{1029});
+        }
+        for (int32_t step = 0; step < 4; ++step) {
+            std::vector<std::array<int32_t, 3>> rows;
+            for (int s = 0; s < 8; ++s) {
+                const auto r = span(tokens(4, 40 + 8*step + s), 1030 + 4*step, s);
+                rows.insert(rows.end(), r.begin(), r.end());
+            }
+            decode(ctx, rows, out);
+        }
     }};
     ret["unified"] = {{3, true}, together};
     ret["streams"] = {{3, false}, together};
