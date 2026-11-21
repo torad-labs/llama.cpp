@@ -429,16 +429,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
     const bool is_glm5next = ud->model->arch == LLM_ARCH_GLM5NEXT;
 
-    if (ud->model->split_mode() == LLAMA_SPLIT_MODE_DATA) {
-        static const std::regex experts("blk\\.\\d+\\.ffn_(up|gate|down)_exps\\.weight");
-        if (std::regex_match(tensor_name, experts)) {
-            GGML_ASSERT(tensor->ne[2] >= (int64_t) ud->n_devices);
-            ggml_backend_meta_split_state split = {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
-            for (size_t rank = 0; rank < ud->n_devices; ++rank) {
-                split.ne[rank] = tensor->ne[2]/ud->n_devices + (rank < tensor->ne[2] % ud->n_devices);
-            }
-            return split;
+    // Each card holds a quarter of Inkling 2's experts whole: their hidden width of 2,304 is 9 K-quant blocks, which a
+    // split of its rows gives out 3/2/2/2, and every layer waits for the card with 3
+    static const std::regex inkling2_experts("blk\\.\\d+\\.ffn_(gate_up|down)_exps\\.weight");
+    const bool by_expert = ud->model->experts_split_by_expert() && std::regex_match(tensor_name, inkling2_experts);
+    static const std::regex experts("blk\\.\\d+\\.ffn_(up|gate|down)_exps\\.weight");
+    if (by_expert || (ud->model->split_mode() == LLAMA_SPLIT_MODE_DATA && std::regex_match(tensor_name, experts))) {
+        GGML_ASSERT(tensor->ne[2] >= (int64_t) ud->n_devices);
+        ggml_backend_meta_split_state split = {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
+        for (size_t rank = 0; rank < ud->n_devices; ++rank) {
+            split.ne[rank] = tensor->ne[2]/ud->n_devices + (rank < tensor->ne[2] % ud->n_devices);
         }
+        return split;
+    }
+    if (ud->model->split_mode() == LLAMA_SPLIT_MODE_DATA) {
         // Caches must supply explicit ownership before allocation; never silently mirror them. The K/V rotation
         // matrices (llama_kv_cache::init_rotation) carry the caches' prefix and are constants: every rank holds one whole
         static const std::regex cache_rot("cache_.*(k|v)_rot_l\\d+");
@@ -2876,6 +2880,11 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+bool llama_model::experts_split_by_expert() const {
+    return params.split_mode == LLAMA_SPLIT_MODE_TENSOR && arch == LLM_ARCH_INKLING2 &&
+        ggml_env_switch("LLAMA_INKLING2_EXPERT_SPLIT");
 }
 
 bool llama_model::no_alloc() const {

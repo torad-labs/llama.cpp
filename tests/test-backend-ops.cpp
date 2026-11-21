@@ -13609,7 +13609,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     add_glm_kda_cases(test_cases);
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS,
-            GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
+            GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+            GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         for (int64_t tokens : {1, 17, 40}) {
             for (bool broadcast : {false, true}) {
                 for (int first : {0, 6}) {
@@ -13621,6 +13622,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t tokens : {1, 3, 8, 16}) {
         for (int first : {0, 6}) {
             test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, tokens, first, 8, 2, 2, 256, 256, true));
+        }
+    }
+    // Inkling 2's experts split by expert over four cards (LLAMA_INKLING2_EXPERT_SPLIT): a quarter of 384, top 8, the pack's
+    // K-quants, at 1 token, a step of 23 sessions and a drafted step of 92 rows
+    for (ggml_type type : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t tokens : {1, 23, 92}) {
+            for (int first : {0, 288}) {
+                test_cases.emplace_back(new test_mul_mat_id_partition(type, true, tokens, first, 384, 8, 96, 512, 512));
+            }
         }
     }
     for (int local : {72, 144}) {
