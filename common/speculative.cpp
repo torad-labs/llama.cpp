@@ -247,6 +247,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // finish what process() left running, before the state it writes is read or changed
+    virtual void settle() {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1228,6 +1231,20 @@ protected:
     // Called while h_nextn still holds the context features of batch_inject: the sequence's n_chunk rows begin at row first.
     virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*first*/, int32_t /*n_chunk*/) {}
 
+    // the sequences of the last feed whose context rows are not read yet, in batch_inject from row first
+    struct feed_span { llama_seq_id seq_id; int32_t first, n_rows; };
+    std::vector<feed_span> feed_pending;
+
+public:
+    void settle() override {
+        for (const auto & sp : feed_pending) {
+            store_context_features(sp.seq_id, sp.first, sp.n_rows);
+        }
+        feed_pending.clear();
+    }
+
+protected:
+
     // Whether a decode may feed several sequences at once: the context rows a draft keeps must then be read by their row
     // in the batch, which the host copy of a micro-batch split by sequences does not keep.
     virtual bool feed_together() const { return true; }
@@ -1266,6 +1283,8 @@ public:
     }
 
     bool process(const common_batch & batch_in) override {
+        settle();
+
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1305,11 +1324,13 @@ public:
         // decode with the others, then each one's context rows are read from it. A decode a sequence made 23 decodes and
         // 23 waits a step at 23 sessions. LLAMA_SPEC_FEED_PER_SEQ_LEGACY=1: one decode a sequence
         static const bool feed_per_seq = ggml_env_switch("LLAMA_SPEC_FEED_PER_SEQ_LEGACY");
+        // The last decode's context rows are read when the draft is next used (settle), so the host does not wait for the
+        // feed and samples the verified rows while the draft's device runs it. LLAMA_SPEC_FEED_WAIT_LEGACY=1: read them here
+        static const bool feed_wait = ggml_env_switch("LLAMA_SPEC_FEED_WAIT_LEGACY");
         std::vector<bool> fed(n_seq, false);
         if (use_dev_features && !feed_per_seq && feed_together()) {
-            struct span { llama_seq_id seq_id; int32_t first, n_rows; };
-            std::vector<span> spans;
-            const auto flush = [&]() {
+            std::vector<feed_span> spans;
+            const auto flush = [&](bool last) {
                 if (spans.empty()) {
                     return true;
                 }
@@ -1319,10 +1340,11 @@ public:
                             __func__, rc, (int) batch_inject.size(), spans.size());
                     return false;
                 }
-                for (const auto & sp : spans) {
-                    store_context_features(sp.seq_id, sp.first, sp.n_rows);
-                }
+                feed_pending = std::move(spans);
                 spans.clear();
+                if (!last || feed_wait) {
+                    settle();
+                }
                 return true;
             };
             batch_inject.clear();
@@ -1336,7 +1358,7 @@ public:
                     continue; // a prompt longer than a ubatch, or a pinned image: the loop below
                 }
                 if ((int32_t) batch_inject.size() + n_rows > n_ubatch) {
-                    if (!flush()) {
+                    if (!flush(false)) {
                         return false;
                     }
                     batch_inject.clear();
@@ -1350,7 +1372,7 @@ public:
                 }
                 fed[seq_id] = true;
             }
-            if (!flush()) {
+            if (!flush(true)) {
                 return false;
             }
         }
@@ -1359,6 +1381,7 @@ public:
             if (i_batch_beg[seq_id] < 0 || fed[seq_id]) {
                 continue;
             }
+            settle(); // the loop below takes batch_inject
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
@@ -4588,6 +4611,7 @@ void common_speculative_draft(common_speculative * spec) {
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            impl->settle();
             impl->draft(dparams);
             impl->n_call_draft++;
         }
@@ -4695,6 +4719,7 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     }
 
     for (auto & impl : spec->impls) {
+        impl->settle();
         if (impl->get_state(seq_id, data)) {
             return true;
         }
@@ -4709,6 +4734,7 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     }
 
     for (auto & impl : spec->impls) {
+        impl->settle();
         impl->set_state(seq_id, data);
     }
 }
