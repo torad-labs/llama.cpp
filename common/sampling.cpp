@@ -343,6 +343,9 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // the verify path rejection last logged: 1 the one-pass vector draw, 0 the candidates, -1 none yet
+    int8_t reject_one_pass = -1;
+
     // the chain's top-k when no sampler before it changes a logit for these params, else 0: the k a backend may take for
     // it (common_sampler_backend_top_k)
     int32_t top_k_first = 0;
@@ -1262,26 +1265,33 @@ static std::vector<llama_token> sample_and_accept_n_rejection(struct common_samp
 
     std::vector<uint64_t> in_q; // a bit a token of q, so the residual looks q up only for the tokens it holds
 
+    // decided before any draw: the candidates path draws on its own, so a row's two uniforms are drawn only for a chain
+    // the vector pass takes
+    const bool chain_one_pass = llama_sampler_chain_takes_row(gsmpl->chain);
+    if (gsmpl->reject_one_pass != (int8_t) chain_one_pass) {
+        gsmpl->reject_one_pass = chain_one_pass;
+        LOG_INF("%s: drafts are verified by rejection %s\n", __func__, chain_one_pass ? "in one vector pass a row" :
+                "through each row's candidates (the vector pass takes a chain of a logit bias, a temperature and dist on a CPU with AVX2 and FMA)");
+    }
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const auto & q = draft_q[i];
 
         const llama_sampling_row r = row(i);
-        if (one_pass(r)) {
+        if (chain_one_pass && !q.empty() && one_pass(r)) {
             const double u_accept   = uni(gsmpl->rng);
             const double u_residual = uni(gsmpl->rng);
             const llama_token id = llama_sampler_chain_reject_row(gsmpl->chain, r.logits, n_vocab, draft[i], q.data(), q.size(),
                     u_accept, u_residual);
-            if (id != LLAMA_TOKEN_NULL) {
-                // no candidates were built for this row
-                gsmpl->cur_p = { nullptr, 0, -1, true };
-                common_sampler_accept(gsmpl, id, true);
-                result.push_back(id);
-                if (id == draft[i]) {
-                    continue;
-                }
-                break;
+            // no candidates were built for this row
+            gsmpl->cur_p = { nullptr, 0, -1, true };
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
+            if (id == draft[i]) {
+                continue;
             }
+            break;
         }
 
         // leaves the target distribution in the candidate array
