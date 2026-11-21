@@ -437,7 +437,7 @@ static bool slot_prefix_copy() {
     return copy;
 }
 
-// LLAMA_SAMPLE_THREADS: the most threads that sample a step's rows on the CPU side by side (4 when unset)
+// LLAMA_SAMPLE_THREADS: the most threads that sample a step's rows on the CPU side by side
 static int sample_threads_max() {
     static const int n = (int) ggml_env_int("LLAMA_SAMPLE_THREADS");
     return n;
