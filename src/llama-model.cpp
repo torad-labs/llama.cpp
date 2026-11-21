@@ -2261,6 +2261,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+    // every down tensor exists now, and no buffer has asked for a split yet
+    experts_by_expert = decide_experts_split_by_expert() ? 1 : 0;
+
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
 
@@ -2977,6 +2980,11 @@ llama_split_mode llama_model::split_mode() const {
 }
 
 bool llama_model::experts_split_by_expert() const {
+    GGML_ASSERT(experts_by_expert >= 0 && "experts_split_by_expert() before load_tensors created the tensors");
+    return experts_by_expert == 1;
+}
+
+bool llama_model::decide_experts_split_by_expert() const {
     if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR || arch != LLM_ARCH_INKLING2) {
         return false;
     }
@@ -3836,6 +3844,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // llama_memory_hybrid_iswa has no indexer cache, so SWA would silently lose it
                         GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
+                        if (arch == LLM_ARCH_INKLING2 && params.type_s != GGML_TYPE_F32) {
+                            LLAMA_LOG_INFO("%s: Inkling 2 keeps its recurrent state in f32 (a conv state, as R): type_s %s is not used\n",
+                                    __func__, ggml_type_name(params.type_s));
+                        }
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,

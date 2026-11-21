@@ -73,6 +73,24 @@ class EvenDown(unittest.TestCase):
                     self.assertEqual(tensors[t.name].tensor_type, t.tensor_type)
                     self.assertTrue(np.array_equal(np.asarray(tensors[t.name].data), np.asarray(t.data)))
 
+    def test_nothing_to_convert(self):
+        """a pack whose down projections are neither Q4_K nor Q5_K fails and writes nothing"""
+        down = np.random.default_rng(9).integers(0, 256, size=(3, 64, 16 * 20), dtype=np.uint8)  # Q4_1, K = 512
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "pack.gguf", Path(tmp) / "even.gguf"
+            writer = gguf.GGUFWriter(source, arch="inkling2")
+            writer.add_tensor("blk.0.ffn_down_exps.weight", down, raw_dtype=T.Q4_1)
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+            run = subprocess.run([sys.executable, str(Path(even_down.__file__)), str(source), str(output)],
+                                 capture_output=True, text=True)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("nothing to convert", run.stderr)
+            self.assertIn("Q4_1", run.stderr)
+            self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
