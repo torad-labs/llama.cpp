@@ -1378,8 +1378,7 @@ static void ggml_cuda_flash_attn_ext_device(ggml_backend_cuda_context & ctx, ggm
             ggml_cuda_fattn_rel_short(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_DECODE:
-            // a sequence's rows read together on the one-cell kernel, which the tile kernel does not do
-            if (fattn_rel_decode_group(dst) == 1 && fattn_rel_mma_shapes(ctx.device, dst) && fattn_rel_mma_aligned(dst)) {
+            if (fattn_rel_mma_shapes(ctx.device, dst) && fattn_rel_mma_aligned(dst)) {
                 ggml_cuda_fattn_rel_mma(ctx, dst);
             } else {
                 ggml_cuda_fattn_rel_decode(ctx, dst);

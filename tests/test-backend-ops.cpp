@@ -16803,11 +16803,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 65536, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 8192, run));
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192 + 5*32, 23, 1, 32, GGML_TYPE_F16, true, true, true, 1024, 1));
-    // a sequence's token and its drafts read each cell once: 23 sessions at depths 1, 2 and 3 in a pool of 8,192 and one of
-    // 65,536 cells (three query heads a block), and 8 sessions whose runs are a cell wide
-    for (int group : {2, 3, 4}) {
+    // a sequence's token and its drafts read each cell once: 23 sessions at depths 0 to 3 in pools of 8,192, 65,536 and
+    // 262,144 cells, and 8 sessions whose runs are a cell wide
+    for (int group : {1, 2, 3, 4}) {
         for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
-            for (int64_t kv : {8192, 65536}) {
+            for (int64_t kv : {8192, 65536, 262144}) {
                 test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 23*group, 1, 1025, type, true, true, true, kv/8, 16, false, group));
             }
             test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192, 8*group, 1, 32, type, true, true, true, 1024, 1, false, group));
@@ -16815,6 +16815,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t gqa : {2, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, gqa, 8192, 8, 1, 32, GGML_TYPE_F16, true, true, true, 1024));
+        // a group's rows times query heads in 8 to 32 columns
+        for (int group : {2, 3, 4}) {
+            for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, gqa, 8192, 8*group, 1, 32, type, true, true, true, 1024, 1, false, group));
+            }
+        }
     }
     // a low-mean step: one session reads the whole pool and the others their own cells, so the hint alone routes it, at
     // the shape as served and at rows and pools the model's knobs can pick (LLAMA_INKLING2_MEAN_ROWS, _MEAN_POOL_MIN)
@@ -17931,6 +17937,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 3014656, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 1024, 1));
+    // 23 sessions of 16,384 cells each, plain (one row a session) and drafted at depth 3 (four rows a session): the
+    // global layers, F16 and q8_0, and a sliding layer's 1,024 cells a session
+    for (int group : {1, 4}) {
+        for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            for (int n_kv_max : {23*16384/8, 1024}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 23*16384, 23*group, 1, 1025, type, true, true, true, n_kv_max, 1, false, group));
+            }
+        }
+    }
     // and its low-mean step: one session reads the whole pool
     for (int64_t kv : { 262144, 3014656 }) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 0, 1, true));
