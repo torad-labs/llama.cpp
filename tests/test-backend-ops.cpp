@@ -6897,6 +6897,65 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Inkling 2's dense projections on one card of tensor-4 (Q3_K_M pack), n rows, over `layers` layers of their own weights,
+// so the weights come from DRAM and not from L2 (16 layers are 186 MB, 12 with the router 225 MB): q, gate, k, r, sink and
+// the global layers' two conv taps in Q3_K, v in Q4_K, wo in Q4_K, the router in F32. Perf only: the time is the graph's.
+struct test_inkling2_dense : public test_case {
+    const int64_t n;
+    const int layers;
+    const bool router;
+    std::vector<ggml_tensor *> first;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_DENSE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, layers, router);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    std::vector<ggml_tensor *> forward_first() override { return first; }
+
+    test_inkling2_dense(int64_t n = 23, int layers = 16, bool router = false) : n(n), layers(layers), router(router) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        first.clear();
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4608, n);
+        ggml_tensor * o = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1536, n);
+        ggml_tensor * out = nullptr;
+        auto mm = [&](ggml_type type, int64_t m, ggml_tensor * b) {
+            if (out) {
+                first.push_back(out);
+            }
+            out = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_weights, type, b->ne[0], m), b);
+        };
+        for (int il = 0; il < layers; ++il) {
+            mm(GGML_TYPE_Q3_K, 1536, x); // q
+            mm(GGML_TYPE_Q3_K,  256, x); // k
+            mm(GGML_TYPE_Q4_K,  256, x); // v
+            if (il % 6 == 5) {
+                mm(GGML_TYPE_Q3_K, 8, x); // k conv taps
+                mm(GGML_TYPE_Q3_K, 8, x); // v conv taps
+            }
+            mm(GGML_TYPE_Q3_K,  192, x); // r
+            mm(GGML_TYPE_Q3_K,   12, x); // sink
+            mm(GGML_TYPE_Q3_K, 1536, x); // gate
+            mm(GGML_TYPE_Q4_K, 4608, o); // wo
+            if (router) {
+                mm(GGML_TYPE_F32, 384, x);
+            }
+        }
+        return out;
+    }
+};
+
 // The packed Q8 draft head, with persistent weights as in the model.
 struct test_glm_q8_head : public test_mul_mat {
     test_glm_q8_head(int64_t rows, int64_t columns)
@@ -15245,6 +15304,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
+    // Inkling 2's dense projections, one card's slice under tensor-4, at decode widths: q and gate 1536 rows, k 256, r 192,
+    // sink 12 and the conv taps 8 (Q3_K), v 256 (Q4_K, Q5_K in layers 0-1), wo 4608 rows of a 1536 slice (Q4_K)
+    for (int64_t n : {9, 16, 23, 32}) {
+        for (int64_t m : {1536, 256, 192, 12, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  256, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  256, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4608, n, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        // a cluster's blocks split K of channels too, broadcast ones among them, and of a partial row tile
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 40, n, 4608, {2, 3}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, 40, n, 4608, {2, 1}, {2, 2}));
+    }
+
     // small K at batch > 8, e.g. LoRA B matrices with K = rank
     for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int64_t k : {16, 32, 48}) {
@@ -17845,6 +17918,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(down, GGML_TYPE_F32, 384, 8, false, 4608, 23, n_ff));
         }
     }
+    // the dense projections of one card under tensor-4 (q/gate, k, r, sink, conv taps, v, wo, the F32 router) at 8 to 64
+    // decode rows: where the few-row MMQ hands over to MMQ (GGML_CUDA_MMQ_FEW_MAX_COLS)
+    for (int64_t n : {8, 9, 12, 16, 23, 24, 32, 40, 46, 64}) {
+        for (int64_t m : {1536, 256, 192, 12, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  256, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4608, n, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,  384, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        // and all of them in a row over 16 layers, the weights read from DRAM
+        test_cases.emplace_back(new test_inkling2_dense(n, 16, false));
+    }
+    test_cases.emplace_back(new test_inkling2_dense(23, 12, true)); // the context holds 128 tensors
     // the same slices in a drafted step of 23 sessions at depths 1, 2 and 3 (46, 69 and 92 rows), past the row kernel's 32:
     // MUL_MAT_ID takes MMQ there, and the rows touch more of the 384 experts
     for (int64_t rows : {46, 69, 92}) {
