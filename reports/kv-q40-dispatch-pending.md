@@ -5,6 +5,10 @@ headers also serve GLM 5.3's build, so every change this plan made to them takes
 Q4_0 template instance and dispatch cases behind `GGML_CUDA_FATTN_REL_DECODE_Q4`, default off, with the q8_0/
 E4M3/F16 paths byte-for-byte what they were; GLM serves none of these types through the Inkling kernels, so its
 behavior is unchanged by construction as well as by switch.
+Released hold (goal-sharpening directive, same day): upstream-shaped caution no longer applies. Once the box
+window validates the kernel on real weights, the switch may collapse into unconditional q4 acceptance like
+q8_0's today — dropping knob ceremony entirely — and doc 18 section 3.3's default flip lands straight in the
+tensor-4 profile with its measurement in the row note, since GLM stays green either way.
 
 Companion to `docs/torad/research/inkling-2-small/18-global-kv-off-f16.md` section 3.1 and ledger rows
 `1454bba3a` (rel-mma reads q8_0 one byte), `15a502bc5`/`4e5911055` (raw path). State as of the merge landing
