@@ -84,20 +84,43 @@ Weight-level additions this study contributes:
   2/2/2/3 superblocks), but nothing in the weights adds a reason beyond what serving
   traces already gave.
 
-*PENDING-TABLE-1: per-layer concentration stats from expert-blocks.npz (top-k energy shares, Gini, gate↔down correlation).*
-*PENDING-TABLE-2: sampled zero-code fraction per layer.*
-*PENDING: cross-layer expert-energy correlation matrix summary.*
+Measured from the assembled `expert-blocks.npz` (scale-level proxies over **every**
+block of both expert stacks; method and limits in §10):
+
+| Quantity | Gate/up (Q3_K) | Down (L0–2 Q5_K / L3+ Q4_K) |
+| --- | --- | --- |
+| top-16 experts' share of Σd²·(Σscale−32)² | **4.2 %** mean | **4.3 %** mean |
+| top-32 share | 8.4 % | 8.5 % |
+| top-64 share | 16.7 % | 16.8 % |
+| Gini coefficient of per-expert energy | 0.0012 mean | 0.0031 mean |
+
+Uniform to a degree that removes the weight-side argument for ANY hot-set residency:
+no expert class exists in the bytes.
+
+Cross-layer stability of per-expert energy vectors: mean off-diagonal correlation
+between layers **−0.0009** (gate/up), i.e. an expert heavy in one layer predicts nothing
+about another layer's weights; best pair r = +0.05. Router row-norm vs expert
+energy-weighted norm within a layer: r = +0.008 — even the eleven quiet-router outliers
+carry normal-size expert weights.
+
+Zero-code fraction (share of dequantized values exactly 0 after quantization, sampled
+exactly over strided rows): **20.63 % mean**, range 20.47–21.17 % across the 17 layers
+measured before the sweep was cut (L0–L16, both down-quant regimes); first six layers at
+stride 16, remainder at stride 64, sampling error ≈ ±0.05 pp on the fraction. The engine
+cannot skip these zeros' bandwidth today (Q3_K has no run coding), but any future
+value-skip fast path inside `vec_dot` starts from this floor.
 
 ## 4. Hot-set / residency
 
-Hotness lives in activations, not weights: router structure is flat across experts, and
-expert weight identity decorrelates across layers. Therefore a **hot-set residency policy
-is NOT justified by weights alone** — it can only be justified by route-frequency evidence
-at depth, which does not exist yet: no capture on any machine holds per-route IDs across
-context positions (the M1 probe recorded counts only; drafter-g7 walk data carries draft,
-not target, routing). Recorded as a gap rather than extrapolated. The cheapest first step
-stays the planned trace at the next four-card window (M1 line): log per-layer top-expert
-histograms for ~1000 decode steps at shallow AND deep context before any LRU design.
+Hotness lives in activations, not weights: expert scale-energy is uniform to Gini
+≈0.001 (top-16 of 384 hold 4.2%), per-expert energy decorrelates across layers
+(r̄ = −0.0009), and router norms are flat by construction. A **hot-set residency policy
+is NOT justified by weights** — only by route-frequency evidence at depth, which does
+not exist anywhere yet: no capture holds per-route IDs across context positions (the M1
+probe recorded counts only; drafter-g7 walk data carries draft, not target, routing).
+Recorded as a gap rather than extrapolated. Cheapest decider stays the planned trace at
+the next four-card window (M1 line): per-layer top-expert histograms over ~1000 decode
+steps at shallow AND deep context before any LRU design.
 
 ## 5. Precision map (storage dtype vs compute accumulator)
 
@@ -126,6 +149,16 @@ Up-cast payoffs: no narrow accumulator found in any hot kernel — `mmvq`, `fuse
 both fattn-rel paths, norms and conv all accumulate f32. The only half-width math still
 inside hot loops is scale handling (`half2 ds/dm` loads in `mmq-few.cu:125..131,
 240`), which converts per block and cannot dominate at 15 µs-class kernels.
+
+## 10. Method limits, stated
+
+Scale-energy proxies count d²·Σ(scale−32)² per K-quant block (down adds the mn²·Σmin²
+term). They rank experts by their stored spread energy exactly as quantized; they are
+NOT full Frobenius norms of the dequantized tensors (block codes add a bounded,
+data-dependent term treated as uniform across blocks within a tensor family). Zero-code
+fractions are exact counts over sampled rows (stride documented above), not whole-tensor
+counts. Router statistics are exact F32 reads. All comparisons between layers hold
+within the same tensor family, which is where every decision above lives.
 
 ## 6. Folded-arithmetic census
 
@@ -219,10 +252,18 @@ capture gates anyway.
 
 ## Provenance appendix
 
-Scripts (this repo, uncommitted here): `research_notes/inkling2-weight-read.py`,
-`inkling2-weight-stage2.py`, `inkling2-weight-stage3.py`, analyzer
-`inkling2-weight-analyze.py`. Artifacts cached outside the repo at
-`~/.cache/inkling2-weightread/` (routers.npz 339.7 MB F32 exact, fingerprints.npz,
-router-stats.json, tensor-inventory.json, gguf-metadata.json incl. kv_type_width note,
-expert-blocks.npz, golden-selftest.npz). Box 61473783 opened 07:44 UTC and stopped
-immediately after artifacts landed.
+Scripts (this repo): `research_notes/inkling2-weight-read.py`,
+`inkling2-weight-stage2.py`, `inkling2-weight-stage3.py`, `zf_one.py`,
+analyzer `inkling2-weight-analyze.py`. Artifacts cached outside the repo at
+`~/.cache/inkling2-weightread/` (routers.npz 339.7 MB F32 exact, fingerprints.npz with
+regenerated NaN-free down block, tensor-inventory.json, router-stats.json,
+energy_{gateup,down}.npy over every expert, zero-frac-progress.json, assembled
+expert-blocks.npz, gguf-metadata.json incl. layout-width note, golden-selftest.npz).
+
+Run history for honesty: vast box 61473783 opened 07:44 UTC with Marcos's instruction to
+open it only to read weights; long single-process jobs were killed twice by the host
+with no traceback, so the reader was split into resumable stages persisting each output;
+the per-layer zero-code sweep ran as one ssh process per layer from here and was cut at
+17 measured layers once its range stabilized (both down regimes covered). Artifacts were
+rsynced home and the box stopped immediately after, 09:08 UTC (~1.42 h billed; disk kept
+for serving). GLM RTX PRO 6000 box never touched.

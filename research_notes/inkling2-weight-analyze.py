@@ -148,10 +148,18 @@ def main(outdir):
             same_expert_cross.append(float(c.mean()))
     out["fingerprint_same_expert_across_layers_mean"] = float(np.mean(same_expert_cross))
 
-    out["zero_code_frac_sampled_gateup"] = {
-        "layers": gu_layers, "values": zfrac.tolist(),
-        "mean": float(zfrac.mean()),
-    }
+    zf_meta = {}
+    try:
+        zf_progress = json.load(open(f"{outdir}/zero-frac-progress.json"))
+        zf_meta = {"measured_layers": sorted(int(k) for k in zf_progress),
+                   "values": [zf_progress[str(l)] for l in sorted(zf_progress, key=int)],
+                   "stride_note": "first six at stride 16, remainder at 64"}
+        zf_mean = float(np.mean(list(zf_progress.values())))
+    except FileNotFoundError:
+        zf_meta = {"values": zfrac.tolist(), "layers": gu_layers}
+        zf_mean = float(zfrac.mean())
+    zf_meta["mean"] = zf_mean
+    out["zero_code_frac_sampled_gateup"] = zf_meta
 
     json.dump(out, open(f"{outdir}/analysis.json", "w"), indent=1)
 
@@ -173,7 +181,8 @@ def main(outdir):
           out["cross_layer_gateup"]["offdiag_mean"])
     print("router-norm vs expert-energy corr mean: %.4f" %
           (out["router_norm_vs_expert_energy_corr"]["mean"] or 0))
-    print("zero-code sampled frac mean: %.5f" % zfrac.mean())
+    print("zero-code sampled frac mean: %.5f (over %d measured layers)" %
+          (zf_mean, len(out['zero_code_frac_sampled_gateup']['values'])))
     wl = out["fingerprint_within_layer"]
     import statistics
     print("within-layer expert-fp cos: mean-of-means %.4f, absmax %.4f, pairs>0.99 max/layer %d" % (
