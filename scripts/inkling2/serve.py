@@ -93,7 +93,8 @@ def arguments(argv=None):
     parser.add_argument("--context", type=int, help="Tokens in the shared pool (default: the profile's)")
     parser.add_argument("--slot-context", type=int,
                         help=f"Maximum input plus generation per session (tensor-4: {CODING_SLOT_CONTEXT}, other profiles: {SLOT_CONTEXT})")
-    parser.add_argument("--kv-cache", choices=["f16", "q8_0"], help="KV cache type (default: the profile's)")
+    parser.add_argument("--kv-cache", choices=["f16", "q8_0", "q4_0"],
+                        help="KV cache type (default: the profile's; q4_0 serves only the dense-path decode today)")
     parser.add_argument("--swa-kv-cache", choices=["f16", "q8_0"],
                         help="Override K and V precision in sliding-window layers (default: follow --kv-cache)")
     parser.add_argument("--attn-mask-bits", action=argparse.BooleanOptionalAction, default=True,
