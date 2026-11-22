@@ -598,3 +598,18 @@ checks = [
 notes = [
   '2026-11-22 00:50 CT: added; 1 of 1 checks fail, as they should before the work',
 ]
+
+[[row]]
+id = 'launcher-one-profile'
+title = 'The launcher serves one measured profile'
+status = 'done'
+owner = ''
+blocked_by = []
+guard = true
+spec = "Marcos, 2026-11-22: one profile only, so every seat's measured improvements compose into the same configuration instead of splitting across variants nobody re-measures. scripts/inkling2/serve.py defines exactly PROFILES = {tensor-4} and defaults to it; removed profiles stay removed (git history keeps them). A new or changed profile passes only by changing this guard row in a checks-only commit of the lead's, with the measurement that justifies it recorded on TORAD.md. search.py's default profile must stay tensor-4 as well."
+checks = [
+  "python3 -c 'import ast,pathlib; t=ast.parse(pathlib.Path(\"scripts/inkling2/serve.py\").read_text()); a=[n for n in t.body if isinstance(n,ast.Assign) and getattr(n.targets[0],\"id\",\"\")==\"PROFILES\"]; assert a, \"no PROFILES\"; ks=[k.value for k in a[0].value.keys]; assert ks==[\"tensor-4\"], ks'",
+]
+notes = [
+  '2026-11-22 00:52 CT: added as a guard; its checks pass',
+]
