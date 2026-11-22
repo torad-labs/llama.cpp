@@ -768,7 +768,7 @@ blocked_by = []
 guard = false
 spec = "2026-11-22 Marcos's verdict on the bottleneck experiment, routed by hyperparam: the host KV-mask building costs 68-115 ms a pass at prefill. Build the mask without the host sweep: a per-sequence row plus OR, or cells addressed by run, whichever measures cheaper. Masks stay bit-identical; GLM sees identical data, the dspark draft's shared rows and SWA masking included. A test named inkling-kvmask compares the new path against the current builder across multi-sequence, SWA, shared-row and GLM shapes. The host builder leaves the hot path or sits behind a default-off check switch. Evidence: prefill timing on a rented CloudRift 5090, in the row note. The KV-states lane holds src/llama-kv-cache.* until its staging completes."
 checks = [
-  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-kvmask | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-kvmask --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R test-kv-mask | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R test-kv-mask --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
 ]
 notes = [
   '2026-11-22 03:09 CT: added; 1 of 1 checks fail, as they should before the work',
@@ -928,4 +928,34 @@ checks = [
 notes = [
   '2026-11-22 04:04 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 05:36 CT llamacpp-coordinator: 2026-11-22 06:05 CT llamacpp-coordinator: ESCALATED by the window: the served four-card server at 2aea42018 CRASHES at startup on the DEFAULT meta reserve sizing, ggml-backend-meta.cpp GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer)) inside find_split, reached via sched_reserve and ggml_backend_meta_buffer_type_get_alloc_size's new measure path (f0735a148) from llama_init_from_model. Not model-specific: it kills any tensor-split server init, the product's default path. Prime suspect: the measure path asserts on tensors that legitimately carry no meta buffer (weights and inputs) during resolution. Window pins GGML_META_MERGED_RESERVE_LEGACY=1 in every arm (memory sizing only, the setting the 425.6 floor was measured under) and proceeds. Fix is routed to the meta lane now; this row is a product blocker, not a test-row red.",
+]
+
+[[row]]
+id = 'kquant-staged-kernel'
+title = 'Double-buffered K-quant tile in the Blackwell MMQ kernel'
+status = 'todo'
+owner = 'hyperparam'
+blocked_by = []
+guard = false
+spec = "2026-11-22 recorded from hyperparam's measured follow-up to a815b3a47 (message seq 59). The Blackwell sm_120 K-quant MMQ table rows landed; the kernel still pays the table's residual. Double-buffer the K-quant tile in mmq.cuh so the next tile loads while the current one multiplies: the measured ~-6%-of-prefill lever the width table cannot reach (RTX 5090, served expert shapes, evidence beside reports/inkling2-mmq-kquant-evidence at 39305dff1). GLM IQ3_XXS choices and GLM 5.3 serving untouched; other models must not be wrecked. A test matching inkling-kquant-tile judges the staged kernel against the current one at Inkling prefill shapes, correctness against the existing path included; the row note records the prefill delta from a rented 5090."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-kquant-tile | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-kquant-tile --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-22 06:15 CT llamacpp-coordinator: added at the request of hyperparam (seq 59) so the measured follow-up does not evaporate; 1 of 1 checks fail today, as they should: no test matching inkling-kquant-tile is registered. The spec judge lands as a dedicated tests/ file; test-backend-ops.cpp stays out of this row.',
+]
+
+[[row]]
+id = 'kquant-j-rule'
+title = 'K-quant-scoped J multiplier rule for the Blackwell MMQ table'
+status = 'todo'
+owner = 'hyperparam'
+blocked_by = []
+guard = false
+spec = "2026-11-22 recorded from hyperparam's measured follow-up to a815b3a47 (message seq 59). A K-quant-scoped J multiplier rule reached expert mix -8.4% against the landed rows' -5.4% in the microperf sweep. Land it scoped to the K-quants so GLM IQ3_XXS choices do not move: the row fails if any IQ3_XXS selection changes, and GLM 5.3 serving stays untouched. Blackwell-first; no legacy-arch ceremony. A test matching inkling-kquant-jrule judges the rule's selections against the current table at Inkling shapes and pins the GLM IQ3_XXS selections as unchanged; the row note records the measured mix and the before/after table."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-kquant-jrule | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-kquant-jrule --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-22 06:15 CT llamacpp-coordinator: added at the request of hyperparam (seq 59) so the measured follow-up does not evaporate; 1 of 1 checks fail today, as they should: no test matching inkling-kquant-jrule is registered. The spec judge lands as a dedicated tests/ file; test-backend-ops.cpp stays out of this row.',
 ]
