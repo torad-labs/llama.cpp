@@ -447,8 +447,153 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
     return max_size;
 }
 
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+
+// The graph allocator sizes every node through this buffer type before any of them is placed in a
+// meta buffer, so their split states are still unresolved then and the sizing saw only whole
+// tensors: each rank's slot carried the slices of the others along the split axis. A 128-query
+// case on four ranks reserved about 2.28x what the same case reserves unsplit, per rank
+// (docs/torad/research/inkling-2-small/13-batched-serving-results.md). During a reserve pass the
+// states resolve through the very same op rules the runtime walk uses, over a provisional
+// zero-sized buffer that carries the caches: its context never serves compute, so nothing reads
+// those entries but later passes, where the cached headers decide staleness just as at runtime.
+//
+// GGML_META_MERGED_RESERVE_LEGACY=1 keeps the merged-width sizing.
+
+// defined once ggml_backend_meta_buffer_context is
+static void ggml_backend_meta_measure_cache_bound(ggml_backend_buffer_t prov);
+
+// One provisional buffer per buffer type, shared by the reserve passes: measuring happens under a
+// mutex, and a pass holds it while it walks. The buffers hold nothing of the graphs; only their
+// contexts keep the measure-time split caches. They live as long as they are needed and more than
+// one process exit order would predict is fine at this size.
+static ggml_backend_buffer_t ggml_backend_meta_measure_buffer(ggml_backend_buffer_type_t buft) {
+    static std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_ptr> * const buffers = new std::map<
+        ggml_backend_buffer_type_t, ggml_backend_buffer_ptr>();
+    const auto it = buffers->find(buft);
+    if (it != buffers->end()) { return it->second.get(); }
+    // A small non-zero size keeps every backend's zero-size allocation paths out of the picture.
+    ggml_backend_buffer_ptr prov(ggml_backend_buft_alloc_buffer(buft, 4096));
+    GGML_ASSERT(prov);
+    ggml_backend_buffer_set_usage(prov.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    return buffers->emplace(buft, std::move(prov)).first->second.get();
+}
+
+namespace {
+
+// Attaches the provisional buffer to a tensor and, before the walk descends there, to every
+// unbuffered tensor its states depend on: sources, views included. Everything attached goes back in
+// reverse order when the measure ends, so placement never sees a node carrying a buffer ahead of
+// time. The attachment itself marks what was visited, which also walks cycles safely.
+class ggml_meta_measure_attach {
+    ggml_backend_buffer_t                                        prov;
+    std::vector<std::pair<ggml_tensor *, ggml_backend_buffer_t>> attached;
+
+public:
+    explicit ggml_meta_measure_attach(const ggml_tensor * root, ggml_backend_buffer_t prov_) : prov(prov_) {
+        std::vector<ggml_tensor *> stack = {(ggml_tensor *) root};
+        while (!stack.empty()) {
+            ggml_tensor * t = stack.back();
+            stack.pop_back();
+            if (!t || t->buffer) { continue; }
+            attached.push_back({t, nullptr}); // prev is null: only unbuffered tensors arrive here
+            t->buffer = prov;
+            for (int i = 0; i < GGML_MAX_SRC && t->src[i]; ++i) {
+                stack.push_back(t->src[i]);
+            }
+            if (t->view_src) {
+                stack.push_back((ggml_tensor *) t->view_src); // const-cast through the header's own type
+            }
+        }
+    }
+
+    ~ggml_meta_measure_attach() {
+        while (!attached.empty()) {
+            auto & entry = attached.back();
+            entry.first->buffer = entry.second;
+            attached.pop_back();
+        }
+    }
+};
+
+} // namespace
+
+// The split state of an unbuffered tensor, resolved the way the runtime resolves it once tensors
+// are placed. States stay cached in the provisional context, keyed by pointer and a snapshot of
+// the tensor, so a rebuilt graph's new tensors miss them and a reused tensor whose bytes changed
+// invalidates its own entry.
+static struct ggml_backend_meta_split_state ggml_backend_meta_measure_split(
+        ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    static std::mutex measure_mutex;
+    std::lock_guard<std::mutex> lock(measure_mutex);
+
+    ggml_backend_buffer_t prov = ggml_backend_meta_measure_buffer(buft);
+    ggml_meta_measure_attach attach(tensor, prov);
+    const ggml_backend_meta_split_state state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true);
+
+    // A long serving life rebuilds many graphs over one process: bound the measure cache like any
+    // cache that no reset knows about. Headers keep later passes honest after this.
+    ggml_backend_meta_measure_cache_bound(prov);
+    return state;
+}
+
+// Whether sizing this op from its slice geometry stays correct at every simple backend today:
+// ops whose backends add scratch that reads source shapes keep their merged-width reserve, and so
+// does a pad, which gathers whatever it pads over.
+static bool ggml_backend_meta_alloc_size_may_shard(const ggml_tensor * tensor) {
+    switch (tensor->op) {
+        case GGML_OP_FLASH_ATTN_EXT:      // f16 staging and rel-prefill partials read K/V/Q shapes
+        case GGML_OP_FLASH_ATTN_EXT_SPARSE:
+        case GGML_OP_GATED_DELTA_NET:     // the chunked prefill scratch reads the ubatch rows
+        case GGML_OP_PAD:                 // a pad over a split gathers: each device writes the whole extent
+        case GGML_OP_TOP_K_CANDIDATES:    // candidates write padding beside their slices
+            return false;
+        default:
+            return true;
+    }
+}
+
 static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    static const bool legacy = ggml_env_switch("GGML_META_MERGED_RESERVE_LEGACY");
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+
+    // A tensor placed outside this pass (a weight, an input with storage, or one mid-placement)
+    // sizes as it always did; so does anything whose slice geometry would not be smaller.
+    if (!legacy && !tensor->buffer && !tensor->view_src && tensor->data == nullptr &&
+            ggml_backend_meta_alloc_size_may_shard(tensor)) {
+        const ggml_backend_meta_split_state state = ggml_backend_meta_measure_split(buft, tensor);
+        if (state.axis >= 0 && state.axis < GGML_MAX_DIMS) {
+            const int split_dim = state.axis;
+            GGML_ASSERT(state.n_segments <= 16);
+            size_t max_alloc_size = 0;
+            for (size_t i = 0; i < n_simple_bufts; i++) {
+                // The slice of rank i along the split axis, with the strides its placement will
+                // carry: a dim ordered outside the split one scales by the same ratio
+                // ggml_backend_meta_buffer_make_simple_tensors applies.
+                int64_t ne_shard = 0;
+                for (size_t s = 0; s < state.n_segments; ++s) {
+                    ne_shard += state.ne[s*n_simple_bufts + i] * state.nr[s];
+                }
+                ggml_tensor shard = *tensor;
+                shard.buffer   = nullptr;
+                shard.view_src = nullptr;
+                shard.data     = nullptr;
+                // strides read the original tensor's, and scale by multiplication before division
+                shard.ne[split_dim] = ne_shard;
+                for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+                    shard.nb[k] = tensor->nb[k];
+                    if (tensor->nb[k] > tensor->nb[split_dim] ||
+                            (tensor->nb[k] == tensor->nb[split_dim] && k > split_dim)) {
+                        shard.nb[k] = tensor->nb[k] * ne_shard / tensor->ne[split_dim];
+                    }
+                }
+                const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), &shard);
+                max_alloc_size = std::max(max_alloc_size, alloc_size);
+            }
+            return max_alloc_size;
+        }
+    }
+
     size_t max_alloc_size = 0;
     for (size_t i = 0; i < n_simple_bufts; i++) {
         const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);
@@ -629,6 +774,16 @@ struct ggml_backend_meta_buffer_context {
         return it != initialized.end() ? &it->second.simple_tensors : nullptr;
     }
 };
+
+// Bounds the measure-time split-state cache of a provisional buffer: a long serving life rebuilds
+// many graphs over one process, and no reset knows about this cache. Headers keep later passes
+// honest after it clears.
+static void ggml_backend_meta_measure_cache_bound(ggml_backend_buffer_t prov) {
+    auto * ctx = (ggml_backend_meta_buffer_context *) prov->context;
+    if (!ctx->alias && ctx->split_state_cache.size() > 65536) {
+        ctx->split_state_cache.clear();
+    }
+}
 
 static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));

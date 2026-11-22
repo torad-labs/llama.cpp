@@ -860,6 +860,10 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-backend-meta-sourceless.cpp)
     llama_build_and_test(test-backend-meta-sampler.cpp)
     llama_build_and_test(test-backend-meta-capacity.cpp)
+    # each rank's compute buffer sized from its slice and not the merged tensor: both sizings run,
+    # one mode a process
+    llama_build_and_test(test-backend-meta-reserve.cpp)
+    llama_test(test-backend-meta-reserve NAME test-backend-meta-reserve-merged ARGS --legacy)
     llama_build_and_test(test-backend-meta-allreduce-copy.cpp)
     if (GGML_CUDA)
         # four ranks on the first GPUs, each reduction past the LL to owners and gathered from them
