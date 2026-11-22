@@ -765,4 +765,53 @@ checks = [
 ]
 notes = [
   '2026-11-22 03:11 CT: added; 1 of 1 checks fail, as they should before the work',
+  "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: the matmul arithmetic is settled (exact +-1 entries, fp32 accumulate). The row fails only if bf16 input rounding changes the quantized result past the quality bar, or the basis read at 23 rows (about 2.6 MB a seam) costs more than the butterfly it replaces. Measure only those two.",
+]
+
+[[row]]
+id = 'inkling-route-gating'
+title = 'Prompt-graph steps touch only the experts their tokens route to'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22 build order from Marcos relayed by chat-inkling (doc 21 fold census 1): route-aware expert gating on prompt-graph steps, up to about 73% dead expert work eliminated on prompt-heavy steps. On a multi-token step, gate the expert chain and epilogue by the route census so an expert tile with no routed rows is skipped, which is exact. Territory: the MoE chain and epilogue (moe-fuse.cu, fuse-moe.cu), owner the ink-fusions lane. A test named inkling-route-gate compares the gated step against dense execution at Inkling shapes (prompt and decode row counts, 384 experts top-8) and test-llama-archs stays green. Switch default off until this row's measurement exists; GLM 5.3 stays green."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-route-gate | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-route-gate --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-22 03:14 CT: added; 1 of 1 checks fail, as they should before the work',
+  "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: skipping an expert with zero routed rows removes work, so speed needs no arm. The row fails only if (a) the census and gate overhead at 23 decode rows exceeds the saved work, or (b) an empty-set claim is ever wrong, which is the correctness test's job. Measure only (a).",
+]
+
+[[row]]
+id = 'inkling-prefill-delta-uploads'
+title = 'Prefill uploads only the cells that changed'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = '2026-11-22 build order from Marcos relayed by chat-inkling (doc 21 / tensor-4 implementation report): prefill and decode replace per-microbatch host writes of the 6.85 MB position array and the mask with dirty-range delta uploads, and the small uploads are batched; the report prices the input uploads at about 2.6 ms a step. Exactness: only cells whose contents changed are uploaded, and a test named inkling-delta-upload compares the uploaded buffers against the full-write path across multi-sequence, SWA, shared-row and dspark shapes. Owner: the inkling prefill lane. No host tensor copies beyond one range (host-memory law). Build and test on the rented 5090s, never the four-card boxes.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-delta-upload | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-delta-upload --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-22 03:14 CT: added; 1 of 1 checks fail, as they should before the work',
+  "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: uploading fewer bytes is less work, so no speed arm. The row fails only if the dirty-range bookkeeping costs more than the bytes saved at small deltas, or a stale range goes un-uploaded (the test's job). Measure only the bookkeeping cost.",
+]
+
+[[row]]
+id = 'inkling-router-swizzle-bake'
+title = 'The router reads a basis baked at load time'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22 build order from Marcos relayed by chat-inkling (doc 21): the router's inputs carry 8-25 effective dimensions by participation ratio, so bake a swizzle or PCA basis into the router weights at load time, once, and have the runtime read the already-rotated basis. Quality gate: identical top-8 routing on a calibration set where the basis is exact, and the arch fixture's greedy chains where it is not; a measured win decides. If the router product sits on a shared path, copy an Inkling-specific version or put the change behind a default-off switch so GLM 5.3 stays green. Owner: ink-capture/graph lane, but src/models/inkling2.cpp currently carries the prefill lane's unstaged D1 hunks, so coordinate with inkling-small before editing it. A test named inkling-router-bake judges the baked basis against the load-time reference."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-router-bake | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-router-bake --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-22 03:14 CT: added; 1 of 1 checks fail, as they should before the work',
+  "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: this one genuinely needs its gate, because truncating the basis can reorder top-8 routes. The plausible failure is quality; the parity test is the experiment, and no separate speed arm is needed since fewer effective dims is less work.",
 ]
