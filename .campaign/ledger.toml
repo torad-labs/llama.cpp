@@ -595,12 +595,13 @@ status = 'todo'
 owner = ''
 blocked_by = []
 guard = false
-spec = "Marcos, 2026-11-22: dequantize at the tensor-core seams and requantize activations there, for memory management and compute together. Operands stay in their stored quantized form (weights, KV) and are converted to the MMA fragment form inside the tile/kernel that consumes them, never through a separate dequant pass or a materialized intermediate; an activation read by several products keeps one requantized form reused across them. This is a design law, not an experiment: no per-change speed A/B - correctness is the gate here, and speed is judged once on four cards at integration. Exactness: bit-identical where the arithmetic allows, otherwise the rounding is named on the row. Ships behind a switch that restores the old path until its parity proof lands, then defaults on per the shared-code law."
+spec = 'Marcos, 2026-11-22: dequantize at the tensor-core seams and requantize activations there, for memory management and compute together. Operands stay in their stored quantized form (weights, KV) and are converted to the MMA fragment form inside the tile/kernel that consumes them, never through a separate dequant pass or a materialized intermediate; an activation read by several products keeps one requantized form reused across them. This is a design law, not an experiment: no per-change speed A/B - correctness is the gate here, and speed is judged once on four cards at integration. Exactness: bit-identical where the arithmetic allows, otherwise the rounding is named on the row. Ships behind a switch that restores the old path until its parity proof lands, then defaults on per the shared-code law.'
 checks = [
   'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-seam | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-seam --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
 ]
 notes = [
-  "2026-11-22 02:00 CT llamacpp-coordinator: added by hand edit (campaign add would build the tree on torad-server). Direction from Marcos: the seam conversion is math, it removes work, so it needs no A/B; correctness checks gate it and the four-card integration run supplies the numbers once. Existing mechanisms it builds on: staged tile decode of q8_0/V (fattn-rel-elem, kv-onebyte row), the few-row shared q8_1 activation quantize (one form reused per input), and the fusion rows that cut the number of seams.",
+  '2026-11-22 02:00 CT llamacpp-coordinator: added by hand edit (campaign add would build the tree on torad-server). Direction from Marcos: the seam conversion is math, it removes work, so it needs no A/B; correctness checks gate it and the four-card integration run supplies the numbers once. Existing mechanisms it builds on: staged tile decode of q8_0/V (fattn-rel-elem, kv-onebyte row), the few-row shared q8_1 activation quantize (one form reused per input), and the fusion rows that cut the number of seams.',
+  '2026-11-22 01:53 CT: 2026-11-22 02:05 CT llamacpp-coordinator: evidence basis recorded from Marcos: this is not a hypothesis. The same approach is already proven in production - GLM and Bonsai improved inference time hugely with it, and quantizing activations for Bonsai gave an insane throughput boost without losing quality. A/B is therefore reserved for cases of genuine uncertainty or loose relation; for this row the gate is correctness, and speed is confirmed once at integration.',
 ]
 
 [[row]]
@@ -634,4 +635,22 @@ checks = [
 ]
 notes = [
   '2026-11-22 00:52 CT: added as a guard; its checks pass',
+]
+
+[[row]]
+id = 'search-methods-upgrades'
+title = 'The search upgrades its method: workload depth, knob screening, model selection, noise, ledger evidence, kernel sweeps'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Marcos asked the hyperparam seat for all six search-method upgrades from the research table: (1) workload-depth worst-case trials, (2) knob screening before full sweeps, (3) model-based selection of the next trial, (4) noise repeats with min-aggregation, (5) ledger-evidence feedback into the search, (6) offline kernel-constant sweeps. Each upgrade is its own new file under scripts/inkling2 (search_workload.py, search_noise.py, search_screen.py, search_model.py, search_evidence.py) or scripts/hyperparameter (kernel_sweep.py), each with its own tests; nobody edits scripts/inkling2/search.py or any tracked file except the hyperparam seat, once, in its integration commit after all six report and are staged by name. An independent eli review on max effort follows integration. Kernel-constant sweeps verify on the rented CloudRift 5090s per the box policy; no four-card window is spent on them. The checks fail today because the modules do not exist yet.'
+checks = [
+  'cd scripts/inkling2 && python3 -B -c "import search_workload, search_noise, search_screen, search_model, search_evidence"',
+  'cd scripts/inkling2 && python3 -B -m unittest search_workload search_noise search_screen search_model search_evidence',
+  'cd scripts/hyperparameter && python3 -B -m unittest kernel_sweep',
+  'cd scripts/inkling2 && python3 -B -m unittest test_search',
+]
+notes = [
+  '2026-11-22 01:53 CT: added; 3 of 4 checks fail, as they should before the work',
 ]
