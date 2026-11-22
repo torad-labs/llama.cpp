@@ -64,12 +64,16 @@ def _gguf_value(v) -> bytes:
     return struct.pack("<IIQ", 9, 6, len(v)) + struct.pack(f"<{len(v)}f", *v)
 
 
-def write_gguf(path: str, kv: dict, tensors: dict) -> None:
-    """A GGUF v3 file of F32 tensors (the gguf package needs PyYAML, which the test venv does not carry)."""
+def write_gguf(path: str, kv: dict, tensors: dict, raw_kv: list | None = None) -> None:
+    """A GGUF v3 file of F32 tensors (the gguf package needs PyYAML, which the test venv does not carry). raw_kv: key
+    and value entries as another GGUF holds them (read_gguf), and a bytes value in kv is written as its typed value."""
     align = 32
-    out = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv)))
+    raw_kv = raw_kv or []
+    out = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv) + len(raw_kv)))
     for key, v in kv.items():
-        out += struct.pack("<Q", len(key)) + key.encode() + _gguf_value(v)
+        out += struct.pack("<Q", len(key)) + key.encode() + (v if isinstance(v, bytes) else _gguf_value(v))
+    for entry in raw_kv:
+        out += entry
     offset, blobs = 0, []
     for name, t in tensors.items():
         t = np.ascontiguousarray(t, dtype=np.float32)
@@ -83,6 +87,110 @@ def write_gguf(path: str, kv: dict, tensors: dict) -> None:
         f.write(bytes(out))
         for blob in blobs:
             f.write(blob)
+
+
+def read_gguf(path: str) -> tuple[dict, dict]:
+    """A GGUF's key-value entries as the file holds them (key, type and value bytes, by key) and its F32 tensors."""
+    sizes = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+    with open(path, "rb") as f:
+        data = f.read()
+    pos = 4
+
+    def rd(fmt):
+        nonlocal pos
+        v = struct.unpack_from("<" + fmt, data, pos)[0]
+        pos += struct.calcsize("<" + fmt)
+        return v
+
+    def skip(t):
+        nonlocal pos
+        if t == 8:
+            n = rd("Q")
+            pos += n
+        elif t == 9:
+            et, n = rd("I"), rd("Q")
+            for _ in range(n):
+                skip(et)
+        else:
+            pos += struct.calcsize("<" + sizes[t])
+    assert data[:4] == b"GGUF"
+    rd("I")
+    n_tensors, n_kv = rd("Q"), rd("Q")
+    kv, align = {}, 32
+    for _ in range(n_kv):
+        start = pos
+        n = rd("Q")
+        name = data[pos:pos + n].decode()
+        pos += n
+        t = rd("I")
+        if name == "general.alignment":
+            align = struct.unpack_from("<I", data, pos)[0]
+        skip(t)
+        kv[name] = data[start:pos]
+    infos = []
+    for _ in range(n_tensors):
+        n = rd("Q")
+        name = data[pos:pos + n].decode()
+        pos += n
+        shape = [rd("Q") for _ in range(rd("I"))]
+        infos.append((name, shape, rd("I"), rd("Q")))
+    pos += -pos % align
+    tensors = {}
+    for name, shape, kind, offset in infos:
+        if kind == 0:
+            tensors[name] = np.frombuffer(data, np.float32, int(np.prod(shape)), pos + offset).reshape(shape[::-1])
+    return kv, tensors
+
+
+def write_dspark_draft(path: str, target: str, seed: int = 4558) -> None:
+    """An Inkling DSpark draft for the inkling2 target, laid out as the drafter kit's rehearsal fixture: two layers,
+    four heads 32 wide, a Markov head of rank 8 and a block of 8, with the target's tokenizer, embeddings and LM head.
+    Its weights are random, so it agrees with the target no more than chance does."""
+    kv_t, t_t = read_gguf(target)
+    width = read_u32(target, "inkling2.embedding_length")
+    layers = read_u32(target, "inkling2.block_count")
+    padded = read_u32(target, "inkling2.vocab_size")
+    vocab = read_u32(target, "inkling2.vocab_size_unpadded")
+    heads, kv_heads, dim, ff, rank = 4, 2, 32, 64, 8
+    kv = {
+        "general.architecture": "dflash", "dflash.context_length": 512, "dflash.embedding_length": width,
+        "dflash.feed_forward_length": ff, "dflash.block_count": 2, "dflash.attention.head_count": heads,
+        "dflash.attention.head_count_kv": kv_heads, "dflash.attention.key_length": dim,
+        "dflash.attention.value_length": dim, "dflash.rope.dimension_count": dim, "dflash.rope.freq_base": 10000.0,
+        "dflash.attention.layer_norm_rms_epsilon": 1e-5, "dflash.vocab_size": padded,
+        "dflash.vocab_size_unpadded": vocab, "dflash.block_size": 8,
+        "dflash.target_layers": struct.pack("<IIQ2i", 9, 5, 2, 0, layers),
+        "dflash.dspark.markov_rank": rank, "dflash.sample_from_anchor": False,
+        "dflash.has_confidence_head": False, "dflash.attention.causal": False, "dflash.attention.sliding_window": 32,
+        "dflash.attention.sliding_window_pattern": struct.pack("<IIQ2?", 9, 7, 2, True, False),
+        "dflash.final_logit_softcapping": 30.0, "tokenizer.ggml.mask_token_id": 0,
+    }
+    raw = [v for k, v in kv_t.items() if k.startswith("tokenizer.") and k != "tokenizer.ggml.mask_token_id"]
+    rng = np.random.default_rng(seed)
+
+    def w(*shape):
+        return rng.normal(0.0, 0.035, shape)
+    tensors = {name: t_t[name] for name in ("token_embd.weight", "token_embd_norm.weight", "output.weight") if name in t_t}
+    tensors.update({
+        "dspark_fuse.weight": rng.normal(0.0, 0.05, (3, 2)), "dspark_norm.weight": np.ones(width),
+        "output_norm.weight": np.ones(width), "mask_embd.weight": w(width), "markov_w1.weight": w(padded, rank),
+        "joint_proj.weight": w(3*rank, 2*(rank + width)), "joint_proj.bias": w(3*rank),
+        "dspark_hidden_out.weight": w(width, rank), "dspark_hidden_out.bias": w(width),
+    })
+    for layer in range(2):
+        p = f"blk.{layer}."
+        for name in ("attn_norm", "ffn_norm", "dflare_norm"):
+            tensors[p + name + ".weight"] = np.ones(width)
+        for name in ("attn_q_norm", "attn_k_norm", "attn_k_ctx_norm"):
+            tensors[p + name + ".weight"] = np.ones(dim)
+        for name in ("attn_k", "attn_v", "attn_k_ctx", "attn_v_ctx"):
+            tensors[p + name + ".weight"] = w(kv_heads*dim, width)
+        tensors[p + "attn_q.weight"] = w(heads*dim, width)
+        tensors[p + "attn_output.weight"] = w(width, heads*dim)
+        tensors[p + "ffn_gate.weight"] = w(ff, width)
+        tensors[p + "ffn_up.weight"] = w(ff, width)
+        tensors[p + "ffn_down.weight"] = w(width, ff)
+    write_gguf(path, kv, tensors, raw)
 
 
 def write_mmproj(path: str, text_embd: int, seed: int = 1) -> int:

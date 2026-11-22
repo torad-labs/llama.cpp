@@ -7106,6 +7106,65 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Inkling 2's dense projections on one card of tensor-4 (Q3_K_M pack), n rows, over `layers` layers of their own weights,
+// so the weights come from DRAM and not from L2 (16 layers are 186 MB, 12 with the router 225 MB): q, gate, k, r, sink and
+// the global layers' two conv taps in Q3_K, v in Q4_K, wo in Q4_K, the router in F32. Perf only: the time is the graph's.
+struct test_inkling2_dense : public test_case {
+    const int64_t n;
+    const int layers;
+    const bool router;
+    std::vector<ggml_tensor *> first;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_DENSE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, layers, router);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    std::vector<ggml_tensor *> forward_first() override { return first; }
+
+    test_inkling2_dense(int64_t n = 23, int layers = 16, bool router = false) : n(n), layers(layers), router(router) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        first.clear();
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4608, n);
+        ggml_tensor * o = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1536, n);
+        ggml_tensor * out = nullptr;
+        auto mm = [&](ggml_type type, int64_t m, ggml_tensor * b) {
+            if (out) {
+                first.push_back(out);
+            }
+            out = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_weights, type, b->ne[0], m), b);
+        };
+        for (int il = 0; il < layers; ++il) {
+            mm(GGML_TYPE_Q3_K, 1536, x); // q
+            mm(GGML_TYPE_Q3_K,  256, x); // k
+            mm(GGML_TYPE_Q4_K,  256, x); // v
+            if (il % 6 == 5) {
+                mm(GGML_TYPE_Q3_K, 8, x); // k conv taps
+                mm(GGML_TYPE_Q3_K, 8, x); // v conv taps
+            }
+            mm(GGML_TYPE_Q3_K,  192, x); // r
+            mm(GGML_TYPE_Q3_K,   12, x); // sink
+            mm(GGML_TYPE_Q3_K, 1536, x); // gate
+            mm(GGML_TYPE_Q4_K, 4608, o); // wo
+            if (router) {
+                mm(GGML_TYPE_F32, 384, x);
+            }
+        }
+        return out;
+    }
+};
+
 // The packed Q8 draft head, with persistent weights as in the model.
 struct test_glm_q8_head : public test_mul_mat {
     test_glm_q8_head(int64_t rows, int64_t columns)
@@ -7747,6 +7806,9 @@ struct test_mul_mat_id_partition : public test_mul_mat_id {
 
     void initialize_tensors(ggml_context * ctx) override {
         test_mul_mat_id::initialize_tensors(ctx);
+        if (routing == 3) {
+            return; // the random routes of every MUL_MAT_ID case, a token's experts distinct
+        }
         ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
         std::vector<int32_t> values(n_mats*n);
         for (int64_t row = 0; row < n; ++row) {
@@ -12058,12 +12120,15 @@ struct test_flash_attn_ext_rel_pos : public test_case {
     const int64_t run; // cells in each run a row owns when n_kv_max bounds it: 1 as decode lays a pool out
     const bool low_mean; // ggml_flash_attn_ext_set_low_mean_mask, a hint only: the first row reads the pool, the others a run each
     const int group;     // ggml_flash_attn_ext_set_query_group, a hint only: runs of rows that read each cell once together
+    // the cells the first row's session holds, spread over the pool in runs; the other runs go in turn to 22 more sessions
+    // (23 as served), whose own the step's other rows see while the rest sit idle. 0: the layouts above
+    const int64_t lead;
     const int64_t shared; // when set, every row reads these first cells and then its own runs, as sessions that share a prompt
 
     std::string vars() override {
         const std::string base = VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_dist, type_KV, sinks, mask_bits, query_sinks, n_kv_max);
         return (run == 16 ? base : base + "," + VAR_TO_STR(run)) + (low_mean ? "," + VAR_TO_STR(low_mean) : "") +
-            (group ? "," + VAR_TO_STR(group) : "") + (shared ? "," + VAR_TO_STR(shared) : "");
+            (group ? "," + VAR_TO_STR(group) : "") + (lead ? "," + VAR_TO_STR(lead) : "") + (shared ? "," + VAR_TO_STR(shared) : "");
     }
 
     double max_nmse_err() override {
@@ -12073,10 +12138,12 @@ struct test_flash_attn_ext_rel_pos : public test_case {
     test_flash_attn_ext_rel_pos(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 6, int64_t kv = 2048, int64_t nb = 32,
                                 int64_t n_stream = 1, int64_t n_dist = 1025, ggml_type type_KV = GGML_TYPE_F16, bool sinks = true,
                                 bool mask_bits = false, bool query_sinks = false, int n_kv_max = 0, int64_t run = 16,
-                                bool low_mean = false, int group = 0, int64_t shared = 0)
+                                bool low_mean = false, int group = 0, int64_t lead = 0, int64_t shared = 0)
         : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_dist(n_dist), type_KV(type_KV), sinks(sinks),
           mask_bits(mask_bits), query_sinks(query_sinks), n_kv_max(n_kv_max), run(run), low_mean(low_mean), group(group),
-          shared(shared) {}
+          lead(lead), shared(shared) {
+        GGML_ASSERT(!lead || !shared);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -12140,6 +12207,12 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                 // causal over the cells' positions, empty cells hidden; every row sees the cells before it
                 // Written a row at a time: a pool of millions of cells never has its whole mask as floats.
                 std::vector<float> f(kv);
+                // with a lead, the session of each run: the lead's runs evenly over the pool, the others' in turn
+                const int64_t n_runs = (kv + run - 1)/run, n_lead = lead/run, n_sessions = std::max<int64_t>(23, group ? nb/group : nb);
+                std::vector<int32_t> owner(lead ? n_runs : 0);
+                for (int64_t r = 0, other = 0; r < int64_t(owner.size()); ++r) {
+                    owner[r] = (r + 1)*n_lead/n_runs > r*n_lead/n_runs ? 0 : int32_t(1 + other++ % (n_sessions - 1));
+                }
                 const size_t row_bytes = ggml_nbytes(t)/(nb*n_stream);
                 for (int64_t s = 0; s < n_stream; ++s) {
                     for (int64_t i = 0; i < nb; ++i) {
@@ -12152,7 +12225,8 @@ struct test_flash_attn_ext_rel_pos : public test_case {
                             // with a query group the runs are a sequence's, shared by its rows as a token's and its drafts'
                             const int64_t seq = group ? i/group : i, n_seq = group ? nb/group : nb;
                             const int64_t head = shared ? shared : 16, own = shared ? j - shared : j;
-                            const bool owned = !runs || ((shared || i + 1 < nb) && (j < head || (own/run)%n_seq == seq));
+                            const bool owned = lead ? j < 16 || owner[j/run] == seq :
+                                    !runs || ((shared || i + 1 < nb) && (j < head || (own/run)%n_seq == seq));
                             const bool seen = owned && c >= 0 && c <= queries[s*nb + i] && (!n_kv_max || live < n_kv_max);
                             f[j] = seen ? 0.0f : -INFINITY;
                             live += seen;
@@ -14289,6 +14363,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // and at their real widths, the 23 rows whose routes GGML_CUDA_MMVQ_EXPERT_SORT_23 sorts: gate and up 4,608 to 4,608,
+    // down 2,304 to 4,608
+    test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_Q3_K, true,  23, 288, 384, 8, 96, 4608, 4608, false, 3));
+    test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_Q4_K, false, 23, 288, 384, 8, 96, 4608, 2304, false, 3));
     for (int local : {72, 144}) {
         test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, 512, 288 - local, 288, 8, local, 2048, 4096));
         test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, false, 512, 0, 288, 8, local, 4096, 2048));
@@ -15689,6 +15767,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_short_conv(258, 513, 2, 3));
     test_cases.emplace_back(new test_short_conv_window(66, 1, 23, 0, false));
     test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true));
+    test_cases.emplace_back(new test_short_conv_window(4608, 1, 23, 0, false)); // a hidden stream whole, as -sm tensor convolves it
     test_cases.emplace_back(new test_short_conv_window(256, 5, 3, 2, false));
     test_cases.emplace_back(new test_short_conv_window(257, 16, 2, 0, true));
     // past the fused kernel's token cap: the plain CONCAT + SHORT_CONV chain
@@ -15950,6 +16029,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+
+    // Inkling 2's dense projections, one card's slice under tensor-4, at decode widths: q and gate 1536 rows, k 256, r 192,
+    // sink 12 and the conv taps 8 (Q3_K), v 256 (Q4_K, Q5_K in layers 0-1), wo 4608 rows of a 1536 slice (Q4_K)
+    for (int64_t n : {9, 16, 23, 32}) {
+        for (int64_t m : {1536, 256, 192, 12, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  256, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  256, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4608, n, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        // a cluster's blocks split K of channels too, broadcast ones among them, and of a partial row tile
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 40, n, 4608, {2, 3}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, 40, n, 4608, {2, 1}, {2, 2}));
+    }
 
     // small K at batch > 8, e.g. LoRA B matrices with K = rank
     for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -16522,6 +16615,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 1, 23, 32 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true,  1024, n, 4608));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, n, 512));
+    }
+    // and as four cards split them evenly when down is in blocks of 32: 576 = 9 x 64 of the hidden width each, gate and
+    // up in 1,152 rows, down from 576, at one session, the 23 served and a drafted step's 92
+    for (int n : { 1, 23, 92 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 1152, n, 4608));
+        for (ggml_type down : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(down, GGML_TYPE_F32, 384, 8, false, 4608, n, 576));
+        }
     }
     // past the ring's 8 tokens (8 tokens x 8 used is its 64 pairs): 9 to 16 go to mmvq.cu's mul_mat_vec_q_moe, a warp a
     // token, and 17 to MMQ. 3 slots at an MTP verify of 3 are 9 tokens, 4 slots 12
@@ -17567,11 +17668,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 65536, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 8192, run));
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192 + 5*32, 23, 1, 32, GGML_TYPE_F16, true, true, true, 1024, 1));
-    // a sequence's token and its drafts read each cell once: 23 sessions at depths 1, 2 and 3 in a pool of 8,192 and one of
-    // 65,536 cells (three query heads a block), and 8 sessions whose runs are a cell wide
-    for (int group : {2, 3, 4}) {
+    // a sequence's token and its drafts read each cell once: 23 sessions at depths 0 to 3 in pools of 8,192, 65,536 and
+    // 262,144 cells, and 8 sessions whose runs are a cell wide
+    for (int group : {1, 2, 3, 4}) {
         for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
-            for (int64_t kv : {8192, 65536}) {
+            for (int64_t kv : {8192, 65536, 262144}) {
                 test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 23*group, 1, 1025, type, true, true, true, kv/8, 16, false, group));
             }
             test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192, 8*group, 1, 32, type, true, true, true, 1024, 1, false, group));
@@ -17579,6 +17680,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t gqa : {2, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, gqa, 8192, 8, 1, 32, GGML_TYPE_F16, true, true, true, 1024));
+        // a group's rows times query heads in 8 to 32 columns
+        for (int group : {2, 3, 4}) {
+            for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, gqa, 8192, 8*group, 1, 32, type, true, true, true, 1024, 1, false, group));
+            }
+        }
     }
     // a low-mean step: one session reads the whole pool and the others their own cells, so the hint alone routes it, at
     // the shape as served and at rows and pools the model's knobs can pick (LLAMA_INKLING2_MEAN_ROWS, _MEAN_POOL_MIN)
@@ -17586,14 +17693,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t kv : {8192, 65536}) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 16, 1, 1025, GGML_TYPE_F16, true, true, true, 0, 1, true));
     }
+    // a decode step at any row count reads only its rows' cells (LLAMA_INKLING2_DECODE_POOL_READS): one session holding a
+    // quarter of the pool or most of it among 22 short ones, with 1 to 23 of them decoding or 1, 4 and 23 verifying a
+    // token and two drafts each; and rows under 8 that are each bounded to an eighth of the pool
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t kv : {65536, 262144}) {
+            for (int64_t lead : {kv/4, kv*7/8}) {
+                for (int64_t nb : {1, 4, 7, 8, 23}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, nb, 1, 1025, type, true, true, true, 0, 1, true, 0, lead));
+                }
+            }
+            for (int64_t nb : {1, 4, 23}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 3*nb, 1, 1025, type, true, true, true, 0, 1, true, 3, kv/4));
+            }
+            for (int64_t nb : {1, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, nb, 1, 1025, type, true, true, true, kv/8, 1, false, 0, kv/10));
+            }
+        }
+    }
+
     // the global layers' K/V at one byte a value (GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE) beside f16: 23 sessions that share
     // a prompt and own their cells one at a time or in runs of 512, in a low-mean step of 65,536 cells and of 262,144 (256
     // streams, as served), then the shapes f16 and q8_0 have above: bounded rows, drafts and 2 or 8 query heads a KV head
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_F8_E4M3}) {
         for (int64_t run : {1, 512}) {
-            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 65536, 23, 1, 1025, type, true, true, true, 0, run, true, 0, 16384));
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 65536, 23, 1, 1025, type, true, true, true, 0, run, true, 0, 0, 16384));
         }
-        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 262144, 23, 1, 1025, type, true, true, true, 0, 1, true, 0, 65536));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 262144, 23, 1, 1025, type, true, true, true, 0, 1, true, 0, 0, 65536));
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 8192, 23, 1, 32, GGML_TYPE_F8_E4M3, true, true, true, 1024));
     test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 65536, 23, 1, 1025, GGML_TYPE_F8_E4M3, true, true, true, 8192, 16));
@@ -18715,6 +18841,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the same two decode shapes behind their history CONCAT, which the perf run times as one graph
     test_cases.emplace_back(new test_short_conv_window(256, 1, 23, 2, false));
     test_cases.emplace_back(new test_short_conv_window(1152, 1, 23, 0, true));
+    // a hidden stream under -sm tensor on four cards: its whole 4,608 channels on every card after one all-reduce, against
+    // one card's 1,152 of a scattered shard (LLAMA_INKLING2_HIDDEN_CONV_LEGACY), at 23 rows and a drafted step's 4 a session
+    test_cases.emplace_back(new test_short_conv_window(4608, 1, 23, 0, false));
+    test_cases.emplace_back(new test_short_conv_window(1152, 4, 23, 0, true));
+    test_cases.emplace_back(new test_short_conv_window(4608, 4, 23, 0, false));
     // Inkling Q3_K_M, 23 decode rows. TP4 splits 2304 intermediate channels in blocks of 256, with gate and up packed together.
     for (int64_t n_ff : {512, 768}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 2*n_ff, 23, 4608));
@@ -18722,6 +18853,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(down, GGML_TYPE_F32, 384, 8, false, 4608, 23, n_ff));
         }
     }
+    // the dense projections of one card under tensor-4 (q/gate, k, r, sink, conv taps, v, wo, the F32 router) at 8 to 64
+    // decode rows: where the few-row MMQ hands over to MMQ (GGML_CUDA_MMQ_FEW_MAX_COLS)
+    for (int64_t n : {8, 9, 12, 16, 23, 24, 32, 40, 46, 64}) {
+        for (int64_t m : {1536, 256, 192, 12, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  256, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4608, n, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,  384, n, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+        // and all of them in a row over 16 layers, the weights read from DRAM
+        test_cases.emplace_back(new test_inkling2_dense(n, 16, false));
+    }
+    test_cases.emplace_back(new test_inkling2_dense(23, 12, true)); // the context holds 128 tensors
     // the same slices in a drafted step of 23 sessions at depths 1, 2 and 3 (46, 69 and 92 rows), past the row kernel's 32:
     // MUL_MAT_ID takes MMQ there, and the rows touch more of the 384 experts
     for (int64_t rows : {46, 69, 92}) {
@@ -18729,6 +18873,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 2*n_ff, rows, 4608));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, rows, n_ff));
         }
+    }
+    // the even split a down in blocks of 32 allows, 576 of the hidden width a card, and the split by expert (96 of the
+    // 384 whole on a card), at 23 rows and a drafted step's 92
+    for (int64_t rows : {23, 92}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true, 1152, rows, 4608));
+        for (ggml_type down : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(down, GGML_TYPE_F32, 384, 8, false, 4608, rows, 576));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_Q3_K, true, rows, 0, 384, 8, 96, 4608, 4608, false, 3));
+        test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_Q4_K, false, rows, 0, 384, 8, 96, 4608, 2304, false, 3));
     }
     // Inkling 2's routed experts at their real shapes (384 experts, 8 used, hidden 4,608 to intermediate 2,304 and back) in
     // Q4_K, past the ring's 8 rows, where MUL_MAT_ID chooses between mmvq.cu's row kernel and MMQ: run once as they are
@@ -18785,6 +18939,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {154880, nrows, 1, 1}, k));
         }
     }
+    // the Inkling 2 DSpark draft's sampled draw: a Markov step takes the k largest of each of 23 sessions' rows
+    for (int k : {32, 64, 128}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {201088, 23, 1, 1}, k));
+    }
 
     // GLM-5.3 Flash's KDA conv-state concat (24576 channels) on one data-parallel rank of 36 sessions over four: 9
     // sequences of a decode row or an MTP verify's 3, one plane each, and one sequence's for comparison
@@ -18825,6 +18983,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 3014656, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 1024, 1));
+    // 23 sessions of 16,384 cells each, plain (one row a session) and drafted at depth 3 (four rows a session): the
+    // global layers, F16 and q8_0, and a sliding layer's 1,024 cells a session
+    for (int group : {1, 4}) {
+        for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            for (int n_kv_max : {23*16384/8, 1024}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 23*16384, 23*group, 1, 1025, type, true, true, true, n_kv_max, 1, false, group));
+            }
+        }
+    }
     // and its low-mean step: one session reads the whole pool
     for (int64_t kv : { 262144, 3014656 }) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, kv, 23, 1, 1025, GGML_TYPE_F16, true, true, true, 0, 1, true));
@@ -18839,7 +19006,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // writes them or in runs of 512 as a prompt does, the cache in f16, q8_0 and f8_e4m3 (GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE)
     for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_F8_E4M3 }) {
         for (int64_t run : { 1, 512 }) {
-            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 196608 + 23*65536, 23, 1, 1025, type, true, true, true, 0, run, true, 0, 196608));
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 196608 + 23*65536, 23, 1, 1025, type, true, true, true, 0, run, true, 0, 0, 196608));
+        }
+    }
+    // a long session among short ones (G7: 199,967 of 853,574 cells, 23 sessions): 1, 4 and 23 of them decoding, and 23
+    // verifying a token and two drafts each, on either global layout, as a low-mean step and as the dense step that
+    // LLAMA_INKLING2_DECODE_CLASS_LEGACY=1 makes of it
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (bool low_mean : { false, true }) {
+            for (int64_t nb : { 1, 4, 23 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 860160, nb, 1, 1025, type, true, true, true, 0, 1, low_mean, 0, 200000));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 860160, 69, 1, 1025, type, true, true, true, 0, 1, low_mean, 3, 200000));
+        }
+        // and 1 or 4 sessions that each hold a tenth of it, bounded rows
+        for (int64_t nb : { 1, 4 }) {
+            for (int n_kv_max : { 0, 860160/8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 860160, nb, 1, 1025, type, true, true, true, n_kv_max, 1, false, 0, 86016));
+            }
         }
     }
 

@@ -75,7 +75,11 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     // no RoPE, the relative-position bias carries the positions
     hparams.rope_pattern.fill(false);
 
-    // the convolution state keeps K, V, the attention output and the FFN output of the widest layer
+    // The two hidden streams' convolution state is the S state, a row apart from K's and V's, so that -sm tensor can
+    // hold it whole on every card while K and V split by heads (llama_meta_device_get_split_state).
+    // LLAMA_INKLING2_HIDDEN_CONV_LEGACY=1: all four streams in one row, the hidden ones split by channel as K and V are
+    const bool hidden_apart = !ggml_env_switch("LLAMA_INKLING2_HIDDEN_CONV_LEGACY");
+    // the convolution state keeps K and V of the widest layer, and the attention output and the FFN output
     uint64_t n_channels_max = 0;
 
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
@@ -85,14 +89,16 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
             throw std::runtime_error("inkling2: invalid attention or expert dimensions");
         }
 
-        n_channels_max = std::max<uint64_t>(n_channels_max, 2ull * hparams.n_embd_k_gqa(il) + 2ull * hparams.n_embd);
+        n_channels_max = std::max<uint64_t>(n_channels_max, 2ull * hparams.n_embd_k_gqa(il) + (hidden_apart ? 0 : 2ull * hparams.n_embd));
     }
 
-    if (n_channels_max * (hparams.n_shortconv_l_cache - 1) > UINT32_MAX) {
+    const uint64_t hidden_channels = hidden_apart ? 2ull * hparams.n_embd : 0;
+    if (std::max(n_channels_max, hidden_channels) * (hparams.n_shortconv_l_cache - 1) > UINT32_MAX) {
         throw std::runtime_error("inkling2: convolution state is too large");
     }
 
     hparams.n_sconv_channels = n_channels_max;
+    hparams.n_sconv_hidden = hidden_channels;
 
     type = LLM_TYPE_UNKNOWN;
 }
@@ -187,8 +193,22 @@ static const inkling2_mask_shapes & mask_shapes() {
         (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_ROWS"),
         (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_POOL_MIN"),
         (uint32_t) ggml_env_int("LLAMA_INKLING2_MEAN_POOL_SHARE"),
+        (uint32_t) ggml_env_int("LLAMA_INKLING2_DECODE_POOL_READS"),
     };
     return shapes;
+}
+
+// without cparams.rel_decode_rows (LLAMA_INKLING2_DECODE_CLASS_LEGACY=1) a decode step of fewer than 8 rows, a drafted step
+// with a long sequence and a low mean anywhere but at LLAMA_INKLING2_MEAN_ROWS rows of F16 K/V
+// (LLAMA_INKLING2_MEAN_MASK_DECODE) are dense, as before
+template<typename Cells>
+static inkling2_decode_mask classify_decode(bool decode_rows, uint32_t pool, uint32_t n_rows, bool allow_mean, Cells cells) {
+    if (!decode_rows) {
+        auto shapes = mask_shapes();
+        shapes.rows_min = std::max<uint32_t>(shapes.rows_min, 8);
+        return inkling2_classify_decode_mask(pool, n_rows, allow_mean, cells, shapes);
+    }
+    return inkling2_classify_decode_rows(pool, n_rows, allow_mean, cells, mask_shapes());
 }
 
 // the positions the relative bias is looked up by, for the global cache (0) and the window cache (1): with the bias inside
@@ -202,6 +222,8 @@ public:
     uint32_t extent[2];
     inkling2_decode_mask mask_mode[2];
     bool mean_decode;
+    // LLAMA_INKLING2_MEAN_MASK_DECODE: the legacy low-mean shape is low-mean under the new classes too
+    bool mean_shape = false;
     // the runs of cells of the global cache (LLAMA_INKLING2_KV_RUNS), at most runs_max a row; 0 when off
     ggml_tensor * runs = nullptr;
     uint32_t runs_max = 0;
@@ -216,9 +238,10 @@ public:
         const ggml_type type = kv->type_k();
         const bool type_ok = type == kv->type_v() &&
                 (type == GGML_TYPE_F16 || (runs_one_byte && (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_F8_E4M3)));
+        // 8 rows or more, as the runs kernels are tested, though the mask classes now start at 1 row
         if (runs_max == 0 || !params.cparams.attn_mask_bits || !params.cparams.kv_unified || kv->is_full() || !type_ok ||
-                kv->get_n_kv() < 8192 ||
-                ub.n_tokens < mask_shapes().rows_min || ub.n_tokens > mask_shapes().rows_max || ub.n_tokens != ub.n_seqs_unq) {
+                kv->get_n_kv() < 8192 || ub.n_tokens < std::max<uint32_t>(mask_shapes().rows_min, 8) ||
+                ub.n_tokens > mask_shapes().rows_max || ub.n_tokens != ub.n_seqs_unq) {
             return false;
         }
         for (uint32_t row = 0; row < ub.n_tokens; ++row) {
@@ -233,6 +256,7 @@ public:
     inkling2_decode_mask classify_mask(const llm_graph_params & params, int i) const {
         const auto & ub = params.ubatch;
         const auto * kv = cache[i];
+        const bool decode_rows = params.cparams.rel_decode_rows;
         if (!params.cparams.attn_mask_bits || !params.cparams.kv_unified || kv->is_full()) {
             return inkling2_decode_mask::dense;
         }
@@ -261,18 +285,20 @@ public:
                     return inkling2_decode_mask::dense;
                 }
             }
-            return inkling2_classify_decode_mask(kv->get_n_kv(), ub.n_seqs_unq, false, [&](uint32_t s) {
+            return classify_decode(decode_rows, kv->get_n_kv(), ub.n_seqs_unq, mean_decode && decode_rows, [&](uint32_t s) {
                 const auto seq = ub.seq_id[s*per_seq][0];
                 return kv->get_kv()->get_cells(seq).seq_n_cells(seq);
-            }, mask_shapes());
+            });
         }
         if (ub.n_tokens != ub.n_seqs_unq) {
             return inkling2_decode_mask::dense;
         }
-        // the low-mean decode kernel reads f16, and q8_0 or f8_e4m3 with GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE
+        // the low-mean decode kernels read f16 and q8_0, and f8_e4m3 with GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE; the legacy
+        // shape is LLAMA_INKLING2_MEAN_ROWS rows of the global cache
         const ggml_type type = kv->type_k();
-        bool allow_mean = mean_decode && i == 0 && ub.n_tokens == mask_shapes().mean_rows && type == kv->type_v() &&
+        const bool legacy_shape = i == 0 && ub.n_tokens == mask_shapes().mean_rows && type == kv->type_v() &&
                 (type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_F8_E4M3);
+        bool allow_mean = mean_decode && (decode_rows || legacy_shape);
         if (allow_mean) {
             for (uint32_t row = 0; row < ub.n_tokens; ++row) {
                 if (ub.n_seq_id[row] != 1) {
@@ -281,10 +307,17 @@ public:
                 }
             }
         }
-        return inkling2_classify_decode_mask(kv->get_n_kv(), ub.n_tokens, allow_mean, [&](uint32_t row) {
+        const auto cells = [&](uint32_t row) {
             const auto seq = ub.seq_id[row][0];
             return kv->get_kv()->get_cells(seq).seq_n_cells(seq);
-        }, mask_shapes());
+        };
+        const auto mode = classify_decode(decode_rows, kv->get_n_kv(), ub.n_tokens, allow_mean, cells);
+        // rows that share a long prefix count it once each and can pass LLAMA_INKLING2_DECODE_POOL_READS: the legacy shape
+        // stays low-mean under LLAMA_INKLING2_MEAN_MASK_DECODE, as the tensor-4 profile sets it
+        if (mode == inkling2_decode_mask::dense && decode_rows && mean_shape && allow_mean && legacy_shape) {
+            return classify_decode(false, kv->get_n_kv(), ub.n_tokens, true, cells);
+        }
+        return mode;
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -411,12 +444,14 @@ static ggml_tensor * gather_channels(ggml_context * ctx, ggml_tensor * x) {
     return ggml_cont(ctx, ggml_transpose(ctx, x));
 }
 
-// -sm tensor: a hidden stream comes out of its reduction whole on every device, while the kernel and the state of its
-// convolution are split by channel (llama_meta_device_get_split_state). Each device convolves its own channels, which
-// a scatter gives it with the channels outermost so that they are one run of the tensor, and the result is gathered.
+// -sm tensor: a hidden stream comes out of its reduction whole on every device. Its state is the S state, whole on every
+// device with its kernel, so each device convolves every channel after one all-reduce. With
+// LLAMA_INKLING2_HIDDEN_CONV_LEGACY the kernel and the state are split by channel (llama_meta_device_get_split_state):
+// each device convolves its own channels, which a scatter gives it with the channels outermost so that they are one run
+// of the tensor, and the result is gathered, two collectives a stream.
 ggml_tensor * llama_model_inkling2::graph::convolve_hidden(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * history,
         int64_t offset, std::vector<ggml_tensor *> & windows, int il) {
-    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || hparams.n_sconv_hidden > 0) {
         return convolve(cur, weight, nullptr, history, offset, windows, il);
     }
     auto ud = model.get_split_state_ud;
@@ -483,7 +518,9 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs(const llm_graph_params &
     rel->extent[0] = hparams.n_relative_extent;
     rel->extent[1] = hparams.n_swa;
     rel->cells = fused_rel;
-    rel->mean_decode = direct_sinks && ggml_env_switch("LLAMA_INKLING2_MEAN_MASK_DECODE");
+    // the low-mean hint takes the decode kernels' sink a query
+    rel->mean_decode = direct_sinks && (cparams.rel_decode_rows || ggml_env_switch("LLAMA_INKLING2_MEAN_MASK_DECODE"));
+    rel->mean_shape = direct_sinks && ggml_env_switch("LLAMA_INKLING2_MEAN_MASK_DECODE");
     const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
     for (int i = 0; i < 2; ++i) {
         const auto mode = rel->mask_mode[i] = fused_rel ? rel->classify_mask(params, i) : inkling2_decode_mask::dense;
@@ -537,6 +574,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     auto * state = recr->mctx->get_r_l(il);
     auto * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
     history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+    // the hidden streams' state: the S state, or the conv row after K and V (LLAMA_INKLING2_HIDDEN_CONV_LEGACY)
+    const bool hidden_apart = hparams.n_sconv_hidden > 0;
+    auto * hidden_state = hidden_apart ? recr->mctx->get_s_l(il) : state;
+    auto * hidden = history;
+    if (hidden_apart) {
+        hidden = build_rs(recr, hidden_state, hparams.n_embd_s(), ubatch.n_seqs);
+        hidden = ggml_reshape_3d(ctx0, hidden, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_hidden, ubatch.n_seqs);
+    }
+    const int64_t hidden_offset = hidden_apart ? 0 : 2*kv;
+    std::vector<ggml_tensor *> hidden_windows;
     res->t_layer_inp[il] = cur;
     auto * residual = cur;
     ggml_tensor * inputs[3] = {cur, cur, cur};
@@ -578,8 +625,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     for (auto * t : {q, r, sinks, gate, k}) {
         ggml_build_forward_expand(gf, t);
     }
-    // the windows of the state's streams, K, V and the two hidden streams, in the order of the state's channels
+    // the windows of the state's streams in the order of its channels: K, V, and the two hidden streams when they
+    // share the row
     std::vector<ggml_tensor *> windows;
+    auto & hwindows = hidden_apart ? hidden_windows : windows;
     k = convolve(k, l.attn_k_conv, swa ? nullptr : build_lora_mm(l.attn_k_conv_proj, inputs[1]), history, 0, windows, il);
     auto * v = convolve(build_lora_mm(l.wv, inputs[2]), l.attn_v_conv,
             swa ? nullptr : build_lora_mm(l.attn_v_conv_proj, inputs[2]), history, kv, windows, il);
@@ -655,7 +704,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     } else {
         cur = ggml_mul(ctx0, attn_out, ggml_sigmoid(ctx0, gate));
     }
-    cur = convolve_hidden(build_lora_mm(l.wo, cur), l.attn_post_conv, history, 2*kv, windows, il);
+    cur = convolve_hidden(build_lora_mm(l.wo, cur), l.attn_post_conv, hidden, hidden_offset, hwindows, il);
     // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
     if (ip % hparams.attn_res_block_size == 0) {
         blocks.push_back(residual);
@@ -677,14 +726,20 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // each card's sum holds only its own experts: summed across the cards as the split rows' sums are
         cur = ggml_backend_meta_reduce(ctx0, cur);
     }
-    cur = convolve_hidden(cur, l.ffn_post_conv, history, 2*kv + n_embd, windows, il);
-    // the layer's new state in one store of its whole row: under -sm tensor the row is split by the KV heads in four
-    // segments, one a stream, and each device's windows are its part of every segment in the same order
-    auto * window = windows[0];
-    for (size_t i = 1; i < windows.size(); ++i) {
-        window = ggml_concat(ctx0, window, windows[i], 1);
+    cur = convolve_hidden(cur, l.ffn_post_conv, hidden, hidden_offset + n_embd, hwindows, il);
+    // the layer's new state in one store of each whole row: under -sm tensor the conv row is split by the KV heads in
+    // a segment a stream, and each device's windows are its part of every segment in the same order
+    auto store = [&](ggml_tensor * dst, const std::vector<ggml_tensor *> & parts) {
+        auto * window = parts[0];
+        for (size_t i = 1; i < parts.size(); ++i) {
+            window = ggml_concat(ctx0, window, parts[i], 1);
+        }
+        build_conv_state_store(recr, dst, window, hparams.n_shortconv_l_cache - 1, 0);
+    };
+    store(state, windows);
+    if (hidden_apart) {
+        store(hidden_state, hidden_windows);
     }
-    build_conv_state_store(recr, state, window, hparams.n_shortconv_l_cache - 1, 0);
     cur = ggml_add(ctx0, residual, cur);
     cb(cur, "l_out", il);
     return cur;
@@ -723,7 +778,14 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
         }
     }
     res->t_embd = cur;
-    cur = build_lora_mm(model.output, cur);
+    // -sm tensor splits the padded vocabulary. The head's rows of the unpadded vocabulary are a view of each device's
+    // rows, so each device keeps the logits of its share and the host reads every share where it lies (logits_gather).
+    // LLAMA_INKLING2_LOGITS_GATHER_LEGACY=1: the padded logits gathered whole to every device, then sliced
+    static const bool logits_gather_legacy = ggml_env_switch("LLAMA_INKLING2_LOGITS_GATHER_LEGACY");
+    const bool split_vocab = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !logits_gather_legacy;
+    cur = split_vocab ?
+        build_lora_mm(ggml_view_2d(ctx0, model.output, n_embd, hparams.n_vocab_unpadded, model.output->nb[1], 0), cur) :
+        build_lora_mm(model.output, cur);
     ggml_prec_set_acc(cur, GGML_PREC_F32);
     const float cap = hparams.f_final_logit_softcapping;
     if (cap != 0.0f) {
@@ -736,11 +798,13 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
         ggml_build_forward_expand(gf, res->t_cand);
         return;
     }
-    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        // -sm tensor splits the padded vocabulary, which the slice below cuts in no ratio of the split: slice it whole
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !split_vocab) {
+        // the slice below cuts the padded vocabulary in no ratio of the split: slice it whole
         cur = gather_channels(ctx0, cur);
     }
-    cur = ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0);
+    if (cur->ne[0] != hparams.n_vocab_unpadded) {
+        cur = ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0);
+    }
     if (cparams.pipeline_parallel || !ggml_is_contiguous(cur)) {
         cur = ggml_cont(ctx0, cur);
     }

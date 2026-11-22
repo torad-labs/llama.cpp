@@ -234,7 +234,8 @@ static void check_cells(const llama_kv_cells & cells, uint32_t n_seq) {
 static void check_inkling2_decode_masks() {
     using mode = inkling2_decode_mask;
     std::vector<uint32_t> cells(23, 8192);
-    const inkling2_mask_shapes served = {32, 8, 32, 8192, 8, 23, 262144, 6};
+    // as LLAMA_INKLING2_DECODE_CLASS_LEGACY=1 serves them, from 8 rows
+    const inkling2_mask_shapes served = {32, 8, 32, 8192, 8, 23, 262144, 6, 3};
     auto shapes = served;
     const auto classify = [&](uint32_t pool, bool mean) {
         return inkling2_classify_decode_mask(pool, cells.size(), mean, [&](uint32_t i) { return cells[i]; }, shapes);
@@ -308,8 +309,40 @@ static void check_inkling2_decode_masks() {
     CHECK(shared_mode() == mode::bounded_rows, "removing one membership restores the per-row bound");
 }
 
+// the default class: any row count the decode kernels take, any share a row holds, until the rows read pool_reads pools
+static void check_inkling2_decode_rows() {
+    using mode = inkling2_decode_mask;
+    const inkling2_mask_shapes shapes = {32, 1, 32, 8192, 8, 23, 262144, 6, 3};
+    std::vector<uint32_t> cells;
+    const auto classify = [&](uint32_t pool, bool mean) {
+        return inkling2_classify_decode_rows(pool, cells.size(), mean, [&](uint32_t i) { return cells[i]; }, shapes);
+    };
+    // G7: one session of 199,967 cells among 23 in a pool of 860,160, of which 1, 4 or 23 decode
+    for (size_t rows : {1, 4, 7, 8, 23}) {
+        cells.assign(rows, 28400);
+        CHECK(classify(860160, true) == mode::bounded_rows, "rows within an eighth of the pool are bounded at any count");
+        cells[0] = 199967;
+        CHECK(classify(860160, true) == mode::low_mean, "one long session reads its own cells at any row count");
+        CHECK(classify(860160, false) == mode::dense, "uncounted rows past an eighth stay dense");
+        cells[0] = 860000;
+        CHECK(classify(860160, true) == mode::low_mean, "a session holding most of the pool reads only its cells");
+    }
+    cells.assign(1, 8192);
+    CHECK(classify(8160, true) == mode::dense, "a pool under the decode kernels' smallest is dense");
+    cells.assign(33, 1);
+    CHECK(classify(860160, true) == mode::dense, "a step past the most rows is dense");
+    cells.clear();
+    CHECK(classify(860160, true) == mode::dense, "a step with no rows is dense");
+    // 23 sessions sharing a long prefix: past three pools together the dense kernel's one read a query head costs less
+    cells.assign(23, 30000);
+    CHECK(classify(230000, true) == mode::low_mean, "the rows read three pools together");
+    ++cells.back();
+    CHECK(classify(230000, true) == mode::dense, "one cell more is dense");
+}
+
 int main() {
     check_inkling2_decode_masks();
+    check_inkling2_decode_rows();
     std::mt19937 rng(20260925);
 
     ggml_init_params ip = { /*.mem_size =*/ 64*1024*1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };

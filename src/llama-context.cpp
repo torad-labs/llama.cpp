@@ -699,6 +699,9 @@ llama_context::llama_context(
         // a drafted step's rows of a sequence read each cell once together, and its mask is classed by its sequences;
         // LLAMA_INKLING2_REL_GROUP_LEGACY=1: each row reads its cells alone, and a drafted step's mask is dense
         cparams.rel_query_group = !ggml_env_switch("LLAMA_INKLING2_REL_GROUP_LEGACY");
+        // a decode step of any row count reads only its rows' cells; LLAMA_INKLING2_DECODE_CLASS_LEGACY=1: fewer than 8
+        // rows, a drafted step with a long sequence and a low mean outside LLAMA_INKLING2_MEAN_ROWS are dense
+        cparams.rel_decode_rows = !ggml_env_switch("LLAMA_INKLING2_DECODE_CLASS_LEGACY");
         // its residual depth mix, norm clips and output gate run as one op each; LLAMA_INKLING2_FUSE_LEGACY=1 builds them
         // from elementwise ops
         cparams.fused_inkling2 = false;
@@ -2269,27 +2272,53 @@ void llama_context::set_embeddings_layer_inp_dev(bool value) {
 
 bool llama_context::supports_embd_row() const {
     // the DFlash/DSpark decoder graphs read the device buffer
-    if (model.arch != LLM_ARCH_DFLASH) {
-        return false;
-    }
+    return model.arch == LLM_ARCH_DFLASH && layer_inp_src() != nullptr;
+}
 
-    const ggml_tensor * src = cparams.ctx_other ? cparams.ctx_other->get_layer_inp_dev() : nullptr;
+ggml_tensor * llama_context::layer_inp_src() const {
+    ggml_tensor * src = cparams.ctx_other ? cparams.ctx_other->get_layer_inp_dev() : nullptr;
     if (src == nullptr) {
-        return false;
+        return nullptr;
     }
 
     // one of our backends must be able to read the buffer, e.g. not a draft on another GPU than the target output
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src->buffer);
-    if (llama_model_is_inkling_draft(model) && ggml_backend_buft_is_meta(buft)) {
-        return false;
-    }
     for (const auto & backend : backends) {
         if (ggml_backend_supports_buft(backend.get(), buft)) {
-            return true;
+            return src;
         }
     }
 
-    return false;
+    // a target split over devices holds the rows whole on each one (llama_meta_device_get_split_state): a draft on one
+    // of them reads the copy there
+    for (const auto & backend : backends) {
+        if (ggml_tensor * copy = ggml_backend_meta_mirrored_tensor(src, ggml_backend_get_device(backend.get()))) {
+            return copy;
+        }
+    }
+
+    return nullptr;
+}
+
+ggml_backend_event_t llama_context::layer_inp_read_event(ggml_backend_dev_t dev) {
+    if (ev_layer_inp_read && layer_inp_read_dev == dev) {
+        return ev_layer_inp_read.get();
+    }
+    ev_layer_inp_read_recorded = false;
+    layer_inp_read_dev = dev;
+    // of a split target, only the copy on dev waits for its reader
+    layer_inp_read_backend = layer_inp_backend;
+    if (layer_inp_backend && ggml_backend_is_meta(layer_inp_backend) && dev != layer_inp_dev_dev) {
+        layer_inp_read_backend = nullptr;
+        for (size_t j = 0; j < ggml_backend_meta_n_backends(layer_inp_backend); ++j) {
+            ggml_backend_t simple = ggml_backend_meta_simple_backend(layer_inp_backend, j);
+            if (ggml_backend_get_device(simple) == dev) {
+                layer_inp_read_backend = simple;
+            }
+        }
+    }
+    ev_layer_inp_read.reset(layer_inp_read_backend ? ggml_backend_event_new(dev) : nullptr);
+    return ev_layer_inp_read.get();
 }
 
 ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
@@ -2309,6 +2338,10 @@ void llama_context::layer_inp_dev_alloc() {
     layer_inp_backend = nullptr;
     buf_layer_inp_dev.reset();
     ctx_layer_inp_dev.reset();
+    ev_layer_inp_read.reset();
+    ev_layer_inp_read_recorded = false;
+    layer_inp_read_dev     = nullptr;
+    layer_inp_read_backend = nullptr;
 
     if (!cparams.embeddings_layer_inp_dev) {
         return;
@@ -2324,11 +2357,6 @@ void llama_context::layer_inp_dev_alloc() {
 
     auto * dev = model.dev_output();
     auto * buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
-    // The Inkling tensor split has no layout for layer_inp_dev.
-    if (model.arch == LLM_ARCH_INKLING2 && ggml_backend_buft_is_meta(buft)) {
-        cparams.embeddings_layer_inp_dev = false;
-        return;
-    }
 
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -2357,10 +2385,11 @@ void llama_context::layer_inp_dev_alloc() {
             ggml_backend_buffer_name(buf_layer_inp_dev.get()), ggml_backend_buffer_get_size(buf_layer_inp_dev.get())/1024.0/1024.0, (int) n_layer_inp);
 
     layer_inp_backend = layer_inp_dev_dev ? backend_from_dev(layer_inp_dev_dev) : nullptr;
-    if (layer_inp_backend && !ev_layer_inp_written) {
-        ev_layer_inp_written.reset(ggml_backend_event_new(layer_inp_dev_dev));
-        ev_layer_inp_read.reset(ggml_backend_event_new(layer_inp_dev_dev));
-        ev_layer_inp_read_recorded = false;
+    if (layer_inp_backend) {
+        if (!ev_layer_inp_written) {
+            ev_layer_inp_written.reset(ggml_backend_event_new(layer_inp_dev_dev));
+        }
+        layer_inp_read_event(layer_inp_dev_dev);
     }
 }
 
@@ -2748,8 +2777,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
     }
+    // A DFlash/DSpark draft decodes two step shapes in turn, its feed (sessions x verified rows) and its block (sessions x
+    // block rows), both past graph_slot_max_tokens at 23 sessions: on the main scheduler, which holds one graph, each
+    // round built both again. Its graphs stay in the slots. LLAMA_DRAFT_GRAPH_SLOTS_LEGACY=1: the main scheduler
+    static const bool draft_slots_legacy = ggml_env_switch("LLAMA_DRAFT_GRAPH_SLOTS_LEGACY");
+    const bool draft_shape = model.arch == LLM_ARCH_DFLASH && !draft_slots_legacy;
     const bool use_slots = !graph_reuse_disable &&
-        (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape || prompt_shape || prompt_kept) && sampling_can_retain();
+        (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape || prompt_shape || prompt_kept || draft_shape) && sampling_can_retain();
 
     bool reuse = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
     for (size_t i = 0; !reuse && use_slots && i < graph_slots.size(); ++i) {
@@ -3615,11 +3649,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     // ordering for the layer input device buffer
-    llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
-    ggml_backend_t  inject_backend = nullptr;
+    llama_context *      inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
+    ggml_backend_t       inject_backend = nullptr;
+    ggml_backend_event_t inject_read    = nullptr;
     if (inject_src) {
-        inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
-        if (inject_backend) {
+        // the device of the rows we read: the buffer's, or of a split target the copy on ours
+        const ggml_tensor * src = layer_inp_src();
+        ggml_backend_dev_t  dev = src ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer)) : nullptr;
+        inject_backend = inject_src->ev_layer_inp_written && dev ? backend_from_dev(dev) : nullptr;
+        inject_read    = inject_backend ? inject_src->layer_inp_read_event(dev) : nullptr;
+        if (inject_read) {
             // wait on the host: a device-side wait would stall our queue for the whole target batch,
             // which trips the Metal command buffer timeout on long prompts
             ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
@@ -3629,7 +3668,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     if (layer_inp_dev && ev_layer_inp_read && ev_layer_inp_read_recorded) {
         // do not overwrite rows the reader has not consumed yet
-        ggml_backend_event_wait(layer_inp_backend, ev_layer_inp_read.get());
+        ggml_backend_event_wait(layer_inp_read_backend, ev_layer_inp_read.get());
     }
 
     // ordering for the h_nextn device buffer, as for the layer input buffer
@@ -3941,8 +3980,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
     if (inject_src) {
-        if (inject_backend) {
-            ggml_backend_event_record(inject_src->ev_layer_inp_read.get(), inject_backend);
+        if (inject_read) {
+            ggml_backend_event_record(inject_read, inject_backend);
             inject_src->ev_layer_inp_read_recorded = true;
         } else {
             synchronize();
@@ -4620,7 +4659,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.layer_inp_dev =*/ layer_inp_dev,
-        /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
+        /*.layer_inp_src =*/ supports_embd_row() ? layer_inp_src() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
         /*.samplers    =*/ sampling.samplers,

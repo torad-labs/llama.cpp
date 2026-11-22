@@ -8,6 +8,8 @@
 //   rel-packed   the same comparison with packed masks requested, including on the legacy path
 //   group  with packed masks, a drafted step classed by its sequences, whose rows of a sequence read each cell once
 //          together on the decode kernel, against a dense step on the prefill kernel (LLAMA_INKLING2_REL_GROUP_LEGACY=1)
+//   decode-rows   with packed masks, decode steps of fewer than 8 rows, a long sequence's among them, reading only
+//          their rows' cells against dense steps (LLAMA_INKLING2_DECODE_CLASS_LEGACY=1)
 //   fuse   the residual depth mix, the norm clips, the attention output gate and the experts' SITU as one op each
 //          against their elementwise graphs (LLAMA_INKLING2_FUSE_LEGACY=1)
 //   conv   each short convolution as one op (ggml_short_conv) against ssm_conv and its elementwise taps and residual
@@ -46,6 +48,8 @@
 //   restore   the same with one sequence saved, dropped and read back before the steps, as the prompt cache does
 //   runs      23 sequences that share a prompt and read their own tokens in chunks taken in turn, one just forked, then
 //             steps of a token a sequence, one sequence cleared and read again alone, and more steps
+//   long      one sequence of 6,000 cells and three of 800 in one unified cache, then steps of 1 and 4 rows, and of
+//             a token and 2 drafts a sequence
 //
 // --inkling-window <device> is a check of another kind in this file for its helpers: sessions that share one cache give
 // each session the logits it has alone (test_inkling_window).
@@ -171,6 +175,14 @@ const std::map<std::string, feature> & features() {
             return t->op == GGML_OP_FLASH_ATTN_EXT && t->src[6] && t->src[3]->type == GGML_TYPE_I16 &&
                 ggml_flash_attn_ext_get_n_kv_max(t) > 0 && ggml_flash_attn_ext_get_query_group(t) > 1 ?
                 "bounded drafted rows" : "";
+        }, [](llama_context_params & params, bool) {
+            params.attn_mask_bits = true;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        }}},
+        {"decode-rows", {"LLAMA_INKLING2_DECODE_CLASS_LEGACY", {"decode rows over their own cells"}, [](const ggml_tensor * t) {
+            return t->op == GGML_OP_FLASH_ATTN_EXT && t->src[6] && t->src[3]->type == GGML_TYPE_I16 &&
+                (ggml_flash_attn_ext_get_n_kv_max(t) > 0 || ggml_flash_attn_ext_has_low_mean_mask(t)) ?
+                "decode rows over their own cells" : "";
         }, [](llama_context_params & params, bool) {
             params.attn_mask_bits = true;
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
@@ -410,6 +422,38 @@ std::map<std::string, std::pair<shape, path_case>> cases(size_t seed) {
         steps(3, 3000);
     }};
     ret["restore"] = {{23, true}, [=](llama_context * ctx, std::vector<float> & out) { served(ctx, out, true); }};
+    // one sequence of 6,000 cells, most of the pool, among three of 800, then steps of fewer than 8 rows: the long
+    // sequence alone, a short one alone, all four, and all four with a token and 2 drafts each. Each step reads only
+    // its rows' cells, the long sequence's as a low mean and a short one's as a bounded row
+    ret["long"] = {{8, true}, [=](llama_context * ctx, std::vector<float> & out) {
+        const int32_t lens[4] = {6000, 800, 800, 800};
+        for (int s = 0; s < 4; ++s) {
+            // in calls of 2,000 rows, which a batch of 2,048 holds
+            const auto prompt = span(tokens(lens[s], 50 + s), 0, s);
+            for (size_t i0 = 0; i0 < prompt.size(); i0 += 2000) {
+                const size_t n = std::min<size_t>(2000, prompt.size() - i0);
+                decode(ctx, {prompt.begin() + i0, prompt.begin() + i0 + n}, out, std::vector<size_t>{n - 1});
+            }
+        }
+        int32_t next[4] = {lens[0], lens[1], lens[2], lens[3]};
+        const auto step = [&](std::initializer_list<int> seqs, uint32_t per_seq, size_t salt) {
+            std::vector<std::array<int32_t, 3>> rows;
+            for (const int s : seqs) {
+                const auto r = span(tokens(per_seq, salt + s), next[s], s);
+                rows.insert(rows.end(), r.begin(), r.end());
+                next[s] += per_seq;
+            }
+            decode(ctx, rows, out);
+        };
+        for (size_t i = 0; i < 3; ++i) {
+            step({0}, 1, 60 + 10*i);
+            step({1}, 1, 61 + 10*i);
+            step({0, 1, 2, 3}, 1, 62 + 10*i);
+        }
+        for (size_t i = 0; i < 2; ++i) {
+            step({0, 1, 2, 3}, 3, 100 + 10*i);
+        }
+    }};
     ret["unified"] = {{3, true}, together};
     ret["streams"] = {{3, false}, together};
     ret["churn"] = {{3, true}, [=](llama_context * ctx, std::vector<float> & out) {

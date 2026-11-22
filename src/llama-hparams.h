@@ -108,6 +108,8 @@ struct llama_hparams {
 
     uint32_t n_shortconv_l_cache  = 0;
     uint32_t n_sconv_channels     = 0;
+    // Inkling 2: the hidden streams' channels, whose convolution state is the S state, apart from n_sconv_channels
+    uint32_t n_sconv_hidden       = 0;
 
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;

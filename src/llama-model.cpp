@@ -524,12 +524,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
 
     const bool is_inkling2 = ud->model->arch == LLM_ARCH_INKLING2;
+    // the hidden streams' state is the S state (hparams.n_sconv_hidden): it and their kernels are whole on every device,
+    // which convolves each hidden stream after one all-reduce of it
+    const bool inkling2_hidden_apart = is_inkling2 && hparams.n_sconv_hidden > 0;
+    if (inkling2_hidden_apart && std::regex_match(tensor_name, pattern_ink_hidden_conv)) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
     if (is_inkling2 && (std::regex_match(tensor_name, pattern_ink_hidden_conv) || std::regex_match(tensor_name, pattern_r_cache))) {
-        // Each layer's convolution state holds the last positions of four streams one after the other: K, V, and the
-        // two hidden streams (the attention output and the experts' sum, after their reductions). K and V split by the
-        // layer's KV heads, as attn_k does. The hidden streams split by channel in the same ratio, n_embd/n_head_kv
-        // channels a KV head: the graph's views and stores into the state scale their offsets by one ratio for all
-        // four, and the hidden kernels split as the state they read.
+        // Each layer's convolution state holds the last positions of its streams one after the other: K, V, and, with
+        // LLAMA_INKLING2_HIDDEN_CONV_LEGACY, the two hidden streams (the attention output and the experts' sum, after
+        // their reductions). K and V split by the layer's KV heads, as attn_k does. The legacy hidden streams split by
+        // channel in the same ratio, n_embd/n_head_kv channels a KV head: the graph's views and stores into the state
+        // scale their offsets by one ratio for all four, and the hidden kernels split as the state they read.
         const bool cache = tensor_name.rfind("cache_", 0) == 0;
         const uint32_t il = std::stoul(cache ? tensor_name.substr(tensor_name.find("_l", 6) + 2) : tensor_name.substr(4));
         const ggml_tensor * k = ud->model->get_tensor(("blk." + std::to_string(il) + ".attn_k.weight").c_str());
@@ -541,9 +547,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         GGML_ASSERT(hparams.n_embd % n_head_kv == 0);
         const int64_t channels_per_head[4] = {head_dim, head_dim, hparams.n_embd / n_head_kv, hparams.n_embd / n_head_kv};
         const int64_t n_cols = cache ? hparams.n_shortconv_l_cache - 1 : 1;
-        GGML_ASSERT(!cache || tensor->ne[0] == n_cols*(2*n_head_kv*head_dim + 2*int64_t(hparams.n_embd)));
+        const int64_t n_streams = inkling2_hidden_apart ? 2 : 4;
+        GGML_ASSERT(!cache || tensor->ne[0] == n_cols*(2*n_head_kv*head_dim + (inkling2_hidden_apart ? 0 : 2*int64_t(hparams.n_embd))));
         ggml_backend_meta_split_state split = {cache ? GGML_BACKEND_SPLIT_AXIS_0 : GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
-        split.n_segments = cache ? 4 : 1;
+        split.n_segments = cache ? n_streams : 1;
         for (size_t s = 0; s < split.n_segments; ++s) {
             split.nr[s] = 1;
             for (size_t j = 0; j < ud->n_devices; ++j) {
@@ -635,13 +642,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
-        // the MTP store of the target's hidden rows (llama_set_nextn_source): a whole copy on every card, as the rows are
-        if (tensor_name == "mtp_h_store") {
+        // the MTP store of the target's hidden rows (llama_set_nextn_source): a whole copy on every card, as the rows are.
+        // The same for the layer inputs a DFlash/DSpark draft reads (layer_inp_dev): a draft on one card reads its copy
+        if (tensor_name == "mtp_h_store" || tensor_name == "layer_inp_dev") {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (is_inkling2 && std::regex_match(tensor_name, pattern_s_cache)) {
-            // the recurrent memory's S state, which Inkling has none of: an empty tensor
-            GGML_ASSERT(ggml_nelements(tensor) == 0);
+            // the recurrent memory's S state: the hidden streams' convolution state whole on every device, or empty
+            GGML_ASSERT(ggml_nelements(tensor) == 0 || inkling2_hidden_apart);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (is_inkling2 && tensor_name.rfind("cache_", 0) != 0 && !std::regex_match(tensor_name, pattern_ink_standard)) {
@@ -965,6 +973,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {{tensor->ne[axis], 1}};
     };
 
+    // whether the devices take equal shares (no -ts, or every ratio the same)
+    auto split_is_even = [&]() -> bool {
+        const float * ts = ud->model->tensor_split();
+        if (ts == nullptr) {
+            return true;
+        }
+        for (size_t j = 1; j < ud->n_devices; j++) {
+            if (ts[j] != ts[0]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
         // glm5next's attention splits by whole heads: a KDA head is n_embd_head_kda channels (its state n_embd_head_kda
         // squared, its conv state d_conv - 1 a channel), a DSA head n_embd_head_k_mla rows of q_b and n_embd_head_v_mla
@@ -1185,6 +1207,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
+            // where 128 leaves the devices uneven, a finer granularity of whole blocks of 32 or more that splits the
+            // width evenly: Inkling 2's 2,304 over four devices is 576 = 9 x 64 each, not 512/640/512/640
+            const int64_t n_ff  = segments[0].first;
+            const int64_t share = n_ff / (int64_t) ud->n_devices;
+            if (split_is_even() && n_ff % (int64_t) ud->n_devices == 0 && share % blck_size_perf != 0 &&
+                    share % std::max<int64_t>(blck_size, 32) == 0 && !ggml_env_switch("LLAMA_SPLIT_FFN_EVEN_LEGACY")) {
+                return {std::gcd(share, blck_size_perf)};
+            }
             return {blck_size_perf};
         }
 
@@ -2984,8 +3014,31 @@ llama_split_mode llama_model::split_mode() const {
 }
 
 bool llama_model::experts_split_by_expert() const {
-    return params.split_mode == LLAMA_SPLIT_MODE_TENSOR && arch == LLM_ARCH_INKLING2 &&
-        ggml_env_switch("LLAMA_INKLING2_EXPERT_SPLIT");
+    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR || arch != LLM_ARCH_INKLING2) {
+        return false;
+    }
+    if (ggml_env_switch("LLAMA_INKLING2_EXPERT_SPLIT")) {
+        return true;
+    }
+    if (ggml_env_switch("LLAMA_INKLING2_EXPERT_SPLIT_LEGACY")) {
+        return false;
+    }
+    // by expert where the cards cannot share the hidden width evenly in down's blocks: 2,304 is 9 K-quant blocks of 256,
+    // which four cards share 3/2/2/2, and every layer waits for the card with 3
+    const int64_t n_dev = get_split_state_ud.n_devices;
+    const float * ts = tensor_split();
+    for (int64_t j = 1; ts != nullptr && j < n_dev; ++j) {
+        if (ts[j] != ts[0]) {
+            return false;
+        }
+    }
+    for (const auto & layer : layers) {
+        const ggml_tensor * down = layer.ffn_down_exps;
+        if (down != nullptr && n_dev > 1 && (down->ne[0] % n_dev != 0 || down->ne[0]/n_dev % ggml_blck_size(down->type) != 0)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool llama_model::no_alloc() const {
@@ -3854,7 +3907,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ params.type_s,
+                            /* recurrent_type_s  */ arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP ? GGML_TYPE_F32 : params.type_s, // Inkling's is a conv state, as R
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,

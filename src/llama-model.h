@@ -1038,7 +1038,7 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
-    // under -sm tensor Inkling 2's routed experts are split by expert, not by their hidden rows (LLAMA_INKLING2_EXPERT_SPLIT)
+    // under -sm tensor Inkling 2's routed experts are split by expert, not by their hidden rows: where down's blocks cannot share the rows evenly, or always under LLAMA_INKLING2_EXPERT_SPLIT
     bool experts_split_by_expert() const;
     bool no_alloc() const;
 

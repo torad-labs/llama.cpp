@@ -498,6 +498,114 @@ static ggml_backend_meta_split_state split_hidden_rows(const ggml_tensor * t, vo
     return {up ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0, {width, width, width, width}, {1}, 1};
 }
 
+static ggml_backend_meta_split_state split_queue(const ggml_tensor * t, void * userdata) {
+    const int n = *static_cast<const int *>(userdata);
+    const bool up = strcmp(t->name, "up") == 0;
+    if (!up && strcmp(t->name, "down") != 0) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
+    ggml_backend_meta_split_state state = {up ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+    for (int rank = 0; rank < n; ++rank) { state.ne[rank] = t->ne[up ? 1 : 0] / n; }
+    return state;
+}
+
+// A decode step queues its reductions back to back: 96 layers of x = tanh(x + down(tanh(up(x)))), each down product a
+// partial sum reduced through host memory on the copy engines and read by the next layer. By default the host waits for
+// the reduction two back before it queues the next; under GGML_CUDA_AR_SLOT_NO_SYNC=1 it waits for nothing from the
+// first layer to the output, the cards order the reuse of the staging and the scratch themselves, and every evaluation,
+// the scheduler's captured segments replayed in the later ones, keeps the bits of the waiting host. Sizes: a 23-row step at 1,024 wide
+// (one chunk, under the 64 KB at which several ranks receive on a stream a peer on the BF16 wire, over it on F32) and a
+// drafted step's 92 rows at 4,608 (several chunks).
+static bool test_reduction_queue(const std::vector<ggml_backend_dev_t> & devs) {
+    int n = (int) devs.size();
+    set_env("GGML_CUDA_ALLREDUCE", "internal");
+    set_env("GGML_CUDA_AR_COPY_PEER", "0");
+    set_env("GGML_CUDA_AR_COPY_THRESHOLD", "1");
+    set_env("GGML_CUDA_AR_LL_MAX_BYTES", "0");
+    set_env("GGML_CUDA_AR_P2P_MAX_BYTES", "0");
+    set_env("GGML_CUDA_AR_HOST_OWNER_ROWS", "0");
+    set_env("GGML_GRAPH_TRACE", "1");
+    constexpr int n_layer = 96, n_eval = 6;
+    bool ok = true;
+    for (const auto & [rows, n_embd] : std::vector<std::pair<int, int64_t>>{{23, 1024}, {92, 4608}}) {
+        for (bool bf16 : {false, true}) {
+            set_env("GGML_CUDA_AR_BF16_THRESHOLD", bf16 ? "1" : "0");
+            std::vector<float> baseline;
+            for (bool waits : {true, false}) {
+                set_env("GGML_CUDA_AR_SLOT_NO_SYNC", waits ? "0" : "1");
+                ggml_backend_dev_t device = ggml_backend_meta_device(const_cast<ggml_backend_dev_t *>(devs.data()), n, split_queue, &n);
+                ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+                const int64_t n_ff = 32 * n;
+                ggml_context * weights = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
+                auto * up = ggml_new_tensor_2d(weights, GGML_TYPE_F32, n_embd, n_ff);
+                auto * down = ggml_new_tensor_2d(weights, GGML_TYPE_F32, n_ff, n_embd);
+                ggml_set_name(up, "up");
+                ggml_set_name(down, "down");
+                auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(weights, ggml_backend_dev_buffer_type(device));
+                GGML_ASSERT(buffer);
+                ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                std::mt19937 rng(73);
+                for (auto * w : {up, down}) {
+                    std::vector<float> data(ggml_nelements(w));
+                    for (float & v : data) { v = float(int(rng() % 2001) - 1000) / 4000.0f; }
+                    ggml_backend_tensor_set(w, data.data(), 0, ggml_nbytes(w));
+                }
+                ggml_context * ctx = ggml_init({(6 * n_layer + 4) * ggml_tensor_overhead() + ggml_graph_overhead_custom(8 * n_layer, false), nullptr, true});
+                auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, rows);
+                ggml_set_input(x);
+                ggml_tensor * h = x;
+                for (int il = 0; il < n_layer; ++il) {
+                    h = ggml_tanh(ctx, ggml_add(ctx, h, ggml_mul_mat(ctx, down, ggml_tanh(ctx, ggml_mul_mat(ctx, up, h)))));
+                }
+                ggml_set_output(h);
+                auto * graph = ggml_new_graph_custom(ctx, 8 * n_layer, false);
+                ggml_build_forward_expand(graph, h);
+                auto * cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+                ggml_backend_t backends[] = {backend, cpu};
+                auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 8 * n_layer, false, true);
+                GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+                const int replayed = replays;
+                const auto full = reductions_to_all;
+                std::vector<float> actual;
+                for (int eval = 0; eval < n_eval; ++eval) {
+                    std::vector<float> input(ggml_nelements(x));
+                    for (float & a : input) { a = float(int(rng() % 2001) - 1000) / 1000.0f; }
+                    ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+                    GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+                    const size_t at = actual.size();
+                    actual.resize(at + ggml_nelements(h));
+                    ggml_backend_tensor_get(h, actual.data() + at, 0, ggml_nbytes(h));
+                }
+                const int replayed_evals = replays - replayed;
+                ggml_backend_sched_free(sched);
+                ggml_free(ctx);
+                ggml_backend_free(cpu);
+                ggml_backend_free(backend);
+                ggml_backend_buffer_free(buffer);
+                ggml_free(weights);
+                const unsigned long long reduced = reductions_to_all - full;
+                bool finite = true;
+                double norm = 0;
+                for (float a : actual) { finite = finite && std::isfinite(a); norm += double(a) * a; }
+                const bool same = waits || (actual.size() == baseline.size() &&
+                    !memcmp(actual.data(), baseline.data(), actual.size() * sizeof(float)));
+                // every evaluation queues its 96 reductions live: the copy engines' reduction is not captured
+                const bool pass = same && finite && norm > 0 && reduced == (unsigned long long) n_layer * n_eval;
+                printf("%s reduction queue: %d ranks, %d x %lld, %s wire, %s, %llu reductions, %d replayed, same=%d\n",
+                       pass ? "ok  " : "FAIL", n, rows, (long long) n_embd, bf16 ? "BF16" : "F32",
+                       waits ? "host waits two back" : "host queues ahead (GGML_CUDA_AR_SLOT_NO_SYNC)", reduced, replayed_evals, same);
+                if (waits) { baseline = std::move(actual); }
+                ok = pass && ok;
+            }
+        }
+    }
+    set_env("GGML_CUDA_AR_SLOT_NO_SYNC", nullptr);
+    for (const char * name : {"GGML_CUDA_AR_LL_MAX_BYTES", "GGML_CUDA_AR_P2P_MAX_BYTES", "GGML_CUDA_AR_HOST_OWNER_ROWS"}) {
+        set_env(name, nullptr);
+    }
+    return ok;
+}
+
 // A hidden state whose every rank reads a quarter of each row is summed only where it is read, with the bits of the
 // sum on every rank. Through host memory GGML_CUDA_AR_HOST_OWNER_ROWS selects it for any rows, a drafted step's too;
 // card to card it rides the chunked kernel, which a captured step replays, and GGML_CUDA_AR_REDUCE_OWNERS=0 turns it off.
@@ -512,9 +620,16 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool 
     bool ok = true;
     for (variant v : {normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8, grouped, drafted}) {
         std::vector<float> baseline;
-        for (int mode = 0; mode < (card ? 2 : 3); ++mode) {
-            const bool enabled = mode != 0;
-            set_env("GGML_CUDA_AR_HOST_OWNER_STREAM_ORDERED", mode == 2 ? "1" : "0");
+        // through host memory each route runs again with the host queuing ahead with no wait of its own
+        // (GGML_CUDA_AR_SLOT_NO_SYNC=1, or GGML_CUDA_AR_HOST_OWNER_STREAM_ORDERED=1 for the owned rows), and every run must
+        // keep the bits of the first, the full reduction so
+        struct config { bool enabled, no_sync, stream_ordered; };
+        const std::vector<config> configs = card ? std::vector<config>{{false, false, false}, {true, false, false}} :
+            std::vector<config>{{false, false, false}, {false, true, false}, {true, false, false}, {true, true, false}, {true, false, true}};
+        for (const config & cfg : configs) {
+            const bool enabled = cfg.enabled;
+            set_env("GGML_CUDA_AR_SLOT_NO_SYNC", cfg.no_sync ? "1" : nullptr);
+            set_env("GGML_CUDA_AR_HOST_OWNER_STREAM_ORDERED", cfg.stream_ordered ? "1" : "0");
             set_env("GGML_CUDA_AR_HOST_OWNER_ROWS", enabled && !card ? "1" : "0");
             set_env("GGML_CUDA_AR_REDUCE_OWNERS", card && !enabled ? "0" : nullptr);
             set_env("GGML_CUDA_AR_WIRE_Q8", v == q8 ? "1" : "0");
@@ -591,15 +706,18 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool 
             // any row count on either route, the Q8 wire card to card only; a replayed evaluation queues no reduction
             const bool selected = enabled && (v == normal || v == serial_receive || v == narrower || v == grouped || v == drafted ||
                 (card && v == q8));
-            const bool same = !enabled || (actual.size() == baseline.size() && !memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)));
+            const bool first = &cfg == &configs.front();
+            const bool same = first || (actual.size() == baseline.size() && !memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)));
             const unsigned calls = depth * queued;
             const bool pass = same && reductions_to_owners - owners == (selected ? calls : 0u) && reductions_to_all - full == (selected ? 0u : calls);
-            if (!enabled) { baseline = std::move(actual); }
-            printf("%s hidden owner rows route=%s variant=%d mode=%d owned=%llu full=%llu replays=%u same=%d\n", pass ? "ok" : "FAIL",
-                   card ? "card" : "host", int(v), mode, reductions_to_owners - owners, reductions_to_all - full, 4 - queued, same);
+            if (first) { baseline = std::move(actual); }
+            printf("%s hidden owner rows route=%s variant=%d enabled=%d slot_no_sync=%d stream_ordered=%d owned=%llu full=%llu replays=%u same=%d\n",
+                   pass ? "ok" : "FAIL", card ? "card" : "host", int(v), enabled, cfg.no_sync, cfg.stream_ordered,
+                   reductions_to_owners - owners, reductions_to_all - full, 4 - queued, same);
             ok = ok && pass;
         }
     }
+    set_env("GGML_CUDA_AR_SLOT_NO_SYNC", nullptr);
     set_env("GGML_CUDA_AR_HOST_OWNER_STREAM_ORDERED", nullptr);
     return ok;
 }
@@ -1646,8 +1764,24 @@ int main(int argc, char ** argv) {
         printf("no GPU for the meta backend, skipped\n");
         return argc > 1 && strncmp(argv[1], "--host-kv", 9) == 0 ? 77 : 0;
     }
-    if (argc == 2 && (strcmp(argv[1], "--hidden-owner-logical") == 0 || strcmp(argv[1], "--hidden-owner-physical") == 0)) {
+    // the first two GPUs, or the first twice
+    std::vector<ggml_backend_dev_t> pair = {gpu, gpu};
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * d = ggml_backend_dev_get(i);
+        if (d != gpu && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) { pair[1] = d; break; }
+    }
+    if (argc == 2 && strcmp(argv[1], "--reduction-queue") == 0) {
+        if (strncmp(ggml_backend_dev_name(gpu), "CUDA", 4) != 0) { return 77; }
+        printf("reduction queue on %s and %s\n", ggml_backend_dev_name(pair[0]), ggml_backend_dev_name(pair[1]));
+        const bool two = test_reduction_queue(pair);
+        return test_reduction_queue({pair[0], pair[1], pair[0], pair[1]}) && two ? 0 : 1;
+    }
+    if (argc == 2 && (strcmp(argv[1], "--hidden-owner-logical") == 0 || strcmp(argv[1], "--hidden-owner-physical") == 0 ||
+                      strcmp(argv[1], "--hidden-owner-two-gpu") == 0)) {
         std::array<ggml_backend_dev_t, 4> devices = {gpu, gpu, gpu, gpu};
+        if (strcmp(argv[1], "--hidden-owner-two-gpu") == 0) {
+            devices = {pair[0], pair[1], pair[0], pair[1]};
+        }
         if (strcmp(argv[1], "--hidden-owner-physical") == 0) {
             size_t count = 0;
             for (size_t i = 0; i < ggml_backend_dev_count() && count < devices.size(); ++i) {

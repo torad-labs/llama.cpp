@@ -318,6 +318,12 @@ private:
 
     ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
+    // ctx_other's layer input buffer as one of our backends reads it: of a mirrored meta buffer, the copy on our device
+    ggml_tensor * layer_inp_src() const;
+
+    // the event a reader of layer_inp_dev's copy on dev records once it has read it, made on dev the first time
+    ggml_backend_event_t layer_inp_read_event(ggml_backend_dev_t dev);
+
     //
     // graph
     //
@@ -699,6 +705,9 @@ private:
     ggml_backend_event_ptr ev_layer_inp_written;
     ggml_backend_event_ptr ev_layer_inp_read;
     bool ev_layer_inp_read_recorded = false;
+    // the device of the copy the reader reads, and the backend that writes that copy and waits on ev_layer_inp_read
+    ggml_backend_dev_t layer_inp_read_dev     = nullptr;
+    ggml_backend_t     layer_inp_read_backend = nullptr;
 
     // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
     // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s

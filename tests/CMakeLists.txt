@@ -314,7 +314,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-llama-archs test-glm5next PROPERTIES TIMEOUT 3600)
     if (GGML_CUDA)
         # Inkling 2 under a two-rank tensor split on the first GPU against that GPU alone, sequence state included
-        foreach(inkling_case prefill decode chunks seq-cp state rollback graph-churn compact-greedy)
+        foreach(inkling_case prefill decode chunks seq-cp state rollback graph-churn compact-greedy layer-inp)
             llama_test(test-llama-archs NAME test-inkling2-split-${inkling_case}
                 ARGS --inkling-split ${inkling_case} --inkling-split-device CUDA0,CUDA0 -s 1234)
         endforeach()
@@ -352,6 +352,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         endforeach()
         llama_test(test-llama-archs NAME test-inkling-group-${inkling_path_name}-drafted
             ARGS --inkling-path group/drafted --inkling-path-device ${inkling_path_device} -s 1234)
+        llama_test(test-llama-archs NAME test-inkling-decode-rows-${inkling_path_name}-long
+            ARGS --inkling-path decode-rows/long --inkling-path-device ${inkling_path_device} -s 1234)
         foreach(inkling_case prompt unified outputs)
             llama_test(test-llama-archs NAME test-inkling-fuse-${inkling_path_name}-${inkling_case}
                 ARGS --inkling-path fuse/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
@@ -720,6 +722,17 @@ if (GGML_CUDA)
         -p "n_mats=384,n_used=8,b=[01],m=(1024|4608),n=(1|23|32),k=(4608|512),")
     set_tests_properties(test-inkling-moe-sorted-routes-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
         ENVIRONMENT "GGML_CUDA_MMVQ_EXPERT_SORT_23=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX=32")
+    # the same, split evenly (a down in blocks of 32: 576 of the hidden width a card) or by expert (96 whole a card), on
+    # the row kernel up to 32 rows and MMQ at a drafted step's 92
+    add_test(NAME test-inkling-moe-even-split-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID,MUL_MAT_ID_PARTITION
+        -p "n_mats=384,n_used=8,b=[01],(m=1152,n=(1|23|92),k=4608,|m=4608,n=(1|23|92),k=576,|m=4608,n=23,k=(4608|2304),.*first=288,local=96,)")
+    set_tests_properties(test-inkling-moe-even-split-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_EXPERT_SORT_23=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX=32;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
+    # and in the routes' own order, past 16 tokens in two halves of the row kernel's grid
+    add_test(NAME test-inkling-moe-even-split-rows-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
+        -p "n_mats=384,n_used=8,b=0,m=4608,n=23,k=576,")
+    set_tests_properties(test-inkling-moe-even-split-rows-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
     add_test(NAME test-inkling-norm-clip-cuda0 COMMAND test-backend-ops test -b CUDA0 -o NORM_CLIP)
     # the few-row K-quant group launch (Inkling 2's Q-input products) against the host, and against each matrix's own
     # launch bit for bit
@@ -828,6 +841,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     target_include_directories(test-backend-meta-split PRIVATE ${PROJECT_SOURCE_DIR}/src)
     if (GGML_CUDA)
         llama_test(test-backend-meta-split NAME test-backend-meta-permuted-read ARGS --permuted-read)
+        # a step's 96 reductions through host memory, with the host waiting two back and under GGML_CUDA_AR_SLOT_NO_SYNC, bit for bit
+        llama_test(test-backend-meta-split NAME test-backend-meta-reduction-queue ARGS --reduction-queue)
+        set_tests_properties(test-backend-meta-reduction-queue PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     add_test(NAME test-backend-meta-candidates COMMAND test-backend-meta-split --candidates)
     if (GGML_CPU)

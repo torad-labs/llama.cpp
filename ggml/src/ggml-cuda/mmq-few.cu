@@ -10,15 +10,20 @@
 // NVIDIA only: the kernel uses the NVIDIA int8 MMA fragment layout and cp.async.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+#include <cooperative_groups.h>
+
 using namespace ggml_cuda_mma;
 
-// Few-row MMQ: int8 MMA mat-mul for 2-24 src1 columns. A CUDA block has 16 src0 rows (32 for 2 column groups on large matrices).
+// Few-row MMQ: int8 MMA mat-mul for 2-32 src1 columns. A CUDA block has 16 src0 rows (32 for 2 column groups on large matrices).
 // Its warps split K in units of 256 values and copy raw src0 rows into their own cp.async ring, src1 is quantized to the MMA fragment layout.
 // MUL_MAT_ID: one column group per expert and CUDA block, for short rows the warps split the rows instead of K (64 rows per block).
+// When the row tiles do not fill the GPU, a cluster of up to 8 blocks splits K of one tile, and its first block adds the
+// others' sums from their shared memory in block order.
 
-static constexpr int MMQ_FEW_MAX_NCG = 3;  // max. number of column groups
+static constexpr int MMQ_FEW_MAX_NCG = 4;  // max. number of column groups
 static constexpr int MMQ_FEW_NROWS   = 16; // src0 rows of one MMA tile
 static constexpr int MMQ_FEW_NWARPS  = 4;
+static constexpr int MMQ_FEW_MAX_CLUSTER = 8; // the largest portable cluster
 
 template <ggml_type type>
 static constexpr __host__ __device__ int mmq_few_unit_size_of() {
@@ -45,7 +50,7 @@ static constexpr __host__ __device__ mmq_q8_1_ds_layout mmq_few_ds_layout(const 
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? MMQ_Q8_1_DS_LAYOUT_DS4 : MMQ_Q8_1_DS_LAYOUT_D4;
 }
 
-// Units of 256 values per ring stage: 1 for Q6_K, 3 column groups (fewer free registers) and 32-row tiles (2 blocks per SM), else 2.
+// Units of 256 values per ring stage: 1 for Q6_K, 3-4 column groups (fewer free registers) and 32-row tiles (2 blocks per SM), else 2.
 static constexpr __host__ __device__ int mmq_few_nunits_stage(const ggml_type type, const int ncg, const int nmt) {
     return type == GGML_TYPE_Q6_K || ncg > 2 || nmt > 1 ? 1 : 2;
 }
@@ -492,14 +497,14 @@ static __device__ __forceinline__ void mmq_few_vec_dot(const char * const (&x)[2
 #endif // defined(CP_ASYNC_AVAILABLE)
 
 // has_ids: MUL_MAT_ID, blockIdx.y is a pair of quantize_mmq_few_id_q8_1, its expert is the src0 channel and dst dims 1 and 2 are slot and token.
-// blk is the block's tile of src0 rows (blockIdx.x of a launch of one matrix).
+// blk is the block's blockIdx.x in a launch of one matrix: tile blk/csize, rank blk%csize of a cluster that splits its K.
 template <ggml_type type, int ncg, int nmt, bool has_ids>
 static __device__ __forceinline__ void mul_mat_q_few_impl(
         const char * x, const int4 * y_ptr, float * dst,
         const int nunits, const int nrows_x, const int ncols_dst, const int64_t stride_row_x, const int stride_col_dst,
         const int channel_ratio, const int64_t stride_channel_x, const int stride_channel_dst,
         const int sample_ratio, const int64_t stride_sample_x, const int stride_sample_dst, const bool x_is_constant, const int * pairs,
-        const int blk) {
+        const int blk, const int csize) {
 #if defined(CP_ASYNC_AVAILABLE)
     constexpr int nwarps    = MMQ_FEW_NWARPS;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -520,11 +525,14 @@ static __device__ __forceinline__ void mul_mat_q_few_impl(
     extern __shared__ char data_mmq_few[];
     char * ring = data_mmq_few + threadIdx.y*nstages*nbytes_stage;
 
+    // the blocks of a cluster split K of one row tile: warp gw of the cluster takes every (csize*nwarps)-th stage
     const bool ksplit   = mmq_few_ksplit(has_ids, nunits);
-    const int  row0_blk = blk*(ksplit ? nrows : nwarps*nrows);
+    const int  rank     = blk % csize;
+    const int  gw       = rank*nwarps + threadIdx.y;
+    const int  row0_blk = blk/csize*(ksplit ? nrows : nwarps*nrows);
     const int  row0     = ksplit ? row0_blk : row0_blk + threadIdx.y*nrows;
-    const int  iu_begin = ksplit ? nunits_stage*threadIdx.y : 0;
-    const int  iu_step  = ksplit ? nunits_stage*nwarps : nunits_stage;
+    const int  iu_begin = ksplit ? nunits_stage*gw : 0;
+    const int  iu_step  = ksplit ? nunits_stage*nwarps*csize : nunits_stage;
 
     const int channel_dst = blockIdx.y;
     const int sample_dst  = blockIdx.z;
@@ -667,7 +675,7 @@ static __device__ __forceinline__ void mul_mat_q_few_impl(
 
     ggml_cuda_pdl_lc();
 
-    // reduce the sums over the warps as one flat array
+    // reduce the sums over the warps as one flat array, then over the blocks of a cluster
     if (ksplit) {
         constexpr int nsum = nmt*ncg*4;
         float * sum_flat = &sum[0][0][0];
@@ -681,15 +689,40 @@ static __device__ __forceinline__ void mul_mat_q_few_impl(
             }
         }
         __syncthreads();
-        if (threadIdx.y > 0) {
-            return;
-        }
+        if (threadIdx.y == 0) {
 #pragma unroll
-        for (int w = 0; w < nwarps - 1; ++w) {
+            for (int w = 0; w < nwarps - 1; ++w) {
 #pragma unroll
-            for (int i = 0; i < nsum; ++i) {
-                sum_flat[i] += buf_sum[(w*nsum + i)*warp_size + threadIdx.x];
+                for (int i = 0; i < nsum; ++i) {
+                    sum_flat[i] += buf_sum[(w*nsum + i)*warp_size + threadIdx.x];
+                }
             }
+        }
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+        if (csize > 1) {
+            // each lane overwrites only the sums it has read
+            if (threadIdx.y == 0) {
+#pragma unroll
+                for (int i = 0; i < nsum; ++i) {
+                    buf_sum[i*warp_size + threadIdx.x] = sum_flat[i];
+                }
+            }
+            cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
+            cluster.sync();
+            if (rank == 0 && threadIdx.y == 0) {
+                for (int r = 1; r < csize; ++r) {
+                    const float * buf_r = cluster.map_shared_rank(buf_sum, r);
+#pragma unroll
+                    for (int i = 0; i < nsum; ++i) {
+                        sum_flat[i] += buf_r[i*warp_size + threadIdx.x];
+                    }
+                }
+            }
+            cluster.sync(); // the other blocks keep their shared memory until the first has read it
+        }
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+        if (threadIdx.y > 0 || rank > 0) {
+            return;
         }
     }
 
@@ -715,7 +748,7 @@ static __device__ __forceinline__ void mul_mat_q_few_impl(
 #else
     GGML_UNUSED_VARS(x, y_ptr, dst, nunits, nrows_x, ncols_dst, stride_row_x, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_dst, x_is_constant, pairs, blk);
+        sample_ratio, stride_sample_x, stride_sample_dst, x_is_constant, pairs, blk, csize);
     NO_DEVICE_CODE;
 #endif // defined(CP_ASYNC_AVAILABLE)
 }
@@ -726,10 +759,11 @@ static __global__ void mul_mat_q_few(
         const char * x, const int4 * y_ptr, float * dst,
         const int nunits, const int nrows_x, const int ncols_dst, const int64_t stride_row_x, const int stride_col_dst,
         const int channel_ratio, const int64_t stride_channel_x, const int stride_channel_dst,
-        const int sample_ratio, const int64_t stride_sample_x, const int stride_sample_dst, const bool x_is_constant, const int * pairs) {
+        const int sample_ratio, const int64_t stride_sample_x, const int stride_sample_dst, const bool x_is_constant, const int * pairs,
+        const int csize) {
     mul_mat_q_few_impl<type, ncg, nmt, has_ids>(x, y_ptr, dst, nunits, nrows_x, ncols_dst, stride_row_x, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_dst, x_is_constant, pairs,
-        blockIdx.x);
+        blockIdx.x, csize);
 }
 
 // The matrices of a group launch (ggml_cuda_mul_mat_q_few_group): the blocks of each one follow those of the one before.
@@ -742,12 +776,12 @@ struct mmq_few_group {
     int          blk_end[MMQ_FEW_GROUP_MAX]; // one past the last block of each matrix, the grid size past the last matrix
 };
 
-// Each block runs the tile of its matrix that the matrix's own launch runs at that blockIdx.x, so each output is the
-// same bit for bit. Constant indices keep the group in the parameter space.
+// Each block runs the tile of its matrix that the matrix's own launch runs at that blockIdx.x, in clusters of the csize
+// each matrix takes alone, so each output is the same bit for bit. Constant indices keep the group in the parameter space.
 template <ggml_type type, int ncg, int nmt>
 __launch_bounds__(MMQ_FEW_NWARPS*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_q_few_group(const mmq_few_group group, const int4 * y_ptr, const int nunits, const int ncols_dst,
-        const bool x_is_constant) {
+        const bool x_is_constant, const int csize) {
     const char * x              = group.x[0];
     float      * dst            = group.dst[0];
     int64_t      stride_row_x   = group.stride_row_x[0];
@@ -766,7 +800,57 @@ static __global__ void mul_mat_q_few_group(const mmq_few_group group, const int4
         }
     }
     mul_mat_q_few_impl<type, ncg, nmt, false>(x, y_ptr, dst, nunits, nrows_x, ncols_dst, stride_row_x, stride_col_dst,
-        1, 0, 0, 1, 0, 0, x_is_constant, nullptr, (int) blockIdx.x - blk0);
+        1, 0, 0, 1, 0, 0, x_is_constant, nullptr, (int) blockIdx.x - blk0, csize);
+}
+
+// Blocks of a cluster that split K of one row tile (nstages_row ring stages along a row, ntiles tiles over all channels).
+// A warp's stages run one after the other, each a load and a chain of MMAs that only the warps beside it hide: at 23
+// columns the 4 warps of a block took the 18 stages of a 4608 row in 5 steps, and Inkling 2's k (256 rows, 16 tiles)
+// took 4.7 us for 0.5 MB once its input was ready (RTX 5080). The cluster grows until its warps take a stage each, while
+// all its blocks are resident at once (2 an SM at the kernels' 200-255 registers). Hopper and newer: cluster launches.
+static int mmq_few_cluster_size(const int nstages_row, const int64_t ntiles) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_MMQ_FEW_CLUSTER_LEGACY");
+    const int device = ggml_cuda_get_device();
+    const int cc     = ggml_cuda_info().devices[device].cc;
+    if (legacy || !GGML_CUDA_CC_IS_NVIDIA(cc) || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_HOPPER ||
+            cc == GGML_CUDA_CC_GB10) {
+        return 1;
+    }
+    const int64_t slots = 2*int64_t(ggml_cuda_info().devices[device].nsm);
+    int csize = 1;
+    while (csize < MMQ_FEW_MAX_CLUSTER && MMQ_FEW_NWARPS*csize < nstages_row && ntiles*(csize + 1) <= slots) {
+        ++csize;
+    }
+    return csize;
+}
+
+// A launch in clusters of csize blocks, or a plain one for 1.
+template <typename Kernel, typename... Args>
+static void mmq_few_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & params, const int csize, Args &&... args) {
+    if (csize == 1) {
+        ggml_cuda_kernel_launch(kernel, params, std::forward<Args>(args)...);
+        return;
+    }
+    cudaLaunchAttribute attr[2];
+    cudaLaunchConfig_t  cfg = {};
+    cfg.gridDim          = params.block_nums;
+    cfg.blockDim         = params.block_dims;
+    cfg.dynamicSmemBytes = params.shmem;
+    cfg.stream           = params.stream;
+    cfg.attrs            = attr;
+    attr[cfg.numAttrs].id               = cudaLaunchAttributeClusterDimension;
+    attr[cfg.numAttrs].val.clusterDim.x = csize;
+    attr[cfg.numAttrs].val.clusterDim.y = 1;
+    attr[cfg.numAttrs].val.clusterDim.z = 1;
+    ++cfg.numAttrs;
+#if defined(GGML_CUDA_USE_PDL)
+    if (ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {
+        attr[cfg.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[cfg.numAttrs].val.programmaticStreamSerializationAllowed = 1;
+        ++cfg.numAttrs;
+    }
+#endif // defined(GGML_CUDA_USE_PDL)
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...));
 }
 
 // ggml_is_constant (static in ggml.c) on the tensor that a view points to
@@ -791,15 +875,19 @@ static void launch_mul_mat_q_few(const ggml_tensor * src0, const ggml_tensor * s
 
     const bool x_is_constant = mmq_few_is_constant(src0);
 
-    const int  nrows_blk = (mmq_few_ksplit(has_ids, nunits) ? 1 : MMQ_FEW_NWARPS)*nmt*MMQ_FEW_NROWS;
-    const dim3 block_nums((ne01 + nrows_blk - 1) / nrows_blk, has_ids ? npairs_max : ne12, ne13);
+    const int     nrows_blk = (mmq_few_ksplit(has_ids, nunits) ? 1 : MMQ_FEW_NWARPS)*nmt*MMQ_FEW_NROWS;
+    const int64_t ntiles    = (ne01 + nrows_blk - 1) / nrows_blk;
+    // MUL_MAT_ID keeps a block a tile
+    const int     csize     = has_ids ? 1 : mmq_few_cluster_size(nunits / mmq_few_nunits_stage(type, ncg, nmt), ntiles*ne12*ne13);
+
+    const dim3 block_nums(ntiles*csize, has_ids ? npairs_max : ne12, ne13);
     const dim3 block_dims(warp_size, MMQ_FEW_NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_q_few<type, ncg, nmt, has_ids>, params,
+    mmq_few_launch(mul_mat_q_few<type, ncg, nmt, has_ids>, params, csize,
         (const char *) src0->data, src1_q, (float *) dst->data,
         nunits, (int) ne01, (int) ne1, (int64_t) nb01, (int) (nb1/sizeof(float)),
         (int) (ne12/ne02), (int64_t) nb02, (int) (nb2/sizeof(float)),
-        (int) (ne13/ne03), (int64_t) nb03, (int) (nb3/sizeof(float)), x_is_constant, pairs);
+        (int) (ne13/ne03), (int64_t) nb03, (int) (nb3/sizeof(float)), x_is_constant, pairs, csize);
 }
 
 static int mmq_few_ncg(const int64_t ncols) {
@@ -841,6 +929,9 @@ static void launch_mul_mat_q_few_switch_ncg(const ggml_tensor * src0, const ggml
         case 3:
             launch_mul_mat_q_few<type, 3, 1>(src0, src1, dst, src1_q, stream);
             break;
+        case 4:
+            launch_mul_mat_q_few<type, 4, 1>(src0, src1, dst, src1_q, stream);
+            break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -849,6 +940,12 @@ static void launch_mul_mat_q_few_switch_ncg(const ggml_tensor * src0, const ggml
 // K-quants only, the types of the dense weights the groups were made for: each type is one more kernel a tile shape
 static constexpr bool mmq_few_group_type(const ggml_type type) {
     return type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+}
+
+// the cluster launch_mul_mat_q_few gives a flat MUL_MAT of src0 alone at this tile shape
+static int mmq_few_group_cluster_size(const ggml_tensor * src0, const int ncg, const int nmt) {
+    const int nunits = (int) (src0->ne[0] / QK_K);
+    return mmq_few_cluster_size(nunits / mmq_few_nunits_stage(src0->type, ncg, nmt), (src0->ne[1] + nmt*MMQ_FEW_NROWS - 1) / (nmt*MMQ_FEW_NROWS));
 }
 
 template <ggml_type type, int ncg, int nmt>
@@ -860,6 +957,9 @@ static void launch_mul_mat_q_few_group(ggml_tensor * const * dsts, const int n, 
     const int nbytes_shared = mmq_few_nbytes_shared(type, ncg, nmt);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_few_group<type, ncg, nmt>), nbytes_shared);
 
+    // the cluster each matrix takes alone, the same for all of them (ggml_cuda_mmq_few_group_fits)
+    const int csize = mmq_few_group_cluster_size(dsts[0]->src[0], ncg, nmt);
+
     mmq_few_group group = {};
     int  nblocks       = 0;
     bool x_is_constant = true;
@@ -870,7 +970,7 @@ static void launch_mul_mat_q_few_group(ggml_tensor * const * dsts, const int n, 
         group.stride_row_x[m]   = src0->nb[1];
         group.nrows_x[m]        = (int) src0->ne[1];
         group.stride_col_dst[m] = (int) (dsts[m]->nb[1]/sizeof(float));
-        nblocks += (int) ((src0->ne[1] + nmt*MMQ_FEW_NROWS - 1) / (nmt*MMQ_FEW_NROWS));
+        nblocks += (int) ((src0->ne[1] + nmt*MMQ_FEW_NROWS - 1) / (nmt*MMQ_FEW_NROWS))*csize;
         group.blk_end[m] = nblocks;
         x_is_constant = x_is_constant && mmq_few_is_constant(src0);
     }
@@ -881,7 +981,7 @@ static void launch_mul_mat_q_few_group(ggml_tensor * const * dsts, const int n, 
     const dim3 block_nums(nblocks, 1, 1);
     const dim3 block_dims(warp_size, MMQ_FEW_NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_q_few_group<type, ncg, nmt>, params, group, src1_q, nunits, (int) dsts[0]->ne[1], x_is_constant);
+    mmq_few_launch(mul_mat_q_few_group<type, ncg, nmt>, params, csize, group, src1_q, nunits, (int) dsts[0]->ne[1], x_is_constant, csize);
 }
 
 template <ggml_type type>
@@ -917,9 +1017,11 @@ bool ggml_cuda_mmq_few_group_fits(const ggml_tensor * first, const ggml_tensor *
             !flat(x) || !flat(y) || !flat(mm) || x->nb[0] != ggml_type_size(x->type) || mm->nb[0] != sizeof(float)) {
         return false;
     }
-    // the tile shape each would launch alone
+    // the tile shape and the cluster each would launch alone; 3 column groups at most, as the groups were made for
     const int ncg = mmq_few_ncg(y->ne[1]);
-    return mmq_few_nmt(x->type, ncg, x->ne[1]) == mmq_few_nmt(x0->type, ncg, x0->ne[1]);
+    const int nmt = mmq_few_nmt(x0->type, ncg, x0->ne[1]);
+    return ncg <= 3 && mmq_few_nmt(x->type, ncg, x->ne[1]) == nmt &&
+        mmq_few_group_cluster_size(x, ncg, nmt) == mmq_few_group_cluster_size(x0, ncg, nmt);
 }
 
 void ggml_cuda_mul_mat_q_few_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, const int n,
@@ -1069,8 +1171,9 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
     if (cc == GGML_CUDA_CC_GB10 && ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_GB10) {
         return 0;
     }
-    // with fewer than 8 units of 256 values per row the warps idle, MMVQ and MMQ are better there (MUL_MAT_ID splits the rows instead)
-    if (mmq_few_unit_size(type) == 0 || (!has_ids && ne00 < 8*QK_K)) {
+    // with fewer than 6 units of 256 values per row the warps idle, MMVQ and MMQ are better there (8 units: see
+    // ggml_cuda_should_use_mmq_few; MUL_MAT_ID splits the rows instead)
+    if (mmq_few_unit_size(type) == 0 || (!has_ids && ne00 < 6*QK_K)) {
         return 0;
     }
     if (cc == GGML_CUDA_CC_GB10) { // tuned on DGX Spark GB10, also for MUL_MAT_ID
@@ -1101,8 +1204,29 @@ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * 
     }
     const int64_t ncols     = ids ? ids->ne[1] : src1->ne[1];
     const int     min_ncols = ggml_cuda_mmq_few_min_ncols(src0->type, cc, src0->ne[0], ids != nullptr);
-    if (min_ncols == 0 || ncols < min_ncols || ncols > MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS) {
+    // GGML_CUDA_MMQ_FEW_MAX_COLS: most columns a MUL_MAT takes, past them MMQ; MUL_MAT_ID takes 24 tokens.
+    // GGML_CUDA_MMQ_FEW_CLUSTER_LEGACY=1: upstream's 24 columns and rows of 8 units or more, and no clusters
+    static const bool legacy_cluster = ggml_env_switch("GGML_CUDA_MMQ_FEW_CLUSTER_LEGACY");
+    static const int  max_ncols      = legacy_cluster ? std::min<int>(ggml_env_int("GGML_CUDA_MMQ_FEW_MAX_COLS"), 3*MMQ_FEW_NCOLS) :
+                                                        (int) ggml_env_int("GGML_CUDA_MMQ_FEW_MAX_COLS");
+    if (min_ncols == 0 || ncols < min_ncols || ncols > (ids ? 3*MMQ_FEW_NCOLS : max_ncols)) {
         return false;
+    }
+    if (!ids) {
+        // Past 24 columns MMQ is faster once the tiles outnumber the blocks resident at once (2 an SM). RTX 5080 (84 SMs),
+        // Q3_K-Q8_0 at 28-32 columns: 48 tiles (768 x 4608) 6.6-8.6 us against MMQ's 11.0-13.4, 256 (4096 x 14336) and 896
+        // (14336 x 4096) 4-15 % slower than MMQ.
+        const int64_t ntiles = (src0->ne[1] + MMQ_FEW_NROWS - 1) / MMQ_FEW_NROWS * src1->ne[2]*src1->ne[3];
+        const int     nsm    = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+        if (ncols > 3*MMQ_FEW_NCOLS && ntiles > 2*int64_t(nsm)) {
+            return false;
+        }
+        // Rows of 6-7 units leave a warp of 4 idle. Q4_K rows of 1536 on the RTX 5080: at 8-24 columns 256-4608 rows take
+        // 1.9-7.5 us against MMQ's 5.0-9.0; 8960 rows 6.8-9.3 against 8.9-10.5 at 8-16 columns but 13.3 against 11.9 at 24
+        // (past 4 tiles an SM); at 4 columns MMVQ is faster under 1536 rows.
+        if (src0->ne[0] < 8*QK_K && (legacy_cluster || ncols < 8 || (ncols > 2*MMQ_FEW_NCOLS && ntiles > 4*int64_t(nsm)))) {
+            return false;
+        }
     }
     // MUL_MAT_ID: the pairs are built in shared memory
     if (ids && (2*src0->ne[2] + 1)*sizeof(int) > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {

@@ -3,7 +3,9 @@
 // attention shape (48 query and 8 KV heads of 128, n_embd 4608, five sliding layers to a global one, kernel 4) is
 // created over the meta backend with no data, with its caches, and every tensor of the model and of its memory is
 // looked up by name: a name the table below does not know fails, and so does a tensor split another way than its
-// heads are, or mirrored where it should be split. The KV caches and the convolution state are split by KV heads.
+// heads are, or mirrored where it should be split. The KV caches and K's and V's convolution state are split by KV
+// heads; the hidden streams' state (the S state) and kernels are whole on every rank, or, with
+// LLAMA_INKLING2_HIDDEN_CONV_LEGACY, in the conv row split by channel as the KV heads are.
 //
 // The split is over two and four ranks evenly and over two at 3:7. Each layer's heads are those its attn_k is split
 // into, and a query head goes with its KV head: a tensor per query head has n_head/n_head_kv of them a KV head.
@@ -36,10 +38,17 @@ constexpr uint32_t n_layer   = 6;
 constexpr uint32_t n_ff_exp  = 2304;
 constexpr uint32_t n_expert  = 8;
 
-// LLAMA_INKLING2_EXPERT_SPLIT: each rank holds its share of the experts whole
+// each rank holds its share of the experts whole: always under LLAMA_INKLING2_EXPERT_SPLIT (forced), else where down's
+// blocks cannot share the hidden width evenly, unless LLAMA_INKLING2_EXPERT_SPLIT_LEGACY keeps the rows
+bool forced = false;
 bool by_expert = false;
+// LLAMA_INKLING2_HIDDEN_CONV_LEGACY: the hidden streams' state shares the conv row and splits by channel
+bool hidden_legacy = false;
 
-gguf_context_ptr inkling_gguf() {
+// the experts' hidden width each rank must hold when it is split evenly (0: only that the ranks cover it)
+int64_t expert_share = 0;
+
+gguf_context_ptr inkling_gguf(ggml_type down) {
     gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
     kv_writer ms(LLM_ARCH_INKLING2, gguf.get());
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,           n_embd);
@@ -57,6 +66,16 @@ gguf_context_ptr inkling_gguf() {
     }
     gguf_set_arr_data(gguf.get(), llama_arch_kv_name(LLM_ARCH_INKLING2, LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN).c_str(),
             GGUF_TYPE_BOOL, swa.data(), swa.size());
+    if (down != GGML_TYPE_F32) {
+        // the down projections' type, which sets the experts' split: the fixture's other weights stay F32
+        ggml_init_params params = {ggml_tensor_overhead()*n_layer, nullptr, true};
+        ggml_context_ptr ctx(ggml_init(params));
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), down, n_ff_exp, n_embd, n_expert);
+            ggml_set_name(t, ("blk." + std::to_string(il) + ".ffn_down_exps.weight").c_str());
+            gguf_add_tensor(gguf.get(), t);
+        }
+    }
     return gguf;
 }
 
@@ -66,6 +85,7 @@ void no_data(ggml_tensor *, void *) {}
 struct expected {
     int axis;
     std::vector<std::vector<int64_t>> segments; // [segment][rank]; empty: only that the ranks' slices cover the axis
+    uint32_t nr = 1; // the times each segment repeats
 };
 
 std::vector<int64_t> times(const std::vector<int64_t> & heads, int64_t per_head) {
@@ -106,17 +126,31 @@ bool expect(const std::string & name, const llama_hparams & hp, const std::vecto
     } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.attn_(k|v)_conv_proj\\.weight"))) {
         out = {1, {times(kv, kernel)}};
     } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.(attn|ffn)_post_conv\\.weight"))) {
-        out = {1, {times(kv, channels)}};
+        // the hidden streams' kernels: whole on every rank, as their state (cache_s) is, or split as the legacy row
+        out = hidden_legacy ? expected{1, {times(kv, channels)}} : expected{GGML_BACKEND_SPLIT_AXIS_MIRRORED, {}};
     } else if (std::regex_match(name, std::regex("cache_r_l\\d+"))) {
-        // the state's streams: K, V, the attention's and the feed-forward's hidden stream, kernel - 1 columns each
-        out = {0, {times(kv, (kernel - 1)*head_dim), times(kv, (kernel - 1)*head_dim),
-                   times(kv, (kernel - 1)*channels), times(kv, (kernel - 1)*channels)}};
+        // the state's streams: K, V, and in the legacy row the attention's and the feed-forward's hidden stream, kernel - 1
+        // columns each
+        out = {0, {times(kv, (kernel - 1)*head_dim), times(kv, (kernel - 1)*head_dim)}};
+        if (hidden_legacy) {
+            out.segments.push_back(times(kv, (kernel - 1)*channels));
+            out.segments.push_back(times(kv, (kernel - 1)*channels));
+        }
     } else if (by_expert && std::regex_match(name, std::regex("blk\\.\\d+\\.ffn_(gate_up|down)_exps\\.weight"))) {
         out = {2, {std::vector<int64_t>(kv.size(), n_expert/kv.size())}};
-    } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.ffn_gate_up_exps\\.weight|output\\.weight"))) {
+    } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.ffn_gate_up_exps\\.weight"))) {
+        // gate and up, each split as down's hidden width is
+        out = {1, {}, 2};
+        if (expert_share) {
+            out.segments = {std::vector<int64_t>(kv.size(), expert_share)};
+        }
+    } else if (std::regex_match(name, std::regex("output\\.weight"))) {
         out = {1, {}};
     } else if (std::regex_match(name, std::regex("blk\\.\\d+\\.ffn_down_exps\\.weight"))) {
         out = {0, {}};
+        if (expert_share) {
+            out.segments = {std::vector<int64_t>(kv.size(), expert_share)};
+        }
     } else {
         return false;
     }
@@ -144,7 +178,9 @@ bool check(const ggml_tensor * t, const llama_meta_device_get_split_state_userda
     expected want;
     bool ok = expect(t->name, ud.model->hparams, kv, q, want);
     if (ok && std::regex_match(t->name, std::regex("cache_s_l\\d+"))) {
-        ok = ggml_nelements(t) == 0; // the recurrent memory's S state, which Inkling has none of
+        // the recurrent memory's S state: the two hidden streams' last kernel - 1 positions, none in the legacy row
+        const int64_t width = hidden_legacy ? 0 : 2*int64_t(n_embd)*(ud.model->hparams.n_shortconv_l_cache - 1);
+        ok = t->ne[0] == width;
     }
     if (ok && want.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
         ok = s.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
@@ -160,7 +196,7 @@ bool check(const ggml_tensor * t, const llama_meta_device_get_split_state_userda
         if (ok && !want.segments.empty()) {
             ok = s.n_segments == want.segments.size();
             for (uint32_t seg = 0; ok && seg < s.n_segments; ++seg) {
-                ok = s.nr[seg] == 1;
+                ok = s.nr[seg] == want.nr;
                 for (size_t j = 0; ok && j < n; ++j) {
                     ok = s.ne[seg*n + j] == want.segments[seg][j];
                 }
@@ -182,8 +218,12 @@ bool check(const ggml_tensor * t, const llama_meta_device_get_split_state_userda
     return ok;
 }
 
-bool test_split(ggml_backend_dev_t gpu, size_t n_ranks, const std::vector<float> & tensor_split) {
-    auto gguf = inkling_gguf();
+bool test_split(ggml_backend_dev_t gpu, size_t n_ranks, const std::vector<float> & tensor_split,
+        ggml_type down = GGML_TYPE_F32, bool even = false) {
+    auto gguf = inkling_gguf(down);
+    const bool equal = std::all_of(tensor_split.begin(), tensor_split.end(), [&](float r) { return r == tensor_split[0]; });
+    by_expert = forced || (equal && n_ff_exp/n_ranks % ggml_blck_size(down) != 0 && !getenv("LLAMA_INKLING2_EXPERT_SPLIT_LEGACY"));
+    expert_share = even && !by_expert ? n_ff_exp/n_ranks : 0;
     std::vector<ggml_backend_dev_t> devs(n_ranks, gpu);
     devs.push_back(nullptr);
     llama_model_params mparams = llama_model_default_params();
@@ -280,8 +320,10 @@ bool test_split(ggml_backend_dev_t gpu, size_t n_ranks, const std::vector<float>
     if (!tensor_split.empty()) {
         split = std::to_string(int(tensor_split[0])) + ":" + std::to_string(int(tensor_split[1]));
     }
-    printf("%s inkling2 tensor split, %zu ranks %s%s: %d weights and %d caches as their heads are split\n",
-            ok ? "ok  " : "FAIL", n_ranks, split.c_str(), by_expert ? ", experts whole" : "", n_weights, n_caches);
+    printf("%s inkling2 tensor split, %zu ranks %s, %s down%s%s%s: %d weights and %d caches as their heads are split\n",
+            ok ? "ok  " : "FAIL", n_ranks, split.c_str(), ggml_type_name(down), by_expert ? ", experts whole" : "",
+            expert_share ? ", hidden width even" : "", hidden_legacy ? ", hidden state in the conv row" : "",
+            n_weights, n_caches);
     return ok;
 }
 
@@ -289,14 +331,37 @@ bool test_split(ggml_backend_dev_t gpu, size_t n_ranks, const std::vector<float>
 
 bool test_inkling_split_decisions(ggml_backend_dev_t gpu) {
     llama_backend_init();
-    bool ok = test_split(gpu, 2, {});
-    ok = test_split(gpu, 4, {}) && ok;
+    // the experts' hidden width of 2,304 splits evenly in whole blocks of 32 or more (576 = 9 x 64 a rank of four), but
+    // not at 3:7 or under LLAMA_SPLIT_FFN_EVEN_LEGACY. Q4_K's blocks of 256 cannot share it (1,152 a rank of two is 4.5
+    // of them), so its experts go whole to the ranks, or by rows under LLAMA_INKLING2_EXPERT_SPLIT_LEGACY
+    bool ok = test_split(gpu, 2, {}, GGML_TYPE_F32, true);
+    ok = test_split(gpu, 4, {}, GGML_TYPE_F32, true) && ok;
     ok = test_split(gpu, 2, {3.0f, 7.0f}) && ok;
+    for (ggml_type down : {GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0}) {
+        ok = test_split(gpu, 2, {}, down, true) && ok;
+        ok = test_split(gpu, 4, {}, down, true) && ok;
+    }
+    ok = test_split(gpu, 4, {1.0f, 1.0f, 1.0f, 1.0f}, GGML_TYPE_Q4_0, true) && ok;
+    ok = test_split(gpu, 2, {}, GGML_TYPE_Q4_K) && ok;
+    ok = test_split(gpu, 4, {}, GGML_TYPE_Q4_K) && ok;
+    ok = test_split(gpu, 2, {3.0f, 7.0f}, GGML_TYPE_Q4_K) && ok;
+    setenv("LLAMA_INKLING2_EXPERT_SPLIT_LEGACY", "1", 1);
+    ok = test_split(gpu, 4, {}, GGML_TYPE_Q4_K) && ok;
+    unsetenv("LLAMA_INKLING2_EXPERT_SPLIT_LEGACY");
+    setenv("LLAMA_SPLIT_FFN_EVEN_LEGACY", "1", 1);
+    ok = test_split(gpu, 4, {}, GGML_TYPE_Q4_0) && ok;
+    unsetenv("LLAMA_SPLIT_FFN_EVEN_LEGACY");
     setenv("LLAMA_INKLING2_EXPERT_SPLIT", "1", 1);
-    by_expert = true;
+    forced = true;
     ok = test_split(gpu, 2, {}) && ok;
     ok = test_split(gpu, 4, {}) && ok;
+    ok = test_split(gpu, 4, {}, GGML_TYPE_Q4_0) && ok;
     unsetenv("LLAMA_INKLING2_EXPERT_SPLIT");
-    by_expert = false;
+    forced = false;
+    setenv("LLAMA_INKLING2_HIDDEN_CONV_LEGACY", "1", 1);
+    hidden_legacy = true;
+    ok = test_split(gpu, 4, {}) && ok;
+    unsetenv("LLAMA_INKLING2_HIDDEN_CONV_LEGACY");
+    hidden_legacy = false;
     return ok;
 }

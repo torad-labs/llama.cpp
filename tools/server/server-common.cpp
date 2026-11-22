@@ -168,6 +168,7 @@ json server_slot_stats::to_json() const {
         base["draft_verify_attempts"] = n_draft_verif_attempts;
         base["draft_verify_rows_total"] = n_draft_verif_rows;
         base["draft_replay_attempts"] = n_draft_replay_attempts;
+        base["draft_reject_rows"] = n_draft_reject_rows;
         for (size_t i = 0; i < draft_verify_rows.size(); ++i) {
             base["draft_verify_rows"][i < 8 ? std::to_string(i+1) : ">8"] = draft_verify_rows[i];
         }

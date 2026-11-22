@@ -506,7 +506,8 @@ struct server_slot {
 
     llama_tokens spec_draft;
 
-    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+    // the draft's distribution of each token in spec_draft, for rejection; empty for a drafter that gives none. Either
+    // empty or one entry a token of spec_draft: change the draft's length through spec_draft_cut and spec_draft_pad
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
@@ -769,6 +770,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
             spec_n_real = 0;
             spec_i_batch.clear();
             spec_ckpt.clear();
@@ -968,6 +970,21 @@ struct server_slot {
         return n_draft_max;
     }
 
+    // keeps the draft's first n tokens and their distributions
+    void spec_draft_cut(size_t n) {
+        spec_draft.resize(std::min(n, spec_draft.size()));
+        spec_draft_q.resize(std::min(n, spec_draft_q.size()));
+    }
+
+    // pads the draft to n tokens with pad, proposed with certainty: rejection keeps a pad with probability p(pad) and
+    // else draws from p without it, so the token is a sample of p either way
+    void spec_draft_pad(size_t n, llama_token pad) {
+        if (!spec_draft_q.empty()) {
+            spec_draft_q.resize(n, std::vector<llama_token_data>{ { pad, 0.0f, 1.0f } });
+        }
+        spec_draft.resize(n, pad);
+    }
+
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any.
     // n_draft_rows > 0 pads a shorter draft with copies of its last token up to that many draft rows, so every slot of
     // the step brings the same row count and the step stays one forward pass; a pad is verified like a draft token,
@@ -981,7 +998,7 @@ struct server_slot {
             if (eog != spec_draft.end()) {
                 // Leave EOG as the final sample, never an evaluated/cached draft.
                 // This also lets a checkpoint replay finish instead of restoring at the same EOG again.
-                spec_draft.erase(eog, spec_draft.end());
+                spec_draft_cut(eog - spec_draft.begin());
                 spec_is_replay = false; // the replay's extra terminal sample is no longer a draft token
             }
         }
@@ -997,7 +1014,7 @@ struct server_slot {
                     ++pad;
                 }
             }
-            spec_draft.resize(n_draft_rows, pad);
+            spec_draft_pad(n_draft_rows, pad);
         }
 
         bool add_ok = true;
@@ -5055,7 +5072,7 @@ private:
             const int32_t removed = last + 1 - end;
             SLT_WRN(slot, "shortening verification from %zu to %d tokens to fit the decode batch\n", slot.spec_i_batch.size(), end - off);
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - removed);
-            slot.spec_draft.resize(end - off - 1);
+            slot.spec_draft_cut(end - off - 1);
             slot.spec_n_real = std::min(slot.spec_n_real, slot.spec_draft.size());
             slot.spec_i_batch.resize(end - off);
             if (slot.spec_draft.empty()) {
@@ -5509,7 +5526,7 @@ private:
 
                 const int n_draft_max = slot.get_n_draft_max(n_generating, n_draft_per_slot);
                 if ((int) slot.spec_draft.size() > std::max(0, n_draft_max)) {
-                    slot.spec_draft.resize(std::max(0, n_draft_max));
+                    slot.spec_draft_cut(std::max(0, n_draft_max));
                     if (slot.spec_draft.empty()) {
                         slot.spec_is_replay = false;
                     }
@@ -6794,7 +6811,7 @@ private:
             (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
     }
 
-    // The slots that verify a draft by sampling its rows and matching do it side by side. Every row is a sample over the
+    // The slots that verify a draft by sampling its rows, matching or by rejection, do it side by side. Every row is a sample over the
     // whole vocabulary on the CPU, and slot after slot they were a quarter of a round at 23 sessions (74 ms of 305 on
     // four cards, 2026-11-19). A slot left out here verifies in post_decode as before.
     std::vector<spec_verify_result> verify_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
@@ -6815,14 +6832,18 @@ private:
                     !common_sampler_backend_passive(slot.smpl.get())) {
                 continue;
             }
-            // a replay or a draft that came with its distribution is verified by rejection
-            if (slot.use_spec_rejection() && (slot.spec_is_replay || !slot.spec_draft_q.empty())) {
+            // a replay is verified in post_decode, and a draft that came with its distribution by rejection here.
+            // LLAMA_SPEC_REJECT_SERIAL_LEGACY=1: by rejection in post_decode, slot after slot
+            static const bool reject_serial = ggml_env_switch("LLAMA_SPEC_REJECT_SERIAL_LEGACY");
+            const bool reject = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+            if (slot.use_spec_rejection() && (slot.spec_is_replay || (reject && reject_serial))) {
                 continue;
             }
             common_speculative_verify seq;
             seq.smpl        = slot.smpl.get();
             seq.draft       = &slot.spec_draft;
             seq.n_remaining = slot.n_remaining();
+            seq.draft_q     = reject ? &slot.spec_draft_q : nullptr;
             for (const auto idx : slot.spec_i_batch) {
                 const auto row = llama_get_sampling_row_ith(ctx_tgt, idx - off);
                 if (!row.logits || row.token != LLAMA_TOKEN_NULL) {
@@ -7072,10 +7093,15 @@ private:
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    accepted = common_speculative_sample_and_accept_rejection(
+                            slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q, slot.n_remaining());
                 } else {
                     accepted = common_speculative_sample_and_accept(
                             slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.n_remaining(), on_sample);
+                }
+                if (use_rejection && synth_probs.empty()) {
+                    // the draft rows rejection decided: those kept, and the one it drew in place of a draft token
+                    slot.stats.n_draft_reject_rows += std::min(accepted.size(), common_speculative_n_check(n_draft, slot.n_remaining()));
                 }
                 // here, before a checkpoint restore rewinds the sampler to its passive state: the replay must sample the
                 // row after the switching token on the CPU, or it stops at the same token on every pass
@@ -7108,6 +7134,7 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_draft_q.clear(); // a replay is verified without them
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -7143,6 +7170,7 @@ private:
             }
 
             const auto ids = std::move(slot.spec_draft);
+            slot.spec_draft_q.clear();
 
             // a landed pad is a token the target sampled, kept in the reply, but not a draft: the stats count drafts
             size_t n_accepted = std::min(ids.size() - 1, slot.spec_n_real);
@@ -7328,6 +7356,7 @@ private:
         metrics.n_draft_tokens      += slot.stats.n_draft_tokens;
         metrics.n_draft_accepted    += slot.stats.n_draft_accepted;
         metrics.n_draft_verif_steps += slot.stats.n_draft_verif_steps;
+        metrics.n_draft_reject_rows += slot.stats.n_draft_reject_rows;
 
         auto & dst = metrics.n_accepted_per_pos;
         const auto & src = slot.n_accepted_per_pos;

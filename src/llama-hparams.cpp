@@ -244,6 +244,11 @@ uint32_t llama_hparams::n_embd_r() const {
 }
 
 uint32_t llama_hparams::n_embd_s() const {
+    if (n_sconv_channels != 0) {
+        // Inkling 2: the hidden streams' convolution state, a row of its own (0 when they share the conv row)
+        return n_sconv_hidden * (n_shortconv_l_cache - 1);
+    }
+
     if (wkv_head_size != 0) {
         // corresponds to RWKV's wkv_states size
         return n_embd * wkv_head_size;

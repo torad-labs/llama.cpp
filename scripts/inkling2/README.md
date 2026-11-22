@@ -12,6 +12,22 @@ python3 scripts/inkling2/serve.py --profile tensor-4 \
 
 The per-session window is 294,912 tokens. A 262,144-token input leaves 32,768 tokens for reasoning and output. The server has no additional reply cap. Automatic slot selection allows active text sessions to share a common prefix and retain distinct continuations. The server takes a rollback checkpoint every 32,768 prompt tokens and uses sliced host transfers with BF16 reductions. See the [physical results](../../docs/torad/research/inkling-2-small/12-four-card-serving.md) for independent versus shared prompts, cold-reader latency, and numerical behavior after eviction.
 
+### The routed experts over four cards
+
+Under `-sm tensor` each card holds a share of every routed expert's hidden width of 2,304, which is the down projection's K. Q3_K_M's Q4_K and Q5_K down projections come in blocks of 256, which four cards can only share 512/512/512/768, and every layer waits for the card with 768: it reads 1.33x the average card's expert bytes. The engine splits such a pack by expert instead, 96 of the 384 experts whole on each card (`LLAMA_INKLING2_EXPERT_SPLIT_LEGACY=1` keeps the uneven rows). How even the cards are then follows each step's routing: by the stock imatrix's expert counts, the busiest card reads about 1.15x the average at 23 rows and 1.07x at a drafted step's 92.
+
+A down projection in blocks of 32 is split evenly, 576 of the width a card, at every row count. The pack's down type is a choice of quality against size; `pack.py` keeps Q3_K_M's (`--expert-down k-quant`, the default) unless told otherwise:
+
+| down projections | how | quality: KL from BF16 | size | KV pool | one card's experts, 23 / 92 rows |
+|---|---|---|---|---|---|
+| Q4_K, Q5_K in layers 0-2 (served) | `pack.py`, default | 0.0342 | as served | as served | 1,844 / 5,108 us (by expert: about 1,800 / 4,100) |
+| IQ4_NL, Q5_0 in layers 0-2 | `pack.py --expert-down iq4_nl` | 0.0389 | as served | as served | 1,450 / 4,312 us |
+| Q4_1, Q5_1 in layers 0-2, from BF16 | `pack.py --expert-down q4_1` | 0.0320 | +12.2 GB, 3.06 GB a card | about 370,000 fewer tokens (12%) | 1,467 / 4,313 us |
+| Q4_1, Q5_1 from the served pack | `even_down.py PACK OUT` | as served (each scale rounded once to f16) | +12.2 GB, 3.06 GB a card | about 370,000 fewer tokens (12%) | 1,467 / 4,313 us |
+| Q4_0, Q5_0 in layers 0-2 | `pack.py --expert-down q4_0` | 0.0541 | as served | as served | 1,418 / 4,251 us |
+
+The quality column is the down projections' KL divergence from BF16 on Gemma 4 E2B with every other weight Q8_0 and an imatrix, on text the imatrix did not see: a stand-in, as no Inkling weights were at hand. The KV pool column is the tensor-4 profile's 3,014,656-token F16 pool, which has to give up the extra weights' memory. The times are one RTX 5060 Ti's gate/up and down products for one layer on one card, the busiest card for the served pack. `even_down.py` needs no source checkpoint; it reads the served pack and writes a new one.
+
 ## Run qualification
 
 Run from the checkout on the test host. Use the server and adjacent CUDA libraries built from this fork, the calibrated Q3_K_M GGUF for the pinned abliterated revision, and its F16 projector. For a split GGUF, use `--model /path/to/first-shard.gguf`. Use `--mmproj` when the projector has a different filename.

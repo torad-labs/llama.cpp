@@ -77,6 +77,9 @@ def arguments(argv=None):
     parser.add_argument("--draft-model", type=Path, help="An explicit Inkling DSpark GGUF with its own vocabulary tensors")
     parser.add_argument("--draft-depth", type=int, choices=range(1, 8), default=3,
                         help="Maximum DSpark proposals per verification (default: 3)")
+    parser.add_argument("--draft-sampling", choices=["probabilistic", "greedy"], default="probabilistic",
+                        help="probabilistic samples the draft at the request's temperature and verifies by rejection; "
+                             "greedy proposes the draft's first choice and verifies by matching (default: probabilistic)")
     parser.add_argument("--draft-device", choices=["CUDA0", "CUDA1", "CUDA2", "CUDA3"], default="CUDA3",
                         help="Device for the draft model (default: CUDA3)")
     parser.add_argument("--mmproj", type=Path, help="A local vision projector in place of the packs' F16 one")
@@ -255,7 +258,7 @@ def make_plan(args):
     if draft is not None:
         argv += ["--spec-type", "draft-dspark", "--spec-draft-model", own_path(draft),
                  "--spec-draft-n-max", str(args.draft_depth), "--spec-draft-n-min", "1",
-                 "--spec-draft-p-min", "0", "--spec-draft-sampling", "greedy",
+                 "--spec-draft-p-min", "0", "--spec-draft-sampling", args.draft_sampling,
                  "--spec-draft-device", args.draft_device, "--spec-draft-ngl", "99",
                  "--spec-draft-ubatch", str(DRAFT_UBATCH_SIZE),
                  "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]

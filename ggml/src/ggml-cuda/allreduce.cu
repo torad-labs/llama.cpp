@@ -863,10 +863,10 @@ static __global__ void ggml_cuda_ar_add_kernel_n(
 // Number of slots in the event / arrival ring.  Two slots is sufficient:
 // lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
 // slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
-// from AR N-2 by the time we get to AR N.  The chunked kernel takes its slot
-// from the device (ggml_cuda_ar_kernel); for the copy-engine path,
-// acquire_slot's cudaEventSynchronize on ev.ker for both devices makes that
-// consumption explicit before the slot's events are recorded again.
+// from AR N-2 by the time we get to AR N.  The chunked and LL kernels take
+// their slot from the device (the token), so the host never waits for them.
+// The copy-engine path's slot is only events, which it may record again as
+// soon as the waits on their last record are issued (ggml_cuda_ar_acquire_slot).
 static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 
 // Maximum chunk size (bytes per GPU) handled by one chunked kernel launch.
@@ -981,6 +981,7 @@ struct ggml_cuda_ar_pipeline {
     uint64_t n_split;         // reductions that went to owners and were gathered from them (GGML_CUDA_AR_SPLIT_REDUCE)
     uint64_t n_wire_q8;       // reductions to every rank that crossed in 8-bit blocks (wire_q8)
     uint64_t call_count;
+    bool     slot_no_sync;     // GGML_CUDA_AR_SLOT_NO_SYNC: the host does not wait for the copy-engine call two back to end
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -1041,13 +1042,29 @@ struct ggml_cuda_ar_pipeline {
     int *                    counter[GGML_CUDA_MAX_DEVICES];
 };
 
-// Wait for the previous use of the slot unless the caller orders all storage reuse on its streams.
+// The copy-engine path's event slot for its next call, once every device has
+// ended the call two back: a wait a device a reduction, so the host queues no
+// more than two reductions ahead. The wait guards no buffer. Every event of a
+// slot is recorded and waited on within one call, a cudaStreamWaitEvent waits
+// for the record current when it was called, and the buffers a call reuses
+// are held by the devices: a sender waits for its peers' last read of its
+// staging (host_large_read_done, recv_peer_done), a receiver for its own last
+// add (dev_tmp_kernel_done), the compute stream for the last send. So
+// GGML_CUDA_AR_SLOT_NO_SYNC=1 drops it and the host queues a whole step. It
+// stays opt-in because it was slower where measured with ranks on two cards:
+// on an RTX 5080 and an RTX 5070 Ti that drives a desktop, 23 x 4,096 on the
+// BF16 wire, 43.6 us a reduction against 38.9 at the median (Nov 21, 2026),
+// the 5070 Ti starting its receive 12.4 us after the 5080's send had ended;
+// with both ranks on the 5080 alone it was faster, 36.4 against 37.4. On four
+// cards the host already ran over 1 ms ahead with the wait. A caller that orders
+// its storage reuse on its streams drops it too (stream_ordered: the host
+// route's owned rows under GGML_CUDA_AR_HOST_OWNER_STREAM_ORDERED).
 static int ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p, bool stream_ordered = false) {
     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
     p->call_count++;
 
-    if (pool_lapped && !stream_ordered) {
+    if (pool_lapped && !stream_ordered && !p->slot_no_sync) {
         for (int i = 0; i < p->n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
             CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
@@ -1344,6 +1361,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         p->copy_chunk_bytes = GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN;
     }
     p->copy_tail_legacy = ggml_env_switch("GGML_CUDA_AR_COPY_TAIL_LEGACY");
+    p->slot_no_sync = ggml_env_switch("GGML_CUDA_AR_SLOT_NO_SYNC");
     // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
@@ -1678,9 +1696,9 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // The copy-engine path's last step on device i, once the compute stream waits
 // for the peer's share in dev_tmp[i]: dst_buf += that share, on the compute
 // stream.  Records dev_tmp-released, which the next call waits for before
-// dev_tmp[i] is overwritten, and AR-done as ev.ker for acquire_slot's
-// pool-wraparound sync.  On the Q8 wire the share the device sent, own, is
-// summed as its peers received it, so dst_buf is written, not added to: each
+// dev_tmp[i] is overwritten, and AR-done as ev.ker, which the host waits on
+// two calls later unless GGML_CUDA_AR_SLOT_NO_SYNC (ggml_cuda_ar_acquire_slot).  On the
+// Q8 wire the share the device sent, own, is summed as its peers received it, so dst_buf is written, not added to: each
 // peer's blocks lie a whole copy_bytes apart in dev_tmp[i], in rank order.
 template <typename T_src, typename T_dst, bool owned_rows = false>
 static void ggml_cuda_ar_copy_add(
@@ -2374,8 +2392,9 @@ bool ggml_cuda_ar_allreduce(
     }
     if (ggml_cuda_ar_try_hc_post(p, backends, tensors, next, use_bf16, use_copy_engine)) { return true; }
 
-    // The copy-engine path syncs the host on its events, which no CUDA graph
-    // can hold (ggml_cuda_ar_capturable).
+    // The copy-engine path's streams wait on events recorded on the other
+    // devices' streams, which a graph captured on one device cannot hold
+    // (ggml_cuda_ar_capturable).
     GGML_ASSERT(!use_copy_engine || !ggml_cuda_ar_capturing(backends[0]));
 
     bool compute_flag[GGML_CUDA_MAX_DEVICES] = {};

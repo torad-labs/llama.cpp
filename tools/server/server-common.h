@@ -655,6 +655,7 @@ struct server_slot_stats {
     uint64_t n_draft_verif_attempts = 0; // includes work discarded by checkpoint restore
     uint64_t n_draft_verif_rows = 0;
     uint64_t n_draft_replay_attempts = 0;
+    uint64_t n_draft_reject_rows = 0; // draft rows rejection sampling decided; 0 where every draft was matched
     std::array<uint64_t, 9> draft_verify_rows = {}; // widths 1..8, then >8
 
     void record_draft_verification(size_t rows, bool replay) {
@@ -782,6 +783,7 @@ struct server_metrics {
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
+    uint64_t n_draft_reject_rows = 0; // Draft rows verified by rejection sampling
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
 
     void init() {

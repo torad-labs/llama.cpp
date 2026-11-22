@@ -793,8 +793,13 @@ static bool ggml_backend_meta_owns_rows(const ggml_tensor * tensor) {
 static bool ggml_backend_meta_slice_view(const ggml_tensor * tensor, const ggml_backend_meta_split_state & source,
         size_t n_devices, bool owns_rows, ggml_backend_meta_view_layout & layout) {
     const ggml_tensor * root = ggml_backend_meta_view_base(tensor);
+    // A weight the callback splits in one segment also holds a contiguous run a device along the split axis (the rows of
+    // a head that a model reads fewer of than it stores, as Inkling 2's padded vocabulary)
+    const bool weight_run = root != nullptr && root->view_src == nullptr && root->buffer != nullptr &&
+        ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        source.n_segments == 1 && source.nr[0] == 1;
     if (tensor->op != GGML_OP_VIEW || root == nullptr || !ggml_is_contiguous(root) ||
-            source.axis < 0 || source.axis >= GGML_MAX_DIMS || !owns_rows) {
+            source.axis < 0 || source.axis >= GGML_MAX_DIMS || !(owns_rows || weight_run)) {
         return false;
     }
     for (int d = source.axis + 1; d < GGML_MAX_DIMS; ++d) { if (root->ne[d] != 1) { return false; } }
@@ -2006,6 +2011,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         pending.pop_back();
     }
     return ggml_backend_meta_cached_split(tensor, assume_sync).first;
+}
+
+ggml_tensor * ggml_backend_meta_mirrored_tensor(const ggml_tensor * tensor, ggml_backend_dev_t dev) {
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer) ||
+            ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return nullptr;
+    }
+    for (size_t j = 0; j < ggml_backend_meta_buffer_n_bufs(tensor->buffer); ++j) {
+        ggml_backend_buffer_t simple = ggml_backend_meta_buffer_simple_buffer(tensor->buffer, j);
+        if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(simple)) == dev) {
+            return ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        }
+    }
+    return nullptr;
 }
 
 // A pad along the axis its source is split by gathers the source. Each device pads its own slice out to the whole
@@ -4184,6 +4203,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+            if (backend_ctx->trace_graphs) {
+                using collective = ggml_backend_meta_context::collective;
+                // a step's collective is on its last node; bytes are the whole tensor's, as one device holds it
+                size_t n_reduce = 0, n_owned = 0, n_gather = 0, reduce_bytes = 0, gather_bytes = 0;
+                for (size_t k = 0; k < backend_ctx->collectives.size(); ++k) {
+                    const int last = k + 1 < offsets.size() ? offsets[k + 1] - 1 : cgraph->n_nodes - 1;
+                    if (backend_ctx->collectives[k] == collective::reduce) {
+                        n_reduce++;
+                        n_owned += backend_ctx->owned[k].valid || backend_ctx->owned[k].rows;
+                        reduce_bytes += ggml_nbytes(cgraph->nodes[last]);
+                    } else if (backend_ctx->collectives[k] == collective::gather) {
+                        n_gather++;
+                        gather_bytes += ggml_nbytes(cgraph->nodes[last]);
+                    }
+                }
+                GGML_LOG_INFO("graph_trace layer=meta event=collectives context=%p uid=%llu nodes=%d subgraphs=%zu "
+                    "reduces=%zu owned=%zu reduce_bytes=%zu gathers=%zu gather_bytes=%zu\n",
+                    (void *) backend_ctx, (unsigned long long) cgraph->uid, cgraph->n_nodes, n_subgraphs, n_reduce, n_owned,
+                    reduce_bytes, n_gather, gather_bytes);
+            }
         }
 
         backend_ctx->uid         = cgraph->uid;
