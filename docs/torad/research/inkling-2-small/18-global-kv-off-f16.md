@@ -148,13 +148,14 @@ Arms prepared for inkling-small's shared four-card window (each = one serve over
 flags, then its capture stack; `replay_compare.py` takes the stacks as files). Every arm builds on the box from
 `refs/heads/window-base` — the known-committed anchor llama-lead requires — and names that sha in its output header,
 which the runner prints for it (`scripts/inkling2/kv1b_run.sh`); the anchor moves only by a fresh push of the current
-committed tip. A stock F16 + wire bf16; B second
-identical run (the K1 drift floor); C `--kv-cache q8_0 --swa-kv-cache f16`; D `--kv-cache q4_0 --swa-kv-cache f16`
-(the explicit sliding flag matters: unset, type_k_swa follows the global type at `src/llama-context.cpp:950`, so a
-bare `--kv-cache q4_0` would quantize the sliding layers too against section 3.3's target); E stock F16 +
-`--reduction-wire q8`, kept factorially separate from C/D in every verdict per the rule below. The kv_stats state
-comes from one slot-save under A (`scripts/inkling2/kv_stats.py` USAGE block has the exact flow). Interpretation of
-C/D/E deltas and KL verdicts sits with this seat; inkling-small holds the no-loss check and the group arms.
+committed tip. Arm names as they return on the sheet — A `stock-f16-wire-bf16`; B `stock-repeat` (the K1 drift
+floor); C `q8-global-swaF16`; D `q4-global-swaF16` (dense-path decode today, switch off — it measures the cache,
+not the kernel); E `wire-q8-on-f16`. Depth plan for K3's captures inside each KV arm: early/middle/late thirds of
+one long session, late depth carrying twice the capture count of either other third per the 1.5 weighting; the
+kv_stats state saves ride arm A only (`--slot-save-path /tmp/kvstates` then `POST /slots/0?action=save` →
+code.state and prose.state, the two-prompt cross-check from that script's USAGE).
+Interpretation of C/D/E deltas and KL verdicts sits with this seat; inkling-small holds the no-loss check and the
+group arms.
 - The wire arm is captured in the same window but analyzed factorially from the KV-format arms (verified:
   doc `08-risks-and-questions.md` risk 6, reduction-wire error enters persistent state; external guidance is transmit
   low precision but add in FP32, since the error compounds token by token). A KV conclusion may never depend on the
