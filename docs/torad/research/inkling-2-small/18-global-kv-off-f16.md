@@ -11,7 +11,9 @@ Status 2026-11-22 CST: owned by the session "Inkling 2 Small global KV cache" (`
 committed by this work yet. Built since, off by default behind `GGML_CUDA_FATTN_REL_DECODE_Q4` (correctness argument in
 `reports/kv-q40-dispatch-pending.md`): the Q4_0 element decode instance in `fattn-rel-elem.cuh` with dispatch in
 the one-cell kernel and rel-runs, the fattn.cu gate hunk applied — GPU validation pending the CloudRift box.
-`scripts/inkling2/kv_stats.py` accepts rotated-on-store states now. `--kv-cache q4_0` accepted by the launcher.
+`scripts/inkling2/kv_stats.py` records rotation-on-store fields instead of refusing them, but only f32/f16/bf16 row
+types parse today — a quantized dump still exits 2 at the type filter until its row decoder lands in the reader.
+`--kv-cache q4_0` accepted by the launcher.
 Builds and correctness runs go over ssh to the CloudRift RTX 5090, not this machine.
 
 Incident closed 2026-11-22: an overnight red of all eight `test-inkling-kv1b-*` model arms (batch ctest at Nov 21
@@ -57,27 +59,34 @@ A cell holds 2 KV heads a card, K and V, 128 values each: 4 rows of 128 a layer 
 - Q8_0 and Q4_0 caches. The launcher exposes `--kv-cache q8_0`, with `--swa-kv-cache` to keep the sliding layers
   apart; `q4_0` is now accepted by the launcher flag for the dense-path decode (verified). The draft layout already
   serves the target shape with Q8_0 global and F16 sliding (`serve.py:231`).
-- A quantized cache is stored rotated (Walsh-Hadamard, `n_rot` 64; `src/llama-kv-cache.cpp:28` and the
+- A quantized cache is stored rotated (orthonormal Walsh-Hadamard applied on store: K mixes its whole head,
+  n_rot_k 128 at head size 128, V mixes within groups of 64 values, n_rot_v 64; `src/llama-kv-cache.cpp:28` and the
   `LLAMA_ATTN_ROT_DISABLE` escape). This is the engine's answer to hot channels, and it is what makes block scales on
-  K reach their floor without a per-channel scale (doc 16 item 1, A1/A2).
+  K reach their floor without a per-channel scale (doc 16 item 1, A1/A2). Per-vector norms survive either rotation,
+  so bounds stated later hold on stored values too.
 - One-byte global KV in the fast kernels, built and off by default (verified): q8_0 **and** f8_e4m3 in the relative
   decode kernel and the run-addressed kernels behind `GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE`; measured reports live at
   `inkling-plan/reports/attn.md` and `runs.md`. The tensor-core relative decode reads one byte in place (`1454bba3a`):
   one card's slice on an RTX 5080, 23 rows over 16,384 cells a row, 316.0 us against 497.1 us for F16; at 92 rows,
   383.4 against 517.4. It ran at 68% of the card's bandwidth on Q8_0 and 81% on F16, so part of the byte saving is
   spent on conversion.
-- That kernel does not take Q4_0 yet. Its element decode is a template over the type, with F16, Q8_0 and E4M3
-  instances.
+- The relative element decode is a template over the type: F16, Q8_0 and E4M3 instances behind
+  `GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE`, and Q4_0 beside them behind its own `GGML_CUDA_FATTN_REL_DECODE_Q4`
+  (off by default; one-cell and runs dispatch included, bit-for-bit store argument in
+  `reports/kv-q40-dispatch-pending.md`). Untested on real hardware until the box window validates it.
 - An E4M3 cache type with a scale per layer (`is_type_scaled`, `src/llama-kv-cache.cpp`), read by the tile kernel under
-  the same switch. The launcher deliberately keeps it unexposed: over Q8_0 it saves only about 0.77 GB more a card,
+  the ONE_BYTE switch. The launcher deliberately keeps it unexposed: over Q8_0 it saves only about 0.77 GB more a card,
   its Mini proxy error is worse (2.6% against 0.59%), and the dense path has no bit-for-bit reference for it — so it
   sits out of the ranking below. It remains the free dry-run candidate if the switch plumbing wants exercise before
   anything is built, since rel-mma reads it today.
 - The raw flash-attention path multiplies K on int8 tensor cores for q4_0/q8_0 at head size 256 (`15a502bc5`) and now
   at head size 128 for q8_0 (`4e5911055`); its K*Q is int8 with Q quantized per column, "not the f16 copy's bit for
   bit". Precedent in-tree for section 3.4.
-- Tools: `kv_stats.py` (value statistics and a format simulation from a slot state; accepts rotated-on-store states
-  since this plan started — it reports `n_rot_k`/`n_rot_v` instead of refusing), `replay_compare.py` (full next-token
+- Tools: `kv_stats.py` (value statistics and a format simulation from a slot state; rotation-on-store fields are
+  recorded when present rather than refused — n_rot_k 128 for K, n_rot_v 64 for V — while only f32/f16/bf16 rows
+  parse today, so simulated q4/q8 errors come from F16 values in the unrotated basis until the quantized row decoder
+  lands: per-vector bounds survive rotation exactly, per-channel figures do not carry across),
+  `replay_compare.py` (full next-token
   scores at identical forced inputs, two stock arms), `coding_probe.py` (a repository fix at a chosen prompt depth).
 
 ### 1.3 Paths that accept F16 only
@@ -137,7 +146,9 @@ run on the dense path, so no new kernel is needed for this leg. Run the q8 reduc
 
 Arms prepared for inkling-small's shared four-card window (each = one serve over the identical prompt set with these
 flags, then its capture stack; `replay_compare.py` takes the stacks as files): A stock F16 + wire bf16; B second
-identical run (the K1 drift floor); C `--kv-cache q8_0`; D `--kv-cache q4_0` (dense-path decode today); E stock F16 +
+identical run (the K1 drift floor); C `--kv-cache q8_0 --swa-kv-cache f16`; D `--kv-cache q4_0 --swa-kv-cache f16`
+(the explicit sliding flag matters: unset, type_k_swa follows the global type at `src/llama-context.cpp:950`, so a
+bare `--kv-cache q4_0` would quantize the sliding layers too against section 3.3's target); E stock F16 +
 `--reduction-wire q8`, kept factorially separate from C/D in every verdict per the rule below. The kv_stats state
 comes from one slot-save under A (`scripts/inkling2/kv_stats.py` USAGE block has the exact flow). Interpretation of
 C/D/E deltas and KL verdicts sits with this seat; inkling-small holds the no-loss check and the group arms.

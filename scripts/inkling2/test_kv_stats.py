@@ -438,6 +438,36 @@ class Statistics(unittest.TestCase):
                 self.assertAlmostEqual(got["vec_min"], float(norms.min()), places=5)
                 self.assertEqual(got["violations"], 0)
 
+    def test_rotated_on_store_state_runs_statistics_and_holds_its_bounds(self):
+        # A deployed quantized cache stores its values rotated (Hadamard on store: K mixes its whole head,
+        # V within groups of values; the real model carries n_rot_k 128 and n_rot_v 64 at head size 128).
+        # An orthonormal rotation preserves per-vector norms, so the bounds hold and the vector-level
+        # statistics match the unrotated state's exactly; per-channel figures do not carry across and are
+        # deliberately not asserted here. The synthetic fixture keeps K-only rotation at its own head size.
+        def hadamard(n):
+            h = np.ones((1, 1), np.float32)
+            while h.shape[0] < n:
+                h = np.kron(h, np.array([[1.0, 1.0], [1.0, -1.0]], np.float32))
+            return h / np.sqrt(float(n))
+
+        kl = self.k.astype(np.float32)                      # (n_layer, cells, heads * head_dim), rows as stored
+        per = kl.shape[-1] // self.h                        # values a head: the rotation mixes one whole head
+        kr3 = kl.reshape(kl.shape[0], kl.shape[1], self.h, per) @ hadamard(per)
+        kr = kr3.reshape(kl.shape).astype(self.k.dtype)
+        blob = build_state(kr, self.v, self.pos, n_rot=(per, 0))
+        st = ks.KVState(write(self.dir.name, "rot.state", blob), HD)
+        rot = ks.collect_stats(st, cfg_for())
+        self.assertEqual((st.n_rot_k, st.n_rot_v), (HD, 0))
+        for li in range(len(rot)):
+            x = kr[li].astype(np.float64).reshape(self.n, self.h, per)  # the stored values are what the reader sees
+            norms = np.linalg.norm(x, axis=2)                           # one vector a cell and head, as everywhere else
+            got = rot[li]["K"]
+            self.assertAlmostEqual(got["vec_max"], float(norms.max()), places=5)
+            self.assertAlmostEqual(got["vec_min"], float(norms.min()), places=5)
+            self.assertEqual(got["n_cells"], self.n)
+            self.assertEqual(got["violations"], 0)
+            self.assertEqual(rot[li]["V"]["violations"], 0)
+
     def test_chunking_does_not_change_the_numbers(self):
         st = self.state()
         a = ks.collect_stats(st, cfg_for("--chunk-cells", "7"))

@@ -1,19 +1,32 @@
-# Q4_0 relative decode — dispatcher patch pending the open merge
+# Q4_0 relative decode — built, gate applied, hardware validation pending
 
 Companion to `docs/torad/research/inkling-2-small/18-global-kv-off-f16.md` section 3.1 and ledger rows
-`1454bba3a` (rel-mma reads q8_0 one byte), `15a502bc5`/`4e5911055` (raw path). Written while
-`MERGE_HEAD` a2861a62 (origin/main into draft-speed) is unresolved; nothing here commits or touches
-the frozen files.
+`1454bba3a` (rel-mma reads q8_0 one byte), `15a502bc5`/`4e5911055` (raw path). State as of the merge landing
+and this seat's commit pass: the merge resolved as `ea83c6dd8` + review fixes `ad51d800a`, the dispatcher patch
+below was applied at `fattn.cu:1397-1398` in the meantime, everything here is committed (`3280492de` kernel
+slice, `69b948642` relocation, `0075b6d62` staging-hygiene note), and a no-stake DeepSeek V4.1 Flash review
+(`reports/q40-review-report-deepseek.md`) found four importants afterwards — the one-cell indexing bug it caught
+is fixed in this file's follow-up commits; nothing here awaits a merge any more.
 
-## What landed already (uncommitted, editable files only)
+## Routing caveat owned by inkling-mini's rider
+
+The uncommitted `BEST_FATTN_KERNEL_REL_ROWS` hunk (Inkling 2 Mini's unified-pool rows decode,
+`ggml/src/ggml-cuda/fattn-rel-rows.cuh`, sits after the REL_DECODE gate) accepts q4_0/q8_0. On a tree carrying
+that rider with `GGML_CUDA_FATTN_REL_DECODE_Q4` unset, a q4_0 cache may route to it instead of the dense
+deq-dense path — which would change the meaning of serve.py's "dense-path decode today" until that rider lands
+or is reverted. Mini owns its landing; validation arms should assert their node class runs regardless.
+
+## What landed already (committed)
 
 - `ggml/src/ggml-cuda/fattn-rel-elem.cuh`: template instance `fattn_rel_elem<GGML_TYPE_Q4_0>` beside
   F16/Q8_0/E4M3, helper `fattn_rel_elem_q4(type)` behind env switch `GGML_CUDA_FATTN_REL_DECODE_Q4`
-  (off by default; plain env reading applies — the name declares no knob in tunables), and
+  (off by default; declared in tunables.toml since), and
   `fattn_rel_elem_align(Q4_0) = 8` beside q8_0's (rows of 72 bytes are not multiples of 16).
   `fattn_rel_elem_one_byte` itself is unchanged, so ONE_BYTE keeps its exact old meaning.
 - `ggml/src/ggml-cuda/fattn-rel-decode.cuh`: `fattn_rel_decode_value<GGML_TYPE_Q4_0>` branch and a
   Q4_0 case in the one-cell kernel's pick switch. This is the fallback that also takes query groups.
+  The DeepSeek review caught the block indexing reading without `col % QK4_0` — wrong nibbles for columns 32-127
+  and reads up to 95 bytes past a row; fixed to take the within-block column like the q8_0 arm does.
 - `ggml/src/ggml-cuda/fattn-rel-runs.cuh`: Q4_0 clause in `fattn_rel_runs_type` and a Q4_0 case in
   `ggml_cuda_fattn_rel_runs`'s dispatch switch (its default would have read the cache as F16).
 
@@ -64,12 +77,12 @@ this hunk changes nothing on its own:
 (With it, group==1 steps stage through the new template instance; group>1 stays on the one-cell
 kernel, which supports groups natively.)
 
-## tunables.toml / ggml-tunables.inc — none now
+## tunables.toml / ggml-tunables.inc
 
-Both are frozen. `ggml_env_switch` reads undeclared names straight from the environment
-(`ggml-tunables.cpp:427`), so no table entry is needed to run. When doc 18 section 3.3 switches the
-profile default, decide then whether `GGML_CUDA_FATTN_REL_DECODE_Q4` becomes a knob or disappears
-behind an unconditional acceptance like q8_0's.
+The merge freeze ended, so the deviation is closed: `GGML_CUDA_FATTN_REL_DECODE_Q4` is declared in
+tunables.toml beside its ONE_BYTE sibling (bool knob, off by default, output rounding). If doc 18
+section 3.3 later switches the profile default, revisit whether the knob stays or the acceptance goes
+unconditional like q8_0's.
 
 ## What test-backend-ops proves once builds are possible
 

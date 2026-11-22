@@ -10,8 +10,9 @@ format is still the KL capture against F16: these numbers only say which candida
 USAGE (the four-card box, the real model; about 16K to 32K tokens a state)
 -------------------------------------------------------------------------
 1. Serve with --slot-save-path, one slot, F16 caches, flash attention on. This is the tensor-4 launch with the pool
-   cut to one session (a state saved from a quantized cache parses as well: such a cache is rotated on store, and the
-   reader reports its n_rot_k/n_rot_v and works in the stored domain):
+   cut to one session. The reader records a state's rotation-on-store when the header carries it (n_rot_k 128 for K,
+   n_rot_v 64 for V) and reports it; only f32/f16/bf16 row types parse today, so a q4_0/q8_0 dump still exits 2 at the
+   type filter until that decode lands — serve states for this tool with F16 caches:
 
      mkdir -p /tmp/kvstates
      python3 scripts/inkling2/serve.py --profile tensor-4 --packs /srv/models/inkling-2-small-abliterated-q3km \\
