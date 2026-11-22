@@ -112,7 +112,7 @@ static void check_maps(pool & w, llama_kpool_views & views, const config & cfg, 
 static void check_masks(pool & w, const llama_ubatch * ub, uint32_t n_ns, int n_threads, std::mt19937 & rng, const char * where) {
     const int64_t n_tps = ub->n_tokens/n_ns;
 
-    ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, true };
 
     for (const ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_I16 }) {
         const int64_t n_kv = n_kv_of(w, 256);
@@ -126,18 +126,36 @@ static void check_masks(pool & w, const llama_ubatch * ub, uint32_t n_ns, int n_
                 ggml_context * ctx = ggml_init(ip);
                 ggml_tensor * one   = ggml_new_tensor_4d(ctx, type, type == GGML_TYPE_I16 ? n_kv/16 : n_kv, n_tps, 1, n_ns);
                 ggml_tensor * split = ggml_new_tensor_4d(ctx, type, type == GGML_TYPE_I16 ? n_kv/16 : n_kv, n_tps, 1, n_ns);
+                // the chunk rows' production layout: a packed mask, built the production way beside the scans
+                ggml_tensor * one_chunk   = type == GGML_TYPE_I16 ? ggml_new_tensor_4d(ctx, type, n_kv/16, n_tps, 1, n_ns) : nullptr;
+                ggml_tensor * split_chunk = type == GGML_TYPE_I16 ? ggml_new_tensor_4d(ctx, type, n_kv/16, n_tps, 1, n_ns) : nullptr;
                 ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
                 // a cell neither build writes shows as a difference only if they leave different bytes there
                 memset(one->data,   0xa5, ggml_nbytes(one));
                 memset(split->data, 0xa5, ggml_nbytes(split));
+                if (one_chunk) {
+                    memset(one_chunk->data,   0xa5, ggml_nbytes(one_chunk));
+                    memset(split_chunk->data, 0xa5, ggml_nbytes(split_chunk));
+                }
 
-                // the scans' rows: the chunk rows have their own build and threads (test-kv-mask)
                 llama_host_threads_set(1);
                 llama_kv_cache_set_input_kq_mask(one, ub, causal, hparams, w.v_cells, w.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, false);
                 llama_host_threads_set(n_threads);
                 llama_kv_cache_set_input_kq_mask(split, ub, causal, hparams, w.v_cells, w.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, false);
                 const int used = llama_host_threads_last();
                 llama_host_threads_set(0);
+
+                int  used_one = 0, used_split = 0;
+                bool built_one = false, built_split = false;
+                if (one_chunk) {
+                    llama_host_threads_set(1);
+                    built_one = llama_kv_cache_set_input_kq_mask(one_chunk, ub, causal, hparams, w.v_cells, w.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, true);
+                    used_one = llama_host_threads_last();
+                    llama_host_threads_set(n_threads);
+                    built_split = llama_kv_cache_set_input_kq_mask(split_chunk, ub, causal, hparams, w.v_cells, w.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, true);
+                    used_split = llama_host_threads_last();
+                    llama_host_threads_set(0);
+                }
 
                 CHECK(memcmp(one->data, split->data, ggml_nbytes(one)) == 0, "%s: KQ mask at %d threads differs from one thread (%s, n_kv %lld, %s, %s)",
                         where, n_threads, ggml_type_name(type), (long long) n_kv, causal ? "causal" : "non-causal",
@@ -146,6 +164,23 @@ static void check_masks(pool & w, const llama_ubatch * ub, uint32_t n_ns, int n_
                         n_threads, ggml_type_name(type));
 
                 ++n_split_masks;
+
+                if (one_chunk) {
+                    CHECK(built_one == built_split, "%s: the chunk rows built the mask on one thread and not on %d", where, n_threads);
+                    CHECK(memcmp(one_chunk->data, split_chunk->data, ggml_nbytes(one)) == 0,
+                            "%s: the chunk rows at %d threads differ from one thread (%lld rows, n_kv %lld, %s, %s)", where, n_threads,
+                            (long long) n_tps, (long long) n_kv, causal ? "causal" : "non-causal",
+                            swa_type == LLAMA_SWA_TYPE_NONE ? "no window" : "window");
+                    CHECK(memcmp(one->data, one_chunk->data, ggml_nbytes(one)) == 0,
+                            "%s: the chunk rows differ from the scans (%lld rows, n_kv %lld, %s, %s, built %d)", where,
+                            (long long) n_tps, (long long) n_kv, causal ? "causal" : "non-causal",
+                            swa_type == LLAMA_SWA_TYPE_NONE ? "no window" : "window", (int) built_one);
+                    CHECK(used_one == 1 && used_split == n_threads,
+                            "%s: the chunk rows of %lld rows split across %d and %d threads, not 1 and %d", where,
+                            (long long) n_tps, used_one, used_split, n_threads);
+
+                    ++n_split_masks;
+                }
 
                 ggml_backend_buffer_free(buf);
                 ggml_free(ctx);

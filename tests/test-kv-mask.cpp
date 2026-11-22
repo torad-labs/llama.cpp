@@ -386,8 +386,10 @@ struct mask_counts {
 // compared byte for byte; expect_chunk: whether the chunk path must build this layout
 static void check_masks_equal(const pool & p, const llama_ubatch & ub, uint32_t n_kv, uint32_t n_stream, ggml_type type,
         bool causal, uint32_t n_swa, llama_swa_type swa_type, const int32_t * rows, bool block_uniform,
-        bool expect_chunk, const char * what, mask_counts & counts) {
+        bool expect_chunk, const char * what, mask_counts & counts,
+        llama_non_causal_type nct = LLAMA_NON_CAUSAL_TYPE_ALL) {
     llama_hparams hparams{};
+    hparams.non_causal_type = nct;
 
     ggml_init_params ip = { /*.mem_size =*/ 64*1024*1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };
 
@@ -461,6 +463,17 @@ static void check_rows_and_blocks(std::mt19937 & rng, mask_counts & counts) {
                 check_masks_equal(p, ub.get(), n_kv, 1, type, causal, 0,   LLAMA_SWA_TYPE_NONE,     nullptr, true, false, what, counts);
                 check_masks_equal(p, ub.get(), n_kv, 1, type, causal, 128, LLAMA_SWA_TYPE_STANDARD, nullptr, true, false, what, counts);
             }
+        }
+
+        // the caller's causal flag flipped by the model's non-causal type: a dense layer's caller flag leaves a windowed
+        // cache causal (SWA_ONLY) or a windowed layer's leaves a dense cache causal (DENSE_ONLY), and both builders follow.
+        // Either way the effective attention is causal here, so only a one-row ubatch at the tip takes the tip path
+        for (const bool causal : { true, false }) {
+            snprintf(what, sizeof(what), "round %d causal flip (%s)", round, causal ? "causal" : "non-causal");
+            check_masks_equal(p, ub.get(), n_kv, 1, GGML_TYPE_I16, causal, 0,  LLAMA_SWA_TYPE_NONE,     nullptr, false,
+                    n_tps > 1, what, counts, LLAMA_NON_CAUSAL_TYPE_SWA_ONLY);
+            check_masks_equal(p, ub.get(), n_kv, 1, GGML_TYPE_I16, causal, 64, LLAMA_SWA_TYPE_STANDARD, nullptr, false,
+                    n_tps > 1, what, counts, LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY);
         }
 
         // the cell rows: a slice a sequence, its cells in cell order (F16, as the kv_rows attention reads them)
@@ -715,8 +728,9 @@ int main(int argc, char ** argv) {
                 seqs.push_back(s);
             }
         }
-        std::vector<llama_pos>    pos;
-        std::vector<llama_seq_id> seq_ids;
+        // the tokens, grouped by sequence first: a real batch interleaves its sequences, and a sequence's own rows can
+        // arrive in any order, so both are generated below
+        std::vector<std::pair<llama_seq_id, llama_pos>> rows;
         bool placed_all = true;
         for (const llama_seq_id s : seqs) {
             const llama_pos p0 = p.p_next[s];
@@ -724,12 +738,37 @@ int main(int argc, char ** argv) {
             const uint32_t n_ahead = rng() % 4 == 0 ? 1 + rng() % 8 : 0;
             placed_all &= p.append(s, n_tps_seq + n_ahead).size() == n_tps_seq + n_ahead;
             for (uint32_t k = 0; k < n_tps_seq; ++k) {
-                pos.push_back(p0 + k);
-                seq_ids.push_back(s);
+                rows.emplace_back(s, p0 + (llama_pos) k);
             }
         }
         if (!placed_all) {
             continue; // the pool is full
+        }
+
+        // the rows of a sequence out of order, within its own block (a split stream's block is its token range)
+        if (seqs.size() > 0 && rng() % 2 == 0) {
+            for (size_t j = 0; j < seqs.size(); ++j) {
+                std::shuffle(rows.begin() + j*n_tps_seq, rows.begin() + (j + 1)*n_tps_seq, rng);
+            }
+        }
+
+        // sequences interleaved: a unified pool's rows belong to no stream, so their order is free
+        if (unified && seqs.size() > 1 && rng() % 2 == 0) {
+            std::vector<std::pair<llama_seq_id, llama_pos>> mixed;
+            mixed.reserve(rows.size());
+            for (uint32_t k = 0; k < n_tps_seq; ++k) {
+                for (size_t j = 0; j < seqs.size(); ++j) {
+                    mixed.push_back(rows[j*n_tps_seq + k]);
+                }
+            }
+            rows = std::move(mixed);
+        }
+
+        std::vector<llama_pos>    pos;
+        std::vector<llama_seq_id> seq_ids;
+        for (const auto & r : rows) {
+            seq_ids.push_back(r.first);
+            pos.push_back(r.second);
         }
         const uint32_t n_tokens = pos.size();
         const uint32_t n_pos    = pos_2d ? 4 : 1;
@@ -775,7 +814,9 @@ int main(int argc, char ** argv) {
                 for (const bool causal : { true, false }) {
                     const uint32_t n_swa = swa_type == LLAMA_SWA_TYPE_NONE ? 0 : 1 + rng() % 300;
 
+                    // the caller's causal flag, flipped for a cache by the model's non-causal type like llama_set_causal_attn
                     llama_hparams hparams{};
+                    hparams.non_causal_type = (llama_non_causal_type) (rng() % 4);
 
                     ggml_context * ctx = ggml_init(ip);
                     ggml_tensor * masks[4];
