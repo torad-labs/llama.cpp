@@ -25,6 +25,14 @@ Open work lives in `.campaign/ledger.toml`. Run `campaign help` for the verbs.
   items builds them and ends; it never commits, closes an item or reviews it.
 <!-- campaign:end -->
 
+## Changing shared code (Marcos, 2026-11-22)
+
+This fork is not attached to upstream llama.cpp's architecture or file layout. Change anything the work needs.
+When a change touches code shared with another model served by this fork (GLM 5.3 today), either copy the
+shared piece into a model-specific path so the other model's behavior is untouched, or guard the change behind
+a switch whose stock value preserves the other model's behavior. Say which you chose in the commit message or
+row note. A measured improvement for one model never changes another model's behavior silently.
+
 ## Boxes and GPUs (Marcos, 2026-11-22)
 
 - All builds, tests and dev runs go to the rented CloudRift box(s) with the RTX 5090s (`on-box`, ssh host
