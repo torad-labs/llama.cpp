@@ -5,7 +5,8 @@
 // Any code names what it counts or times and adds to it; nothing in here knows a model. A reader takes two
 // snapshots and reads the difference between them, so one tool serves every model, backend and workload:
 //
-//   GGML_LEDGER=0           turns it off (on by default: an entry is two or three relaxed atomic adds)
+//   GGML_LEDGER=1           turns it on (off by default, so a served model pays nothing for profiling paths it
+//                           does not use; an enabled entry costs two or three relaxed atomic adds)
 //   GGML_LEDGER_FILE=path   writes a snapshot when the process exits
 //   GGML_LEDGER_PERIOD=N    device time is read on one decode in N (default 8), since reading it costs two
 //                           events on the device's stream for each graph evaluation

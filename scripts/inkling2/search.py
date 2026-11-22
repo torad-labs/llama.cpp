@@ -142,7 +142,11 @@ def plan(base, settings):
     """A trial's server command and settings: the profile as it launches now with the trial's settings on top."""
     options = [word for name, value in settings.items() if name.startswith("--") for word in serve.option_words(name, value)]
     argv, env = serve.make_plan(serve.arguments(base + options))
-    return argv, {**env, **{name: value for name, value in settings.items() if not name.startswith("--")}}
+    trial_env = {**env, **{name: value for name, value in settings.items() if not name.startswith("--")}}
+    # the ledger is off by default so served models pay nothing for it; a search reads it with every trial, so it
+    # is asked for here by name (the same explicit opt-in a measurement arm uses)
+    trial_env.setdefault("GGML_LEDGER", "1")
+    return argv, trial_env
 
 
 def run_trial(base, settings, folder, args):
