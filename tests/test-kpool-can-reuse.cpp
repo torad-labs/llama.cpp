@@ -165,7 +165,7 @@ static void test_host_kv_graph_transition() {
                 llm_graph_result result(256);
                 result.reset();
                 llm_graph_params params {};
-                params.hparams = h;
+                params.model = model.get();
                 params.cparams.n_ctx = cells;
                 params.cparams.n_seq_max = 1;
                 params.cparams.n_seq_devices = 1;

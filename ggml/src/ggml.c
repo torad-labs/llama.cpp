@@ -54,6 +54,8 @@
 
 #define UNUSED GGML_UNUSED
 
+static_assert(GGML_VERSION_MAJOR == 1, "major version update requires attending to all [TAG_GGML_VERSION_MAJOR_UPDATE] tags");
+
 uint64_t ggml_graph_next_uid(void) {
 #ifdef _MSC_VER
 #if defined(_WIN32)
@@ -1135,9 +1137,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "NORM_CLIP",
     "ATTN_RES_MIX",
     "SHORT_CONV",
+    "LOOP_CONTROL",
+
+    "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1255,9 +1260,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "norm_clip(x)",
     "attn_res_mix(x)",
     "short_conv(x)",
+    "loop_control(x)",
+
+    "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4079,7 +4087,7 @@ struct ggml_tensor * ggml_set_rows(
     GGML_ASSERT(b->ne[2] % c->ne[1] == 0);
     GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
     GGML_ASSERT(c->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16 || b->type == GGML_TYPE_BF16);
     GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
 
     GGML_ASSERT(ggml_is_contiguous_rows(a));
@@ -5344,7 +5352,7 @@ struct ggml_tensor * ggml_tri(
     struct ggml_context * ctx,
     struct ggml_tensor  * a,
     enum ggml_tri_type    type) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16);
 
     GGML_ASSERT(ggml_is_contiguous(a));
     GGML_ASSERT(a->ne[0] == a->ne[1]);
@@ -5452,14 +5460,26 @@ struct ggml_tensor * ggml_top_k_candidates(
         struct ggml_tensor  * a,
         int                   k,
         int                   n_parts) {
+    return ggml_top_k_candidates_bounded(ctx, a, k, n_parts, 0, false);
+}
+
+struct ggml_tensor * ggml_top_k_candidates_bounded(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k,
+        int                   n_parts,
+        int                   n_vocab,
+        bool                  first_nan) {
     GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
     GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1 && a->ne[0] <= INT32_MAX);
-    GGML_ASSERT(k > 0 && n_parts > 0);
+    GGML_ASSERT(k > 0 && n_parts > 0 && n_vocab >= 0 && n_vocab <= a->ne[0]);
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, k, n_parts, a->ne[1]);
     result->op     = GGML_OP_TOP_K_CANDIDATES;
     result->src[0] = a;
     ggml_set_op_params_i32(result, 0, 0); // global column offset, set by the Meta backend
+    ggml_set_op_params_i32(result, 1, n_vocab);
+    ggml_set_op_params_i32(result, 2, first_nan);
     return result;
 }
 
@@ -5514,6 +5534,36 @@ struct ggml_tensor * ggml_attn_res_mix(
     for (int i = 0; i < n_sources; ++i) {
         result->src[1 + i] = sources[i];
     }
+    return result;
+}
+
+// ggml_loop_control
+
+struct ggml_tensor * ggml_loop_control(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * message,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * gain,
+        struct ggml_tensor  * forget,
+        float                 eps) {
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const int64_t rank     = down->ne[1];
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && cur->nb[0] == sizeof(float) && ggml_is_matrix(cur));
+    GGML_ASSERT(message->type == GGML_TYPE_F32 && message->nb[0] == sizeof(float) && ggml_are_same_shape(cur, message));
+    GGML_ASSERT(down->ne[0] == 2*n_embd && ggml_is_matrix(down) && ggml_is_contiguous_rows(down));
+    GGML_ASSERT(gain->ne[0] == rank && gain->ne[1] == n_embd && ggml_is_matrix(gain) && ggml_is_contiguous_rows(gain));
+    GGML_ASSERT(ggml_are_same_shape(gain, forget) && ggml_is_contiguous_rows(forget));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_op_params_f32(result, 0, eps);
+    result->op     = GGML_OP_LOOP_CONTROL;
+    result->src[0] = cur;
+    result->src[1] = message;
+    result->src[2] = down;
+    result->src[3] = gain;
+    result->src[4] = forget;
     return result;
 }
 
@@ -6413,6 +6463,27 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+
+// ggml_sleep
+
+// the result aliases a, the op only delays and never touches the data
+struct ggml_tensor * ggml_sleep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               us) {
+    GGML_ASSERT(us >= 0);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+    ggml_format_name(result, "%s (sleep)", a->name);
+
+    ggml_set_op_params_i32(result, 0, us);
+
+    result->op     = GGML_OP_SLEEP;
+    result->src[0] = a;
+
+    return result;
+}
+
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(

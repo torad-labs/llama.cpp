@@ -55,6 +55,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN_REL_POS,
     LLM_FUSED_OP_INKLING2_LAYER,
     LLM_FUSED_OP_INKLING2_CONV,
+    LLM_FUSED_OP_INKLING2_LOOP_CONTROL,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
@@ -337,6 +338,21 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
+};
+
+// random expert ids for the MoE GEMMs, for benchmarks only (env: LLAMA_MOE_RANDOM_ROUTING)
+class llm_graph_input_moe_ids : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_ids(int64_t n_expert) : n_expert(n_expert) {}
+    virtual ~llm_graph_input_moe_ids() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * ids = nullptr; // I32 [n_expert_used_max, n_tokens]
+
+    const int64_t n_expert;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -887,7 +903,6 @@ class llm_graph_result;
 struct llm_graph_params {
     const llama_model * model = nullptr;
 
-    llama_hparams hparams;
     llama_cparams cparams;
 
     llama_ubatch ubatch; // note: intentionally make a copy
@@ -902,10 +917,6 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
-
-    const llama_prec_policy * prec_policy = nullptr;
-
-    const llama_hadamard * hdmd = nullptr;
 
     ggml_tensor * layer_inp_dev = nullptr; // own layer input device buffer (write)
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
@@ -936,6 +947,10 @@ struct llm_graph_params {
     llm_graph_result * res;
 
     llm_graph_nextn nextn;
+
+    // the loop's active pass count (Inkling 2 loop; 0: the model's own). Part of the topology: a graph is built, kept and
+    // reused per count.
+    uint32_t loop_passes = 0;
 
     // LLAMA_GRAPH_ANY_SEQS=1 with one stream for every sequence (a unified cache on one device a sequence): a graph
     // built for one set of sequences is computed for any other set of as many, each input checking what it holds of the
@@ -1023,6 +1038,10 @@ struct llm_graph_params {
 
         if (nextn.mode != other.nextn.mode || nextn.store != other.nextn.store) {
             return reject("nextn_store");
+        }
+
+        if (loop_passes != other.loop_passes) {
+            return reject("loop_passes");
         }
 
         const bool compatible =
@@ -1140,6 +1159,9 @@ public:
 
     std::vector<ggml_tensor *> t_sampling_all;
 
+    // [0] is the LLAMA_MOE_RANDOM_ROUTING input, the rest are views of it
+    std::vector<ggml_tensor *> t_moe_ids;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1193,6 +1215,8 @@ struct llm_graph_context {
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
 
+    const llama_prec_policy & prec_policy;
+
     const int64_t n_embd;
     const int64_t n_layer;
     const int64_t n_layer_nextn;
@@ -1233,8 +1257,6 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     const llama_moe_cache        * moe_cache;
-
-    const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
 
@@ -1450,6 +1472,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
+    ggml_tensor * build_inp_moe_ids(int64_t n_used, int64_t n_rows) const;
 
     ggml_tensor * build_inp_cross_embd() const;
     ggml_tensor * build_inp_pos_bucket_enc() const;
@@ -1468,6 +1491,7 @@ struct llm_graph_context {
         ggml_tensor * sinks;  // [n_head_q, n_tokens] f32
         int32_t n_kv_max;
         bool low_mean_mask;
+        ggml_tensor * kv_runs = nullptr; // the runs of cells each row reads, see ggml_flash_attn_ext_set_kv_runs
     };
 
     ggml_tensor * build_attn_mha(

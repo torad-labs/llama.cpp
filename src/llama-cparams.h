@@ -65,12 +65,15 @@ struct llama_cparams {
     bool auto_finkling2;
     bool fused_inkling2_conv; // Inkling 2: each short convolution of a layer as one op (ggml_short_conv)
     bool auto_fconv;
+    bool fused_inkling2_loop_control; // Inkling 2 Loop: each controller of a looped layer as one op (ggml_loop_control)
+    bool auto_floopctl;
     bool no_perf;
     bool op_offload;
     bool kv_unified;
     bool attn_mask_bits;     // the KV attention mask is bit-packed (GGML_TYPE_I16) instead of f16; only with flash_attn
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
 
     size_t moe_cache_size;
     float  moe_cache_cpu_share;

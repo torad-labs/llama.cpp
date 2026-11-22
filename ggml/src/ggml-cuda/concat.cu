@@ -212,7 +212,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
             // state with the new rows here. GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY=1 keeps it on GB10 only.
             static const bool sm120_legacy = ggml_env_switch("GGML_CUDA_CONCAT_TRANSPOSE_SM120_LEGACY");
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            const bool transpose_dim0 = (cc == GGML_CUDA_CC_DGX_SPARK || (cc == GGML_CUDA_CC_BLACKWELL && !sm120_legacy)) &&
+            const bool transpose_dim0 = (cc == GGML_CUDA_CC_GB10 || (cc == GGML_CUDA_CC_BLACKWELL && !sm120_legacy)) &&
                 dim == 0 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
                 src0->ne[2] == dst->ne[2] && src1->ne[2] == dst->ne[2] && dst->ne[2] <= 65535 &&
                 src0->nb[2] % sizeof(uint32_t) == 0 && src1->nb[2] % sizeof(uint32_t) == 0 &&

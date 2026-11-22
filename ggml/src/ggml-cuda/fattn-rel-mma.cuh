@@ -4,6 +4,7 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 #include "fattn-rel-decode.cuh"
+#include "fattn-rel-elem.cuh"
 
 // A tile holds 16 visible KV rows. A scan step reads 4 mask words a lane, 4096 cells a warp, or 2 a row of a query group.
 constexpr int fattn_rel_mma_cells = 16;
@@ -33,14 +34,32 @@ static int fattn_rel_mma_run_log2() {
     return run_log2;
 }
 
+// The K/V types the decode reads on the tile kernel through fattn_rel_elem: f16, and with
+// GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE q8_0 and f8_e4m3, converted to f16 as a tile is staged.
+static bool fattn_rel_mma_type(const ggml_type type) {
+    static const bool one_byte = ggml_env_switch("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE");
+    return type == GGML_TYPE_F16 || (one_byte && fattn_rel_elem_one_byte(type));
+}
+
 // GGML_CUDA_FATTN_REL_MMA_WIDE_LEGACY: F16 K/V and one row a warp only, as before q8_0 and query groups came here.
 static bool fattn_rel_mma_wide() {
     static const bool legacy = ggml_env_switch("GGML_CUDA_FATTN_REL_MMA_WIDE_LEGACY");
     return !legacy;
 }
 
-// F16 or Q8_0 K/V shared by 2 to 8 query heads a KV head, and the rows of a query group while they fit 24 columns.
-// The one-cell kernel keeps the other shapes.
+// A row of this type is staged through fattn_rel_elem: f16, and a one-byte type of a step of one row a warp. Otherwise
+// Q8_0 is read 4 bytes at a time (fattn_rel_mma_stage).
+static bool fattn_rel_mma_elem(const ggml_type type, const int group) {
+    return fattn_rel_mma_type(type) && (type == GGML_TYPE_F16 || group == 1);
+}
+
+// The bytes a K/V row's address must be a multiple of for its stage.
+static size_t fattn_rel_mma_align(const ggml_type type, const int group) {
+    return fattn_rel_mma_elem(type, group) ? fattn_rel_elem_align(type) : 4;
+}
+
+// K/V of such a type, or Q8_0, shared by 2 to 8 query heads a KV head, and the rows of a query group while they fit
+// 24 columns. The one-cell kernel keeps the other shapes.
 static bool fattn_rel_mma_shapes(const int device, const ggml_tensor * dst) {
     static const bool legacy = ggml_env_switch("GGML_CUDA_FATTN_REL_DECODE_LEGACY");
     const auto * q = dst->src[0];
@@ -48,18 +67,18 @@ static bool fattn_rel_mma_shapes(const int device, const ggml_tensor * dst) {
     const auto * v = dst->src[2];
     const int64_t gqa = q->ne[2]/k->ne[2];
     const int group = fattn_rel_decode_group(dst);
-    const bool q8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 && fattn_rel_mma_wide();
-    const bool f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
-    // A stage reads F16 rows 16 bytes at a time and Q8_0 rows (136 bytes) 4 bytes at a time.
-    const size_t align = q8 ? 4 : 16;
-    return !legacy && ampere_mma_available(ggml_cuda_info().devices[device].cc) && (f16 || q8) &&
+    const bool elem = k->type == v->type && fattn_rel_mma_elem(k->type, group);
+    const bool q8 = !elem && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 && fattn_rel_mma_wide();
+    const size_t align = fattn_rel_mma_align(k->type, group);
+    return !legacy && ampere_mma_available(ggml_cuda_info().devices[device].cc) && (elem || q8) &&
         q->ne[2] == gqa*k->ne[2] && gqa >= 2 && gqa <= 8 &&
         (group == 1 || (fattn_rel_mma_wide() && group*gqa <= fattn_rel_mma_cols)) &&
         k->nb[1]%align == 0 && k->nb[2]%align == 0 && v->nb[1]%align == 0 && v->nb[2]%align == 0;
 }
 
+// The copies that stage a tile read K and V 16 bytes at a time, q8_0 8 (fattn_rel_elem) or 4.
 static bool fattn_rel_mma_aligned(const ggml_tensor * dst) {
-    const uintptr_t align = dst->src[1]->type == GGML_TYPE_Q8_0 ? 4 : 16;
+    const size_t align = fattn_rel_mma_align(dst->src[1]->type, fattn_rel_decode_group(dst));
     return (uintptr_t) dst->src[1]->data%align == 0 && (uintptr_t) dst->src[2]->data%align == 0;
 }
 
@@ -90,18 +109,17 @@ static __device__ __forceinline__ int4 fattn_rel_mma_q8_halves(const uint32_t q0
     return r;
 }
 
-// A lane stages half of a K row and half of its V row, 64 values each, as halves. Q8_0 is read in place: half a row is
-// 2 blocks, 68 bytes, 17 words: the first scale, its quants 2 bytes into a word, the second scale and its quants.
-template <ggml_type type>
+// A lane stages half of a K row and half of its V row, 64 values each, as halves: through fattn_rel_elem, K and V loaded
+// before either is stored, or Q8_0 in place 4 bytes at a time: half a row is 2 blocks, 68 bytes, 17 words: the first
+// scale, its quants 2 bytes into a word, the second scale and its quants.
+template <ggml_type type, bool elem>
 static __device__ __forceinline__ void fattn_rel_mma_stage(int4 * k_dst, int4 * v_dst, const char * k_src, const char * v_src, int half_row) {
-    if constexpr (type == GGML_TYPE_F16) {
-        const int4 * k4 = (const int4 *) k_src + 8*half_row;
-        const int4 * v4 = (const int4 *) v_src + 8*half_row;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            k_dst[j] = k4[j];
-            v_dst[j] = v4[j];
-        }
+    if constexpr (elem) {
+        using e = fattn_rel_elem<type>;
+        const auto k_raw = e::load(k_src, half_row);
+        const auto v_raw = e::load(v_src, half_row);
+        e::store(k_raw, half_row, k_dst);
+        e::store(v_raw, half_row, v_dst);
     } else {
         static_assert(type == GGML_TYPE_Q8_0, "bad type");
         const uint32_t * k32 = (const uint32_t *) (k_src + 68*half_row);
@@ -132,7 +150,8 @@ static __device__ __forceinline__ void fattn_rel_mma_stage(int4 * k_dst, int4 * 
 // Each row is read once a KV head. Masked cells are never read, so they cannot change how the visible ones are rounded.
 // A query group's rows (a token and its drafts) share the tile: a column is one row's head and takes only the cells its
 // row's mask holds, in ascending order. Tiles are cut on the group's cells. ncols: tiles of 8 columns, max_group: most rows.
-template <ggml_type type, int ncols, int max_group>
+// elem: rows are staged through fattn_rel_elem. query_first: the grid's x is the query and z the stream.
+template <bool query_first, ggml_type type, bool elem, int ncols, int max_group>
 static __global__ void fattn_rel_mma_rows(
         const char * q, const char * k, const char * v, const uint32_t * mask, const float * table,
         const int32_t * q_pos, const int32_t * kv_pos, const float * shift, float * partial, float scale, int n_kv, int n_dist, int gqa,
@@ -142,8 +161,10 @@ static __global__ void fattn_rel_mma_rows(
     constexpr int cells = fattn_rel_mma_cells, words = max_group > 1 ? fattn_rel_mma_words/2 : fattn_rel_mma_words;
     // A staged row is 128 halves and 16 bytes of padding, which spread the rows ldmatrix reads together over the banks.
     constexpr int row_i4 = 17;
-    const int lane = threadIdx.x, stream = blockIdx.x, n_streams = gridDim.x;
-    const int kv_head = blockIdx.y, query0 = blockIdx.z*group;
+    const int lane = threadIdx.x;
+    const int stream = query_first ? blockIdx.z : blockIdx.x;
+    const int n_streams = query_first ? gridDim.z : gridDim.x;
+    const int kv_head = blockIdx.y, query0 = (query_first ? blockIdx.x : blockIdx.z)*group;
     const int head0 = kv_head*gqa, n_heads = gridDim.y*gqa, n_cols = group*gqa;
     __shared__ int4 staged_k[cells*row_i4], staged_v[cells*row_i4];
     __shared__ int list[32*32 + cells];
@@ -269,7 +290,7 @@ static __global__ void fattn_rel_mma_rows(
                 const int cell_b = tile_cells[slot_b < n ? slot_b : 0];
                 const int held_a = slot_a >= n ? 0 : max_group > 1 ? held[done + slot_a] : 1;
                 const int held_b = slot_b >= n ? 0 : max_group > 1 ? held[done + slot_b] : 1;
-                fattn_rel_mma_stage<type>(staged_k + slot*row_i4 + 8*half_row, staged_v + slot*row_i4 + 8*half_row,
+                fattn_rel_mma_stage<type, elem>(staged_k + slot*row_i4 + 8*half_row, staged_v + slot*row_i4 + 8*half_row,
                     k + int64_t(cell)*k_row, v + int64_t(cell)*v_row, half_row);
 
                 const int cell_pos[2] = {kv_pos[cell_a], kv_pos[cell_b]};
@@ -419,16 +440,49 @@ static void ggml_cuda_fattn_rel_mma(ggml_backend_cuda_context & ctx, ggml_tensor
     const bool shift = ggml_cuda_fattn_shift_query_sinks();
     const int gqa = q->ne[2]/k->ne[2];
     const int group = fattn_rel_decode_group(dst);
-    const bool q8 = k->type == GGML_TYPE_Q8_0;
-    using kernel_t = decltype(&fattn_rel_mma_rows<GGML_TYPE_F16, 1, 1>);
+    // Only rearrange independent CTAs. A stream still computes and writes the same partial,
+    // and the merge still reads it in exactly the same order.
+    static const bool enable_query_first = ggml_env_switch("GGML_CUDA_FATTN_REL_QUERY_FIRST");
+    const bool query_first = enable_query_first && group == 1 && ggml_flash_attn_ext_has_low_mean_mask(dst) &&
+            q->ne[1] == 23 && k->ne[2] == 2 && q->ne[2] == 12 && n_streams == 256;
+    using kernel_t = decltype(&fattn_rel_mma_rows<false, GGML_TYPE_F16, true, 1, 1>);
+    // the instance of a type and its stage; query groups only on f16 and q8_0 read by words
+    auto pick = [&](auto type, auto elem) -> kernel_t {
+        constexpr ggml_type t = decltype(type)::value;
+        constexpr bool e = decltype(elem)::value;
+        if (query_first) {
+            return fattn_rel_mma_rows<true, t, e, 1, 1>;
+        }
+        if constexpr (t != GGML_TYPE_F16 && e) {
+            return fattn_rel_mma_rows<false, t, e, 1, 1>;
+        } else {
+            switch (group == 1 ? 0 : (group*gqa + 7)/8) {
+                case 0:  return fattn_rel_mma_rows<false, t, e, 1, 1>;
+                case 1:  return fattn_rel_mma_rows<false, t, e, 1, 4>;
+                case 2:  return fattn_rel_mma_rows<false, t, e, 2, 4>;
+                default: return fattn_rel_mma_rows<false, t, e, 3, 4>;
+            }
+        }
+    };
     kernel_t kernel;
-    switch (group == 1 ? 0 : (group*gqa + 7)/8) {
-        case 0:  kernel = q8 ? fattn_rel_mma_rows<GGML_TYPE_Q8_0, 1, 1> : fattn_rel_mma_rows<GGML_TYPE_F16, 1, 1>; break;
-        case 1:  kernel = q8 ? fattn_rel_mma_rows<GGML_TYPE_Q8_0, 1, 4> : fattn_rel_mma_rows<GGML_TYPE_F16, 1, 4>; break;
-        case 2:  kernel = q8 ? fattn_rel_mma_rows<GGML_TYPE_Q8_0, 2, 4> : fattn_rel_mma_rows<GGML_TYPE_F16, 2, 4>; break;
-        default: kernel = q8 ? fattn_rel_mma_rows<GGML_TYPE_Q8_0, 3, 4> : fattn_rel_mma_rows<GGML_TYPE_F16, 3, 4>; break;
+    switch (k->type) {
+        case GGML_TYPE_Q8_0:
+            kernel = fattn_rel_mma_elem(k->type, group) ?
+                pick(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{}, std::true_type{}) :
+                pick(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{}, std::false_type{});
+            break;
+#ifdef FATTN_REL_ELEM_F8
+        case GGML_TYPE_F8_E4M3:
+            kernel = pick(std::integral_constant<ggml_type, GGML_TYPE_F8_E4M3>{}, std::true_type{});
+            break;
+#endif // FATTN_REL_ELEM_F8
+        default:
+            GGML_ASSERT(k->type == GGML_TYPE_F16);
+            kernel = pick(std::integral_constant<ggml_type, GGML_TYPE_F16>{}, std::true_type{});
+            break;
     }
-    kernel<<<dim3(n_streams, k->ne[2], q->ne[1]/group), WARP_SIZE, 0, ctx.stream()>>>(
+    const dim3 grid = query_first ? dim3(q->ne[1], k->ne[2], n_streams) : dim3(n_streams, k->ne[2], q->ne[1]/group);
+    kernel<<<grid, WARP_SIZE, 0, ctx.stream()>>>(
             (const char *) q->data, (const char *) k->data, (const char *) v->data,
             (const uint32_t *) dst->src[3]->data, (const float *) dst->src[6]->data,
             (const int32_t *) dst->src[7]->data, (const int32_t *) dst->src[8]->data, shift ? sinks : nullptr, partial,

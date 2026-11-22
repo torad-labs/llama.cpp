@@ -152,8 +152,8 @@ static __device__ constexpr int calc_experts_per_thread(int n_experts, int warp_
 
     It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
 */
-template <int n_experts, bool has_bias>
-__launch_bounds__(TOPK_MOE_ROWS_PER_BLOCK * ggml_cuda_get_physical_warp_size(), 1)
+template <int n_experts, bool has_bias, int rows_per_block>
+__launch_bounds__(rows_per_block * ggml_cuda_get_physical_warp_size(), 1)
 __global__ void topk_moe_cuda(const float *         logits,
                               float *               weights,
                               int32_t *             ids,
@@ -356,8 +356,8 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 }
 
-template<bool has_bias>
-static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
+template<bool has_bias, int rows_per_block>
+static void launch_topk_moe_rows(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
                                  float *                     weights,
                                  int32_t *                   ids,
@@ -370,69 +370,64 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const topk_moe_config       config) {
     GGML_ASSERT(!(config.with_norm && config.delayed_softmax) &&
                 "delayed softmax is not supported with weight normalization");
-    const int    rows_per_block = TOPK_MOE_ROWS_PER_BLOCK;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     dim3         block_dims(warp_size, rows_per_block, 1);
     cudaStream_t stream = ctx.stream();
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 
+#define TOPK_MOE_CASE(n) \
+    case n: \
+        ggml_cuda_kernel_launch(topk_moe_cuda<n, has_bias, rows_per_block>, launch_params, \
+            logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config); \
+        break;
     switch (n_expert) {
-        case 1:
-            ggml_cuda_kernel_launch(topk_moe_cuda<1, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 2:
-            ggml_cuda_kernel_launch(topk_moe_cuda<2, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 4:
-            ggml_cuda_kernel_launch(topk_moe_cuda<4, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 8:
-            ggml_cuda_kernel_launch(topk_moe_cuda<8, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 16:
-            ggml_cuda_kernel_launch(topk_moe_cuda<16, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 32:
-            ggml_cuda_kernel_launch(topk_moe_cuda<32, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 64:
-            ggml_cuda_kernel_launch(topk_moe_cuda<64, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 128:
-            ggml_cuda_kernel_launch(topk_moe_cuda<128, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 256:
-            ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 288: // StepFun 3.7
-            ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 384: // DeepSeek V4.1
-            ggml_cuda_kernel_launch(topk_moe_cuda<384, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 512:
-            ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 576:
-            ggml_cuda_kernel_launch(topk_moe_cuda<576, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
+        TOPK_MOE_CASE(1)
+        TOPK_MOE_CASE(2)
+        TOPK_MOE_CASE(4)
+        TOPK_MOE_CASE(8)
+        TOPK_MOE_CASE(16)
+        TOPK_MOE_CASE(32)
+        TOPK_MOE_CASE(64)
+        TOPK_MOE_CASE(128)
+        TOPK_MOE_CASE(256)
+        TOPK_MOE_CASE(288) // StepFun 3.7
+        TOPK_MOE_CASE(384) // DeepSeek V4.1, Inkling 2
+        TOPK_MOE_CASE(512)
+        TOPK_MOE_CASE(576)
         default:
             GGML_ASSERT(false && "fatal error");
     }
+#undef TOPK_MOE_CASE
+}
+
+// More rows than a block takes, whose weights and ids lie over the logits: one block of 16, 24 or 32 warps, so every
+// row is read before any is written
+template<bool has_bias>
+static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
+                                 const float *               logits,
+                                 float *                     weights,
+                                 int32_t *                   ids,
+                                 float *                     bias,
+                                 const int                   n_rows,
+                                 const int                   n_expert,
+                                 const int                   n_expert_used,
+                                 const float                 clamp_val,
+                                 const float                 scale_val,
+                                 const topk_moe_config       config,
+                                 const bool                  one_block) {
+#define TOPK_MOE_ROWS(rows) \
+    launch_topk_moe_rows<has_bias, rows>(ctx, logits, weights, ids, bias, n_rows, n_expert, n_expert_used, clamp_val, scale_val, config)
+    if (!one_block || n_rows <= TOPK_MOE_ROWS_PER_BLOCK) {
+        TOPK_MOE_ROWS(TOPK_MOE_ROWS_PER_BLOCK);
+    } else if (n_rows <= 16) {
+        TOPK_MOE_ROWS(16);
+    } else if (n_rows <= 24) {
+        TOPK_MOE_ROWS(24);
+    } else {
+        TOPK_MOE_ROWS(32);
+    }
+#undef TOPK_MOE_ROWS
 }
 
 void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
@@ -479,17 +474,28 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;
 
+    // past one block's rows, outputs over the logits need the rows' reads in one block (see reads_before_writes)
+    const auto overlaps = [&](const ggml_tensor * t) {
+        const char * a = (const char *) logits->data;
+        const char * b = (const char *) t->data;
+        return a < b + ggml_nbytes(t) && b < a + ggml_nbytes(logits);
+    };
+    const bool one_block = n_rows > TOPK_MOE_ROWS_PER_BLOCK && ggml_cuda_topk_moe_reads_before_writes(n_rows) &&
+        (overlaps(weights) || overlaps(ids));
+
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
-                             scale_val, config);
+                             scale_val, config, one_block);
     } else {
         launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
-                             scale_val, config);
+                             scale_val, config, one_block);
     }
 }
 
 bool ggml_cuda_topk_moe_reads_before_writes(const int64_t n_rows) {
-    return n_rows <= TOPK_MOE_ROWS_PER_BLOCK;
+    // GGML_CUDA_TOPK_MOE_WIDE_LEGACY=1: only the rows that fit one block of TOPK_MOE_ROWS_PER_BLOCK
+    static const bool wide_legacy = ggml_env_switch("GGML_CUDA_TOPK_MOE_WIDE_LEGACY");
+    return n_rows <= (wide_legacy ? TOPK_MOE_ROWS_PER_BLOCK : TOPK_MOE_WIDE_ROWS);
 }
 
 bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,

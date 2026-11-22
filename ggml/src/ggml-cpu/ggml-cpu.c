@@ -2060,6 +2060,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_short_conv(params, tensor);
             } break;
+        case GGML_OP_LOOP_CONTROL:
+            {
+                ggml_compute_forward_loop_control(params, tensor);
+            } break;
         case GGML_OP_LEAKY_RELU:
             {
                 ggml_compute_forward_leaky_relu(params, tensor);
@@ -2071,6 +2075,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_FILL:
             {
                 ggml_compute_forward_fill(params, tensor);
+            } break;
+        case GGML_OP_SLEEP:
+            {
+                ggml_compute_forward_sleep(params, tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT_SPARSE:
         case GGML_OP_FLASH_ATTN_EXT:
@@ -2355,6 +2363,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_LEAKY_RELU:
+        case GGML_OP_SLEEP:
             {
                 n_tasks = 1;
             } break;
@@ -2429,10 +2438,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_GET_ROWS:
             {
-                // FIXME: get_rows can use additional threads, but the cost of launching additional threads
-                // decreases performance with GPU offloading
-                //n_tasks = n_threads;
-                n_tasks = 1;
+                // waking the other threads costs more than a small lookup, e.g. when this is the only CPU node of an offloaded model
+                n_tasks = ggml_nelements(node) >= 262144 ? n_threads : 1;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:
@@ -2490,6 +2497,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_NORM_CLIP:
         case GGML_OP_ATTN_RES_MIX:
         case GGML_OP_SHORT_CONV:
+        case GGML_OP_LOOP_CONTROL:
         case GGML_OP_FLASH_ATTN_EXT_SPARSE:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
@@ -2986,7 +2994,8 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_SET_ROWS:
                     {
-                        if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
+                        if ((node->src[0]->type == GGML_TYPE_F16  && node->type != GGML_TYPE_F16) ||
+                            (node->src[0]->type == GGML_TYPE_BF16 && node->type != GGML_TYPE_BF16)) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
@@ -3049,6 +3058,15 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TOP_K_CANDIDATES:
                     {
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
+                    } break;
+                case GGML_OP_LOOP_CONTROL:
+                    {
+                        // each token's two norms and gate inputs, then a weight row in f32 a thread (down's, or
+                        // gain's and forget's)
+                        const int64_t n_tokens = node->ne[1];
+                        const int64_t rank     = node->src[2]->ne[1];
+                        const int64_t row      = MAX(node->src[2]->ne[0], 2*rank) + (int64_t) CACHE_LINE_SIZE_F32;
+                        cur = sizeof(float)*(size_t) ((2 + rank)*n_tokens + row*n_tasks);
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT_SPARSE:
         case GGML_OP_FLASH_ATTN_EXT:

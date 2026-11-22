@@ -147,3 +147,40 @@ its economics invert at high session counts: verification multiplies target rows
 so 23 decoding sessions become 184-row steps with 96 reductions each. The fork's adaptive
 draft-depth idea from GLM MTP transfers as a concept; none of its code does. See the
 phase plan in [07-implementation-plan.md](07-implementation-plan.md).
+
+## Addendum, 2026-11-22: measured state and the qgre learnings
+
+The architecture-shaped kernel plan (kernels shaped to the architecture, from the
+other seat's survey: 3.1 far cells without a bias, 3.2 the shared prefix read once,
+3.3 cells by run, 3.4 one-byte KV in the global layers, 3.5 the window ring, 3.6/3.7
+the stacked Q-input and F32 products, 3.8 the experts by measurement) supersedes my
+ranking below where the two differ: its byte counts demote the K-quant ring to an
+M1-gated item and promote the far-path and one-byte-KV work, which the expert-ring
+note on the moe-shapes row records as a correction. The two documents agree on the
+drafter-last ordering.
+
+Status against these steps after the 2026-11-21/22 four-card windows:
+
+- Landed and measured (four RTX PRO 6000, 23 sessions, the six-arm window and the
+  2026-11-22 arms): query-first attention (+26.8%), compact greedy (+11.5%), the shared
+  few-row quantize (+0.75% on the serving arm), composed as the one `tensor-4` profile:
+  stock 292.0 tok/s -> 425.6 tok/s, +45.7%, p99 delivery gap 92.5 -> 65.1 ms. These are
+  slices of Steps 1, 2 and 4; the rows `inkling-optimize-*` carry the remainder.
+- New rows from the qgre mining (`.dev/docs/measurement-history/` in qgre-main):
+  `inkling-optimize-sync-structure` (Step 5: the layer-boundary sync and partial-reduce
+  restructuring - qgre's 100 tok/s crossing was two sync-structure changes composing
+  +14.5% with no bandwidth change) and `inkling-optimize-l2-warm` (Step 4 adjacent: the
+  expert tiles warmed through `cp.async.bulk.prefetch.tensor`, dose-capped, no evict_last,
+  issued before the dependency wait; per-lane `prefetch.global.L2` loops are a measured
+  loss). The TMA design laws for the Step 4 kernel work (TMA tile loads for weight bytes,
+  the scale words as their own SWIZZLE_128B plane, the sm_120 alignment limits) are
+  recorded on the `inkling-optimize-moe-shapes` row.
+- Step 6 extension to assess: an e4m3 (FP8) KV cache for the global layers, where the
+  bytes dominate (the shared-prefix re-read is 49.4 GB/step/card at the stock trace; FP8
+  halves it). The fork already reads q4_0 KV natively; the quality leg decides.
+- Not adopted, measured: `--expert-row-limit 32` (-0.3% in the 2026-11-22 arms; the 2019
+  +1.9% single trial did not reproduce), `GGML_CUDA_AR_GATHER_BLOCKS 4` (-1.4%; 16 neutral).
+  Whole-expert split (-1.3%) and Q3_K block reuse (-7.5%) stand from the earlier windows.
+- The launcher consolidated to the one `tensor-4` profile; the tested variants and their
+  numbers are recorded in the serve.py comment block. DSpark stays last per this step,
+  to be revisited with the trained drafter and its acceptance data.

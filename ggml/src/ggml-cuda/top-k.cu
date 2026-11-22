@@ -184,13 +184,6 @@ static __global__ void top_k_radix_gather(
     constexpr int NBINS     = 1 << RADIX_BITS;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = BLOCK_SIZE / warp_size;
-    const auto popc = [](const ggml_cuda_thread_mask_t mask) {
-        if constexpr (warp_size == 64) {
-            return __popcll(mask);
-        } else {
-            return __popc(mask);
-        }
-    };
     __shared__ int warp_ties[nwarps];
 
     const int row = blockIdx.x / blocks_per_row;
@@ -247,11 +240,11 @@ static __global__ void top_k_radix_gather(
         const bool    is_tie = col < warp_end && top_k_float_to_ordered(row_src[col]) == threshold;
 
         const ggml_cuda_thread_mask_t ties = ggml_cuda_ballot(is_tie);
-        const int tie_pos = pos + popc(ties & (((ggml_cuda_thread_mask_t) 1 << lane) - 1));
+        const int tie_pos = pos + ggml_cuda_popc(ties & (((ggml_cuda_thread_mask_t) 1 << lane) - 1));
         if (is_tie && tie_pos < pos_end) {
             row_dst[k - rank + tie_pos] = col;
         }
-        pos += popc(ties);
+        pos += ggml_cuda_popc(ties);
     }
 }
 
@@ -450,7 +443,7 @@ static __device__ __forceinline__ uint32_t topk_radix_warp_incl_scan(uint32_t v,
 template <int ITEMS, bool CAND, bool CANONICAL = false>
 static __global__ void __launch_bounds__(TOPK_RADIX_BLOCK) topk_radix(
         const float * src, const uint32_t * src_key, const int * src_col, int * out_col, uint32_t * out_key,
-        const int64_t row_stride, const int seg_len, const int nseg, const int ncols, const int k) {
+        const int64_t row_stride, const int seg_len, const int nseg, const int ncols, const int k, const bool first_nan) {
     constexpr int BLOCK  = TOPK_RADIX_BLOCK;
     constexpr int NWARPS = BLOCK / WARP_SIZE;
     static_assert(NWARPS <= WARP_SIZE, "one warp scans the warps' sums");
@@ -482,7 +475,7 @@ static __global__ void __launch_bounds__(TOPK_RADIX_BLOCK) topk_radix(
             const float value = src[base + col];
             if constexpr (CANONICAL) {
                 // Keep numeric ties equal without changing the bits packed in the result.
-                if (isnan(value)) { return 1; }
+                if (isnan(value)) { return first_nan && col0 + col == 0 ? UINT32_MAX : 1u; }
                 return topk_radix_key(value == 0.0f ? 0.0f : value);
             }
             return topk_radix_key(value);
@@ -636,15 +629,15 @@ static __global__ void __launch_bounds__(TOPK_RADIX_BLOCK) topk_radix(
 template <bool CAND, bool CANONICAL = false>
 static void topk_radix_launch(const int nblocks, const float * src, const uint32_t * src_key, const int * src_col,
                               int * out_col, uint32_t * out_key, const int64_t row_stride, const int seg_len,
-                              const int nseg, const int ncols, const int k, cudaStream_t stream) {
+                              const int nseg, const int ncols, const int k, cudaStream_t stream, bool first_nan = false) {
     if (seg_len <= 4*TOPK_RADIX_BLOCK) {
-        topk_radix<4, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k);
+        topk_radix<4, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan);
     } else if (seg_len <= 8*TOPK_RADIX_BLOCK) {
-        topk_radix<8, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k);
+        topk_radix<8, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan);
     } else if (seg_len <= 16*TOPK_RADIX_BLOCK) {
-        topk_radix<16, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k);
+        topk_radix<16, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan);
     } else {
-        topk_radix<0, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k);
+        topk_radix<0, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan);
     }
 }
 
@@ -703,7 +696,11 @@ void ggml_cuda_op_top_k_candidates(ggml_backend_cuda_context & ctx, ggml_tensor 
     const ggml_tensor * src = dst->src[0];
     GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I64);
     GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
-    const int ncols = src->ne[0];
+    const int stride = src->ne[0];
+    const int offset = ggml_get_op_params_i32(dst, 0);
+    const int vocab = ggml_get_op_params_i32(dst, 1);
+    const int ncols = vocab ? std::clamp(vocab - offset, 0, stride) : stride;
+    const bool first_nan = offset == 0 && ggml_get_op_params_i32(dst, 2);
     const int nrows = dst->ne[2];
     const int k = dst->ne[0];
     const int count = std::min(k, ncols);
@@ -713,7 +710,7 @@ void ggml_cuda_op_top_k_candidates(ggml_backend_cuda_context & ctx, ggml_tensor 
     if (count > 0 && nrows > 0) {
         if (ncols <= 16*TOPK_RADIX_BLOCK || 2*int64_t(count) > TOPK_RADIX_TILE) {
             topk_radix_launch<false, true>(nrows, values, nullptr, nullptr, ids.get(), nullptr,
-                                          ncols, ncols, 1, ncols, count, stream);
+                                          stride, ncols, 1, ncols, count, stream, first_nan);
         } else {
             const int tile = TOPK_RADIX_TILE;
             const int ntiles = (ncols + tile - 1) / tile;
@@ -721,7 +718,7 @@ void ggml_cuda_op_top_k_candidates(ggml_backend_cuda_context & ctx, ggml_tensor 
             ggml_cuda_pool_alloc<uint32_t> keys(ctx.pool(), size_t(nrows)*ncand);
             ggml_cuda_pool_alloc<int> cols(ctx.pool(), size_t(nrows)*ncand);
             topk_radix_launch<false, true>(nrows*ntiles, values, nullptr, nullptr, cols.get(), keys.get(),
-                                          ncols, tile, ntiles, ncols, count, stream);
+                                          stride, tile, ntiles, ncols, count, stream, first_nan);
             topk_radix_launch<true>(nrows, nullptr, keys.get(), cols.get(), ids.get(), nullptr,
                                    ncand, ncand, 1, ncand, count, stream);
         }
@@ -729,7 +726,7 @@ void ggml_cuda_op_top_k_candidates(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int64_t total = ggml_nelements(dst);
     if (total > 0) {
         topk_pack_candidates<<<(total + 255)/256, 256, 0, stream>>>(values, ids.get(), (uint64_t *) dst->data,
-            ncols, k, count, dst->ne[1], ggml_get_op_params_i32(dst, 0), total);
+            stride, k, count, dst->ne[1], offset, total);
     }
 }
 

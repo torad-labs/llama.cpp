@@ -140,7 +140,7 @@ gated_delta_net_cuda(const float * q,
     const uint32_t sequence = blockIdx.y;
     // Each warp owns one or more columns, using warp-level primitives to reduce across rows.
     const int      lane     = threadIdx.x;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_GB10
     constexpr int cols_per_warp = S_v == 128 && !KDA ? 4 : KDA_COLS;
 #else
     constexpr int cols_per_warp = KDA_COLS;
@@ -375,7 +375,7 @@ static void launch_gated_delta_net(
         GGML_ABORT("GGML_CUDA_KDA_COLUMNS must be 1, 2 or 4");
     }();
     const int cols_per_warp = KDA && S_v == 128 && cc == GGML_CUDA_CC_BLACKWELL ? kda_cols :
-        (cc == GGML_CUDA_CC_DGX_SPARK && S_v == 128 && !KDA ? 4 : 1);
+        (cc == GGML_CUDA_CC_GB10 && S_v == 128 && !KDA ? 4 : 1);
     dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols_per_warp - 1) / (num_warps * cols_per_warp));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
@@ -734,7 +734,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     ggml_cuda_pool_alloc<float> g_exp_alloc(ctx.pool());
     bool g_precomputed = false;
     if (!kda && !raw && state_type == GGML_TYPE_F32 && S_v == 128 && n_tokens >= 32 &&
-            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK) {
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_GB10) {
         const int64_t n_g = ggml_nelements(src_g);
         g_exp_alloc.alloc(n_g);
         const int block = 256;

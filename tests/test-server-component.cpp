@@ -4,6 +4,7 @@
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
 #include "../tools/server/server-schema.h"
+#include "../tools/server/server-task.h"
 
 #include <algorithm>
 #include <cmath>
@@ -330,6 +331,71 @@ static void test_json_helpers(testing & t) {
     });
 }
 
+//
+// server_prompt
+//
+
+static void test_server_prompt_reuse(testing & t) {
+    // 110 text tokens, the position of a token is its index
+    auto make_prompt = [](std::vector<std::array<llama_pos, 2>> checkpoints) {
+        llama_tokens toks(110);
+        for (size_t i = 0; i < toks.size(); i++) {
+            toks[i] = 100 + (llama_token) i;
+        }
+
+        server_prompt res;
+        res.tokens = server_tokens(toks, false);
+        for (const auto & range : checkpoints) {
+            auto ckpt = std::make_shared<common_prompt_checkpoint>();
+            ckpt->pos_min  = range[0];
+            ckpt->pos_max  = range[1];
+            ckpt->n_tokens = range[1] + 1;
+            res.checkpoints.push_back(std::move(ckpt));
+        }
+        return res;
+    };
+
+    auto reuse = [](const server_prompt & prompt, size_t common, bool append, int n_swa, llama_pos pos_min) {
+        auto next = prompt.tokens.clone();
+        next.keep_first(common);
+        if (append) {
+            next.push_back(999);
+        }
+        return server_prompt_cache::reusable_prefix(prompt, next, pos_min, n_swa);
+    };
+
+    t.test("recurrent", [&](testing & t) {
+        // a recurrent state holds one position: the live state is at 109, n_swa is 0
+        const auto prompt = make_prompt({{95, 95}, {99, 99}, {105, 105}});
+        const llama_pos pos_min = 109;
+
+        t.assert_equal("new tokens after the prompt", size_t(110), reuse(prompt, 110, true, 0, pos_min));
+
+        t.assert_equal("same prompt", size_t(106), reuse(prompt, 110, false, 0, pos_min));
+
+        // the closest checkpoint before the new tokens is used, the one after them is not
+        t.assert_equal("cut at 104", size_t(100), reuse(prompt, 104, true, 0, pos_min));
+
+        // the state at 99 already holds the token at 99, it cannot be used to process it again
+        t.assert_equal("cut at 99", size_t(96), reuse(prompt, 99, true, 0, pos_min));
+
+        t.assert_equal("cut at 50", size_t(0), reuse(prompt, 50, true, 0, pos_min));
+    });
+
+    t.test("swa", [&](testing & t) {
+        // n_swa is 8: the live state starts at 102, the checkpoint holds the positions 92 to 99
+        const auto prompt = make_prompt({{92, 99}});
+        const llama_pos pos_min = 102;
+
+        t.assert_equal("new tokens after the prompt", size_t(110), reuse(prompt, 110, true, 8, pos_min));
+
+        // the token at 104 needs the positions 97 to 103, the live state starts too late for a cut at 104
+        t.assert_equal("cut at 104", size_t(99), reuse(prompt, 104, true, 8, pos_min));
+
+        t.assert_equal("cut at 95", size_t(0), reuse(prompt, 95, true, 8, pos_min));
+    });
+}
+
 static void test_lora_helpers(testing & t) {
     // only pointer identity is used, never dereferenced
     auto * p0 = reinterpret_cast<llama_adapter_lora *>(0x10);
@@ -362,6 +428,13 @@ static void test_lora_helpers(testing & t) {
         t.assert_true("diff scale",   !are_lora_equal({make(p0, 1.0f)}, {make(p0, 0.5f)}));
         t.assert_true("diff ptr",     !are_lora_equal({make(p0, 1.0f)}, {make(p1, 1.0f)}));
         t.assert_true("diff size",    !are_lora_equal({make(p0, 1.0f)}, {}));
+    });
+
+    t.test("lora_should_clear_cache", [&](testing & t) {
+        // the adapter pointer is only read when the configs differ
+        t.assert_true("both empty", !lora_should_clear_cache({}, {}));
+        t.assert_true("same",       !lora_should_clear_cache({make(p0, 1.0f)}, {make(p0, 1.0f)}));
+        t.assert_true("to no lora", lora_should_clear_cache({make(p0, 0.0f)}, {}));
     });
 
     t.test("lora_get_enabled_ids", [&](testing & t) {
@@ -615,7 +688,7 @@ static void test_decision_ocr_jev_validation(testing & t) {
     const auto reject_questions = [&](const char * name, const json & body, const std::string & expected) {
         std::string error;
         try {
-            ctx.parse_questions(body);
+            ctx.parse_questions(body, false);
         } catch (const std::invalid_argument & e) {
             error = e.what();
         }
@@ -869,6 +942,7 @@ int main(int argc, char ** argv) {
     t.test("sse",           test_sse);
     t.test("json_helpers",  test_json_helpers);
     t.test("lora_helpers",  test_lora_helpers);
+    t.test("server_prompt_reuse", test_server_prompt_reuse);
     t.test("server_pipe",   test_server_pipe);
     t.test("decision_escape", test_decision_escape);
     t.test("rerank_template", test_rerank_template);

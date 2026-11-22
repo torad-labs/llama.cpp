@@ -20,7 +20,8 @@ ENV = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3", "LL
        "LD_LIBRARY_PATH": str(serve.ROOT / "build/bin"), **HOST_ROUTE}
 TENSOR4_ENV = {**ENV, "LLAMA_KV_SEQ_CELLS": "294912", "LLAMA_SLOT_PREFIX_COPY": "1", "LLAMA_INKLING2_MEAN_MASK_DECODE": "1",
                "GGML_CUDA_AR_GATHER_HOST_SLICES": "1", "GGML_CUDA_AR_HOST_OWNER_ROWS": "1",
-               "GGML_CUDA_MMVQ_KQUANT_MMID_MAX": "23", "LLAMA_INKLING2_BUCKET_PREFILL_KV": "1", "GGML_CUDA_MMVQ_EXPERT_SORT_23": "1"}
+               "GGML_CUDA_MMVQ_KQUANT_MMID_MAX": "23", "LLAMA_INKLING2_BUCKET_PREFILL_KV": "1", "GGML_CUDA_MMVQ_EXPERT_SORT_23": "1",
+               "GGML_CUDA_FATTN_REL_QUERY_FIRST": "1", "LLAMA_INKLING2_COMPACT_GREEDY": "1"}
 
 
 def pinned(pack, kv, context, cache_ram="32768", projector=MMPROJ):
@@ -39,7 +40,7 @@ def plan(*options):
 
 
 class ProfilePlanTest(unittest.TestCase):
-    def test_tensor_4_auto_draft(self):
+    def test_tensor_4_draft_layout_rides_the_flag(self):
         with tempfile.TemporaryDirectory() as root:
             packs = Path(root)
             draft = packs / serve.DRAFT
@@ -47,7 +48,7 @@ class ProfilePlanTest(unittest.TestCase):
             self.assertNotIn("--spec-type", plain)
             draft.touch()
             self.assertEqual(plain, plan("--packs", root)[0])
-            auto, _ = plan("--packs", root, "--profile", "tensor-4-draft")
+            auto, _ = plan("--packs", root, "--draft")
             for flag, value in {
                 "--spec-type": "draft-dspark", "--spec-draft-model": str(draft),
                 "--spec-draft-n-max": "3", "--spec-draft-sampling": "probabilistic",
@@ -55,13 +56,12 @@ class ProfilePlanTest(unittest.TestCase):
                 "--cache-type-k": "q8_0", "--cache-type-k-swa": "f16", "-c": "1572864", "-ub": "256",
             }.items():
                 self.assertEqual(auto[auto.index(flag) + 1], value)
-            self.assertEqual(auto, plan("--packs", root, "--draft")[0])
             greedy, _ = plan("--packs", root, "--draft", "--draft-sampling", "greedy")
             self.assertEqual(greedy[greedy.index("--spec-draft-sampling") + 1], "greedy")
             override, _ = plan("--packs", root, "--draft", "--ubatch-size", "512")
             self.assertEqual(override[override.index("-ub") + 1], "512")
             self.assertEqual(plain, plan("--packs", root, "--no-draft")[0])
-            control, _ = plan("--packs", root, "--profile", "tensor-4-draft", "--no-draft")
+            control, _ = plan("--packs", root, "--draft-layout", "--no-draft")
             self.assertEqual(control, auto[:auto.index("--spec-type")])
             custom = ["--packs", root, "--model", str(packs / "custom.gguf")]
             self.assertNotIn("--spec-type", plan(*custom)[0])
@@ -78,20 +78,18 @@ class ProfilePlanTest(unittest.TestCase):
         self.assertEqual(env, TENSOR4_ENV)
         self.assertEqual((argv, env), plan("--profile", "tensor-4"))
 
-    def test_tensor_4_capacity_serves_the_iq3_pack_at_q8_0_with_every_session_full(self):
-        argv, env = plan("--profile", "tensor-4-capacity")
-        self.assertEqual(argv, pinned("Inkling-2-Small-abliterated-e4853745-IQ3_XXS-imatrix", "q8_0", "6029312"))
-        self.assertEqual(env, ENV)
-
-    def test_tensor_4_quality_serves_the_q4_pack_at_f16_with_two_full_sessions(self):
-        argv, env = plan("--profile", "tensor-4-quality")
-        self.assertEqual(argv, pinned("Inkling-2-Small-abliterated-e4853745-Q4_K_M-imatrix", "f16", "524288"))
-        self.assertEqual(env, ENV)
+    def test_tensor_4_defaults_to_the_two_measured_decode_changes(self):
+        # the fastest measured serving configuration is the one profile (reports/inkling2-tensor4-implementation.md)
+        argv, env = plan("--profile", "tensor-4")
+        self.assertIn("GGML_CUDA_FATTN_REL_QUERY_FIRST", env)
+        self.assertIn("LLAMA_INKLING2_COMPACT_GREEDY", env)
+        self.assertEqual((argv, env), plan())
 
     def test_tensor_4_can_select_plain_engine_or_q8_wire_without_bf16_ownership(self):
         profile = ("--profile", "tensor-4")
         _, engine = plan(*profile, "--reduction-route", "engine")
-        self.assertEqual({key for key in engine if key.startswith("GGML_CUDA")}, {"GGML_CUDA_MMVQ_KQUANT_MMID_MAX", "GGML_CUDA_MMVQ_EXPERT_SORT_23"})
+        self.assertEqual({key for key in engine if key.startswith("GGML_CUDA")},
+                         {"GGML_CUDA_MMVQ_KQUANT_MMID_MAX", "GGML_CUDA_MMVQ_EXPERT_SORT_23", "GGML_CUDA_FATTN_REL_QUERY_FIRST"})
         _, q8 = plan(*profile, "--reduction-wire", "q8")
         self.assertEqual(q8["GGML_CUDA_AR_WIRE_Q8"], "1")
         self.assertNotIn("GGML_CUDA_AR_HOST_OWNER_ROWS", q8)
@@ -100,6 +98,7 @@ class ProfilePlanTest(unittest.TestCase):
 
     def test_explicit_tensor_4_overrides(self):
         argv, env = plan("--profile", "tensor-4", "--no-host-owner-rows", "--no-prefix-copy", "--no-mean-mask-decode", "--no-bucket-prefill-kv", "--no-stable-prefill", "--no-sort-expert-rows",
+                         "--no-query-first-decode", "--no-compact-greedy",
                          "--cache-ram", "0", "--context", "1048576", "--slots", "8", "--slot-context", "131072",
                          "--expert-row-limit", "auto", "--checkpoint-every", "0")
         for flag, expected in [("--cache-ram", "0"), ("-c", "1048576"), ("-np", "8"), ("--checkpoint-every", "0")]:
@@ -140,6 +139,13 @@ class OptionTest(unittest.TestCase):
         self.assertNotIn("GGML_CUDA_FATTN_REL_PREFILL_F32", plan("--no-stable-prefill")[1])
         self.assertEqual(plan("--sort-expert-rows")[1]["GGML_CUDA_MMVQ_EXPERT_SORT_23"], "1")
         self.assertNotIn("GGML_CUDA_MMVQ_EXPERT_SORT_23", plan("--no-sort-expert-rows")[1])
+
+    def test_decode_changes_switch_on_and_off_one_by_one(self):
+        query_first, compact = "GGML_CUDA_FATTN_REL_QUERY_FIRST", "LLAMA_INKLING2_COMPACT_GREEDY"
+        self.assertNotIn(query_first, plan("--no-query-first-decode")[1])
+        self.assertNotIn(compact, plan("--no-compact-greedy")[1])
+        self.assertNotIn(query_first, plan("--no-query-first-decode", "--no-compact-greedy")[1])
+        self.assertNotIn(compact, plan("--no-query-first-decode", "--no-compact-greedy")[1])
 
     def test_mean_mask_decode_can_be_disabled(self):
         key = "LLAMA_INKLING2_MEAN_MASK_DECODE"
@@ -262,10 +268,9 @@ class DryRunTest(unittest.TestCase):
 
     def test_dry_run_prints_the_pinned_plan_and_starts_nothing(self):
         clean = {"PATH": os.environ.get("PATH", "")}
-        out = self.dry_run("--profile", "tensor-4-capacity", env=clean)
-        self.assertEqual(out, {"argv": plan("--profile", "tensor-4-capacity")[0],
-                               "env": ENV, "removed": []})
-        self.assertEqual(out, self.dry_run("--profile", "tensor-4-capacity", env=clean))
+        out = self.dry_run(env=clean)
+        self.assertEqual(out, {"argv": plan()[0], "env": TENSOR4_ENV, "removed": []})
+        self.assertEqual(out, self.dry_run(env=clean))
 
     def test_qualifier_dry_run_uses_tensor_4_and_honors_opt_outs(self):
         options = ["--profile", "tensor-4", "--no-prefix-copy", "--no-mean-mask-decode", "--no-host-owner-rows", "--no-bucket-prefill-kv", "--stable-prefill",

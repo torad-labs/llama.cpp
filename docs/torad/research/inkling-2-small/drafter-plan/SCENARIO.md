@@ -44,7 +44,7 @@ one.
 
 The exact launch, argument by argument and variable by variable, is recorded in
 `data/drafter-20261119/g1-gate/launch.json` and `meta-heldout.json`, and `scripts/inkling2/serve.py` with its
-`README.md` is the launcher (profile `tensor-4-draft`).
+`README.md` is the launcher (profile `tensor-4` with `--draft`; `--draft-layout --no-draft` is the matched control).
 
 ## The numeric path, as the engine has it
 

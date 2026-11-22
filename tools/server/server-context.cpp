@@ -172,6 +172,7 @@ struct server_batch {
         bool output;
         bool is_prompt; // for stats tracking
         int32_t decision_order = 0;
+        int32_t decision_group = 0;
         int32_t i_embd = -1; // row in embd, -1 if this is a token
     };
     std::vector<token> tokens;
@@ -252,6 +253,11 @@ struct server_batch {
         tokens[idx].decision_order = order;
     }
 
+    void set_decision_group(int32_t idx, int32_t group) {
+        GGML_ASSERT(idx >= 0 && idx < (int32_t)tokens.size());
+        tokens[idx].decision_group = group;
+    }
+
     // render the sub-batch [off, off + n_tokens) into view, index i in view is index off + i here
     void render(int32_t off, int32_t n_tokens) {
         GGML_ASSERT(off >= 0 && off < size());
@@ -266,6 +272,7 @@ struct server_batch {
                 view.add(t.token, t.pos[0], t.id_slot, t.output);
             }
             view.tokens.back().decision_order = t.decision_order;
+            view.tokens.back().decision_group = t.decision_group;
         }
     }
 };
@@ -1581,6 +1588,9 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // n_swa for server_prompt::get_reuse(): 0 with a recurrent state, which holds one position only
+    int32_t n_swa_reuse;
+
     // slots / clients
     std::vector<server_slot> slots;
     size_t prompt_cursor = 0;
@@ -2171,6 +2181,9 @@ private:
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
 
+        // the min position of a hybrid memory is the position of its recurrent state, not the start of the SWA window
+        n_swa_reuse = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt) ? 0 : n_swa;
+
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
@@ -2593,6 +2606,8 @@ private:
         size_t donor_reuse = 0;
         bool copy_overwrite = false;
         id_slot_copied = -1;
+        // the adapters the task runs with: a state made with others is not reused for it
+        const auto task_lora = get_task_lora(task);
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -2644,8 +2659,13 @@ private:
                 // Rank resident slots by recoverable work, just like RAM
                 // snapshots: recurrent/SWA rollback can shorten the raw LCP.
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
-                const size_t reusable = server_prompt_cache::reusable_prefix(slot.prompt, task.tokens,
-                        llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), n_swa, lcp_len);
+                // the launch would clear this slot, its state cannot be reused with another lora config
+                const bool lora_clash = lora_should_clear_cache(slot.prompt.lora, task_lora);
+                if (lora_clash) {
+                    SLT_TRC(slot, "%s", " - nothing to reuse, other lora config\n");
+                }
+                const size_t reusable = lora_clash ? 0 : server_prompt_cache::reusable_prefix(slot.prompt, task.tokens,
+                        llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), n_swa_reuse, lcp_len);
                 const float f_sim_cur = task.tokens.empty() ? 0.0f : float(reusable) / task.tokens.size();
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu, lcp=%zu) > %.3f\n",
@@ -2679,8 +2699,7 @@ private:
                     SLT_INF(*passed, "slot keeps its prompt, f_sim = %.3f, f_keep = %.3f: an empty slot is free\n",
                             f_sim_passed, f_sim_passed * task.tokens.size() / passed->prompt.tokens.size());
                     // the prefix was computed with the slot's adapters: it serves a request that runs with the same ones
-                    if (prefix_copy() && are_lora_equal(passed->lora,
-                                task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora))) {
+                    if (prefix_copy() && are_lora_equal(passed->lora, task_lora)) {
                         donor = passed;
                         donor_reuse = reuse_passed;
                     }
@@ -2693,11 +2712,10 @@ private:
                 }
                 if (prefix_copy() && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
                         !task.is_parent() && !task.is_child() && !task.is_stateless() && !task.tokens.has_media()) {
-                    const auto lora = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
                     for (const auto & cur : held) {
                         if (cur.second > donor_reuse && !cur.first->prompt.tokens.has_media() &&
                                 float(cur.second) / task.tokens.size() > slot_prompt_similarity &&
-                                are_lora_equal(cur.first->lora, lora)) {
+                                are_lora_equal(cur.first->lora, task_lora)) {
                             donor = cur.first;
                             donor_reuse = cur.second;
                         }
@@ -2771,7 +2789,7 @@ private:
         if (ret && prompt_cache && !task.is_stateless()) {
             const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), ret->id);
             auto * incoming = task.params.cache_prompt ?
-                prompt_cache->find_best(ret->prompt, task.tokens, pos_min, n_swa, resident_reuse) : nullptr;
+                prompt_cache->find_best(ret->prompt, task.tokens, pos_min, n_swa_reuse, resident_reuse, &task_lora) : nullptr;
             if (incoming) {
                 donor = nullptr;
             }
@@ -2852,7 +2870,7 @@ private:
         }
 
         size_t best = server_prompt_cache::reusable_prefix(recipient.prompt, task.tokens,
-                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), recipient.id), n_swa);
+                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), recipient.id), n_swa_reuse);
         server_slot * source = nullptr;
         bool wait = false;
         for (auto & candidate : slots) {
@@ -2876,7 +2894,7 @@ private:
                 continue;
             }
             const size_t reuse = future ? fork : server_prompt_cache::reusable_prefix(candidate.prompt, task.tokens,
-                    llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), candidate.id), n_swa);
+                    llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), candidate.id), n_swa_reuse);
             // A handoff should save a useful prompt pass, not wait for a few common tokens.
             if (reuse < 256 || reuse <= best || float(reuse) / task.tokens.size() <= slot_prompt_similarity) {
                 continue;
@@ -2928,7 +2946,7 @@ private:
                         [&](const auto & checkpoint) { return checkpoint->n_tokens == (int64_t) waiting.n_tokens; })) {
                 create_checkpoint(*source, 0, pos_min, pos_max, true);
             }
-            const size_t reuse = server_prompt_cache::reusable_prefix(source->prompt, recipient.task->tokens, pos_min, n_swa);
+            const size_t reuse = server_prompt_cache::reusable_prefix(source->prompt, recipient.task->tokens, pos_min, n_swa_reuse);
             if (reuse >= 256) {
                 copy_active_prefix(*source, recipient, reuse);
             } else {
@@ -2976,21 +2994,27 @@ private:
         return output;
     }
 
+    // per-request lora if given, otherwise the global config
+    std::vector<common_adapter_lora_info> get_task_lora(const server_task & task) const {
+        return task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         slot.idle_cache_refusal = {};
-        // per-request lora if given, otherwise the global config
-        auto task_loras = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
-        if (!are_lora_equal(task_loras, slot.lora)) {
+        auto task_loras = get_task_lora(task);
+
+        // the state can come from the prompt cache, so it is compared with its own lora config, not with the one of the last task
+        if (!are_lora_equal(task_loras, slot.prompt.lora)) {
             // if lora has changed, check to see if the cache should be cleared
-            if (lora_should_clear_cache(slot.lora, task_loras)) {
-                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
+            if (lora_should_clear_cache(slot.prompt.lora, task_loras)) {
+                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.prompt.lora.size(), task_loras.size());
                 slot.checkpoints_wait();
                 slot.prompt.clear();
             } else {
                 SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
             }
-            slot.lora = task_loras;
         }
+        slot.lora = task_loras;
 
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
@@ -3039,6 +3063,8 @@ private:
                 slot.alora_invocation_start = alora_invocation_start;
             }
         }
+
+        slot.prompt.lora = slot.lora;
 
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
@@ -3129,14 +3155,26 @@ private:
             // the chain reads on the CPU, a penalty window before its top-k included (common_sampler_n_candidates), so
             // no row is gathered or copied whole and no sampler graph is built a row. One k a context: the largest a
             // slot has asked for. LLAMA_OUTPUT_CANDIDATES_LEGACY=1: off
-            const int32_t n_cand = common_output_candidates_legacy() ? 0 : common_sampler_n_candidates(slot.smpl.get());
+            const bool candidates_enabled = !common_output_candidates_legacy();
+            int32_t n_cand = candidates_enabled ? common_sampler_n_candidates(slot.smpl.get()) : 0;
             slot.cand_rows = !slot.backend_sampler && n_cand > 0 && n_cand <= cand_k_max && !need_pre_sample_logits &&
                 pull_k.empty() && !lens_on && common_sampler_backend_passive(slot.smpl.get());
+            static const bool compact_greedy = ggml_env_switch("LLAMA_INKLING2_COMPACT_GREEDY");
+            const int32_t n_greedy = compact_greedy && candidates_enabled && !slot.backend_sampler && !slot.cand_rows &&
+                    !slot.can_speculate() && !need_pre_sample_logits && pull_k.empty() && !lens_on &&
+                    common_sampler_backend_passive(slot.smpl.get()) ? common_sampler_n_greedy_candidates(slot.smpl.get()) : 0;
+            const bool greedy = n_greedy > 0 && n_greedy <= cand_k_max &&
+                    llama_set_seq_greedy_candidates(ctx_tgt, slot.id);
+            if (greedy) {
+                n_cand = n_greedy;
+                slot.cand_rows = true;
+            } else {
+                llama_set_seq_candidates(ctx_tgt, slot.id, slot.cand_rows);
+            }
             if (slot.cand_rows && n_cand > cand_k) {
                 cand_k = n_cand;
                 llama_set_output_candidates(ctx_tgt, cand_k);
             }
-            llama_set_seq_candidates(ctx_tgt, slot.id, slot.cand_rows);
 
             if (!slot.backend_sampler && !slot.cand_rows && top_k > 0 && pre_probs_in_k && pull_k.empty() && !lens_on &&
                     common_sampler_backend_passive(slot.smpl.get())) {
@@ -3950,25 +3988,26 @@ private:
             }
             res->scores.assign(embd, embd + llama_model_n_embd_out(model_tgt));
         } else if (!decision.labels.empty()) {
-            const float * logits = llama_get_logits_ith(slot.ctx_tgt, i_batch);
-            if (logits == nullptr) {
-                send_error(slot, "failed to get logits", ERROR_TYPE_SERVER);
-                return;
-            }
             const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-            for (const llama_token label : decision.labels) {
-                GGML_ASSERT(label >= 0 && label < n_vocab);
-                res->scores.push_back(logits[label]);
-            }
-            if (!decision.label_groups.empty()) {
-                std::vector<float> scores;
-                size_t i = 0;
-                for (const int32_t n : decision.label_groups) {
-                    GGML_ASSERT(n > 0 && i + n <= res->scores.size());
-                    scores.push_back(*std::max_element(res->scores.begin() + i, res->scores.begin() + i + n));
-                    i += n;
+            const size_t  n_out   = decision.label_groups.empty() ? decision.labels.size() : decision.label_groups.size();
+            GGML_ASSERT(decision.label_pos.empty() || decision.label_pos.size() == n_out);
+            size_t i = 0;
+            for (size_t o = 0; o < n_out; o++) {
+                const int32_t i_out  = decision.label_pos.empty() ? i_batch : i_batch - (slot.task->n_tokens() - 1 - decision.label_pos[o]);
+                const float * logits = llama_get_logits_ith(slot.ctx_tgt, i_out);
+                if (logits == nullptr) {
+                    send_error(slot, "failed to get logits", ERROR_TYPE_SERVER);
+                    return;
                 }
-                res->scores = std::move(scores);
+                const size_t n = decision.label_groups.empty() ? 1 : decision.label_groups[o];
+                GGML_ASSERT(n > 0 && i + n <= decision.labels.size());
+                float score = -INFINITY;
+                for (size_t j = i; j < i + n; j++) {
+                    GGML_ASSERT(decision.labels[j] >= 0 && decision.labels[j] < n_vocab);
+                    score = std::max(score, logits[decision.labels[j]]);
+                }
+                res->scores.push_back(score);
+                i += n;
             }
         } else {
             // the outputs of this slot in this batch are the last tokens of the prompt
@@ -5936,7 +5975,7 @@ private:
                             const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
 
                             // a state or a checkpoint is useful when its pos_min is below this threshold
-                            const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+                            const auto pos_min_thold = std::max(0, n_swa_reuse > 0 ? pos_eval - n_swa_reuse + 2 : pos_eval);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -6276,6 +6315,9 @@ private:
                         if (!slot.task->decision.order.empty()) {
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
                         }
+                        if (!slot.task->decision.group.empty()) {
+                            batch.set_decision_group(batch.size() - 1, slot.task->decision.group[slot.prompt.n_tokens()]);
+                        }
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
@@ -6348,6 +6390,11 @@ private:
 
                         // extract the logits only for the last token
                         batch.set_output(batch.size() - 1, true);
+
+                        // and at the answer of each packed question
+                        for (const int32_t pos : slot.task->decision.label_pos) {
+                            batch.set_output(batch.size() - slot.task->n_tokens() + pos, true);
+                        }
 
                         slot.stats.n_gen = 0;
                         slot.i_batch     = batch.size() - 1;
@@ -6477,6 +6524,9 @@ private:
                 GGML_ASSERT(add_ok);
                 if (!slot.task->decision.order.empty()) {
                     batch.set_decision_order(batch.size() - 1, slot.task->decision.order[cur_token_idx]);
+                }
+                if (!slot.task->decision.group.empty()) {
+                    batch.set_decision_group(batch.size() - 1, slot.task->decision.group[cur_token_idx]);
                 }
                 slot.prompt.tokens.push_back(cur_tok);
                 continue;
@@ -8288,6 +8338,9 @@ void server_routes::init_routes() {
     // audio is PCM16 mono at the model sample rate, sent as base64 in input_audio_buffer.append events
     // input_audio_buffer.commit with "final": true ends the input, closing the socket also ends it
     this->ws_realtime = [this](const server_http_req & req, server_http_context::ws_conn & conn) {
+        // make sure sleep state is handled by create_response()
+        auto res = create_response();
+
         auto send_event = [&conn](json ev) {
             ev["event_id"] = "event_" + random_string();
             conn.send(safe_json_to_str(ev));
@@ -8307,7 +8360,7 @@ void server_routes::init_routes() {
         // models that answer after the audio hold a conversation, see server-realtime.h
         // live transcription: Voxtral Realtime (no chat), or an "asr" model in a session opened with ?intent=transcription
         const bool live_asr = !ctx_server.asr_prompt.empty() && req.get_param("intent") == "transcription";
-        if (ctx_server.mtmd_cap.audio_stream && ctx_server.mtmd_cap.chat && !live_asr) {
+        if (ctx_server.mtmd_cap.audio_duplex || (ctx_server.mtmd_cap.audio_stream && ctx_server.mtmd_cap.chat && !live_asr)) {
             server_realtime_conversation({queue_tasks, queue_results, *meta, params, ctx_server.mctx, ctx_server.mtmd_cap, ctx_server.vocab}, conn);
             return;
         }
@@ -8332,7 +8385,6 @@ void server_routes::init_routes() {
             }}}},
         };
 
-        auto res = create_response();
         auto & rd = res->rd;
         {
             server_task task(SERVER_TASK_TYPE_TRANSCRIBE_RT);
@@ -8664,7 +8716,8 @@ void server_routes::init_routes() {
         }
 
         const json body = json::parse(req.body);
-        const auto questions = decision.parse_questions(body);
+        const auto questions = decision.parse_questions(body, meta->has_inp_audio);
+        const size_t set_size = decision.set_size(questions);
 
         std::vector<raw_buffer> files;
         const json state = decision.prepare_state(decision.parse_state(body, files));
@@ -8673,7 +8726,8 @@ void server_routes::init_routes() {
             return res;
         }
 
-        // one task per variant of each question, or one task for all the questions
+        // one task per variant of each question, or one task for all the questions, or per packed set
+        const bool is_packed = decision.is_joint() || set_size > 0;
         auto & rd = res->rd;
         {
             std::vector<server_task> tasks;
@@ -8682,6 +8736,14 @@ void server_routes::init_routes() {
                 task.id = rd.get_new_id();
                 decision.fill_task_joint(state, questions, files, ctx_server.mctx, ctx_server.init_opt, task);
                 tasks.push_back(std::move(task));
+            } else if (set_size > 0) {
+                for (size_t i = 0; i < questions.size(); i += set_size) {
+                    const std::vector<server_decision_question> set(questions.begin() + i, questions.begin() + std::min(questions.size(), i + set_size));
+                    server_task task = server_task(SERVER_TASK_TYPE_DECISION);
+                    task.id = rd.get_new_id();
+                    decision.fill_task_set(state, set, files, ctx_server.mctx, ctx_server.init_opt, task);
+                    tasks.push_back(std::move(task));
+                }
             } else {
                 for (const auto & question : questions) {
                     for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
@@ -8713,15 +8775,20 @@ void server_routes::init_routes() {
         size_t i_score  = 0;
         for (const auto & question : questions) {
             std::vector<std::vector<float>> scores;
-            if (decision.is_joint()) {
-                // one result with the scores of all the questions, in order
-                auto * result = dynamic_cast<server_task_result_decision *>(all_results.results[0].get());
+            if (is_packed) {
+                auto * result = dynamic_cast<server_task_result_decision *>(all_results.results[i_result].get());
                 GGML_ASSERT(result != nullptr && i_score + question.options.size() <= result->scores.size());
                 scores.emplace_back(result->scores.begin() + i_score, result->scores.begin() + i_score + question.options.size());
+                if (i_score == 0) {
+                    n_tokens += result->n_tokens;
+                }
                 i_score += question.options.size();
-                n_tokens = result->n_tokens;
+                if (i_score == result->scores.size()) {
+                    i_result++;
+                    i_score = 0;
+                }
             }
-            for (size_t variant = 0; !decision.is_joint() && variant < decision.n_variants(question); variant++) {
+            for (size_t variant = 0; !is_packed && variant < decision.n_variants(question); variant++) {
                 auto * result = dynamic_cast<server_task_result_decision *>(all_results.results[i_result++].get());
                 GGML_ASSERT(result != nullptr);
                 scores.push_back(result->scores);
@@ -9199,7 +9266,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const serve
     // speaker_ref in the request overrides the default voice
     const bool has_speaker_ref   = req.files.count("speaker_ref") > 0 || !json_value(body, "speaker_ref_b64", std::string()).empty();
     const std::string voice      = json_value(body, "voice", has_speaker_ref ? std::string() : params.tts_voice);
-    const std::string tts_prompt = common_chat_get_tts_prompt(meta->chat_params.tmpls.get(), prompt, lang, voice);
+    // raw_prompt: the input goes to the model as is (e.g. phonemes), the "tts" chat template is skipped
+    const bool raw_prompt        = json_value(body, "raw_prompt", false);
+    const auto g2p = [this](const std::string & word) {
+        char buf[512];
+        return mtmd_gen_audio_g2p(ctx_server.mctx, word.c_str(), buf, sizeof(buf)) > 0 ? std::string(buf) : std::string();
+    };
+    const std::string tts_prompt = raw_prompt ? std::string() : common_chat_get_tts_prompt(meta->chat_params.tmpls.get(), prompt, lang, voice, g2p);
     // a model with predefined voices only speaks with one of them
     mtmd::bitmap_ptr voice_ref;
     if (!voice.empty() && info.n_voices > 0) {

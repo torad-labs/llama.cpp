@@ -35,7 +35,7 @@ def main() -> None:
     spec = importlib.util.spec_from_file_location("inkling2_serve", args.source / "scripts/inkling2/serve.py")
     serve = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(serve)
-    asked = ["--profile", "tensor-4-draft", "--no-draft", "--text-only", "--server", str(args.tool)]
+    asked = ["--profile", "tensor-4", "--draft-layout", "--no-draft", "--text-only", "--server", str(args.tool)]
     asked += ["--model", str(args.model)] if args.model else ["--packs", str(args.packs)]
     if args.slots is not None:
         asked += ["--slots", str(args.slots)]

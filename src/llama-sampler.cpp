@@ -4426,6 +4426,57 @@ bool llama_sampler_chain_coupled(const struct llama_sampler * chain) {
     return true;
 }
 
+int32_t llama_sampler_chain_greedy_candidates(const struct llama_sampler * chain) {
+    if (!chain || chain->iface != &llama_sampler_chain_i) {
+        return 0;
+    }
+    const auto * p = static_cast<const llama_sampler_chain *>(chain->ctx);
+    if (p->is_init) {
+        return 0;
+    }
+
+    bool biased = false, temperature = false, greedy = false;
+    int32_t count = 1;
+    for (const auto & s : p->samplers) {
+        const auto * iface = s.ptr->iface;
+        if (iface == &llama_sampler_empty_i) {
+            continue;
+        }
+        if (greedy) {
+            return 0;
+        }
+        if (iface == &llama_sampler_logit_bias_i && !biased && !temperature) {
+            const auto * bias = static_cast<const llama_sampler_logit_bias *>(s.ptr->ctx);
+            llama_token prev = -1;
+            for (const auto & lb : bias->by_token) {
+                if (lb.bias != -INFINITY || lb.token < 0 || lb.token >= bias->n_vocab) {
+                    return 0;
+                }
+                count += lb.token != prev;
+                prev = lb.token;
+            }
+            if (count > bias->n_vocab) {
+                return 0;
+            }
+            biased = true;
+        } else if (!temperature && iface == &llama_sampler_temp_ext_i) {
+            const auto * temp = static_cast<const llama_sampler_temp_ext *>(s.ptr->ctx);
+            if (temp->temp != 0.0f || temp->delta != 0.0f) {
+                return 0;
+            }
+            temperature = true;
+        } else if (!temperature && iface == &llama_sampler_temp_i &&
+                   static_cast<const llama_sampler_temp *>(s.ptr->ctx)->temp == 0.0f) {
+            temperature = true;
+        } else if (iface == &llama_sampler_greedy_i) {
+            greedy = true;
+        } else {
+            return 0;
+        }
+    }
+    return greedy ? count : 0;
+}
+
 // one-pass draws
 
 #ifdef LLAMA_SAMPLER_ROW_VEC

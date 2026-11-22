@@ -46,9 +46,9 @@ python3 scripts/glm53/dflash_own_head.py \
     --out "$PACKS/Inkling-2-Small-abliterated-e4853745-DSpark-BF16-own-head.gguf"
 ```
 
-Select `--profile tensor-4-draft` to load the paired draft automatically. This profile uses a 1,572,864-token shared pool, Q8_0 global KV, F16 sliding KV and a 256-token physical microbatch. The draft runs on `CUDA3` with Q8_0 KV and proposes up to three tokens. The server verifies each proposal with the target's sampling settings. The full Tensor 4 pool ran out of memory with the paired draft on four RTX PRO 6000 GPUs. Use `tensor-4` for the qualified serving configuration.
+Pass `--draft` to load the paired DSpark draft. The flag also applies the draft layout: a 1,572,864-token shared pool, Q8_0 global KV, F16 sliding KV and a 256-token physical microbatch (the full Tensor 4 pool ran out of memory with the paired draft on four RTX PRO 6000 GPUs). The draft runs on `CUDA3` with Q8_0 KV and proposes up to three tokens; the server verifies each proposal with the target's sampling settings. `tensor-4` without the flag is the qualified serving configuration.
 
-`--draft-depth` and `--draft-device` select other configurations. Use `--draft-model` when supplying a different target path. Add `--no-draft` to `tensor-4-draft` for a control with matching target settings.
+`--draft-depth` and `--draft-device` select other configurations. Use `--draft-model` when supplying a different target path. `--no-draft` is the plain serving control.
 
 For repeated text prefixes, let the server choose each request's slot. When the server can fork a matching active request, the sessions share its KV cells and evaluate their own suffixes. The prefix must cover at least 256 tokens and exceed the configured similarity threshold (10% by default). Text chat can share with the vision projector loaded. The active-prefix path skips requests containing media. The pinned-slot qualification phases exercise independent sessions. Use `--no-prefix-copy` to disable prefix sharing.
 
@@ -87,7 +87,7 @@ The restore phase also records the original and independently computed resident 
 
 ```sh
 python3 scripts/inkling2/search.py run \
-    --profile tensor-4-draft \
+    --profile tensor-4 \
     --server "$PWD/build/bin/llama-server" \
     --packs /models/Inkling-2-Small-abliterated-e4853745 \
     --build "$(git rev-parse --short HEAD)" \

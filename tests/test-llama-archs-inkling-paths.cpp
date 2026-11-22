@@ -17,6 +17,15 @@
 //   kv-q8_0, kv-q4_0   keys and values of every layer in a q8_0 or q4_0 cache against the F16 cache
 //   kv-split   the global layers' keys and values in q8_0 and the sliding layers' in q4_0 (type_k_swa, type_v_swa)
 //          against the F16 cache
+//   kv1b-q8_0, kv1b-e4m3   the global layers' keys and values at one byte a value, q8_0 or f8_e4m3 without a scale, the
+//          sliding layers' in F16, against the F16 cache, on the served attention of one card of four (12 query heads of
+//          128 on 2 KV heads); the decode steps of 23 sessions are low-mean steps on every device (the tests set
+//          LLAMA_INKLING2_MEAN_MASK_DECODE, LLAMA_INKLING2_MEAN_POOL_MIN=8192 and GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE)
+//   far    the global layers' decode by the runs of cells each row reads (LLAMA_INKLING2_KV_RUNS) against its mask, on
+//          the served attention of one card of four; with GGML_CUDA_FATTN_REL_RUNS_SHARED the shared runs are read
+//          once for a group of rows
+//   far-q8_0, far-e4m3   the same on a q8_0 or f8_e4m3 global cache, the sliding layers' F16, against the mask path on
+//          the same caches (the tests set GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE)
 //
 // A q4_0 cache cannot meet the fixture's tolerance against F16: its rounding alone moves these logits by an NMSE of
 // 3.3e-3 (prompt) to 4.0e-3 (unified), as measured on Nov 17, 2026, where q8_0's moves them by 6.2e-6 to 1.3e-5, the
@@ -33,11 +42,18 @@
 //   unified   three sequences in one unified cache, prompts of 40, 56 and 72 tokens, then 8 steps of all three together
 //   streams   the same with a cache stream per sequence
 //   drafted   eight sequences of 1,030 cells in one unified cache, then 4 steps of a token and 3 drafts a sequence
+//   served    23 sequences that share a prompt of 1,800 tokens and add 400 each, then 4 steps of a token a sequence: the
+//             pool, padded to 16,384 cells, is 7.4 times a row's cells (6.5 as served), so the steps are low-mean, not
+//             bounded, and rows reach keys more than 1024 back, shared and their own
+//   restore   the same with one sequence saved, dropped and read back before the steps, as the prompt cache does
+//   runs      23 sequences that share a prompt and read their own tokens in chunks taken in turn, one just forked, then
+//             steps of a token a sequence, one sequence cleared and read again alone, and more steps
 //   long      one sequence of 6,000 cells and three of 800 in one unified cache, then steps of 1 and 4 rows, and of
 //             a token and 2 drafts a sequence
 //
 // --inkling-window <device> is a check of another kind in this file for its helpers: sessions that share one cache give
 // each session the logits it has alone (test_inkling_window).
+// --inkling-stack <devs> is another: the products of a layer's Q input as one launch (test_inkling_stack).
 
 #include "test-llama-archs.h"
 
@@ -49,6 +65,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -72,6 +89,7 @@ struct feature {
     std::function<void(llama_context_params &, bool)> configure = nullptr;
     double vs_legacy = tolerance; // the bar against the legacy path
     double vs_host = 0.0;         // when set, the bar against the same path on the CPU, run on a device
+    std::function<void(gguf_context *)> fixture = nullptr; // a change to the fixture model
 };
 
 // an attention node by the types of the cache it reads
@@ -82,11 +100,63 @@ std::string kv_kind(const ggml_tensor * t) {
     return std::string("K ") + ggml_type_name(t->src[1]->type) + ", V " + ggml_type_name(t->src[2]->type);
 }
 
+// an attention node on a cache that is not F16, and whether it is a low-mean decode step
+std::string kv1b_kind(const ggml_tensor * t) {
+    if (t->op != GGML_OP_FLASH_ATTN_EXT || t->src[1]->type == GGML_TYPE_F16) {
+        return "";
+    }
+    return kv_kind(t) + (ggml_flash_attn_ext_has_low_mean_mask(t) ? ", low-mean decode" : "");
+}
+
+// the served attention of one card of four: 12 query heads of 128 on 2 KV heads
+void served_heads(gguf_context * gguf) {
+    const auto set = [&](llm_kv key, uint32_t value) {
+        gguf_set_val_u32(gguf, llama_arch_kv_name(LLM_ARCH_INKLING2, key).c_str(), value);
+    };
+    set(LLM_KV_ATTENTION_HEAD_COUNT, 12);
+    set(LLM_KV_ATTENTION_HEAD_COUNT_KV, 2);
+    set(LLM_KV_ATTENTION_KEY_LENGTH, 128);
+    set(LLM_KV_ATTENTION_VALUE_LENGTH, 128);
+}
+
+// an attention node given the runs of cells its rows read (ggml_flash_attn_ext_set_kv_runs)
+std::string runs_kind(const ggml_tensor * t) {
+    return t->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_get_kv_runs(t) ? "attention by runs" : "";
+}
+
+// the global decode by runs of cells (LLAMA_INKLING2_KV_RUNS, read as each graph is built) with packed masks
+void kv_runs_on(llama_context_params & params, bool legacy) {
+    params.attn_mask_bits = true;
+    if (legacy) {
+        unsetenv("LLAMA_INKLING2_KV_RUNS");
+    } else {
+        setenv("LLAMA_INKLING2_KV_RUNS", "1", 1);
+    }
+}
+
+// the same on a global cache of one byte a value (the tests set GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE), sliding layers F16,
+// against the mask path on the same caches
+std::function<void(llama_context_params &, bool)> kv_runs_one_byte(ggml_type global) {
+    return [=](llama_context_params & params, bool legacy) {
+        kv_runs_on(params, legacy);
+        params.type_k = params.type_v = global;
+        params.type_k_swa = params.type_v_swa = GGML_TYPE_F16;
+    };
+}
+
 // keys and values of the global layers in global, of the sliding layers in swa, against F16
 std::function<void(llama_context_params &, bool)> kv_types(ggml_type global, ggml_type swa) {
     return [=](llama_context_params & params, bool legacy) {
         params.type_k = params.type_v = legacy ? GGML_TYPE_F16 : global;
         params.type_k_swa = params.type_v_swa = legacy ? GGML_TYPE_F16 : swa;
+    };
+}
+
+// keys and values of the global layers at one byte a value and of the sliding layers in F16, with packed masks
+std::function<void(llama_context_params &, bool)> kv1b_types(ggml_type global) {
+    return [=](llama_context_params & params, bool legacy) {
+        kv_types(global, GGML_TYPE_F16)(params, legacy);
+        params.attn_mask_bits = true;
     };
 }
 
@@ -135,6 +205,13 @@ const std::map<std::string, feature> & features() {
             q4_0_on_host}},
         {"kv-split", {nullptr, {"K q8_0, V q8_0", "K q4_0, V q4_0"}, kv_kind, kv_types(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0),
             q4_0_rounding, q4_0_on_host}},
+        {"kv1b-q8_0", {nullptr, {"K q8_0, V q8_0", "K q8_0, V q8_0, low-mean decode"}, kv1b_kind,
+            kv1b_types(GGML_TYPE_Q8_0), tolerance, 0.0, served_heads}},
+        {"kv1b-e4m3", {nullptr, {"K f8_e4m3, V f8_e4m3", "K f8_e4m3, V f8_e4m3, low-mean decode"}, kv1b_kind,
+            kv1b_types(GGML_TYPE_F8_E4M3), tolerance, 0.0, served_heads}},
+        {"far", {nullptr, {"attention by runs"}, runs_kind, kv_runs_on, tolerance, 0.0, served_heads}},
+        {"far-q8_0", {nullptr, {"attention by runs"}, runs_kind, kv_runs_one_byte(GGML_TYPE_Q8_0), tolerance, 0.0, served_heads}},
+        {"far-e4m3", {nullptr, {"attention by runs"}, runs_kind, kv_runs_one_byte(GGML_TYPE_F8_E4M3), tolerance, 0.0, served_heads}},
     };
     return all;
 }
@@ -278,6 +355,73 @@ std::map<std::string, std::pair<shape, path_case>> cases(size_t seed) {
             decode(ctx, rows, out);
         }
     }};
+    const auto served = [=](llama_context * ctx, std::vector<float> & out, bool restore) {
+        constexpr int n_seq = 23;
+        decode(ctx, span(tokens(1800, 50), 0, 0), out, std::vector<size_t>{1799});
+        for (int s = 1; s < n_seq; ++s) {
+            llama_memory_seq_cp(llama_get_memory(ctx), 0, s, -1, -1);
+        }
+        for (int s = 0; s < n_seq; ++s) {
+            decode(ctx, span(tokens(400, 60 + s), 1800, s), out, std::vector<size_t>{399});
+        }
+        if (restore) {
+            const size_t size = llama_state_seq_get_size(ctx, 7);
+            std::vector<uint8_t> saved(size);
+            if (llama_state_seq_get_data(ctx, saved.data(), size, 7) != size ||
+                    !llama_memory_seq_rm(llama_get_memory(ctx), 7, -1, -1) ||
+                    llama_state_seq_set_data(ctx, saved.data(), size, 7) != size) {
+                throw std::runtime_error("inkling2: could not save and restore sequence 7");
+            }
+        }
+        for (int32_t step = 0; step < 4; ++step) {
+            std::vector<std::array<int32_t, 3>> rows;
+            for (int s = 0; s < n_seq; ++s) {
+                rows.push_back({tokens(4, 90 + s)[step], 2200 + step, s});
+            }
+            decode(ctx, rows, out);
+        }
+    };
+    ret["served"] = {{23, true}, [=](llama_context * ctx, std::vector<float> & out) { served(ctx, out, false); }};
+    // 23 sequences that share a prompt of 1,500 tokens (a prefix copy), then read 300 tokens each in chunks of 64 taken in
+    // turn, sequence 22 only 40 (its 1,024 near cells reach into the prompt), then 6 steps of a token a sequence (one cell
+    // a sequence in turn), sequence 5 cleared and read again alone with 200 tokens of its own, and 3 more steps
+    ret["runs"] = {{23, true}, [=](llama_context * ctx, std::vector<float> & out) {
+        constexpr int n_seq = 23, prompt = 1500;
+        decode(ctx, span(tokens(prompt, 70), 0, 0), out, std::vector<size_t>{prompt - 1});
+        for (int s = 1; s < n_seq; ++s) {
+            llama_memory_seq_cp(llama_get_memory(ctx), 0, s, -1, -1);
+        }
+        std::vector<int32_t> next(n_seq, prompt);
+        for (int32_t c = 0; c < 300; c += 64) {
+            std::vector<std::array<int32_t, 3>> rows;
+            for (int s = 0; s < n_seq; ++s) {
+                const int32_t n = std::min<int32_t>(64, (s == n_seq - 1 ? 40 : 300) - c);
+                if (n > 0) {
+                    const auto r = span(tokens(n, 100 + 32*c + s), next[s], s);
+                    rows.insert(rows.end(), r.begin(), r.end());
+                    next[s] += n;
+                }
+            }
+            decode(ctx, rows, out, std::vector<size_t>{rows.size() - 1});
+        }
+        const auto steps = [&](int32_t n, size_t salt) {
+            for (int32_t i = 0; i < n; ++i) {
+                std::vector<std::array<int32_t, 3>> rows;
+                for (int s = 0; s < n_seq; ++s) {
+                    rows.push_back({tokens(1, salt + n_seq*i + s)[0], next[s]++, s});
+                }
+                decode(ctx, rows, out);
+            }
+        };
+        steps(6, 2000);
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), 5, -1, -1)) {
+            throw std::runtime_error("inkling2: could not clear sequence 5");
+        }
+        decode(ctx, span(tokens(200, 90), 0, 5), out, std::vector<size_t>{199});
+        next[5] = 200;
+        steps(3, 3000);
+    }};
+    ret["restore"] = {{23, true}, [=](llama_context * ctx, std::vector<float> & out) { served(ctx, out, true); }};
     // one sequence of 6,000 cells, most of the pool, among three of 800, then steps of fewer than 8 rows: the long
     // sequence alone, a short one alone, all four, and all four with a token and 2 drafts each. Each step reads only
     // its rows' cells, the long sequence's as a low mean and a short one's as a bounded row
@@ -344,6 +488,9 @@ int test_inkling_path(const std::string & path, size_t seed, ggml_backend_dev_t 
         return get_model(gguf.get(), nullptr, seed, 0.1f, host ? std::vector<ggml_backend_dev_t>{} :
                 std::vector<ggml_backend_dev_t>{dev});
     };
+    if (fit->second.fixture) {
+        fit->second.fixture(gguf.get());
+    }
     llama_model_ptr model = load(on_host);
     const feature & f = fit->second;
     std::vector<float> expected, actual, host;
@@ -511,5 +658,60 @@ int test_inkling_window(size_t seed, ggml_backend_dev_t dev) {
     const size_t far_round = far_rows("a round a call", by_round);
     const bool ok = !alone.empty() && far_run == 0 && far_ubatch == 0 && far_round == 0;
     fprintf(stderr, "%s inkling2 window on %s\n", ok ? "OK" : "FAIL", ggml_backend_dev_name(dev));
+    return ok ? 0 : 1;
+}
+
+// The products that read a layer's Q input (q, rel, sink and gate, and k on the sliding layers) as one launch of the CUDA
+// few-row MMQ group against one launch each (GGML_CUDA_MMQ_FEW_GROUP_LEGACY=1), on one device or under a tensor split
+// over several. The group takes K-quant weights whose rows hold 8 blocks of 256 or more at 3 to 24 rows, so the fixture
+// is widened to n_embd 2048 in heads of 128, the five weights are Q3_K and attn_v Q4_K as in the served pack, and the
+// rows come in ubatches of 23, the served decode's, and a last one of 5. The logits must be the same bit for bit.
+int test_inkling_stack(size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+    constexpr uint32_t n_embd = 2048, n_head = 16, n_head_kv = 8, head_dim = 128;
+    auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+    kv_writer ms(LLM_ARCH_INKLING2, gguf.get());
+    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,        n_embd);
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head);
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv);
+    ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,    head_dim);
+    ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,  head_dim);
+    const uint32_t n_layer = gguf_get_val_u32(gguf.get(),
+            gguf_find_key(gguf.get(), llama_arch_kv_name(LLM_ARCH_INKLING2, LLM_KV_BLOCK_COUNT).c_str()));
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        for (const char * name : {"attn_q", "attn_k", "attn_rel", "attn_sink_proj", "attn_gate", "attn_v"}) {
+            ggml_tensor t;
+            memset(&t, 0, sizeof(t));
+            t.type = strcmp(name, "attn_v") == 0 ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K;
+            ggml_format_name(&t, "blk.%u.%s.weight", il, name);
+            gguf_add_tensor(gguf.get(), &t);
+        }
+    }
+    llama_model_ptr model = get_model(gguf.get(), nullptr, seed, 0.0f, devs,
+            devs.size() > 1 ? LLAMA_SPLIT_MODE_TENSOR : LLAMA_SPLIT_MODE_LAYER);
+
+    const auto run = [&](bool legacy, std::vector<float> & out) {
+        set_env("GGML_CUDA_MMQ_FEW_GROUP_LEGACY", legacy ? "1" : nullptr); // read at each evaluation
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 256;
+        params.n_batch = 256;
+        params.n_ubatch = 23;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.n_threads = params.n_threads_batch = 4;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+        if (!ctx) {
+            throw std::runtime_error("inkling2 stack: the context was not created");
+        }
+        decode(ctx.get(), span(get_tokens(97, 128, seed), 0, 0), out);
+        set_env("GGML_CUDA_MMQ_FEW_GROUP_LEGACY", nullptr);
+    };
+    std::vector<float> expected, actual;
+    run(true, expected);
+    run(false, actual);
+
+    const bool ok = !expected.empty() && expected.size() == actual.size() &&
+        memcmp(expected.data(), actual.data(), expected.size()*sizeof(float)) == 0;
+    fprintf(stderr, "inkling2 stack on %zu device(s): %zu logits, %s bit for bit (NMSE %g)\n", devs.size(), expected.size(),
+            ok ? "the same" : "not the same", expected.size() == actual.size() ? nmse(expected, actual) : INFINITY);
+    fprintf(stderr, "%s inkling2 stack\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

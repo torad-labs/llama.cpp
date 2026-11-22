@@ -214,6 +214,7 @@ struct server_task {
     struct decision {
         std::vector<llama_token> labels;       // logits of these tokens, at the last prompt token
         std::vector<int32_t>     label_groups; // if set, number of labels per output, the output is their max
+        std::vector<int32_t>     label_pos;    // if set, prompt position of each output, else the last token
         std::vector<int32_t>     markers;      // embeddings[column] at these prompt positions
         int32_t                  column = 0;
         // if set, embeddings is [q | k], and the output is instead the scaled dot product of q[pointer] and k[marker]
@@ -242,6 +243,9 @@ struct server_task {
         // the scores are the first n_scores rows of the embeddings
         std::vector<int32_t> order;
         int32_t              n_scores = 0;
+
+        // one value per prompt token, see llama_batch_ext_set_decision_group()
+        std::vector<int32_t> group;
     };
     decision decision;
 
@@ -699,6 +703,10 @@ struct server_prompt {
     // The last input boundary follows the prompt through RAM saves and copies; -1 means unknown.
     int n_tokens_input = -1;
 
+    // the lora config that the tokens were processed with, it follows the state to the prompt cache and back
+    // (a state restored from a file made by a stop has none)
+    std::vector<common_adapter_lora_info> lora;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
@@ -724,6 +732,7 @@ struct server_prompt {
             tokens.clone(),
             checkpoints,
             n_tokens_input,
+            lora,
         };
     }
 };
@@ -905,8 +914,10 @@ public:
     static size_t reusable_prefix(const server_prompt & prompt, const server_tokens & tokens_new,
             llama_pos pos_min, int32_t n_swa, std::optional<size_t> lcp = std::nullopt);
 
+    // lora_new: the lora config of the new prompt, the states made with another config are skipped
     server_prompt_cache_state * find_best(const server_prompt & prompt, const server_tokens & tokens_new,
-            llama_pos pos_min, int32_t n_swa, std::optional<size_t> resident_reuse = std::nullopt);
+            llama_pos pos_min, int32_t n_swa, std::optional<size_t> resident_reuse = std::nullopt,
+            const std::vector<common_adapter_lora_info> * lora_new = nullptr);
 
     // consume: the slot takes the whole snapshot, so the RAM copy goes; otherwise the slot will cut it to the shared
     // prefix and the copy stays recoverable for the conversation it belongs to

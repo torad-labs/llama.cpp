@@ -33,18 +33,29 @@ BATCH_SIZE = 2048
 DRAFT_CONTEXT = 1572864
 DRAFT_UBATCH_SIZE = 256
 MAX_SLOTS = 256  # the engine's sequence limit (LLAMA_MAX_SEQ)
+# The one serving configuration for the ablated model on four RTX PRO 6000 cards. Every variant tested
+# against it lost or was an experiment, and their settings are recorded here so nothing is re-derived:
+#   stock decode order (all switches off): 289.6/290.7 tok/s in the 2026-11-21 six-arm window, 292.0 in the
+#     2026-11-22 arms - the combined profile beat it by +45.7% (425.6 tok/s, p99 92.5 -> 65.1 ms).
+#   query-first attention +26.8% and compact greedy +11.5% over the stock control, each alone
+#     (reports/inkling2-tensor4-implementation.md); the shared few-row quantize +0.75% on the serving arm
+#     (fast 425.61 vs fast-legacyq8 422.44, 2026-11-22 arms). --no-query-first-decode / --no-compact-greedy /
+#     GGML_CUDA_MMVQ_FEW_SHARED_Q8_1_LEGACY=1 restore the stock behavior; the parity capture remains pending
+#     (reports/inkling2-tensor4-capture).
+#   --expert-row-limit 32: +1.9% in one 2026-11-19 trial, -0.3% in the 2026-11-22 arms - not adopted.
+#   GGML_CUDA_AR_GATHER_BLOCKS 4: -1.4% (default 8 stands; 16 pending).
+#   Former profiles, removed 2026-11-22 (restore from git history if a test needs them):
+#     tensor-4-draft    context 1572864, the DSpark drafter's reduced-pool layout; draft measured -23% at 23 clients.
+#     tensor-4-capacity {SOURCE}-IQ3_XXS-imatrix.gguf, q8_0 KV, context SLOTS*SLOT_CONTEXT - the capacity tier.
+#     tensor-4-quality  {SOURCE}-Q4_K_M-imatrix.gguf, f16 KV, context 2*SLOT_CONTEXT - a two-session quality box.
 PROFILES = {
     "tensor-4": {"pack": f"{SOURCE}-Q3_K_M-imatrix.gguf", "mmproj": "mmproj-F16.gguf",
                  "context": 3014656, "slot_context": CODING_SLOT_CONTEXT, "kv": "f16", "cache_ram": 262144,
                  "checkpoint_every": 32768, "expert_row_limit": 23, "bucket_prefill_kv": True,
                  "stable_prefill": False, "sort_expert_rows": True,
-                 "prefix_copy": True, "mean_mask_decode": True, "reduction_route": "host-sliced", "host_owner_rows": True},
-    # IQ3-class pack, about 34 GiB a card for KV: 8.39M tokens at Q8_0. The pool holds all 23 sessions full at once.
-    "tensor-4-capacity": {"pack": f"{SOURCE}-IQ3_XXS-imatrix.gguf", "context": SLOTS * SLOT_CONTEXT, "kv": "q8_0"},
-    # Q4-class pack, about 4 GiB a card for KV: 0.54M tokens at F16. Two full sessions; a quality experiment only.
-    "tensor-4-quality": {"pack": f"{SOURCE}-Q4_K_M-imatrix.gguf", "context": 2 * SLOT_CONTEXT, "kv": "f16"},
+                 "prefix_copy": True, "mean_mask_decode": True, "reduction_route": "host-sliced", "host_owner_rows": True,
+                 "query_first_decode": True, "compact_greedy": True},
 }
-PROFILES["tensor-4-draft"] = {**PROFILES["tensor-4"], "context": DRAFT_CONTEXT}
 
 
 def expert_row_limit(value):
@@ -59,7 +70,10 @@ def arguments(argv=None):
                         help="Folder holding the converted packs under their recipe names (default: models/" + SOURCE + ")")
     parser.add_argument("--model", type=Path, help="A local GGUF in place of the profile's pack")
     parser.add_argument("--draft", action=argparse.BooleanOptionalAction,
-                        help="Use the paired native DSpark draft (enabled in tensor-4-draft)")
+                        help="Use the paired native DSpark draft (default off; the flag also applies the draft "
+                             "layout: context 1572864, ubatch 256, q8_0 target KV)")
+    parser.add_argument("--draft-layout", action="store_true",
+                        help="Apply the draft layout without a draft: the matched control of a draft A/B")
     parser.add_argument("--draft-model", type=Path, help="An explicit Inkling DSpark GGUF with its own vocabulary tensors")
     parser.add_argument("--draft-depth", type=int, choices=range(1, 8), default=3,
                         help="Maximum DSpark proposals per verification (default: 3)")
@@ -93,6 +107,12 @@ def arguments(argv=None):
     parser.add_argument("--slot-save-path", type=Path, help="Directory for explicit server slot save/restore requests")
     parser.add_argument("--mean-mask-decode", action=argparse.BooleanOptionalAction,
                         help="Try grouped SM120 F16 global attention for 23 decoding sessions with low average KV visibility")
+    parser.add_argument("--query-first-decode", action=argparse.BooleanOptionalAction,
+                        help="Order the 23 low-mean decode queries before the KV partitions so one prefix tile serves them all "
+                             "(tensor-4 default; bit-identical operator output, parity at the server level not yet captured)")
+    parser.add_argument("--compact-greedy", action=argparse.BooleanOptionalAction,
+                        help="Read back a short candidate list instead of the whole vocabulary for greedy rows "
+                             "(tensor-4 default; neutral greedy chains with static exclusions only)")
     parser.add_argument("--reference-sinks", action="store_true",
                         help="Use the padded, shifted relative-position table for comparison with the original attention")
     parser.add_argument("--ubatch-size", type=int,
@@ -148,7 +168,8 @@ def arguments(argv=None):
     profile = PROFILES[args.profile]
     for key, fallback in (("cache_ram", 32768), ("prefix_copy", False), ("mean_mask_decode", False), ("reduction_route", "host"),
                           ("checkpoint_every", None), ("expert_row_limit", None), ("bucket_prefill_kv", False),
-                          ("stable_prefill", False), ("sort_expert_rows", False)):
+                          ("stable_prefill", False), ("sort_expert_rows", False), ("query_first_decode", False),
+                          ("compact_greedy", False)):
         if getattr(args, key) is None:
             setattr(args, key, profile.get(key, fallback))
     if args.expert_row_limit == "auto":
@@ -169,14 +190,13 @@ def make_plan(args):
     if args.draft_model is not None and args.draft is False:
         raise ValueError("draft-model cannot be combined with --no-draft")
     draft = args.draft_model
-    draft_profile = args.profile == "tensor-4-draft"
-    if draft is None and (draft_profile if args.draft is None else args.draft):
-        if args.model is not None or args.profile not in ("tensor-4", "tensor-4-draft"):
+    if draft is None and args.draft:
+        if args.model is not None:
             raise ValueError("a draft for a different target requires --draft-model")
         draft = args.packs / DRAFT
-    draft_layout = draft is not None or draft_profile
+    draft_layout = draft is not None or args.draft_layout
     slots = args.slots if args.slots is not None else SLOTS
-    default_context = DRAFT_CONTEXT if draft_layout and args.profile == "tensor-4" else profile["context"]
+    default_context = DRAFT_CONTEXT if draft_layout else profile["context"]
     context = args.context if args.context is not None else default_context
     slot_context = args.slot_context if args.slot_context is not None else profile.get("slot_context", SLOT_CONTEXT)
     if not 1 <= args.port <= 65535:
@@ -265,6 +285,10 @@ def make_plan(args):
         env["GGML_CUDA_MMVQ_EXPERT_SORT_23"] = "1"
     if args.mean_mask_decode:
         env["LLAMA_INKLING2_MEAN_MASK_DECODE"] = "1"
+    if args.query_first_decode:
+        env["GGML_CUDA_FATTN_REL_QUERY_FIRST"] = "1"
+    if args.compact_greedy:
+        env["LLAMA_INKLING2_COMPACT_GREEDY"] = "1"
     if args.reference_sinks:
         env["LLAMA_INKLING2_SHIFT_SINKS"] = "1"
     if args.keep_graphs is not None:

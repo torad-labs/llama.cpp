@@ -296,6 +296,11 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
             tmp16[i] = ggml_fp32_to_fp16(tmp[i]);
         }
         ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
+    } else if (ggml_is_quantized(tensor->type) && !ggml_quantize_requires_imatrix(tensor->type)) {
+        // a fixture that declares a weight's type in its metadata (test_inkling_stack)
+        std::vector<uint8_t> q(ggml_nbytes(tensor));
+        ggml_quantize_chunk(tensor->type, tmp.data(), q.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+        ggml_backend_tensor_set(tensor, q.data(), 0, q.size());
     } else {
         GGML_ABORT("fatal error");
     }
@@ -318,6 +323,8 @@ static void usage(char ** argv) {
     LOG("                           kv-q8_0, kv-q4_0 or kv-split, in prompt, decode, unified or streams\n");
     LOG("  --inkling-path-device <dev>  The device of that case (default: CUDA0)\n");
     LOG("  --inkling-window <dev>   Compare Inkling 2 sessions that share one cache with each session alone, on <dev>\n");
+    LOG("  --inkling-loop <dev>     Test the run-time pass count of Inkling 2 Loop (counts, reuse, validation, slot sizing) on <dev>\n");
+    LOG("  --inkling-stack <devs>   Compare Inkling 2's Q-input products as one launch with one launch each, on <devs> (two: -sm tensor)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -3388,9 +3395,62 @@ static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggm
     return true;
 }
 
+// speculative decoding: each step decodes a token and 0 to n_draft_max drafts, then rejects the drafts
+// the logits of the token must match a decode without drafts
+static double check_draft_rollback(llama_model * model, const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref) {
+    const uint32_t n_vocab     = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens    = tokens.size();
+    const uint32_t n_draft_max = 2;
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_rs_seq        = n_draft_max;
+
+    llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
+    if (!lctx) {
+        throw std::runtime_error("failed to create llama context");
+    }
+
+    common_batch batch(lctx.get());
+    for (uint32_t pos = 0; pos < n_tokens/2; pos++) {
+        batch.add(tokens[pos], pos, 0, false);
+    }
+    if (llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+        throw std::runtime_error("failed to decode batch");
+    }
+
+    std::vector<float> logits;
+    std::vector<float> ref;
+    for (uint32_t pos = n_tokens/2; pos < n_tokens; pos++) {
+        batch.clear();
+        batch.add(tokens[pos], pos, 0, true);
+        const uint32_t n_draft = pos % (n_draft_max + 1);
+        for (uint32_t i = 1; i <= n_draft; i++) {
+            batch.add((tokens[pos] + i) % n_vocab, pos + i, 0, true);
+        }
+        if (llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode batch");
+        }
+
+        const float * logits_ith = llama_get_logits_ith(lctx.get(), 0);
+        logits.insert(logits.end(), logits_ith, logits_ith + n_vocab);
+        ref.insert(ref.end(), logits_ref.begin() + (size_t) pos*n_vocab, logits_ref.begin() + (size_t) (pos + 1)*n_vocab);
+
+        if (!llama_memory_seq_rm(llama_get_memory(lctx.get()), 0, pos + 1, -1)) {
+            throw std::runtime_error("failed to reject the drafts");
+        }
+    }
+
+    return nmse(ref, logits);
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_FLINT:
+        case LLM_ARCH_ZAYA1:
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_MAION_CODER:
         case LLM_ARCH_COHERE2MOE:
@@ -3454,6 +3514,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_METIS16:
         case LLM_ARCH_ZONOS3:
         case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
             return true;
         default:
             return false;
@@ -3501,6 +3562,9 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_BERT || arch == LLM_ARCH_MODERN_BERT || arch == LLM_ARCH_NOMIC_BERT || arch == LLM_ARCH_NOMIC_BERT_MOE ||
             arch == LLM_ARCH_NEO_BERT || arch == LLM_ARCH_JINA_BERT_V2 || arch == LLM_ARCH_JINA_BERT_V3 || arch == LLM_ARCH_EUROBERT) {
         return false; // TODO vocab
+    }
+    if (arch == LLM_ARCH_KOKORO || arch == LLM_ARCH_TINY_VOCA) {
+        return false; // TODO encoder without memory, a sequence must fit in one ubatch
     }
     if (arch == LLM_ARCH_PLM) {
         return false; // TODO tensor shapes
@@ -3936,6 +4000,18 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             }
                             test_ok = false;
                         }
+
+                        // the k-pool layout is updated in place when drafts are rejected
+                        // TODO: the meta backend aborts with n_rs_seq > 0 (view of permuted tensor not implemented)
+                        if ((arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                            const double nmse_rollback = check_draft_rollback(model_and_ctx_dev.first.get(), tokens, logits_dev);
+                            if (!(nmse_rollback <= 1e-4)) {
+                                if (test_ok) {
+                                    status_nmse = "\033[1;31mFAIL\033[0m (rollback)";
+                                }
+                                test_ok = false;
+                            }
+                        }
                     }
 
                     if (llama_arch_supports_save(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
@@ -4336,6 +4412,8 @@ int main(int argc, char ** argv) {
     std::string inkling_split, inkling_device; // --inkling-split <case> on --inkling-split-device's ranks, as above
     std::string inkling_path, inkling_path_device; // --inkling-path <feature>/<case> on --inkling-path-device
     std::string inkling_window; // --inkling-window <device>
+    std::string inkling_loop; // --inkling-loop <device>
+    std::string inkling_stack; // --inkling-stack <devs>
     bool glm_alias_only = false;
     bool glm_kpool_only = false;
     bool glm_nextn_only = false;
@@ -4383,6 +4461,16 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--inkling-window") == 0) {
             if (i + 1 == argc) return 1;
             inkling_window = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--inkling-loop") == 0) {
+            if (i + 1 == argc) return 1;
+            inkling_loop = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--inkling-stack") == 0) {
+            if (i + 1 == argc) return 1;
+            inkling_stack = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--glm-shared-buffers-device") == 0) { // the tensor split's ranks, as --glm-tensor-device
@@ -4534,6 +4622,22 @@ int main(int argc, char ** argv) {
             const auto device = ggml_backend_dev_by_name(inkling_window.c_str());
             if (!device) throw std::runtime_error("Inkling window device is unavailable: " + inkling_window);
             return test_inkling_window(seed, device);
+        }
+        if (!inkling_loop.empty()) {
+            ggml_backend_load_all();
+            const auto device = ggml_backend_dev_by_name(inkling_loop.c_str());
+            if (!device) throw std::runtime_error("Inkling loop device is unavailable: " + inkling_loop);
+            return test_inkling_loop(seed, device);
+        }
+        if (!inkling_stack.empty()) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> ranks;
+            for (const auto & name : string_split<std::string>(inkling_stack, ',')) {
+                const auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) throw std::runtime_error("Inkling stack device is unavailable: " + name);
+                ranks.push_back(device);
+            }
+            return test_inkling_stack(seed, ranks);
         }
         if (!shared_device.empty()) {
             ggml_backend_load_all();
