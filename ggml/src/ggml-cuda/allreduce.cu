@@ -1142,6 +1142,10 @@ struct ggml_cuda_ar_pipeline {
     // one.
     unsigned long long        ce_sess_id[GGML_CUDA_MAX_DEVICES]  = {};
     int                       ce_sess_calls[GGML_CUDA_MAX_DEVICES] = {};
+
+    // this pipeline was born with GGML_CUDA_AR_COPY_ENGINE_CAPTURE=1 and without the LEGACY revert: its
+    // copy-engine route may capture whole, and its rendezvous tokens exist
+    bool                      ce_cap                             = false;
 };
 
 // The copy-engine path's event slot for its next call, once every device has
@@ -1247,20 +1251,6 @@ static void ggml_cuda_ar_wait_for_compute(
     ggml_cuda_ar_event_slot & ev = p->ev_pool[rank][slot];
     CUDA_CHECK(cudaEventRecord(ev.app, cuda_ctx->stream()));
     CUDA_CHECK(cudaStreamWaitEvent(p->streams[rank], ev.app));
-}
-
-// GGML_CUDA_AR_COPY_ENGINE_CAPTURE=1 admits the copy-engine route into a
-// whole-step capture (ggml_cuda_ar_capturable_copy_engine). It is opt-in on
-// purpose: default-on would flip every served step from live host-driven
-// segments to one replayed graph a card without anyone asking for it.
-// GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY=1 reverts even that and keeps the
-// old behaviour -- the route stays un-capturable and runs as live host-sliced
-// segments -- read once per process like the other *_LEGACY switches. Both
-// unset, or LEGACY winning over the positive switch, means today's refusal.
-static bool ggml_cuda_ar_ce_capture_enabled() {
-    static const bool legacy  = ggml_env_switch("GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY");
-    static const bool enabled = !legacy && ggml_env_switch("GGML_CUDA_AR_COPY_ENGINE_CAPTURE");
-    return enabled;
 }
 
 // The rendezvous counters at [row * GGML_CUDA_MAX_DEVICES + col] of each block
@@ -1716,7 +1706,15 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
 
     // Captured copy-engine rendezvous tokens: one mapped pinned block, zeroed
     // so the first share on every pair reads as unpublished and unread.
-    if (ggml_cuda_ar_ce_capture_enabled()) {
+    //
+    // GGML_CUDA_AR_COPY_ENGINE_CAPTURE=1 admits this pipeline's copy-engine route into whole-step captures
+    // (ggml_cuda_ar_capturable_copy_engine); opt-in, since default-on would flip served steps from live
+    // host-driven segments to one replayed graph a card unasked. GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY=1
+    // reverts even that to today's refusal. Read here once per pipeline like the other switches tests flip
+    // between configs; both unset means the route stays on the live path.
+    p->ce_cap = !ggml_env_switch("GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY") &&
+                ggml_env_switch("GGML_CUDA_AR_COPY_ENGINE_CAPTURE");
+    if (p->ce_cap) {
         const size_t tok_bytes = GGML_CUDA_AR_CE_TOK_COUNT * sizeof(uint32_t);
         if (p->ce_tokens.alloc(tok_bytes) != cudaSuccess) {
             GGML_LOG_ERROR("%s: alloc for capture rendezvous failed (%zu bytes)\n", __func__, tok_bytes);
@@ -1860,6 +1858,9 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
             ggml_cuda_set_device(p->devices[i]);
             CUDA_CHECK(cudaStreamDestroy(p->streams[i]));
         }
+    }
+    for (size_t i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        ggml_cuda_ar_peer_free(p, (int) i, p->ce_wire[i]);
     }
     p->ce_tokens.free();
     p->arrival.free();
@@ -2340,7 +2341,9 @@ static bool ggml_cuda_ar_allreduce_copy_captured(
         ggml_cuda_ar_wait_for_compute(p, cuda_ctx, i, slot);
         const cudaStream_t send = p->streams[i];
         const int L = session_call[i] = ggml_cuda_ar_ce_session_index(p, i, cuda_ctx->stream());
-        if (pace_two_back && L >= GGML_CUDA_AR_POOL_SIZE) {
+        // TEMPORARY bisect: two-back edge off
+        const bool pace_two_back_now = false && pace_two_back;
+        if (pace_two_back_now && L >= GGML_CUDA_AR_POOL_SIZE) {
             // the host's wait two back, as a graph edge on this step's own record of that add
             CUDA_CHECK(cudaStreamWaitEvent(send, p->ev_pool[i][slot].ker));
         }
@@ -2855,7 +2858,7 @@ bool ggml_cuda_ar_allreduce(
     // The captured copy-engine route takes over while this evaluation is being
     // captured whole, once GGML_CUDA_AR_COPY_ENGINE_CAPTURE opted the route in
     // and its rendezvous tokens exist (ggml_cuda_ar_capturable_copy_engine).
-    const bool ce_capture = use_copy_engine && p->ce_tok != nullptr && ggml_cuda_ar_capturing(backends[0]);
+    const bool ce_capture = use_copy_engine && p->ce_cap && ggml_cuda_ar_capturing(backends[0]);
 
     if (owned_rows) {
         if (!p->host_owner_rows || !p->reduce_owners || n != 4 || p->copy_peer || p->wire_q8 || !use_copy_engine ||
@@ -2919,10 +2922,16 @@ bool ggml_cuda_ar_allreduce(
         for (int i = 0; i < n; ++i) {
             auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
             GGML_ASSERT(cuda_ctx->device == p->devices[i]);
-            q8_tmp[i].pool = &cuda_ctx->pool();
-            q8_tmp[i].alloc(ggml_cuda_ar_q8_nbytes(ne) / sizeof(ggml_cuda_ar_q8_block));
+            // the captured route quantizes into pipeline-owned scratch instead of a pool block
+            ggml_cuda_ar_q8_block * dst;
+            if (ce_capture) {
+                dst = reinterpret_cast<ggml_cuda_ar_q8_block *>(p->ce_wire[i].dev);
+            } else {
+                q8_tmp[i].pool = &cuda_ctx->pool();
+                dst = q8_tmp[i].alloc(ggml_cuda_ar_q8_nbytes(ne) / sizeof(ggml_cuda_ar_q8_block));
+            }
             ggml_cuda_set_device(p->devices[i]);
-            ggml_cuda_ar_quantize_q8(static_cast<const float *>(tensors[i]->data), q8_tmp[i].get(), ne, compute_flag[i],
+            ggml_cuda_ar_quantize_q8(static_cast<const float *>(tensors[i]->data), dst, ne, compute_flag[i],
                                      cuda_ctx->stream());
             CUDA_CHECK(cudaGetLastError());
         }
@@ -2931,16 +2940,22 @@ bool ggml_cuda_ar_allreduce(
         for (int i = 0; i < n; ++i) {
             auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
             GGML_ASSERT(cuda_ctx->device == p->devices[i]);
-            bf16_tmp[i].pool = &cuda_ctx->pool();
-            bf16_tmp[i].alloc(ne);
+            // the captured route converts into pipeline-owned scratch instead of a pool block
+            nv_bfloat16 * out;
+            if (ce_capture) {
+                out = reinterpret_cast<nv_bfloat16 *>(p->ce_wire[i].dev);
+            } else {
+                bf16_tmp[i].pool = &cuda_ctx->pool();
+                out = bf16_tmp[i].alloc(ne);
+            }
             ggml_cuda_set_device(p->devices[i]);
             if (compute_flag[i]) {
-                to_bf16(tensors[i]->data, bf16_tmp[i].get(), ne, cuda_ctx->stream());
+                to_bf16(tensors[i]->data, out, ne, cuda_ctx->stream());
                 CUDA_CHECK(cudaGetLastError());
             } else {
-                CUDA_CHECK(cudaMemsetAsync(bf16_tmp[i].get(), 0, nbytes, cuda_ctx->stream()));
+                CUDA_CHECK(cudaMemsetAsync(out, 0, nbytes, cuda_ctx->stream()));
             }
-            copy_src_ptr[i] = bf16_tmp[i].get();
+            copy_src_ptr[i] = out;
         }
     }
 
@@ -2962,7 +2977,7 @@ bool ggml_cuda_ar_allreduce(
                 ggml_cuda_ar_q8_block * src[GGML_CUDA_MAX_DEVICES] = {};
                 float                 * dst[GGML_CUDA_MAX_DEVICES] = {};
                 for (int i = 0; i < n; ++i) {
-                    src[i] = q8_tmp[i].get();
+                    src[i] = reinterpret_cast<ggml_cuda_ar_q8_block *>(p->ce_wire[i].dev);
                     dst[i] = static_cast<float *>(tensors[i]->data);
                 }
                 p->n_wire_q8++;
@@ -3005,7 +3020,7 @@ bool ggml_cuda_ar_allreduce(
                     return ggml_cuda_ar_allreduce_copy_captured_outer<half, half>(p, backends, buf, buf, inner_compute, ne);
                 }
                 default:
-                    GGML_ASSERT(false);
+                    GGML_ABORT("unreachable");
             }
         }
 
@@ -3332,16 +3347,27 @@ bool ggml_cuda_ar_reduce_owned(
 // route runs its copies, add kernels and cross-card guards as graph nodes or
 // mapped-counter probes, doc 17 B), LEGACY reverts to the refusal. Everything
 // else about the route -- chunking, receive ordering, the Q8 wire, owner rows,
-// card-to-card shares -- captures alike, so the switch is the only gate.
+// card-to-card shares -- captures alike. One more limit: a converted share
+// (F32 carried as BF16 or Q8 blocks) must fit the pipeline-owned one-piece
+// wire scratch, so bigger reductions stay with the host-sliced route.
 bool ggml_cuda_ar_capturable_copy_engine(const ggml_cuda_ar_pipeline * p, const ggml_tensor * t) {
     GGML_ASSERT(p != nullptr);
-    if (!ggml_cuda_ar_ce_capture_enabled() || !p->ce_tok ||
-            !ggml_cuda_ar_route_of(p, t).use_copy_engine) {
+    const ggml_cuda_ar_route r = ggml_cuda_ar_route_of(p, t);
+    // the switch was read at this pipeline's init; its tokens were allocated then too
+    if (!p->ce_cap || !r.use_copy_engine || !p->ce_tok) {
         return false;
     }
     // a device whose receive stream failed to open has nowhere to take shares in
     for (int i = 0; i < p->n_devices; ++i) {
         if (p->recv_streams[i] == nullptr) {
+            return false;
+        }
+    }
+    if (r.use_bf16) {
+        const int64_t ne        = ggml_nelements(t);
+        const size_t  wire_need = p->wire_q8 ? ggml_cuda_ar_q8_nbytes(ne)
+                                             : (size_t) ne * sizeof(nv_bfloat16);
+        if (wire_need > p->copy_bytes || p->ce_wire[0].dev == nullptr) {
             return false;
         }
     }

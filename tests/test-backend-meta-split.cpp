@@ -606,6 +606,118 @@ static bool test_reduction_queue(const std::vector<ggml_backend_dev_t> & devs) {
     return ok;
 }
 
+// The row inkling-execution-ar-capture: a decode-shaped step whose reductions all ride the copy engines (every size past
+// the threshold, LL and the p2p kernel off), first as live host-sliced segments -- GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY,
+// today's behaviour -- then captured whole under GGML_CUDA_AR_COPY_ENGINE_CAPTURE and replayed from there. Both legs must
+// keep the same bits, layer for layer; the legacy leg queues its reductions once per evaluation, the captured one only
+// while the capture is issued, so fewer live reductions plus meta reporting the capture and the replays is what says the
+// copy-engine reductions sit inside the graphs. Logical ranks, two of them through pinned staging or four of them
+// card-to-card by default (peer staging stays where the caller puts it).
+static bool test_ar_capture(const std::vector<ggml_backend_dev_t> & devs, bool force_host_staging) {
+    int n = (int) devs.size();
+    set_env("GGML_CUDA_ALLREDUCE", "internal");
+    set_env("GGML_CUDA_AR_LL_MAX_BYTES", "0");
+    set_env("GGML_CUDA_AR_P2P_MAX_BYTES", "0");
+    set_env("GGML_CUDA_AR_HOST_OWNER_ROWS", "0");
+    if (force_host_staging) {
+        set_env("GGML_CUDA_AR_COPY_PEER", "0");
+    } else {
+        set_env("GGML_CUDA_AR_COPY_PEER", nullptr);
+    }
+    set_env("GGML_CUDA_AR_COPY_THRESHOLD", "1");
+    set_env("GGML_GRAPH_TRACE", "1");
+    constexpr int n_layer = 12, n_eval = 5;
+    // a drafted step's width: 128 rows of 4608 keep both wire widths past the threshold and over one chunk
+    constexpr int64_t rows = 128, n_embd = 4608;
+    bool ok = true;
+    for (const bool bf16 : {false, true}) {
+        set_env("GGML_CUDA_AR_BF16_THRESHOLD", bf16 ? "1" : "0");
+        std::vector<float> baseline;
+        for (int leg = 0; leg < 2; ++leg) {
+            // leg 0 keeps today's refusal whole (LEGACY beats the positive switch); leg 1 captures
+            set_env("GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY", leg == 0 ? "1" : nullptr);
+            set_env("GGML_CUDA_AR_COPY_ENGINE_CAPTURE", leg == 1 ? "1" : nullptr);
+            ggml_backend_dev_t device = ggml_backend_meta_device(const_cast<ggml_backend_dev_t *>(devs.data()), n, split_queue, &n);
+            ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+            const int64_t n_ff = 32 * n;
+            ggml_context * weights = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
+            auto * up = ggml_new_tensor_2d(weights, GGML_TYPE_F32, n_embd, n_ff);
+            auto * down = ggml_new_tensor_2d(weights, GGML_TYPE_F32, n_ff, n_embd);
+            ggml_set_name(up, "up");
+            ggml_set_name(down, "down");
+            auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(weights, ggml_backend_dev_buffer_type(device));
+            GGML_ASSERT(buffer);
+            ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            // the same draws feed both legs, so their outputs compare bit for bit
+            std::mt19937 rng(73 + (bf16 ? 1 : 0));
+            for (auto * w : {up, down}) {
+                std::vector<float> data(ggml_nelements(w));
+                for (float & v : data) { v = float(int(rng() % 2001) - 1000) / 4000.0f; }
+                ggml_backend_tensor_set(w, data.data(), 0, ggml_nbytes(w));
+            }
+            ggml_context * ctx = ggml_init({(6 * n_layer + 4) * ggml_tensor_overhead() + ggml_graph_overhead_custom(8 * n_layer, false), nullptr, true});
+            auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, rows);
+            ggml_set_input(x);
+            ggml_tensor * h = x;
+            for (int il = 0; il < n_layer; ++il) {
+                h = ggml_tanh(ctx, ggml_add(ctx, h, ggml_mul_mat(ctx, down, ggml_tanh(ctx, ggml_mul_mat(ctx, up, h)))));
+            }
+            ggml_set_output(h);
+            auto * graph = ggml_new_graph_custom(ctx, 8 * n_layer, false);
+            ggml_build_forward_expand(graph, h);
+            auto * cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            ggml_backend_t backends[] = {backend, cpu};
+            auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 8 * n_layer, false, true);
+            GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+            const int captured_before = captured;
+            const int replayed_before = replays;
+            const unsigned long long reduced_before = reductions_to_all;
+            std::vector<float> actual;
+            for (int eval = 0; eval < n_eval; ++eval) {
+                std::vector<float> input(ggml_nelements(x));
+                for (float & a : input) { a = float(int(rng() % 2001) - 1000) / 1000.0f; }
+                ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+                GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+                const size_t at = actual.size();
+                actual.resize(at + ggml_nelements(h));
+                ggml_backend_tensor_get(h, actual.data() + at, 0, ggml_nbytes(h));
+            }
+            const int capd = captured - captured_before;
+            const int rep = replays - replayed_before;
+            ggml_backend_sched_free(sched);
+            ggml_free(ctx);
+            ggml_backend_free(cpu);
+            ggml_backend_free(backend);
+            ggml_backend_buffer_free(buffer);
+            ggml_free(weights);
+            const unsigned long long reduced = reductions_to_all - reduced_before;
+            bool finite = true;
+            double norm = 0;
+            for (float a : actual) { finite = finite && std::isfinite(a); norm += double(a) * a; }
+            bool same = actual.size() == baseline.size() &&
+                !memcmp(actual.data(), baseline.data(), actual.size() * sizeof(float));
+            // leg 0: every evaluation queues its reductions live and nothing captures. leg 1: the step is captured once
+            // and replayed from then on -- meta reports the capture and the replays, and fewer copy-engine calls run live.
+            const bool pass = finite && norm > 0 && (leg == 0 ?
+                    capd == 0 && rep == 0 && reduced == (unsigned long long) n_layer * n_eval :
+                    capd > 0 && rep > 0 && reduced < (unsigned long long) n_layer * n_eval && same);
+            printf("%s ar-capture: %d ranks, %s staging, %s wire, %s, %llu live reductions, %d captures, %d replays, same=%d\n",
+                   pass ? "ok  " : "FAIL", n,
+                   force_host_staging || n < 4 ? "pinned" : "peer-or-pinned", bf16 ? "BF16" : "F32",
+                   leg == 0 ? "segments only (LEGACY)" : "captured whole", reduced, capd, rep, leg == 0 ? -1 : same);
+            if (leg == 0) { baseline = std::move(actual); }
+            ok = pass && ok;
+        }
+    }
+    set_env("GGML_CUDA_AR_BF16_THRESHOLD", nullptr);
+    set_env("GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY", nullptr);
+    set_env("GGML_CUDA_AR_COPY_ENGINE_CAPTURE", nullptr);
+    for (const char * name : {"GGML_CUDA_AR_LL_MAX_BYTES", "GGML_CUDA_AR_P2P_MAX_BYTES", "GGML_CUDA_AR_HOST_OWNER_ROWS"}) {
+        set_env(name, nullptr);
+    }
+    return ok;
+}
+
 // A hidden state whose every rank reads a quarter of each row is summed only where it is read, with the bits of the
 // sum on every rank. Through host memory GGML_CUDA_AR_HOST_OWNER_ROWS selects it for any rows, a drafted step's too;
 // card to card it rides the chunked kernel, which a captured step replays, and GGML_CUDA_AR_REDUCE_OWNERS=0 turns it off.
@@ -1775,6 +1887,13 @@ int main(int argc, char ** argv) {
         printf("reduction queue on %s and %s\n", ggml_backend_dev_name(pair[0]), ggml_backend_dev_name(pair[1]));
         const bool two = test_reduction_queue(pair);
         return test_reduction_queue({pair[0], pair[1], pair[0], pair[1]}) && two ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--ar-capture") == 0) {
+        if (strncmp(ggml_backend_dev_name(gpu), "CUDA", 4) != 0) { return 77; }
+        printf("ar capture on %s and %s\n", ggml_backend_dev_name(pair[0]), ggml_backend_dev_name(pair[1]));
+        // two logical ranks through pinned staging, then four of them with card-to-card shares left to the knobs
+        const bool two = test_ar_capture(pair, true);
+        return test_ar_capture({pair[0], pair[1], pair[0], pair[1]}, false) && two ? 0 : 1;
     }
     if (argc == 2 && (strcmp(argv[1], "--hidden-owner-logical") == 0 || strcmp(argv[1], "--hidden-owner-physical") == 0 ||
                       strcmp(argv[1], "--hidden-owner-two-gpu") == 0)) {
