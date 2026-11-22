@@ -19,9 +19,6 @@ USAGE (the four-card box, the real model; about 16K to 32K tokens a state)
          --slot-context 40960 --cache-ram 0 --slot-save-path /tmp/kvstates --port 8103 &
      until curl -sf localhost:8103/health; do sleep 5; done
 
-   Without serve.py: llama-server -m MODEL -ngl 99 -sm tensor -fa on --cache-type-k f16 --cache-type-v f16 -c 49152
-   -np 1 --slot-save-path /tmp/kvstates (the directory must exist).
-
 2. Put one prompt of about 24K tokens in slot 0, then save the slot. K and V are about 32 KiB a token (8 layers x K
    and V x 2 KiB), so 24K tokens is 0.8 GiB of the file (it is larger by the window cache, 160 MiB, and the context
    checkpoints the server appends). 16K tokens gives thirds of 5K cells for the depth check; 32K is 1 GiB.
