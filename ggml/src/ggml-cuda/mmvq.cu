@@ -2118,9 +2118,9 @@ bool ggml_cuda_mul_mat_vec_q_moe_gate_fuses(const ggml_tensor * mm, const ggml_t
         ggml_cuda_mmvq_moe_keeps_y(src0->type, src0->ne[0], /*gate =*/ true, y_bytes);
 }
 
-void ggml_cuda_mul_mat_vec_q(
+static void ggml_cuda_mul_mat_vec_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const char * ready_y) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -2246,8 +2246,8 @@ void ggml_cuda_mul_mat_vec_q(
     static const bool ring_quantize_check = ggml_env_switch("GGML_CUDA_MMVQ_MOE_QUANTIZE_CHECK");
 
     ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
-    char * src1_q8_1 = ring_quantizes && !ring_quantize_check ? nullptr :
-        mmvq_src1_q8_1(ctx, src1, src0->type, src1_q8_1_own);
+    char * src1_q8_1 = ready_y ? const_cast<char *>(ready_y) :
+        (ring_quantizes && !ring_quantize_check ? nullptr : mmvq_src1_q8_1(ctx, src1, src0->type, src1_q8_1_own));
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -2401,6 +2401,24 @@ void ggml_cuda_mul_mat_vec_q(
     run(dst_d, false);
     mmvq_q8_sm120_compare_launch(dst_d, ref.get(), ne01, ncols_dst, nchannels_dst, ne3, stride_col_dst, stride_channel_dst,
         s3, stream);
+}
+
+void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                             const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, /*fusion =*/ nullptr, /*ready_y =*/ nullptr);
+}
+
+// completes the overload family mmvq.cuh declares for callers that pass fusion args (with or without an
+// on-stream q8_1 copy of src1)
+void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                             const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, fusion, /*ready_y =*/ nullptr);
+}
+
+void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                             const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion,
+                             const char * ready_y) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, fusion, ready_y);
 }
 
 int ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, const int n,
