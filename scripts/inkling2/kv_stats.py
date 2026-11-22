@@ -114,8 +114,9 @@ def _dequant_q(buf, name):
     lo = (b[:, 2:] & 0x0F).astype(np.float32)
     hi = (b[:, 2:] >> 4).astype(np.float32)
     q = np.empty((n_blocks, 32), np.float32)
-    q[:, 0::2] = lo                                                  # ggml row order: byte j holds values 2j low, 2j+1 high
-    q[:, 1::2] = hi
+    q[:, :16] = lo    # ggml's canonical q4_0: byte j holds value j in its low nibble and value j+16 in its
+    q[:, 16:] = hi    # high nibble (quantize_row_q4_0_ref, ggml-quants.c; the CUDA store in cpy-utils.cuh,
+                      # and device readers in fattn-rel-decode.cuh, all agree)
     return ((q - 8.0) * d[:, None]).reshape(-1)
 
 HEAD_DIM = 128

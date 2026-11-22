@@ -197,7 +197,11 @@ order it must land:
 While writing the migration decoder against real bytes: ggml's canonical Q4_0 packs byte j low = value j,
 high = value j+16 (`quantize_row_q4_0_ref`, ggml-quants.c; device store identical in
 ggml/src/ggml-cuda/cpy-utils.cuh `quantize_f32_q4_0_block`; both kernels verified bit-for-bit earlier).
-`scripts/inkling2/kv_stats.py` `_dequant_q` interleaves instead (`q[:, 0::2] = lo; q[:, 1::2] = hi`,
-"byte j holds values 2j low"), so quantized dumps decode with half the values on the wrong lanes there.
-F16/bf16 rows are unaffected. kv-stats seat owns the fix; this slice's migration follows the engine layout,
-and tests/test-llama-kv-mixed.cpp pins it with handcrafted blocks (a zero nibble reads -8*d, the +8 bias).
+`scripts/inkling2/kv_stats.py` `_dequant_q` interleaved instead (`q[:, 0::2] = lo; q[:, 1::2] = hi`,
+"byte j holds values 2j low"), so quantized dumps decoded with half the values on the wrong lanes there.
+F16/bf16 rows were unaffected. Fixed 2026-11-22: `_dequant_q` reads the canonical order (values 0-15 from the
+low nibbles, 16-31 from the high ones); the test encoder `pack_q4_0`, the hand-built order test, and a new q4_0
+round-trip test (`test_q4_0_rows_decode_to_the_encoded_values`) pin that order, and the engine-side claims were
+re-verified in ggml-quants.c, cpy-utils.cuh, set-rows.cu and the device readers (fattn-rel-decode.cuh,
+fattn-rel-elem.cuh — both already canonical). tests/test-llama-kv-mixed.cpp pins the engine layout with
+handcrafted blocks.

@@ -773,13 +773,13 @@ def pack_q8_0(vals):
 
 
 def pack_q4_0(vals):
-    """Encode float values as q4_0 blocks; decoded value i is d * (nibble_i - 8) with ggml row order:
-    byte j holds value 2j in its low nibble and value 2j+1 in its high nibble."""
+    """Encode float values as q4_0 blocks; decoded value i is d * (nibble_i - 8) with ggml's canonical row
+    order: byte j holds value j in its low nibble and value j+16 in its high nibble."""
     b = vals.reshape(-1, 32).astype(np.float32)
     d = np.abs(b).max(axis=1) / 7.5                             # keeps rint inside [0, 15] after the +8 shift
     df = d.astype("<f2").astype(np.float32)
     q = np.clip(np.rint(b / df[:, None]) + 8, 0, 15).astype(np.uint8)
-    qs = (q[:, 0::2] | (q[:, 1::2] << 4)).astype(np.uint8)
+    qs = (q[:, :16] | (q[:, 16:] << 4)).astype(np.uint8)
     dbits = d.astype("<f2").view(np.uint8).reshape(-1, 2)
     return np.concatenate([dbits, qs], axis=1).reshape(-1)
 
@@ -823,21 +823,32 @@ class QuantizedRows(unittest.TestCase):
             got = st.read("K", layer, 0, self.n).reshape(-1)
             np.testing.assert_allclose(got.reshape(-1), expect_k.reshape(-1), rtol=1e-6, atol=1e-6)
 
+    def test_q4_0_rows_decode_to_the_encoded_values(self):
+        st = self.state_from(self.byte_layers([pack_q4_0(self.k[l]) for l in range(self.n_layer)]),
+                             self.byte_layers([pack_q4_0(self.v[l]) for l in range(self.n_layer)]), 8)
+        self.assertEqual(st.type_name, "q4_0")
+        for layer in range(self.n_layer):
+            d4 = pack_q4_0(self.k[layer]).reshape(-1, 18)
+            sc = d4[:, :2].copy().view("<f2").astype(np.float32).reshape(-1)   # one f16 scale a block
+            q = np.empty((d4.shape[0], 32), np.float32)
+            q[:, :16] = d4[:, 2:] & 0x0F                                       # byte j: value j low,
+            q[:, 16:] = d4[:, 2:] >> 4                                         # value j+16 high
+            expect_k = ((q - 8.0) * sc[:, None]).reshape(-1, self.h * HD)
+            got = st.read("K", layer, 0, self.n).reshape(-1)
+            np.testing.assert_allclose(got.reshape(-1), expect_k.reshape(-1), rtol=1e-6, atol=1e-6)
+
     def test_q4_0_rows_decode_nibbles_low_then_high(self):
-        # a hand-built block settles byte order without the encoder: scale f16(1.0); nibble i of the row's
-        # permutation lands at value position i under ggml row order (byte j: 2j low, 2j+1 high).
+        # a hand-built block settles byte order without the encoder: scale f16(1.0); under ggml's canonical
+        # q4_0 a byte j holds value j in its low nibble and value j+16 in its high nibble, so the row's first
+        # 16 values ride the low nibbles and values 16-31 the high ones (dequantize_row_q4_0,
+        # quantize_f32_q4_0_block, and the device readers in fattn-rel-{decode,elem}.cuh all agree).
         rng = np.random.default_rng(5)
         pa, pb = rng.permutation(16), rng.permutation(16)
-        exp = np.empty(32, np.float32)
-        exp[0::2] = pa.astype(np.float32) - 8.0                     # even values ride the low nibbles
-        exp[1::2] = pb.astype(np.float32) - 8.0                     # odd values ride the high nibbles
+        exp = np.concatenate([pa.astype(np.float32), pb.astype(np.float32)]) - 8.0
         blk = np.zeros((self.n * self.h, 18), np.uint8)
         blk[:, 0] = 0x00                                            # f16 1.0 is 0x3C80: little-endian bytes 00 3C
         blk[:, 1] = 0x3C
-        qs = np.empty(32, np.uint8)
-        qs[0::2] = pa
-        qs[1::2] = pb
-        blk[:, 2:] = (qs[0::2] | (qs[1::2] << 4))[None, :]
+        blk[:, 2:] = (pa | (pb << 4))[None, :]
         blob_k = np.stack([blk.reshape(self.n, -1)] * self.n_layer)
         st = self.state_from(blob_k, blob_k, 8)
         got = st.read("K", 0, 0, self.n).reshape(-1)[:64].reshape(self.h, HD)  # first cell: two heads
