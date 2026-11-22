@@ -10,7 +10,8 @@ format is still the KL capture against F16: these numbers only say which candida
 USAGE (the four-card box, the real model; about 16K to 32K tokens a state)
 -------------------------------------------------------------------------
 1. Serve with --slot-save-path, one slot, F16 caches, flash attention on. This is the tensor-4 launch with the pool
-   cut to one session (a quantized cache is rotated on store, and this script refuses it):
+   cut to one session (a state saved from a quantized cache parses as well: such a cache is rotated on store, and the
+   reader reports its n_rot_k/n_rot_v and works in the stored domain):
 
      mkdir -p /tmp/kvstates
      python3 scripts/inkling2/serve.py --profile tensor-4 --packs /srv/models/inkling-2-small-abliterated-q3km \\
@@ -230,9 +231,12 @@ class KVState:
                              "records before it are not in the layout this script reads")
         if v_trans:
             raise StateError(f"{self.path}: V is stored transposed (no flash attention); serve with -fa on")
-        if self.n_rot_k or self.n_rot_v:
-            raise StateError(f"{self.path}: the cache is rotated on store (n_rot_k={self.n_rot_k}, n_rot_v={self.n_rot_v}, a "
-                             "quantized cache type): the values are not the model's K and V; serve with F16 caches")
+        # A state from a rotated cache (n_rot_k/n_rot_v nonzero: a quantized type rotates by Walsh-Hadamard on store) is
+        # read as-is, in its stored domain: the rotation is orthogonal and Q is multiplied by the same rotation at
+        # attention time, so dot products and per-block relative errors computed on the stored values are exactly what
+        # the kernel sees; block scales sit along storage order either way. An orthogonal transform keeps each vector's
+        # L2 norm, so the bounds the self-check tests stand here too. The header still carries n_rot_k/n_rot_v and
+        # info()/render_text report them.
         self.n_layer = n_layer
         self.off = {"K": [], "V": []}
         types = {"K": set(), "V": set()}

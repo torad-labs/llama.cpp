@@ -350,12 +350,18 @@ class Parser(unittest.TestCase):
         want = (self.k[0].astype(F32).view(np.uint32) & 0xFFFF0000).view(F32)  # what 8 mantissa bits keep
         np.testing.assert_array_equal(st.read("K", 0, 0, 50).reshape(50, -1), want)
 
+    def test_rotated_on_store_parses_with_the_rotation_reported(self):
+        # a quantized cache stores its values rotated on store; the reader works in that stored domain
+        st = self.parse(build_state(self.k, self.v, n_rot=(128, 0)))
+        self.assertEqual((st.n_rot_k, st.n_rot_v), (128, 0))
+        np.testing.assert_array_equal(st.read("K", 1, 0, 50).reshape(50, -1), self.k[1].astype(F32))  # as stored
+        self.assertEqual(st.info()["n_rot_k"], 128)  # reported by info()
+
     def test_wrong_files_are_refused_with_a_reason(self):
         good = build_state(self.k, self.v)
         cases = [("magic", build_state(self.k, self.v, magic=0x12345678), "not a sequence state"),
                  ("version", build_state(self.k, self.v, version=3), "version 3"),
                  ("transposed", build_state(self.k, self.v, v_trans=1), "transposed"),
-                 ("rotated", build_state(self.k, self.v, n_rot=(128, 0)), "rotated"),
                  ("q8_0", build_state(self.k, self.v, type_id=8), "not F32, F16 or BF16"),
                  ("truncated", good[:len(good) // 2], "ends inside"),
                  ("empty", good[:8], "ends inside")]
