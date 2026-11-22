@@ -1,0 +1,481 @@
+== q3_K 2304 4608 128 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5a35b8e4b840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=128 bcast=1 J=8
+RESULT type=q3_K m=2304 k=4608 tokens=128 bcast=1 J=8 us_mean=1248.84 us_min=1226 iters=50
+== q4_K 4608 2304 128 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x57e68adc1820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=128 bcast=0 J=8
+RESULT type=q4_K m=4608 k=2304 tokens=128 bcast=0 J=8 us_mean=1369.88 us_min=1361 iters=50
+== q3_K 2304 4608 256 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5f3293d15860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=256 bcast=1 J=16
+RESULT type=q3_K m=2304 k=4608 tokens=256 bcast=1 J=16 us_mean=1473.18 us_min=1456 iters=50
+== q4_K 4608 2304 256 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5a348e78b860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=256 bcast=0 J=16
+RESULT type=q4_K m=4608 k=2304 tokens=256 bcast=0 J=16 us_mean=1484.68 us_min=1469 iters=50
+== q3_K 2304 4608 512 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5f569fe52860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=512 bcast=1 J=24
+RESULT type=q3_K m=2304 k=4608 tokens=512 bcast=1 J=24 us_mean=1461.38 us_min=1423 iters=50
+== q4_K 4608 2304 512 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5d71ed26c840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=512 bcast=0 J=24
+RESULT type=q4_K m=4608 k=2304 tokens=512 bcast=0 J=24 us_mean=1625.04 us_min=1605 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5cf3b90a0860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=40
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=40 us_mean=1985.20 us_min=1919 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x619fdcb40820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=40
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=40 us_mean=1930.70 us_min=1901 iters=50
+== q3_K 2304 4608 2048 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x62906ebce840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=2048 bcast=1 J=64
+RESULT type=q3_K m=2304 k=4608 tokens=2048 bcast=1 J=64 us_mean=2981.06 us_min=2931 iters=50
+== q4_K 4608 2304 2048 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x61a60b68f820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=2048 bcast=0 J=64
+RESULT type=q4_K m=4608 k=2304 tokens=2048 bcast=0 J=64 us_mean=2580.84 us_min=2547 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x65156871a840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=40
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=40 us_mean=2449.24 us_min=2436 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5aa38b4e8860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=40
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=40 us_mean=2133.22 us_min=2086 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5d3df62ec860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=8
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=8 us_mean=3577.98 us_min=3506 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x621b27492820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=8
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=8 us_mean=3238.56 us_min=3222 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x6043836fc840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=8
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=8 us_mean=3658.02 us_min=3547 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x56071101c840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=8
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=8 us_mean=3572.10 us_min=3478 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5d3d1ad47820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=16
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=16 us_mean=2796.58 us_min=2762 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x60dac2b30860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=16
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=16 us_mean=2513.84 us_min=2500 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x653dbc39b840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=16
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=16 us_mean=3405.24 us_min=3379 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5d357d113820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=16
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=16 us_mean=2847.94 us_min=2803 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x59ee769d0840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=24
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=24 us_mean=1861.92 us_min=1811 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5b86a2a38840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=24
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=24 us_mean=1885.50 us_min=1867 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x6065532e3840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=24
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=24 us_mean=2627.00 us_min=2615 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x627bec467840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=24
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=24 us_mean=2074.30 us_min=2038 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5bed60244820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=32
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=32 us_mean=1796.66 us_min=1751 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x63e0ba4ce860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=32
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=32 us_mean=1813.46 us_min=1794 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5e9dbe0a2840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=32
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=32 us_mean=2487.74 us_min=2478 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x57348255b820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=32
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=32 us_mean=2035.38 us_min=2010 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5b34a198b820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=40
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=40 us_mean=1987.42 us_min=1917 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x56a222cf2820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=40
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=40 us_mean=1930.60 us_min=1902 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x573d3099c860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=40
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=40 us_mean=2449.78 us_min=2433 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x63741f8a5850): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=40
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=40 us_mean=2131.30 us_min=2088 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5b5fb966d850): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=48
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=48 us_mean=2181.76 us_min=2087 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x646ccec32850): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=48
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=48 us_mean=2026.16 us_min=1972 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x62c81c72f820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=48
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=48 us_mean=2516.88 us_min=2506 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x61d0b6474850): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=48
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=48 us_mean=2193.28 us_min=2128 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5967fbda2860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=56
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=56 us_mean=2463.60 us_min=2321 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5acec8589840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=56
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=56 us_mean=2278.56 us_min=2184 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5fe68832b850): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=56
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=56 us_mean=2552.96 us_min=2505 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5e44d0c89860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=56
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=56 us_mean=2442.62 us_min=2338 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x55cc912ad840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=64
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=64 us_mean=2675.26 us_min=2624 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x56d2bee41840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=64
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=64 us_mean=2277.14 us_min=2226 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x64b7238c4840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=64
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=64 us_mean=2617.14 us_min=2580 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5b1230750860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=64
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=64 us_mean=2485.16 us_min=2427 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5946a6c9c860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=80
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=80 us_mean=3171.16 us_min=3073 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5fb51028e860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=80
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=80 us_mean=2669.86 us_min=2574 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5d88d324c860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=80
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=80 us_mean=2872.84 us_min=2778 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x56960d51e820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=80
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=80 us_mean=2849.32 us_min=2731 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x606cf31e3820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=96
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=96 us_mean=3628.78 us_min=3507 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x63440cf2e860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=96
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=96 us_mean=3006.34 us_min=2883 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x55eb0b831860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=96
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=96 us_mean=3358.28 us_min=3245 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x5ef5d1c73840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=96
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=96 us_mean=3271.04 us_min=3118 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x59c1322aa840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=112
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=112 us_mean=4064.74 us_min=3901 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x621f17737860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=112
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=112 us_mean=3383.98 us_min=3223 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x64bf142a4820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=112
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=112 us_mean=3666.38 us_min=3500 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x58c1e4d00840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=112
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=112 us_mean=3649.10 us_min=3473 iters=50
+== q3_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x60af88f80820): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=128
+RESULT type=q3_K m=2304 k=4608 tokens=1024 bcast=1 J=128 us_mean=4475.06 us_min=4279 iters=50
+== q4_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x55d014d39840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=128
+RESULT type=q4_K m=4608 k=2304 tokens=1024 bcast=0 J=128 us_mean=3721.10 us_min=3523 iters=50
+== q5_K 2304 4608 1024 1 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x58cac4c9d860): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=128
+RESULT type=q5_K m=2304 k=4608 tokens=1024 bcast=1 J=128 us_mean=3903.82 us_min=3695 iters=50
+== q5_K 4608 2304 1024 0 perf
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32109 MiB):
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes, VRAM: 32109 MiB
+    profile: 170 SMs at 2550 MHz, 65536 regs/SM, 100 KiB smem/SM (99 KiB/block opt-in), 1536 threads/SM, 24 blocks/SM, L2 98304 KiB (persisting 61440 KiB), DRAM 1792 GB/s (14001 MHz x 512 bit)
+operator(): CUDA graphs kept per context: at most 32768 nodes (GGML_CUDA_GRAPH_NODES) and 0 graphs (GGML_CUDA_GRAPH_MAX); 0 = no cap
+ggml_cuda_graph_instantiate: CUDA0 (context 0x587392b05840): 1 CUDA graphs held at most, 3 nodes (caps 0 and 32768, 0 for none); instantiating one took 0.00 MiB at most, all of them 0.00 MiB
+CASE type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=128
+RESULT type=q5_K m=4608 k=2304 tokens=1024 bcast=0 J=128 us_mean=3926.46 us_min=3714 iters=50
+DONE a2
