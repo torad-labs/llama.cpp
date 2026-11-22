@@ -17777,6 +17777,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 2048, 2, 1, 16, GGML_TYPE_F16, true, true, true, 32));
 
+    // the gqa_packed relative prefill tile beside its unpacked kernel: groups of query heads that share a KV head on small
+    // shapes whose distances sit inside and past the table's extent, with split-K parts across both merge sizes
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6,  256, 33, 1, 1025, GGML_TYPE_F16, true, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 2048, 35, 1, 1025, GGML_TYPE_F16, true, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos( 64, 2, 6,  512, 64, 1, 1025, GGML_TYPE_F16, true, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 4, 3, 1040, 31, 1, 1025, GGML_TYPE_F16, true, true, true));
+
     for (int64_t nb : {1, 23, 65}) {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 2, 6, 512, nb, 2, 16, GGML_TYPE_F16, true, true, true));
     }
