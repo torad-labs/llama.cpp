@@ -3,6 +3,7 @@
 static __global__ void short_conv_f32(const float * x, const float * w, const float * d, float * y, const int64_t k,
         const int64_t channels, const int64_t n_t, const int64_t n_s, const int64_t sx1, const int64_t sx2,
         const int64_t sd1, const int64_t group, const float scale) {
+    ggml_cuda_pdl_sync();
     const int64_t c = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     const int64_t s = blockIdx.y;
     if (c >= channels || s >= n_s) {
@@ -32,6 +33,7 @@ static __global__ void short_conv_4_tiled(const float * x, const float * w, cons
     constexpr int tile_size = 32;
     // Read consecutive tokens and transpose the tile to write consecutive channels.
     __shared__ float tile[tile_size][tile_size + 1];
+    ggml_cuda_pdl_sync();
     const int64_t c0 = int64_t(blockIdx.x)*tile_size;
     const int64_t s = blockIdx.y;
     for (int64_t t0 = int64_t(blockIdx.z)*tile_size; t0 < n_t; t0 += int64_t(gridDim.z)*tile_size) {
@@ -79,6 +81,7 @@ static __global__ void short_conv_window_f32(const float * past, const int64_t s
         const int64_t sp2, const float * rows, const int64_t sr0, const int64_t sr1, const int64_t sr2,
         const float * w, const float * d, float * y, float * window, const int64_t channels, const int64_t n_t,
         const int64_t sd1, const int64_t group, const float scale) {
+    ggml_cuda_pdl_sync();
     const int64_t c = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     const int64_t s = blockIdx.y;
     if (c >= channels) {
@@ -138,15 +141,19 @@ void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const int64_t sd1 = d ? d->nb[1]/f : 0;
         const int64_t group = d ? channels/(d->ne[0]/k) : 1;
         const float scale = ggml_get_op_params_f32(dst, 0);
+        // PDL: the launch latency hides under the CONCAT's and mat-vecs' tails; the kernel waits for their
+        // writes in its body before reading them.
         if (k == 4) {
             auto kernel = d ? short_conv_window_f32<4, true> : short_conv_window_f32<4, false>;
-            kernel<<<grid, block, 0, ctx.stream()>>>((const float *) past->data, past->nb[0]/f, past->nb[1]/f,
+            ggml_cuda_kernel_launch(kernel, {grid, block, 0, ctx.stream()},
+                (const float *) past->data, past->nb[0]/f, past->nb[1]/f,
                 past->nb[2]/f, (const float *) rows->data, rows->nb[0]/f, rows->nb[1]/f, rows->nb[2]/f,
                 (const float *) w->data, dp, (float *) dst->data, (float *) win->window->data, channels, n_t,
                 sd1, group, scale);
         } else {
             auto kernel = d ? short_conv_window_f32<3, true> : short_conv_window_f32<3, false>;
-            kernel<<<grid, block, 0, ctx.stream()>>>((const float *) past->data, past->nb[0]/f, past->nb[1]/f,
+            ggml_cuda_kernel_launch(kernel, {grid, block, 0, ctx.stream()},
+                (const float *) past->data, past->nb[0]/f, past->nb[1]/f,
                 past->nb[2]/f, (const float *) rows->data, rows->nb[0]/f, rows->nb[1]/f, rows->nb[2]/f,
                 (const float *) w->data, dp, (float *) dst->data, (float *) win->window->data, channels, n_t,
                 sd1, group, scale);
@@ -158,7 +165,7 @@ void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const dim3 block(32, 8);
         const dim3 grid((channels + 31)/32, n_s, std::min<int64_t>((n_t + 31)/32, 65535));
         auto kernel = d ? short_conv_4_tiled<true> : short_conv_4_tiled<false>;
-        kernel<<<grid, block, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+        ggml_cuda_kernel_launch(kernel, {grid, block, 0, ctx.stream()}, (const float *) x->data, (const float *) w->data,
             d ? (const float *) d->data : nullptr, (float *) dst->data, channels, n_t, x->nb[1]/f, x->nb[2]/f,
             d ? d->nb[1]/f : 0, d ? channels/(d->ne[0]/4) : 1, ggml_get_op_params_f32(dst, 0));
         return;
@@ -166,7 +173,7 @@ void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const dim3 block = n_t < 8 ? dim3(128) : dim3(32, 4);
     const int64_t token_tiles = n_t < 8 ? 1 : (n_t + block.y - 1)/block.y;
     const dim3 grid((channels + block.x - 1)/block.x, n_s, std::min<int64_t>(token_tiles, 65535));
-    short_conv_f32<<<grid, block, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+    ggml_cuda_kernel_launch(short_conv_f32, {grid, block, 0, ctx.stream()}, (const float *) x->data, (const float *) w->data,
         d ? (const float *) d->data : nullptr, (float *) dst->data, k, channels, n_t, n_s, x->nb[1]/f, x->nb[2]/f,
         d ? d->nb[1]/f : 0, d ? channels/(d->ne[0]/k) : 1, ggml_get_op_params_f32(dst, 0));
 }

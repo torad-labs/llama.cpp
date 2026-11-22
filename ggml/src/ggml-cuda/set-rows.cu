@@ -3,11 +3,12 @@
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
-// Generic quantized set_rows kernel template
+// Generic quantized set_rows kernel template.
+// No __restrict__: the kernel launches under PDL, which must not be combined with it (see common.cuh).
 template <typename src_t, typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
-static __global__ void k_set_rows_quant(const src_t * __restrict__ src0,
-                                        const idx_t * __restrict__ src1,
-                                        block_type * __restrict__ dst,
+static __global__ void k_set_rows_quant(const src_t * src0,
+                                        const idx_t * src1,
+                                        block_type * dst,
                                         const int64_t ne_total,
                                         const int64_t ne10,
                                         const int64_t ne11,
@@ -27,6 +28,7 @@ static __global__ void k_set_rows_quant(const src_t * __restrict__ src0,
                                         const uint3   ne02,
                                         const uint3   ne11_fd,
                                         const uint3   ne12_fd) {
+    ggml_cuda_pdl_sync();
     const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
 
     if (i >= ne_total) {
@@ -114,7 +116,9 @@ static void set_rows_cuda_quant(
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
-        k_set_rows_quant<src_t, idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
+        // PDL: the launch latency hides under the producer's tail; the kernel waits before reading.
+        ggml_cuda_kernel_launch(k_set_rows_quant<src_t, idx_t, block_type, qk, quantize_func>,
+            {grid_size, block_size, 0, stream},
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
             ne01_fd, ne02_fd, ne11_fd, ne12_fd);
     }

@@ -3118,8 +3118,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * up = nullptr;
 
         // Inkling 2's SITU at few rows: gate and up as two products over the halves of the merged experts, which the
-        // CUDA backend runs as one gated mat-vec with the SITU in its epilogue (llama_inkling2_situ_max_rows)
-        const bool split_gate_up = gate_up_exps && type_op == LLM_FFN_SITU && cparams.fused_inkling2 && !cached &&
+        // CUDA backend runs as one gated mat-vec with the SITU in its epilogue (llama_inkling2_situ_max_rows).
+        // cached is true on the no-cache route since the moe-cache move (951d465f5) made every caller pass it:
+        // what keeps this path off the cache is that the ids are the router's own (mm_ids null), so run on it.
+        static const bool merged_legacy = ggml_env_switch("LLAMA_INKLING2_MOE_MERGED_LEGACY");
+        const bool split_gate_up = gate_up_exps && type_op == LLM_FFN_SITU && cparams.fused_inkling2 && !merged_legacy &&
             mm_ids == nullptr && !up_exps_s && !gate_up_exps_b && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
             cur->ne[2] <= llama_inkling2_situ_max_rows;
         if (split_gate_up) {
