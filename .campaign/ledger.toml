@@ -500,6 +500,7 @@ notes = [
   "2026-11-21 21:52 CT claude-tensor4: 2026-11-22 claude-tensor4: M4 instrument ready: scripts/inkling2/kv_stats.py (+48 tests) reads a saved slot state, checks the architecture bounds (K L2 <= 22.6274 with 0.2% slack, V RMS in [0.9, 1.01]) and simulates E4M3, Q8_0, e2m1/E4M3-per-16 and Q4_0, each with and without a static per-channel scale. Illustrative only (Inkling 2 MINI real weights, 1-1.4K tokens, CPU): 99% of K vectors sit exactly at the clip; channel max/median 3.5-6.7 (K), 3.8-8.8 (V); K relative error Q8_0 0.59% -> 0.51% with +chan, E4M3 2.6% (no gain from +chan), e2m1 9.4-9.7%, Q4_0 9.5 -> 8.2% with +chan. If Small looks alike, Q8_0 is the safer one-byte candidate (E4M3's 3-bit mantissa costs ~4x the error), and the KIVI channel scale buys little at 8 bits, more at 4. The KL capture decides; run kv_stats on a real Small 16-32K state in the final four-card window (usage at the top of the script).",
   '2026-11-22 02:04 CT: 2026-11-22 02:35 CT llamacpp-coordinator: doc 18 plan of record folded into coordination. K1 (F16 floor from two stock arms) and K2 (format ranking from an F16 slot state) come from the first F16 four-card window; K3 runs Q4_0, Q8_0 and the reduction wire on the dense path at early/middle/late depth plus coding_probe; section 3.2 gate lifting now has its own row (inkling-optimize-kv-gates); the q4_0 tile instance already exists off by default (TORAD 3280492de). Format decisions wait on K3; the profile switch and kept-graph/draft spending wait on K4/K5.',
   '2026-11-22 03:17 CT llamacpp-coordinator: 2026-11-22 03:26 CT llamacpp-coordinator: Marcos: q4 KV paid off immensely on GLM. The byte cut is math, so what Inkling needs judged is only the K-score quality: the global layers score every visible cell with the stored K itself, so 4-bit K error enters the scores directly. The KQ4 window arm (q4_0 global KV plus GGML_CUDA_FATTN_REL_DECODE_Q4) enters through inkling-small once inkling-quant completes the pending rel-mma q4 dispatch (research_notes/kv-q40-dispatch-pending.md, 3280492de). Doc 18 prices it at 18 ms down to 5.1-6.0 ms if bandwidth-bound.',
+  "2026-11-22 03:19 CT llamacpp-coordinator: 2026-11-22 03:31 CT llamacpp-coordinator: Marcos reaffirms q4 KV is proven and treats it as such unless the architecture makes it different. Checked: it does not. Inkling scores cells with the stored K exactly as GLM's attention does; the relative-position bias adds to logits independently of K's precision; the 262K softmax dilutes per-cell error; the Hadamard rotation keeps q4 error uniform, and the K clip at 22.63 plus V RMS normalization keep both inside e4m3/q4 range. The quality gate is confirmation, not a bet. The rel-mma dispatch stays the only prerequisite.",
 ]
 
 [[row]]
@@ -832,4 +833,19 @@ checks = [
 ]
 notes = [
   '2026-11-22 03:17 CT: added; 1 of 1 checks fail, as they should before the work',
+]
+
+[[row]]
+id = 'inkling-fp8-accumulation'
+title = 'FP8 accumulates where the reduction can carry it'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22 Marcos: accumulating in FP8 is one of the biggest levers. Inventory every accumulator on the hot decode path (rel-mma attention QK and PV, the expert and dense GEMMs, the split reductions) and what an e4m3 operand path buys on sm_120: twice the MMA rate and half the operand bytes, with f32 accumulation where the hardware gives it. FP8 accumulation proper must be hierarchical: e4m3 partials requantized at f32 chunk boundaries, because a naive e4m3 accumulator over a 262K-cell reduction fails by construction (three mantissa bits, error growing with the reduction; that is the named falsifier, not something to discover). First target: global attention QK and PV beside the one-byte KV work, where doc 18 names FP8 MMA as the unlock for one-byte KV. Quality gate: per-cell score error versus f16 and the arch fixture's greedy chains; GLM 5.3 untouched. Evidence: reports/inkling2-fp8-accumulation.json."
+checks = [
+  'python3 scripts/inkling2/fp8_accumulation.py --check --evidence reports/inkling2-fp8-accumulation.json',
+]
+notes = [
+  '2026-11-22 03:19 CT: added; 1 of 1 checks fail, as they should before the work',
 ]
