@@ -562,8 +562,8 @@ notes = [
 [[row]]
 id = 'inkling-execution-ar-capture'
 title = 'Copy-engine reductions captured; one graph a step'
-status = 'todo'
-owner = ''
+status = 'in_flight'
+owner = 'inkling-small'
 blocked_by = []
 guard = false
 spec = "The copy-engine all-reduce route becomes capturable without host waits (doc 17, target B): the route's staging copies, add kernels and cross-card event edges become graph nodes, the two-back pacing between reductions survives as a dependency edge rather than a host wait, and ggml_cuda_ar_capturable_copy_engine() admits the route so the meta backend captures the whole decode step, all 48 layers plus reductions and logits, one launch per card per step, updated in place between steps. Bit-identical: same operations, same order, same reductions; correctness through test-backend-meta-split's Inkling cases, new ctests named inkling-ar-capture-*, and test-llama-archs on logical ranks; four-card rates measured once in the group window."
@@ -575,13 +575,14 @@ notes = [
   '2026-11-22 00:28 CT: added; 2 of 2 checks fail, as they should before the work',
   '2026-11-22 01:30 CT: 2026-11-22: GLM-shared code rule: the captured copy-engine route changes multi-card all-reduce shared with GLM 5.3; guarded behind GGML_CUDA_AR_COPY_ENGINE_CAPTURE/_LEGACY, both default off, so stock GLM behavior is preserved (guard choice, not copy).',
   "2026-11-22 02:05 CT: 2026-11-22 02:10 CT llamacpp-coordinator: window staging expectation for this row's group arm: the copied/reduced path measured with GGML_CUDA_AR_COPY_ENGINE_CAPTURE on and off at the merged window-base, every switch at its row default in the baseline, window-base sha and full switch block printed per arm, tree patch saved beside outputs. Row is unclaimed though its builder snapshots are staged (a3faae9c4) - the lane seat should claim it so ownership is visible.",
+  '2026-11-22 02:05 CT inkling-small: claimed',
 ]
 
 [[row]]
 id = 'inkling-optimize-rel-packed-prefill'
 title = 'Relative prefill attention packs the six heads that share KV'
-status = 'todo'
-owner = ''
+status = 'in_flight'
+owner = 'inkling-small'
 blocked_by = []
 guard = false
 spec = 'The relative prefill kernel (fattn-rel-prefill.cuh, today one warp per block, one head, sixteen queries on WMMA) packs the query heads that share a KV head into one tile, about ten tokens by six heads in sixty-four rows, so K and V tiles are read once for the GQA group instead of once per query head (doc 17, D2; served global prefill re-reads them 6x). Bit-identical per head when the KV order is kept; mma.sync with ldmatrix or WMMA fragments both acceptable. New ctests whose names carry inkling-rel-prefill-gqa cover packed versus unpacked agreement across depths beyond the bias extent, and FLASH_ATTN_EXT plus test-llama-archs hold. Four-card rates measured once in the group window.'
@@ -593,6 +594,7 @@ notes = [
   '2026-11-22 00:40 CT: added; 1 of 2 checks fail, as they should before the work',
   '2026-11-22 01:30 CT: 2026-11-22: GLM-shared code rule: the packed prefill lives only in the Inkling relative-prefill kernel (no GLM path reaches it) and is guarded behind GGML_CUDA_FATTN_REL_PACKED_PREFILL default off; stock behavior preserved either way.',
   "2026-11-22 02:05 CT: 2026-11-22 02:10 CT llamacpp-coordinator: window staging expectation for this row's group arm: GGML_CUDA_FATTN_REL_PACKED_PREFILL on and off at the merged window-base, every switch at its row default in the baseline, window-base sha and full switch block per arm, tree patch beside outputs. Row is unclaimed though its builder snapshot is staged (a3faae9c4) - the lane seat should claim it.",
+  '2026-11-22 02:05 CT inkling-small: claimed',
 ]
 
 [[row]]
