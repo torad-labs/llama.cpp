@@ -3904,7 +3904,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // llama_memory_hybrid_iswa has no indexer cache, so SWA would silently lose it
                         GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
-                        if (arch == LLM_ARCH_INKLING2 && params.type_s != GGML_TYPE_F32) {
+                        if ((arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) && params.type_s != GGML_TYPE_F32) {
                             LLAMA_LOG_INFO("%s: Inkling 2 keeps its recurrent state in f32 (a conv state, as R): type_s %s is not used\n",
                                     __func__, ggml_type_name(params.type_s));
                         }
