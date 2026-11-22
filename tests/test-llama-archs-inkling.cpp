@@ -585,6 +585,24 @@ int test_inkling_loop(size_t seed, ggml_backend_dev_t dev) {
         check(nmse(with_max.logits, r3.logits) <= tolerance, "LLAMA_LOOP_PASSES_MAX sizes the slots for three passes");
     }
 
+    // a saved state carries cells laid out for the count it ran under: saving and restoring refuse another count in
+    // every surface that moves them, and hold at the model's own (a refusal answers 0, as errors do)
+    {
+        auto ctx = make_context(vary_max.get(), shape);
+        record discarded;
+        run(ctx.get(), discarded);   // the model's own count: there are cells to save
+        const size_t whole = llama_state_get_size(ctx.get()), seq0 = llama_state_seq_get_size(ctx.get(), 0);
+        llama_set_loop_passes(ctx.get(), 2);
+        const bool refused = llama_state_get_size(ctx.get()) == 0 && llama_state_seq_get_size(ctx.get(), 0) == 0 &&
+                llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+        llama_set_loop_passes(ctx.get(), 0);
+        const size_t back = llama_state_get_size(ctx.get());
+        fprintf(stderr, "inkling2 loop state sizes: whole %zu, sequence %zu; recounted save refused: %s; reset own: %zu\n",
+                whole, seq0, refused ? "yes" : "no", back);
+        check(whole > 0 && seq0 > 0 && refused && back == whole,
+                "state save/load refuses a recount and holds at the model's own");
+    }
+
     // the draft's layer taps read fixed cache slots: they refuse a count that is not the model's own, and run at it
     {
         auto ctx = make_context(vary_max.get(), shape);
