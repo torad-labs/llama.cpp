@@ -8,6 +8,7 @@
 #include "fattn-rel-mma.cuh"
 #include "fattn-rel-prefill.cuh"
 #include "fattn-rel-runs.cuh"
+#include "fattn-rel-rows.cuh"
 #include "ggml-attn-mask.h"
 
 // ggml_flash_attn_ext_add_rel_pos: a bias of its own a Q head, which the kernels add as they load the mask
@@ -1056,6 +1057,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_REL_DECODE = 500,
     BEST_FATTN_KERNEL_REL_SHORT  = 510,
     BEST_FATTN_KERNEL_REL_PREFILL = 520,
+    BEST_FATTN_KERNEL_REL_ROWS    = 530,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -1395,6 +1397,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             k->type == v->type && (k->type == GGML_TYPE_Q8_0 || fattn_rel_mma_type(k->type)) && softcap == 0.0f) {
         return BEST_FATTN_KERNEL_REL_DECODE;
     }
+    // Inkling 2 Mini's decode rows on a q4_0 or q8_0 cache: only their cells' reads and streams balanced to fill the
+    // card (fattn-rel-rows.cuh). The bounded and low-mean classes above keep their steps.
+    if (kernel != BEST_FATTN_KERNEL_NONE && fattn_rel_rows_takes(device, dst)) {
+        return BEST_FATTN_KERNEL_REL_ROWS;
+    }
     if (kernel == BEST_FATTN_KERNEL_MMA_F16 && ggml_cuda_fattn_may_use_rel_prefill(device, dst) &&
             q->ne[3] == 1 && q->ne[2] <= REL_PREFILL_MAX_HEADS && mask->ne[2] == 1 &&
             q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == k->nb[0] &&
@@ -1423,6 +1430,8 @@ static size_t ggml_cuda_flash_attn_ext_device_alloc_size(int device, const ggml_
         case BEST_FATTN_KERNEL_REL_PREFILL:
             return fattn_rel_prefill_alloc_size(dst);
         case BEST_FATTN_KERNEL_REL_SHORT:
+        case BEST_FATTN_KERNEL_REL_ROWS:
+            return fattn_rel_rows_alloc_size(device, dst);
             return ggml_nbytes(dst);
         case BEST_FATTN_KERNEL_REL_DECODE:
             // K and V have no address yet, and the launch takes the one-cell kernel when they are not aligned.
@@ -1458,6 +1467,9 @@ static void ggml_cuda_flash_attn_ext_device(ggml_backend_cuda_context & ctx, ggm
             ggml_cuda_flash_attn_ext_rel_prefill(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_SHORT:
+        case BEST_FATTN_KERNEL_REL_ROWS:
+            ggml_cuda_fattn_rel_rows(ctx, dst);
+            break;
             ggml_cuda_fattn_rel_short(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_DECODE:
