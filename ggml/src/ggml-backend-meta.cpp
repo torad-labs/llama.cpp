@@ -485,18 +485,28 @@ namespace {
 // Attaches the provisional buffer to a tensor and, before the walk descends there, to every
 // unbuffered tensor its states depend on: sources, views included. Everything attached goes back in
 // reverse order when the measure ends, so placement never sees a node carrying a buffer ahead of
-// time. The attachment itself marks what was visited, which also walks cycles safely.
+// time. The attachment itself marks what was visited, which also walks cycles safely. A reachable
+// tensor whose storage sits in anything but a meta buffer sets foreign: the runtime resolves such
+// tensors through their own paths, not through this one, so the caller sizes the node whole.
 class ggml_meta_measure_attach {
     ggml_backend_buffer_t                                        prov;
     std::vector<std::pair<ggml_tensor *, ggml_backend_buffer_t>> attached;
 
 public:
+    bool foreign = false;
+
     explicit ggml_meta_measure_attach(const ggml_tensor * root, ggml_backend_buffer_t prov_) : prov(prov_) {
         std::vector<ggml_tensor *> stack = {(ggml_tensor *) root};
         while (!stack.empty()) {
             ggml_tensor * t = stack.back();
             stack.pop_back();
-            if (!t || t->buffer) { continue; }
+            if (!t) { continue; }
+            if (t->buffer) {
+                // only meta-backed tensors resolve here at all: leave every other buffer's holder
+                // out entirely, and let the merged-width sizing answer for the node
+                if (!ggml_backend_buffer_is_meta(t->buffer)) { foreign = true; }
+                continue;
+            }
             attached.push_back({t, nullptr}); // prev is null: only unbuffered tensors arrive here
             t->buffer = prov;
             for (int i = 0; i < GGML_MAX_SRC && t->src[i]; ++i) {
@@ -530,6 +540,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_measure_split(
 
     ggml_backend_buffer_t prov = ggml_backend_meta_measure_buffer(buft);
     ggml_meta_measure_attach attach(tensor, prov);
+    if (attach.foreign) {
+        // some reachable source keeps its storage elsewhere: nothing here may resolve through the
+        // meta machinery, and the node sizes as the whole tensor instead
+        return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {}, {1}, 1};
+    }
     const ggml_backend_meta_split_state state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true);
 
     // A long serving life rebuilds many graphs over one process: bound the measure cache like any
@@ -588,10 +603,16 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
                         shard.nb[k] = tensor->nb[k] * ne_shard / tensor->ne[split_dim];
                     }
                 }
+                if (!ggml_backend_dev_supports_op(dev_ctx->simple_devs[i], &shard)) {
+                    all_supported = false;
+                    break;
+                }
                 const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), &shard);
                 max_alloc_size = std::max(max_alloc_size, alloc_size);
             }
-            return max_alloc_size;
+            if (all_supported) {
+                return max_alloc_size;
+            }
         }
     }
 
