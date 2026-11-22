@@ -2669,11 +2669,169 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, cons
     }
 }
 
-void llama_kv_cache_set_input_kq_mask(
+// The rows of a prompt chunk in a bit-packed mask: a row of a sequence sees exactly the sequence's cells within a position
+// window, so the row is the sequence's bits from the window's lower bound on with the cells above its position cleared, and
+// every row after it is the row before it with the cells the window's edges passed set or cleared, instead of a scan of
+// the row's n_kv cells. The caller admits only the layouts whose scans see the same window: no cell rows, no ALiBi, no 2D
+// positions, no per-block uniform rows, and no window or the standard causal window (llama_kv_cache_set_input_kq_mask)
+struct llama_kq_mask_rows {
+    llama_seq_id seq;
+
+    const llama_kv_cells * cells;
+
+    // (position, mask row of the ubatch) of the sequence's tokens, ascending
+    std::vector<std::pair<llama_pos, uint32_t>> rows;
+};
+
+// rows [k0, k1) of one sequence: the first from the sequence's bits, each later one from the row before it
+static void set_input_attn_mask_rows_block(
+        uint16_t * data, int64_t n_words, const llama_kq_mask_rows & of, size_t k0, size_t k1,
+        bool causal, bool window, uint32_t n_swa) {
+    const auto & rows = of.rows;
+    const auto & sp   = of.cells->seq_pos_get(of.seq);
+
+    const llama_pos p_first = rows[k0].first;
+
+    uint16_t * row = data + (int64_t) rows[k0].second*n_words;
+
+    // the first row of the block: the sequence's bits from the window's lower bound on
+    const int64_t p_min = window ? std::max<int64_t>(0, (int64_t) p_first + 1 - n_swa) : 0;
+
+    of.cells->copy_seq_mask(of.seq, row, (size_t) n_words, (llama_pos) p_min, window ? n_swa : 0);
+
+    // the cells above this row's position: cleared now, and the rows after it set back the ones their positions pass
+    if (causal) {
+        for (auto it = sp.upper_bound({ p_first, std::numeric_limits<uint32_t>::max() }); it != sp.end(); ++it) {
+            const uint32_t cell = it->second;
+            if (cell/16 < (uint32_t) n_words) {
+                row[cell/16] &= (uint16_t) ~(1u << (cell%16));
+            }
+        }
+    }
+
+    for (size_t k = k0 + 1; k < k1; ++k) {
+        const llama_pos p0 = rows[k - 1].first;
+        const llama_pos p1 = rows[k    ].first;
+
+        uint16_t       * cur  = data + (int64_t) rows[k    ].second*n_words;
+        const uint16_t * prev = data + (int64_t) rows[k - 1].second*n_words;
+
+        std::memcpy(cur, prev, (size_t) n_words*sizeof(uint16_t));
+
+        // the cells the window's upper edge passed are visible to this row
+        if (causal && p1 != p0) {
+            for (auto it = sp.upper_bound({ p0, std::numeric_limits<uint32_t>::max() }); it != sp.end() && it->first <= p1; ++it) {
+                const uint32_t cell = it->second;
+                if (cell/16 < (uint32_t) n_words) {
+                    cur[cell/16] |= (uint16_t) (1u << (cell%16));
+                }
+            }
+        }
+
+        // the cells the window's lower edge passed are not
+        if (window) {
+            const int64_t m0 = std::max<int64_t>(0, (int64_t) p0 + 1 - n_swa);
+            const int64_t m1 = std::max<int64_t>(0, (int64_t) p1 + 1 - n_swa);
+
+            if (m1 > m0) {
+                for (auto it = sp.lower_bound({ (llama_pos) m0, 0 }); it != sp.end() && it->first < m1; ++it) {
+                    const uint32_t cell = it->second;
+                    if (cell/16 < (uint32_t) n_words) {
+                        cur[cell/16] &= (uint16_t) ~(1u << (cell%16));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// every row of the ubatch from the sequences' bits (see llama_kq_mask_rows): one job a block of rows of one sequence, so a
+// single sequence's prompt also splits across the host threads (llama_host_rows)
+static void set_input_attn_mask_rows(
+        uint16_t * data, const llama_ubatch * ubatch,
+        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream,
+        int64_t n_words, int64_t n_stream, int64_t n_tps, bool causal, bool window, uint32_t n_swa) {
+    // the rows a job: enough for one sequence's prompt to split across the host threads, few enough that a block's first
+    // row (from the bits, the cells above it cleared) is rebuilt only once a handful of rows
+    static constexpr size_t rows_per_job = 8;
+
+    struct job {
+        size_t group;
+        size_t k0;
+        size_t k1;
+    };
+
+    std::vector<llama_kq_mask_rows> groups;
+    std::vector<job> jobs;
+
+    groups.reserve(ubatch->n_tokens);
+    jobs.reserve(ubatch->n_tokens/rows_per_job + 1);
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        const size_t g0 = groups.size();
+
+        // the group of each sequence's rows in this stream
+        int32_t group_of[LLAMA_MAX_SEQ];
+        std::fill(group_of, group_of + LLAMA_MAX_SEQ, -1);
+
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = (uint32_t) (s*n_tps + ii);
+
+            const llama_seq_id seq = ubatch->seq_id[i][0];
+
+            GGML_ASSERT(seq >= 0 && seq < LLAMA_MAX_SEQ);
+
+            if (group_of[seq] < 0) {
+                group_of[seq] = (int32_t) groups.size();
+                groups.push_back({ seq, &v_cells.at(seq_to_stream.at(seq)), {} });
+            }
+
+            groups[group_of[seq]].rows.emplace_back(ubatch->pos[i], i);
+        }
+
+        for (size_t g = g0; g < groups.size(); ++g) {
+            auto & rows = groups[g].rows;
+            std::sort(rows.begin(), rows.end());
+
+            // at most 32 jobs (and fewer when the sequence keeps many cells above the ubatch, which every job's first
+            // row clears): a block's first row is built from the bits, so the cells above it cost once a block
+            const auto & sp = groups[g].cells->seq_pos_get(groups[g].seq);
+
+            const int64_t n_future = (int64_t) std::distance(
+                    sp.upper_bound({ rows.back().first, std::numeric_limits<uint32_t>::max() }), sp.end());
+
+            size_t n_jobs = std::max<size_t>(1, std::min<size_t>((rows.size() + rows_per_job - 1)/rows_per_job, 32));
+            if (n_future > 0) {
+                n_jobs = std::min<size_t>(n_jobs, std::max<size_t>(1, (size_t) ((int64_t) rows.size()*8/n_future)));
+            }
+
+            const size_t per_job = (rows.size() + n_jobs - 1)/n_jobs;
+
+            for (size_t k0 = 0; k0 < rows.size(); k0 += per_job) {
+                jobs.push_back({ g, k0, std::min(rows.size(), k0 + per_job) });
+            }
+        }
+    }
+
+    if (jobs.empty()) {
+        return;
+    }
+
+    const int64_t row_bytes = std::max<int64_t>(1, (int64_t) ubatch->n_tokens*n_words*(int64_t) sizeof(uint16_t)/(int64_t) jobs.size());
+
+    llama_host_rows((int64_t) jobs.size(), row_bytes, [&](int64_t b0, int64_t b1, int) {
+        for (int64_t b = b0; b < b1; ++b) {
+            const auto & j = jobs[b];
+            set_input_attn_mask_rows_block(data, n_words, groups[j.group], j.k0, j.k1, causal, window, n_swa);
+        }
+    });
+}
+
+bool llama_kv_cache_set_input_kq_mask(
         ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_hparams & hparams,
         const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream,
         uint32_t n_swa, llama_swa_type swa_type, bool scan_cells, bool seq_bits,
-        const int32_t * rows, bool block_uniform) {
+        const int32_t * rows, bool block_uniform, bool chunk_rows) {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     const int64_t n_kv     = dst->type == GGML_TYPE_I16 ? 16*dst->ne[0] : dst->ne[0]; // a bit-packed mask holds 16 cells per element
@@ -2723,8 +2881,17 @@ void llama_kv_cache_set_input_kq_mask(
             } else {
                 llama_host_rows(n_tokens, words*sizeof(uint16_t), copy_rows);
             }
-            return;
+            return false;
         }
+    }
+
+    // A prompt chunk, its rows anywhere in their sequences: the tip path's layouts, whose rows are the sequences' bits
+    // within a position window (see llama_kq_mask_rows), built a row from the row before it instead of cell by cell
+    if (chunk_rows && dst->type == GGML_TYPE_I16 && seq_bits && !scan_cells && !rows && !hparams.use_alibi &&
+            (swa_type == LLAMA_SWA_TYPE_NONE || standard_window) && !ubatch->is_pos_2d() && !block_uniform) {
+        set_input_attn_mask_rows(static_cast<uint16_t *>(dst->data), ubatch, v_cells, seq_to_stream,
+                dst->ne[0], n_stream, n_tps, causal_attn, standard_window, n_swa);
+        return true;
     }
 
     const args_set_input_attn_mask args = {
@@ -2749,6 +2916,8 @@ void llama_kv_cache_set_input_kq_mask(
         case GGML_TYPE_I16: set_input_attn_mask_impl(args, llama_kq_mask_bits              {(uint16_t    *) dst->data}, causal_attn); break;
         default: GGML_ABORT("unsupported KQ mask type %s", ggml_type_name(dst->type));
     }
+
+    return false;
 }
 
 void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {

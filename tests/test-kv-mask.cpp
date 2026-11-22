@@ -10,6 +10,7 @@
 
 #include "../src/models/inkling2-attention.h"
 #include "../src/llama-hparams.h"
+#include "../src/llama-host-threads.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cells.h"
 
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -340,14 +342,351 @@ static void check_inkling2_decode_rows() {
     CHECK(classify(230000, true) == mode::dense, "one cell more is dense");
 }
 
-int main() {
+// a ubatch of the given (sequence, position) rows, in that order
+struct ubatch_builder {
+    std::vector<llama_pos>      pos;
+    std::vector<llama_seq_id>   seq;
+    std::vector<llama_seq_id *> seq_ptr;
+    std::vector<int32_t>        n_seq_id;
+    std::vector<llama_pos>      pos_all;
+    llama_ubatch                ub = {};
+
+    void add(llama_seq_id s, llama_pos p) {
+        pos.push_back(p);
+        seq.push_back(s);
+    }
+
+    const llama_ubatch & get() {
+        const uint32_t n = pos.size();
+
+        seq_ptr.resize(n);
+        n_seq_id.assign(n, 1);
+        pos_all = pos;
+
+        for (uint32_t i = 0; i < n; ++i) {
+            seq_ptr[i] = &seq[i];
+        }
+
+        ub.n_tokens = n;
+        ub.n_pos    = 1;
+        ub.pos      = pos_all.data();
+        ub.n_seq_id = n_seq_id.data();
+        ub.seq_id   = seq_ptr.data();
+
+        return ub;
+    }
+};
+
+struct mask_counts {
+    int n_masks = 0;
+    int n_chunk = 0;
+};
+
+// the ubatch's mask built four ways - cell by cell, 16 cells at a time, 64 at a time from the bits, and the chunk rows -
+// compared byte for byte; expect_chunk: whether the chunk path must build this layout
+static void check_masks_equal(const pool & p, const llama_ubatch & ub, uint32_t n_kv, uint32_t n_stream, ggml_type type,
+        bool causal, uint32_t n_swa, llama_swa_type swa_type, const int32_t * rows, bool block_uniform,
+        bool expect_chunk, const char * what, mask_counts & counts) {
+    llama_hparams hparams{};
+
+    ggml_init_params ip = { /*.mem_size =*/ 64*1024*1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };
+
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * masks[4];
+    for (int m = 0; m < 4; ++m) {
+        masks[m] = ggml_new_tensor_4d(ctx, type, type == GGML_TYPE_I16 ? n_kv/16 : n_kv, ub.n_tokens/n_stream, 1, n_stream);
+        memset(masks[m]->data, 0xa5, ggml_nbytes(masks[m])); // a cell no path writes shows as a difference
+    }
+
+    llama_kv_cache_set_input_kq_mask(masks[0], &ub, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, true,  false, rows, block_uniform, false);
+    llama_kv_cache_set_input_kq_mask(masks[1], &ub, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, false, rows, block_uniform, false);
+    llama_kv_cache_set_input_kq_mask(masks[2], &ub, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, true,  rows, block_uniform, false);
+    const bool chunk = llama_kv_cache_set_input_kq_mask(masks[3], &ub, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, true, rows, block_uniform, true);
+
+    CHECK(chunk == expect_chunk, "%s: the chunk rows %s the rows, expected they %s them", what,
+            chunk ? "built" : "left", expect_chunk ? "build" : "leave");
+
+    const size_t nb = ggml_nbytes(masks[0]);
+    CHECK(memcmp(masks[0]->data, masks[1]->data, nb) == 0, "%s: the 16-cell scan differs from the cell scan", what);
+    CHECK(memcmp(masks[0]->data, masks[2]->data, nb) == 0, "%s: the scans from the bits differ from the cell scan", what);
+    CHECK(memcmp(masks[0]->data, masks[3]->data, nb) == 0, "%s: the chunk rows differ from the cell scan", what);
+
+    counts.n_masks += 4;
+    counts.n_chunk += chunk;
+
+    ggml_free(ctx);
+}
+
+// The two layouts the chunk rows must leave to the scans: the cell rows an attention reads through an index list
+// (llm_attn_mask::rows, the kv_rows attention) and the rows a block of draft tokens shares (block_uniform, dspark)
+static void check_rows_and_blocks(std::mt19937 & rng, mask_counts & counts) {
+    for (int round = 0; round < 40; ++round) {
+        const uint32_t size  = std::vector<uint32_t>{ 2048, 4096, 16384 }[rng() % 3];
+        const uint32_t n_seq = 2 + rng() % 3;
+
+        pool p(size, n_seq, /*unified =*/ true, /*pos_2d =*/ false, rng);
+
+        for (int k = 0; k < 10; ++k) {
+            p.random_op(n_seq);
+        }
+
+        // the ubatch: n_tps tokens of each sequence, placed first, at the tip
+        const uint32_t n_tps = 1 + rng() % 4;
+
+        ubatch_builder ub;
+        bool placed_all = true;
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq && placed_all; ++s) {
+            const llama_pos p0 = p.p_next[s];
+            placed_all = p.append(s, n_tps).size() == n_tps;
+            for (uint32_t k = 0; k < n_tps; ++k) {
+                ub.add(s, p0 + k);
+            }
+        }
+        if (!placed_all) {
+            continue; // the pool is full
+        }
+
+        uint32_t used_max = 0;
+        for (const auto & cells : p.v_cells) {
+            used_max = std::max(used_max, cells.used_max_p1());
+        }
+        const uint32_t n_kv = std::min<uint32_t>(size, std::max(256u, GGML_PAD(used_max, 256)));
+
+        char what[160];
+
+        // the shared block rows: every token of a sequence reads the first token's row
+        for (const ggml_type type : { GGML_TYPE_I16, GGML_TYPE_F16 }) {
+            for (const bool causal : { true, false }) {
+                snprintf(what, sizeof(what), "round %d shared rows (%s, %s)", round, ggml_type_name(type), causal ? "causal" : "non-causal");
+                check_masks_equal(p, ub.get(), n_kv, 1, type, causal, 0,   LLAMA_SWA_TYPE_NONE,     nullptr, true, false, what, counts);
+                check_masks_equal(p, ub.get(), n_kv, 1, type, causal, 128, LLAMA_SWA_TYPE_STANDARD, nullptr, true, false, what, counts);
+            }
+        }
+
+        // the cell rows: a slice a sequence, its cells in cell order (F16, as the kv_rows attention reads them)
+        uint32_t n_rows = 0;
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            n_rows = std::max(n_rows, p.v_cells[0].seq_n_cells(s));
+        }
+        n_rows = std::max<uint32_t>(16u, GGML_PAD(n_rows, 16));
+
+        std::vector<int32_t> row_data((size_t) n_rows*n_seq, -1);
+        std::vector<llama_kv_rows_slice> slices(n_seq);
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            slices[s].seq_ids = { s };
+        }
+        p.v_cells[0].get_seq_cells(slices, row_data.data(), n_rows);
+
+        for (const bool block_uniform : { false, true }) {
+            for (const bool causal : { true, false }) {
+                snprintf(what, sizeof(what), "round %d cell rows (%s%s)", round, causal ? "causal" : "non-causal",
+                        block_uniform ? ", shared rows" : "");
+                check_masks_equal(p, ub.get(), n_rows, n_seq, GGML_TYPE_F16, causal, 0,  LLAMA_SWA_TYPE_NONE,     row_data.data(), block_uniform, false, what, counts);
+                check_masks_equal(p, ub.get(), n_rows, n_seq, GGML_TYPE_F16, causal, 64, LLAMA_SWA_TYPE_STANDARD, row_data.data(), block_uniform, false, what, counts);
+            }
+        }
+
+        // one cell row over every sequence (an interleaved ubatch that cannot split): the union of their cells, each once
+        {
+            const uint32_t n_rows_all = std::max<uint32_t>(16u, GGML_PAD(used_max, 16));
+
+            std::vector<int32_t> row_all((size_t) n_rows_all, -1);
+            std::vector<llama_kv_rows_slice> slice_all(1);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                slice_all[0].seq_ids.push_back(s);
+            }
+            p.v_cells[0].get_seq_cells(slice_all, row_all.data(), n_rows_all);
+
+            for (const bool causal : { true, false }) {
+                snprintf(what, sizeof(what), "round %d one cell-row slice (%s)", round, causal ? "causal" : "non-causal");
+                check_masks_equal(p, ub.get(), n_rows_all, 1, GGML_TYPE_F16, causal, 0,  LLAMA_SWA_TYPE_NONE,     row_all.data(), false, false, what, counts);
+                check_masks_equal(p, ub.get(), n_rows_all, 1, GGML_TYPE_F16, causal, 64, LLAMA_SWA_TYPE_STANDARD, row_all.data(), false, false, what, counts);
+            }
+        }
+    }
+}
+
+// A pool at the served prefill's depth (reports/inkling2-prefill-roofline.md (a)): 1.65M cells, a second sequence sharing
+// half of the first one's prefix, prompt chunks mid-sequence with cells of their own sequence above them, rows inside the
+// shared prefix, an empty sequence, and the same chunk built at one thread and at four
+static void check_large_layouts(std::mt19937 & rng, mask_counts & counts) {
+    const uint32_t size = 1703936;
+
+    pool p(size, 4, /*unified =*/ true, /*pos_2d =*/ false, rng); // sequences 0-2 hold cells; sequence 3 stays empty
+
+    p.append(0, 1000000);
+
+    // sequence 1 takes the first half of sequence 0's prefix (a cached prompt), then has its own tail
+    for (uint32_t i = 0; i < p.v_cells[0].size(); ++i) {
+        if (p.v_cells[0].pos_in(i, 0, 500000) && p.v_cells[0].seq_has(i, 0)) {
+            p.v_cells[0].seq_add(i, 1);
+        }
+    }
+    p.p_next[1] = p.cells_of(1).seq_pos_max(1) + 1;
+
+    p.append(1, 150000);
+    p.append(2, 550000); // 1,700,000 cells: the served phase's widest pool (reports/inkling2-prefill-roofline.md)
+
+    check_cells(p.v_cells[0], 4);
+
+    uint32_t used_max = 0;
+    for (const auto & cells : p.v_cells) {
+        used_max = std::max(used_max, cells.used_max_p1());
+    }
+    uint32_t n_kv = std::min<uint32_t>(size, std::max(256u, GGML_PAD(used_max, 256)));
+    n_kv -= n_kv % 16;
+
+    char what[160];
+
+    // sequence 0's chunk mid-sequence (300,000 of its cells above it), the tips of the other two in the same ubatch
+    ubatch_builder chunk;
+    for (uint32_t k = 0; k < 16; ++k) {
+        chunk.add(0, 700000 + k);
+        chunk.add(1, 650000 - 16 + k);
+        chunk.add(2, 550000 - 16 + k);
+    }
+
+    for (const llama_swa_type swa : { LLAMA_SWA_TYPE_NONE, LLAMA_SWA_TYPE_STANDARD }) {
+        snprintf(what, sizeof(what), "large chunk (%s)", swa == LLAMA_SWA_TYPE_NONE ? "no window" : "window");
+        check_masks_equal(p, chunk.get(), n_kv, 1, GGML_TYPE_I16, true,
+                swa == LLAMA_SWA_TYPE_STANDARD ? 2048 : 0, swa, nullptr, false, true, what, counts);
+    }
+
+    // rows inside the shared prefix: both sequences see the same cells, each with cells above its own position
+    ubatch_builder shared;
+    for (uint32_t k = 0; k < 3; ++k) {
+        shared.add(0, 100000 + k);
+        shared.add(1, 100000 + k);
+    }
+
+    snprintf(what, sizeof(what), "large shared prefix");
+    check_masks_equal(p, shared.get(), n_kv, 1, GGML_TYPE_I16, true, 0, LLAMA_SWA_TYPE_NONE, nullptr, false, true, what, counts);
+
+    // an empty sequence: no cells of its own, its row is all zero
+    ubatch_builder empty;
+    empty.add(0, 5);
+    empty.add(3, 0);
+
+    snprintf(what, sizeof(what), "large empty sequence");
+    check_masks_equal(p, empty.get(), n_kv, 1, GGML_TYPE_I16, true, 0, LLAMA_SWA_TYPE_NONE, nullptr, false, true, what, counts);
+
+    // the same chunk at one thread and at four: every byte the same output, and the build really splits
+    {
+        llama_hparams hparams{};
+
+        const llama_ubatch & cub = chunk.get();
+
+        ggml_init_params ip = { /*.mem_size =*/ 64*1024*1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };
+        ggml_context * ctx = ggml_init(ip);
+
+        ggml_tensor * one   = ggml_new_tensor_4d(ctx, GGML_TYPE_I16, n_kv/16, cub.n_tokens, 1, 1);
+        ggml_tensor * split = ggml_new_tensor_4d(ctx, GGML_TYPE_I16, n_kv/16, cub.n_tokens, 1, 1);
+        memset(one->data,   0xa5, ggml_nbytes(one));
+        memset(split->data, 0xa5, ggml_nbytes(split));
+
+        llama_host_threads_set(1);
+        const bool built_one = llama_kv_cache_set_input_kq_mask(one, &cub, true, hparams, p.v_cells, p.seq_to_stream, 2048, LLAMA_SWA_TYPE_STANDARD, false, true, nullptr, false, true);
+        const int used_one = llama_host_threads_last();
+        llama_host_threads_set(4);
+        const bool built_split = llama_kv_cache_set_input_kq_mask(split, &cub, true, hparams, p.v_cells, p.seq_to_stream, 2048, LLAMA_SWA_TYPE_STANDARD, false, true, nullptr, false, true);
+        const int used_split = llama_host_threads_last();
+        llama_host_threads_set(0);
+
+        CHECK(built_one && built_split && used_one == 1 && used_split == 4, "large chunk: the chunk rows at 1 and 4 threads (%d, %d), split across %d and %d",
+                (int) built_one, (int) built_split, used_one, used_split);
+        CHECK(memcmp(one->data, split->data, ggml_nbytes(one)) == 0, "large chunk: the chunk rows at 4 threads differ from one thread");
+
+        counts.n_masks += 2;
+        counts.n_chunk += built_one + built_split;
+
+        ggml_free(ctx);
+    }
+}
+
+// The builder's host time for the served prefill shape: n_seq sessions of n_tps rows a pass over a pool of n_pref+n_tps
+// cells a session (reports/inkling2-prefill-roofline.md (a): 8 x 128 rows, 983,040 cells), the scans as served and the
+// chunk rows, one thread and the host threads
+static int bench_builder(int argc, char ** argv) {
+    const uint32_t n_seq  = argc > 2 ? (uint32_t) atoi(argv[2]) : 8;
+    const uint32_t n_tps  = argc > 3 ? (uint32_t) atoi(argv[3]) : 128;
+    const uint32_t n_pref = argc > 4 ? (uint32_t) atoi(argv[4]) : 122752;
+    const uint32_t n_swa  = argc > 5 ? (uint32_t) atoi(argv[5]) : 0;
+
+    std::mt19937 rng(20261122);
+
+    const uint32_t size = n_seq*(n_pref + n_tps) + 256;
+
+    pool p(size, n_seq, /*unified =*/ true, /*pos_2d =*/ false, rng);
+
+    ubatch_builder ub;
+    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+        p.append(s, n_pref);
+        const llama_pos p0 = p.p_next[s];
+        p.append(s, n_tps);
+        for (uint32_t k = 0; k < n_tps; ++k) {
+            ub.add(s, p0 + k);
+        }
+    }
+
+    uint32_t used_max = 0;
+    for (const auto & cells : p.v_cells) {
+        used_max = std::max(used_max, cells.used_max_p1());
+    }
+    const uint32_t n_kv = std::min<uint32_t>(size, std::max(256u, GGML_PAD(used_max, 256)));
+
+    llama_hparams hparams{};
+
+    const size_t mask_bytes = (size_t) n_kv/16*(n_seq*n_tps)*sizeof(uint16_t);
+
+    ggml_init_params ip = { /*.mem_size =*/ mask_bytes + 64*1024*1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };
+    ggml_context * ctx = ggml_init(ip);
+
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_I16, n_kv/16, n_seq*n_tps, 1, 1);
+
+    const llama_swa_type swa_type = n_swa > 0 ? LLAMA_SWA_TYPE_STANDARD : LLAMA_SWA_TYPE_NONE;
+
+    // warm both, and check the chunk rows against the scans at this size
+    llama_kv_cache_set_input_kq_mask(mask, &ub.get(), true, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, false);
+    const std::vector<uint16_t> scanned((const uint16_t *) mask->data, (const uint16_t *) mask->data + ggml_nelements(mask));
+    llama_kv_cache_set_input_kq_mask(mask, &ub.get(), true, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, true);
+    CHECK(memcmp(scanned.data(), mask->data, mask_bytes) == 0, "bench: the chunk rows differ from the scans at %u rows and %u cells", n_seq*n_tps, n_kv);
+
+    const auto time_it = [&](bool chunk, int threads) {
+        llama_host_threads_set(threads);
+        const int64_t t0 = ggml_time_us();
+        llama_kv_cache_set_input_kq_mask(mask, &ub.get(), true, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, chunk);
+        const int64_t t1 = ggml_time_us();
+        llama_host_threads_set(0);
+        return (t1 - t0)/1000.0;
+    };
+
+    for (const int threads : { 1, 0 }) {
+        double scan_ms = 1e9, chunk_ms = 1e9;
+        for (int r = 0; r < 3; ++r) {
+            scan_ms  = std::min(scan_ms,  time_it(false, threads));
+            chunk_ms = std::min(chunk_ms, time_it(true,  threads));
+        }
+        printf("bench: %u rows, %u cells, window %u, %s: scans %.1f ms, chunk rows %.1f ms (%.2fx)\n",
+                n_seq*n_tps, n_kv, n_swa, threads == 1 ? "1 thread" : "host threads", scan_ms, chunk_ms, scan_ms/chunk_ms);
+    }
+
+    ggml_free(ctx);
+
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--bench") == 0) {
+        return bench_builder(argc, argv);
+    }
+
     check_inkling2_decode_masks();
     check_inkling2_decode_rows();
     std::mt19937 rng(20260925);
 
     ggml_init_params ip = { /*.mem_size =*/ 64*1024*1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };
 
-    int n_masks = 0, n_whole = 0;
+    int n_masks = 0, n_whole = 0, n_chunk = 0;
 
     for (int round = 0; round < 1200; ++round) {
         const uint32_t size    = std::vector<uint32_t>{ 256, 1024, 4096, 5000 }[rng() % 4];
@@ -365,9 +704,11 @@ int main() {
             check_cells(cells, n_seq);
         }
 
-        // the ubatch: a decode (1 token) or a verify (up to 5) of some sequences, placed in the cells first as the cache
-        // does (apply_ubatch before the inputs are set); split streams take the same count from each sequence
-        const uint32_t n_tps_seq = rng() % 2 ? 1 : 2 + rng() % 4;
+        // the ubatch: a decode (1 token), a verify (up to 5) or a prompt chunk (up to 64 tokens) of some sequences,
+        // placed in the cells first as the cache does (apply_ubatch before the inputs are set); split streams take the
+        // same count from each sequence. A prompt row is rarely at its sequence's tip: sometimes the sequence keeps its
+        // own cells above the ubatch too (a prompt chunk under a restored tail, a rejected draft's cells)
+        const uint32_t n_tps_seq = rng() % 4 == 0 ? 8 + rng() % 57 : rng() % 2 ? 1 : 2 + rng() % 4;
         std::vector<llama_seq_id> seqs;
         for (uint32_t s = 0; s < n_seq; ++s) {
             if (!unified || rng() % 2 == 0 || s == n_seq - 1) {
@@ -379,7 +720,9 @@ int main() {
         bool placed_all = true;
         for (const llama_seq_id s : seqs) {
             const llama_pos p0 = p.p_next[s];
-            placed_all &= p.append(s, n_tps_seq).size() == n_tps_seq;
+            // the cells of the batch, and sometimes cells of the same sequence above every row of it
+            const uint32_t n_ahead = rng() % 4 == 0 ? 1 + rng() % 8 : 0;
+            placed_all &= p.append(s, n_tps_seq + n_ahead).size() == n_tps_seq + n_ahead;
             for (uint32_t k = 0; k < n_tps_seq; ++k) {
                 pos.push_back(p0 + k);
                 seq_ids.push_back(s);
@@ -435,16 +778,21 @@ int main() {
                     llama_hparams hparams{};
 
                     ggml_context * ctx = ggml_init(ip);
-                    ggml_tensor * masks[3];
-                    for (int m = 0; m < 3; ++m) {
+                    ggml_tensor * masks[4];
+                    for (int m = 0; m < 4; ++m) {
                         masks[m] = ggml_new_tensor_4d(ctx, type, type == GGML_TYPE_I16 ? n_kv/16 : n_kv, n_tokens/n_stream, 1, n_stream);
                         memset(masks[m]->data, 0xa5, ggml_nbytes(masks[m])); // a cell no path writes shows as a difference
                     }
 
-                    // cell by cell; 16 cells at a time; 64 at a time from the bits
-                    llama_kv_cache_set_input_kq_mask(masks[0], &ubatch, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, true,  false);
-                    llama_kv_cache_set_input_kq_mask(masks[1], &ubatch, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, false);
-                    llama_kv_cache_set_input_kq_mask(masks[2], &ubatch, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, true);
+                    // cell by cell; 16 cells at a time; 64 at a time from the bits, all with chunk_rows off; then the
+                    // chunk rows, a row from the row before it (the scans build the prompt chunks' rows, as before)
+                    CHECK(!llama_kv_cache_set_input_kq_mask(masks[0], &ubatch, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, true,  false, nullptr, false, false),
+                            "round %d: the cell scan reports the chunk rows", round);
+                    CHECK(!llama_kv_cache_set_input_kq_mask(masks[1], &ubatch, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, false, nullptr, false, false),
+                            "round %d: the 16-cell scan reports the chunk rows", round);
+                    CHECK(!llama_kv_cache_set_input_kq_mask(masks[2], &ubatch, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, true,  nullptr, false, false),
+                            "round %d: the bits scan reports the chunk rows", round);
+                    const bool chunk = llama_kv_cache_set_input_kq_mask(masks[3], &ubatch, causal, hparams, p.v_cells, p.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, true);
 
                     const size_t nb = ggml_nbytes(masks[0]);
                     CHECK(memcmp(masks[0]->data, masks[1]->data, nb) == 0, "round %d: 16-cell scan differs from the cell scan (%s, n_kv %u, %s, %s)",
@@ -452,8 +800,15 @@ int main() {
                     CHECK(memcmp(masks[0]->data, masks[2]->data, nb) == 0, "round %d: the bits differ from the cell scan (%s, n_kv %u, %s, %s, %u seqs, %s, %u tokens)",
                             round, ggml_type_name(type), n_kv, causal ? "causal" : "non-causal", swa_type == LLAMA_SWA_TYPE_NONE ? "no window" : "window",
                             n_seq, unified ? "unified" : "split", n_tokens);
+                    CHECK(memcmp(masks[0]->data, masks[3]->data, nb) == 0, "round %d: the chunk rows differ from the cell scan (%s, n_kv %u, %s, %s, %u seqs, %s, %u tokens, built %d)",
+                            round, ggml_type_name(type), n_kv, causal ? "causal" : "non-causal", swa_type == LLAMA_SWA_TYPE_NONE ? "no window" : "window",
+                            n_seq, unified ? "unified" : "split", n_tokens, (int) chunk);
+                    // the chunk path takes only layouts its rows are the scans' rows for
+                    CHECK(!chunk || (type == GGML_TYPE_I16 && !pos_2d), "round %d: the chunk path built a %s mask%s",
+                            round, ggml_type_name(type), pos_2d ? " with 2D positions" : "");
 
                     ++n_masks;
+                    n_chunk += chunk;
                     n_whole += swa_type == LLAMA_SWA_TYPE_NONE;
 
                     ggml_free(ctx);
@@ -466,7 +821,16 @@ int main() {
         }
     }
 
-    printf("test-kv-mask: %d masks compared (%d through the bits), %d failures\n", n_masks, n_whole, n_fail);
+    // the layouts the chunk rows leave to the scans, and the served phase's depth
+    mask_counts counts;
+    check_rows_and_blocks(rng, counts);
+    check_large_layouts(rng, counts);
 
-    return n_fail == 0 ? 0 : 1;
+    n_masks += counts.n_masks;
+    n_chunk += counts.n_chunk;
+
+    printf("test-kv-mask: %d masks compared (%d through the bits, %d by the chunk rows), %d failures\n",
+            n_masks, n_whole, n_chunk, n_fail);
+
+    return n_fail == 0 && n_chunk > 0 ? 0 : 1;
 }

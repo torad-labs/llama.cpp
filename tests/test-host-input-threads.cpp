@@ -131,10 +131,11 @@ static void check_masks(pool & w, const llama_ubatch * ub, uint32_t n_ns, int n_
                 memset(one->data,   0xa5, ggml_nbytes(one));
                 memset(split->data, 0xa5, ggml_nbytes(split));
 
+                // the scans' rows: the chunk rows have their own build and threads (test-kv-mask)
                 llama_host_threads_set(1);
-                llama_kv_cache_set_input_kq_mask(one, ub, causal, hparams, w.v_cells, w.seq_to_stream, n_swa, swa_type, false, true);
+                llama_kv_cache_set_input_kq_mask(one, ub, causal, hparams, w.v_cells, w.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, false);
                 llama_host_threads_set(n_threads);
-                llama_kv_cache_set_input_kq_mask(split, ub, causal, hparams, w.v_cells, w.seq_to_stream, n_swa, swa_type, false, true);
+                llama_kv_cache_set_input_kq_mask(split, ub, causal, hparams, w.v_cells, w.seq_to_stream, n_swa, swa_type, false, true, nullptr, false, false);
                 const int used = llama_host_threads_last();
                 llama_host_threads_set(0);
 

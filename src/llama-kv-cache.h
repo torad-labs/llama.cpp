@@ -511,13 +511,15 @@ private:
 
 // llama_kv_cache::set_input_attn_mask on cells alone (dst in host memory): the mask of the ubatch's tokens over each stream's
 // cells. scan_cells tests every cell of a row's first scan (LLAMA_KQ_MASK_SCAN_LEGACY=1); seq_bits takes a group of 64
-// cells before the batch whole from the sequence's bits (off with LLAMA_KQ_MASK_SEQ_BITS_LEGACY=1)
+// cells before the batch whole from the sequence's bits (off with LLAMA_KQ_MASK_SEQ_BITS_LEGACY=1); chunk_rows builds the
+// rows of a prompt chunk from the sequences' bits, each row from the row before it, and returns whether it did (false:
+// the scans built them)
 // rows: the cell of each mask column per stream (llm_attn_mask::rows), nullptr if the columns are the cells
-void llama_kv_cache_set_input_kq_mask(
+bool llama_kv_cache_set_input_kq_mask(
         ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_hparams & hparams,
         const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream,
         uint32_t n_swa, llama_swa_type swa_type, bool scan_cells, bool seq_bits,
-        const int32_t * rows = nullptr, bool block_uniform = false);
+        const int32_t * rows = nullptr, bool block_uniform = false, bool chunk_rows = true);
 
 class llama_kv_cache_context : public llama_memory_context_i {
 public:
