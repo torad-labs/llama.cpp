@@ -778,6 +778,16 @@ if (GGML_CUDA)
     add_test(NAME test-inkling-f32-topk-alias-legacy-cuda0 COMMAND test-inkling-f32-topk)
     set_tests_properties(test-inkling-f32-topk-moe-cuda0 test-inkling-f32-topk-alias-cuda0
         test-inkling-f32-topk-alias-legacy-cuda0 PROPERTIES LABELS "main")
+    # the gqa_packed relative prefill tile and its unpacked kernel on the same small shapes (two KV heads, groups of 3 or
+    # 6 query heads a side, depths inside and past the f32 table's extent), each against the host reference: the packed
+    # one runs when GGML_CUDA_FATTN_REL_PACKED_PREFILL is set beside the f32 prefill switch
+    add_test(NAME test-inkling-rel-prefill-gqa-unpacked-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
+        -p "^hs=(128,nh=2,gqa=6,kv=(256,nb=33|2048,nb=35)|64,nh=2,gqa=6,kv=512,nb=64|128,nh=4,gqa=3,kv=1040,nb=31),n_stream=1,n_dist=1025,type_KV=f16,sinks=1,mask_bits=1,query_sinks=1,n_kv_max=0")
+    add_test(NAME test-inkling-rel-prefill-gqa-packed-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
+        -p "^hs=(128,nh=2,gqa=6,kv=(256,nb=33|2048,nb=35)|64,nh=2,gqa=6,kv=512,nb=64|128,nh=4,gqa=3,kv=1040,nb=31),n_stream=1,n_dist=1025,type_KV=f16,sinks=1,mask_bits=1,query_sinks=1,n_kv_max=0")
+    set_tests_properties(test-inkling-rel-prefill-gqa-unpacked-cuda0 PROPERTIES ENVIRONMENT "GGML_CUDA_FATTN_REL_PREFILL_F32=1")
+    set_tests_properties(test-inkling-rel-prefill-gqa-packed-cuda0 PROPERTIES ENVIRONMENT
+        "GGML_CUDA_FATTN_REL_PREFILL_F32=1;GGML_CUDA_FATTN_REL_PACKED_PREFILL=1")
     set_tests_properties(test-inkling-f32-topk-alias-legacy-cuda0 PROPERTIES ENVIRONMENT "GGML_CUDA_TOPK_MOE_WIDE_LEGACY=1")
 endif()
 
@@ -844,6 +854,10 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
         # a step's 96 reductions through host memory, with the host waiting two back and under GGML_CUDA_AR_SLOT_NO_SYNC, bit for bit
         llama_test(test-backend-meta-split NAME test-backend-meta-reduction-queue ARGS --reduction-queue)
         set_tests_properties(test-backend-meta-reduction-queue PROPERTIES SKIP_RETURN_CODE 77)
+        # inkling-execution-ar-capture: the copy-engine route captured whole against segments only, bit for bit,
+        # on logical ranks (two of them through pinned staging, four card-to-card by default)
+        llama_test(test-backend-meta-split NAME test-inkling-ar-capture ARGS --ar-capture)
+        set_tests_properties(test-inkling-ar-capture PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     add_test(NAME test-backend-meta-candidates COMMAND test-backend-meta-split --candidates)
     if (GGML_CPU)

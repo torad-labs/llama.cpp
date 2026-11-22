@@ -1,6 +1,9 @@
 #pragma once
 
 #include "common.cuh"
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include "cp-async.cuh"
+#endif
 
 static int fattn_rel_prefill_parts(const ggml_tensor * dst) {
     return dst->src[0]->ne[1] <= 32 ? 128 : 8;
@@ -278,6 +281,198 @@ static __global__ void fattn_rel_prefill_merge(const float * partial, float * ou
 }
 #endif
 
+// gqa_packed: the packed successor of fattn_rel_prefill_tiles. One block runs a KV head's whole group of query heads
+// as warps, so every K and V tile is staged once into shared memory by cp.async for all of them instead of being
+// re-read by each head's block. A warp keeps the unpacked kernel's rows and arithmetic exactly; only where its tiles
+// come from changes, so a head's sums stay bit-identical when the KV order is kept.
+//
+// Shared layout per block: two slots of one tile's K panel then V panel (each 16 x dim halves), then one f16 panel of
+// query rows per warp, whose bytes double as the warp's score and weight slices once its fragments are in registers.
+template<int dim>
+static __global__ void fattn_rel_prefill_gqa_packed_tiles(
+        const char * q, const char * k, const char * v, const uint16_t * mask, const float * table,
+        const int * q_pos, const int * k_pos, const float * sinks, float * partial, const fattn_rel_prefill_ranges * spans,
+        float scale, int nq, int nh, int n_dist, int gqa, size_t mask_stride,
+        size_t q_row, size_t q_head, size_t k_row, size_t k_head, size_t v_row, size_t v_head) {
+#if defined(CP_ASYNC_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    namespace wmma = nvcuda::wmma;
+    using A = wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>;
+    using B_key = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major>;
+    using B_value = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>;
+    using C = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+
+    const int parts = gridDim.z;
+    const int nth = blockDim.x, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int query = 16*blockIdx.x, kvh = blockIdx.y;
+    const int rows = min(16, nq - query);
+    const int head = kvh*gqa + warp;
+    k += size_t(kvh)*k_head;
+    v += size_t(kvh)*v_head;
+
+    const fattn_rel_prefill_ranges & span = spans[blockIdx.x];
+    const int first = span.first, last = span.last, count = span.count;
+
+    // The physical cell a tile's row r reads (the unpacked kernel's mapping), -1 when it holds nothing.
+    auto mapped_cell = [&](int logical, int r) {
+        if (!count) {
+            return logical + r <= last ? logical + r : -1;
+        }
+        int cell = -1;
+        for (int i = 0; i < count; ++i) {
+            if (logical + r >= span.runs[i].x && logical + r <= span.runs[i].y) {
+                cell = span.runs[i].z + (logical + r - span.runs[i].x);
+            }
+        }
+        return cell;
+    };
+
+    __shared__ __align__(16) int cells_sh[16];
+    extern __shared__ char smem_dyn[];
+    half * kv_buf = (half *) smem_dyn;
+    half * q_base = kv_buf + 64*dim;
+
+    // One warp's own panel of query rows, converted and scaled once as in the unpacked kernel.
+    half * qpw = q_base + size_t(warp)*16*dim;
+    for (int i = lane; i < 16*dim; i += 32) {
+        const int row = i/dim, col = i%dim;
+        const float value = row < rows ? ((const float *) (q + (query + row)*q_row + head*q_head))[col] : 0.0f;
+        qpw[row*dim + col] = __float2half(value*scale);
+    }
+    A queries[dim/16];
+    C values[dim/16];
+#pragma unroll
+    for (int col = 0; col < dim; col += 16) {
+        wmma::load_matrix_sync(queries[col/16], qpw + col, dim);
+        wmma::fill_fragment(values[col/16], 0.0f);
+    }
+
+    float maximum = lane < rows ? sinks[int64_t(query + lane)*nh + head] : 0.0f;
+    float denominator = blockIdx.z == 0 ? 1.0f : 0.0f;
+
+    // Stage one tile's K and V panels into a slot: mapped rows are copied by cp.async, unmapped ones zeroed,
+    // as the unpacked kernel's padded path fills them.
+    auto stage_tile = [&](int slot, int logical) {
+        half * dst_base = kv_buf + size_t(slot)*32*dim;
+        constexpr int chunks_row = dim/8;
+        for (int c = threadIdx.x; c < 2*16*chunks_row; c += nth) {
+            const int panelrow = c/chunks_row, chunk = (c%chunks_row)*8;
+            const int r = panelrow & 15;
+            const int cell = mapped_cell(logical, r);
+            char * dstp = (char *) (dst_base + panelrow*dim + chunk);
+            if (cell >= 0) {
+                const bool is_v = panelrow >= 16;
+                const char * src = (is_v ? v : k) + size_t(cell)*(is_v ? v_row : k_row) + chunk*sizeof(half);
+                cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(dstp), src);
+            } else {
+                *(int4 *) dstp = make_int4(0, 0, 0, 0);
+            }
+        }
+    };
+
+    if (first + 16*blockIdx.z <= last) {
+        stage_tile(0, first + 16*blockIdx.z);
+        cp_async_commit_group();
+    }
+
+    int it = 0;
+    for (int logical = first + 16*blockIdx.z; logical <= last; logical += 16*parts, ++it) {
+        const bool has_next = logical + 16*parts <= last;
+        if (threadIdx.x < 16) {
+            cells_sh[threadIdx.x] = mapped_cell(logical, threadIdx.x);
+        }
+        if (has_next) {
+            stage_tile((it + 1) & 1, logical + 16*parts);
+            cp_async_commit_group();
+            cp_async_wait_group<1>();
+        } else {
+            cp_async_wait_group<0>();
+        }
+        __syncthreads();
+
+        const half * kt = kv_buf + size_t(it & 1)*32*dim;
+        const half * vt = kt + 16*dim;
+        float * sc = (float *) qpw;
+        half * wt = (half *) (sc + 256);
+
+        C dots;
+        wmma::fill_fragment(dots, 0.0f);
+#pragma unroll
+        for (int col = 0; col < dim; col += 16) {
+            B_key key;
+            wmma::load_matrix_sync(key, kt + col, dim);
+            wmma::mma_sync(dots, queries[col/16], key, dots);
+        }
+        wmma::store_matrix_sync(sc, dots, 16, wmma::mem_row_major);
+        __syncwarp();
+        if (lane < 16) {
+            const int row = query + lane;
+            float next = maximum;
+#pragma unroll
+            for (int col = 0; col < 16; ++col) {
+                const int key = cells_sh[col];
+                float score = -INFINITY;
+                if (lane < rows && key >= 0 && (mask[row*mask_stride + key/16] & (1u << (key%16)))) {
+                    const int64_t dist = int64_t(q_pos[row]) - k_pos[key];
+                    score = sc[lane*16 + col] + (dist >= 0 && dist < n_dist ? table[(int64_t(row)*nh + head)*n_dist + dist] : 0.0f);
+                }
+                sc[lane*16 + col] = score;
+                next = fmaxf(next, score);
+            }
+            const float rescale = maximum == next ? 1.0f : expf(maximum - next);
+            denominator *= rescale;
+#pragma unroll
+            for (int col = 0; col < 16; ++col) {
+                const float weight = sc[lane*16 + col] == -INFINITY ? 0.0f : expf(sc[lane*16 + col] - next);
+                denominator += weight;
+                wt[lane*16 + col] = __float2half(weight);
+                sc[lane*16 + col] = rescale;
+            }
+            maximum = next;
+        }
+        __syncwarp();
+        A weight;
+        C rescale;
+        wmma::load_matrix_sync(weight, wt, 16);
+        wmma::load_matrix_sync(rescale, sc, 16, wmma::mem_row_major);
+#pragma unroll
+        for (int col = 0; col < dim; col += 16) {
+            B_value value;
+            wmma::load_matrix_sync(value, vt + col, dim);
+            C & accum = values[col/16];
+#pragma unroll
+            for (int i = 0; i < C::num_elements; ++i) {
+                accum.x[i] *= rescale.x[i];
+            }
+            wmma::mma_sync(accum, weight, value, accum);
+        }
+
+        __syncthreads();
+    }
+
+    partial += ((int64_t(query)*nh + head)*parts + blockIdx.z)*(dim + 2);
+    const int stride = nh*parts*(dim + 2);
+    if (lane < rows) {
+        partial[lane*stride] = maximum;
+        partial[lane*stride + 1] = denominator;
+    }
+#pragma unroll
+    for (int col = 0; col < dim; col += 16) {
+        float * sc = (float *) qpw;
+        wmma::store_matrix_sync(sc, values[col/16], 16, wmma::mem_row_major);
+        __syncwarp();
+#pragma unroll
+        for (int i = lane; i < 256; i += 32) {
+            if (i/16 < rows) {
+                partial[(i/16)*stride + 2 + col + i%16] = sc[i/16*16 + i%16];
+            }
+        }
+        __syncwarp();
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
 static size_t fattn_rel_prefill_partial_offset(const ggml_tensor * dst, size_t output_bytes) {
     const size_t tiles = (dst->src[0]->ne[1] + 15)/16;
     return GGML_PAD(output_bytes, 128) + GGML_PAD(tiles*(3 + REL_PREFILL_RANGES*3)*sizeof(int32_t), 128);
@@ -287,6 +482,12 @@ static size_t fattn_rel_prefill_alloc_size(const ggml_tensor * dst) {
     const size_t rows = std::min<int64_t>(dst->ne[1], REL_PREFILL_MAX_HEADS)*dst->ne[2];
     const size_t output_bytes = rows*ggml_row_size(dst->type, dst->ne[0]);
     return fattn_rel_prefill_partial_offset(dst, output_bytes) + rows*fattn_rel_prefill_parts(dst)*(2 + dst->ne[0])*sizeof(float);
+}
+
+// The dynamic shared memory the gqa_packed kernel runs on: two slots of a tile's K and V panels, then one f16 panel
+// of query rows per warp whose bytes double as its score and weight slices.
+static size_t fattn_rel_prefill_gqa_packed_smem(int64_t dim, int64_t gqa) {
+    return GGML_PAD((2*32 + 16*gqa)*dim*sizeof(half), 16);
 }
 
 static void ggml_cuda_flash_attn_ext_rel_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -299,6 +500,33 @@ static void ggml_cuda_flash_attn_ext_rel_prefill(ggml_backend_cuda_context & ctx
     float scale;
     memcpy(&scale, dst->op_params, sizeof(scale));
     fattn_rel_prefill_spans<<<tiles, 128, 0, ctx.stream()>>>((const uint16_t *) mask->data, mask->nb[1]/2, (const int *) dst->src[8]->data, q->ne[1], k->ne[1], spans);
+
+    static const bool gqa_packed = ggml_env_switch("GGML_CUDA_FATTN_REL_PACKED_PREFILL");
+    if (gqa_packed && q->ne[3] == 1 && q->ne[2] % k->ne[2] == 0 && q->ne[2]/k->ne[2] >= 2) {
+        auto launch_packed = [&](auto size) {
+            constexpr int dim = decltype(size)::value;
+            const int64_t gqa = q->ne[2]/k->ne[2];
+            const size_t smem_bytes = fattn_rel_prefill_gqa_packed_smem(dim, gqa);
+            if (smem_bytes > 49152) {
+                CUDA_CHECK(cudaFuncSetAttribute(fattn_rel_prefill_gqa_packed_tiles<dim>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem_bytes)));
+            }
+            fattn_rel_prefill_gqa_packed_tiles<dim><<<dim3(tiles, unsigned(k->ne[2]), parts), 32*int(gqa), int(smem_bytes), ctx.stream()>>>(
+                (const char *) q->data, (const char *) k->data, (const char *) v->data, (const uint16_t *) mask->data,
+                (const float *) dst->src[6]->data, (const int *) dst->src[7]->data, (const int *) dst->src[8]->data,
+                (const float *) dst->src[9]->data, partial, spans, scale, q->ne[1], q->ne[2], dst->src[6]->ne[0],
+                int(gqa), mask->nb[1]/2, q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2]);
+            fattn_rel_prefill_merge<dim><<<q->ne[1]*q->ne[2], dim, 0, ctx.stream()>>>(partial, (float *) dst->data, parts);
+        };
+        if (q->ne[0] == 64) {
+            launch_packed(std::integral_constant<int, 64>{});
+        } else {
+            launch_packed(std::integral_constant<int, 128>{});
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     auto launch = [&](auto size) {
         constexpr int dim = decltype(size)::value;
         fattn_rel_prefill_tiles<dim><<<dim3(tiles, q->ne[2], parts), 32, 0, ctx.stream()>>>(
