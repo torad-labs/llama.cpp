@@ -349,6 +349,7 @@ notes = [
   '2026-11-22 00:48 CT: 2026-11-22 00:52 CT llamacpp-coordinator: no row note since 2026-11-21 17:28 CT (7h+). If the row is active on the CloudRift tree (~/inkling-small), add a progress note naming where the MUL_MAT_ID row-split bug stands and what the row needs next; if it is parked, say who holds it.',
   "2026-11-22 01:44 CT: 2026-11-22 01:44 CT llamacpp-coordinator: no progress note from owner in 8+ hours and no live seat answers to codex/claude-tensor4; parking the row so the quiet-state is judgeable. Owner may reclaim with campaign claim + a progress note; the MUL_MAT_ID row-split bug and remaining checks stay documented in this row's earlier notes.",
   '2026-11-22 01:44 CT: status blocked',
+  "2026-11-22 03:17 CT llamacpp-coordinator: 2026-11-22 03:26 CT llamacpp-coordinator: staging attribution answered by name by the ink-experts seat. NOT theirs: ggml/src/ggml-cuda/mmvq.cu and mmvq.cuh (the 6/7-arg mul_mat_vec_q overloads belong to the fused router/A3 stream, mini/ink-fusions lane; qgre-lead concurs), and zero hunks in tests/test-backend-ops.cpp. Theirs: new mmq-tma-tiles.cu/.cuh; ggml-cuda.cu include at :42 and one dispatch hunk inside ggml_cuda_mul_mat_id near :4730 that supersedes the 23-row expert kernel when GGML_CUDA_MMQ_TMA is on; tunables.toml GGML_CUDA_MMQ_TMA default false; regenerated ggml-tunables.inc. Their box build linked test-backend-ops clean at 07:58 UTC and again just now. Their staging now has its own row, inkling-mmq-tma-tiles; this parked row's TMA design laws feed it.",
 ]
 
 [[row]]
@@ -498,6 +499,7 @@ notes = [
   '2026-11-21 21:12 CT claude-tensor4: 2026-11-22 claude-tensor4: eli review amendments (doc 15 sec 7). Run FIRST or in parallel with far-runs - it depends on neither (staged_k/staged_v exist at fattn-rel-mma.cuh:81) and halving bytes halves the re-read bytes too. The row must name: the guard (fattn_rel_mma_shapes needs F16 K, fattn-rel-mma.cuh:40; dispatch fattn.cu:1463-1466 sends other types to the one-cell kernel), a store-side cast kernel (prefill writes the cache 14 of 15 minutes; restores rewrite cells), and a snapshot-format migration. Predeclare the KL threshold before the capture; budget two arms (E4M3, Q8_0) at 262K depth. M4 is a host-side read: scripts/inkling2/kv_stats.py (subagent in flight).',
   "2026-11-21 21:52 CT claude-tensor4: 2026-11-22 claude-tensor4: M4 instrument ready: scripts/inkling2/kv_stats.py (+48 tests) reads a saved slot state, checks the architecture bounds (K L2 <= 22.6274 with 0.2% slack, V RMS in [0.9, 1.01]) and simulates E4M3, Q8_0, e2m1/E4M3-per-16 and Q4_0, each with and without a static per-channel scale. Illustrative only (Inkling 2 MINI real weights, 1-1.4K tokens, CPU): 99% of K vectors sit exactly at the clip; channel max/median 3.5-6.7 (K), 3.8-8.8 (V); K relative error Q8_0 0.59% -> 0.51% with +chan, E4M3 2.6% (no gain from +chan), e2m1 9.4-9.7%, Q4_0 9.5 -> 8.2% with +chan. If Small looks alike, Q8_0 is the safer one-byte candidate (E4M3's 3-bit mantissa costs ~4x the error), and the KIVI channel scale buys little at 8 bits, more at 4. The KL capture decides; run kv_stats on a real Small 16-32K state in the final four-card window (usage at the top of the script).",
   '2026-11-22 02:04 CT: 2026-11-22 02:35 CT llamacpp-coordinator: doc 18 plan of record folded into coordination. K1 (F16 floor from two stock arms) and K2 (format ranking from an F16 slot state) come from the first F16 four-card window; K3 runs Q4_0, Q8_0 and the reduction wire on the dense path at early/middle/late depth plus coding_probe; section 3.2 gate lifting now has its own row (inkling-optimize-kv-gates); the q4_0 tile instance already exists off by default (TORAD 3280492de). Format decisions wait on K3; the profile switch and kept-graph/draft spending wait on K4/K5.',
+  '2026-11-22 03:17 CT llamacpp-coordinator: 2026-11-22 03:26 CT llamacpp-coordinator: Marcos: q4 KV paid off immensely on GLM. The byte cut is math, so what Inkling needs judged is only the K-score quality: the global layers score every visible cell with the stored K itself, so 4-bit K error enters the scores directly. The KQ4 window arm (q4_0 global KV plus GGML_CUDA_FATTN_REL_DECODE_Q4) enters through inkling-small once inkling-quant completes the pending rel-mma q4 dispatch (research_notes/kv-q40-dispatch-pending.md, 3280492de). Doc 18 prices it at 18 ms down to 5.1-6.0 ms if bandwidth-bound.',
 ]
 
 [[row]]
@@ -815,4 +817,19 @@ checks = [
 notes = [
   '2026-11-22 03:14 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: this one genuinely needs its gate, because truncating the basis can reorder top-8 routes. The plausible failure is quality; the parity test is the experiment, and no separate speed arm is needed since fewer effective dims is less work.",
+]
+
+[[row]]
+id = 'inkling-mmq-tma-tiles'
+title = 'The expert matvec reads weights through TMA tiles'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22: the expert matvec reads its weight bytes through TMA tile loads on sm_120 so they never touch a register (the row kernel's per-lane ld.global is what this removes). Design laws from qgre's TMA campaign: K-quant scale words as a SWIZZLE_128B rank-2 plane, one DMA per scale window; rank-3 DMAs accept non-monotonic strides; evict_first on weight loads is load-bearing; SMEM 128-B aligned, box inner <=128 B, strides x16, (B,4,3) swizzle family, SMEM cap 101,376 B. GGML_CUDA_MMQ_TMA defaults false and supersedes the 23-row expert row kernel it dispatches before. Exactness: same values as the row kernel where the math allows, a measured divergence named in the row note otherwise. A test named inkling-mmq-tma judges the tile path against the row kernel at Inkling shapes (384 experts, top-8, 2304/4608, 23 and prefill row counts). GLM untouched. Owner: the ink-experts lane; window anchor ed36e2572."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-mmq-tma | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-mmq-tma --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-22 03:17 CT: added; 1 of 1 checks fail, as they should before the work',
 ]
