@@ -759,7 +759,8 @@ if (GGML_CUDA)
     set_tests_properties(test-inkling-kv-q4-decode-tile-cuda0 PROPERTIES LABELS "main"
         ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_Q4=1")
     add_test(NAME test-inkling-kv1b-ops-query-first-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
-        -p "kv=262144,nb=23,.*type_KV=(q8_0|f8_e4m3).*shared=")    set_tests_properties(test-inkling-kv1b-ops-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
+        -p "kv=262144,nb=23,.*type_KV=(q8_0|f8_e4m3).*shared=")
+    set_tests_properties(test-inkling-kv1b-ops-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
     # the global decode by runs of cells (ggml_flash_attn_ext_set_kv_runs) against the host: a shared prefix, chunks taken
     # in turn, decode cells, a session just forked, strides, 2 to 8 query heads a KV head, 32 sessions and the served
     # shape; with query-first, and with the shared runs read once for groups of 1, 5 and 32 rows
