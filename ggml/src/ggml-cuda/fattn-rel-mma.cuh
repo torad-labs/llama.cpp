@@ -35,10 +35,13 @@ static int fattn_rel_mma_run_log2() {
 }
 
 // The K/V types the decode reads on the tile kernel through fattn_rel_elem: f16, and with
-// GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE q8_0 and f8_e4m3, converted to f16 as a tile is staged.
+// GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE q8_0 and f8_e4m3, converted to f16 as a tile is staged; q4_0 rides its own
+// GGML_CUDA_FATTN_REL_DECODE_Q4 switch beside them. Shared-code law choice recorded in
+// reports/kv-q40-dispatch-pending.md: guard strategy — stock behavior for every other served model holds by
+// construction while the switch is off, since GLM serves none of these cache types through Inkling kernels anyway.
 static bool fattn_rel_mma_type(const ggml_type type) {
     static const bool one_byte = ggml_env_switch("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE");
-    return type == GGML_TYPE_F16 || (one_byte && fattn_rel_elem_one_byte(type));
+    return type == GGML_TYPE_F16 || (one_byte && fattn_rel_elem_one_byte(type)) || fattn_rel_elem_q4(type);
 }
 
 // GGML_CUDA_FATTN_REL_MMA_WIDE_LEGACY: F16 K/V and one row a warp only, as before q8_0 and query groups came here.
@@ -476,6 +479,12 @@ static void ggml_cuda_fattn_rel_mma(ggml_backend_cuda_context & ctx, ggml_tensor
             kernel = pick(std::integral_constant<ggml_type, GGML_TYPE_F8_E4M3>{}, std::true_type{});
             break;
 #endif // FATTN_REL_ELEM_F8
+        case GGML_TYPE_Q4_0:
+            // group>1 never reaches this switch for q4 (fattn_rel_mma_elem keeps staged non-f16 at one row a
+            // warp), so the grouped template argument stays true like the other staged types; shapes() declines
+            // everything else and the one-cell kernel takes those steps natively.
+            kernel = pick(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{}, std::true_type{});
+            break;
         default:
             GGML_ASSERT(k->type == GGML_TYPE_F16);
             kernel = pick(std::integral_constant<ggml_type, GGML_TYPE_F16>{}, std::true_type{});

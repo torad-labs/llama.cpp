@@ -274,6 +274,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
 endif()
 
+llama_build(test-llama-archs.cpp llama-archs-gguf.cpp test-llama-archs-inkling.cpp test-llama-archs-inkling-paths.cpp)
 # section 3.5 skeleton (doc 18-global-kv-off-f16.md): the mixed recency store's pools and dense read merge
 llama_build(test-llama-kv-mixed.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
@@ -750,9 +751,15 @@ if (GGML_CUDA)
     # a prompt, bounded rows, drafts on the one-cell kernel, 2 to 8 query heads a KV head, and query-first at 256 streams
     add_test(NAME test-inkling-kv1b-ops-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
         -p "hs=128,nh=2,.*type_KV=(q8_0|f8_e4m3)")
+    # the global decode on a q4_0 K/V cache behind GGML_CUDA_FATTN_REL_DECODE_Q4: every relative q4 case against the
+    # host with the switch on, so the tile staging and the one-cell value reader both stand where the dense deq-dense
+    # reference stood (the same cases run switch-off elsewhere in the suite and hold the row order there)
+    add_test(NAME test-inkling-kv-q4-decode-tile-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
+        -p "hs=128,.*type_KV=q4_0")
+    set_tests_properties(test-inkling-kv-q4-decode-tile-cuda0 PROPERTIES LABELS "main"
+        ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_Q4=1")
     add_test(NAME test-inkling-kv1b-ops-query-first-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
-        -p "kv=262144,nb=23,.*type_KV=(q8_0|f8_e4m3).*shared=")
-    set_tests_properties(test-inkling-kv1b-ops-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
+        -p "kv=262144,nb=23,.*type_KV=(q8_0|f8_e4m3).*shared=")    set_tests_properties(test-inkling-kv1b-ops-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
     # the global decode by runs of cells (ggml_flash_attn_ext_set_kv_runs) against the host: a shared prefix, chunks taken
     # in turn, decode cells, a session just forked, strides, 2 to 8 query heads a KV head, 32 sessions and the served
     # shape; with query-first, and with the shared runs read once for groups of 1, 5 and 32 rows
@@ -796,6 +803,23 @@ if (GGML_CUDA)
     set_tests_properties(test-inkling-rel-prefill-gqa-packed-cuda0 PROPERTIES ENVIRONMENT
         "GGML_CUDA_FATTN_REL_PREFILL_F32=1;GGML_CUDA_FATTN_REL_PACKED_PREFILL=1")
     set_tests_properties(test-inkling-f32-topk-alias-legacy-cuda0 PROPERTIES ENVIRONMENT "GGML_CUDA_TOPK_MOE_WIDE_LEGACY=1")
+    # Inkling 2's routed-expert chain as fused launches (fuse-moe.cu, plan 17 C3): the chain's one launch, the gate/up
+    # product with the SITU in its epilogue and the down product with the weighted sum in its epilogue. The binary is run
+    # once with GGML_CUDA_MOE_FUSE=0 and once =1 and the two results must be the same bytes; each run also checks its arm
+    # against a double-precision CPU port (router logits, ids, weights, sampled SITU and one weighted-sum output) and sees
+    # the tensors a fused launch leaves unwritten keep their sentinel. The expert-row limit is the served 23 so that the
+    # reference arm runs the row kernels the fused launches copy.
+    llama_build(test-inkling-moe-fuse.cpp LINK ggml)
+    add_test(NAME inkling-fuse-chain-ref-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-ref.bin)
+    add_test(NAME inkling-fuse-chain-fused-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-fused.bin)
+    add_test(NAME inkling-fuse-chain-exact COMMAND ${CMAKE_COMMAND} -E compare_files
+        ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-ref.bin ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-fused.bin)
+    set_tests_properties(inkling-fuse-chain-ref-cuda0 PROPERTIES LABELS "main"
+        ENVIRONMENT "GGML_CUDA_MOE_FUSE=0;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
+    set_tests_properties(inkling-fuse-chain-fused-cuda0 PROPERTIES LABELS "main"
+        ENVIRONMENT "GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
+    set_tests_properties(inkling-fuse-chain-exact PROPERTIES LABELS "main"
+        DEPENDS "inkling-fuse-chain-ref-cuda0;inkling-fuse-chain-fused-cuda0")
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
