@@ -27,13 +27,16 @@ Open work lives in `.campaign/ledger.toml`. Run `campaign help` for the verbs.
 
 ## Changing shared code (Marcos, 2026-11-22)
 
-This fork is not attached to upstream llama.cpp's architecture or file layout. Change anything the work needs.
-When a change touches code shared with another model served by this fork (GLM 5.3 today), either copy the
-shared piece into a model-specific path so the other model's behavior is untouched, or guard the change behind
-a switch whose stock value preserves the other model's behavior. A change proven bit-identical may be on by
-default with a `..._LEGACY` switch back instead. Say which you chose, and where the proof or parity lives, in
-the commit message or row note. A measured improvement for one model never changes another model's behavior
-silently.
+The goal is throughput and better engine management, not upstream compatibility. llama.cpp keeps its decode
+paths generic so every model and backend fits; this fork does not owe that.
+
+- Change anything the work needs: drop compatibility machinery, restructure how decode and the engine are run,
+  and write code made specifically for Inkling 2 Small where that makes it serve better.
+- Two limits: GLM 5.3 serving must keep working, and other models must not be completely wrecked.
+- Prefer a model-specific path or a `..._LEGACY` switch when the shared version would hurt another served
+  model; when the change helps everyone and GLM stays green, land it shared without ceremony. Bit-identical
+  is the strongest proof when it comes for free, but a measured divergence is allowed when it is worth it.
+- Say what you changed, and the measurement behind it, in the commit message or row note.
 
 ## Boxes and GPUs (Marcos, 2026-11-22)
 
