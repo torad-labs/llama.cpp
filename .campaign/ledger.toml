@@ -670,6 +670,7 @@ notes = [
   '2026-11-22 01:53 CT: added; 3 of 4 checks fail, as they should before the work',
   '2026-11-22 01:53 CT hyperparam: claimed',
   "2026-11-22 02:26 CT llamacpp-coordinator: 2026-11-22 02:25 CT llamacpp-coordinator: eli max-effort review returned 12 findings; fixed in b856229e8 (verified on origin/draft-speed) with regression tests for each gap. Both row checks pass on the working copy via campaign check --local (100 search + 14 harness tests). The reviewer's verification pass on b856229e8 is running. The gate runs on the batch PR that carries draft-speed to main, as with #291; the row stays in_flight until then.",
+  "2026-11-22 02:31 CT llamacpp-coordinator: 2026-11-22 02:32 CT llamacpp-coordinator: reviewer's clean verdict on the full wave. Her verification pass reopened two items in b856229e8 (launched-settings capture reading plan()'s renamed argv; the MMVQ companion define never reaching nvcc); both closed in 77f209693 with the tests that catch them, and her verification of that commit reads both closed, no regression, suites green. Both row checks re-run on the working copy: pass (15.4 s and 3.3 s). Final hashes: e0de9dd4e modules, 1b77d7f10 integration, b856229e8 review fixes, 77f209693 verification fixes; all on origin/draft-speed. Row held for the batch gate.",
 ]
 
 [[row]]
