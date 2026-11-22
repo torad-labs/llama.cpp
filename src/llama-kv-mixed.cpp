@@ -13,11 +13,9 @@ bool llama_kv_mixed_enabled() {
 
 uint32_t llama_kv_mixed_hot_cells() {
     static const uint32_t cells = [] {
-        const char * env = getenv("LLAMA_INKLING2_KV_MIXED_HOT");
-        if (!env || !*env) {
-            return 1024u;
-        }
-        const long v = atol(env);
+        // the knob is declared with default 1024: ggml_env_int reads it through the tunables registry,
+        // so unset means the toml default and --knob sweeps reach it like every other int
+        const long v = ggml_env_int("LLAMA_INKLING2_KV_MIXED_HOT", 1024);
         return v > 0 ? (uint32_t) v : 1024u;
     }();
     return cells;
