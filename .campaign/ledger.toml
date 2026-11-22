@@ -734,6 +734,7 @@ checks = [
 notes = [
   '2026-11-22 03:09 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-22 03:11 CT hyperparam: claimed',
+  "2026-11-22 03:16 CT llamacpp-coordinator: 2026-11-22 03:18 CT llamacpp-coordinator: lane released - inkling-quant staged and committed its llama-kv-cache work (672f9f0a9 migrate-on-load plus mixed-recency skeleton; follow-up ed36e2572 registering llama-kv-mixed.cpp), both on origin/draft-speed and both files clean in the shared tree. The window anchor advances to ed36e2572 per inkling-quant's detached-tip verification. hyperparam's mask agent may start on src/llama-kv-cache.* now.",
 ]
 
 [[row]]
