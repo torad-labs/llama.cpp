@@ -353,5 +353,30 @@ class KernelSweepTest(unittest.TestCase):
             kernel_sweep.plan(self.config, out=io.StringIO())
 
 
+class ShippedConfig(unittest.TestCase):
+    """The config that ships with the harness must produce commands that can actually build (found by the Eli
+    verification pass: a companion -D appended as its own cmake argument never reaches nvcc)."""
+
+    def test_companion_flags_ride_the_same_cuda_flags_word(self):
+        config = kernel_sweep.load_config(Path(__file__).with_name("kernel_constants.toml"))
+        constant = config.constants["MMVQ_MAX_BATCH_SIZE"]
+        configure = kernel_sweep.value_commands(config, constant, 4)["configure"]
+        flags = [word for word in configure if word.startswith("-DCMAKE_CUDA_FLAGS=")]
+        self.assertEqual(len(flags), 1)
+        self.assertIn("-DMMVQ_MAX_BATCH_SIZE=4", flags[0])
+        self.assertIn("-DMMVF_MAX_BATCH_SIZE=4", flags[0])
+        self.assertFalse([word for word in configure if word.startswith("-DMMVF_MAX_BATCH_SIZE=")])
+
+    def test_every_shipped_macro_value_lands_in_the_cuda_flags(self):
+        config = kernel_sweep.load_config(Path(__file__).with_name("kernel_constants.toml"))
+        for constant in config.constants.values():
+            if constant.kind != "macro":
+                continue  # constexpr constants refuse before any command is built
+            for value in constant.values:
+                configure = kernel_sweep.value_commands(config, constant, value)["configure"]
+                flags = next(word for word in configure if word.startswith("-DCMAKE_CUDA_FLAGS="))
+                self.assertIn(f"-D{constant.define}={value}", flags, constant.name)
+
+
 if __name__ == "__main__":
     unittest.main()

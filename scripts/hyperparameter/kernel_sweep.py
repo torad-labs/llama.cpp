@@ -330,9 +330,21 @@ def value_commands(config, constant, value):
         "value": value,
     }
     mapping["binary"] = _format([config.build.binary], mapping, "build.binary")[0]
+    configure = _format(config.build.configure, mapping, "build.configure")
+    extra = _format(constant.extra_flags, mapping, f"constants.{constant.name}.extra_flags")
+    if extra:
+        # companions must ride the SAME CMAKE_CUDA_FLAGS string: a second -DCMAKE_*_FLAGS-looking -D is stored by
+        # cmake as an unused cache entry and never reaches nvcc (the MMVQ/MMVF static_assert then still fails)
+        for position, word in enumerate(configure):
+            if word.startswith("-DCMAKE_CUDA_FLAGS="):
+                configure[position] = word + " " + " ".join(extra)
+                break
+        else:
+            raise SweepError(
+                f"constants.{constant.name}: extra_flags need a -DCMAKE_CUDA_FLAGS= entry in build.configure to join"
+            )
     return {
-        "configure": _format(config.build.configure, mapping, "build.configure")
-                     + _format(constant.extra_flags, mapping, f"constants.{constant.name}.extra_flags"),
+        "configure": configure,
         "build": _format(config.build.build, mapping, "build.build"),
         "run": _format(timing_command(config, constant), mapping, f"constants.{constant.name}.timing"),
     }

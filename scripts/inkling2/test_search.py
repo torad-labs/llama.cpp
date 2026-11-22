@@ -152,6 +152,17 @@ class SearchRuns(unittest.TestCase):
         self.assertIn("exited 3", dead[0]["error"])
         self.assertEqual(len(self.trials()), 5)
 
+    def test_a_trial_records_the_settings_it_really_launched_with(self):
+        # the launcher renames its options before the engine sees them (--draft-depth becomes --spec-draft-n-max),
+        # so launched values must come from the launcher's own view, not from the engine command line
+        trials = self.trials()
+        walked = next((trial for trial in trials if trial["settings"].get("--draft-depth") == "5"), None)
+        self.assertIsNotNone(walked, "no trial walked --draft-depth=5")
+        self.assertEqual(walked["launched"]["--draft-depth"], "5")
+        baseline = next(trial for trial in trials if trial["settings"] == {})
+        self.assertEqual(baseline["launched"]["--draft-depth"], "3")   # the launcher's default, not "off"
+        self.assertEqual(baseline["launched"]["--draft"], "on")        # --option=--draft on every trial
+
     def test_a_trial_names_how_much_of_its_drafts_the_target_kept(self):
         self.assertEqual(self.trials()[0]["draft_accepted"], 0.5)
 

@@ -235,21 +235,23 @@ def run(args):
     registry = {p["name"]: p for p in tomllib.loads((serve.ROOT / "tunables.toml").read_text())["param"]}
 
     def launched_of(settings):
-        """Every knob's effective value as this trial really launched it, read off its own plan: `settings` holds only
-        the knobs the walk moved, and a model fitted on those alone would place the baseline at the all-lowest corner
-        and re-propose combinations the profile already ran."""
-        argv, env = plan(base, settings)
+        """Every knob's effective value as this trial really launched it: `settings` holds only the knobs the walk
+        moved, and a model fitted on those alone would place the baseline at the all-lowest corner and re-propose
+        combinations the profile already ran. The launcher's OWN options are re-derived the way serve.py reads them
+        (plan() renames them -- --draft-depth becomes --spec-draft-n-max, --expert-row-limit an env word -- so they
+        cannot be looked up in plan()'s output); env knobs keep their names and are read from the plan's env."""
+        _, env = plan(base, settings)
+        launcher = serve.arguments(base + [word for name, value in settings.items()
+                                           if name.startswith("--") for word in serve.option_words(name, value)])
         launched = dict(settings)
         for name in SPACE:
             if name in launched:
                 continue
             if name.startswith("--"):
-                if name in argv:
-                    position = argv.index(name)
-                    landed = argv[position + 1] if position + 1 < len(argv) and not argv[position + 1].startswith("--") else "on"
-                    launched[name] = landed
-                else:
-                    launched[name] = "off"
+                value = getattr(launcher, name[2:].replace("-", "_"), None)
+                if value is None:
+                    continue  # the launcher has no such option or it is unset: nothing to record, not a lie
+                launched[name] = "on" if value is True else "off" if value is False else str(value)
             elif name in env:
                 launched[name] = env[name]
         return launched
