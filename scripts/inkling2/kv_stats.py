@@ -417,6 +417,53 @@ def layer_label(cfg, li):
     return FIRST_GLOBAL_LAYER + GLOBAL_LAYER_STEP * li
 
 
+def eff_dim_pass(state, chunk_cells=4096, log=None):
+    """Per-head effective dimensionality of K and V in the stored (rotated) domain, per global layer.
+
+    The participation ratio ED = (sum eigenvalues)^2 / sum(eigenvalue^2) of one head's Gram matrix answers the
+    truncating-basis question: an ED near the head size means energy is spread and a low-rank basis before store
+    saves nothing worth its error; a small ED means most components are noise a truncation could drop. Also
+    reports how many components carry 90/95/99 percent of the energy."""
+    d = state.head_dim
+    fracs = (0.90, 0.95, 0.99)
+
+    def one(kind, li):
+        heads = state.n_heads
+        gram = np.zeros((heads, d, d), np.float64)
+        for c0 in range(0, state.cell_count, chunk_cells):
+            x = state.read(kind, li, c0, min(c0 + chunk_cells, state.cell_count))
+            gram += np.einsum("nhd,nhe->hde", x.astype(np.float64), x.astype(np.float64))
+        ed, n_frac = [], [[None] * len(fracs) for _ in range(heads)]
+        for h in range(heads):
+            lam = np.linalg.eigvalsh(gram[h])[::-1]
+            lam = np.maximum(lam, 0.0)
+            total = lam.sum()
+            if total <= 0:
+                ed.append(float(d)); [nf.__setitem__(i, float(d)) for i, nf in enumerate(n_frac[h])]
+                continue
+            ed.append(float(total ** 2 / np.square(lam).sum()))
+            cum = np.cumsum(lam) / total
+            for fi, f in enumerate(fracs):
+                n_frac[h][fi] = int(np.searchsorted(cum, f - 1e-12) + 1)
+        row = {"ed_mean": float(np.mean(ed)), "ed_min": float(min(ed)), "ed_max": float(max(ed))}
+        for fi, f in enumerate(fracs):
+            allv = [n_frac[h][fi] for h in range(heads)]
+            row[f"n{int(f*100)}_mean"] = float(np.mean(allv))
+            row[f"n{int(f*100)}_max"] = int(max(allv))
+        return row
+
+    out = []
+    for li in range(state.n_layer):
+        entry = {}
+        for kind in ("K", "V"):
+            t0 = time.time()
+            entry[kind] = one(kind, li)
+            if log:
+                log(f"  eff-dim {kind} layer {li + 1}/{state.n_layer} {time.time() - t0:.1f}s")
+        out.append(entry)
+    return out
+
+
 def collect_stats(state, cfg, log=None):
     third = state.third_index()
     out = []
@@ -722,6 +769,11 @@ def analyze(states, cfg, log=None):
             log(f"state {si + 1}/{len(states)}: {state.path}")
         stats = collect_stats(state, cfg, log)
         all_stats.append(stats)
+        if getattr(cfg, "eff_dim", False):
+            e = eff_dim_pass(state, chunk_cells=cfg.chunk_cells, log=log)
+            res["states"][si]["eff_dim"] = [{"index": li, "layer_id": layer_label(cfg, li),
+                                             "K": e[li]["K"], "V": e[li]["V"]}
+                                            for li in range(state.n_layer)]
         layers = []
         for li in range(state.n_layer):
             e = {"index": li, "layer_id": layer_label(cfg, li)}
@@ -914,6 +966,10 @@ def parse_args(argv=None):
     p.add_argument("--formats", type=lambda s: s.split(","), default=[f.name for f in FORMATS],
                    help="formats to simulate, comma separated (default: all of " + ",".join(f.name for f in FORMATS) + ")")
     p.add_argument("--no-sim", action="store_true", help="statistics only")
+    p.add_argument("--eff-dim", action="store_true",
+                   help="per-head effective dimensionality (participation ratio of the Gram spectrum in the stored "
+                        "domain) per global layer for K and V: settles whether a truncating basis before store beats "
+                        "a flat low-bit format on bytes or error")
     p.add_argument("-q", "--quiet", action="store_true", help="no progress lines")
     cfg = p.parse_args(argv)
     unknown = set(cfg.formats) - {f.name for f in FORMATS}

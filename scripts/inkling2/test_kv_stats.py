@@ -468,6 +468,28 @@ class Statistics(unittest.TestCase):
             self.assertEqual(got["violations"], 0)
             self.assertEqual(rot[li]["V"]["violations"], 0)
 
+    def test_eff_dim_rank_limited_and_isotropic(self):
+        # vectors confined to r dims give a participation ratio near r; isotropic gaussian noise gives one far
+        # above any truncation-friendly value at this cell count but below the head size itself.
+        rng = np.random.default_rng(31)
+        r = 4
+        n_layer = 2
+        base_k, base_v = make_kv(rng, n_layer, self.n, self.h)
+        k_low = base_k.astype(np.float32).reshape(n_layer, self.n, self.h, HD)
+        k_low[..., r:] = 0.0                       # every vector lives on the first r channels
+        knorm = np.linalg.norm(k_low, axis=-1, keepdims=True)
+        k_low = (k_low / np.maximum(knorm, 1e-9) * ks.K_NORM_MAX * 0.5).reshape(base_k.shape)
+        low = self.state(k=k_low.astype(np.float16), v=base_v, name="low.state")
+        iso = self.state(name="iso.state")     # distinct files: state() writes one name per call and the second
+                                               # write would otherwise overwrite the first before either is read
+        nl = low.n_layer
+        lo, iso_r = ks.eff_dim_pass(low), ks.eff_dim_pass(iso)
+        for li in range(nl):
+            self.assertLessEqual(lo[li]["K"]["ed_max"], r + 1.0)
+            self.assertEqual(int(round(lo[li]["K"]["n99_mean"])), r)
+            self.assertGreater(iso_r[li]["K"]["ed_min"], 12.0)
+            self.assertLess(iso_r[li]["K"]["ed_mean"], HD)
+
     def test_chunking_does_not_change_the_numbers(self):
         st = self.state()
         a = ks.collect_stats(st, cfg_for("--chunk-cells", "7"))
