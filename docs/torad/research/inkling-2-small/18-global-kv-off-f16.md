@@ -7,13 +7,15 @@ setting: four RTX PRO 6000 (sm_120), 23 sessions, Q3_K_M pack, a step of about 5
 Marking as in 15: verified (read in code or measured), external, inferred.
 
 Status 2026-11-22 CST: owned by the session "Inkling 2 Small global KV cache" (`local_4207d667`). The mid-merge hold of
-2026-11-21 ended: origin/main merged as `ea83c6dd8`, so the freeze on conflicted files is lifted and nothing has been
-committed by this work yet. Built since, off by default behind `GGML_CUDA_FATTN_REL_DECODE_Q4` (correctness argument in
-`reports/kv-q40-dispatch-pending.md`): the Q4_0 element decode instance in `fattn-rel-elem.cuh` with dispatch in
-the one-cell kernel and rel-runs, the fattn.cu gate hunk applied — GPU validation pending the CloudRift box.
-`scripts/inkling2/kv_stats.py` records rotation-on-store fields instead of refusing them, but only f32/f16/bf16 row
-types parse today — a quantized dump still exits 2 at the type filter until its row decoder lands in the reader.
-`--kv-cache q4_0` accepted by the launcher.
+2026-11-21 ended: origin/main merged as `ea83c6dd8`. Landed build slices, all off by default: the Q4_0 element decode
+(`GGML_CUDA_FATTN_REL_DECODE_Q4`) in `fattn-rel-elem.cuh` with dispatch in the one-cell kernel, rel-runs and the rel-mma
+tile kernel (`3280492de`/`31047b0ba`; correctness argument in `reports/kv-q40-dispatch-pending.md`), the §3.5
+mixed-store skeleton behind `LLAMA_INKLING2_KV_MIXED`, and the state-migration helper riding the same branch. Box
+validation of the q4 dispatch is green: on buildbox, `test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
+-p "hs=128,.*type_KV=q4_0"` under the switch went 17/17 against the host reference (tree `e4bfbf7c0`, kernel sources
+identical to `31047b0ba`). `scripts/inkling2/kv_stats.py` parses quantized row types too (q4_0/q8_0, ggml's canonical
+nibble order, fixed in `5cea311fd`) and records rotation-on-store fields; its `--eff-dim` pass measures per-head
+effective dimensionality. `--kv-cache q4_0` accepted by the launcher.
 Builds and correctness runs go over ssh to the CloudRift RTX 5090, not this machine.
 
 Incident closed 2026-11-22: an overnight red of all eight `test-inkling-kv1b-*` model arms (batch ctest at Nov 21
@@ -72,8 +74,9 @@ A cell holds 2 KV heads a card, K and V, 128 values each: 4 rows of 128 a layer 
   spent on conversion.
 - The relative element decode is a template over the type: F16, Q8_0 and E4M3 instances behind
   `GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE`, and Q4_0 beside them behind its own `GGML_CUDA_FATTN_REL_DECODE_Q4`
-  (off by default; one-cell and runs dispatch included, bit-for-bit store argument in
-  `reports/kv-q40-dispatch-pending.md`). Untested on real hardware until the box window validates it.
+  (off by default; one-cell, runs and rel-mma tile dispatch included, bit-for-bit store argument in
+  `reports/kv-q40-dispatch-pending.md`). Box-validated 2026-11-22: 17/17 relative q4 cases against the host
+  reference (see the status block).
 - An E4M3 cache type with a scale per layer (`is_type_scaled`, `src/llama-kv-cache.cpp`), read by the tile kernel under
   the ONE_BYTE switch. The launcher deliberately keeps it unexposed: over Q8_0 it saves only about 0.77 GB more a card,
   its Mini proxy error is worse (2.6% against 0.59%), and the dense path has no bit-for-bit reference for it — so it
@@ -83,9 +86,10 @@ A cell holds 2 KV heads a card, K and V, 128 values each: 4 rows of 128 a layer 
   at head size 128 for q8_0 (`4e5911055`); its K*Q is int8 with Q quantized per column, "not the f16 copy's bit for
   bit". Precedent in-tree for section 3.4.
 - Tools: `kv_stats.py` (value statistics and a format simulation from a slot state; rotation-on-store fields are
-  recorded when present rather than refused — n_rot_k 128 for K, n_rot_v 64 for V — while only f32/f16/bf16 rows
-  parse today, so simulated q4/q8 errors come from F16 values in the unrotated basis until the quantized row decoder
-  lands: per-vector bounds survive rotation exactly, per-channel figures do not carry across),
+  recorded when present rather than refused — n_rot_k 128 for K, n_rot_v 64 for V — and f32/f16/bf16/q4_0/q8_0 rows
+  all parse now, quantized ones decoded in the stored (rotated) domain the kernel reads, so simulated format errors
+  and the `--eff-dim` pass measure the real bytes; per-vector bounds survive rotation exactly, per-channel figures do
+  not carry across),
   `replay_compare.py` (full next-token
   scores at identical forced inputs, two stock arms), `coding_probe.py` (a repository fix at a chosen prompt depth).
 
