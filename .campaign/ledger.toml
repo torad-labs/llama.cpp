@@ -723,8 +723,8 @@ notes = [
 [[row]]
 id = 'kv-mask-prefill-build'
 title = 'Prefill builds no host KV mask; sequences carry their rows'
-status = 'todo'
-owner = ''
+status = 'in_flight'
+owner = 'hyperparam'
 blocked_by = []
 guard = false
 spec = "2026-11-22 Marcos's verdict on the bottleneck experiment, routed by hyperparam: the host KV-mask building costs 68-115 ms a pass at prefill. Build the mask without the host sweep: a per-sequence row plus OR, or cells addressed by run, whichever measures cheaper. Masks stay bit-identical; GLM sees identical data, the dspark draft's shared rows and SWA masking included. A test named inkling-kvmask compares the new path against the current builder across multi-sequence, SWA, shared-row and GLM shapes. The host builder leaves the hot path or sits behind a default-off check switch. Evidence: prefill timing on a rented CloudRift 5090, in the row note. The KV-states lane holds src/llama-kv-cache.* until its staging completes."
@@ -733,13 +733,14 @@ checks = [
 ]
 notes = [
   '2026-11-22 03:09 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-22 03:11 CT hyperparam: claimed',
 ]
 
 [[row]]
 id = 'blackwell-kquant-mmq'
 title = 'Blackwell sm_120 MMQ takes the K-quants at prefill'
-status = 'todo'
-owner = ''
+status = 'in_flight'
+owner = 'hyperparam'
 blocked_by = []
 guard = false
 spec = "2026-11-22 Marcos's verdict on the bottleneck experiment, routed by hyperparam: Blackwell sm_120 has no K-quant MMQ table/stream path for Q3_K/Q4_K/Q5_K, and prefill pays a 155 ms residual against the roofline's own floors. Build the sm_120 MMQ path for the three Inkling weight types at prefill row counts. GLM's IQ3_XXS entries and GLM 5.3 serving stay untouched; other models must not regress. Blackwell-first, no legacy-arch ceremony. Bit-identical output where the math allows; a measured divergence is allowed when the row note names it. A test named inkling-mmq-kquant judges the new path against the existing kernel at Inkling shapes. Compile and measure on a rented CloudRift 5090 (sm_120), never the four-card boxes."
@@ -748,4 +749,20 @@ checks = [
 ]
 notes = [
   '2026-11-22 03:09 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-22 03:11 CT hyperparam: claimed',
+]
+
+[[row]]
+id = 'inkling-rotation-in-tensor-cores'
+title = 'Rotation runs in the tensor cores, folded into the seams'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22 Marcos: a Hadamard rotation can run in the tensor cores as a matmul with exact +-1/sqrt(d) entries and fp32 accumulate. That is the butterfly's signed-sum arithmetic, with one launch instead of log2(d) passes, and it holds precision because the entries are exact and the accumulation is fp32; the only loss is the input rounding, below q8 quantize error. Rotation already exists at three seams in this tree: fwht.cu and the fused SiLU+FWHT+q8_1 at moe-fuse.cu:337 (MoE activation), clip+FWHT in attn-prep.cu (attention input), and the exact KV store rotation (n_rot_k/n_rot_v). The work: fold H into static weights once at load (W <- W H^T), rotate the activation at the seam, and because RMSNorm is rotation-equivariant keep the rotated domain across norm -> quantize -> matmul. First experiment at the MoE q8_1 seam: tensor-core H against the fwht_siglu_q8 kernel, time per step and error against an f32 rotation plus the downstream q8 error, with the arch fixture's greedy chains as the quality gate. Not bit-identical by nature; a measured win decides where it lands, and the evidence goes in reports/inkling2-rotation-tensor-core.json."
+checks = [
+  'python3 scripts/inkling2/rotation_tensor_core.py --check --evidence reports/inkling2-rotation-tensor-core.json',
+]
+notes = [
+  '2026-11-22 03:11 CT: added; 1 of 1 checks fail, as they should before the work',
 ]
