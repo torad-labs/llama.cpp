@@ -12436,6 +12436,129 @@ struct test_flash_attn_ext_rel_runs : public test_case {
     }
 };
 
+// Inkling 2 Mini's decode (ggml_cuda_fattn_rel_rows): nb rows, the first nb of n_sessions sessions of a shared pool, a
+// sink a query, a bit-packed mask, a 1,024-entry table. The pool's first `shared` cells are a prompt every session holds
+// (a copied prefix); the rest lie in runs of `run` cells the sessions own in turn (1: decode's interleave, 512: a prompt's
+// chunks), and every 29th cell is empty. A session's positions follow its prefix, shuffled over its cells as a sliding
+// layer reuses them. A row sees the prefix and its session's cells, the last `window` positions of them on a sliding
+// layer (0: all), from the position after its last. permuted: K and V are views of a cache that holds a cell's heads
+// side by side, as the model's does.
+struct test_flash_attn_ext_rel_rows : public test_case {
+    const ggml_type type_KV;
+    const int64_t nh;       // K/V heads
+    const int64_t gqa;
+    const int64_t kv;       // cells of the pool
+    const int64_t nb;       // rows
+    const int64_t n_sessions;
+    const int64_t run;
+    const int64_t shared;
+    const int64_t window;
+    const bool permuted;
+
+    std::string vars() override {
+        return VARS_TO_STR10(type_KV, nh, gqa, kv, nb, n_sessions, run, shared, window, permuted);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_rel_rows(ggml_type type_KV = GGML_TYPE_Q4_0, int64_t nh = 8, int64_t gqa = 3, int64_t kv = 4096,
+                                 int64_t nb = 4, int64_t n_sessions = 4, int64_t run = 1, int64_t shared = 0,
+                                 int64_t window = 0, bool permuted = true)
+        : type_KV(type_KV), nh(nh), gqa(gqa), kv(kv), nb(nb), n_sessions(n_sessions), run(run), shared(shared),
+          window(window), permuted(permuted) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t hs = 128, n_dist = 1024;
+        GGML_ASSERT(kv % 32 == 0 && nb <= n_sessions);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, 1);
+        ggml_tensor * k;
+        ggml_tensor * v;
+        if (permuted) {
+            k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_KV, hs, nh, kv, 1), 0, 2, 1, 3);
+            v = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_KV, hs, nh, kv, 1), 0, 2, 1, 3);
+        } else {
+            k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+            v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        }
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_I16, kv/16, nb, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_dist, nh*gqa, nb, 1);
+        ggml_tensor * q_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nb, 1);
+        ggml_set_name(q_pos, "q_pos");
+        ggml_tensor * kv_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
+        ggml_set_name(kv_pos, "kv_pos");
+        ggml_tensor * sink = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh*gqa, nb, 1, 1);
+        ggml_set_name(sink, "q_sinks");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_rel_pos(out, table, q_pos, kv_pos);
+        ggml_flash_attn_ext_add_rel_pos_sinks(out, sink);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x3A11);
+        // the session of each cell: -2 the prefix, -1 empty
+        std::vector<int32_t> owner(kv), pos(kv, -1);
+        std::vector<std::vector<int64_t>> cells(n_sessions);
+        for (int64_t j = 0; j < kv; ++j) {
+            owner[j] = j % 29 == 13 ? -1 : j < shared ? -2 : int32_t(((j - shared)/run) % n_sessions);
+            if (owner[j] == -2) {
+                pos[j] = int32_t(j);
+            } else if (owner[j] >= 0) {
+                cells[owner[j]].push_back(j);
+            }
+        }
+        std::vector<int32_t> queries(nb);
+        for (int64_t s = 0; s < n_sessions; ++s) {
+            std::vector<int32_t> own(cells[s].size());
+            for (size_t i = 0; i < own.size(); ++i) {
+                own[i] = int32_t(shared + i);
+            }
+            std::shuffle(own.begin(), own.end(), gen);
+            for (size_t i = 0; i < own.size(); ++i) {
+                pos[cells[s][i]] = own[i];
+            }
+            if (s < nb) {
+                queries[s] = int32_t(shared + own.size());
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, queries.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "kv_pos") == 0) {
+                ggml_backend_tensor_set(t, pos.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "q_sinks") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (float & x : data) {
+                    x = logf(float(kv)) + std::uniform_real_distribution<float>(-5.0f, 5.0f)(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
+                std::vector<float> f(kv);
+                const size_t row_bytes = ggml_nbytes(t)/nb;
+                for (int64_t i = 0; i < nb; ++i) {
+                    for (int64_t j = 0; j < kv; ++j) {
+                        const bool seen = (owner[j] == -2 || owner[j] == i) && pos[j] < queries[i] &&
+                                (window == 0 || queries[i] - pos[j] < window);
+                        f[j] = seen ? 0.0f : -INFINITY;
+                    }
+                    set_tensor_kq_mask(t, f, i*row_bytes);
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -17751,6 +17874,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel_runs(6, 23, 196608, 65536, 128, 32, 0, 0, GGML_TYPE_Q8_0));
 
+    // Inkling 2 Mini's decode (ggml_cuda_fattn_rel_rows): 1 to 8 sessions of a shared pool on a q4_0 or q8_0 cache, 3
+    // query heads a KV head: decode's interleave and a prompt's chunks, a copied prefix, a sliding layer's window, pools
+    // of a few words to Mini's four sessions of 20K, a row that sees nothing, and 16 to 24 columns at other GQA
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 2, 3, 4, 5, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 4096, nb, std::max<int64_t>(nb, 4), 1));
+            test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 4608, nb, std::max<int64_t>(nb, 4), 1, 0, 1024));
+            test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 512, nb, 8, 16));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 20480, 4, 4, 512, 4096));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 20480, 1, 1, 512, 0, 0, false));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 81920, 4, 4, 512));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 29696, 4, 4, 512, 17408));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 1280, 1, 1, 1, 0, 1024));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 256, 2, 2, 512));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 32, 1, 1, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 2, 8, 4096, 3, 4, 16));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 4, 2, 4096, 8, 8, 1, 0, 0, false));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel_rows(GGML_TYPE_Q4_0, 2, 6, 4096, 4, 4, 1));
     // flash attention over a list of K/V rows per slice (unified KV cache)
     for (int64_t nb : {1, 3, 8, 64, 512}) {
         for (int64_t n_slices : {1, 4}) {
@@ -18973,6 +19116,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, false, false, 0, 0, /*mask_bits=*/true));
         }
     }
+
+    // Inkling 2 Mini's decode on one card (q4_0 K/V, 8 KV heads, GQA 3): four sessions of 20K tokens each, apart and over
+    // a copied 17K prefix, one session of 20K, a sliding layer's pool at four sessions and one, and a short pool
+    for (int64_t nb : {1, 4}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(GGML_TYPE_Q4_0, 8, 3, 512, nb, 4, 64));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel_rows(GGML_TYPE_Q4_0, 8, 3, 20480, 1, 1, 512));
+    test_cases.emplace_back(new test_flash_attn_ext_rel_rows(GGML_TYPE_Q4_0, 8, 3, 81920, 4, 4, 512));
+    test_cases.emplace_back(new test_flash_attn_ext_rel_rows(GGML_TYPE_Q4_0, 8, 3, 29696, 4, 4, 512, 17408));
+    test_cases.emplace_back(new test_flash_attn_ext_rel_rows(GGML_TYPE_Q4_0, 8, 3, 4608, 4, 4, 1, 0, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext_rel_rows(GGML_TYPE_Q4_0, 8, 3, 1280, 1, 1, 1, 0, 1024));
 
     // Inkling 2's attention on one rank of the tensor-4 profile (2 KV heads at GQA 6, 23 sessions, F16 K/V in a shared
     // pool, a bit-packed mask, a sink a query): the global layers with every session's cells one at a time, as decode
