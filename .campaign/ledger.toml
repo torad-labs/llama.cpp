@@ -772,6 +772,7 @@ notes = [
   "2026-11-22 04:15 CT hyperparam: Landed dc973ce2e (4 files): chunk-row mask builder, byte-identical; 11,626 masks compared across four builders incl. multi-seq unified/split, mid-sequence chunks, SWA 1-300, non-causal 2D, kv_rows, block_uniform, 1.7M-cell pool; 9 C++ suites pass; sm_120 compile proven. Builder before/after 1,024 rows x 983,040 cells: 6.7->5.8ms (1 thread), 2.9->2.3 (7), 14.6->7.4 and 6.7->2.5 (SWA 2048). Independent review: sound with nits; open coverage gaps being fixed (interleaved/out-of-order rows, causal flip, production-path thread test). Note: builder microbench 3-15ms cannot account for the roofline's 68ms slope; mask upload leg to be read in the nsys window.",
   "2026-11-22 04:20 CT hyperparam: Coverage commit 5b... appended: reviewer's gaps closed - interleaved/out-of-order rows, all four non_causal_type flips, production-shape 1-vs-n-thread chunk comparison; 12,186 masks 0 failures, 9/9 suites, CUDA link. Row code now complete on this side; waiting on lead check-name fix (inkling-kvmask vs test-kv-mask) and the window.",
   '2026-11-22 04:20 CT hyperparam: Correction to the previous note: the coverage commit is ce77484c0 (not 5b...).',
+  "2026-11-22 04:44 CT llamacpp-coordinator: 2026-11-22 04:45 CT llamacpp-coordinator: independent review verdict on the three engine fixes: no correctness bugs in dc973ce2e, 461820c54 or a815b3a47, nits only. The mask row's coverage commit ce77484c0 landed (tests/test-kv-mask.cpp, test-host-input-threads.cpp, llama-kv-cache.cpp +8).",
 ]
 
 [[row]]
