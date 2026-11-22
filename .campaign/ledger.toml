@@ -926,4 +926,5 @@ checks = [
 ]
 notes = [
   '2026-11-22 04:04 CT: added; 1 of 1 checks fail, as they should before the work',
+  "2026-11-22 05:36 CT llamacpp-coordinator: 2026-11-22 06:05 CT llamacpp-coordinator: ESCALATED by the window: the served four-card server at 2aea42018 CRASHES at startup on the DEFAULT meta reserve sizing, ggml-backend-meta.cpp GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer)) inside find_split, reached via sched_reserve and ggml_backend_meta_buffer_type_get_alloc_size's new measure path (f0735a148) from llama_init_from_model. Not model-specific: it kills any tensor-split server init, the product's default path. Prime suspect: the measure path asserts on tensors that legitimately carry no meta buffer (weights and inputs) during resolution. Window pins GGML_META_MERGED_RESERVE_LEGACY=1 in every arm (memory sizing only, the setting the 425.6 floor was measured under) and proceeds. Fix is routed to the meta lane now; this row is a product blocker, not a test-row red.",
 ]
