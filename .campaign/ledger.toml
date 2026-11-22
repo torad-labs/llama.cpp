@@ -492,6 +492,7 @@ notes = [
   '2026-11-21 21:00 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-21 21:12 CT claude-tensor4: 2026-11-22 claude-tensor4: eli review amendments (doc 15 sec 7). Run FIRST or in parallel with far-runs - it depends on neither (staged_k/staged_v exist at fattn-rel-mma.cuh:81) and halving bytes halves the re-read bytes too. The row must name: the guard (fattn_rel_mma_shapes needs F16 K, fattn-rel-mma.cuh:40; dispatch fattn.cu:1463-1466 sends other types to the one-cell kernel), a store-side cast kernel (prefill writes the cache 14 of 15 minutes; restores rewrite cells), and a snapshot-format migration. Predeclare the KL threshold before the capture; budget two arms (E4M3, Q8_0) at 262K depth. M4 is a host-side read: scripts/inkling2/kv_stats.py (subagent in flight).',
   "2026-11-21 21:52 CT claude-tensor4: 2026-11-22 claude-tensor4: M4 instrument ready: scripts/inkling2/kv_stats.py (+48 tests) reads a saved slot state, checks the architecture bounds (K L2 <= 22.6274 with 0.2% slack, V RMS in [0.9, 1.01]) and simulates E4M3, Q8_0, e2m1/E4M3-per-16 and Q4_0, each with and without a static per-channel scale. Illustrative only (Inkling 2 MINI real weights, 1-1.4K tokens, CPU): 99% of K vectors sit exactly at the clip; channel max/median 3.5-6.7 (K), 3.8-8.8 (V); K relative error Q8_0 0.59% -> 0.51% with +chan, E4M3 2.6% (no gain from +chan), e2m1 9.4-9.7%, Q4_0 9.5 -> 8.2% with +chan. If Small looks alike, Q8_0 is the safer one-byte candidate (E4M3's 3-bit mantissa costs ~4x the error), and the KIVI channel scale buys little at 8 bits, more at 4. The KL capture decides; run kv_stats on a real Small 16-32K state in the final four-card window (usage at the top of the script).",
+  '2026-11-22 02:04 CT: 2026-11-22 02:35 CT llamacpp-coordinator: doc 18 plan of record folded into coordination. K1 (F16 floor from two stock arms) and K2 (format ranking from an F16 slot state) come from the first F16 four-card window; K3 runs Q4_0, Q8_0 and the reduction wire on the dense path at early/middle/late depth plus coding_probe; section 3.2 gate lifting now has its own row (inkling-optimize-kv-gates); the q4_0 tile instance already exists off by default (TORAD 3280492de). Format decisions wait on K3; the profile switch and kept-graph/draft spending wait on K4/K5.',
 ]
 
 [[row]]
@@ -651,12 +652,25 @@ blocked_by = []
 guard = false
 spec = 'Marcos asked the hyperparam seat for all six search-method upgrades from the research table: (1) workload-depth worst-case trials, (2) knob screening before full sweeps, (3) model-based selection of the next trial, (4) noise repeats with min-aggregation, (5) ledger-evidence feedback into the search, (6) offline kernel-constant sweeps. Each upgrade is its own new file under scripts/inkling2 (search_workload.py, search_noise.py, search_screen.py, search_model.py, search_evidence.py) or scripts/hyperparameter (kernel_sweep.py), each with its own tests; nobody edits scripts/inkling2/search.py or any tracked file except the hyperparam seat, once, in its integration commit after all six report and are staged by name. An independent eli review on max effort follows integration. Kernel-constant sweeps verify on the rented CloudRift 5090s per the box policy; no four-card window is spent on them. The checks fail today because the modules do not exist yet.'
 checks = [
-  'cd scripts/inkling2 && python3 -B -c "import search_workload, search_noise, search_screen, search_model, search_evidence"',
-  'cd scripts/inkling2 && python3 -B -m unittest search_workload search_noise search_screen search_model search_evidence',
-  'cd scripts/hyperparameter && python3 -B -m unittest kernel_sweep',
-  'cd scripts/inkling2 && python3 -B -m unittest test_search',
+  'cd scripts/inkling2 && python3 -B -m unittest discover -p "test_search*.py"',
+  'cd scripts/hyperparameter && python3 -B -m unittest discover',
 ]
 notes = [
   '2026-11-22 01:53 CT: added; 3 of 4 checks fail, as they should before the work',
   '2026-11-22 01:53 CT hyperparam: claimed',
+]
+
+[[row]]
+id = 'inkling-optimize-kv-gates'
+title = 'The fast paths take the chosen KV format'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Doc 18 section 3.2 (docs/torad/research/inkling-2-small/18-global-kv-off-f16.md): switching the global cache type must not change which kernels run. Each path that today accepts F16 only is taken to the chosen quantized format, or measured to fall to a path as fast: bucketed prefill graph reuse (LLAMA_INKLING2_BUCKET_PREFILL_KV, llama-kv-cache.cpp:1497), the short-rows relative kernel (BEST_FATTN_KERNEL_REL_SHORT, fattn.cu), grouped low-visibility decode (--mean-mask-decode), query groups on drafted rows for the chosen format, and query-first decode verified on a quantized cache. Bucketed prefill and the short-rows kernel come first; the tensor-4 profile turns them on.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-kvg | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-kvg --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  "2026-11-22 02:35 CT llamacpp-coordinator: added by hand edit (campaign add would build on torad-server). Fails today: no inkling-kvg test is registered. The q4_0 element decode instance for the tile kernel already exists off by default (TORAD 3280492de, GGML_CUDA_FATTN_REL_DECODE_Q4), so doc 18's 'the tile kernel does not take Q4_0 yet' is one line stale; this row is the gate-lifting half.",
 ]
