@@ -30,8 +30,10 @@ Open work lives in `.campaign/ledger.toml`. Run `campaign help` for the verbs.
 This fork is not attached to upstream llama.cpp's architecture or file layout. Change anything the work needs.
 When a change touches code shared with another model served by this fork (GLM 5.3 today), either copy the
 shared piece into a model-specific path so the other model's behavior is untouched, or guard the change behind
-a switch whose stock value preserves the other model's behavior. Say which you chose in the commit message or
-row note. A measured improvement for one model never changes another model's behavior silently.
+a switch whose stock value preserves the other model's behavior. A change proven bit-identical may be on by
+default with a `..._LEGACY` switch back instead. Say which you chose, and where the proof or parity lives, in
+the commit message or row note. A measured improvement for one model never changes another model's behavior
+silently.
 
 ## Boxes and GPUs (Marcos, 2026-11-22)
 
