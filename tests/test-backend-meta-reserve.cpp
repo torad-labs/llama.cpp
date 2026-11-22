@@ -424,6 +424,138 @@ bool run_case(const fixture & f, int n_ranks, bool uneven, bool with_foreign_wei
     return ok;
 }
 
+// A later reserve of the same context after real placement ran in between, the shape a serving
+// context takes: one scheduler lives for the whole context, graph one is reserved, then really
+// allocated and computed so its tensors carry that scheduler's buffers, graph two is reserved
+// through the same scheduler, and graph one is reserved again. The walk sees a mix of unbuffered,
+// really-meta-placed and scheduler-copied tensors across reserves, which is where state reuse
+// across reallocation showed up. Every tensor the scheduler placed dies with it, so the same one
+// must stay alive until the last reserve.
+bool run_repeat_reserve(const fixture & f, int n_ranks, bool uneven) {
+    case_graph first;
+    first.add_weight("wq", E_small, K_small, /*with_data =*/ true,
+            ggml_backend_dev_buffer_type(f.meta), /*seed =*/ 8000);
+    first.build(E_small, K_small, R_small);
+
+    ggml_backend_t backends[2] = {
+        ggml_backend_dev_init(f.meta, nullptr),
+        ggml_backend_dev_init(f.cpu, nullptr),
+    };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, 1024, false, true);
+    for (int i = 0; i < ggml_graph_n_nodes(first.gf); ++i) {
+        ggml_backend_sched_set_tensor_backend(sched, ggml_graph_node(first.gf, i), backends[0]);
+    }
+    const auto reserve_here = [&](struct ggml_cgraph * gf) {
+        std::vector<size_t> sizes(2, 0);
+        ggml_backend_sched_reserve_size(sched, gf, sizes.data());
+        return sizes;
+    };
+
+    bool ok = true;
+    const std::vector<size_t> s1 = reserve_here(first.gf);
+    if (s1.size() < 2 || !s1[0]) { fprintf(stderr, "repeat: first reserve reported nothing\n"); ok = false; }
+
+    // place for real on the meta backend: buffers exist, split states resolve at runtime once
+    bool placed = ok && (bool) ggml_backend_sched_alloc_graph(sched, first.gf);
+    if (placed) {
+        std::vector<float> xin(E_small*R_small);
+        fill_probe(xin.data(), E_small*R_small, /*seed =*/ 400000);
+        ggml_backend_tensor_set(first.x, xin.data(), 0, sizeof(float)*E_small*R_small);
+        placed = ggml_backend_sched_graph_compute(sched, first.gf) == GGML_STATUS_SUCCESS;
+    }
+    if (!placed) {
+        fprintf(stderr, "repeat: placement pass failed\n");
+        ok = false;
+    }
+
+    // a second graph reading the placed output beside its own weights, reserved through the same
+    // scheduler after the first graph's buffers are real: same shape, same answer as the first
+    // reserve, whatever the placed graph left behind
+    case_graph second;
+    second.add_weight("wq", E_small, K_small, /*with_data =*/ true,
+            ggml_backend_dev_buffer_type(f.meta), /*seed =*/ 8500);
+    second.build(E_small, K_small, R_small);
+
+    const std::vector<size_t> s2 = reserve_here(second.gf);
+
+    // and the first graph again after all that: its tensors carry this scheduler's buffers, so it
+    // reserves for what is still unplaced; above all the reserve must not abort on that state
+    const std::vector<size_t> s3 = reserve_here(first.gf);
+    bool stable = s1.size() >= 2 && s2.size() >= 2 && s3.size() >= 2 && s2[0] == s1[0];
+    if (!stable) {
+        fprintf(stderr, "%d-rank%s repeat reserve changed the answer: first %zu, same shape %zu, placed again %zu\n",
+                n_ranks, uneven ? ", uneven shares" : "",
+                s1.size() > 1 ? s1[0] : 0, s2.size() > 1 ? s2[0] : 0, s3.size() > 1 ? s3[0] : 0);
+        ok = false;
+    }
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backends[1]);
+    ggml_backend_free(backends[0]);
+    second.release_buffers();
+    first.release_buffers();
+
+    fprintf(stdout, "%s: repeated reserves through one scheduler with placement between them stay stable over %d ranks%s (%zu bytes)\n",
+            ok && stable ? "PASS" : "FAIL", n_ranks, uneven ? ", uneven shares" : "",
+            s1.size() > 1 ? s1[0] : 0);
+    return ok && stable;
+}
+
+// a node whose split_input-bearing source keeps its storage in an ordinary buffer: declared through
+// ggml_backend_meta_split_input along the outermost rows like the serving inputs are, then placed on
+// plain memory beside the meta weights. The measure walk must leave it alone and still shrink the
+// rest: the split-declared weight's product is sized whole-width where it runs, not on the meta side.
+bool run_split_input_plain(const fixture & f, int n_ranks, bool uneven) {
+    case_graph mixed;
+    mixed.add_weight("wq", E_big, K_big, /*with_data =*/ false,
+            ggml_backend_dev_buffer_type(f.meta), /*seed =*/ 9000);
+
+    // the split-declared weight: a plain-memory copy of the projection whose K rows the ranks
+    // would own. split_input splits the last extent, so the tensor is [E, K] and the counts run
+    // over K.
+    {
+        const ggml_init_params ip = {2*ggml_tensor_overhead(), nullptr, /*.no_alloc =*/ true};
+        case_graph::weight w;
+        w.ctx = ggml_init(ip);
+        GGML_ASSERT(w.ctx);
+        w.t = ggml_new_tensor_2d(w.ctx, GGML_TYPE_F32, E_big, K_big);
+        ggml_set_name(w.t, "split_rows");
+        std::vector<int64_t> counts(n_ranks);
+        for (int j = 0; j < n_ranks; ++j) { counts[j] = (int64_t) (g_frac[j]*K_big); }
+        ggml_backend_meta_split_input(w.t, /*axis =*/ 1, counts.data(), n_ranks);
+        w.buf = ggml_backend_alloc_ctx_tensors_from_buft(w.ctx, f.plain);
+        GGML_ASSERT(w.buf);
+        {
+            std::vector<float> vals(E_big*K_big);
+            fill_probe(vals.data(), (int64_t) vals.size(), /*seed =*/ 9500);
+            ggml_backend_tensor_set(w.t, vals.data(), 0, sizeof(float)*vals.size());
+        }
+        mixed.weights.push_back(std::move(w));
+    }
+    mixed.build(E_big, K_big, R_big);
+
+    const std::vector<size_t> sizes = reserve_sizes(f, mixed.gf);
+    const size_t shard_top = top_share_bytes(K_big, sizeof(float))*R_big;
+    const size_t whole     = (size_t) K_big*R_big*sizeof(float); // the plain weight's whole product
+    bool ok = sizes.size() >= 2;
+    if (ok && !legacy_env()) {
+        // the sharded meta product takes its share; the split-declared plain branch keeps its whole
+        // width off the meta ledger and on the other one
+        const size_t expect = shard_top + ggml_nbytes(mixed.x);
+        ok = sizes[0] >= expect && sizes[0] <= expect + 2048 && sizes[1] >= whole;
+        if (!ok) {
+            fprintf(stderr, "%d-rank%s split-input graph meta side %zu (expect about %zu), other side %zu "
+                    "(at least a whole product %zu)\n",
+                    n_ranks, uneven ? ", uneven shares" : "", sizes[0], expect, sizes[1], whole);
+        }
+    }
+    mixed.release_buffers();
+
+    fprintf(stdout, "%s: the split_input node on plain memory over %d ranks measures without touching foreign buffers\n",
+            ok ? "PASS" : "FAIL", n_ranks);
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -439,6 +571,8 @@ int main(int argc, char ** argv) {
             const fixture f = make_fixture(n_ranks, uneven);
             ok = measure_shrink(f, n_ranks, uneven, legacy) && ok;
             ok = measure_foreign(f, n_ranks) && ok;
+            ok = run_repeat_reserve(f, n_ranks, uneven) && ok;
+            ok = run_split_input_plain(f, n_ranks, uneven) && ok;
             if (!legacy) {
                 ok = run_case(f, n_ranks, uneven, /*with_foreign_weight =*/ false,
                         /*matrix =*/ false) && ok;
