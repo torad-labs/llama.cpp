@@ -42,7 +42,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 BUILD_KEYS = {"source_dir", "build_dir", "target", "jobs", "configure", "build", "binary"}
 CONSTANT_KEYS = {
     "define", "source", "source_line", "default", "values", "op", "needs_guard",
-    "kind", "rules", "timing", "guard_hint", "note",
+    "kind", "rules", "timing", "guard_hint", "note", "extra_flags",
 }
 RULE_KEYS = {"min", "max", "multiple_of", "power_of_two"}
 
@@ -74,6 +74,7 @@ class Constant:
     timing: list | None = None
     guard_hint: str | None = None
     note: str | None = None
+    extra_flags: list = field(default_factory=list)  # more configure arguments, {value} resolved; e.g. companions a static_assert pairs with this define
 
 
 @dataclass
@@ -224,6 +225,7 @@ def load_config(path):
             timing=_string_list(entry, "timing", where_c) if "timing" in entry else None,
             guard_hint=entry.get("guard_hint"),
             note=entry.get("note"),
+            extra_flags=_string_list(entry, "extra_flags", where_c) if "extra_flags" in entry else [],
         )
     if not constants:
         raise SweepError(f"{where}: no constants defined")
@@ -329,7 +331,8 @@ def value_commands(config, constant, value):
     }
     mapping["binary"] = _format([config.build.binary], mapping, "build.binary")[0]
     return {
-        "configure": _format(config.build.configure, mapping, "build.configure"),
+        "configure": _format(config.build.configure, mapping, "build.configure")
+                     + _format(constant.extra_flags, mapping, f"constants.{constant.name}.extra_flags"),
         "build": _format(config.build.build, mapping, "build.build"),
         "run": _format(timing_command(config, constant), mapping, f"constants.{constant.name}.timing"),
     }
@@ -447,9 +450,18 @@ def _run_value(config, constant, value, runner, out):
     for stage in ("configure", "build", "run"):
         print(f"{constant.name}={value} {stage}: {shlex.join(commands[stage])}", file=out)
         started = time.monotonic()
-        process = runner(
-            commands[stage], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
+        try:
+            process = runner(
+                commands[stage], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+        except OSError as error:
+            # a missing cmake, an unreadable binary: invalid this value, keep the sweep going
+            record["status"] = "invalid"
+            record["failed_stage"] = stage
+            record["invalid_reason"] = f"{stage} could not run: {error}"
+            record["wall_seconds"]["total"] = round(total + (time.monotonic() - started), 3)
+            print(f"{constant.name}={value}: invalid ({record['invalid_reason']})", file=out)
+            return record
         elapsed = time.monotonic() - started
         total += elapsed
         record["wall_seconds"][stage] = round(elapsed, 3)

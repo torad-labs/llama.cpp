@@ -29,32 +29,17 @@ binary = "{build_dir}/bin/test-backend-ops"
 # timing run goes on until it finishes.
 command = ["{binary}", "perf", "-b", "CUDA0", "-o", "MUL_MAT_ID"]
 
-[constants.MMQ_NWARPS]
-define = "MMQ_NWARPS"
-source = "ggml/src/ggml-cuda/mmq.cuh"
-source_line = 16
-kind = "macro"
-default = 8
-values = [4, 8, 16]
-op = "MUL_MAT Q3_K"
-needs_guard = true
-guard_hint = "wrap ggml/src/ggml-cuda/mmq.cuh:16 in #ifndef MMQ_NWARPS / #endif"
-note = "no reader in the tree today: MMQ block warps come from ggml_cuda_mmq_get_nthreads() and the Blackwell CASE table, so a sweep here measures noise until a kernel reads the macro again"
-
-[constants.MMQ_NWARPS.rules]
-power_of_two = true
-
 [constants.MMQ_ITER_K]
 define = "MMQ_ITER_K"
 source = "ggml/src/ggml-cuda/mmq.cuh"
 source_line = 14
 kind = "macro"
 default = 256
-values = [128, 256, 512]
+values = [256]
 op = "MUL_MAT_ID Q3_K"
 needs_guard = true
 guard_hint = "wrap ggml/src/ggml-cuda/mmq.cuh:14 in #ifndef MMQ_ITER_K / #endif"
-note = "a tile of MMQ_ITER_K columns is divided by the quant block size (blocks_per_iter = ITER_K / qk), so 128 is pruned: it is zero blocks for the 256-element K-quant blocks"
+note = "no legal non-default value on the target today: 128 is zero 256-element K-quant blocks, and 512 breaks the Blackwell table (passed as K_vram, mmq-config-blackwell.cuh) and the IQ3_XXS staged kernel's blocks_per_iter == 1 assert (mmq.cuh:1054) on sm_120. Kept as the documented place a sweep will grow when a kernel accepts it"
 
 [constants.MMQ_ITER_K.rules]
 multiple_of = 256
@@ -69,7 +54,8 @@ values = [4, 8, 16, 32]
 op = "MUL_MAT_ID Q4_K"
 needs_guard = true
 guard_hint = "wrap ggml/src/ggml-cuda/mmvq.cuh:3 in #ifndef MMVQ_MAX_BATCH_SIZE / #endif"
-note = "most tokens the row kernel takes before MMQ; a value above MMVQ_MMID_CEILING cannot be reached by MUL_MAT_ID"
+extra_flags = ["-DMMVF_MAX_BATCH_SIZE={value}"]
+note = "most tokens the row kernel takes before MMQ; ggml-cuda.cu static_asserts MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE, so the companion define is passed with it in extra_flags; a value above MMVQ_MMID_CEILING cannot be reached by MUL_MAT_ID"
 
 [constants.MMVQ_MAX_BATCH_SIZE.rules]
 min = 1

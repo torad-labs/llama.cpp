@@ -135,6 +135,23 @@ class Proposal(unittest.TestCase):
         self.assertEqual(Model().propose(space, n=0), [])
 
 
+class RankedFill(unittest.TestCase):
+    """The ranked path cannot always fill the request: few unseen lattice points remain, and the rest of the
+    proposals come from the random path. That branch crashed on unpacking an index tuple (found by the Eli review)."""
+
+    def test_a_nearly_walked_space_still_proposes_without_crashing(self):
+        space = {"a": ["0", "1", "2", "3"], "b": ["x"]}
+        trials = [{"settings": {"a": value, "b": "x"}, "tokens_per_second": float(10 - index)}
+                  for index, value in enumerate(["0", "1", "2"])]
+        model = Model()
+        model.fit(trials)
+        proposals = model.propose(space, n=2, seed=0)      # only one unseen point: the random path must fill the rest
+        self.assertEqual(len(proposals), 2)
+        values = [proposal["a"] for proposal in proposals]
+        self.assertIn("3", values)                          # the unseen point is preferred over any seen one
+        self.assertEqual(len(set(values)), len(values))     # and no combination repeats
+
+
 class CrashPenalty(unittest.TestCase):
     def test_crashed_region_is_steered_around(self):
         everything = combinations(CRASH_SPACE)

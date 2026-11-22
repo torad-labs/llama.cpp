@@ -334,7 +334,10 @@ class Model:
             proposals.append(settings_of(indices))
             chosen.add(indices)
         if len(proposals) < count:
-            taken = {tuple(space[name][index] for name, index in indices) for indices in chosen} | self._tried
+            keys = list(space)
+            # chosen holds index tuples, the same shape as the points; _random excludes value tuples
+            taken = {tuple(space[name][indices[position]] for position, name in enumerate(keys))
+                     for indices in chosen} | self._tried
             proposals.extend(self._random(space, sizes, count - len(proposals), generator, taken))
         return proposals
 

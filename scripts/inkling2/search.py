@@ -150,11 +150,17 @@ def measure_at(url, sessions, args, context):
 
 def measure(url, sessions, args):
     """A trial over every depth --depths names, kept as its worst depth (search_workload.py: a configuration tuned
-    on one trace was up to twice as bad on another). One depth costs that depth and not the trial. With no --depths,
-    the trial is measured at --context alone, the depth the caller asked the load for."""
+    on one trace was up to twice as bad on another). With no --depths, the trial is measured at --context alone.
+    A depth that failed is a depth the trial did NOT survive: the trial's rate is None and its error says which
+    depth failed, because scoring it on the depths that came back would favor the setting that dies deepest."""
     spec = getattr(args, "depths", "")
     depths = search_workload.depths_from(spec) if spec.strip() else [getattr(args, "context", 0)]
-    return search_workload.run_depths(lambda depth: measure_at(url, sessions, args, depth), depths)
+    aggregated = search_workload.run_depths(lambda depth: measure_at(url, sessions, args, depth), depths)
+    failed = aggregated.get("failed_depths") or []
+    if failed and aggregated.get("tokens_per_second") is not None:
+        aggregated = {**aggregated, "tokens_per_second": None,
+                      "error": "; ".join(f"depth {entry['depth']} failed: {entry['error']}" for entry in failed)}
+    return aggregated
 
 
 def plan(base, settings):
@@ -170,7 +176,7 @@ def plan(base, settings):
 
 def run_trial(base, settings, folder, args):
     argv, env = plan(base, settings)
-    folder.mkdir(parents=True)
+    folder.mkdir(parents=True, exist_ok=True)  # a resumed search finds its own repeat folders in place
     (folder / "plan.json").write_text(json.dumps({"argv": argv, "env": env}, indent=1) + "\n")
     url = "http://127.0.0.1:" + argv[argv.index("--port") + 1]
     start = time.monotonic()
@@ -192,15 +198,22 @@ def run_trial(base, settings, folder, args):
                     pass
                 time.sleep(1)
             ready = time.monotonic() - start
-            return {**measure(url, int(argv[argv.index("-np") + 1]), args), "startup_seconds": round(ready, 1), "error": None}
+            # the measurement's own error (a failed depth) must survive: overwriting it with None turned a
+            # failed baseline into a TypeError and marked MLflow runs FINISHED that had measured nothing
+            record = {**measure(url, int(argv[argv.index("-np") + 1]), args), "startup_seconds": round(ready, 1)}
+            record.setdefault("error", None)
+            return record
         except (OSError, RuntimeError, TimeoutError, ValueError) as error:
             return {"tokens_per_second": None, "error": str(error)}
         finally:
             glm_measure.terminate(server, timeout=60)
 
 
-def key_of(build, settings):
-    return hashlib.sha256(json.dumps([build, sorted(settings.items())]).encode()).hexdigest()[:12]
+def key_of(build, settings, measurement=None):
+    """What makes a trial already done: the build, the settings, and how it was measured -- re-running a folder with
+    other --depths/--tokens/--rounds/--context measures again instead of silently reusing the old shape."""
+    return hashlib.sha256(json.dumps([build, sorted(settings.items()),
+                                      sorted((measurement or {}).items())]).encode()).hexdigest()[:12]
 
 
 def trials_of(out):
@@ -221,11 +234,35 @@ def run(args):
     done = {t["key"]: t for t in trials_of(args.out)}
     registry = {p["name"]: p for p in tomllib.loads((serve.ROOT / "tunables.toml").read_text())["param"]}
 
+    def launched_of(settings):
+        """Every knob's effective value as this trial really launched it, read off its own plan: `settings` holds only
+        the knobs the walk moved, and a model fitted on those alone would place the baseline at the all-lowest corner
+        and re-propose combinations the profile already ran."""
+        argv, env = plan(base, settings)
+        launched = dict(settings)
+        for name in SPACE:
+            if name in launched:
+                continue
+            if name.startswith("--"):
+                if name in argv:
+                    position = argv.index(name)
+                    landed = argv[position + 1] if position + 1 < len(argv) and not argv[position + 1].startswith("--") else "on"
+                    launched[name] = landed
+                else:
+                    launched[name] = "off"
+            elif name in env:
+                launched[name] = env[name]
+        return launched
+
+    measurement = {"depths": getattr(args, "depths", ""), "context": getattr(args, "context", 0),
+                   "tokens": getattr(args, "tokens", 0), "rounds": getattr(args, "rounds", 0)}
+
     def trial(settings):
-        key = key_of(args.build, settings)
+        key = key_of(args.build, settings, measurement)
         if key not in done:
             print(f"trial {len(done)}: {settings or 'the profile as it launches'}", flush=True)
             record = {"key": key, "build": args.build, "profile": args.profile, "settings": settings,
+                      "launched": launched_of(settings),
                       "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                       **run_trial(base, settings, args.out / f"{len(done):03d}-{key}", args)}
             with (args.out / "trials.jsonl").open("a") as file:
@@ -239,7 +276,7 @@ def run(args):
 
     best, top = {}, trial({})
     if top["tokens_per_second"] is None:
-        raise ValueError("the profile as it launches gave no rate: " + top["error"])
+        raise ValueError("the profile as it launches gave no rate: " + (top.get("error") or "no error recorded"))
     baseline = top["tokens_per_second"]
 
     def keep():
@@ -250,30 +287,58 @@ def run(args):
 
     keep()
 
+    def persist_trial(key, merged):
+        """Replace a trial's line in trials.jsonl with its confirmed record, so the repeat evidence outlives the run
+        (log, propose and explain read the file, and a resumed search must see the rejection that lived in memory)."""
+        path = args.out / "trials.jsonl"
+        lines = [json.dumps(merged if json.loads(line).get("key") == key else json.loads(line))
+                 for line in path.read_text().splitlines()]
+        path.write_text("\n".join(lines) + "\n")
+
     def confirm_candidate(settings, found):
-        """A candidate that could win is measured again until its repeats agree (search_noise.py); the record keeps
-        their minimum, and an unstable candidate loses its rate so a noisy draw cannot win the walk."""
+        """A candidate that could win is measured again until all its draws agree (search_noise.py is the rule; the
+        first draw counts like every other, so --repeats=2 can dispute a first draw). The record keeps the minimum of
+        the agreeing draws, an unstable candidate loses its rate, and a repeat that cannot run also loses it: no
+        candidate wins the walk on the single draw that confirmation was called to check."""
         repeats = args.repeats
         max_repeats = args.max_repeats if args.max_repeats > 0 else repeats * 2
-        attempts = []
-        def draw():
-            attempts.append(run_trial(base, settings, args.out / f"{found['key']}-repeat{len(attempts) + 1}", args))
-            return attempts[-1]
-        try:
-            # the first trial already drawn is one of the repeats; confirm draws the rest
-            answer = search_noise.confirm(draw, repeats - 1, max_repeats=max(1, max_repeats - 1))
-        except (OSError, RuntimeError, TimeoutError, ValueError) as error:
-            print(f"  a repeat of {settings} failed: {error}", flush=True)
-            return found
-        rates = [found["tokens_per_second"], *answer["rates"]]
-        stable = not search_noise.unstable(rates)
-        merged = {**found, "repeat_rates": rates, "stable": stable, "repeats": len(rates),
-                  "tokens_per_second": search_noise.aggregate(rates) if stable else None}
+        if max_repeats < repeats:
+            raise ValueError(f"--max-repeats {max_repeats} is under --repeats {repeats}")
+        rates = [found["tokens_per_second"]]
+        attempts, failed_repeat = 0, None
+        while True:
+            stable = not search_noise.unstable(rates)
+            if len(rates) >= repeats and (stable or len(rates) >= max_repeats):
+                break
+            attempts += 1
+            try:
+                again = run_trial(base, settings, args.out / f"{found['key']}-repeat{attempts}", args)
+            except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+                failed_repeat = str(error)
+                break
+            if search_workload.rate_of(again) is None:
+                failed_repeat = again.get("error") or "a repeat gave no rate"
+                break
+            rates.append(again["tokens_per_second"])
+        if failed_repeat is not None:
+            merged = {**found, "tokens_per_second": None, "repeat_rates": rates, "stable": False,
+                      "repeats": len(rates), "error": f"a repeat failed: {failed_repeat}"}
+            print(f"  a repeat of {settings} failed: {failed_repeat}", flush=True)
+        else:
+            merged = {**found, "repeat_rates": rates, "stable": stable, "repeats": len(rates),
+                      "tokens_per_second": search_noise.aggregate(rates) if stable else None}
+            if not stable:
+                merged["error"] = None
+        persist_trial(found["key"], merged)
         done[found["key"]].update(merged)
         return merged
 
     if args.screen:
+        baseline_plan = plan(base, {})
+
         def screened_rate(name, value):
+            if plan(base, {name: value}) == baseline_plan:
+                return top["tokens_per_second"]  # this level is the launching profile itself, already measured
             try:
                 found = trial({name: value})
                 return found["tokens_per_second"] or 0.0
@@ -281,7 +346,9 @@ def run(args):
                 return 0.0
         verdict = search_screen.screen(space, screened_rate, top["tokens_per_second"],
                                        response=args.gain, budget=args.screen_budget or None)
-        space = {name: space[name] for name in verdict["survivors"]}
+        # keep the declared walk order: --draft-depth before --draft before --draft-layout is deliberate (drafting
+        # moves a step's row count, so its depth is chosen with drafting on), and sorted survivors would undo it
+        space = {name: values for name, values in space.items() if name in verdict["survivors"]}
         print(f"screen: {len(verdict['survivors'])} of {len(verdict['survivors']) + len(verdict['screened_out'])} knobs "
               f"can move the rate, {verdict['evaluations']} trials: {', '.join(verdict['survivors']) or 'none'}", flush=True)
 
@@ -314,6 +381,8 @@ def run(args):
 
 def load(args):
     result = measure(args.url, args.sessions, args)
+    if result.get("tokens_per_second") is None:
+        raise ValueError(result.get("error") or "the load gave no rate")
     print(json.dumps(result))
     return 0
 
@@ -376,7 +445,10 @@ def propose(args):
     if args.knob:
         space = {name: values.split(",") for name, _, values in (knob.rpartition("=") for knob in args.knob)}
     model = search_model.Model()
-    model.fit(trials_of(args.out))
+    # a trial records only the knobs the walk moved; "launched" holds every knob as it really ran, so the model
+    # places the baseline where it launched, not at the all-lowest corner (records from before "launched" fall back)
+    model.fit([{**trial, "settings": trial.get("launched") or trial.get("settings") or {}}
+               for trial in trials_of(args.out)])
     print(json.dumps(model.propose(space, n=args.count, seed=args.seed), indent=1))
     return 0
 
@@ -384,7 +456,11 @@ def propose(args):
 def explain(args):
     """Why the fastest trials won, from the engine's ledger each trial recorded (search_evidence.py): the per-feature
     evidence of the top trials against the rest, and the trials whose window was not representative."""
-    print(json.dumps(search_evidence.explain(trials_of(args.out), top=args.top), indent=1))
+    trials = trials_of(args.out)
+    result = search_evidence.explain(trials, top=max(1, args.top))
+    result["unstable"] = [{"key": trial.get("key"), "flags": flags}
+                          for trial in trials if (flags := search_evidence.unstable_flags(trial))]
+    print(json.dumps(result, indent=1))
     return 0
 
 
