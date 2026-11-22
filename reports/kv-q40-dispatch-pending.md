@@ -1,5 +1,11 @@
 # Q4_0 relative decode — built, gate applied, hardware validation pending
 
+Shared-code law (be60f24ef) compliance for this slice, stated once here rather than per file: the fattn-rel-*
+headers also serve GLM 5.3's build, so every change this plan made to them takes the guard strategy — a new
+Q4_0 template instance and dispatch cases behind `GGML_CUDA_FATTN_REL_DECODE_Q4`, default off, with the q8_0/
+E4M3/F16 paths byte-for-byte what they were; GLM serves none of these types through the Inkling kernels, so its
+behavior is unchanged by construction as well as by switch.
+
 Companion to `docs/torad/research/inkling-2-small/18-global-kv-off-f16.md` section 3.1 and ledger rows
 `1454bba3a` (rel-mma reads q8_0 one byte), `15a502bc5`/`4e5911055` (raw path). State as of the merge landing
 and this seat's commit pass: the merge resolved as `ea83c6dd8` + review fixes `ad51d800a`, the dispatcher patch
