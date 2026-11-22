@@ -93,10 +93,12 @@ static __device__ __forceinline__ float fattn_rel_decode_value(const char * row,
     } else if constexpr (type == GGML_TYPE_F8_E4M3) {
         return ggml_cuda_f8_e4m3_to_fp32(((const uint8_t *) row)[col]);
     } else if constexpr (type == GGML_TYPE_Q4_0) {
-        // a block keeps its scale and 16 bytes qs holding a nibble a value: values 0-15 of the block are the low nibbles
-        // of qs, one per byte, values 16-31 its high nibbles, as dequantize_row_q4_0 reads them.
+        // a block keeps its scale and 16 bytes qs holding a nibble a value: within one block values 0-15 are the low
+        // nibbles of qs, one per byte, values 16-31 its high nibbles, as dequantize_row_q4_0 reads them; the column
+        // takes its own block first (col % QK4_0), like the q8_0 arm below.
         const block_q4_0 & block = ((const block_q4_0 *) row)[col/QK4_0];
-        const int q = col < QK4_0/2 ? (block.qs[col] & 0x0F) : (block.qs[col - QK4_0/2] >> 4);
+        const int c = col % QK4_0;
+        const int q = c < QK4_0/2 ? (block.qs[c] & 0x0F) : (block.qs[c - QK4_0/2] >> 4);
         return __half2float(block.d)*float(q - 8);
     } else {
         const block_q8_0 & block = ((const block_q8_0 *) row)[col/QK8_0];

@@ -22,7 +22,7 @@ static bool fattn_rel_elem_one_byte(const ggml_type type) {
 }
 
 // q4_0 rides its own switch, so GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE keeps meaning exactly what it meant for q8_0 and
-// f8_e4m3. A gate outside these headers that wants it takes this helper too (see research_notes/kv-q40-dispatch-pending.md).
+// f8_e4m3. A gate outside these headers that wants it takes this helper too (see reports/kv-q40-dispatch-pending.md).
 static bool fattn_rel_elem_q4(const ggml_type type) {
     static const bool on = ggml_env_switch("GGML_CUDA_FATTN_REL_DECODE_Q4");
     return on && type == GGML_TYPE_Q4_0;
