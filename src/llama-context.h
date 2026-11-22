@@ -164,6 +164,8 @@ struct llama_context {
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_loop_passes(int32_t passes);
+    // a saved state carries cells laid out for the count it ran under; refuse one that restores into another
+    void check_state_loop_count() const;
     bool mtp_draft_step(int32_t step);
     bool set_mtp_graph_reuse(int32_t n_max);
     void set_causal_attn(bool value);

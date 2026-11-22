@@ -2701,6 +2701,8 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     // indexed by physical layer - core_start
     std::vector<loop_layer> loop_layers;
 
+    uint32_t loop_own_passes() const override { return n_passes; }
+
     // the passes a decode with these graph parameters runs, or an exception for a count this model cannot run
     uint32_t passes_for(const llm_graph_params & params) const;
 

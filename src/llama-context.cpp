@@ -5714,6 +5714,18 @@ private:
     const llama_memory_buffers & mbufs;
 };
 
+void llama_context::check_state_loop_count() const {
+    if (model.arch != LLM_ARCH_INKLING2_LOOP) {
+        return;
+    }
+    const uint32_t own = model.loop_own_passes();
+    const uint32_t passes = loop_passes ? loop_passes : own;
+    if (passes != own) {
+        throw std::runtime_error(format("inkling2_loop: state save/load with %u loop passes refuses, its cells do not restore into another slot layout (the model's own count: %u)",
+                passes, own));
+    }
+}
+
 size_t llama_context::state_get_size() {
     llama_io_write_dummy io(false);
     try {
@@ -5962,6 +5974,8 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
+    check_state_loop_count();
+
     // the rows written are those a restore may still copy
     state_async_wait(-1);
 
@@ -5992,6 +6006,8 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    check_state_loop_count();
+
     // the cells replaced here are those a save or a restore may still copy
     state_async_wait(-1);
 
@@ -6021,6 +6037,8 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    check_state_loop_count();
+
     // the rows written are those a restore of the sequence may still copy
     state_async_wait(seq_id);
 
@@ -6037,6 +6055,8 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    check_state_loop_count();
+
     // the cells removed here are those a save or a restore of the sequence may still copy
     state_async_wait(seq_id);
 
