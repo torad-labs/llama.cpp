@@ -341,6 +341,7 @@ notes = [
   "2026-11-21 20:00 CT claude-tensor4: 2026-11-22 claude-tensor4: the ring/K-quant prototype's design laws, mined from qgre's TMA campaign (all measured on sm_120): weight bytes ride TMA tile loads so they never touch a register (the row kernel's per-lane ld.global is the thing to remove); stage the K-quant scale words as their own SWIZZLE_128B rank-2 plane, one DMA per scale window (qgre: -6.8 pct time / +7.3 pct tok/s); HW swizzle beats padding (padding is refuted under SWIZZLE_128B); rank-3 (128,rows,chunks) DMAs accept non-monotonic strides (+3.03); evict_first on weight TMA loads is load-bearing (-4.9 if dropped), the bulk.tensor warm rides no hint, per-lane prefetch.global.L2 loops measured a loss; alignment laws: SMEM 128-B aligned, box inner <=128 B, strides x16, only the (B,4,3) swizzle family is legal, SMEM opt-in cap 101,376 B; qgre's TMA weight stream ran 88.1 pct of theoretical - the target for our expert kernels.",
   "2026-11-21 20:05 CT claude-tensor4: 2026-11-22 claude-tensor4: the launcher consolidated to ONE profile per Marcos: tensor-4 carries the combined measured configuration (query-first + compact greedy + the shared quantize, all default-on with escape hatches), and tensor-4-draft/capacity/quality are removed - their settings and why they lost are in the serve.py comment block. The --draft flag now applies the draft layout directly (context 1572864, ubatch 256, q8_0 target KV); search.py's default profile is tensor-4. 26/26 launcher tests pass. Arms so far: stock 292.01, fast 425.61, fast-rl32 424.23, fast-legacyq8 422.44, fast-gb4 419.61, fast-gb16 426.75 - the combined profile stands.",
   "2026-11-21 20:07 CT claude-tensor4: 2026-11-22 claude-tensor4: CORRECTION to my earlier ranking - the architecture-shaped plan (kernels-shaped-to-the-architecture doc) demotes the K-quant ring: at the probe's 102 distinct experts a layer, a step reads about 18.6 GB of expert weights a card (10-12 ms of pure reads) against 12.8 ms measured - the expert path is already near its byte floor, and the Q3_K block-reuse attempt measured -7.5. The ring pays only near 70 distinct experts; M1 (distinct experts in a traced step) settles it with one number. The TMA design laws in my earlier note still hold for whichever kernel is built. The plan's priority for the bytes: 3.1 far-cells-no-bias + 3.3 run addressing first (exact), then 3.4 one-byte KV in the tile kernel (E4M3 no-scale is safe because K is clipped to 22.63 and V normalized to RMS 1 - both far inside E4M3's range), then 3.2 shared-prefix read-once, then 3.7/3.6 (the two F32 products and the stacked Q-input product), 3.5 the window ring.",
+  '2026-11-22 00:48 CT: 2026-11-22 00:52 CT llamacpp-coordinator: no row note since 2026-11-21 17:28 CT (7h+). If the row is active on the CloudRift tree (~/inkling-small), add a progress note naming where the MUL_MAT_ID row-split bug stands and what the row needs next; if it is parked, say who holds it.',
 ]
 
 [[row]]
@@ -385,7 +386,7 @@ notes = [
 [[row]]
 id = 'inkling-tensor4-dspark'
 title = 'Tensor 4 serves Inkling with its native draft'
-status = 'in_flight'
+status = 'blocked'
 owner = 'codex-inkling-dspark'
 blocked_by = []
 guard = false
@@ -399,12 +400,14 @@ inputs = [
 notes = [
   '2026-11-18 20:22 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-18 20:22 CT codex-inkling-dspark: claimed',
+  "2026-11-22 00:48 CT: 2026-11-22 00:52 CT llamacpp-coordinator: drift found. Owner codex-inkling-dspark has no live session since its Nov 18 claim (no seat, no notes). Its check names test_serve.ProfilePlanTest.test_tensor_4_auto_draft, which no longer exists: the launcher consolidated to one profile and the draft layout now rides --draft (test_tensor_4_draft_layout_rides_the_flag). The row's deliverable appears landed on main via the draft-speed batch. A lead must update this row's check in a checks-only commit, then release/claim it.",
+  '2026-11-22 00:48 CT: status blocked',
 ]
 
 [[row]]
 id = 'inkling-query-first-decode'
 title = 'Schedule shared-prefix decode blocks by query'
-status = 'in_flight'
+status = 'blocked'
 owner = 'decode-throughput'
 blocked_by = []
 guard = false
@@ -420,6 +423,8 @@ inputs = [
 notes = [
   '2026-11-21 07:16 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-21 07:16 CT decode-throughput: claimed',
+  "2026-11-22 00:48 CT: 2026-11-22 00:55 CT llamacpp-coordinator: drift check. Owner decode-throughput last noted Nov 21 07:16 CT and no live seat answers. The row's deliverable is on main (GGML_CUDA_FATTN_REL_QUERY_FIRST declared and used). Its check fails on clean main only because python3 scripts/tunables.py check reports two repo-level problems unrelated to this row: LLAMA_MOE_RANDOM_ROUTING is read in src/llama-context.cpp and not declared in tunables.toml; LLAMA_SERVER_DEBUG_PROXY_ALLOW_PRIVATE is declared and read nowhere. Row blocked on the check; an upkeep row repo-tunables-clean carries the fix.",
+  '2026-11-22 00:48 CT: status blocked',
 ]
 
 [[row]]
@@ -577,4 +582,19 @@ checks = [
 ]
 notes = [
   '2026-11-22 00:40 CT: added; 1 of 2 checks fail, as they should before the work',
+]
+
+[[row]]
+id = 'repo-tunables-clean'
+title = 'The tunables registry agrees with the source'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'python3 scripts/tunables.py check reports no problems on main. Today it reports two: LLAMA_MOE_RANDOM_ROUTING is read in src/llama-context.cpp and not declared in tunables.toml; LLAMA_SERVER_DEBUG_PROXY_ALLOW_PRIVATE is declared in the registry and the source reads it nowhere by name. Fix by declaring or removing each entry in the direction the source moved, not by weakening the check.'
+checks = [
+  'python3 scripts/tunables.py check',
+]
+notes = [
+  '2026-11-22 00:50 CT: added; 1 of 1 checks fail, as they should before the work',
 ]
