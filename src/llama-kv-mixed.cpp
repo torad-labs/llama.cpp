@@ -15,7 +15,7 @@ uint32_t llama_kv_mixed_hot_cells() {
     static const uint32_t cells = [] {
         // the knob is declared with default 1024: ggml_env_int reads it through the tunables registry,
         // so unset means the toml default and --knob sweeps reach it like every other int
-        const long v = ggml_env_int("LLAMA_INKLING2_KV_MIXED_HOT", 1024);
+        const long v = ggml_env_int("LLAMA_INKLING2_KV_MIXED_HOT");  // the registry declares default 1024
         return v > 0 ? (uint32_t) v : 1024u;
     }();
     return cells;
