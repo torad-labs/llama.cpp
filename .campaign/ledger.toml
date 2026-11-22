@@ -313,8 +313,8 @@ notes = [
 id = 'inkling-optimize-moe-shapes'
 title = 'Expert paths proven at Inkling shapes'
 feature = 'inkling-optimize'
-status = 'todo'
-owner = ''
+status = 'in_flight'
+owner = 'claude-tensor4'
 blocked_by = []
 guard = false
 spec = "The routed-expert paths run at Inkling's real shapes, 384 experts with eight per token, intermediate 2304 against hidden 4608, without a removable gate declining them: the softcapped expert activation runs inside the fused path wherever it is the faster choice, and the choice between the small-row path and the grouped-matmul path is decided per row count from reads on this machine's card and recorded with the change. Backend operation tests at those shapes and the synthetic model both agree with the reference results."
@@ -331,6 +331,16 @@ notes = [
   "2026-11-17 09:40 CT: Step 4 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. Re-examine ggml_cuda_mmvq_moe_usable bounds, ggml_cuda_can_share_mmq_id and ggml_cuda_should_fuse_mul_mat_q at 384 experts, top-8, 2304/4608. At 23 served rows a layer touches roughly 150 experts, which is where the small-row vs grouped decision bites; decide from reads on this machine's card and record the read with the change. SITU softcapped activation must run in the fused path. GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.",
   "2026-11-17 15:07 CT: Machine load: keep every build you start at 8 jobs or fewer (cmake --build ... -j 8, never a bare -j). The frozen checks predate this and some run unbounded; that is the lead's to fix after this campaign lands, not yours to edit. Your own builds are yours: bound them.",
   "2026-11-20 00:17 CT decode-search: Read on the four-card box, chapter 14 of docs/torad/research/inkling-2-small (lines 148-161): the expert projections are 14.2 ms of a 54.6 ms decode step at 23 sessions, the largest part left. The ring kernel in ggml/src/ggml-cuda/mmvq-moe.cu takes only IQ3_XXS and Q8_0 (mmvq_moe_takes) and at most 64 token-expert pairs (MMVQ_MOE_MAX_PAIRS, a 64-bit pair mask and two pairs a lane of the producer warp), and 23 sessions name 184 pairs, so the served Q3_K and Q4_K expert tensors never take it. This row's re-examination of ggml_cuda_mmvq_moe_usable should cover both bounds: the quant types and the pair count.",
+  '2026-11-21 16:31 CT claude-tensor4: claimed',
+  "2026-11-21 16:49 CT claude-tensor4: 2026-11-21 claude-tensor4: claimed. Started the row's gate re-examination at the dispatch level: the shared few-row quantize now exists (ggml-cuda.cu mmq_few_shared_q8, mmq-few.cu 7-arg mul_mat_q_few, GGML_CUDA_MMVQ_FEW_SHARED_Q8_1_LEGACY=1 escape) so the dense products that read one normalized input (wq/wk/wv/wqkv_gate on SWA layers) quantize it once per weight type instead of once per product. Bit-identical by construction; local validation on card 1 in progress. Router top-k already fused in this fork (topk_moe_cuda at ~48 calls/step in the old trace), so the argsort concern from the review was mostly stale. Remaining for the row: mmvq_moe_usable pair-count bound (184 routes vs 64), the cuBLAS cluster identity (~1.4 ms/step, needs a box trace), and the inkling-moe test surface. Rental runbook: reports/inkling2-tensor4-rental-runbook.md",
+  "2026-11-21 17:08 CT claude-tensor4: 2026-11-21 claude-tensor4: Marcos: never use the local 5070 Ti (PCI card 1) for runs; use the 5080 (card 0, idle, CUDA_VISIBLE_DEVICES=0) or rent on CloudRift. The ledger's frozen checks still say gpu1.lock/card 1 - that's the lead's to change, not mine; until then my own runs take /run/user/1000/gpu0.lock on card 0.",
+  "2026-11-21 17:10 CT claude-tensor4: 2026-11-21 claude-tensor4: found a pre-existing CUDA MUL_MAT_ID numeric regression on this tree. Failing shapes (test-backend-ops -b CUDA0 -o MUL_MAT_ID, CPU reference clean, 5080): q3_K/q4_K/q5_K, n_mats=32, n_used=8, m=256, n=17 and n=23, k=512, ids_offset=1, ERR up to 0.0268 vs 5e-4 tolerance. Ruled out: the new shared few-row quantize (m=256 never reaches few-row or the sharing intercept; GGML_CUDA_MMVQ_FEW_SHARED_Q8_1_LEGACY=1 still fails). The uncommitted diffs (tunables, ggml.c, top-k.cu, fattn) don't touch the MUL_MAT_ID meta path, so the suspect is the upstream merge 749b5307b. Not covered by any done row: inkling-baseline-arch only ran -o FLASH_ATTN_EXT, and this row's checks are expected-fail. Served 23-row decode shapes pass (test-llama-archs inkling2 4/4); whether prefill shapes (m=2048, k=4608) are affected is untested. Next: build 749b5307b and 3d9eea147 in worktrees and bisect.",
+  "2026-11-21 17:17 CT claude-tensor4: 2026-11-21 claude-tensor4: MUL_MAT_ID regression pinned to the few-row MMQ ids path: GGML_CUDA_MMQ_FEW_LEGACY=1 -> OK, GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32 -> OK (both steer around it); the five MMQ_* hatches still FAIL. Failing grid: tests/test-backend-ops.cpp:15868, {Q3_K,Q4_K,Q5_K} x tokens {17,23,32} x broadcast {0,1}, n_mats=32, m=256, k=512. At k=512 rows hold 2 units of 256 values, below mmq_few_ksplit's 8-unit threshold, so mul_mat_q_few has_ids takes the ROW-SPLIT mode; served shapes (18 units gate/up, 9 down) take K-split and pass - why test-llama-archs is green while the op test fails. Pattern: broadcast=false (one activation row per slot) fails all three types; broadcast=true fails only Q5_K, which needs the src1 sums (DS4). Suspects: quantize_mmq_few_id_q8_1's per-slot addressing under row-split geometry; Q5_K sums at 2 units. Next: dump wrong (token,slot) outputs, then fix in mmq-few/quantize.",
+  '2026-11-21 17:28 CT claude-tensor4: 2026-11-21 claude-tensor4: correction + narrowing. The failing sets differ per run because the test seeds ids with an unseeded std::random_device (tests/test-backend-ops.cpp:7436) - the bug is CONTENT-DEPENDENT on the routing pattern, not a fixed shape list. PDL is ruled out: GGML_CUDA_PDL=0 still fails nondeterministically (11 and 9 failing cases in two runs vs 6/11/8 with PDL on). Established: the bug lives in the few-row ids path (MMQ_FEW_LEGACY=1 and MMVQ_KQUANT_MMID_MAX=32 both steer around it and pass); the failing family is the K-quant grid at tests/test-backend-ops.cpp:15868 (n_mats=32, m=256, k=512 = 2 units -> row-split mode; broadcast and token-count variants). Next session: seed the ids deterministically in a scratch build, capture a failing pattern, dump the wrong (token,slot) outputs, fix in quantize_mmq_few_id_q8_1 or mul_mat_q_few. Serving shapes (9-18 units -> K-split mode) are unaffected as far as test-llama-archs shows.',
+  "2026-11-21 18:01 CT claude-tensor4: 2026-11-21 claude-tensor4: stress verdict - the dormant few-row ids bug did not reappear: 0 failing across 5 n=23-subset runs and 3 full MUL_MAT_ID suite runs on the current binary (the rebuilt lib includes the other seat's latest fattn work; code-layout lottery or an incidental change). The bug stays open on this row with the repro hooks wired (LLAMA_TEST_SEED, LLAMA_TEST_DUMP_MISMATCH) and the evidence chain in the earlier notes. All remaining GPU work moved off torad-server per Eli: the CloudRift 5090 (inkling-mini's box) now carries my tree at ~/inkling-small with my files pushed on top of their src-dev, building there; the 5080/5070 Ti are done.",
+  "2026-11-21 20:00 CT claude-tensor4: 2026-11-22 claude-tensor4: the ring/K-quant prototype's design laws, mined from qgre's TMA campaign (all measured on sm_120): weight bytes ride TMA tile loads so they never touch a register (the row kernel's per-lane ld.global is the thing to remove); stage the K-quant scale words as their own SWIZZLE_128B rank-2 plane, one DMA per scale window (qgre: -6.8 pct time / +7.3 pct tok/s); HW swizzle beats padding (padding is refuted under SWIZZLE_128B); rank-3 (128,rows,chunks) DMAs accept non-monotonic strides (+3.03); evict_first on weight TMA loads is load-bearing (-4.9 if dropped), the bulk.tensor warm rides no hint, per-lane prefetch.global.L2 loops measured a loss; alignment laws: SMEM 128-B aligned, box inner <=128 B, strides x16, only the (B,4,3) swizzle family is legal, SMEM opt-in cap 101,376 B; qgre's TMA weight stream ran 88.1 pct of theoretical - the target for our expert kernels.",
+  "2026-11-21 20:05 CT claude-tensor4: 2026-11-22 claude-tensor4: the launcher consolidated to ONE profile per Marcos: tensor-4 carries the combined measured configuration (query-first + compact greedy + the shared quantize, all default-on with escape hatches), and tensor-4-draft/capacity/quality are removed - their settings and why they lost are in the serve.py comment block. The --draft flag now applies the draft layout directly (context 1572864, ubatch 256, q8_0 target KV); search.py's default profile is tensor-4. 26/26 launcher tests pass. Arms so far: stock 292.01, fast 425.61, fast-rl32 424.23, fast-legacyq8 422.44, fast-gb4 419.61, fast-gb16 426.75 - the combined profile stands.",
+  "2026-11-21 20:07 CT claude-tensor4: 2026-11-22 claude-tensor4: CORRECTION to my earlier ranking - the architecture-shaped plan (kernels-shaped-to-the-architecture doc) demotes the K-quant ring: at the probe's 102 distinct experts a layer, a step reads about 18.6 GB of expert weights a card (10-12 ms of pure reads) against 12.8 ms measured - the expert path is already near its byte floor, and the Q3_K block-reuse attempt measured -7.5. The ring pays only near 70 distinct experts; M1 (distinct experts in a traced step) settles it with one number. The TMA design laws in my earlier note still hold for whichever kernel is built. The plan's priority for the bytes: 3.1 far-cells-no-bias + 3.3 run addressing first (exact), then 3.4 one-byte KV in the tile kernel (E4M3 no-scale is safe because K is clipped to 22.63 and V normalized to RMS 1 - both far inside E4M3's range), then 3.2 shared-prefix read-once, then 3.7/3.6 (the two F32 products and the stacked Q-input product), 3.5 the window ring.",
 ]
 
 [[row]]
@@ -354,6 +364,7 @@ notes = [
   '2026-11-17 09:40 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-17 09:40 CT: Step 6 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. The fork flash-attention already reads q8_0 KV; prove global and sliding layers separately at depth on the synthetic fixture against F16, q4_0 behind the same proof. Real-weight quality verdict waits for packs on the rented box; the inkling2 launcher keeps F16 defaults until then (scripts/inkling2/serve.py). GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.',
   "2026-11-17 15:07 CT: Machine load: keep every build you start at 8 jobs or fewer (cmake --build ... -j 8, never a bare -j). The frozen checks predate this and some run unbounded; that is the lead's to fix after this campaign lands, not yours to edit. Your own builds are yours: bound them.",
+  "2026-11-21 20:00 CT claude-tensor4: 2026-11-22 claude-tensor4: Marcos's dequant-at-boundary question, assessed: pack-level NVFP4 is VRAM-infeasible at the production pool (+16 GiB a card, no headroom) - the capacity-tier play only. In-kernel FP8 fragment conversion trades against the int8 path at equal MMA issue rates and must be measured in the ring prototype. The bytes-dominant place a native format pays is the KV side of global attention: FP8 KV halves the 49.4 GB shared-prefix re-read (~9 ms/step at the stock trace); this fork already reads q4_0 KV natively (TORAD 60feea0), so an e4m3 KV variant belongs in this row's proof alongside q8_0/q4_0.",
 ]
 
 [[row]]
@@ -388,4 +399,150 @@ inputs = [
 notes = [
   '2026-11-18 20:22 CT: added; 1 of 1 checks fail, as they should before the work',
   '2026-11-18 20:22 CT codex-inkling-dspark: claimed',
+]
+
+[[row]]
+id = 'inkling-query-first-decode'
+title = 'Schedule shared-prefix decode blocks by query'
+status = 'in_flight'
+owner = 'decode-throughput'
+blocked_by = []
+guard = false
+spec = 'Add the measured default-off query-first CUDA block order for 23 low-mean queries, two local KV heads and 256 partitions, preserving partial summation.'
+checks = [
+  "grep -Fq 'GGML_TUNABLE(\"GGML_CUDA_FATTN_REL_QUERY_FIRST\", BOOL, 0, 0.0' ggml/src/ggml-tunables.inc && python3 scripts/tunables.py check",
+]
+inputs = [
+  'tunables.toml',
+  'ggml/src/ggml-tunables.inc',
+  'ggml/src/ggml-cuda/fattn-rel-mma.cuh',
+]
+notes = [
+  '2026-11-21 07:16 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-21 07:16 CT decode-throughput: claimed',
+]
+
+[[row]]
+id = 'inkling-optimize-sync-structure'
+title = 'Layer-boundary synchronization restructured after the qgre learnings'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "The decode step's synchronization structure between graph segments and around the owner reduction is restructured so that fewer host-side waits and event round-trips sit on the critical path: the pattern is qgre's measured crossing (partial sums folded into one epilogue encode, publishes on region edges, retire atoms deleted, +14.5 pct composed with no bandwidth change). The engine's per-step host cudaEventSynchronize count and the inter-segment gaps drop measurably on the four-card trace, reduction order and results are unchanged, and the state-parity and split-graph suites hold."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target test-backend-meta-split test-backend-ops && ./build-campaign/bin/test-backend-meta-split',
+]
+notes = [
+  '2026-11-21 19:39 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
+]
+
+[[row]]
+id = 'inkling-optimize-l2-warm'
+title = 'Expert tiles warmed early through the tensor prefetch path'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "The routed experts, known once the router's ids complete, are warmed into L2 through cp.async.bulk.prefetch.tensor (no SMEM destination, no mbarrier, issued in the consumer's walk order before the dependency wait) with a dose cap measured on this machine's card, per qgre's laws: the warm is a latency lever that moves zero DRAM bytes, it has a knee between 15 and 28 MiB per layer, it must not ride evict_last, and per-lane prefetch.global.L2 loops are a measured loss. L2 hit rate on the expert stream rises with DRAM traffic unchanged, results are bit-identical, and the four-card serving arms decide the default."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j --target test-backend-ops && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ./build-campaign/bin/test-backend-ops test -b CUDA0 -o MUL_MAT_ID',
+]
+notes = [
+  '2026-11-21 19:59 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
+]
+
+[[row]]
+id = 'inkling-optimize-attention-far-runs'
+title = 'Global attention: far cells without a bias, cells addressed by run'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "Plan items 3.1 and 3.3 (docs/torad/research/inkling-2-small/15-kernels-shaped-to-the-architecture.md). The global decode kernel stops computing position, distance and bias for cells beyond the 1,023-token near region - the bias is exactly zero there (verified in fattn-rel-decode.cuh and fattn-rel-mma.cuh) - and where a sequence's cells are contiguous, the kernel addresses K and V by runs (base, length) instead of scanning mask words and gathering rows. The shared prefix minus the near cells goes to the far path; the mask path remains for non-contiguous sequences. Exactness: the same values, reduction-order drift only; backend-op cases past 1,024 cells against the CPU reference and the synthetic arch fixture must pass. Off by default behind a tunables line."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-far | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-far --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-21 20:45 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
+  "2026-11-21 21:12 CT claude-tensor4: 2026-11-22 claude-tensor4: eli review amendments (doc 15 sec 7). Add the model-side classifier (classify_mask, inkling2.cpp:193-211) AND the backend guards (fattn.cu:1459-1466, fattn-rel-mma.cuh:34-48) as co-equal work items - a finished kernel the dispatcher never feeds is the plan's likeliest failure. A just-forked session's near window spans the prefix run and the private run: the prefix kernel must subtract exactly that window. 3.3 is not bit-identical with bulk tiles (rescale cadence is per 16-cell tile): keep 16-cell tiles or gate on the KL capture. M7 must assert per-stream position monotonicity for the window ring.",
+]
+
+[[row]]
+id = 'inkling-optimize-kv-onebyte'
+title = 'Global-layer KV at one byte a value in the tile kernel'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "Plan item 3.4. The global layers' KV stores one byte a value - E4M3 without a scale (the architecture bounds stored K at 22.63 and normalizes V to RMS 1, both far inside E4M3's 448) or Q8_0, both candidates as one parameterized element decode in the staged tile kernel, Q and the multiply staying F16. Global layers only. Gated by the KL parity capture with the budget taken from the stock-vs-stock drift; M4 (stored extents, small-value share) picks the candidate. Doubles the KV pool's token capacity. Off by default."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-kv1b | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-kv1b --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-21 21:00 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-21 21:12 CT claude-tensor4: 2026-11-22 claude-tensor4: eli review amendments (doc 15 sec 7). Run FIRST or in parallel with far-runs - it depends on neither (staged_k/staged_v exist at fattn-rel-mma.cuh:81) and halving bytes halves the re-read bytes too. The row must name: the guard (fattn_rel_mma_shapes needs F16 K, fattn-rel-mma.cuh:40; dispatch fattn.cu:1463-1466 sends other types to the one-cell kernel), a store-side cast kernel (prefill writes the cache 14 of 15 minutes; restores rewrite cells), and a snapshot-format migration. Predeclare the KL threshold before the capture; budget two arms (E4M3, Q8_0) at 262K depth. M4 is a host-side read: scripts/inkling2/kv_stats.py (subagent in flight).',
+  "2026-11-21 21:52 CT claude-tensor4: 2026-11-22 claude-tensor4: M4 instrument ready: scripts/inkling2/kv_stats.py (+48 tests) reads a saved slot state, checks the architecture bounds (K L2 <= 22.6274 with 0.2% slack, V RMS in [0.9, 1.01]) and simulates E4M3, Q8_0, e2m1/E4M3-per-16 and Q4_0, each with and without a static per-channel scale. Illustrative only (Inkling 2 MINI real weights, 1-1.4K tokens, CPU): 99% of K vectors sit exactly at the clip; channel max/median 3.5-6.7 (K), 3.8-8.8 (V); K relative error Q8_0 0.59% -> 0.51% with +chan, E4M3 2.6% (no gain from +chan), e2m1 9.4-9.7%, Q4_0 9.5 -> 8.2% with +chan. If Small looks alike, Q8_0 is the safer one-byte candidate (E4M3's 3-bit mantissa costs ~4x the error), and the KIVI channel scale buys little at 8 bits, more at 4. The KL capture decides; run kv_stats on a real Small 16-32K state in the final four-card window (usage at the top of the script).",
+]
+
+[[row]]
+id = 'inkling-optimize-prefix-read-once'
+title = 'Global attention: the shared prefix read once for a group of queries'
+status = 'todo'
+owner = ''
+blocked_by = [
+  'inkling-optimize-attention-far-runs',
+]
+guard = false
+spec = "Plan item 3.2 (doc 15). A global-layer decode kernel for the cells several queries see: one read of a K and V tile serves a group of queries, each query's six heads filling tensor-core columns; the partials (max, sum, accumulator) of a query and head merge with the private and near partials by the existing merge, the sink joining at the merge. Queries spread over warps and blocks: staging a tile once for all rows inside one block measured slower (ds4-dfm-rs). The group size is chosen by a sweep on the card with query-first on, and the bound is re-measured after the one-byte KV row lands. Summation order changes: gated by the KL parity capture. Names the dispatcher guard and the model-side classifier it updates. Off by default."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-prefix | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-prefix --no-tests=error --output-on-failure && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-prefix test is registered',
+]
+
+[[row]]
+id = 'inkling-optimize-window-ring'
+title = 'Sliding layers read a ring, not a mask'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Plan item 3.5. The 40 sliding layers read a ring of 1,024 rows a session (plus one prefill chunk), contiguous a session; the distance of a slot is its offset from the ring head, so the kernel needs the head index and no mask or positions. First M7 reads how the cache lays window cells today and asserts that positions are strictly monotone per stream across restores and forks. Same cells and distances as the mask path: bit-identical. Off by default.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-ring | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-ring --no-tests=error --output-on-failure && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-ring test is registered',
+]
+
+[[row]]
+id = 'inkling-optimize-q-input-stack'
+title = 'The products that read the Q input become one stacked product'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = 'Plan item 3.6, unblocked by the pack read of 2026-11-22: attn_q, attn_rel, attn_sink_proj, attn_gate and attn_k are Q3_K in all 48 layers; attn_v is Q4_K (layers 2-47) or Q5_K (layers 0-1). The four products reading the Q input are stacked at load into one weight and their results viewed, as the merged gate and up product is under the tensor split; on the 40 sliding layers attn_k joins (five products on one input); attn_v stays separate. About 184 fewer product launches a step (160 sliding, 24 global), about 0.6 ms at the recorded 3.3 us a product. Same weights and quantized input: bit-identical. Tau folds into the stacked product or the attention prologue (plan 3.9). Off by default.'
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-stack | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-stack --no-tests=error --output-on-failure && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-stack test is registered',
+]
+
+[[row]]
+id = 'inkling-optimize-f32-products'
+title = 'The bias-table product and the router product leave cuBLAS'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "Plan item 3.7. The bias-table product (1,024 x 48 heads x 23 rows of F32 a layer, which attention reads though only the near region uses it) goes away: the near kernel computes the bias as the 16-term dot of the table row with the query's relative feature, or the table is built in the attention prologue. The router's 4,608 to 384 F32 product moves into the fused top-k kernel (sigmoid, bias, selection, weights), and the layers that decline the top-k fusion are named and fixed. M5 names the cuBLAS kernels first. F32 with a different summation order: fixture tolerance. Off by default."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-f32 | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-f32 --no-tests=error --output-on-failure && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-f32 test is registered',
 ]
