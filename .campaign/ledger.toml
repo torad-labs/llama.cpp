@@ -600,6 +600,7 @@ notes = [
   '2026-11-22 01:30 CT: 2026-11-22: GLM-shared code rule: the packed prefill lives only in the Inkling relative-prefill kernel (no GLM path reaches it) and is guarded behind GGML_CUDA_FATTN_REL_PACKED_PREFILL default off; stock behavior preserved either way.',
   "2026-11-22 02:05 CT: 2026-11-22 02:10 CT llamacpp-coordinator: window staging expectation for this row's group arm: GGML_CUDA_FATTN_REL_PACKED_PREFILL on and off at the merged window-base, every switch at its row default in the baseline, window-base sha and full switch block per arm, tree patch beside outputs. Row is unclaimed though its builder snapshot is staged (a3faae9c4) - the lane seat should claim it.",
   '2026-11-22 02:05 CT inkling-small: claimed',
+  "2026-11-22 02:15 CT: 2026-11-22 02:40 CT llamacpp-coordinator: tests/test-backend-ops.cpp is a three-claimant file - inkling-small's D2 gqa op cases, mini's +748 attention-prep block, and mini's PARKED rel_rows test block. Staging for the window is hunk-level with the parked block expressly excluded; both claimants send hunk identities and the run sheet records the split. A name-only staging of this file would sweep the parked rider in.",
 ]
 
 [[row]]
