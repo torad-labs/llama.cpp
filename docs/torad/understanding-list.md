@@ -53,7 +53,7 @@ coding requests; GLM read 42.8 tok/s a session steady and 18.8 on agent-shaped t
 
 | # | Measure | What it tells us | Have | Models |
 | ---: | --- | --- | --- | --- |
-| 1 | Replay of recorded agent sessions as the one benchmark: real prompt and reply sizes, tool turns, pauses, real depth | The rate people get. Every other number is judged by whether it moves this one | partly (`replay_*.py`, `coding_probe.py`; GLM's `agents.py` is not in the repo) | both |
+| 1 | Replay of recorded agent sessions as the one benchmark: real prompt and reply sizes, tool turns, pauses, real depth | The rate people get. Every other number is judged by whether it moves this one | partly (`replay_*.py`, `coding_probe.py`; the agent-session driver is now in the repo as `scripts/hyperparameter/agents.py`) | both |
 | 2 | Where a session's wall clock goes: reading prompts, decoding, waiting behind another session's prompt, checkpoints, restores | Whether decode is even the right target. Inkling's prefill was 14 of the workload's 15 minutes | partly | both |
 | 3 | Share of traffic spent in steady state, and how long a server takes to reach it | GLM passes rose 24.8 to 45 tok/s over six passes while shapes were captured; only 43% of a read's time was in full steps | partly (GLM, by hand) | both |
 | 4 | Census of step shapes: rows a step, sequences a step, prompt rows mixed in, and time by shape | Which shapes deserve a fast path. One mixed step ran up to 19 forward passes | partly (GLM, by hand) | both |
@@ -140,7 +140,7 @@ router, a quarter of GLM's subgraphs launched kernel by kernel.
 
 | # | Measure | What it tells us | Have | Models |
 | ---: | --- | --- | --- | --- |
-| 46 | One record a run for both models: build, box, configuration, workload, ledgers, output hash | A history that can be asked questions. The box-side readers (`idle-census.py`, `passcount.py`, `evalwhy.py` and others) are not in the repo | partly (MLflow, Inkling search only) | both |
+| 46 | One record a run for both models: build, box, configuration, workload, ledgers, output hash | A history that can be asked questions. The box-side readers (`idle-census.py`, `passcount.py`, `evalwhy.py` and the other four) are recovered into `scripts/hyperparameter/` | partly (MLflow, Inkling search only) | both |
 | 47 | What the local fixture predicts against four cards | Which questions need a rented box and which do not | no | both |
 | 48 | The same ledger on every commit, on the fixture | A regression found the day it lands | no | both |
 | 49 | A long soak: memory growth, kept-graph population, rate and temperature over hours | What only appears after a day of serving | no | both |
