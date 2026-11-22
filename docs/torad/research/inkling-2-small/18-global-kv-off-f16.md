@@ -9,7 +9,7 @@ Marking as in 15: verified (read in code or measured), external, inferred.
 Status 2026-11-22 CST: owned by the session "Inkling 2 Small global KV cache" (`local_4207d667`). The mid-merge hold of
 2026-11-21 ended: origin/main merged as `ea83c6dd8`, so the freeze on conflicted files is lifted and nothing has been
 committed by this work yet. Built since, off by default behind `GGML_CUDA_FATTN_REL_DECODE_Q4` (correctness argument in
-`research_notes/kv-q40-dispatch-pending.md`): the Q4_0 element decode instance in `fattn-rel-elem.cuh` with dispatch in
+`reports/kv-q40-dispatch-pending.md`): the Q4_0 element decode instance in `fattn-rel-elem.cuh` with dispatch in
 the one-cell kernel and rel-runs, the fattn.cu gate hunk applied — GPU validation pending the CloudRift box.
 `scripts/inkling2/kv_stats.py` accepts rotated-on-store states now. `--kv-cache q4_0` accepted by the launcher.
 Builds and correctness runs go over ssh to the CloudRift RTX 5090, not this machine.
@@ -18,7 +18,7 @@ Incident closed 2026-11-22: an overnight red of all eight `test-inkling-kv1b-*` 
 23:26 CT) reproduces green from this disk with every rider active; its signature was a node-class coverage assertion —
 logits parity passing everywhere (NMSE 3e-8..1.3e-6 against a 1e-4 bound), zero low-mean decode nodes routed — on a
 mid-merge tree whose fattn.cu/ggml-cuda.cu resolution state predates the merges that settled it. Recorded as
-non-reproductive-fixed-by-merge (`research_notes/kv-q40-dispatch-pending.md`, "kv1b attribution"). Standing rule taken
+non-reproductive-fixed-by-merge (`reports/kv-q40-dispatch-pending.md`, "kv1b attribution"). Standing rule taken
 from it: validation arms for our new kernel paths assert their node class appears, never numerics alone.
 
 ## Summary
