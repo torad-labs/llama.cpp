@@ -820,6 +820,18 @@ if (GGML_CUDA)
         ENVIRONMENT "GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
     set_tests_properties(inkling-fuse-chain-exact PROPERTIES LABELS "main"
         DEPENDS "inkling-fuse-chain-ref-cuda0;inkling-fuse-chain-fused-cuda0")
+    # [fp8] the e4m3 hi+lo pair algebra and the block-scaled folds of GGML_CUDA_FATTN_FP8_ACCUM, on the device
+    # (campaign row inkling-fp8-accumulation; the primitives live in ggml/src/ggml-cuda/fattn-rel-fp8-pair.cuh):
+    # the RNE code held against CUDA's own fp8 conversion, the block encode's one ceil scale a warp, a
+    # single-lane fold bit-exact, the 32- and 256-partial folds against double sums, and the one-hot per-term
+    # fold; the binary skips (77) on a device below compute capability 12.0
+    find_package(CUDAToolkit REQUIRED)
+    set_source_files_properties(test-inkling-fp8-pair.cpp PROPERTIES LANGUAGE CUDA)
+    llama_build(test-inkling-fp8-pair.cpp)
+    target_include_directories(test-inkling-fp8-pair PRIVATE ${CUDAToolkit_INCLUDE_DIRS}
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    llama_test(test-inkling-fp8-pair NAME test-inkling-fp8-pair-cuda0)
+    set_tests_properties(test-inkling-fp8-pair-cuda0 PROPERTIES LABELS "main" SKIP_RETURN_CODE 77)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
