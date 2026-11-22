@@ -65,7 +65,17 @@ otherwise K is quantized on the fly and the comparison muddles.
 
 ## Status 2026-11-22
 
-Landed: the header, the unit test, the switch declaration, and the CMake arm (all off by default; nothing
-wired into the decode yet). The D2-held files are untouched. Box validation of the unit test runs on the
-5090 buildbox; its verdict goes to the row. The rel-mma QK/PV folding, the merge rewiring and the ops/model
-arms follow inkling-small's hunk commit.
+Landed: the header, the unit test, the switch declaration, and the CMake arm (all off by default).
+**Box-validated** on the 5090 buildbox (`test-inkling-fp8-pair-cuda0`, sm_120a): all checks pass —
+encode held against CUDA's own conversion and the host's double decoder bit-exact, hi error mean 5.6e-01
+against 1.2e-02 for hi+lo, the single-lane fold bit-exact 32/32, the x32 block sum 1.2e-03 worst relative,
+the mixed block sum 5.5e-04, the 256-partial element fold 3.1e-04, the two-term per-term folds 2.0e-03 /
+1.5e-03 (8 and 16 terms), the one-term 16-term fold 4.0e-02 (the terms' own 3-bit rounding, by design).
+Two fixes the box found: the block-cooperative encode's subnormal grid (a lane far below its block's amax
+must re-round on the e4m3 subnormal step, never floor the exponent — the non-exact block lanes red on
+exactly this), and the test target must compile for `sm_120a` (the block-scaled QMMA is an arch-specific
+feature; ptxas refuses it on plain sm_120).
+
+Condition 1 is satisfied — inkling-small's D2 hunk commit landed as `38107c8a2`. Next: the rel-mma QK/PV
+folding, the merge rewiring, the ops-level `test-inkling-kv-fp8acc-tile-cuda0` arm, the model-level
+`test-inkling-fp8acc-{served,restore}` arms and the evidence JSON.

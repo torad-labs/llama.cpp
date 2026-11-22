@@ -830,6 +830,9 @@ if (GGML_CUDA)
     llama_build(test-inkling-fp8-pair.cpp)
     target_include_directories(test-inkling-fp8-pair PRIVATE ${CUDAToolkit_INCLUDE_DIRS}
         ${PROJECT_SOURCE_DIR}/ggml/src)
+    # the block-scaled QMMA (kind::mxf8f6f4, ue8m0 scales) is an sm_120a feature: ptxas refuses it on
+    # plain sm_120, which a configure that overrides CMAKE_CUDA_ARCHITECTURES would otherwise hand this file
+    set_target_properties(test-inkling-fp8-pair PROPERTIES CUDA_ARCHITECTURES 120a)
     llama_test(test-inkling-fp8-pair NAME test-inkling-fp8-pair-cuda0)
     set_tests_properties(test-inkling-fp8-pair-cuda0 PROPERTIES LABELS "main" SKIP_RETURN_CODE 77)
 endif()

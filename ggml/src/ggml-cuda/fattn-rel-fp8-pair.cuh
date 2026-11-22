@@ -117,6 +117,10 @@ __device__ __forceinline__ uint8_t fattn_fp8_ceil_sf_bits(uint32_t amax) {
 // One finite f32 (its bits) as an e4m3 code at the given scale: RNE on the 3-bit mantissa. The round adds
 // half a step plus the kept mantissa's lsb, so an exact half carries only when the kept mantissa is odd;
 // a carry walks into the exponent; e4 past 15 saturates at 0x7E (448, the NaN code 0x7F's neighbour).
+// A value below the block's first normal binade (e4 <= 0) lands on the subnormal grid (step 2^-9 of the
+// scale) by a fresh RNE of its exact significand - never by flooring the exponent, which would keep the
+// normal mantissa bits and read far off (the block-cooperative encode of a lane far below its block's
+// amax is exactly this case, and the box test reds on it).
 __device__ __forceinline__ uint8_t fattn_fp8_code_at_bits(uint32_t bits, uint8_t sf) {
     const uint32_t e = (bits >> 23) & 0xFFu;
     if (e == 0xFFu) {
@@ -129,9 +133,24 @@ __device__ __forceinline__ uint8_t fattn_fp8_code_at_bits(uint32_t bits, uint8_t
     const uint32_t mantissa = bits & 0x7FFFFFu;
     const uint32_t rounded = mantissa + 0x7FFFFu + ((mantissa >> 20) & 1u);
     const int e4 = (int) e - (int) sf + 7 + (int) (rounded >> 23);
-    uint8_t mag = e4 >= 16 ? (uint8_t) 0x7Eu : (uint8_t) (((uint32_t) (e4 > 0 ? e4 : 0) << 3) |
-                                                         ((rounded >> 20) & 7u));
-    mag = (mag == 0x7Fu) ? (uint8_t) 0x7Eu : mag;
+    if (e4 >= 16) {
+        return (uint8_t) ((sign << 7) | 0x7Eu);   // 448: the NaN code 0x7F's neighbour
+    }
+    if (e4 <= 0) {
+        // Subnormal grid: value = (m / 8) * 2^-6 at this scale, step 2^-9, so m = RNE(sig * 2^(e4 - 21))
+        // with sig = 1.M in Q23. m == 8 carries to e4 = 1's mantissa 0, which is the same code byte.
+        const uint32_t sig = 0x800000u | mantissa;
+        const int sh = 21 - e4;   // 21..147; past 31 the exact value is below half a step
+        uint32_t m = 0u;
+        if (sh < 32) {
+            const uint32_t base = sig >> sh;
+            const uint32_t rem = sig & ((1u << sh) - 1u);
+            const uint32_t half = 1u << (sh - 1);
+            m = base + ((rem > half || (rem == half && (base & 1u))) ? 1u : 0u);
+        }
+        return (uint8_t) ((sign << 7) | (uint8_t) m);
+    }
+    const uint8_t mag = (uint8_t) (((uint32_t) e4 << 3) | ((rounded >> 20) & 7u));
     return (uint8_t) ((sign << 7) | mag);
 }
 
@@ -191,7 +210,7 @@ __device__ __forceinline__ fattn_fp8_pair fattn_fp8_encode_block(float v) {
 // instruction (the caller's final producer must be fattn_fp8_lds_sf: the erratum law above).
 // byte_id selects the scale byte a K32 block reads of the supplied word; thread_id is 0 at our shapes.
 __device__ __forceinline__ void fattn_fp8_mma_word_sf(
-        uint32_t A[4], uint32_t B[2], float C[4], uint32_t SFA, uint16_t byte_id_a,
+        const uint32_t A[4], const uint32_t B[2], float C[4], uint32_t SFA, uint16_t byte_id_a,
         uint32_t SFB, uint16_t byte_id_b) {
     const uint16_t thread_id = 0u;
     asm volatile(

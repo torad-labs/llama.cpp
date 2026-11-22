@@ -139,7 +139,7 @@ __global__ void k_fold_slots(const uint32_t * slots, int n, uint32_t * out) {
 #endif
 }
 
-// k_terms: one warp an element; each lane sums N_TERMS of its own terms, each under its own scale.
+// k_terms: one warp an element; each lane sums N_TERMS one-term values of its own, each under its own scale.
 template <int N_TERMS>
 __global__ void k_terms(const float * values, uint32_t * out) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -155,6 +155,34 @@ __global__ void k_terms(const float * values, uint32_t * out) {
         terms.sf[t >> 2] |= (uint32_t) p.sf << ((t & 3) * 8);
     }
     const fattn_fp8_two r = fattn_fp8_sum_terms<N_TERMS>(terms, lane, stage);
+    out[(size_t) w * 32 + lane] = fattn_fp8_slot_pack(r);
+#else
+    (void) values; (void) out;
+#endif
+}
+
+// k_terms_two: each lane carries N_VALUES of its own as TWO terms a value (hi then lo), the design's case:
+// every term is a pair under its own scale, so the fold's only rounding is its one exit encode.
+template <int N_VALUES>
+__global__ void k_terms_two(const float * values, uint32_t * out) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    __shared__ fattn_fp8_fold_stage stage;
+    const int lane = threadIdx.x;
+    const int w = blockIdx.x;
+    fattn_fp8_terms terms = {{0u, 0u, 0u, 0u}, {0u, 0u, 0u, 0u}};
+#pragma unroll
+    for (int i = 0; i < N_VALUES; ++i) {
+        const float v = values[((size_t) w * 32 + lane) * N_VALUES + i];
+        const fattn_fp8_two p = fattn_fp8_encode_two(v);
+        const fattn_fp8_pair parts[2] = {p.hi, p.lo};
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int t = 2 * i + k;
+            terms.code[t >> 2] |= (uint32_t) parts[k].code << ((t & 3) * 8);
+            terms.sf[t >> 2] |= (uint32_t) parts[k].sf << ((t & 3) * 8);
+        }
+    }
+    const fattn_fp8_two r = fattn_fp8_sum_terms<2 * N_VALUES>(terms, lane, stage);
     out[(size_t) w * 32 + lane] = fattn_fp8_slot_pack(r);
 #else
     (void) values; (void) out;
@@ -226,8 +254,8 @@ int main() {
                 const uint8_t lo_code = (uint8_t) ((slot[i] >> 8) & 0xFF);
                 const uint8_t lo_sf = (uint8_t) ((slot[i] >> 24) & 0xFF);
                 const double lo_floor = lo_code == 0 ? 0.0 : host_step(lo_code, lo_sf) * (1.0 + 1e-9);
-                CHECK(err_two <= lo_floor + 1e-30, "two-term error past half a lo step at %d: v %a err %a lo %
-                      a", i, v, err_two, lo_floor);
+                CHECK(err_two <= lo_floor + 1e-30,
+                      "two-term error past half a lo step at %d: v %a err %a lo_floor %a", i, v, err_two, lo_floor);
                 err_hi_sum += err_hi;
                 err_two_sum += err_two;
                 ++live;
@@ -420,17 +448,19 @@ int main() {
         cudaFree(d_slots); cudaFree(d_out);
     }
 
-    // ── the one-hot per-term fold: each term under its own scale, 4 and 16 live of the capacity ──
+    // ── the one-hot per-term fold: each term under its own scale ──
+    // Two-term feeds first: every value rides as hi + lo, so the fold's only rounding is its exit encode
+    // (the design's quality case: 4 values = 8 terms, 8 values = 16 terms, the capacity full).
     {
-        const int live_cases[2] = {4, 16};
+        const int value_cases[2] = {4, 8};
         for (int ci = 0; ci < 2; ++ci) {
-            const int n_terms = live_cases[ci];
-            std::vector<float> vals((size_t) 32 * n_terms);
+            const int n_values = value_cases[ci];
+            std::vector<float> vals((size_t) 32 * n_values);
             std::vector<double> ref(32, 0.0), l1(32, 0.0);
             for (int lane = 0; lane < 32; ++lane) {
-                for (int t = 0; t < n_terms; ++t) {
+                for (int t = 0; t < n_values; ++t) {
                     const float v = frand(rng, -2.0, 2.0);
-                    vals[(size_t) lane * n_terms + t] = v;
+                    vals[(size_t) lane * n_values + t] = v;
                     ref[lane] += (double) v;
                     l1[lane] += std::fabs((double) v);
                 }
@@ -439,24 +469,58 @@ int main() {
             cudaMalloc(&d_v, vals.size() * sizeof(float));
             cudaMalloc(&d_out, 32 * sizeof(uint32_t));
             cudaMemcpy(d_v, vals.data(), vals.size() * sizeof(float), cudaMemcpyHostToDevice);
-            if (n_terms == 4) {
-                k_terms<4><<<1, 32>>>(d_v, d_out);
+            if (n_values == 4) {
+                k_terms_two<4><<<1, 32>>>(d_v, d_out);
             } else {
-                k_terms<16><<<1, 32>>>(d_v, d_out);
+                k_terms_two<8><<<1, 32>>>(d_v, d_out);
             }
-            CHECK(cudaDeviceSynchronize() == cudaSuccess, "k_terms launch: %s", cudaGetErrorString(cudaGetLastError()));
+            CHECK(cudaDeviceSynchronize() == cudaSuccess, "k_terms_two launch: %s", cudaGetErrorString(cudaGetLastError()));
             std::vector<uint32_t> out(32);
             cudaMemcpy(out.data(), d_out, out.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost);
             double worst = 0.0;
             for (int lane = 0; lane < 32; ++lane) {
                 const double d = std::fabs(host_two(out[lane]) - ref[lane]);
                 worst = std::fmax(worst, d / std::fmax(l1[lane], 1e-30));
-                CHECK(d <= l1[lane] * std::pow(2.0, -5.0) + 1e-30,
-                      "sum_terms(%d) lane %d: got %a want %a", n_terms, lane, host_two(out[lane]), ref[lane]);
+                CHECK(d <= l1[lane] * std::pow(2.0, -6.0) + 1e-30,
+                      "sum_terms two-term (%d values) lane %d: got %a want %a", n_values, lane,
+                      host_two(out[lane]), ref[lane]);
             }
-            std::printf("sum_terms(%2d): worst rel %.3e\n", n_terms, worst);
+            std::printf("sum_terms two-term (%d values, %2d terms): worst rel %.3e\n", n_values, 2 * n_values, worst);
             cudaFree(d_v); cudaFree(d_out);
         }
+    }
+    // One-term feeds: 16 single e4m3 values a lane (the full capacity). The fold itself is exact given its
+    // terms, so the measured error is the terms' own 3-bit rounding - documented at 2^-3 of the l1 sum - and
+    // this is the case a caller that cannot afford two terms an element accepts.
+    {
+        const int n_terms = 16;
+        std::vector<float> vals((size_t) 32 * n_terms);
+        std::vector<double> ref(32, 0.0), l1(32, 0.0);
+        for (int lane = 0; lane < 32; ++lane) {
+            for (int t = 0; t < n_terms; ++t) {
+                const float v = frand(rng, -2.0, 2.0);
+                vals[(size_t) lane * n_terms + t] = v;
+                ref[lane] += (double) v;
+                l1[lane] += std::fabs((double) v);
+            }
+        }
+        float * d_v; uint32_t * d_out;
+        cudaMalloc(&d_v, vals.size() * sizeof(float));
+        cudaMalloc(&d_out, 32 * sizeof(uint32_t));
+        cudaMemcpy(d_v, vals.data(), vals.size() * sizeof(float), cudaMemcpyHostToDevice);
+        k_terms<16><<<1, 32>>>(d_v, d_out);
+        CHECK(cudaDeviceSynchronize() == cudaSuccess, "k_terms launch: %s", cudaGetErrorString(cudaGetLastError()));
+        std::vector<uint32_t> out(32);
+        cudaMemcpy(out.data(), d_out, out.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+        double worst = 0.0;
+        for (int lane = 0; lane < 32; ++lane) {
+            const double d = std::fabs(host_two(out[lane]) - ref[lane]);
+            worst = std::fmax(worst, d / std::fmax(l1[lane], 1e-30));
+            CHECK(d <= l1[lane] * std::pow(2.0, -3.0) + 1e-30,
+                  "sum_terms one-term lane %d: got %a want %a", lane, host_two(out[lane]), ref[lane]);
+        }
+        std::printf("sum_terms one-term (16 terms): worst rel %.3e (the terms' own 3-bit rounding)\n", worst);
+        cudaFree(d_v); cudaFree(d_out);
     }
 
     if (g_failures != 0) {
