@@ -1,6 +1,9 @@
 #include "llama-kv-cache.h"
 
 #include "gguf.h"
+
+#include "../ggml/src/ggml-quants.h"
+
 #include "llama-host-threads.h"
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -460,6 +463,63 @@ llama_kv_cache::llama_kv_cache(
 
     init_rotation(name_tag);
 
+    // section 3.5 skeleton (doc docs/torad/research/inkling-2-small/18-global-kv-off-f16.md): mixed recency pools
+    // for the global layers behind LLAMA_INKLING2_KV_MIXED - F16 hot rows sized to every sequence's newest extent,
+    // one pool per stream and layer beside the cold ones, filled only as stores route through kv_mixed_flush().
+    // Attention does not read them yet; reports/kv-q40-dispatch-pending.md "section 3.5 skeleton" says what remains.
+    if (!no_alloc && !other && !is_indexer && swa_type == LLAMA_SWA_TYPE_NONE &&
+            model.arch == LLM_ARCH_INKLING2 && llama_kv_mixed_enabled()) {
+        const uint32_t extent   = llama_kv_mixed_hot_cells();
+        const uint32_t hot_rows = std::min<uint64_t>((uint64_t) extent*n_seq_max, kv_size);
+
+        bool ready = !layers.empty();
+        for (const auto & layer : layers) {
+            for (uint32_t s = 0; s < n_stream && ready; ++s) {
+                ready = layer.k_stream[s] && layer.v_stream[s];
+            }
+        }
+
+        // the pool of a stream's layer lives at that layer's index: both iterations visit the same order
+        kv_mixed_k.resize(n_stream);
+        kv_mixed_v.resize(n_stream);
+
+        bool all_ok = ready;
+        if (ready) {
+            for (const auto & layer : layers) {
+                for (uint32_t s = 0; s < n_stream && all_ok; ++s) {
+                    ggml_tensor * k = layer.k_stream[s];
+                    ggml_tensor * v = layer.v_stream[s];
+
+                    auto pk = std::make_unique<llama_kv_mixed_pool>();
+                    if (!pk->init(hparams.n_embd_k_gqa(layer.il), hot_rows, ggml_backend_buffer_get_type(k->buffer))) {
+                        all_ok = false;
+                        break;
+                    }
+                    kv_mixed_k[s].push_back(std::move(pk));
+
+                    auto pv = std::make_unique<llama_kv_mixed_pool>();
+                    if (!pv->init(hparams.n_embd_v_gqa(layer.il), hot_rows, ggml_backend_buffer_get_type(v->buffer))) {
+                        all_ok = false;
+                        break;
+                    }
+                    kv_mixed_v[s].push_back(std::move(pv));
+                }
+                if (!all_ok) {
+                    break;
+                }
+            }
+        }
+
+        // setups without every piece read nothing: pools only serve what their stamps name
+        LLAMA_LOG_INFO("%s: mixed recency pools %s (%u streams, extent %u, rows/stream %u)\n", __func__,
+                all_ok ? "allocated" : "not allocated (missing K/V pieces)", n_stream, extent, hot_rows);
+
+        if (!all_ok) {
+            kv_mixed_k.clear();
+            kv_mixed_v.clear();
+        }
+    }
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
@@ -517,6 +577,9 @@ void llama_kv_cache::clear(bool data) {
         v_cells[s].reset();
         v_heads[s] = 0;
     }
+
+    // whatever the pools stamp now names dropped cells
+    kv_mixed_reset();
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -1217,11 +1280,104 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+// section 3.5 skeleton plumbing (doc 18): route the previous step's writes into their recency pools. Called where
+// the previous graph's scatter is final - the head of the next batch's metadata pass - and validated against the
+// cache as it stands now, so cells that fell out of recency or were dropped since skip silently.
+void llama_kv_cache::kv_mixed_flush() {
+    if (kv_mixed_pending.empty()) {
+        return;
+    }
+
+    std::vector<std::vector<uint32_t>> per(n_stream);
+    for (const auto & [strm, cell] : kv_mixed_pending) {
+        if (strm < per.size()) {
+            per[strm].push_back(cell);
+        }
+    }
+
+    const uint32_t extent = llama_kv_mixed_hot_cells();
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (per[s].empty()) {
+            continue;
+        }
+
+        GGML_ASSERT(kv_mixed_k.size() == n_stream && kv_mixed_v.size() == n_stream);
+
+        auto & cells = v_cells[s];
+
+        // near means some sequence holding the cell sees it within the served recency extent of its own tip: the
+        // same predicate a read merge consults later, evaluated live over this cache
+        auto near_cell = [&](uint32_t idx) -> bool {
+            if (cells.is_empty(idx)) {
+                return false;
+            }
+            const llama_pos p = cells.pos_get(idx);
+            for (int seq = 0, remaining = cells.seq_count(idx); remaining > 0; ++seq) {
+                if (!cells.seq_has(idx, seq)) {
+                    continue;
+                }
+                --remaining;
+                const llama_pos tip = cells.seq_pos_max(seq);
+                if (tip >= p && tip - p < (llama_pos) extent) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // pools and layers share one index by construction (see the ctor)
+        for (size_t li = 0; li < kv_mixed_k[s].size(); ++li) {
+            GGML_ASSERT(li < layers.size());
+
+            ggml_tensor * k = layers[li].k_stream[s];
+            ggml_tensor * v = layers[li].v_stream[s];
+
+            if (k && kv_mixed_k[s][li]) {
+                kv_mixed_k[s][li]->mirror(k, per[s].data(), per[s].size(), near_cell);
+            }
+
+            if (v && kv_mixed_v[s][li]) {
+                kv_mixed_v[s][li]->mirror(v, per[s].data(), per[s].size(), near_cell);
+            }
+        }
+    }
+
+    kv_mixed_pending.clear();
+}
+
+void llama_kv_cache::kv_mixed_reset() {
+    if (kv_mixed_pending.empty()) {
+        return;
+    }
+
+    kv_mixed_pending.clear();
+
+    for (auto & streams : kv_mixed_k) {
+        for (auto & pool : streams) {
+            if (pool) {
+                pool->reset_stamps();
+            }
+        }
+    }
+
+    for (auto & streams : kv_mixed_v) {
+        for (auto & pool : streams) {
+            if (pool) {
+                pool->reset_stamps();
+            }
+        }
+    }
+}
+
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool purge) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
+
+    // previous step's writes are final by now: mirror them while this batch's metadata has not moved anything yet
+    kv_mixed_flush();
 
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
@@ -1306,6 +1462,17 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+
+    // section 3.5 skeleton: the cells this batch wrote mirror into their recency pools before the next batch's
+    // metadata pass applies - see kv_mixed_flush()
+    if (!kv_mixed_k.empty()) {
+        kv_mixed_pending.clear();
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+                kv_mixed_pending.emplace_back(sinfo.strm[s], sinfo.idxs[s][ii]);
+            }
+        }
     }
 }
 
@@ -3014,6 +3181,9 @@ const slot_info_vec_t *   sinfos_in) {
         return;
     }
 
+    // a restore rewrites what these cells hold: drop the recency picture and let routing rebuild it
+    kv_mixed_reset();
+
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -3393,7 +3563,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
+#include "llama-kv-state-migrate.h"
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+    // with the knob on a state saved under another cache configuration migrates into this one (see the helpers
+    // above); unset, every mismatch below fails exactly as it always has
+    const bool migrate = llama_kv_state_migrate_enabled();
     auto & cells = v_cells[strm];
 
     // batch the scatter reads per contiguous run of destination indices
@@ -3438,18 +3612,50 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     }
 
     if (this->v_trans != (bool) v_trans) {
-        LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
+        LLAMA_LOG_ERROR("%s: incompatible V transposition%s\n", __func__,
+                migrate ? " (state migration keeps it; only cache types and rotations convert)" : "");
         return false;
     }
 
-    if (n_rot_k_ref != n_rot_k) {
-        LLAMA_LOG_ERROR("%s: incompatible key rotation (%u instead of %u)\n", __func__, n_rot_k_ref, n_rot_k);
-        return false;
+    // the rotation sides a converted read works between: what stored the file's values and what this cache would
+    // store fresh. Sizes resolve to matrices lazily, so a size the engine never precomputed still converts.
+    struct rot_side { const float * m = nullptr; int n = 0; };
+    auto rot_of = [&](uint32_t n_rot, bool & ok) -> rot_side {
+        if (!n_rot) {
+            return {};
+        }
+        if (!ggml_is_power_of_2((int) n_rot) || n_rot > 4096u) {
+            ok = false;
+            return {};
+        }
+        const std::vector<float> & h = llama_kv_state_rot_matrix(n_rot);
+        ok = true;
+        return { h.data(), (int) n_rot };
+    };
+
+    bool rots_ok = true;
+    const rot_side rot_src_k = rot_of(n_rot_k_ref, rots_ok);
+    const rot_side rot_dst_k = rot_of(n_rot_k,     rots_ok);
+    const rot_side rot_src_v = rot_of(n_rot_v_ref, rots_ok);
+    const rot_side rot_dst_v = rot_of(n_rot_v,     rots_ok);
+
+    if (rots_ok && migrate && (n_rot_k_ref != n_rot_k || n_rot_v_ref != n_rot_v)) {
+        LLAMA_LOG_INFO("%s: migrating state rotation (%u/%u stored into %u/%u)\n", __func__,
+                n_rot_k_ref, n_rot_v_ref, n_rot_k, n_rot_v);
     }
 
-    if (n_rot_v_ref != n_rot_v) {
-        LLAMA_LOG_ERROR("%s: incompatible value rotation (%u instead of %u)\n", __func__, n_rot_v_ref, n_rot_v);
-        return false;
+    if (!migrate || !rots_ok) {
+        if (n_rot_k_ref != n_rot_k) {
+            LLAMA_LOG_ERROR("%s: incompatible key rotation (%u instead of %u)%s\n", __func__, n_rot_k_ref, n_rot_k,
+                    migrate && !rots_ok ? " (state migration could not resolve a rotation matrix)" : "");
+            return false;
+        }
+
+        if (n_rot_v_ref != n_rot_v) {
+            LLAMA_LOG_ERROR("%s: incompatible value rotation (%u instead of %u)%s\n", __func__, n_rot_v_ref, n_rot_v,
+                    migrate && !rots_ok ? " (state migration could not resolve a rotation matrix)" : "");
+            return false;
+        }
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
@@ -3464,23 +3670,58 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         int32_t k_type_i_ref;
         io.read(&k_type_i_ref, sizeof(k_type_i_ref));
         const int32_t k_type_i = (int32_t) k->type;
-        if (k_type_i != k_type_i_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
-            return false;
-        }
 
         // Read row size of key
         uint64_t k_size_row_ref;
         io.read(&k_size_row_ref, sizeof(k_size_row_ref));
         const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        if (k_size_row != k_size_row_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
+
+        // the record's own type and row bytes must describe rows this migrator can interpret
+        auto row_bytes_ok = [](int32_t t, int64_t values, uint64_t ref) -> bool {
+            if (!llama_kv_state_type_supported(t)) {
+                return false;
+            }
+            const ggml_type type = (ggml_type) t;
+            if ((type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) && values % QK8_0 != 0) {
+                return false;
+            }
+            return ref == (uint64_t) ggml_row_size(type, values);
+        };
+
+        // an identical configuration reads exactly as before: the migrator's own supported types have no
+        // bearing here, a same-type restore never encodes anything
+        if (!migrate || (k_type_i == k_type_i_ref && n_rot_k_ref == n_rot_k)) {
+            if (k_type_i != k_type_i_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
+                return false;
+            }
+
+            if (k_size_row != k_size_row_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
+                return false;
+            }
+
+            for (const auto & r : runs) {
+                io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
+            }
+            continue;
+        }
+
+        // migrate the record's rows into this cache's type and domain of stored values
+        if (!llama_kv_state_type_supported(k_type_i) || !row_bytes_ok(k_type_i_ref, n_embd_k_gqa, k_size_row_ref)) {
+            LLAMA_LOG_ERROR("%s: cannot migrate key to a %s cache from a %s row of %llu bytes (layer %d)%s\n",
+                    __func__, ggml_type_name(k->type), ggml_type_name((ggml_type) k_type_i_ref),
+                    (unsigned long long) k_size_row_ref, il,
+                    llama_kv_state_migrate_enabled() ? "" : " (LLAMA_KV_STATE_MIGRATE off)");
             return false;
         }
 
-        for (const auto & r : runs) {
-            io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
-        }
+        const bool same_rot = (rot_src_k.n == rot_dst_k.n) && (!rot_src_k.m || rot_src_k.m == rot_dst_k.m);
+
+        llama_kv_state_read_rows_converted(io, k, sinfo.idxs[0].data(), cell_count,
+                (ggml_type) k_type_i_ref, k_size_row_ref, (int64_t) n_embd_k_gqa, k->type,
+                same_rot ? nullptr : rot_src_k.m, same_rot ? 0 : rot_src_k.n,
+                same_rot ? nullptr : rot_dst_k.m, same_rot ? 0 : rot_dst_k.n);
     }
 
     if (!this->v_trans) {
@@ -3498,23 +3739,46 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             int32_t v_type_i_ref;
             io.read(&v_type_i_ref, sizeof(v_type_i_ref));
             const int32_t v_type_i = (int32_t) v->type;
-            if (v_type_i != v_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
-                return false;
-            }
 
             // Read row size of value
             uint64_t v_size_row_ref;
             io.read(&v_size_row_ref, sizeof(v_size_row_ref));
             const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
-            if (v_size_row != v_size_row_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
+
+            if (!migrate || (v_type_i == v_type_i_ref && n_rot_v_ref == n_rot_v)) {
+                if (v_type_i != v_type_i_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
+                    return false;
+                }
+
+                if (v_size_row != v_size_row_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
+                    return false;
+                }
+
+                for (const auto & r : runs) {
+                    io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
+                }
+                continue;
+            }
+
+            // migrate the record's rows into this cache's type and domain of stored values
+            if (!llama_kv_state_type_supported(v_type_i) ||
+                    !(v_size_row_ref == (uint64_t) ggml_row_size((ggml_type) v_type_i_ref, n_embd_v_gqa)) ||
+                    ((v_type_i_ref == GGML_TYPE_Q4_0 || v_type_i_ref == GGML_TYPE_Q8_0) && n_embd_v_gqa % QK8_0 != 0)) {
+                LLAMA_LOG_ERROR("%s: cannot migrate value to a %s cache from a %s row of %llu bytes (layer %d)%s\n",
+                        __func__, ggml_type_name(v->type), ggml_type_name((ggml_type) v_type_i_ref),
+                        (unsigned long long) v_size_row_ref, il,
+                        llama_kv_state_migrate_enabled() ? "" : " (LLAMA_KV_STATE_MIGRATE off)");
                 return false;
             }
 
-            for (const auto & r : runs) {
-                io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
-            }
+            const bool same_rot = (rot_src_v.n == rot_dst_v.n) && (!rot_src_v.m || rot_src_v.m == rot_dst_v.m);
+
+            llama_kv_state_read_rows_converted(io, v, sinfo.idxs[0].data(), cell_count,
+                    (ggml_type) v_type_i_ref, v_size_row_ref, (int64_t) n_embd_v_gqa, v->type,
+                    same_rot ? nullptr : rot_src_v.m, same_rot ? 0 : rot_src_v.n,
+                    same_rot ? nullptr : rot_dst_v.m, same_rot ? 0 : rot_dst_v.n);
         }
     } else {
         // For each layer, read the values for each cell (transposed)
@@ -3533,13 +3797,16 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&v_type_i_ref, sizeof(v_type_i_ref));
             const int32_t v_type_i = (int32_t) v->type;
             if (v_type_i != v_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
+                // state migration converts plain rows only; transposed V records keep today's refusal
+                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)%s\n", __func__, v_type_i, v_type_i_ref, il,
+                        migrate ? " (state migration does not convert transposed V records)" : "");
                 return false;
             }
 
             // Read element size of value
             uint32_t v_size_el_ref;
             io.read(&v_size_el_ref, sizeof(v_size_el_ref));
+
             const size_t v_size_el = ggml_type_size(v->type);
             if (v_size_el != v_size_el_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value element size (%zu != %zu, layer %d)\n", __func__, v_size_el, (size_t) v_size_el_ref, il);

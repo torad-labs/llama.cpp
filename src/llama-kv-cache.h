@@ -3,10 +3,12 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-kv-mixed.h"
 #include "llama-memory.h"
 
 #include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct llama_cparams;
@@ -407,6 +409,19 @@ private:
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;
     uint32_t n_rot_v = 0;
+
+    // section 3.5 skeleton (doc 18): the global layers' mixed recency store behind LLAMA_INKLING2_KV_MIXED - an
+    // F16 hot pool per stream and layer for K and for V beside the cold buffers, and the cells whose writes a
+    // pending mirror still owes them
+    std::vector<std::vector<llama_kv_mixed_pool_ptr>> kv_mixed_k; // [stream][layer]
+    std::vector<std::vector<llama_kv_mixed_pool_ptr>> kv_mixed_v;
+    std::vector<std::pair<uint32_t, uint32_t>> kv_mixed_pending;  // (stream, cell)
+
+    // route the pending mirrors into their pools, validating each cell against this cache as it stands now
+    void kv_mixed_flush();
+
+    // drop every stamp and pending mirror: restores rebuild the recency picture from what follows
+    void kv_mixed_reset();
 
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1

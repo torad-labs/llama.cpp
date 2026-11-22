@@ -154,3 +154,50 @@ this one committed its docstring fix on top of it. Fixed by plumbing while nothi
 to d8d6b5607 (kv_stats change alone) and the rows file returned to disk untracked as its owner left it.
 Standing rule adopted here: every future commit in this checkout inspects `git diff --cached --stat`
 immediately before committing — the index never starts empty.
+
+## section 3.5 skeleton
+
+Landed 2026-11-22 CST behind `LLAMA_INKLING2_KV_MIXED` (off by default; declared in tunables.toml with
+`LLAMA_INKLING2_KV_MIXED_HOT`, extent 1,024 as served):
+
+- `src/llama-kv-mixed.{h,cpp}` — the hot pool object: F16 rows ringed over writes on the cold buffers'
+  backend type, stamps saying whose value each slot holds (`mirror()` routes stores by recency,
+  `merge_rows()` materializes one source per cell, `reset_stamps()` clears after restores).
+- `src/llama-kv-cache.{h,cpp}` plumbing — Inkling 2 global caches (swa none, not the indexer) allocate an
+  F16 K/V pair of pools per stream and layer sized to every sequence's newest extent;
+  `apply_ubatch` records the batch's written cells and mirrors them at the head of the NEXT metadata pass
+  (previous graph final there), validating each against live positions first; state reads and clear reset
+  the picture so restores never serve stale stamps.
+- `tests/test-llama-kv-mixed.cpp` arms `test-inkling-kvmix-{cpu,cuda0}` — all-hot and all-cold fixtures read
+  bit for bit like their single pool, mixed windows take exactly one source per cell, evictions fall back
+  to cold exactly, and the LLAMA_KV_STATE_MIGRATE helper units (block layouts, Hadamard composition, the
+  converted row reader over shuffled destination runs) ride the same binary.
+
+The mirror today carries the COLD pool's own values decoded and re-encoded F16, so hot precision equals
+cold until true pre-quantization capture lands. Reads do not consume the split yet. What remains, in the
+order it must land:
+
+1. **Pre-store dual write** — beside `cpy_k`/`cpy_v`'s set_rows into the q4/q8 pool, a second scatter of the
+   same pre-store k_cur/v_cur rows into the F16 pool. The call sites in llama-graph.cpp need no edit: chain
+   the two scatters (hot scatter fed by the cold node's passthrough output keeps both ordered through one
+   returned tensor), with a recency index I32 input built host-side from ubatch positions, on the
+   llm_graph_input pattern this file already uses (`set_input_k_idxs`, `llm_graph_input_k_shift`). Ring
+   slots then stamp at write time and the flush path retires.
+2. **Kernel staging for split reads** — per query row, near cells read the F16 pool and far cells the
+   staged low-bit rows; the boundary is the model's own (relative bias exactly zero from 1,024 back). Dense
+   path first (concat of the two sources into one f16 staging buffer per span), then rel-runs / one-cell /
+   rel-mma variants behind the existing switches, each asserting its node class runs per the kv1b standing
+   rule. Forked sessions inside a prefix read their near cells at the low bits until the private tail grows
+   past the extent - doc 15 section 3.1's case, stated here as accepted semantics.
+3. **Dispatch wiring** — only after 1 and 2, gate `build_attn` to assemble dual-pool inputs under the knob;
+   today the knob changes allocation and mirrors alone, which the fixture arms pin.
+
+## kv_stats q4_0 nibble order
+
+While writing the migration decoder against real bytes: ggml's canonical Q4_0 packs byte j low = value j,
+high = value j+16 (`quantize_row_q4_0_ref`, ggml-quants.c; device store identical in
+ggml/src/ggml-cuda/cpy-utils.cuh `quantize_f32_q4_0_block`; both kernels verified bit-for-bit earlier).
+`scripts/inkling2/kv_stats.py` `_dequant_q` interleaves instead (`q[:, 0::2] = lo; q[:, 1::2] = hi`,
+"byte j holds values 2j low"), so quantized dumps decode with half the values on the wrong lanes there.
+F16/bf16 rows are unaffected. kv-stats seat owns the fix; this slice's migration follows the engine layout,
+and tests/test-llama-kv-mixed.cpp pins it with handcrafted blocks (a zero nibble reads -8*d, the +8 bias).

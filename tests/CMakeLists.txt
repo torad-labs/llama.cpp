@@ -274,7 +274,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
 endif()
 
-llama_build(test-llama-archs.cpp llama-archs-gguf.cpp test-llama-archs-inkling.cpp test-llama-archs-inkling-paths.cpp)
+# section 3.5 skeleton (doc 18-global-kv-off-f16.md): the mixed recency store's pools and dense read merge
+llama_build(test-llama-kv-mixed.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
@@ -379,6 +380,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
                     "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;LLAMA_INKLING2_MEAN_MASK_DECODE=1;LLAMA_INKLING2_MEAN_POOL_MIN=8192")
             endforeach()
         endforeach()
+        # section 3.5 skeleton (doc 18-global-kv-off-f16.md): the mixed recency store's dual pools route stores by
+        # recency and its dense read merge serves every cell from exactly one source - all-hot and all-cold fixtures
+        # equal their single pool bit for bit, evictions fall back to cold exactly
+        set(inkling_kvmix_test test-inkling-kvmix-${inkling_path_name})
+        llama_test(test-llama-kv-mixed NAME ${inkling_kvmix_test} ARGS ${inkling_path_device})
+        set_tests_properties(${inkling_kvmix_test} PROPERTIES ENVIRONMENT "LLAMA_INKLING2_KV_MIXED=1")
         # the global layers' decode by the runs of cells each row reads against its mask (LLAMA_INKLING2_KV_RUNS), and on
         # a GPU with the shared runs read once for groups of 3 rows (GGML_CUDA_FATTN_REL_RUNS_SHARED)
         foreach(inkling_case runs served restore)
