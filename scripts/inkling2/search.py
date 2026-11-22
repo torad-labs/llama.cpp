@@ -36,7 +36,8 @@ import measure as glm_measure
 # they go before the settings whose best value depends on it.
 SPACE = {
     "--draft-depth": ["1", "2", "3", "4", "5", "6", "7"],
-    "--draft": ["off"],
+    "--draft": ["off", "on"],
+    "--draft-layout": ["off", "on"],
     "LLAMA_SAMPLE_THREADS": ["1", "2", "4", "8", "16", "23"],
     "GGML_CUDA_FATTN_REL_DECODE_STREAMS": ["4", "8", "16", "32", "64"],
     "GGML_CUDA_FATTN_REL_DECODE_MEAN_STREAMS": ["64", "128", "256", "512", "1024"],

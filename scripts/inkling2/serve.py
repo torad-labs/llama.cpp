@@ -72,7 +72,7 @@ def arguments(argv=None):
     parser.add_argument("--draft", action=argparse.BooleanOptionalAction,
                         help="Use the paired native DSpark draft (default off; the flag also applies the draft "
                              "layout: context 1572864, ubatch 256, q8_0 target KV)")
-    parser.add_argument("--draft-layout", action="store_true",
+    parser.add_argument("--draft-layout", action=argparse.BooleanOptionalAction,
                         help="Apply the draft layout without a draft: the matched control of a draft A/B")
     parser.add_argument("--draft-model", type=Path, help="An explicit Inkling DSpark GGUF with its own vocabulary tensors")
     parser.add_argument("--draft-depth", type=int, choices=range(1, 8), default=3,
