@@ -34,6 +34,7 @@ if [ -n "${RESTORE:-}" ]; then
     IFS=$oldIFS
 fi
 
+echo "=== $TAG window-base $(git rev-parse HEAD) $(date -u +%H:%M:%S)"  # the known-committed anchor every arm names in its header
 echo "=== $TAG CONFIGURE/BUILD $(date -u +%H:%M:%S)"
 cmake -S . -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF >/dev/null 2>/tmp/cfg-$TAG.err || {
     cat /tmp/cfg-$TAG.err

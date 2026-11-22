@@ -145,7 +145,10 @@ positions of a long session — late depth weighted heaviest, per 1.5 — plus `
 run on the dense path, so no new kernel is needed for this leg. Run the q8 reduction wire as a further arm.
 
 Arms prepared for inkling-small's shared four-card window (each = one serve over the identical prompt set with these
-flags, then its capture stack; `replay_compare.py` takes the stacks as files): A stock F16 + wire bf16; B second
+flags, then its capture stack; `replay_compare.py` takes the stacks as files). Every arm builds on the box from
+`refs/heads/window-base` — the known-committed anchor llama-lead requires — and names that sha in its output header,
+which the runner prints for it (`scripts/inkling2/kv1b_run.sh`); the anchor moves only by a fresh push of the current
+committed tip. A stock F16 + wire bf16; B second
 identical run (the K1 drift floor); C `--kv-cache q8_0 --swa-kv-cache f16`; D `--kv-cache q4_0 --swa-kv-cache f16`
 (the explicit sliding flag matters: unset, type_k_swa follows the global type at `src/llama-context.cpp:950`, so a
 bare `--kv-cache q4_0` would quantize the sliding layers too against section 3.3's target); E stock F16 +
