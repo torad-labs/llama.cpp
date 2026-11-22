@@ -574,6 +574,7 @@ checks = [
 notes = [
   '2026-11-22 00:28 CT: added; 2 of 2 checks fail, as they should before the work',
   '2026-11-22 01:30 CT: 2026-11-22: GLM-shared code rule: the captured copy-engine route changes multi-card all-reduce shared with GLM 5.3; guarded behind GGML_CUDA_AR_COPY_ENGINE_CAPTURE/_LEGACY, both default off, so stock GLM behavior is preserved (guard choice, not copy).',
+  "2026-11-22 02:05 CT: 2026-11-22 02:10 CT llamacpp-coordinator: window staging expectation for this row's group arm: the copied/reduced path measured with GGML_CUDA_AR_COPY_ENGINE_CAPTURE on and off at the merged window-base, every switch at its row default in the baseline, window-base sha and full switch block printed per arm, tree patch saved beside outputs. Row is unclaimed though its builder snapshots are staged (a3faae9c4) - the lane seat should claim it so ownership is visible.",
 ]
 
 [[row]]
@@ -591,6 +592,7 @@ checks = [
 notes = [
   '2026-11-22 00:40 CT: added; 1 of 2 checks fail, as they should before the work',
   '2026-11-22 01:30 CT: 2026-11-22: GLM-shared code rule: the packed prefill lives only in the Inkling relative-prefill kernel (no GLM path reaches it) and is guarded behind GGML_CUDA_FATTN_REL_PACKED_PREFILL default off; stock behavior preserved either way.',
+  "2026-11-22 02:05 CT: 2026-11-22 02:10 CT llamacpp-coordinator: window staging expectation for this row's group arm: GGML_CUDA_FATTN_REL_PACKED_PREFILL on and off at the merged window-base, every switch at its row default in the baseline, window-base sha and full switch block per arm, tree patch beside outputs. Row is unclaimed though its builder snapshot is staged (a3faae9c4) - the lane seat should claim it.",
 ]
 
 [[row]]
