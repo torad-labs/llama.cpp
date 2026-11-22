@@ -3830,6 +3830,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        if (rel && rel->kv_runs) {
+            ggml_flash_attn_ext_set_kv_runs(cur, rel->kv_runs);
+        }
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         // one sequence, causal attention and no window: every row's mask is a prefix of the cells, unless the caller's

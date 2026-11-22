@@ -350,6 +350,7 @@ struct common_sampler {
     // how many of a row's largest logits the chain reads on the CPU, 0 for every token's: its top-k, and behind penalties
     // that only lower logits, their window too (sampler_top_k_first)
     int32_t n_candidates = 0;
+    int32_t n_greedy_candidates = 0;
 
     // common_sampler_sample_coupled's copy of the chain, the tokens a drafter proposed that the copy has accepted since
     // it was made, whether it has drawn since the last of them, and the drafter's candidates. An accept, a reset or a
@@ -384,6 +385,14 @@ struct common_sampler {
             cur.resize(sampled_logits_count);
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+            }
+            // Run static exclusions and strict greedy in the same token order as the whole row.
+            if (n_greedy_candidates > 0 && sampled_logits_count < (uint32_t) n_vocab) {
+                std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                    return a.id < b.id;
+                });
+                cur_p = { cur.data(), cur.size(), -1, false };
+                return;
             }
             // a backend's top-k gives its candidates in no fixed order among equal logits: sorted by logit, ties by id,
             // as common_sampler_top_k_candidates sorts them, the chain draws from them as from the k the CPU takes (a
@@ -781,6 +790,9 @@ struct common_sampler * common_sampler_init(
     // the CPU cuts a row, to the top-k and the window
     result->top_k_first  = window == 0 ? top_k : 0;
     result->n_candidates = top_k > 0 ? top_k + window : 0;
+    if (params.n_probs == 0 && params.top_k <= 0 && params.temp == 0.0f) {
+        result->n_greedy_candidates = llama_sampler_chain_greedy_candidates(chain);
+    }
 
     // a lazy grammar waiting for its trigger and a reasoning budget that is not forcing leave every logit as it is,
     // so while both stay so a backend-sampled token is the one the CPU chain would draw (common_sampler_backend_passive);
@@ -842,6 +854,10 @@ int32_t common_sampler_backend_top_k(const struct common_sampler * gsmpl) {
 
 int32_t common_sampler_n_candidates(const struct common_sampler * gsmpl) {
     return gsmpl && !top_k_prefilter_legacy() ? gsmpl->n_candidates : 0;
+}
+
+int32_t common_sampler_n_greedy_candidates(const struct common_sampler * gsmpl) {
+    return gsmpl && !top_k_prefilter_legacy() ? gsmpl->n_greedy_candidates : 0;
 }
 
 bool common_output_candidates_legacy() {
@@ -920,6 +936,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     // derived from params at init: a clone reads the rows its original does
     result->top_k_first  = gsmpl->top_k_first;
     result->n_candidates = gsmpl->n_candidates;
+    result->n_greedy_candidates = gsmpl->n_greedy_candidates;
     return result;
 }
 
@@ -938,6 +955,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->params       = src->params;
     dst->top_k_first  = src->top_k_first;
     dst->n_candidates = src->n_candidates;
+    dst->n_greedy_candidates = src->n_greedy_candidates;
     dst->prev         = src->prev;
     dst->cur          = src->cur;
     dst->cur_p        = src->cur_p;

@@ -1308,6 +1308,10 @@ extern "C" {
     LLAMA_API void llama_set_output_candidates(struct llama_context * ctx, int32_t k);
     LLAMA_API void llama_set_seq_candidates(struct llama_context * ctx, llama_seq_id seq_id, bool enable);
 
+    // Mark a sequence for strict greedy sampling from a bounded shortlist. Returns false if the context does not
+    // support it. A batch uses the compact head only when every output sequence has opted in.
+    LLAMA_API bool llama_set_seq_greedy_candidates(struct llama_context * ctx, llama_seq_id seq_id);
+
     //
     // NextN / speculative decoding API
     //
@@ -1321,6 +1325,13 @@ extern "C" {
     // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
     // chain multiple trained NextN heads. Default 0 (first head).
     LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+
+    // The number of passes a decode of a loop model (Inkling 2 loop) runs, in place of the model's own count
+    // (LLM_KV_LOOP_COUNT, also LLAMA_LOOP_PASSES when the context is made). 0: the model's own. The count is part of the
+    // graph's topology: set it before decoding, and keep one count for the life of the sequences in the cache. A count
+    // the model was not trained for is refused unless its loop.varying is true or LLAMA_LOOP_PASSES_ANY is set, and a
+    // draft whose layer taps read fixed cache slots requires the model's own count.
+    LLAMA_API void llama_set_loop_passes(struct llama_context * ctx, int32_t passes);
 
     // Get all nextn embeddings, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
@@ -1653,6 +1664,10 @@ extern "C" {
     /// The chain ends in a coupled dist sampler and everything before it is applied on the host without changing its
     /// own state: a copy of it applied to another model's logits draws with the noise of the chain's next sample.
     LLAMA_API bool llama_sampler_chain_coupled(const struct llama_sampler * chain);
+
+    // Candidates sufficient for exact greedy selection: one plus the number of distinct static exclusions.
+    // Returns zero for a chain with any other active transform. The shortlist is sampled in token ID order.
+    LLAMA_API int32_t llama_sampler_chain_greedy_candidates(const struct llama_sampler * chain);
 
     /// The token the chain draws from a row of every token's logit (logits[id], n_vocab of them), as llama_sampler_apply
     /// over all of them as candidates draws it, in one vector pass that builds no candidates. Taken: a chain of a logit

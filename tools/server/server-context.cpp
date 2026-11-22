@@ -3138,14 +3138,26 @@ private:
             // the chain reads on the CPU, a penalty window before its top-k included (common_sampler_n_candidates), so
             // no row is gathered or copied whole and no sampler graph is built a row. One k a context: the largest a
             // slot has asked for. LLAMA_OUTPUT_CANDIDATES_LEGACY=1: off
-            const int32_t n_cand = common_output_candidates_legacy() ? 0 : common_sampler_n_candidates(slot.smpl.get());
+            const bool candidates_enabled = !common_output_candidates_legacy();
+            int32_t n_cand = candidates_enabled ? common_sampler_n_candidates(slot.smpl.get()) : 0;
             slot.cand_rows = !slot.backend_sampler && n_cand > 0 && n_cand <= cand_k_max && !need_pre_sample_logits &&
                 pull_k.empty() && !lens_on && common_sampler_backend_passive(slot.smpl.get());
+            static const bool compact_greedy = ggml_env_switch("LLAMA_INKLING2_COMPACT_GREEDY");
+            const int32_t n_greedy = compact_greedy && candidates_enabled && !slot.backend_sampler && !slot.cand_rows &&
+                    !slot.can_speculate() && !need_pre_sample_logits && pull_k.empty() && !lens_on &&
+                    common_sampler_backend_passive(slot.smpl.get()) ? common_sampler_n_greedy_candidates(slot.smpl.get()) : 0;
+            const bool greedy = n_greedy > 0 && n_greedy <= cand_k_max &&
+                    llama_set_seq_greedy_candidates(ctx_tgt, slot.id);
+            if (greedy) {
+                n_cand = n_greedy;
+                slot.cand_rows = true;
+            } else {
+                llama_set_seq_candidates(ctx_tgt, slot.id, slot.cand_rows);
+            }
             if (slot.cand_rows && n_cand > cand_k) {
                 cand_k = n_cand;
                 llama_set_output_candidates(ctx_tgt, cand_k);
             }
-            llama_set_seq_candidates(ctx_tgt, slot.id, slot.cand_rows);
 
             if (!slot.backend_sampler && !slot.cand_rows && top_k > 0 && pre_probs_in_k && pull_k.empty() && !lens_on &&
                     common_sampler_backend_passive(slot.smpl.get())) {

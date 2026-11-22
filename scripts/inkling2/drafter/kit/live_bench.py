@@ -48,7 +48,7 @@ def server_command(args):
     spec = importlib.util.spec_from_file_location("inkling2_serve", args.source / "scripts/inkling2/serve.py")
     serve = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(serve)
-    asked = ["--profile", "tensor-4-draft", "--text-only", "--server", str(args.server), "--slots", str(args.slots),
+    asked = ["--profile", "tensor-4", "--draft", "--text-only", "--server", str(args.server), "--slots", str(args.slots),
              "--port", str(args.port)]
     asked += ["--draft-model", str(args.draft)] if args.draft else ["--no-draft"]
     if args.draft and args.depth:

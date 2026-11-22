@@ -971,6 +971,7 @@ struct ggml_cuda_ar_pipeline {
     uint64_t n_host_slice_gathers;
     bool     owner_slices;   // captured gathers write only each rank's own slice to every peer
     bool     host_owner_rows;
+    bool     host_owner_stream_ordered;
     int      gather_blocks;  // blocks the owner gather launches with (GGML_CUDA_AR_GATHER_BLOCKS)
     bool     reduce_owners;  // a reduce whose result each rank reads only in part sums only that part (ggml_cuda_ar_reduce_owned)
     uint64_t n_reduced_owned; // reductions summed to their owners, and to every rank, logged when the pipeline is freed
@@ -1040,14 +1041,13 @@ struct ggml_cuda_ar_pipeline {
     int *                    counter[GGML_CUDA_MAX_DEVICES];
 };
 
-// The copy-engine path's event slot for its next call, once both devices have
-// finished the call two back.
-static int ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
+// Wait for the previous use of the slot unless the caller orders all storage reuse on its streams.
+static int ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p, bool stream_ordered = false) {
     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
     p->call_count++;
 
-    if (pool_lapped) {
+    if (pool_lapped && !stream_ordered) {
         for (int i = 0; i < p->n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
             CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
@@ -1360,6 +1360,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                                    (uint64_t) GGML_CUDA_AR_MAX_BYTES);
     // Default 1: a reduce whose only reader is a scatter by rows sums each element only on the rank that reads it.
     p->host_owner_rows  = ggml_env_switch("GGML_CUDA_AR_HOST_OWNER_ROWS");
+    p->host_owner_stream_ordered = ggml_env_switch("GGML_CUDA_AR_HOST_OWNER_STREAM_ORDERED");
     p->reduce_owners    = ggml_env_switch("GGML_CUDA_AR_REDUCE_OWNERS");
     // Each thread of the gather reads its share of the peers' quarters one vector after another, and every read of the
     // mapped memory is a round trip on the bus: more blocks make fewer in a row. Every block waits for the same block of
@@ -1775,7 +1776,10 @@ static bool ggml_cuda_ar_allreduce_copy_n(
         ggml_cuda_ar_pipeline * p, ggml_backend_t * backends,
         T_src * const src_buf[GGML_CUDA_MAX_DEVICES], T_dst * const dst_buf[GGML_CUDA_MAX_DEVICES],
         const bool compute[GGML_CUDA_MAX_DEVICES], int64_t ne, size_t nbytes) {
-    const int slot = ggml_cuda_ar_acquire_slot(p);
+    const bool stream_ordered = owned_rows && p->host_owner_stream_ordered;
+    // All waits for this event generation are enqueued before the next call records it again.
+    // The previous receives release host_large; the previous add releases dev_tmp below.
+    const int slot = ggml_cuda_ar_acquire_slot(p, stream_ordered);
     // owned rows go in one piece: each rank takes its quarter of every row, which a byte range of the rows does not hold
     const size_t chunk_bytes = owned_rows ? nbytes : ggml_cuda_ar_chunk_bytes(p, nbytes);
     const size_t chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;

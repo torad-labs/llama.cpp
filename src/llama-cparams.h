@@ -64,6 +64,8 @@ struct llama_cparams {
     bool auto_finkling2;
     bool fused_inkling2_conv; // Inkling 2: each short convolution of a layer as one op (ggml_short_conv)
     bool auto_fconv;
+    bool fused_inkling2_loop_control; // Inkling 2 Loop: each controller of a looped layer as one op (ggml_loop_control)
+    bool auto_floopctl;
     bool no_perf;
     bool op_offload;
     bool kv_unified;

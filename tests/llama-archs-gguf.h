@@ -62,5 +62,6 @@ struct kv_writer {
     }
 };
 
-// the fixture of arch: with moe its MoE variant, with mtp its NextN layers, with at least n_layer_min layers
-gguf_context_ptr get_gguf_ctx(llm_arch arch, bool moe, bool mtp = false, uint32_t n_layer_min = 0);
+// the fixture of arch: with moe its MoE variant, with mtp its NextN layers, with at least n_layer_min layers;
+// loop_varying marks Inkling 2 Loop's loop.varying (a run-time pass count), where the default fixture is fixed
+gguf_context_ptr get_gguf_ctx(llm_arch arch, bool moe, bool mtp = false, uint32_t n_layer_min = 0, bool loop_varying = false);

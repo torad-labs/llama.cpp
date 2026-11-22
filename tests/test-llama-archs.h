@@ -33,3 +33,10 @@ int test_inkling_path(const std::string & path, size_t seed, ggml_backend_dev_t 
 
 // --inkling-window <device>: sessions of Inkling 2 that share one cache against each session alone, on dev
 int test_inkling_window(size_t seed, ggml_backend_dev_t dev);
+
+// --inkling-loop <device>: the run-time pass count of Inkling 2 Loop (counts, reuse, validation, sizing), on dev
+int test_inkling_loop(size_t seed, ggml_backend_dev_t dev);
+
+// --inkling-stack <devs>: Inkling 2's products of the Q input as one few-row launch against one launch each, on devs
+// (one device, or a tensor split over several)
+int test_inkling_stack(size_t seed, const std::vector<ggml_backend_dev_t> & devs);

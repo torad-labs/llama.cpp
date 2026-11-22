@@ -246,12 +246,65 @@ std::map<std::string, case_def> cases(size_t seed) {
     return ret;
 }
 
+bool compact_greedy(std::size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+    auto model = get_model(gguf.get(), nullptr, seed, 0.0f, devs, LLAMA_SPLIT_MODE_TENSOR);
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    auto reference = make_context(model.get(), {64, 2, 0});
+    auto candidate = make_context(model.get(), {64, 2, 0});
+    llama_set_output_candidates(candidate.get(), 3);
+    bool ok = true;
+    for (int pos = 0; pos < 6; ++pos) {
+        const bool compact = pos % 2 == 0;
+        ok = llama_set_seq_greedy_candidates(candidate.get(), 0) && ok;
+        if (compact) {
+            ok = llama_set_seq_greedy_candidates(candidate.get(), 1) && ok;
+        } else {
+            llama_set_seq_candidates(candidate.get(), 1, false);
+        }
+
+        llama_batch batch = llama_batch_init(2, 0, 1);
+        batch_add(batch, (13*pos + 5) % vocab, pos, {0}, true);
+        batch_add(batch, (19*pos + 7) % vocab, pos, {1}, true);
+        const int ref_rc = llama_decode(reference.get(), batch);
+        const int cand_rc = llama_decode(candidate.get(), batch);
+        llama_batch_free(batch);
+        if (ref_rc != 0 || cand_rc != 0) {
+            return false;
+        }
+        for (int row = 0; row < 2; ++row) {
+            const float * logits = llama_get_logits_ith(reference.get(), row);
+            const auto actual = llama_get_sampling_row_ith(candidate.get(), row);
+            if (!compact) {
+                ok = ok && actual.logits && std::equal(logits, logits + vocab, actual.logits);
+                continue;
+            }
+            if (actual.logits || actual.n_candidates != 3 || actual.n_sampled_logits != 3) {
+                return false;
+            }
+            std::vector<llama_token> ids(vocab);
+            for (int id = 0; id < vocab; ++id) { ids[id] = id; }
+            std::partial_sort(ids.begin(), ids.begin() + 3, ids.end(), [&](llama_token a, llama_token b) {
+                return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
+            });
+            for (int i = 0; i < 3; ++i) {
+                ok = ok && actual.candidates[i] == ids[i] && actual.sampled_logits[i] == logits[ids[i]];
+            }
+        }
+    }
+    fprintf(stderr, "%s compact greedy: padded head and mixed output batches\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 } // namespace
 
 int test_inkling_split(const std::string & name, size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
     if (devs.size() < 2) {
         fprintf(stderr, "inkling2 split %s: a tensor split needs two ranks, %zu given\n", name.c_str(), devs.size());
         return 1;
+    }
+    if (name == "compact-greedy") {
+        return compact_greedy(seed, devs) ? 0 : 1;
     }
     const auto all = cases(seed);
     const auto it = all.find(name);
@@ -304,5 +357,217 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
                 expected.memory[i].size(), m);
     }
     fprintf(stderr, "%s inkling2 split %s\n", ok ? "OK" : "FAIL", name.c_str());
+    return ok ? 0 : 1;
+}
+
+// Inkling 2 Loop's run-time pass count (LLAMA_LOOP_PASSES, llama_set_loop_passes, LLAMA_LOOP_PASSES_MAX): a count the
+// model's own gives the same logits and state the fixed build gives, a varying model runs the counts its slots hold,
+// every other way is refused, and a count change costs the graph its reuse. One device, the fixture of the loop arch
+int test_inkling_loop(size_t seed, ggml_backend_dev_t dev) {
+    bool ok = true;
+    const auto check = [&ok](bool held, const char * what) {
+        fprintf(stderr, "%s inkling2 loop %s\n", held ? "OK" : "FAIL", what);
+        ok = ok && held;
+    };
+    const auto refuses = [](const std::function<void()> & f) {
+        try {
+            f();
+            return false;
+        } catch (const std::exception &) {
+            return true;
+        }
+    };
+    const auto tokens = [&](uint32_t n, size_t salt) { return get_tokens(n, 128, seed + salt); };
+    // prefill 32 rows, then 4 steps: two graph shapes a same-count rerun of both reuses; a run starts from empty memory
+    const auto run = [&](llama_context * ctx, record & out) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+        decode_span(ctx, tokens(32, 10), 0, 0, out);
+        decode_steps(ctx, tokens(4, 11), 32, 0, out);
+    };
+
+    // the varying fixture loaded with slots for three passes, without, and the fixed one; one seed, so their weights
+    // agree tensor for tensor and a same-graph run may only differ as the backend is unsteady
+    set_env("LLAMA_LOOP_PASSES_MAX", "3");
+    llama_model_ptr vary_max = get_model(get_gguf_ctx(LLM_ARCH_INKLING2_LOOP, true, false, 0, true).get(), nullptr, seed, 0.0f, {dev});
+    set_env("LLAMA_LOOP_PASSES_MAX", nullptr);
+    llama_model_ptr vary     = get_model(get_gguf_ctx(LLM_ARCH_INKLING2_LOOP, true, false, 0, true).get(), nullptr, seed, 0.0f, {dev});
+    llama_model_ptr fixed    = get_model(get_gguf_ctx(LLM_ARCH_INKLING2_LOOP, true, false, 0, false).get(), nullptr, seed, 0.0f, {dev});
+    llama_model_ptr plain    = get_model(get_gguf_ctx(LLM_ARCH_INKLING2, true).get(), nullptr, seed, 0.0f, {dev});
+    const context_shape shape = {64, 1, 0};
+
+    // every count of the varying model runs, and a count's output differs from the next count's
+    record r1, r2, r3;
+    {
+        auto ctx = make_context(vary_max.get(), shape);
+        llama_set_loop_passes(ctx.get(), 1);
+        run(ctx.get(), r1);
+        llama_set_loop_passes(ctx.get(), 2);
+        run(ctx.get(), r2);
+        llama_set_loop_passes(ctx.get(), 3);
+        run(ctx.get(), r3);
+    }
+    // the fixture's weights are small, so a pass moves the logits by less than the tolerance: a count differs when it moves
+    // them past what a rerun of one count moves them (nothing on the CPU, the backend's unsteadiness on a GPU), with a floor
+    record r3_again;
+    {
+        auto ctx = make_context(vary_max.get(), shape);
+        llama_set_loop_passes(ctx.get(), 3);
+        run(ctx.get(), r3_again);
+    }
+    const double noise = nmse(r3_again.logits, r3.logits);
+    const double apart = std::max(1e-9, 100.0*noise);
+    fprintf(stderr, "inkling2 loop counts: %zu logits, NMSE 2 from 1 %g, 3 from 2 %g, a rerun of 3 from 3 %g\n",
+            r1.logits.size(), nmse(r2.logits, r1.logits), nmse(r3.logits, r2.logits), noise);
+    check(!r1.logits.empty() && nmse(r2.logits, r1.logits) > apart && nmse(r3.logits, r2.logits) > apart,
+            "counts 1, 2 and 3 run and differ");
+
+    // a decode reuses the graph of the count before it when the count is the same, and no graph crosses a count change
+    {
+        auto ctx = make_context(vary_max.get(), shape);
+        record discarded;
+        llama_set_loop_passes(ctx.get(), 2);
+        run(ctx.get(), discarded);
+        llama_perf_context_reset(ctx.get());
+        run(ctx.get(), discarded);   // same count, same shapes: both rows reused
+        const int same = llama_perf_context(ctx.get()).n_reused;
+        llama_set_loop_passes(ctx.get(), 1);
+        run(ctx.get(), discarded);   // the count changed: rebuilt, nothing reused
+        const int changed = llama_perf_context(ctx.get()).n_reused;
+        run(ctx.get(), discarded);   // settled at the new count: reused again
+        const int settled = llama_perf_context(ctx.get()).n_reused;
+        // a run is 5 decodes: the prefill, the first step (a shape of its own) and three steps of that shape. The same
+        // count reuses all 5 (the graphs are kept), a changed count rebuilds the prefill and the first step and reuses
+        // the other 3, and the settled count reuses all 5 again
+        fprintf(stderr, "inkling2 loop reuse: %d reused rerunning a count, then %d on a changed count, then %d settled\n",
+                same, changed - same, settled - changed);
+        check(same == 5 && changed - same == 3 && settled - changed == 5,
+                "graph reuse follows the count (rerun 5, changed count 3, settled 5)");
+    }
+
+    // the model's own count is the same logits the fixed build gives, with the count asked twice (LLAMA_LOOP_PASSES=2
+    // at the context) and with loop.varying (llama_set_loop_passes(2))
+    record ref_fixed, ref_env, ref_vary;
+    {
+        run(make_context(fixed.get(), shape).get(), ref_fixed);
+    }
+    {
+        set_env("LLAMA_LOOP_PASSES", "2");
+        run(make_context(fixed.get(), shape).get(), ref_env);
+        set_env("LLAMA_LOOP_PASSES", nullptr);
+    }
+    {
+        auto ctx = make_context(vary.get(), shape);
+        llama_set_loop_passes(ctx.get(), 2);
+        run(ctx.get(), ref_vary);
+    }
+    const double env_nmse   = nmse(ref_fixed.logits, ref_env.logits);
+    const double vary_nmse  = nmse(ref_fixed.logits, ref_vary.logits);
+    check(env_nmse <= tolerance && vary_nmse <= tolerance,
+            "the model's own count holds with LLAMA_LOOP_PASSES and on a varying model");
+
+    // reset (0) returns the context to the model's own count
+    record d, e, f;
+    {
+        auto ctx = make_context(vary.get(), shape);
+        run(ctx.get(), d);
+        llama_set_loop_passes(ctx.get(), 1);
+        run(ctx.get(), e);
+        llama_set_loop_passes(ctx.get(), 0);
+        run(ctx.get(), f);
+    }
+    check(nmse(d.logits, f.logits) <= tolerance && nmse(d.logits, e.logits) > apart,
+            "llama_set_loop_passes(0) resets to the model's own count");
+
+    // a fixed model refuses a count it was not trained for, unless LLAMA_LOOP_PASSES_ANY says run it untrained
+    {
+        auto ctx = make_context(fixed.get(), shape);
+        check(refuses([&] {
+            llama_set_loop_passes(ctx.get(), 1);
+            record discarded;
+            run(ctx.get(), discarded);
+        }), "a fixed model refuses one pass");
+        check(refuses([&] { record discarded; run(ctx.get(), discarded); }), "a fixed model refuses one pass again");
+        // the refusal is the context's to forget: the count allowed since, the same context runs it. A refused build must
+        // leave no graph behind for the next decode of the same shape to reuse
+        set_env("LLAMA_LOOP_PASSES_ANY", "1");
+        record recovered;
+        bool ran = true;
+        try {
+            run(ctx.get(), recovered);
+        } catch (const std::exception & err) {
+            fprintf(stderr, "inkling2 loop: the refused count did not run once allowed: %s\n", err.what());
+            ran = false;
+        }
+        set_env("LLAMA_LOOP_PASSES_ANY", nullptr);
+        const double recovered_nmse = ran ? nmse(recovered.logits, r1.logits) : INFINITY;
+        fprintf(stderr, "inkling2 loop: the count refused, then allowed, in one context: NMSE %g from the same count on a fresh one\n",
+                recovered_nmse);
+        check(ran && recovered_nmse <= tolerance, "a refused count runs in the same context once allowed");
+    }
+    {
+        set_env("LLAMA_LOOP_PASSES_ANY", "1");
+        auto ctx = make_context(fixed.get(), shape);
+        llama_set_loop_passes(ctx.get(), 1);
+        record untrained;
+        bool ran = true;
+        try {
+            run(ctx.get(), untrained);
+        } catch (const std::exception & err) {
+            fprintf(stderr, "inkling2 loop: LLAMA_LOOP_PASSES_ANY: %s\n", err.what());
+            ran = false;
+        }
+        set_env("LLAMA_LOOP_PASSES_ANY", nullptr);
+        // the fixed fixture's weights are the varying fixture's, tensor for tensor: one pass gives r1
+        check(ran && nmse(untrained.logits, r1.logits) <= tolerance, "LLAMA_LOOP_PASSES_ANY runs the untrained count");
+    }
+
+    // slots are built for the model's own count unless LLAMA_LOOP_PASSES_MAX raises them at load: three passes of the
+    // varying fixture refuse without the maximum, run with it, and the maximum leaves the default count's logits alone
+    {
+        auto ctx = make_context(vary.get(), shape);
+        check(refuses([&] {
+            llama_set_loop_passes(ctx.get(), 3);
+            record discarded;
+            run(ctx.get(), discarded);
+        }), "three passes refuse without LLAMA_LOOP_PASSES_MAX");
+    }
+    {
+        auto ctx = make_context(vary_max.get(), shape);
+        llama_set_loop_passes(ctx.get(), 3);
+        record with_max;
+        run(ctx.get(), with_max);
+        check(nmse(with_max.logits, r3.logits) <= tolerance, "LLAMA_LOOP_PASSES_MAX sizes the slots for three passes");
+    }
+
+    // the draft's layer taps read fixed cache slots: they refuse a count that is not the model's own, and run at it
+    {
+        auto ctx = make_context(vary_max.get(), shape);
+        llama_set_embeddings_layer_inp(ctx.get(), 0, true);
+        llama_set_embeddings_layer_inp_dev(ctx.get(), true);
+        check(refuses([&] {
+            llama_set_loop_passes(ctx.get(), 1);
+            record discarded;
+            run(ctx.get(), discarded);
+        }), "taps refuse a count the model's own");
+        bool ran = true;
+        try {
+            llama_set_loop_passes(ctx.get(), 0);
+            record tapped;
+            run(ctx.get(), tapped);
+        } catch (const std::exception & err) {
+            fprintf(stderr, "inkling2 loop: taps at the model's own count: %s\n", err.what());
+            ran = false;
+        }
+        check(ran, "taps run at the model's own count");
+    }
+
+    // a model without the loop refuses the setter at any count but the reset
+    {
+        auto ctx = make_context(plain.get(), shape);
+        check(refuses([&] { llama_set_loop_passes(ctx.get(), 1); }) && !refuses([&] { llama_set_loop_passes(ctx.get(), 0); }),
+                "a plain inkling2 refuses the setter");
+    }
+
+    fprintf(stderr, "%s inkling2 loop\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

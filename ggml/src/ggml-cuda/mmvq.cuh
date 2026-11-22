@@ -46,6 +46,16 @@ bool ggml_cuda_mul_mat_vec_q_moe_gate_fuses(const ggml_tensor * mm, const ggml_t
 int ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, bool feeds_fold,
     unsigned int * release_to = nullptr);
 
+// A group launch of mul_mat_vec_q: MUL_MATs of one src1 by weights of one type and row length, each of which
+// ggml_cuda_mul_mat_vec_q would run unfused on mul_mat_vec_q (Inkling 2's q, rel, sink, gate, k and v of one attention
+// input), as one launch over all their rows with src1 quantized once, each output the same bit for bit as its own
+// launch's. Up to MMVQ_GROUP_MAX of them; the weight types a group takes:
+#define MMVQ_GROUP_MAX 8
+bool ggml_cuda_mul_mat_vec_q_group_type(ggml_type type);
+
+// the n MUL_MATs dsts (2 to MMVQ_GROUP_MAX) as one launch; their weights are 2D, their outputs contiguous
+void ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n);
+
 // n MUL_MATs of src1 by the weights w[0..n) whose outputs dst concatenates in that order along dim 0 (KDA's q, k and v):
 // whether one mul_mat_vec_q launch runs them, the weights as its channels, which needs them one stride from each other.
 bool ggml_cuda_mul_mat_vec_q_concat_supported(const ggml_tensor * const * w, int n, const ggml_tensor * src1,

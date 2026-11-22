@@ -4,6 +4,7 @@
 #include "log.h"
 #include "llama.h"
 #include "ggml-backend.h"
+#include "inkling-replay.h"
 
 #include <cctype>
 #include <clocale>
@@ -96,6 +97,23 @@ int main(int argc, char ** argv) {
 
     common_init();
 
+    std::unique_ptr<inkling_replay> replay;
+    if (argc > 1 && std::string_view(argv[1]) == "--inkling-replay") {
+        if (argc < 5 || (std::string_view(argv[4]) != "full" && std::string_view(argv[4]) != "compact")) {
+            LOG_ERR("usage: %s --inkling-replay INPUT.json OUT full|compact [model and context args]\n", argv[0]);
+            return 1;
+        }
+        try {
+            replay = std::make_unique<inkling_replay>(argv[2], argv[3], std::string_view(argv[4]) == "compact");
+        } catch (const std::exception & e) {
+            LOG_ERR("inkling replay: %s\n", e.what());
+            return 1;
+        }
+        argv[4] = argv[0];
+        argv += 4;
+        argc -= 4;
+    }
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
@@ -110,7 +128,14 @@ int main(int argc, char ** argv) {
     params.warmup = false;
     std::unique_ptr<tensor_dump> dump;
     const char * dump_path = std::getenv("LLAMA_EVAL_DUMP");
-    if (dump_path) {
+    if (replay) {
+        try {
+            replay->configure(params);
+        } catch (const std::exception & e) {
+            LOG_ERR("inkling replay: %s\n", e.what());
+            return 1;
+        }
+    } else if (dump_path) {
         const char * filter = std::getenv("LLAMA_EVAL_FILTER");
         if (!filter || !filter[0]) {
             LOG_ERR("LLAMA_EVAL_DUMP requires LLAMA_EVAL_FILTER to select tensor names\n");
@@ -144,8 +169,18 @@ int main(int argc, char ** argv) {
         LOG_INF("\n");
     }
 
-    bool OK = run(ctx, params);
-    if (!OK || (dump && (dump->failed || dump->count == 0))) {
+    bool ok = false;
+    try {
+        if (replay) {
+            replay->run(ctx, params);
+            ok = true;
+        } else {
+            ok = run(ctx, params);
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("inkling replay: %s\n", e.what());
+    }
+    if (!ok || (dump && (dump->failed || dump->count == 0))) {
         return 1;
     }
 

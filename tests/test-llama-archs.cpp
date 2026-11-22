@@ -296,6 +296,11 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
             tmp16[i] = ggml_fp32_to_fp16(tmp[i]);
         }
         ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
+    } else if (ggml_is_quantized(tensor->type) && !ggml_quantize_requires_imatrix(tensor->type)) {
+        // a fixture that declares a weight's type in its metadata (test_inkling_stack)
+        std::vector<uint8_t> q(ggml_nbytes(tensor));
+        ggml_quantize_chunk(tensor->type, tmp.data(), q.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+        ggml_backend_tensor_set(tensor, q.data(), 0, q.size());
     } else {
         GGML_ABORT("fatal error");
     }
@@ -318,6 +323,8 @@ static void usage(char ** argv) {
     LOG("                           kv-q8_0, kv-q4_0 or kv-split, in prompt, decode, unified or streams\n");
     LOG("  --inkling-path-device <dev>  The device of that case (default: CUDA0)\n");
     LOG("  --inkling-window <dev>   Compare Inkling 2 sessions that share one cache with each session alone, on <dev>\n");
+    LOG("  --inkling-loop <dev>     Test the run-time pass count of Inkling 2 Loop (counts, reuse, validation, slot sizing) on <dev>\n");
+    LOG("  --inkling-stack <devs>   Compare Inkling 2's Q-input products as one launch with one launch each, on <devs> (two: -sm tensor)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -4405,6 +4412,8 @@ int main(int argc, char ** argv) {
     std::string inkling_split, inkling_device; // --inkling-split <case> on --inkling-split-device's ranks, as above
     std::string inkling_path, inkling_path_device; // --inkling-path <feature>/<case> on --inkling-path-device
     std::string inkling_window; // --inkling-window <device>
+    std::string inkling_loop; // --inkling-loop <device>
+    std::string inkling_stack; // --inkling-stack <devs>
     bool glm_alias_only = false;
     bool glm_kpool_only = false;
     bool glm_nextn_only = false;
@@ -4452,6 +4461,16 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--inkling-window") == 0) {
             if (i + 1 == argc) return 1;
             inkling_window = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--inkling-loop") == 0) {
+            if (i + 1 == argc) return 1;
+            inkling_loop = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--inkling-stack") == 0) {
+            if (i + 1 == argc) return 1;
+            inkling_stack = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--glm-shared-buffers-device") == 0) { // the tensor split's ranks, as --glm-tensor-device
@@ -4603,6 +4622,22 @@ int main(int argc, char ** argv) {
             const auto device = ggml_backend_dev_by_name(inkling_window.c_str());
             if (!device) throw std::runtime_error("Inkling window device is unavailable: " + inkling_window);
             return test_inkling_window(seed, device);
+        }
+        if (!inkling_loop.empty()) {
+            ggml_backend_load_all();
+            const auto device = ggml_backend_dev_by_name(inkling_loop.c_str());
+            if (!device) throw std::runtime_error("Inkling loop device is unavailable: " + inkling_loop);
+            return test_inkling_loop(seed, device);
+        }
+        if (!inkling_stack.empty()) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> ranks;
+            for (const auto & name : string_split<std::string>(inkling_stack, ',')) {
+                const auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) throw std::runtime_error("Inkling stack device is unavailable: " + name);
+                ranks.push_back(device);
+            }
+            return test_inkling_stack(seed, ranks);
         }
         if (!shared_device.empty()) {
             ggml_backend_load_all();

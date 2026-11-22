@@ -444,6 +444,7 @@ extern "C" {
         GGML_OP_NORM_CLIP,
         GGML_OP_ATTN_RES_MIX,
         GGML_OP_SHORT_CONV,
+        GGML_OP_LOOP_CONTROL,
 
         GGML_OP_SLEEP,
 
@@ -2276,6 +2277,16 @@ extern "C" {
             int                   k,
             int                   n_parts);
 
+    // Like top_k_candidates, but only the first n_vocab columns are valid. For a strict greedy scan in token order,
+    // first_nan keeps a NaN at global ID 0 as the highest-ranked record (the scan never replaces its initial NaN).
+    GGML_API struct ggml_tensor * ggml_top_k_candidates_bounded(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            int                   n_parts,
+            int                   n_vocab,
+            bool                  first_nan);
+
     // y = a*scale (scale broadcast over a, optional), each row of y scaled down to an L2 norm of at most threshold:
     // y * min(1, threshold/(|y| + eps))
     GGML_API struct ggml_tensor * ggml_norm_clip(
@@ -2296,6 +2307,21 @@ extern "C" {
             struct ggml_tensor ** sources,
             int                   n_sources,
             float                 scale,
+            float                 eps);
+
+    // a looped layer's controller: a cross-pass message mixed into its input, gated on both (Inkling 2 Loop). For token t,
+    // with r = rms_norm(cur[:, t], eps) ++ rms_norm(message[:, t], eps) and z = down r,
+    // out[:, t] = cur - tanh(forget z)*cur + tanh(gain z)*message
+    //   cur, message: [n_embd, n_tokens] f32, rows contiguous
+    //   down:         [2*n_embd, rank]; gain, forget: [rank, n_embd]; each f32, f16, bf16 or a quantized type
+    //   result:       [n_embd, n_tokens] f32
+    GGML_API struct ggml_tensor * ggml_loop_control(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * message,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * gain,
+            struct ggml_tensor  * forget,
             float                 eps);
 
     // a depthwise short convolution with its residual, over the window of its state and the current rows: for channel c,

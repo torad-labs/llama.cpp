@@ -4,7 +4,7 @@
 #include <cinttypes>
 #include <cstring>
 
-gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp, const uint32_t n_layer_min) {
+gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp, const uint32_t n_layer_min, const bool loop_varying) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -518,7 +518,7 @@ gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mt
             ms.add_kv(LLM_KV_LOOP_END,       uint32_t(2));
             ms.add_kv(LLM_KV_LOOP_COUNT,     uint32_t(2));
             ms.add_kv(LLM_KV_LOOP_GATE_RANK, uint32_t(8));
-            ms.add_kv(LLM_KV_LOOP_VARYING,   false);
+            ms.add_kv(LLM_KV_LOOP_VARYING,   loop_varying);
         }
         ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(4));
         ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab + 2);

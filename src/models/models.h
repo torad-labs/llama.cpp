@@ -2636,7 +2636,9 @@ struct llama_model_inkling2 : public llama_model_base {
                 std::vector<ggml_tensor *> & windows, int il);
         ggml_tensor * convolve_hidden(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * history, int64_t offset,
                 std::vector<ggml_tensor *> & windows, int il);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        // a controller of a looped layer: one op (cparams.fused_inkling2_loop_control, when its conditions hold), or its
+        // elementwise graph
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl, int il);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2649,7 +2651,7 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         // the output mix, the head and the logits; a state_only graph ends before them
-        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks, bool candidates_only = false);
 
         llm_graph_input_attn_kv_iswa * attn = nullptr;
         llm_graph_input_rs           * recr = nullptr;
@@ -2668,6 +2670,8 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * rel_idx[2]  = {};
         int32_t       n_kv_max[2] = {};
         bool          low_mean[2] = {};
+        // the runs of cells the global layers read (LLAMA_INKLING2_KV_RUNS), or nullptr
+        ggml_tensor * kv_runs = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -2689,15 +2693,19 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     int      n_phys     = 0;
     uint32_t core_start = 0;
     uint32_t core_end   = 0;
-    uint32_t n_passes   = 0;
+    uint32_t n_passes   = 0; // the GGUF's loop.count: the trained count, and the default a decode runs
+    uint32_t n_passes_max = 0; // the count the cache slots are built for: the GGUF's, or more under LLAMA_LOOP_PASSES_MAX
     uint32_t gate_rank  = 0;
     bool     varying    = false; // trained for a varying number of passes
 
     // indexed by physical layer - core_start
     std::vector<loop_layer> loop_layers;
 
+    // the passes a decode with these graph parameters runs, or an exception for a count this model cannot run
+    uint32_t passes_for(const llm_graph_params & params) const;
+
     struct graph : public llama_model_inkling2::graph {
-        graph(const llm_graph_params & params);
+        graph(const llm_graph_params & params, uint32_t passes);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

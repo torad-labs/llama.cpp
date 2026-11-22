@@ -120,10 +120,10 @@ class SearchRuns(unittest.TestCase):
 
     @classmethod
     def search(cls, verb, *options, env=None):
-        words = {"run": ["--profile", "tensor-4-draft", "--server", str(cls.server), "--port", "18103", "--tokens", "24",
+        words = {"run": ["--profile", "tensor-4", "--option=--draft", "--server", str(cls.server), "--port", "18103", "--tokens", "24",
                          "--rounds", "2", "--tuned", os.devnull, "--knob=--draft-depth=5,7", "--knob=LLAMA_SAMPLE_THREADS=1,8"],
                  "log": ["--experiment", "inkling2/decode"],
-                 "apply": ["--profile", "tensor-4-draft", "--tuned", str(cls.tuned)]}[verb]
+                 "apply": ["--profile", "tensor-4", "--tuned", str(cls.tuned)]}[verb]
         return subprocess.run([sys.executable, search.__file__, verb, "--out", str(cls.out), *words, *options],
                               env=env or cls.env, capture_output=True, text=True)
 
@@ -181,14 +181,15 @@ class SearchRuns(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stderr)
 
         def plan(*options):
-            return serve.make_plan(serve.arguments(["--profile", "tensor-4-draft", "--tuned", str(self.tuned), *options]))
+            return serve.make_plan(serve.arguments(["--profile", "tensor-4", "--draft", "--tuned", str(self.tuned), *options]))
 
         argv, env = plan()
         self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], "5")
         self.assertEqual(env["LLAMA_SAMPLE_THREADS"], "8")
         argv, _ = plan("--draft-depth", "2")
         self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], "2")
-        _, env = serve.make_plan(serve.arguments(["--profile", "tensor-4", "--tuned", str(self.tuned)]))
+        # the kept settings come from the tuned file alone
+        _, env = serve.make_plan(serve.arguments(["--profile", "tensor-4", "--draft", "--tuned", os.devnull]))
         self.assertNotIn("LLAMA_SAMPLE_THREADS", env)
 
 
@@ -221,7 +222,7 @@ class SearchSpace(unittest.TestCase):
         for name, values in search.SPACE.items():
             for value in values:
                 if name.startswith("--"):
-                    serve.make_plan(serve.arguments(["--profile", "tensor-4-draft", "--tuned", os.devnull,
+                    serve.make_plan(serve.arguments(["--profile", "tensor-4", "--draft", "--tuned", os.devnull,
                                                      *serve.option_words(name, value)]))
                     continue
                 knob = registry[name]

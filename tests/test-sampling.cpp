@@ -825,6 +825,33 @@ static void test_chain_sample_row() {
     llama_sampler_free(bare);
 }
 
+static void test_greedy_static_exclusions() {
+    const llama_logit_bias deny[] = {{1, -INFINITY}, {1, -INFINITY}, {3, -INFINITY}};
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_logit_bias(5, 3, deny));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(0));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_temp_ext(0.0f, 0.0f, 1.0f));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+    GGML_ASSERT(llama_sampler_chain_greedy_candidates(chain.get()) == 3);
+
+    llama_token_data full[] = {{0, 0.5f, 0}, {1, 2.0f, 0}, {2, 0.5f, 0}, {3, 3.0f, 0}, {4, -0.0f, 0}};
+    llama_token_data cut[] = {full[0], full[1], full[3]};
+    llama_token_data_array a = {full, 5, -1, false};
+    llama_token_data_array b = {cut, 3, -1, false};
+    llama_sampler_apply(chain.get(), &a);
+    llama_sampler_apply(chain.get(), &b);
+    GGML_ASSERT(a.data[a.selected].id == 0 && b.data[b.selected].id == 0);
+
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(2));
+    GGML_ASSERT(llama_sampler_chain_greedy_candidates(chain.get()) == 0);
+
+    const llama_logit_bias boost = {1, 1.0f};
+    llama_sampler_ptr transform(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(transform.get(), llama_sampler_init_logit_bias(5, 1, &boost));
+    llama_sampler_chain_add(transform.get(), llama_sampler_init_greedy());
+    GGML_ASSERT(llama_sampler_chain_greedy_candidates(transform.get()) == 0);
+}
+
 int main(void) {
     ggml_time_init();
 
@@ -916,6 +943,7 @@ int main(void) {
     test_sampler_queue(10000, "mkp", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mpk", 100, 0.8f, 0.1f);
 
+    test_greedy_static_exclusions();
     test_top_k_candidates_exact();
     test_top_k_penalties_candidates_boundary();
     test_top_k_penalties_candidates_random();

@@ -512,7 +512,9 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool 
     bool ok = true;
     for (variant v : {normal, serial_receive, extra_reader, extra_cont_reader, narrower, unequal, q8, grouped, drafted}) {
         std::vector<float> baseline;
-        for (bool enabled : {false, true}) {
+        for (int mode = 0; mode < (card ? 2 : 3); ++mode) {
+            const bool enabled = mode != 0;
+            set_env("GGML_CUDA_AR_HOST_OWNER_STREAM_ORDERED", mode == 2 ? "1" : "0");
             set_env("GGML_CUDA_AR_HOST_OWNER_ROWS", enabled && !card ? "1" : "0");
             set_env("GGML_CUDA_AR_REDUCE_OWNERS", card && !enabled ? "0" : nullptr);
             set_env("GGML_CUDA_AR_WIRE_Q8", v == q8 ? "1" : "0");
@@ -533,25 +535,31 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool 
                 for (float & x : data) { x = float(int(rng() % 10001) - 5000) / 7417.0f; }
                 ggml_backend_tensor_set(w, data.data(), 0, ggml_nbytes(w));
             }
-            ggml_context * ctx = ggml_init({32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+            const int depth = !card && (v == normal || v == serial_receive) ? 6 : 1;
+            ggml_context * ctx = ggml_init({32 * depth * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+            auto * graph = ggml_new_graph(ctx);
             const int rows = v == narrower ? 22 : v == grouped ? 24 : v == drafted ? 92 : 23;
             const int per_seq = v == grouped ? 2 : v == drafted ? 4 : 1;
-            auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, rows);
-            ggml_set_input(x);
-            auto * partial = ggml_mul_mat(ctx, down, ggml_mul_mat(ctx, up, x));
-            auto * r = ggml_reshape_3d(ctx, partial, 4608, per_seq, rows/per_seq);
-            auto * c = ggml_cont(ctx, ggml_permute(ctx, r, 2, 0, 1, 3));
-            const int64_t counts[] = {1152 + (v == unequal), 1152 - (v == unequal), 1152, 1152};
-            auto * scatter = ggml_backend_meta_scatter(ctx, c, 2, counts, 4);
-            auto * out = ggml_scale(ctx, ggml_cont(ctx, ggml_permute(ctx, scatter, 1, 2, 0, 3)), 0.5f);
-            ggml_set_output(out);
-            auto * graph = ggml_new_graph(ctx);
-            ggml_build_forward_expand(graph, out);
-            auto * extra = (v == extra_reader || v == extra_cont_reader)
-                ? ggml_scale(ctx, v == extra_reader ? partial : c, 0.25f) : nullptr;
-            if (extra) {
-                ggml_set_output(extra);
-                ggml_build_forward_expand(graph, extra);
+            std::vector<ggml_tensor *> inputs, outputs;
+            for (int layer = 0; layer < depth; ++layer) {
+                auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, rows);
+                ggml_set_input(x);
+                inputs.push_back(x);
+                auto * partial = ggml_mul_mat(ctx, down, ggml_mul_mat(ctx, up, x));
+                auto * r = ggml_reshape_3d(ctx, partial, 4608, per_seq, rows/per_seq);
+                auto * c = ggml_cont(ctx, ggml_permute(ctx, r, 2, 0, 1, 3));
+                const int64_t counts[] = {1152 + (v == unequal), 1152 - (v == unequal), 1152, 1152};
+                auto * scatter = ggml_backend_meta_scatter(ctx, c, 2, counts, 4);
+                auto * out = ggml_scale(ctx, ggml_cont(ctx, ggml_permute(ctx, scatter, 1, 2, 0, 3)), 0.5f);
+                ggml_set_output(out);
+                ggml_build_forward_expand(graph, out);
+                outputs.push_back(out);
+                if (v == extra_reader || v == extra_cont_reader) {
+                    auto * extra = ggml_scale(ctx, v == extra_reader ? partial : c, 0.25f);
+                    ggml_set_output(extra);
+                    ggml_build_forward_expand(graph, extra);
+                    outputs.push_back(extra);
+                }
             }
             auto * cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
             ggml_backend_t backends[] = {backend, cpu};
@@ -560,12 +568,13 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool 
             std::vector<float> actual;
             const int replayed = replays;
             for (int iter = 0; iter < 4; ++iter) {
-                std::vector<float> input(ggml_nelements(x));
-                for (float & a : input) { a = float(int(rng() % 2001) - 1000) / 724.0f; }
-                ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+                for (auto * x : inputs) {
+                    std::vector<float> input(ggml_nelements(x));
+                    for (float & a : input) { a = float(int(rng() % 2001) - 1000) / 724.0f; }
+                    ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+                }
                 GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
-                for (auto * result : {out, extra}) {
-                    if (!result) { continue; }
+                for (auto * result : outputs) {
                     const size_t at = actual.size();
                     actual.resize(at + ggml_nelements(result));
                     ggml_backend_tensor_get(result, actual.data() + at, 0, ggml_nbytes(result));
@@ -583,13 +592,15 @@ static bool test_hidden_owner_rows(std::array<ggml_backend_dev_t, 4> devs, bool 
             const bool selected = enabled && (v == normal || v == serial_receive || v == narrower || v == grouped || v == drafted ||
                 (card && v == q8));
             const bool same = !enabled || (actual.size() == baseline.size() && !memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)));
-            const bool pass = same && reductions_to_owners - owners == (selected ? queued : 0u) && reductions_to_all - full == (selected ? 0u : queued);
+            const unsigned calls = depth * queued;
+            const bool pass = same && reductions_to_owners - owners == (selected ? calls : 0u) && reductions_to_all - full == (selected ? 0u : calls);
             if (!enabled) { baseline = std::move(actual); }
-            printf("%s hidden owner rows route=%s mode=%d enabled=%d owned=%llu full=%llu replays=%u same=%d\n", pass ? "ok" : "FAIL",
-                   card ? "card" : "host", int(v), enabled, reductions_to_owners - owners, reductions_to_all - full, 4 - queued, same);
+            printf("%s hidden owner rows route=%s variant=%d mode=%d owned=%llu full=%llu replays=%u same=%d\n", pass ? "ok" : "FAIL",
+                   card ? "card" : "host", int(v), mode, reductions_to_owners - owners, reductions_to_all - full, 4 - queued, same);
             ok = ok && pass;
         }
     }
+    set_env("GGML_CUDA_AR_HOST_OWNER_STREAM_ORDERED", nullptr);
     return ok;
 }
 
@@ -1406,7 +1417,7 @@ static ggml_backend_meta_split_state split_candidate_logits(const ggml_tensor *,
 }
 
 static bool test_candidates(ggml_backend_dev_t device, int vocab, int rows, int k, int split_axis,
-                            const std::array<int64_t, 4> & shards, bool benchmark = false) {
+                            const std::array<int64_t, 4> & shards, bool benchmark = false, int valid = 0, bool greedy = false) {
     const int captured_before = captured;
     ggml_backend_dev_t devs[] = {device, second_device(device), device, second_device(device)};
     auto layout = shards;
@@ -1425,7 +1436,8 @@ static bool test_candidates(ggml_backend_dev_t device, int vocab, int rows, int 
         ggml_backend_meta_split_input(logits, split_axis, shards.data(), shards.size());
     }
     const int parts = split_axis == 0 || split_axis < 0 ? 4 : 1;
-    ggml_tensor * out = ggml_top_k_candidates(ctx, logits, k, parts);
+    ggml_tensor * out = ggml_top_k_candidates_bounded(ctx, logits, k, parts, valid, greedy);
+    valid = valid ? valid : vocab;
     ggml_set_output(out);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
@@ -1439,7 +1451,7 @@ static bool test_candidates(ggml_backend_dev_t device, int vocab, int rows, int 
 
     std::vector<float> values(size_t(vocab)*rows);
     std::vector<uint64_t> records(size_t(k)*parts*rows);
-    std::vector<int> expected(vocab);
+    std::vector<int> expected(valid);
     bool ok = true;
     for (int iteration = 0; iteration < 6; ++iteration) {
         std::mt19937 rng(1234 + iteration);
@@ -1454,6 +1466,10 @@ static bool test_candidates(ggml_backend_dev_t device, int vocab, int rows, int 
             values[vocab/2] = INFINITY;
             values.back() = -INFINITY;
         }
+        for (int row = 0; row < rows; ++row) {
+            // Padding must not win even when a padded score is larger than every served score.
+            std::fill(values.begin() + size_t(row)*vocab + valid, values.begin() + size_t(row+1)*vocab, INFINITY);
+        }
         ggml_backend_tensor_set_async(backend, logits, values.data(), 0, ggml_nbytes(logits));
         GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
         for (int row = 0; row < rows; ++row) {
@@ -1465,10 +1481,11 @@ static bool test_candidates(ggml_backend_dev_t device, int vocab, int rows, int 
         for (int row = 0; row < rows; ++row) {
             const float * src = values.data() + size_t(row)*vocab;
             auto better = [&](int a, int b) {
+                if (greedy && std::isnan(src[0]) && (a == 0 || b == 0)) { return a != b && a == 0; }
                 if (std::isnan(src[a]) != std::isnan(src[b])) { return !std::isnan(src[a]); }
                 return src[a] > src[b] || (!(src[a] < src[b]) && a < b);
             };
-            for (int i = 0; i < vocab; ++i) { expected[i] = i; }
+            for (int i = 0; i < valid; ++i) { expected[i] = i; }
             std::sort(expected.begin(), expected.end(), better);
             std::vector<int> actual;
             int first = 0;
@@ -1479,7 +1496,7 @@ static bool test_candidates(ggml_backend_dev_t device, int vocab, int rows, int 
                     const uint64_t record = records[(size_t(row)*parts + part)*k + c];
                     const int32_t id = int32_t(uint32_t(record));
                     if (id == -1) { continue; }
-                    if (id < first || id >= first + width) { ok = false; continue; }
+                    if (id < first || id >= first + width || id >= valid) { ok = false; continue; }
                     uint32_t bits;
                     memcpy(&bits, &src[id], sizeof(bits));
                     ok = ok && uint32_t(record >> 32) == bits;
@@ -1487,7 +1504,7 @@ static bool test_candidates(ggml_backend_dev_t device, int vocab, int rows, int 
                     part_ids.push_back(id);
                 }
                 std::sort(part_ids.begin(), part_ids.end(), better);
-                ok = ok && int(part_ids.size()) == std::min(k, width);
+                ok = ok && int(part_ids.size()) == std::min(k, std::max(0, std::min(width, valid - first)));
                 size_t pos = 0;
                 for (int id : expected) {
                     if (id >= first && id < first + width && pos < part_ids.size()) {
@@ -1498,7 +1515,7 @@ static bool test_candidates(ggml_backend_dev_t device, int vocab, int rows, int 
             }
             std::sort(actual.begin(), actual.end(), better);
             ok = ok && std::adjacent_find(actual.begin(), actual.end()) == actual.end();
-            const int winners = std::min(k, vocab);
+            const int winners = std::min(k, valid);
             ok = ok && actual.size() >= size_t(winners);
             for (int i = 0; i < winners && i < int(actual.size()); ++i) { ok = ok && actual[i] == expected[i]; }
         }
@@ -1542,6 +1559,8 @@ static bool test_candidates_all(ggml_backend_dev_t device) {
         ok = test_candidates(device, 8193, 3, k, 0, {0, 8190, 2, 1}) && ok;
         ok = test_candidates(device, 257, 8, k, 1, {1, 0, 2, 5}) && ok;
     }
+    ok = test_candidates(device, 17, 3, 1, 0, {0, 13, 0, 4}, false, 9, true) && ok;
+    ok = test_candidates(device, 201024, 23, 3, 0, {50256, 50256, 50256, 50256}, false, 200058, true) && ok;
     ok = test_candidates(device, 8193, 3, 296, -1, {}) && ok;
     ok = test_candidates(device, 17001, 3, 5000, -1, {}) && ok;
     for (int rows : {1, 23, 69}) {

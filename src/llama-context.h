@@ -163,6 +163,7 @@ struct llama_context {
     bool set_ctx_state_src(llama_context * ctx_src);
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
+    void set_loop_passes(int32_t passes);
     bool mtp_draft_step(int32_t step);
     bool set_mtp_graph_reuse(int32_t n_max);
     void set_causal_attn(bool value);
@@ -339,6 +340,7 @@ public:
 
     void set_output_candidates(int32_t k);
     void set_seq_candidates(llama_seq_id seq_id, bool enable);
+    bool set_seq_greedy_candidates(llama_seq_id seq_id);
 
     // the MTP store (llama-ext.h): this context is the target, head its MTP head
     bool    nextn_bind(llama_context & head, int32_t n_keep);
@@ -497,7 +499,7 @@ private:
     // output rows as their largest logits (llama_set_output_candidates): a decode reads the records
     // ggml_top_k_candidates packed for a row, and the row's first reader cuts them to the k largest
     struct candidates_info {
-        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_DRAFT_RECORDS, ROW_CUT };
+        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_DRAFT_RECORDS, ROW_GREEDY_RECORDS, ROW_CUT };
 
         buffer_view<int64_t>     records = {nullptr, 0}; // [n_outputs][n_record]
         buffer_view<float>       logits  = {nullptr, 0}; // [n_outputs][k], the largest first
@@ -511,7 +513,7 @@ private:
 
         std::vector<uint64_t> keys; // scratch of a cut
 
-        std::set<llama_seq_id> seqs; // sequences whose rows are read as candidates
+        std::map<llama_seq_id, bool> seqs; // true for strict greedy, false for ordinary top-k
     };
 
     candidates_info cand;
@@ -609,6 +611,10 @@ private:
     const size_t graph_slots_max = (size_t) ggml_env_int("LLAMA_GRAPH_SLOTS");
     // LLAMA_GRAPH_ANY_SEQS=1, read when the context is made (llm_graph_params::any_seqs)
     const bool graph_any_seqs = ggml_env_switch("LLAMA_GRAPH_ANY_SEQS");
+    // the loop's active pass count (Inkling 2 loop), read when the context is made (llm_graph_params::loop_passes), and
+    // settable through llama_set_loop_passes(). 0: the model's own count. One count for the life of the cache's
+    // sequences: cells written at one count leave the later slots empty for a lower one, and stale for a higher one.
+    uint32_t loop_passes = ggml_env_int("LLAMA_LOOP_PASSES");
     // LLAMA_PROMPT_SHAPES=1, read when the context is made: a ubatch of one sequence and a power of two of rows above
     // graph_slot_max_tokens, up to llama_prompt_shape_max(), keeps its graph in a slot as well. These are the ubatches
     // the batch allocator makes of a prompt's rows with the switch (llama_batch_allocr::split_equal), so a prompt read

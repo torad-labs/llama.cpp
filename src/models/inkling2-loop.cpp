@@ -21,7 +21,12 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error(format("inkling2_loop: invalid loop core [%u, %u) with block size %u, %u passes or gate rank %u for %d layers",
                 core_start, core_end, block, n_passes, gate_rank, n_phys));
     }
-    const size_t n_slot = n_phys + (size_t) (n_passes - 1)*(core_end - core_start);
+    // the slots are built for the maximum pass count: the active count (LLAMA_LOOP_PASSES, or the context's setter) picks
+    // how many a decode runs, and everything a run-time count stands on -- the slots, their per-layer hparams and the
+    // weight aliases -- is sized here. 0: the GGUF's loop.count. A maximum under the trained count would break it.
+    n_passes_max = std::max(n_passes, (uint32_t) std::max<int64_t>(0, ggml_env_int("LLAMA_LOOP_PASSES_MAX")));
+
+    const size_t n_slot = n_phys + (size_t) (n_passes_max - 1)*(core_end - core_start);
     if (n_slot > LLAMA_MAX_LAYERS) {
         throw std::runtime_error(format("inkling2_loop: %zu cache slots exceed the maximum of %d", n_slot, LLAMA_MAX_LAYERS));
     }
@@ -70,10 +75,36 @@ void llama_model_inkling2_loop::post_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(params);
+    // a count the model cannot run is refused before the graph context exists: the context takes the parameters into
+    // the result as it is made, and a result left holding a refused build's parameters and no inputs is one the next
+    // decode with the same parameters reuses (a retained graph's slot), and computes empty
+    const uint32_t passes = passes_for(params);
+    return std::make_unique<graph>(params, passes);
 }
 
-llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama_model_inkling2::graph(params, no_build{}) {
+uint32_t llama_model_inkling2_loop::passes_for(const llm_graph_params & params) const {
+    // the model's own count unless the context set another (LLAMA_LOOP_PASSES). A count the model was not trained for
+    // needs loop.varying or LLAMA_LOOP_PASSES_ANY, and the draft's layer taps read fixed slots, so they need the
+    // model's own count.
+    const uint32_t passes = params.loop_passes ? params.loop_passes : n_passes;
+    if (passes != n_passes) {
+        if (passes == 0 || passes > n_passes_max) {
+            throw std::runtime_error(format("inkling2_loop: %u passes requested, the cache holds slots for %u (the model's own count: %u)",
+                    passes, n_passes_max, n_passes));
+        }
+        if (!varying && !ggml_env_switch("LLAMA_LOOP_PASSES_ANY")) {
+            throw std::runtime_error(format("inkling2_loop: %u passes requested of a fixed-loop model (loop.varying false, its own count: %u); set LLAMA_LOOP_PASSES_ANY=1 to run it untrained",
+                    passes, n_passes));
+        }
+        if (params.layer_inp_dev) {
+            throw std::runtime_error(format("inkling2_loop: the draft's layer taps read fixed cache slots, so a decode cannot run %u passes (the model's own count: %u)",
+                    passes, n_passes));
+        }
+    }
+    return passes;
+}
+
+llama_model_inkling2_loop::graph::graph(const llm_graph_params & params, uint32_t passes) : llama_model_inkling2::graph(params, no_build{}) {
     const auto & m = static_cast<const llama_model_inkling2_loop &>(model);
     const int start = m.core_start;
     const int end   = m.core_end;
@@ -87,7 +118,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     // every pass starts from the prelude output
     auto * prelude = cur;
     const auto prelude_blocks = blocks;
-    for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
+    for (uint32_t pass = 0; pass < passes; ++pass) {
         // the bank of the previous pass: its blocks after the first core block, and its output
         std::vector<ggml_tensor *> bank;
         ggml_tensor * bank_out = nullptr;

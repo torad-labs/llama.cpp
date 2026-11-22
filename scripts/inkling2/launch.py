@@ -14,7 +14,7 @@ import serve
 
 split = sys.argv.index("--")
 wrap, settings = sys.argv[1:split], dict(word.rsplit("=", 1) for word in sys.argv[split + 1:])
-base = ["--profile", "tensor-4-draft", "--server", os.environ["SERVER"], "--port", "8103", "--tuned", os.devnull,
+base = ["--profile", "tensor-4", "--draft", "--server", os.environ["SERVER"], "--port", "8103", "--tuned", os.devnull,
         "--packs", os.environ["PACKS"]]
 argv, env = search.plan(base, settings)
 argv = serve.glm53.resolve_server_arguments(argv, env)

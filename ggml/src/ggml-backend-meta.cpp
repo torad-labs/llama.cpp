@@ -1318,7 +1318,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
         const bool kv_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
         GGML_ASSERT(kv_split || kv_mirrored);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        // with query sinks src[4] is the runs of the cells the rows see (ggml_flash_attn_ext_set_kv_runs), every device's
+        GGML_ASSERT(tensor->src[4] == nullptr ||
+                src_ss[4].axis == (tensor->src[9] ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_0));
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 

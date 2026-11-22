@@ -15,6 +15,7 @@ struct llama_model;
 struct llama_context;
 
 class llama_kpool_views;
+class llama_kv_runs;
 
 // GLM-5-Next pooled-key cache: the sequences whose cached pooled keys a position mutation left stale. Pools group cells by
 // absolute position, so seq_add or seq_div regroups them while every cached key still looks complete. A ubatch holding a
@@ -326,6 +327,12 @@ public:
     // the position of each cell in the ubatch's streams, -1 for an empty cell: [n_kv, n_stream]
     void set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // whether the runs of cells of each row's sequence (llama-kv-runs.h) fit n_max a row: a cache of one stream that owns
+    // its cells, whose change log nothing else takes
+    bool kv_runs_fit(const llama_ubatch & ubatch, uint32_t n_max) const;
+    // the runs input of ggml_flash_attn_ext_set_kv_runs, after kv_runs_fit said yes to the ubatch
+    void set_input_kv_runs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
@@ -365,6 +372,9 @@ private:
     mutable llama_kpool_stale kpool_stale;
 
     mutable std::shared_ptr<llama_kpool_views> kpool_views;
+
+    // the runs of cells a decode step reads (kv_runs_fit), made at the first call
+    mutable std::shared_ptr<llama_kv_runs> kv_runs;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;

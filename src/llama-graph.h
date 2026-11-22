@@ -55,6 +55,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN_REL_POS,
     LLM_FUSED_OP_INKLING2_LAYER,
     LLM_FUSED_OP_INKLING2_CONV,
+    LLM_FUSED_OP_INKLING2_LOOP_CONTROL,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
@@ -947,6 +948,10 @@ struct llm_graph_params {
 
     llm_graph_nextn nextn;
 
+    // the loop's active pass count (Inkling 2 loop; 0: the model's own). Part of the topology: a graph is built, kept and
+    // reused per count.
+    uint32_t loop_passes = 0;
+
     // LLAMA_GRAPH_ANY_SEQS=1 with one stream for every sequence (a unified cache on one device a sequence): a graph
     // built for one set of sequences is computed for any other set of as many, each input checking what it holds of the
     // set (the recurrent states' cells: llama_memory_recurrent's relocate; the pooled keys' streams:
@@ -1033,6 +1038,10 @@ struct llm_graph_params {
 
         if (nextn.mode != other.nextn.mode || nextn.store != other.nextn.store) {
             return reject("nextn_store");
+        }
+
+        if (loop_passes != other.loop_passes) {
+            return reject("loop_passes");
         }
 
         const bool compatible =
@@ -1482,6 +1491,7 @@ struct llm_graph_context {
         ggml_tensor * sinks;  // [n_head_q, n_tokens] f32
         int32_t n_kv_max;
         bool low_mean_mask;
+        ggml_tensor * kv_runs = nullptr; // the runs of cells each row reads, see ggml_flash_attn_ext_set_kv_runs
     };
 
     ggml_tensor * build_attn_mha(

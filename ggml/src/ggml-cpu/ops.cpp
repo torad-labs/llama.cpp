@@ -9012,19 +9012,24 @@ void ggml_compute_forward_top_k_candidates(const ggml_compute_params * params, g
     const ggml_tensor * src = dst->src[0];
     GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I64);
     GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
-    const int64_t ncols = src->ne[0];
+    const int64_t stride = src->ne[0];
     const int64_t k = dst->ne[0];
     const int64_t parts = dst->ne[1];
-    const int64_t count = std::min(k, ncols);
     const int32_t offset = ggml_get_op_params_i32(dst, 0);
-    int32_t * tmp = count ? (int32_t *) params->wdata + (ncols + CACHE_LINE_SIZE_F32)*params->ith : nullptr;
+    const int32_t vocab = ggml_get_op_params_i32(dst, 1);
+    const int64_t ncols = vocab ? std::clamp<int64_t>(vocab - offset, 0, stride) : stride;
+    const bool first_nan = offset == 0 && ggml_get_op_params_i32(dst, 2);
+    const int64_t count = std::min(k, ncols);
+    int32_t * tmp = count ? (int32_t *) params->wdata + (stride + CACHE_LINE_SIZE_F32)*params->ith : nullptr;
     for (int64_t row = params->ith; row < dst->ne[2]; row += params->nth) {
         uint64_t * out = (uint64_t *) dst->data + row*parts*k;
         std::fill(out, out + parts*k, uint64_t(UINT32_MAX));
         if (count == 0) { continue; }
-        const float * values = (const float *) src->data + row*ncols;
+        const float * values = (const float *) src->data + row*stride;
+        const bool leading_nan = first_nan && std::isnan(values[0]);
         for (int64_t i = 0; i < ncols; ++i) { tmp[i] = i; }
-        std::partial_sort(tmp, tmp + count, tmp + ncols, [values](int32_t a, int32_t b) {
+        std::partial_sort(tmp, tmp + count, tmp + ncols, [values, leading_nan](int32_t a, int32_t b) {
+            if (leading_nan && (a == 0 || b == 0)) { return a < b; }
             if (std::isnan(values[a]) != std::isnan(values[b])) { return !std::isnan(values[a]); }
             return values[a] > values[b] || (!(values[a] < values[b]) && a < b);
         });
@@ -13171,6 +13176,88 @@ void ggml_compute_forward_attn_res_mix(const ggml_compute_params * params, ggml_
                     y[i] += w*x[i];
                 }
             }
+        }
+    }
+}
+
+// ggml_compute_forward_loop_control
+
+// row i of a weight in f32: the row itself, or converted into buf
+static const float * loop_control_row(const ggml_tensor * w, int64_t i, float * buf) {
+    const char * row = (const char *) w->data + i*w->nb[1];
+    if (w->type == GGML_TYPE_F32) {
+        return (const float *) row;
+    }
+    ggml_get_type_traits(w->type)->to_float(row, buf, w->ne[0]);
+    return buf;
+}
+
+// In three steps between barriers: the tokens' norms (split by tokens), the gate inputs z (split by down's rows, each
+// converted once for all tokens) and the gates and the mix (split by output columns, each gain and forget row converted
+// once). Every sum is an f32 dot of the f32 weights.
+void ggml_compute_forward_loop_control(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cur     = dst->src[0];
+    const ggml_tensor * message = dst->src[1];
+    const ggml_tensor * down    = dst->src[2];
+    const ggml_tensor * gain    = dst->src[3];
+    const ggml_tensor * forget  = dst->src[4];
+    const float eps = ggml_get_op_params_f32(dst, 0);
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t rank     = down->ne[1];
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * norms = (float *) params->wdata;  // [2, n_tokens]: cur's and message's
+    float * z     = norms + 2*n_tokens;       // [rank, n_tokens]
+    float * buf   = z + rank*n_tokens + ith*(std::max(down->ne[0], 2*rank) + (int64_t) CACHE_LINE_SIZE_F32);
+    const auto token_row = [](const ggml_tensor * t, int64_t i) {
+        return (const float *) ((const char *) t->data + i*t->nb[1]);
+    };
+    const auto split = [&](int64_t n, int64_t & i0, int64_t & i1) {
+        const int64_t d = (n + nth - 1)/nth;
+        i0 = std::min(n, d*ith);
+        i1 = std::min(n, i0 + d);
+    };
+
+    int64_t i0, i1;
+    split(n_tokens, i0, i1);
+    for (int64_t t = i0; t < i1; ++t) {
+        for (int s = 0; s < 2; ++s) {
+            const float * x = token_row(s ? message : cur, t);
+            ggml_float sum = 0.0;
+            for (int64_t k = 0; k < n_embd; ++k) {
+                sum += (ggml_float) (x[k]*x[k]);
+            }
+            norms[2*t + s] = 1.0f/sqrtf((float) (sum/n_embd) + eps);
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    split(rank, i0, i1);
+    for (int64_t i = i0; i < i1; ++i) {
+        const float * w = loop_control_row(down, i, buf);
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            float dc = 0.0f, dm = 0.0f;
+            ggml_vec_dot_f32(n_embd, &dc, 0, w,          0, token_row(cur, t),     0, 1);
+            ggml_vec_dot_f32(n_embd, &dm, 0, w + n_embd, 0, token_row(message, t), 0, 1);
+            z[t*rank + i] = norms[2*t]*dc + norms[2*t + 1]*dm;
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    split(n_embd, i0, i1);
+    for (int64_t j = i0; j < i1; ++j) {
+        const float * wg = loop_control_row(gain,   j, buf);
+        const float * wf = loop_control_row(forget, j, buf + rank);
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            float g = 0.0f, f = 0.0f;
+            ggml_vec_dot_f32(rank, &g, 0, wg, 0, z + t*rank, 0, 1);
+            ggml_vec_dot_f32(rank, &f, 0, wf, 0, z + t*rank, 0, 1);
+            const float c = token_row(cur, t)[j];
+            const float m = token_row(message, t)[j];
+            float * y = (float *) ((char *) dst->data + t*dst->nb[1]);
+            y[j] = (c - tanhf(f)*c) + tanhf(g)*m;
         }
     }
 }

@@ -90,6 +90,8 @@ template <ggml_type type>
 static __device__ __forceinline__ float fattn_rel_decode_value(const char * row, int col) {
     if constexpr (type == GGML_TYPE_F16) {
         return __half2float(((const half *) row)[col]);
+    } else if constexpr (type == GGML_TYPE_F8_E4M3) {
+        return ggml_cuda_f8_e4m3_to_fp32(((const uint8_t *) row)[col]);
     } else {
         const block_q8_0 & block = ((const block_q8_0 *) row)[col/QK8_0];
         return __half2float(block.d)*float(block.qs[col%QK8_0]);
@@ -260,14 +262,21 @@ static void ggml_cuda_fattn_rel_decode(ggml_backend_cuda_context & ctx, ggml_ten
     const bool shift = ggml_cuda_fattn_shift_query_sinks();
     const int group = fattn_rel_decode_group(dst);
     using kernel_t = decltype(&fattn_rel_decode_rows<GGML_TYPE_F16, 1, 1>);
-    const auto pick = [&](auto heads) -> kernel_t {
+    const auto pick_group = [&](auto type, auto heads) -> kernel_t {
+        constexpr ggml_type T = decltype(type)::value;
         constexpr int H = decltype(heads)::value;
-        const bool q8 = k->type == GGML_TYPE_Q8_0;
         switch (group) {
-            case 2:  return q8 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, H, 2> : fattn_rel_decode_rows<GGML_TYPE_F16, H, 2>;
-            case 3:  return q8 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, H, 3> : fattn_rel_decode_rows<GGML_TYPE_F16, H, 3>;
-            case 4:  return q8 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, H, 4> : fattn_rel_decode_rows<GGML_TYPE_F16, H, 4>;
-            default: return q8 ? fattn_rel_decode_rows<GGML_TYPE_Q8_0, H, 1> : fattn_rel_decode_rows<GGML_TYPE_F16, H, 1>;
+            case 2:  return fattn_rel_decode_rows<T, H, 2>;
+            case 3:  return fattn_rel_decode_rows<T, H, 3>;
+            case 4:  return fattn_rel_decode_rows<T, H, 4>;
+            default: return fattn_rel_decode_rows<T, H, 1>;
+        }
+    };
+    const auto pick = [&](auto heads) -> kernel_t {
+        switch (k->type) {
+            case GGML_TYPE_Q8_0:    return pick_group(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{}, heads);
+            case GGML_TYPE_F8_E4M3: return pick_group(std::integral_constant<ggml_type, GGML_TYPE_F8_E4M3>{}, heads);
+            default:                return pick_group(std::integral_constant<ggml_type, GGML_TYPE_F16>{}, heads);
         }
     };
     const kernel_t kernel = group_heads ? pick(std::integral_constant<int, 3>{}) : pick(std::integral_constant<int, 1>{});

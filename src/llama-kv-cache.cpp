@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-kv-cache-kpool.h"
+#include "llama-kv-runs.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -2677,6 +2678,30 @@ void llama_kv_cache::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * 
         GGML_ASSERT(n_kv <= cells.size());
         ggml_backend_tensor_set(dst, cells.positions().data(), s*dst->nb[1], n_kv*sizeof(llama_pos));
     }
+}
+
+bool llama_kv_cache::kv_runs_fit(const llama_ubatch & ubatch, uint32_t n_max) const {
+    // the runs follow the cells through their change log: a cache that reads another's cells, or the pooled keys that
+    // take the log too, have none
+    if (n_stream != 1 || other || hparams.indexer_kpool > 0) {
+        return false;
+    }
+    if (!kv_runs) {
+        kv_runs = std::make_shared<llama_kv_runs>();
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!kv_runs->get(v_cells[0], ubatch.seq_id[i][0], n_max)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache::set_input_kv_runs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(kv_runs && dst->type == GGML_TYPE_I32 && dst->ne[0] == 4 && dst->ne[2] == ubatch->n_tokens + 1);
+    std::vector<int32_t> data(ggml_nelements(dst));
+    kv_runs->write(v_cells[0], *ubatch, data.data(), dst->ne[1]);
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

@@ -314,10 +314,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-llama-archs test-glm5next PROPERTIES TIMEOUT 3600)
     if (GGML_CUDA)
         # Inkling 2 under a two-rank tensor split on the first GPU against that GPU alone, sequence state included
-        foreach(inkling_case prefill decode chunks seq-cp state rollback graph-churn)
+        foreach(inkling_case prefill decode chunks seq-cp state rollback graph-churn compact-greedy)
             llama_test(test-llama-archs NAME test-inkling2-split-${inkling_case}
                 ARGS --inkling-split ${inkling_case} --inkling-split-device CUDA0,CUDA0 -s 1234)
         endforeach()
+        # the synthetic Inkling 2 against the host with its router and relative-bias table on the split-K and short-K
+        # kernels
+        llama_test(test-llama-archs NAME test-inkling-f32-model ARGS -a inkling2 -s 1234)
+        set_tests_properties(test-inkling-f32-model PROPERTIES ENVIRONMENT "GGML_CUDA_F32_FEW=1")
+        # Inkling 2's products of the Q input as one few-row launch against one launch each, bit for bit, on the first
+        # GPU and under a two-rank tensor split on it (GGML_CUDA_MMQ_FEW_GROUP_LEGACY)
+        llama_test(test-llama-archs NAME test-inkling-stack-cuda0 ARGS --inkling-stack CUDA0 -s 1234)
+        llama_test(test-llama-archs NAME test-inkling-stack-split-cuda0 ARGS --inkling-stack CUDA0,CUDA0 -s 1234)
     endif()
     # Inkling 2's optimized paths against the paths they replaced, on the CPU and the GPU: the relative bias inside the
     # attention kernel (rel), the layer's fused ops (fuse), its short convolutions (conv), and its quantized KV caches
@@ -331,6 +339,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         # sessions that share one cache, a call of several micro-batches included, against each session alone
         llama_test(test-llama-archs NAME test-inkling-window-${inkling_path_name}
             ARGS --inkling-window ${inkling_path_device} -s 1234)
+        # the run-time pass count of Inkling 2 Loop: counts, reuse, validation and slot sizing
+        llama_test(test-llama-archs NAME test-inkling2-loop-${inkling_path_name}
+            ARGS --inkling-loop ${inkling_path_device} -s 1234)
         foreach(inkling_case prompt decode unified streams)
             llama_test(test-llama-archs NAME test-inkling-rel-${inkling_path_name}-${inkling_case}
                 ARGS --inkling-path rel/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
@@ -353,6 +364,45 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             foreach(inkling_case prompt unified)
                 llama_test(test-llama-archs NAME test-inkling-kv-${inkling_path_name}-${inkling_kv}-${inkling_case}
                     ARGS --inkling-path kv-${inkling_kv}/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+            endforeach()
+        endforeach()
+        # the global layers' keys and values at one byte a value (q8_0, f8_e4m3) against F16, the sliding layers' F16:
+        # 23 sessions that share a prompt in low-mean decode steps, and one session saved and read back
+        foreach(inkling_kv q8_0 e4m3)
+            foreach(inkling_case served restore)
+                set(inkling_kv1b_test test-inkling-kv1b-${inkling_path_name}-${inkling_kv}-${inkling_case})
+                llama_test(test-llama-archs NAME ${inkling_kv1b_test}
+                    ARGS --inkling-path kv1b-${inkling_kv}/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+                set_tests_properties(${inkling_kv1b_test} PROPERTIES ENVIRONMENT
+                    "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;LLAMA_INKLING2_MEAN_MASK_DECODE=1;LLAMA_INKLING2_MEAN_POOL_MIN=8192")
+            endforeach()
+        endforeach()
+        # the global layers' decode by the runs of cells each row reads against its mask (LLAMA_INKLING2_KV_RUNS), and on
+        # a GPU with the shared runs read once for groups of 3 rows (GGML_CUDA_FATTN_REL_RUNS_SHARED)
+        foreach(inkling_case runs served restore)
+            llama_test(test-llama-archs NAME test-inkling-far-${inkling_path_name}-${inkling_case}
+                ARGS --inkling-path far/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+            if (NOT inkling_path_device STREQUAL "CPU")
+                llama_test(test-llama-archs NAME test-inkling-prefix-${inkling_path_name}-${inkling_case}
+                    ARGS --inkling-path far/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+                set_tests_properties(test-inkling-prefix-${inkling_path_name}-${inkling_case} PROPERTIES ENVIRONMENT
+                    "GGML_CUDA_FATTN_REL_RUNS_SHARED=1;GGML_CUDA_FATTN_REL_RUNS_GROUP=3")
+            endif()
+        endforeach()
+        # and on a q8_0 or f8_e4m3 global cache (GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE)
+        foreach(inkling_kv q8_0 e4m3)
+            foreach(inkling_case runs served)
+                set(inkling_far_test test-inkling-far-${inkling_path_name}-${inkling_kv}-${inkling_case})
+                llama_test(test-llama-archs NAME ${inkling_far_test}
+                    ARGS --inkling-path far-${inkling_kv}/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+                set_tests_properties(${inkling_far_test} PROPERTIES ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
+                if (NOT inkling_path_device STREQUAL "CPU")
+                    set(inkling_prefix_test test-inkling-prefix-${inkling_path_name}-${inkling_kv}-${inkling_case})
+                    llama_test(test-llama-archs NAME ${inkling_prefix_test}
+                        ARGS --inkling-path far-${inkling_kv}/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+                    set_tests_properties(${inkling_prefix_test} PROPERTIES ENVIRONMENT
+                        "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;GGML_CUDA_FATTN_REL_RUNS_SHARED=1;GGML_CUDA_FATTN_REL_RUNS_GROUP=3")
+                endif()
             endforeach()
         endforeach()
     endforeach()
@@ -671,8 +721,51 @@ if (GGML_CUDA)
     set_tests_properties(test-inkling-moe-sorted-routes-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
         ENVIRONMENT "GGML_CUDA_MMVQ_EXPERT_SORT_23=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MIN=1;GGML_CUDA_MMVQ_EXPERT_SORT_ROWS_MAX=32")
     add_test(NAME test-inkling-norm-clip-cuda0 COMMAND test-backend-ops test -b CUDA0 -o NORM_CLIP)
+    # the few-row K-quant group launch (Inkling 2's Q-input products) against the host, and against each matrix's own
+    # launch bit for bit
+    add_test(NAME test-inkling-stack-mul-mat-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_GROUP,MUL_MAT_GROUP_EXACT
+        -p "type=q[3-6]_K")
     add_test(NAME test-inkling-short-conv-op-cuda0 COMMAND test-backend-ops test -b CUDA0 -o SHORT_CONV)
+    # the global decode on a one-byte K/V cache (q8_0, f8_e4m3) on the tile kernel against the host: 23 sessions that share
+    # a prompt, bounded rows, drafts on the one-cell kernel, 2 to 8 query heads a KV head, and query-first at 256 streams
+    add_test(NAME test-inkling-kv1b-ops-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
+        -p "hs=128,nh=2,.*type_KV=(q8_0|f8_e4m3)")
+    add_test(NAME test-inkling-kv1b-ops-query-first-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
+        -p "kv=262144,nb=23,.*type_KV=(q8_0|f8_e4m3).*shared=")
+    set_tests_properties(test-inkling-kv1b-ops-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
+    # the global decode by runs of cells (ggml_flash_attn_ext_set_kv_runs) against the host: a shared prefix, chunks taken
+    # in turn, decode cells, a session just forked, strides, 2 to 8 query heads a KV head, 32 sessions and the served
+    # shape; with query-first, and with the shared runs read once for groups of 1, 5 and 32 rows
+    # (the q8_0 and f8_e4m3 cases take the runs kernels with GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE)
+    add_test(NAME test-inkling-far-ops-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT -p "kv_runs")
+    set_tests_properties(test-inkling-far-ops-cuda0 PROPERTIES ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
+    add_test(NAME test-inkling-far-ops-query-first-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT -p "kv_runs")
+    set_tests_properties(test-inkling-far-ops-query-first-cuda0 PROPERTIES ENVIRONMENT
+        "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;GGML_CUDA_FATTN_REL_QUERY_FIRST=1")
+    foreach(inkling_group 1 5 32)
+        add_test(NAME test-inkling-prefix-ops-g${inkling_group}-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT -p "kv_runs")
+        set_tests_properties(test-inkling-prefix-ops-g${inkling_group}-cuda0 PROPERTIES ENVIRONMENT
+            "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;GGML_CUDA_FATTN_REL_RUNS_SHARED=1;GGML_CUDA_FATTN_REL_RUNS_GROUP=${inkling_group}")
+    endforeach()
+    set_tests_properties(test-inkling-prefix-ops-g5-cuda0 PROPERTIES ENVIRONMENT
+        "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;GGML_CUDA_FATTN_REL_RUNS_SHARED=1;GGML_CUDA_FATTN_REL_RUNS_GROUP=5;GGML_CUDA_FATTN_REL_QUERY_FIRST=1")
+    set_tests_properties(test-inkling-kv1b-ops-query-first-cuda0 PROPERTIES LABELS "main"
+        ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;GGML_CUDA_FATTN_REL_QUERY_FIRST=1")
     set_tests_properties(test-inkling-moe-mul-mat-id-cuda0 test-inkling-moe-block-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600)
+    # the router and the relative-bias table on their own kernels (GGML_CUDA_F32_FEW) against the host, then the top-k
+    # fusion at the router's 384 experts and, with the tensors placed so the weights and ids lie over the logits, at each
+    # row count that fuses in one wide block
+    add_test(NAME test-inkling-f32-router-cuda0 COMMAND test-backend-ops test -b CUDA0 -o INKLING_F32 -p "m=384,")
+    add_test(NAME test-inkling-f32-bias-table-cuda0 COMMAND test-backend-ops test -b CUDA0 -o INKLING_F32 -p "m=1024,")
+    set_tests_properties(test-inkling-f32-router-cuda0 test-inkling-f32-bias-table-cuda0 PROPERTIES LABELS "main"
+        ENVIRONMENT "GGML_CUDA_F32_FEW=1")
+    add_test(NAME test-inkling-f32-topk-moe-cuda0 COMMAND test-backend-ops test -b CUDA0 -o TOPK_MOE -p "ne=\\[384,")
+    llama_build(test-inkling-f32-topk.cpp LINK ggml)
+    add_test(NAME test-inkling-f32-topk-alias-cuda0 COMMAND test-inkling-f32-topk)
+    add_test(NAME test-inkling-f32-topk-alias-legacy-cuda0 COMMAND test-inkling-f32-topk)
+    set_tests_properties(test-inkling-f32-topk-moe-cuda0 test-inkling-f32-topk-alias-cuda0
+        test-inkling-f32-topk-alias-legacy-cuda0 PROPERTIES LABELS "main")
+    set_tests_properties(test-inkling-f32-topk-alias-legacy-cuda0 PROPERTIES ENVIRONMENT "GGML_CUDA_TOPK_MOE_WIDE_LEGACY=1")
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
