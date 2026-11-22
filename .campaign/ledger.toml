@@ -303,6 +303,7 @@ notes = [
   '2026-11-22 03:40 CT llamacpp-coordinator: 2026-11-22 03:41 CT llamacpp-coordinator: stamp correction to the note above - it was written at 03:40 CST, not 04:05; content stands. I am stamping future notes from the clock directly.',
   "2026-11-22 03:41 CT llamacpp-coordinator: 2026-11-22 03:48 CT llamacpp-coordinator: mini's safe-subset staging hash is verified and on origin: 05e2c889f is exactly 8 files and 1093 insertions (attn-prep.cu/.cuh, moe-fuse.cu/.cuh compiled standalone-inert, the PDL trio short-conv/set-rows/unary, and llama-graph's single SITU-revival hunk). It is the current draft-speed tip on origin, so a branch-based window cut includes it and excludes every uncommitted hunk by construction. The remaining pieces live in hunks shared with fuse-moe (ink-fusions), mmq-tma-tiles (experts) and mmvq refinements, plus the tunables and tests blocks; they go to a post-window joint carve commit, each lane named, with GGML_CUDA_MOE_FUSE_DEBUG stripped in it. The window cut still needs inkling-small's folded hash; window-base printed per arm is the branch HEAD at cut.",
   "2026-11-22 03:46 CT llamacpp-coordinator: 2026-11-22 03:50 CT llamacpp-coordinator: box accounting at Marcos's 'use CloudRift'. CloudRift: one rig-held 5090 (MMQ agent, 0.52h, 0.34 dollars) plus two unheld running 5090s, e1349c32 labeled mini-search-1121-081435 and e6406138 labeled gpu-5090-02; owners asked to claim or stop. vast: a 5060 Ti running at 0.26/h idle seven days (keep flag set), a 5090 running at 0.74/h (keep set), a running 4-GPU RTX PRO 6000 S at 7.18/h whose identity (GLM serving or Inkling window box) is with Marcos, and an exited 4-GPU box kept with disk. No box is touched until its owner or Marcos answers; the GLM-serving box is never touched. Also recorded: mask fix dc973ce2e green and in the cut list; compile fix 461820c54 on origin; meta-row abort routed to the allocator lane; FP8 condition 1 met via 38107c8a2, rel-mma wiring may proceed.",
+  "2026-11-22 04:04 CT llamacpp-coordinator: 2026-11-22 03:55 CT llamacpp-coordinator: box verdicts. The running 4-GPU vast instance 61903032 is the GLM-serving box (Marcos) and is never touched. The idle vast RTX 5060 Ti 61506906 was stopped after 6.4h, about 1.64 dollars; its disk is kept and billed as storage until 'rig vast down --box 61506906' if it should be gone. The exited 4-GPU 61473783 stays kept with disk. The vast 5090 61934572 is loading and no seat has claimed it yet. CloudRift: the rig-held 5090 is the MMQ agent's; unheld e1349c32 (mini-search-1121-081435) and e6406138 (gpu-5090-02) await owner claims.",
 ]
 
 [[row]]
@@ -876,4 +877,34 @@ notes = [
   '2026-11-22 03:24 CT llamacpp-coordinator: 2026-11-22 04:02 CT llamacpp-coordinator: Marcos: adopt the QGRE accumulator. Decision of record: this engine implements the e4m3 hi+lo pair accumulation with E8M0 per-block scales on the sm_120a block-scaled MMA. First target: global attention QK and PV; e4m3 K/V tying into the one-byte KV kernels, every term under its own scale, fp32 only in the accumulator fragment, partials across KV tiles and the shared-prefix merge carried as hi+lo pairs, one RNE encode per fold exit. Scale operands produced by LDS from shared memory, never assembled at the MMA (sm_120a QMMA scale-collector erratum). Lanes: inkling-quant owns the KV/kernel side, inkling-small the attention integration, qgre-lead consult. Sequence after the rel-mma q4 dispatch; not part of the current window.',
   '2026-11-22 03:24 CT: 2026-11-22 (ownership): this lane (inkling-small) owns the attention integration — the QK/PV fold and the shared-prefix merge consume pair partials, one RNE encode per fold exit, scale operands from shared memory; inkling-quant owns the KV/kernel side and sends a contract (files, fold order, test names) before building. When the contract arrives, read it against the prefix-read-once merge so both land on one contract. Not in the current window.',
   "2026-11-22 03:34 CT llamacpp-coordinator: 2026-11-22 03:40 CT llamacpp-coordinator: inkling-quant's implementation plan is countersigned with three conditions, sent to it: (1) begin with the new fattn-rel-fp8-pair.cuh and the tests; fattn-rel-mma, rel-decode and rel-runs carry inkling-small's staged D2 hunks, so modify those only after its hunk commit lands or it confirms no overlap; (2) record plainly that partial traffic stays 4 bytes a value, so the measured win is fp8 MMA rate plus one-rounding precision, and the arm's falsifier is hi+lo quality against f16 plus prefill time; (3) the model-level greedy fixture runs with the switch ON and type_KV=f8_e4m3, else K is quantized on the fly and the comparison muddles.",
+]
+
+[[row]]
+id = 'inkling-route-histogram'
+title = 'The hot-expert premise is measured before any engine work'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22 chat-inkling proposal, falsifier-first per Marcos's lens and his GLM precedent question. GLM keeps its single hottest expert replicated on every card so routes never cross ranks; whether Inkling should do the same is a premise question first. Doc 21 measured per-expert energy Gini 0.001 with top-16 holding 4.2%, near-uniform gate norms, and the M1 probe's mild concentration (median 102 distinct against about 147 uniform), so the GLM hot leader may not exist here. Work: extract real per-expert hit counts across layers from the existing capture or replay rig CPU-side (teacher-forced replay over stored prompts, no four-card window), and name the falsifier up front: if the top-1 share per token lands under about 1.5x the uniform mean, the GLM hot-expert replication does not transfer and no engine work follows. Evidence: reports/inkling2-route-histogram.json with per-layer hit counts, top-1/top-8 shares, the uniform comparison, and the verdict."
+checks = [
+  'python3 scripts/inkling2/route_histogram.py --check --evidence reports/inkling2-route-histogram.json',
+]
+notes = [
+  '2026-11-22 04:00 CT: added; 1 of 1 checks fail, as they should before the work',
+]
+
+[[row]]
+id = 'repo-meta-init-abort'
+title = 'The meta backend admits only the tensors it declared'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22: test-llama-archs -a inkling2 aborts rc=134 on the META-BACKEND row only: ggml-backend-meta.cpp:939 GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer)) via llama_init_from_model; the CUDA0 and CPU rows pass in the same binary and -a inkling2_loop passes every row, so the loop path is clean. Origin: the meta backend's compute-reserve work (f0735a148) admits a tensor the meta backend did not declare, or init walks tensors it does not own. Work: the meta backend admits only the tensors it declared, and a test catches an undeclared tensor at init instead of asserting. This reds the archs Meta row for every batch arm until fixed."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-22 04:04 CT: added; 1 of 1 checks fail, as they should before the work',
 ]
