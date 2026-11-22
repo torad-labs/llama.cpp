@@ -25,6 +25,15 @@ Open work lives in `.campaign/ledger.toml`. Run `campaign help` for the verbs.
   items builds them and ends; it never commits, closes an item or reviews it.
 <!-- campaign:end -->
 
+## Boxes and GPUs (Marcos, 2026-11-22)
+
+- All builds, tests and dev runs go to the rented CloudRift box(s) with the RTX 5090s (`on-box`, ssh host
+  `buildbox`). Rent another 5090 if the work needs one. Nothing new runs on this machine's local cards.
+- The four-card RTX PRO 6000 Inkling box tests a batch of changes after they are made: one test and profile
+  window per batch on that box, then stop the box, and every seat iterates against its recorded numbers from
+  the 5090s. Profile once per window; do not re-profile piecemeal.
+- Never touch or stop the other RTX PRO 6000 box: it serves GLM and Marcos works through it.
+
 ## Host-side tensor memory
 
 - Host-side code (tests, tools, loaders, fixture writers) never holds a full f32 copy of a large tensor.
