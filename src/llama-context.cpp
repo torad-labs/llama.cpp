@@ -27,8 +27,11 @@
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+
+#include "ggml-ledger.h"
 
 //
 // llama_context
@@ -97,7 +100,22 @@ struct llama_decode_phase_timer {
     struct timespec    t0;
     bool               on;
 
-    llama_decode_phase_timer(llama_decode_phase p) : phase(p), on(llama_time_decode()) {
+    // the ledger's slot of a phase (ggml-ledger.h): every decode's phases, with no switch to set
+    static int ledger_slot(llama_decode_phase p) {
+        static const struct slots {
+            int of[LLAMA_DECODE_PHASE_COUNT];
+            slots() {
+                for (int i = 0; i < LLAMA_DECODE_PHASE_COUNT; i++) {
+                    of[i] = i == LLAMA_DECODE_PHASE_DECODE_TOTAL
+                        ? ggml_ledger_slot("decode.total")
+                        : ggml_ledger_slot_of("decode", llama_decode_phase_name((llama_decode_phase) i));
+                }
+            }
+        } s;
+        return s.of[p];
+    }
+
+    llama_decode_phase_timer(llama_decode_phase p) : phase(p), on(llama_time_decode() || ggml_ledger_on()) {
         if (on) {
             clock_gettime(CLOCK_MONOTONIC, &t0);
         }
@@ -116,6 +134,10 @@ struct llama_decode_phase_timer {
         struct timespec t1;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         const double us = (t1.tv_sec - t0.tv_sec)*1e6 + (t1.tv_nsec - t0.tv_nsec)/1e3;
+        ggml_ledger_add(ledger_slot(phase), (int64_t) us);
+        if (!llama_time_decode()) {
+            return;
+        }
         static double sum[LLAMA_DECODE_PHASE_COUNT] = {};
         static int    cnt[LLAMA_DECODE_PHASE_COUNT] = {};
         sum[phase] += us;
@@ -142,6 +164,37 @@ struct llama_decode_phase_timer {
         }
     }
 };
+
+// The ledger's memory by owner (ggml-ledger.h): what a context holds on each device for its model's weights, for its
+// own state (the KV cache and recurrent state) and for compute buffers, read on the decoding thread every five
+// seconds at most. Contexts are numbered in the order they first decode: a server's target first, then its draft.
+static void llama_ledger_memory(const llama_context * ctx) {
+    if (!ggml_ledger_on()) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<const llama_context *, std::pair<int, int64_t>> seen;
+    const int64_t now = ggml_time_us();
+    int id = 0;
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const auto it = seen.try_emplace(ctx, (int) seen.size(), now - 10'000'000).first;
+        // the first eight contexts of a process: a server has a target and a draft, and a process that makes
+        // contexts without end would otherwise fill the ledger with their names
+        if (it->second.first >= 8 || now - it->second.second < 5'000'000) {
+            return;
+        }
+        it->second.second = now;
+        id = it->second.first;
+    }
+    const std::string base = "mem.ctx" + std::to_string(id) + ".";
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        const char * name = ggml_backend_buft_name(buft);
+        ggml_ledger_set(ggml_ledger_slot_of((base + "model_mib").c_str(), name), (int64_t) (mb.model >> 20));
+        ggml_ledger_set(ggml_ledger_slot_of((base + "context_mib").c_str(), name), (int64_t) (mb.context >> 20));
+        ggml_ledger_set(ggml_ledger_slot_of((base + "compute_mib").c_str(), name), (int64_t) (mb.compute >> 20));
+    }
+}
 
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
@@ -2721,6 +2774,12 @@ bool llama_context::graph_devices_low() const {
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    {
+        static const int slot_rows = ggml_ledger_slot("decode.ubatch.rows");
+        static const int slot_seqs = ggml_ledger_slot("decode.ubatch.seqs");
+        ggml_ledger_add(slot_rows, ubatch.n_tokens);
+        ggml_ledger_add(slot_seqs, ubatch.n_seqs_unq);
+    }
     // Keep each ubatch's rows before its graph storage can be reused.
     mtp_index_capture();
     {
@@ -3400,7 +3459,13 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    ggml_ledger_step();
+    llama_ledger_memory(this);
     llama_decode_phase_timer t_decode(LLAMA_DECODE_PHASE_DECODE_TOTAL);
+    {
+        static const int slot_rows = ggml_ledger_slot("decode.rows");
+        ggml_ledger_add(slot_rows, (int64_t) batch_inp.tokens.size());
+    }
     llama_outputs_pending_guard pending{outputs_pending};
 
     // An unconsumed selection from an earlier decode is not a draft step.

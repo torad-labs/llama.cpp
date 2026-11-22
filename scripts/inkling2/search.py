@@ -32,6 +32,9 @@ import serve
 sys.path.append(str(serve.ROOT / "scripts/glm53"))
 import measure as glm_measure
 
+sys.path.append(str(serve.ROOT / "scripts"))
+import ledger
+
 # What a search tries, in the order it tries it: draft depth and whether to draft at all move a step's row count, so
 # they go before the settings whose best value depends on it.
 SPACE = {
@@ -110,16 +113,29 @@ def read_round(url, rows, tokens, timeout, sampling):
             "tokens_sha256": ids}
 
 
+def ledger_of(url):
+    """The engine's ledger as the server has it now, or None from a server that keeps none."""
+    try:
+        found = ledger.load(url)
+    except (OSError, ValueError):
+        return None
+    return found if isinstance(found, dict) and "slots" in found else None
+
+
 def measure(url, sessions, args):
-    """A warm round the rate does not count, then the measured rounds; the trial's rate is their median."""
+    """A warm round the rate does not count, then the measured rounds; the trial's rate is their median.
+    The engine's ledger over the measured rounds goes with it: where a step's time went, whatever the model."""
     sampling = {} if args.temperature is None else {"temperature": args.temperature}
     rows = prompts(url, sessions, args.context)
     for _ in range(args.warm_rounds):
         read_round(url, rows, args.tokens, args.timeout, sampling)
+    before = ledger_of(url)
     rounds = [read_round(url, rows, args.tokens, args.timeout, sampling) for _ in range(args.rounds)]
+    after = ledger_of(url)
     middle = sorted(rounds, key=lambda r: r["tokens_per_second"])[len(rounds) // 2]
     return {**middle, "tokens_per_second": statistics.median(r["tokens_per_second"] for r in rounds),
-            "rounds": [r["tokens_per_second"] for r in rounds], "prompt_tokens": statistics.median(len(row) for row in rows)}
+            "rounds": [r["tokens_per_second"] for r in rounds], "prompt_tokens": statistics.median(len(row) for row in rows),
+            "ledger": ledger.summary(ledger.difference(before, after)) if before and after else None}
 
 
 def plan(base, settings):

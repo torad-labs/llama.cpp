@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 #include "../ggml/src/ggml-attn-mask.h"
 #include "../ggml/src/ggml-impl.h"
+#include "ggml-ledger.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1082,6 +1083,8 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
     // GGML_GRAPH_TRACE=1 names the condition that turned the kept graph down, under the reject line of its result
     static const bool trace = ggml_env_switch("GGML_GRAPH_TRACE");
     const auto no = [&](const char * why) {
+        // rare next to a step, so the name is looked up each time: the rows of the ubatch the kept graph refused
+        ggml_ledger_add(ggml_ledger_slot_of("graph.kept.reject.kpool", why), params.ubatch.n_tokens);
         if (trace) {
             LLAMA_LOG_INFO("graph_trace layer=llama event=kpool_reject why=%s rows=%u seqs=%u draft=%d\n",
                     why, params.ubatch.n_tokens, params.ubatch.n_seqs_unq, draft != nullptr);
@@ -1982,8 +1985,10 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     static const bool trace = ggml_env_switch("GGML_GRAPH_TRACE");
+    static const bool ledger = ggml_ledger_on();
     const char * reason = nullptr;
-    if (!this->params.allow_reuse(params, trace ? &reason : nullptr)) {
+    if (!this->params.allow_reuse(params, trace || ledger ? &reason : nullptr)) {
+        ggml_ledger_add(ggml_ledger_slot_of("graph.kept.reject", reason), params.ubatch.n_tokens);
         if (trace) {
             LLAMA_LOG_INFO("graph_trace layer=llama event=reject result=%p uid=%llu reason=%s rows=%u next_rows=%u\n",
                 (void *) this, (unsigned long long) gf->uid, reason, this->params.ubatch.n_tokens, params.ubatch.n_tokens);

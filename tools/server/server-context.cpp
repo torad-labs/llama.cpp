@@ -15,6 +15,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "decode-trace.h"
+#include "ggml-ledger.h"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -8086,6 +8087,17 @@ void server_routes::init_routes() {
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    // The engine's ledger as it stands (ggml-ledger.h): a reader takes it before and after a stretch of work and reads
+    // the difference. It holds counts and times, never text, and reading it touches no slot and no device.
+    this->get_ledger = [this](const server_http_req &) {
+        auto res = create_response(true);
+        std::string text(ggml_ledger_json(nullptr, 0), '\0');
+        ggml_ledger_json(text.data(), text.size());
+        text.resize(text.size() - 1);
+        res->ok(json::parse(text));
         return res;
     };
 

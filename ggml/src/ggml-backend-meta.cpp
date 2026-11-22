@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-ledger.h"
 
 #include <algorithm>
 #include <atomic>
@@ -4693,6 +4694,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 backend_ctx->graph_next(bcj.backend,
                     i + 1 < backend_ctx->n_subgraphs ? bcj.cgraphs[i + 1].cgraph_main : nullptr);
             }
+            static const int ledger_subgraph = ggml_ledger_slot("meta.subgraph_us");
+            const ggml_ledger_timer ledger_timer(ledger_subgraph);
             step_status[j] = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
         };
         for (i = 0; i < backend_ctx->n_subgraphs; i++) {
@@ -4710,6 +4713,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             if (n_backends > 1 && backend_ctx->collectives[i] == ggml_backend_meta_context::collective::gather) {
+                static const int ledger_gather = ggml_ledger_slot("meta.gather_us");
+                const ggml_ledger_timer ledger_timer(ledger_gather);
                 bool backend_allgather_success = false;
                 if (backend_ctx->comm_ctx && backend_ctx->comm_allgather) {
                     std::vector<ggml_tensor *> nodes;
@@ -4721,12 +4726,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     backend_allgather_success = backend_ctx->comm_allgather(backend_ctx->comm_ctx, nodes.data());
                 }
                 if (!backend_allgather_success) {
+                    static const int ledger_fallback = ggml_ledger_slot("meta.gather.fallback");
+                    ggml_ledger_add(ledger_fallback, 1);
                     const ggml_status status = gather_fallback(i);
                     if (status != GGML_STATUS_SUCCESS) {
                         return status;
                     }
                 }
             } else if (n_backends > 1 && backend_ctx->collectives[i] == ggml_backend_meta_context::collective::reduce) {
+                static const int ledger_reduce = ggml_ledger_slot("meta.reduce_us");
+                const ggml_ledger_timer ledger_timer(ledger_reduce);
                 bool backend_allreduce_success = false;
                 if (backend_ctx->comm_ctx) {
                     std::vector<ggml_tensor *> nodes;
@@ -4753,6 +4762,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 if (!backend_allreduce_success) {
+                    static const int ledger_fallback = ggml_ledger_slot("meta.reduce.fallback");
+                    ggml_ledger_add(ledger_fallback, 1);
                     const ggml_status status = allreduce_fallback(i);
                     if (status != GGML_STATUS_SUCCESS) {
                         return status;
@@ -4766,6 +4777,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // the step that cannot be captured, each device's subgraph or the all-reduce after it, or -1 for none
     auto uncapturable_step = [&]() -> int {
         const auto refuse = [&](size_t step, int rank, const char * reason) {
+            ggml_ledger_add(ggml_ledger_slot_of("meta.capture.refuse", reason), (int64_t) step);
             if (backend_ctx->trace_graphs) {
                 GGML_LOG_INFO("graph_trace layer=meta event=refuse context=%p uid=%llu step=%zu rank=%d reason=%s\n",
                     (void *) backend_ctx, (unsigned long long) cgraph->uid, step, rank, reason);
@@ -4805,6 +4817,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         cg->refused = step >= 0;
         if (no_memory) {
             cg->n_evals = 1;
+            ggml_ledger_add(ggml_ledger_slot("meta.capture.defer.no_memory"), 1);
             if (backend_ctx->trace_graphs) {
                 GGML_LOG_INFO("graph_trace layer=meta event=defer context=%p uid=%llu reason=no_memory\n",
                     (void *) backend_ctx, (unsigned long long) cgraph->uid);
@@ -4829,6 +4842,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             if (status == GGML_STATUS_SUCCESS && captured) {
                 cg->execs = std::move(execs);
+                ggml_ledger_add(ggml_ledger_slot("meta.capture"), cgraph->n_nodes);
                 if (backend_ctx->trace_graphs) {
                     GGML_LOG_INFO("graph_trace layer=meta event=capture context=%p uid=%llu ranks=%zu nodes=%d subgraphs=%zu\n",
                         (void *) backend_ctx, (unsigned long long) cgraph->uid, n_backends, cgraph->n_nodes, backend_ctx->n_subgraphs);
@@ -4843,6 +4857,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
             cg->refused = true;
+            ggml_ledger_add(ggml_ledger_slot("meta.capture.refuse.capture_end"), 1);
             if (backend_ctx->trace_graphs) {
                 GGML_LOG_INFO("graph_trace layer=meta event=refuse context=%p uid=%llu reason=capture_end status=%d\n",
                     (void *) backend_ctx, (unsigned long long) cgraph->uid, (int) status);

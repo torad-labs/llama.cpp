@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-ledger.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -2418,6 +2419,7 @@ struct ggml_backend_cuda_context {
             next_graph_eviction_time = time_now + std::min<int64_t>(idle_us, 5'000'000);
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (!(it->first == key) && time_now - it->second->last_used_time >= idle_us) {
+                    ggml_ledger_add(ggml_ledger_slot_at("cuda.graph.evict.idle", device), (int64_t) it->second->num_nodes);
                     if (graph_trace_enabled()) {
                         GGML_LOG_INFO("graph_trace layer=cuda event=evict context=%p device=%d uid=%llu reason=idle nodes=%zu\n",
                             (void *) this, device, (unsigned long long) it->second->uid, it->second->num_nodes);
@@ -2434,6 +2436,7 @@ struct ggml_backend_cuda_context {
         if (it == cuda_graphs.end()) {
             it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
             it->second->key = &it->first; // a node's key stays where it is until the node is erased
+            ggml_ledger_add(ggml_ledger_slot_at("cuda.graph.miss", device), key.n_nodes);
             if (graph_trace_enabled()) {
                 GGML_LOG_INFO("graph_trace layer=cuda event=miss context=%p device=%d key=%p ggml_nodes=%d entries=%zu\n",
                     (void *) this, device, key.first_node, key.n_nodes, cuda_graphs.size());
@@ -2574,6 +2577,8 @@ struct ggml_backend_cuda_context {
                     }
                 }
             }
+            ggml_ledger_add(ggml_ledger_slot_at(max && held.graphs > max ? "cuda.graph.evict.count_cap" : "cuda.graph.evict.node_cap",
+                    device), (int64_t) lru->num_nodes);
             if (graph_trace_enabled()) {
                 GGML_LOG_INFO("graph_trace layer=cuda event=evict context=%p device=%d uid=%llu reason=%s nodes=%zu held_graphs=%zu held_nodes=%zu\n",
                     (void *) this, device, (unsigned long long) lru->uid,

@@ -229,6 +229,168 @@ static void ggml_cuda_count_inflight_after(int device, cudaStream_t stream) {
     c.launched[device]++;
 }
 
+// The ledger (ggml-ledger.h) of a device: every graph evaluation by how it ran (a replay of a captured graph, a
+// capture, a direct evaluation and why it was direct, an evaluation inside the meta backend's capture), its host
+// time, and on the decodes the ledger times, how long the device had it: from an event the stream reaches when it
+// begins the evaluation to one it reaches when the evaluation's last work is done. A step's wall time less those
+// spans is what the device spent with none of this context's work.
+enum ggml_cuda_ledger_kind {
+    GGML_CUDA_LEDGER_REPLAY,
+    GGML_CUDA_LEDGER_CAPTURE,
+    GGML_CUDA_LEDGER_DIRECT,
+    GGML_CUDA_LEDGER_OUTER,
+    GGML_CUDA_LEDGER_KINDS,
+};
+
+struct ggml_cuda_ledger_span {
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t end   = nullptr;
+};
+
+struct ggml_cuda_ledger_device {
+    std::once_flag once;
+    int eval_us[GGML_CUDA_LEDGER_KINDS];
+    int eval_nodes   = -1;
+    int span_us      = -1;
+    int launch_outer = -1;
+    int instantiate  = -1;
+    int mem_used_mib = -1;
+    int graphs_held  = -1;
+
+    std::mutex                        mtx;
+    std::deque<ggml_cuda_ledger_span> pending; // spans whose end the device has not reached, oldest first
+    std::vector<ggml_cuda_ledger_span> spare;
+    int64_t                           mem_read_us = 0;
+
+    void init(int device) {
+        std::call_once(once, [&] {
+            eval_us[GGML_CUDA_LEDGER_REPLAY]  = ggml_ledger_slot_at("cuda.eval.replay_us", device);
+            eval_us[GGML_CUDA_LEDGER_CAPTURE] = ggml_ledger_slot_at("cuda.eval.capture_us", device);
+            eval_us[GGML_CUDA_LEDGER_DIRECT]  = ggml_ledger_slot_at("cuda.eval.direct_us", device);
+            eval_us[GGML_CUDA_LEDGER_OUTER]   = ggml_ledger_slot_at("cuda.eval.outer_us", device);
+            eval_nodes   = ggml_ledger_slot_at("cuda.eval.nodes", device);
+            span_us      = ggml_ledger_slot_at("cuda.span_us", device);
+            launch_outer = ggml_ledger_slot_at("cuda.outer.launch", device);
+            instantiate  = ggml_ledger_slot_at("cuda.graph.instantiate_us", device);
+            mem_used_mib = ggml_ledger_slot_at("cuda.mem.used_mib", device);
+            graphs_held  = ggml_ledger_slot_at("cuda.graph.held", device);
+        });
+    }
+};
+
+static ggml_cuda_ledger_device & ggml_cuda_ledger(int device) {
+    static ggml_cuda_ledger_device devices[GGML_CUDA_MAX_DEVICES];
+    devices[device].init(device);
+    return devices[device];
+}
+
+// the spans the device finished go to the ledger; called with the device current
+static void ggml_cuda_ledger_collect(ggml_cuda_ledger_device & led) {
+    std::lock_guard<std::mutex> lock(led.mtx);
+    while (!led.pending.empty()) {
+        const ggml_cuda_ledger_span span = led.pending.front();
+        const cudaError_t err = cudaEventQuery(span.end);
+        if (err == cudaErrorNotReady) {
+            (void) cudaGetLastError();
+            break;
+        }
+        CUDA_CHECK(err);
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, span.begin, span.end));
+        ggml_ledger_add(led.span_us, (int64_t) (ms * 1000.0f));
+        led.pending.pop_front();
+        led.spare.push_back(span);
+    }
+}
+
+static ggml_cuda_ledger_span ggml_cuda_ledger_span_begin(ggml_cuda_ledger_device & led, cudaStream_t stream) {
+    ggml_cuda_ledger_span span;
+    {
+        std::lock_guard<std::mutex> lock(led.mtx);
+        if (!led.spare.empty()) {
+            span = led.spare.back();
+            led.spare.pop_back();
+        }
+    }
+    if (span.begin == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&span.begin, cudaEventDefault));
+        CUDA_CHECK(cudaEventCreateWithFlags(&span.end, cudaEventDefault));
+    }
+    CUDA_CHECK(cudaEventRecord(span.begin, stream));
+    return span;
+}
+
+static void ggml_cuda_ledger_span_end(ggml_cuda_ledger_device & led, const ggml_cuda_ledger_span & span, cudaStream_t stream) {
+    CUDA_CHECK(cudaEventRecord(span.end, stream));
+    std::lock_guard<std::mutex> lock(led.mtx);
+    led.pending.push_back(span);
+}
+
+// used memory of the device, once a second at most: cudaMemGetInfo is about 27 us
+static void ggml_cuda_ledger_memory(ggml_cuda_ledger_device & led) {
+    const int64_t now = ggml_time_us();
+    {
+        std::lock_guard<std::mutex> lock(led.mtx);
+        if (now - led.mem_read_us < 1'000'000) {
+            return;
+        }
+        led.mem_read_us = now;
+    }
+    size_t free = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    ggml_ledger_set(led.mem_used_mib, (int64_t) ((total - free) >> 20));
+}
+
+// One graph evaluation in the ledger, from its making to its end. kind and reason are set once the evaluation
+// knows how it runs; in the meta backend's capture the stream is recording, so no event goes on it.
+struct ggml_cuda_ledger_eval {
+    ggml_cuda_ledger_device * led   = nullptr;
+    cudaStream_t              stream = nullptr;
+    int                       device = 0;
+    int                       kind   = GGML_CUDA_LEDGER_DIRECT;
+    const char *              reason = nullptr;
+    bool                      timed  = false;
+    ggml_cuda_ledger_span     span;
+    int64_t                   t0     = 0;
+
+    ggml_cuda_ledger_eval(int device, cudaStream_t stream, bool capturing, int n_nodes, size_t held) : stream(stream), device(device) {
+        if (!ggml_ledger_on()) {
+            return;
+        }
+        led = &ggml_cuda_ledger(device);
+        ggml_cuda_ledger_collect(*led);
+        ggml_cuda_ledger_memory(*led);
+        ggml_ledger_add(led->eval_nodes, n_nodes);
+        ggml_ledger_set(led->graphs_held, (int64_t) held);
+        timed = !capturing && ggml_ledger_step_timed();
+        if (timed) {
+            span = ggml_cuda_ledger_span_begin(*led, stream);
+        }
+        t0 = ggml_time_us();
+    }
+
+    ~ggml_cuda_ledger_eval() {
+        if (led == nullptr) {
+            return;
+        }
+        ggml_ledger_add(led->eval_us[kind], ggml_time_us() - t0);
+        if (kind == GGML_CUDA_LEDGER_DIRECT && reason != nullptr) {
+            // why a graph the device could have replayed was run kernel by kernel
+            static thread_local std::unordered_map<uint64_t, int> slots;
+            const uint64_t key = ((uint64_t) (uintptr_t) reason << 6) ^ (uint64_t) device;
+            auto it = slots.find(key);
+            if (it == slots.end()) {
+                const std::string name = std::string("cuda.eval.direct.") + reason;
+                it = slots.emplace(key, ggml_ledger_slot_at(name.c_str(), device)).first;
+            }
+            ggml_ledger_add(it->second, 1);
+        }
+        if (timed) {
+            ggml_cuda_ledger_span_end(*led, span, stream);
+        }
+    }
+};
+
 int ggml_cuda_get_device() {
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
@@ -5502,7 +5664,10 @@ static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, gg
             CUDA_CHECK(cudaGraphDestroy(graph->instance_source));
         }
         graph->instance_source = graph->graph;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        {
+            const ggml_ledger_timer ledger_timer(ggml_ledger_on() ? ggml_cuda_ledger(cuda_ctx->device).instantiate : -1);
+            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        }
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
         graph->clusters = ggml_cuda_graph_get_clusters(graph->graph, cuda_ctx->device);
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
@@ -10048,10 +10213,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_key graph_key;
 
 #ifdef USE_CUDA_GRAPH
+    ggml_cuda_ledger_eval ledger_eval(cuda_ctx->device, cuda_ctx->stream(), cuda_ctx->outer_capture, cgraph->n_nodes,
+            cuda_ctx->cuda_graphs.size());
     const char * graph_reason = "disabled";
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     if (cuda_ctx->outer_capture) {
+        ledger_eval.kind = GGML_CUDA_LEDGER_OUTER;
         const ggml_cuda_nvtx_range nvtx_graph("graph");
         ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
         cuda_ctx->l2_graph_next = nullptr;
@@ -10118,6 +10286,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             (void *) cuda_ctx, cuda_ctx->device, (unsigned long long) cgraph->uid, graph_key.first_node, cgraph->n_nodes,
             use_cuda_graph ? "ready" : graph_reason);
     }
+    ledger_eval.kind   = use_cuda_graph ? (cuda_graph_update_required ? GGML_CUDA_LEDGER_CAPTURE : GGML_CUDA_LEDGER_REPLAY)
+                                        : GGML_CUDA_LEDGER_DIRECT;
+    ledger_eval.reason = graph_reason;
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -10220,6 +10391,9 @@ static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
     cudaGraphExec_t exec = nullptr;
     CUDA_CHECK(cudaGraphInstantiate(&exec, graph, NULL, NULL, 0));
     const int64_t t_instantiate_us = ggml_time_us() - t_start_us;
+    if (ggml_ledger_on()) {
+        ggml_ledger_add(ggml_ledger_slot_at("cuda.outer.instantiate_us", cuda_ctx->device), t_instantiate_us);
+    }
     if (mem_stats) { CUDA_CHECK(cudaMemGetInfo(&free_after, &total)); }
     CUDA_CHECK(cudaGraphDestroy(graph));
     if (mem_stats) {
@@ -10247,6 +10421,25 @@ static bool ggml_backend_cuda_capture_no_memory(ggml_backend_t backend) {
 static void ggml_backend_cuda_capture_launch(ggml_backend_t backend, void * exec) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
+    if (ggml_ledger_on() && !ggml_cuda_count_inflight() && !ggml_cuda_time_launch()) {
+        // a whole step of this device in one launch: counted, and on a timed decode its span on the device
+        ggml_cuda_ledger_device & led = ggml_cuda_ledger(cuda_ctx->device);
+        ggml_cuda_ledger_collect(led);
+        ggml_cuda_ledger_memory(led);
+        const bool timed = ggml_ledger_step_timed();
+        ggml_cuda_ledger_span span;
+        if (timed) {
+            span = ggml_cuda_ledger_span_begin(led, cuda_ctx->stream());
+        }
+        {
+            const ggml_ledger_timer ledger_timer(led.launch_outer);
+            CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
+        }
+        if (timed) {
+            ggml_cuda_ledger_span_end(led, span, cuda_ctx->stream());
+        }
+        return;
+    }
     if (ggml_cuda_count_inflight()) {
         ggml_cuda_count_inflight_before(cuda_ctx->device);
         CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));

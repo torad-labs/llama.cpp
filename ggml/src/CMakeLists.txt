@@ -195,6 +195,8 @@ add_library(ggml-base
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp
+            ../include/ggml-ledger.h
+            ggml-ledger.cpp
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
