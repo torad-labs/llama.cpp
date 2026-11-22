@@ -581,6 +581,10 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
         if (state.axis >= 0 && state.axis < GGML_MAX_DIMS) {
             const int split_dim = state.axis;
             GGML_ASSERT(state.n_segments <= 16);
+            // admission is whole-node: every rank's device must support the sharded op it will run
+            const ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(buft);
+            const auto * dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+            bool all_supported = true;
             size_t max_alloc_size = 0;
             for (size_t i = 0; i < n_simple_bufts; i++) {
                 // The slice of rank i along the split axis, with the strides its placement will
