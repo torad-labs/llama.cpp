@@ -685,3 +685,33 @@ checks = [
 notes = [
   "2026-11-22 02:35 CT llamacpp-coordinator: added by hand edit (campaign add would build on torad-server). Fails today: no inkling-kvg test is registered. The q4_0 element decode instance for the tile kernel already exists off by default (TORAD 3280492de, GGML_CUDA_FATTN_REL_DECODE_Q4), so doc 18's 'the tile kernel does not take Q4_0 yet' is one line stale; this row is the gate-lifting half.",
 ]
+
+[[row]]
+id = 'inkling-launch-budget'
+title = "An Inkling decode step launches at most half today's kernels"
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22 Marcos: profiling shows an extreme number of kernel launches per decode step; reduce it a lot. Count from the engine ledger (each executed ggml node is at least one dispatch; confirm against ncu launch counts) at the tensor-4 profile, 23 sessions, the same build and steps for baseline and result. Work: fuse elementwise/norm/rope/quantize chains; assemble attention input in one launch (GLM's concat-one-launch precedent); fuse router+topk and expert gather/scatter; make expert-path launches scale with groups, not experts. Bit-identical fusions may default on with a ..._LEGACY switch, others start off. GLM 5.3 stays green; Mini shares any shared kernel. Evidence: reports/inkling2-launch-budget.json with baseline_per_step, result_per_step, build, profile; scripts/inkling2/launch_budget.py builds it from a server's ledger and judges result <= baseline/2."
+checks = [
+  'python3 scripts/inkling2/launch_budget.py --check --evidence reports/inkling2-launch-budget.json',
+]
+notes = [
+  '2026-11-22 02:19 CT: added; 1 of 1 checks fail, as they should before the work',
+]
+
+[[row]]
+id = 'inkling-counter-sync'
+title = 'Ordering is counted, not barrier-waited, on the decode path'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22 Marcos: engines barrier from over-caution where a counter would do; QGRE's megakernel uses arrival counters. Inventory every blocking wait on the decode path: cudaStreamSynchronize, cudaEventSynchronize, cudaDeviceSynchronize, ggml_backend_synchronize, graph event fork-join waits, allreduce host waits, and host round-trips taken only to order GPU work. Where a wait enforces ordering only, replace it with a device-side arrival counter: producer atomicAdd with release, consumer spin with acquire, host never blocks. Keep real waits where the host reads data. Each site gets a disposition in reports/inkling2-wait-audit.json (counter, kept-host-data, out-of-path); scripts/inkling2/wait_audit.py judges that no barrier disposition remains on the hot decode path and that the evidence names the host data for every kept wait. GLM 5.3 stays green; the capture lane's allreduce waits are in scope where they are ordering-only."
+checks = [
+  'python3 scripts/inkling2/wait_audit.py --check --evidence reports/inkling2-wait-audit.json',
+]
+notes = [
+  '2026-11-22 02:19 CT: added; 1 of 1 checks fail, as they should before the work',
+]
