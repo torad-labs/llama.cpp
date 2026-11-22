@@ -810,6 +810,8 @@ if (GGML_CUDA)
     # against a double-precision CPU port (router logits, ids, weights, sampled SITU and one weighted-sum output) and sees
     # the tensors a fused launch leaves unwritten keep their sentinel. The expert-row limit is the served 23 so that the
     # reference arm runs the row kernels the fused launches copy.
+    # guarded: test-inkling-moe-fuse.cpp is not in this commit (fusions lane still uncommitted)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-inkling-moe-fuse.cpp)
     llama_build(test-inkling-moe-fuse.cpp LINK ggml)
     add_test(NAME inkling-fuse-chain-ref-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-ref.bin)
     add_test(NAME inkling-fuse-chain-fused-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-fused.bin)
@@ -821,12 +823,15 @@ if (GGML_CUDA)
         ENVIRONMENT "GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
     set_tests_properties(inkling-fuse-chain-exact PROPERTIES LABELS "main"
         DEPENDS "inkling-fuse-chain-ref-cuda0;inkling-fuse-chain-fused-cuda0")
+    endif()
     # [fp8] the e4m3 hi+lo pair algebra and the block-scaled folds of GGML_CUDA_FATTN_FP8_ACCUM, on the device
     # (campaign row inkling-fp8-accumulation; the primitives live in ggml/src/ggml-cuda/fattn-rel-fp8-pair.cuh):
     # the RNE code held against CUDA's own fp8 conversion, the block encode's one ceil scale a warp, a
     # single-lane fold bit-exact, the 32- and 256-partial folds against double sums, and the one-hot per-term
     # fold; the binary skips (77) on a device below compute capability 12.0
     find_package(CUDAToolkit REQUIRED)
+    # guarded: test-inkling-fp8-pair.cpp is not in this commit
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-inkling-fp8-pair.cpp)
     set_source_files_properties(test-inkling-fp8-pair.cpp PROPERTIES LANGUAGE CUDA)
     llama_build(test-inkling-fp8-pair.cpp)
     target_include_directories(test-inkling-fp8-pair PRIVATE ${CUDAToolkit_INCLUDE_DIRS}
@@ -836,6 +841,7 @@ if (GGML_CUDA)
     set_target_properties(test-inkling-fp8-pair PROPERTIES CUDA_ARCHITECTURES 120a)
     llama_test(test-inkling-fp8-pair NAME test-inkling-fp8-pair-cuda0)
     set_tests_properties(test-inkling-fp8-pair-cuda0 PROPERTIES LABELS "main" SKIP_RETURN_CODE 77)
+    endif()
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
