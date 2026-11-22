@@ -362,7 +362,7 @@ class Parser(unittest.TestCase):
         cases = [("magic", build_state(self.k, self.v, magic=0x12345678), "not a sequence state"),
                  ("version", build_state(self.k, self.v, version=3), "version 3"),
                  ("transposed", build_state(self.k, self.v, v_trans=1), "transposed"),
-                 ("q8_0", build_state(self.k, self.v, type_id=8), "not F32, F16 or BF16"),
+                 ("unknown-type", build_state(self.k, self.v, type_id=99), "is not one of f32/f16/bf16/q4_0/q8_0"),
                  ("truncated", good[:len(good) // 2], "ends inside"),
                  ("empty", good[:8], "ends inside")]
         for name, blob, text in cases:
@@ -734,6 +734,120 @@ class WholeRun(unittest.TestCase):
         self.assertNotIn("sim", res["states"][0])
         self.assertEqual(res["cross_states"], {})
         self.assertNotIn("Format simulation", text)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# quantized rows: an independent encoder (the oracle) against the reader's decoder
+# ---------------------------------------------------------------------------------------------------------------------
+
+def pack_q8_0(vals):
+    """Encode float values as q8_0 blocks; returns uint8 bytes. The engine writes the same layout."""
+    b = vals.reshape(-1, 32).astype(np.float32)
+    d = np.abs(b).max(axis=1) / 127.0
+    df = d.astype("<f2").astype(np.float32)                     # the stored scale is a half-rounded value
+    q = np.clip(np.rint(b / df[:, None]), -128, 127).astype(np.int8)
+    dbits = d.astype("<f2").view(np.uint8).reshape(-1, 2)       # its bits go on disk
+    return np.concatenate([dbits, q.view(np.uint8)], axis=1).reshape(-1)
+
+
+def pack_q4_0(vals):
+    """Encode float values as q4_0 blocks; decoded value i is d * (nibble_i - 8) with ggml row order:
+    byte j holds value 2j in its low nibble and value 2j+1 in its high nibble."""
+    b = vals.reshape(-1, 32).astype(np.float32)
+    d = np.abs(b).max(axis=1) / 7.5                             # keeps rint inside [0, 15] after the +8 shift
+    df = d.astype("<f2").astype(np.float32)
+    q = np.clip(np.rint(b / df[:, None]) + 8, 0, 15).astype(np.uint8)
+    qs = (q[:, 0::2] | (q[:, 1::2] << 4)).astype(np.uint8)
+    dbits = d.astype("<f2").view(np.uint8).reshape(-1, 2)
+    return np.concatenate([dbits, qs], axis=1).reshape(-1)
+
+
+class QuantizedRows(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        rng = np.random.default_rng(97)
+        self.n_layer, self.n, self.h = 2, 60, 2
+        k = rng.standard_normal((self.n_layer, self.n, self.h * HD)) * 6.0
+        v = rng.standard_normal((self.n_layer, self.n, self.h * HD))
+        self.k = k.astype(np.float32) * np.minimum(
+            1.0, ks.K_NORM_MAX / (np.linalg.norm(k.astype(np.float32), axis=-1, keepdims=True) + 1e-6))
+        vh = v.astype(np.float32).reshape(v.shape[0], v.shape[1], self.h, HD)
+        self.v = (vh / np.sqrt((vh ** 2).mean(axis=-1, keepdims=True) + 1e-9)).reshape(v.shape)  # RMS 1 a head,
+        # like the engine's rms_norm before the store: mean over the head's values, not vector L2
+
+    def state_from(self, kb, vb, type_id, name="q.state", n_rot=(0, 0)):
+        blob = build_state(kb.astype(np.uint8), vb.astype(np.uint8), dtype=np.uint8,
+                           type_id=type_id, n_rot=n_rot)
+        return ks.KVState(write(self.dir.name, name, blob), HD)
+
+    def packed_layers(self, arr):  # (L, cells, h*HD) floats -> (L, cells, bytes-per-cell) uint8 of q8_0 blocks
+        rows = []
+        for l in range(arr.shape[0]):
+            flat = pack_q8_0(arr[l])
+            rows.append(flat.reshape(arr.shape[1], -1))
+        return np.stack(rows)
+
+    def byte_layers(self, flats):  # per-layer flat uint8 byte strings -> the same (L, cells, row_bytes) shape
+        return np.stack([b.reshape(self.n, -1) for b in flats])
+
+    def test_q8_0_rows_decode_to_the_encoded_values(self):
+        st = self.state_from(self.packed_layers(self.k), self.packed_layers(self.v), 13)
+        self.assertEqual(st.type_name, "q8_0")
+        for layer in range(self.n_layer):
+            d8 = pack_q8_0(self.k[layer]).reshape(-1, 34)
+            sc = d8[:, :2].copy().view("<f2").astype(np.float32).reshape(-1)   # one f16 scale a block
+            expect_k = (d8[:, 2:].view(np.int8).astype(np.float32) * sc[:, None]).reshape(-1, self.h * HD)
+            got = st.read("K", layer, 0, self.n).reshape(-1)
+            np.testing.assert_allclose(got.reshape(-1), expect_k.reshape(-1), rtol=1e-6, atol=1e-6)
+
+    def test_q4_0_rows_decode_nibbles_low_then_high(self):
+        # a hand-built block settles byte order without the encoder: scale f16(1.0); nibble i of the row's
+        # permutation lands at value position i under ggml row order (byte j: 2j low, 2j+1 high).
+        rng = np.random.default_rng(5)
+        pa, pb = rng.permutation(16), rng.permutation(16)
+        exp = np.empty(32, np.float32)
+        exp[0::2] = pa.astype(np.float32) - 8.0                     # even values ride the low nibbles
+        exp[1::2] = pb.astype(np.float32) - 8.0                     # odd values ride the high nibbles
+        blk = np.zeros((self.n * self.h, 18), np.uint8)
+        blk[:, 0] = 0x00                                            # f16 1.0 is 0x3C80: little-endian bytes 00 3C
+        blk[:, 1] = 0x3C
+        qs = np.empty(32, np.uint8)
+        qs[0::2] = pa
+        qs[1::2] = pb
+        blk[:, 2:] = (qs[0::2] | (qs[1::2] << 4))[None, :]
+        blob_k = np.stack([blk.reshape(self.n, -1)] * self.n_layer)
+        st = self.state_from(blob_k, blob_k, 8)
+        got = st.read("K", 0, 0, self.n).reshape(-1)[:64].reshape(self.h, HD)  # first cell: two heads
+        np.testing.assert_allclose(got[0], exp, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(got[1], exp, rtol=1e-6, atol=1e-6)
+
+    def test_rotated_quantized_state_matches_unrotated_at_vector_level(self):
+        # the deployed pipeline rotates on store before quantizing; orthonormality keeps per-vector norms and
+        # therefore every bound intact across the two bases, which is what the kernel sees either way.
+        def hadamard(nv):
+            m = np.ones((1, 1), np.float32)
+            while m.shape[0] < nv:
+                m = np.kron(m, np.array([[1.0, 1.0], [1.0, -1.0]], np.float32))
+            return m / np.sqrt(float(nv))
+
+        kro = (self.k.astype(np.float32).reshape(self.n_layer, self.n, self.h, HD)
+               @ hadamard(HD)).reshape(self.k.shape)
+        plain = ks.KVState(write(self.dir.name, "p.q8",
+                                 build_state(self.packed_layers(self.k).astype(np.uint8),
+                                             self.packed_layers(self.v).astype(np.uint8),
+                                             dtype=np.uint8, type_id=13)), HD)
+        rot = ks.KVState(write(self.dir.name, "r.q8",
+                               build_state(self.packed_layers(kro).astype(np.uint8),
+                                           self.packed_layers(self.v).astype(np.uint8),
+                                           dtype=np.uint8, type_id=13, n_rot=(HD, 0))), HD)
+        pr, rr = ks.collect_stats(plain, cfg_for()), ks.collect_stats(rot, cfg_for())
+        for li in range(self.n_layer):
+            a, b = pr[li]["K"], rr[li]["K"]
+            self.assertAlmostEqual(a["vec_max"], b["vec_max"], delta=ks.K_NORM_MAX * 0.02)
+            self.assertAlmostEqual(a["vec_min"], b["vec_min"], delta=0.5)
+            self.assertEqual(b["violations"], 0)
+            self.assertEqual(rr[li]["V"]["violations"], 0)
 
 
 if __name__ == "__main__":

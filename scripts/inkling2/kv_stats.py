@@ -10,9 +10,9 @@ format is still the KL capture against F16: these numbers only say which candida
 USAGE (the four-card box, the real model; about 16K to 32K tokens a state)
 -------------------------------------------------------------------------
 1. Serve with --slot-save-path, one slot, F16 caches, flash attention on. This is the tensor-4 launch with the pool
-   cut to one session. The reader records a state's rotation-on-store when the header carries it (n_rot_k 128 for K,
-   n_rot_v 64 for V) and reports it; only f32/f16/bf16 row types parse today, so a q4_0/q8_0 dump still exits 2 at the
-   type filter until that decode lands — serve states for this tool with F16 caches:
+   cut to one session. States saved from quantized caches parse too: rows of q4_0 or q8_0 decode on read into the
+   stored (rotated) domain the kernel sees, so statistics and format simulations run on deployed values rather than
+   F16 stand-ins, and the reader reports the header's rotation-on-store (n_rot_k 128 for K, n_rot_v 64 for V):
 
      mkdir -p /tmp/kvstates
      python3 scripts/inkling2/serve.py --profile tensor-4 --packs /srv/models/inkling-2-small-abliterated-q3km \\
@@ -98,6 +98,25 @@ STATE_MAGIC = 0x67677371  # 'ggsq'
 STATE_VERSION = 4
 TOKEN_NULL = 0xFFFFFFFF
 TYPES = {0: ("f32", 4), 1: ("f16", 2), 30: ("bf16", 2)}
+# Quantized rows decode to f32 on read, in the stored (rotated) domain the kernel sees: per-block scale first,
+# then the values of one ggml block. GGML_CUDA_FATTN_REL_DECODE_* reads exactly these bytes on device.
+QUANT_TYPES = {8: ("q4_0", 18, 32), 13: ("q8_0", 34, 32)}  # id -> (name, block bytes, values a block)
+
+
+def _dequant_q(buf, name):
+    """One flat layer's quantized rows as float32 [values], blocks of d + q."""
+    n_blocks = buf.size // (QUANT_TYPES[8 if name == "q4_0" else 13][1])
+    b = buf.reshape(n_blocks, QUANT_TYPES[8 if name == "q4_0" else 13][1])
+    d = b[:, :2].copy().view("<f2").astype(np.float32).reshape(-1)   # one f16 scale a block; copy before view:
+    # the column slice is strided, and numpy only reinterprets itemsize on contiguous memory
+    if name == "q8_0":
+        return (b[:, 2:].view(np.int8).astype(np.float32) * d[:, None]).reshape(-1)
+    lo = (b[:, 2:] & 0x0F).astype(np.float32)
+    hi = (b[:, 2:] >> 4).astype(np.float32)
+    q = np.empty((n_blocks, 32), np.float32)
+    q[:, 0::2] = lo                                                  # ggml row order: byte j holds values 2j low, 2j+1 high
+    q[:, 1::2] = hi
+    return ((q - 8.0) * d[:, None]).reshape(-1)
 
 HEAD_DIM = 128
 FIRST_GLOBAL_LAYER = 5  # the global layers are 5, 11, ..., 47 in Small and 5, 11, 17, 23 in Mini
@@ -248,14 +267,25 @@ class KVState:
         if len(both) != 1:
             raise StateError(f"{self.path}: layers differ in type or row size ({sorted(both)}): not supported")
         t, row = both.pop()
-        if t not in TYPES:
-            raise StateError(f"{self.path}: cache type id {t} is not F32, F16 or BF16; serve with F16 caches")
-        self.type_name, elem = TYPES[t]
-        if row % (elem * head_dim):
-            raise StateError(f"{self.path}: row of {row} bytes is not a whole number of heads of {head_dim} {self.type_name}")
-        self.row_bytes = row
-        self.n_heads = row // (elem * head_dim)
-        self.head_dim = head_dim
+        if t in QUANT_TYPES:
+            name, blk, vpb = QUANT_TYPES[t]
+            vals = row // blk * vpb
+            if row % blk or head_dim % vpb or vals % head_dim:
+                raise StateError(f"{self.path}: row of {row} bytes is not whole {name} blocks of "
+                                 f"{blk} bytes covering whole heads of {head_dim}")
+            self.type_name, self.row_bytes = name, row
+            self.n_heads = vals // head_dim
+            self.head_dim = head_dim
+        elif t not in TYPES:
+            raise StateError(f"{self.path}: cache type id {t} is not one of f32/f16/bf16/q4_0/q8_0")
+        else:
+            self.type_name, elem = TYPES[t]
+            if row % (elem * head_dim):
+                raise StateError(f"{self.path}: row of {row} bytes is not a whole number of heads of {head_dim} {self.type_name}")
+            self.row_bytes = row
+            self.n_heads = row // (elem * head_dim)
+            self.head_dim = head_dim
+
 
     def read(self, kind, layer, c0, c1):
         """Cells c0..c1 (file order) of one layer as float32 [cells, heads, head_dim]."""
@@ -265,6 +295,8 @@ class KVState:
             f.seek(self.off[kind][layer] + c0 * self.row_bytes)
             if f.readinto(memoryview(buf)) != buf.size:
                 raise StateError(f"{self.path}: short read of {kind} layer {layer}")
+        if self.type_name in ("q4_0", "q8_0"):
+            return _dequant_q(buf, self.type_name).reshape(n, self.n_heads, self.head_dim)
         if self.type_name == "bf16":
             x = (buf.view("<u2").astype(np.uint32) << 16).view(np.float32)
         else:
