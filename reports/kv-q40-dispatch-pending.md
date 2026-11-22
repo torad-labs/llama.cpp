@@ -121,3 +121,13 @@ Buildbox note for whoever resumes here: gpu-5090-02 moved endpoints after its re
 as `riftuser@180.189.55.43` port 12800 (`rig cloudrift status`; mini-search box same IP, port
 40500); ~/.config/rig/ssh_config's buildbox block was rewritten accordingly with fresh host keys,
 and the fresh image needed `-DCMAKE_CUDA_ARCHITECTURES=120`.
+
+## Staging hygiene, from the 847e4c638 sweep
+
+Committing by named `git add <paths>` does not make a commit contain only those paths: everything already in
+the shared index goes too. 847e4c638 originally carried inkling-mini's `fattn-rel-rows.cuh` (unified-pool rows
+decode kernel for Mini, q4_0/q8_0, GGML_CUDA_FATTN_REL_ROWS_LEGACY), staged by another seat's session before
+this one committed its docstring fix on top of it. Fixed by plumbing while nothing was pushed: the branch moved
+to d8d6b5607 (kv_stats change alone) and the rows file returned to disk untracked as its owner left it.
+Standing rule adopted here: every future commit in this checkout inspects `git diff --cached --stat`
+immediately before committing — the index never starts empty.
