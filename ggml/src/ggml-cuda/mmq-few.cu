@@ -853,6 +853,37 @@ static void mmq_few_launch(Kernel kernel, const ggml_cuda_kernel_launch_params &
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...));
 }
 
+// The largest cluster of this kernel's blocks, with their dynamic shared memory, that one GPC can hold. The count of
+// resident blocks above is over the whole GPU, and cudaLaunchKernelEx fails on a cluster that no GPC can place.
+// Asked once a device for each kernel: the caller keeps the answers (every few-row kernel has the same pointer type).
+template <typename kernel_t>
+static int mmq_few_cluster_fit(kernel_t kernel, const dim3 block_dims, const int nbytes_shared, int (&fit)[GGML_CUDA_MAX_DEVICES]) {
+    const int device = ggml_cuda_get_device();
+    if (fit[device] == 0) {
+        int csize = MMQ_FEW_MAX_CLUSTER;
+        for (; csize > 1; --csize) {
+            cudaLaunchAttribute attr;
+            attr.id               = cudaLaunchAttributeClusterDimension;
+            attr.val.clusterDim.x = csize;
+            attr.val.clusterDim.y = 1;
+            attr.val.clusterDim.z = 1;
+            cudaLaunchConfig_t cfg = {};
+            cfg.gridDim          = dim3(csize, 1, 1);
+            cfg.blockDim         = block_dims;
+            cfg.dynamicSmemBytes = nbytes_shared;
+            cfg.attrs            = &attr;
+            cfg.numAttrs         = 1;
+            int nclusters = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveClusters(&nclusters, kernel, &cfg));
+            if (nclusters > 0) {
+                break;
+            }
+        }
+        fit[device] = csize;
+    }
+    return fit[device];
+}
+
 // ggml_is_constant (static in ggml.c) on the tensor that a view points to
 static bool mmq_few_is_constant(const ggml_tensor * src0) {
     const ggml_tensor * x_root = src0->view_src ? src0->view_src : src0;
@@ -877,13 +908,18 @@ static void launch_mul_mat_q_few(const ggml_tensor * src0, const ggml_tensor * s
 
     const int     nrows_blk = (mmq_few_ksplit(has_ids, nunits) ? 1 : MMQ_FEW_NWARPS)*nmt*MMQ_FEW_NROWS;
     const int64_t ntiles    = (ne01 + nrows_blk - 1) / nrows_blk;
+    const dim3    block_dims(warp_size, MMQ_FEW_NWARPS, 1);
+    auto kernel = mul_mat_q_few<type, ncg, nmt, has_ids>;
     // MUL_MAT_ID keeps a block a tile
-    const int     csize     = has_ids ? 1 : mmq_few_cluster_size(nunits / mmq_few_nunits_stage(type, ncg, nmt), ntiles*ne12*ne13);
+    int csize = has_ids ? 1 : mmq_few_cluster_size(nunits / mmq_few_nunits_stage(type, ncg, nmt), ntiles*ne12*ne13);
+    if (csize > 1) {
+        static int fit[GGML_CUDA_MAX_DEVICES] = { 0 }; // 0: not asked yet
+        csize = std::min(csize, mmq_few_cluster_fit(kernel, block_dims, nbytes_shared, fit));
+    }
 
     const dim3 block_nums(ntiles*csize, has_ids ? npairs_max : ne12, ne13);
-    const dim3 block_dims(warp_size, MMQ_FEW_NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(block_nums, block_dims, nbytes_shared, stream);
-    mmq_few_launch(mul_mat_q_few<type, ncg, nmt, has_ids>, params, csize,
+    mmq_few_launch(kernel, params, csize,
         (const char *) src0->data, src1_q, (float *) dst->data,
         nunits, (int) ne01, (int) ne1, (int64_t) nb01, (int) (nb1/sizeof(float)),
         (int) (ne12/ne02), (int64_t) nb02, (int) (nb2/sizeof(float)),
@@ -942,7 +978,7 @@ static constexpr bool mmq_few_group_type(const ggml_type type) {
     return type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
 }
 
-// the cluster launch_mul_mat_q_few gives a flat MUL_MAT of src0 alone at this tile shape
+// the cluster launch_mul_mat_q_few gives a flat MUL_MAT of src0 alone at this tile shape, before mmq_few_cluster_fit
 static int mmq_few_group_cluster_size(const ggml_tensor * src0, const int ncg, const int nmt) {
     const int nunits = (int) (src0->ne[0] / QK_K);
     return mmq_few_cluster_size(nunits / mmq_few_nunits_stage(src0->type, ncg, nmt), (src0->ne[1] + nmt*MMQ_FEW_NROWS - 1) / (nmt*MMQ_FEW_NROWS));
@@ -958,7 +994,21 @@ static void launch_mul_mat_q_few_group(ggml_tensor * const * dsts, const int n, 
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_few_group<type, ncg, nmt>), nbytes_shared);
 
     // the cluster each matrix takes alone, the same for all of them (ggml_cuda_mmq_few_group_fits)
-    const int csize = mmq_few_group_cluster_size(dsts[0]->src[0], ncg, nmt);
+    const dim3 block_dims(warp_size, MMQ_FEW_NWARPS, 1);
+    int csize = mmq_few_group_cluster_size(dsts[0]->src[0], ncg, nmt);
+    if (csize > 1) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_few<type, ncg, nmt, false>), nbytes_shared);
+        static int fit_one[GGML_CUDA_MAX_DEVICES]   = { 0 };
+        static int fit_group[GGML_CUDA_MAX_DEVICES] = { 0 };
+        csize = std::min(csize, mmq_few_cluster_fit(mul_mat_q_few<type, ncg, nmt, false>, block_dims, nbytes_shared, fit_one));
+        if (mmq_few_cluster_fit(mul_mat_q_few_group<type, ncg, nmt>, block_dims, nbytes_shared, fit_group) < csize) {
+            // a GPC cannot hold the group kernel's clusters of that size: a launch each, the same bit for bit
+            for (int m = 0; m < n; ++m) {
+                launch_mul_mat_q_few<type, ncg, nmt>(dsts[m]->src[0], dsts[m]->src[1], dsts[m], src1_q, stream);
+            }
+            return;
+        }
+    }
 
     mmq_few_group group = {};
     int  nblocks       = 0;
@@ -979,7 +1029,6 @@ static void launch_mul_mat_q_few_group(ggml_tensor * const * dsts, const int n, 
     }
 
     const dim3 block_nums(nblocks, 1, 1);
-    const dim3 block_dims(warp_size, MMQ_FEW_NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(block_nums, block_dims, nbytes_shared, stream);
     mmq_few_launch(mul_mat_q_few_group<type, ncg, nmt>, params, csize, group, src1_q, nunits, (int) dsts[0]->ne[1], x_is_constant, csize);
 }

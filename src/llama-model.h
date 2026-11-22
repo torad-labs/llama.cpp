@@ -1017,6 +1017,13 @@ struct llama_model {
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
+protected:
+    // experts_split_by_expert(): -1 until load_tensors has created the tensors it depends on
+    int8_t experts_by_expert = -1;
+    bool decide_experts_split_by_expert() const;
+
+public:
+
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
@@ -1039,6 +1046,7 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     // under -sm tensor Inkling 2's routed experts are split by expert, not by their hidden rows: where down's blocks cannot share the rows evenly, or always under LLAMA_INKLING2_EXPERT_SPLIT
+    // (decided once by load_tensors, when every down tensor exists)
     bool experts_split_by_expert() const;
     bool no_alloc() const;
 
