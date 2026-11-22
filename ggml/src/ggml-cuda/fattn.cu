@@ -1392,7 +1392,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             k->ne[1] >= 8192 && k->ne[1] <= INT32_MAX && k->ne[1]%32 == 0 &&
             q->ne[3] == 1 && q->ne[1] <= 32*fattn_rel_decode_group(dst) && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
             q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == k->nb[0] &&
-            k->type == v->type && (k->type == GGML_TYPE_Q8_0 || fattn_rel_mma_type(k->type)) && softcap == 0.0f) {
+            k->type == v->type && (k->type == GGML_TYPE_Q8_0 || fattn_rel_mma_type(k->type) ||
+                fattn_rel_elem_q4(k->type)) && softcap == 0.0f) {
         return BEST_FATTN_KERNEL_REL_DECODE;
     }
     if (kernel == BEST_FATTN_KERNEL_MMA_F16 && ggml_cuda_fattn_may_use_rel_prefill(device, dst) &&

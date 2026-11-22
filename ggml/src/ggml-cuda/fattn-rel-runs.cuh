@@ -20,10 +20,11 @@ constexpr int fattn_rel_runs_stages = 2;  // tiles a block holds: one is read wh
 constexpr int fattn_rel_runs_row_i4 = 17; // a staged row: 128 halves and 16 bytes of padding against bank conflicts
 
 // The cache types the tiles are read from: f16, copied as it is, and with GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE q8_0 and
-// f8_e4m3, converted to f16 as a tile is staged (fattn_rel_elem), as the mask kernels read them.
+// f8_e4m3, and q4_0 under its own switch (fattn_rel_elem_q4), converted to f16 as a tile is staged (fattn_rel_elem), as
+// the mask kernels read them.
 static bool fattn_rel_runs_type(const ggml_type type) {
     static const bool one_byte = ggml_env_switch("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE");
-    return type == GGML_TYPE_F16 || (one_byte && fattn_rel_elem_one_byte(type));
+    return type == GGML_TYPE_F16 || (one_byte && fattn_rel_elem_one_byte(type)) || fattn_rel_elem_q4(type);
 }
 
 static bool fattn_rel_runs_hinted(const ggml_tensor * dst) {
@@ -583,6 +584,9 @@ static void ggml_cuda_fattn_rel_runs_type(ggml_backend_cuda_context & ctx, ggml_
 static void ggml_cuda_fattn_rel_runs(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     switch (dst->src[1]->type) {
+        case GGML_TYPE_Q4_0:
+            ggml_cuda_fattn_rel_runs_type<GGML_TYPE_Q4_0>(ctx, dst);
+            break;
         case GGML_TYPE_Q8_0:
             ggml_cuda_fattn_rel_runs_type<GGML_TYPE_Q8_0>(ctx, dst);
             break;
