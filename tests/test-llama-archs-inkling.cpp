@@ -246,12 +246,65 @@ std::map<std::string, case_def> cases(size_t seed) {
     return ret;
 }
 
+bool compact_greedy(std::size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+    auto model = get_model(gguf.get(), nullptr, seed, 0.0f, devs, LLAMA_SPLIT_MODE_TENSOR);
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    auto reference = make_context(model.get(), {64, 2, 0});
+    auto candidate = make_context(model.get(), {64, 2, 0});
+    llama_set_output_candidates(candidate.get(), 3);
+    bool ok = true;
+    for (int pos = 0; pos < 6; ++pos) {
+        const bool compact = pos % 2 == 0;
+        ok = llama_set_seq_greedy_candidates(candidate.get(), 0) && ok;
+        if (compact) {
+            ok = llama_set_seq_greedy_candidates(candidate.get(), 1) && ok;
+        } else {
+            llama_set_seq_candidates(candidate.get(), 1, false);
+        }
+
+        llama_batch batch = llama_batch_init(2, 0, 1);
+        batch_add(batch, (13*pos + 5) % vocab, pos, {0}, true);
+        batch_add(batch, (19*pos + 7) % vocab, pos, {1}, true);
+        const int ref_rc = llama_decode(reference.get(), batch);
+        const int cand_rc = llama_decode(candidate.get(), batch);
+        llama_batch_free(batch);
+        if (ref_rc != 0 || cand_rc != 0) {
+            return false;
+        }
+        for (int row = 0; row < 2; ++row) {
+            const float * logits = llama_get_logits_ith(reference.get(), row);
+            const auto actual = llama_get_sampling_row_ith(candidate.get(), row);
+            if (!compact) {
+                ok = ok && actual.logits && std::equal(logits, logits + vocab, actual.logits);
+                continue;
+            }
+            if (actual.logits || actual.n_candidates != 3 || actual.n_sampled_logits != 3) {
+                return false;
+            }
+            std::vector<llama_token> ids(vocab);
+            for (int id = 0; id < vocab; ++id) { ids[id] = id; }
+            std::partial_sort(ids.begin(), ids.begin() + 3, ids.end(), [&](llama_token a, llama_token b) {
+                return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
+            });
+            for (int i = 0; i < 3; ++i) {
+                ok = ok && actual.candidates[i] == ids[i] && actual.sampled_logits[i] == logits[ids[i]];
+            }
+        }
+    }
+    fprintf(stderr, "%s compact greedy: padded head and mixed output batches\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 } // namespace
 
 int test_inkling_split(const std::string & name, size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
     if (devs.size() < 2) {
         fprintf(stderr, "inkling2 split %s: a tensor split needs two ranks, %zu given\n", name.c_str(), devs.size());
         return 1;
+    }
+    if (name == "compact-greedy") {
+        return compact_greedy(seed, devs) ? 0 : 1;
     }
     const auto all = cases(seed);
     const auto it = all.find(name);

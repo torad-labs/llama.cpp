@@ -9012,19 +9012,24 @@ void ggml_compute_forward_top_k_candidates(const ggml_compute_params * params, g
     const ggml_tensor * src = dst->src[0];
     GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I64);
     GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
-    const int64_t ncols = src->ne[0];
+    const int64_t stride = src->ne[0];
     const int64_t k = dst->ne[0];
     const int64_t parts = dst->ne[1];
-    const int64_t count = std::min(k, ncols);
     const int32_t offset = ggml_get_op_params_i32(dst, 0);
-    int32_t * tmp = count ? (int32_t *) params->wdata + (ncols + CACHE_LINE_SIZE_F32)*params->ith : nullptr;
+    const int32_t vocab = ggml_get_op_params_i32(dst, 1);
+    const int64_t ncols = vocab ? std::clamp<int64_t>(vocab - offset, 0, stride) : stride;
+    const bool first_nan = offset == 0 && ggml_get_op_params_i32(dst, 2);
+    const int64_t count = std::min(k, ncols);
+    int32_t * tmp = count ? (int32_t *) params->wdata + (stride + CACHE_LINE_SIZE_F32)*params->ith : nullptr;
     for (int64_t row = params->ith; row < dst->ne[2]; row += params->nth) {
         uint64_t * out = (uint64_t *) dst->data + row*parts*k;
         std::fill(out, out + parts*k, uint64_t(UINT32_MAX));
         if (count == 0) { continue; }
-        const float * values = (const float *) src->data + row*ncols;
+        const float * values = (const float *) src->data + row*stride;
+        const bool leading_nan = first_nan && std::isnan(values[0]);
         for (int64_t i = 0; i < ncols; ++i) { tmp[i] = i; }
-        std::partial_sort(tmp, tmp + count, tmp + ncols, [values](int32_t a, int32_t b) {
+        std::partial_sort(tmp, tmp + count, tmp + ncols, [values, leading_nan](int32_t a, int32_t b) {
+            if (leading_nan && (a == 0 || b == 0)) { return a < b; }
             if (std::isnan(values[a]) != std::isnan(values[b])) { return !std::isnan(values[a]); }
             return values[a] > values[b] || (!(values[a] < values[b]) && a < b);
         });

@@ -796,7 +796,15 @@ static void launch_mul_mat_q_few_switch_ncg(const ggml_tensor * src0, const ggml
     }
 }
 
-void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+size_t ggml_cuda_mmq_few_shared_q8_size(const ggml_tensor * src0, const ggml_tensor * src1) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    const int nunits = src0->ne[0] / QK_K;
+    const int ncg    = mmq_few_ncg(src1->ne[1]);
+    return size_t(src1->ne[2])*src1->ne[3]*nunits*ncg*MMQ_FEW_Q8_1_INT4*sizeof(int4);
+}
+
+void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        char * src1_q_shared, const bool quantize_src1) {
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
@@ -815,6 +823,7 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
     ggml_cuda_pool_alloc<int4> src1_q(ctx.pool());
     int npairs_max = 0;
     if (ids) {
+        GGML_ASSERT(src1_q_shared == nullptr); // a shared copy holds the MUL_MAT layout, the ids quantize writes pairs
         GGML_ASSERT(ids->type == GGML_TYPE_I32);
         GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
         GGML_ASSERT(ne1 == ids->ne[0] && ne13 == 1 && ne3 == 1);
@@ -834,39 +843,52 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
         GGML_ASSERT(ne11 <= MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS);
         GGML_ASSERT(ne12 % ne02 == 0 && ne13 % ne03 == 0);
 
-        src1_q.alloc(int64_t(ne12)*ne13*nunits*ncg*MMQ_FEW_Q8_1_INT4);
-        quantize_mmq_few_q8_1_cuda((const float *) src1->data, src1_q.get(), mmq_few_ds_layout(src0->type), ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
-            ne11, ne12, ne13, stream);
+        if (src1_q_shared != nullptr) {
+            if (quantize_src1) {
+                quantize_mmq_few_q8_1_cuda((const float *) src1->data, (int4 *) src1_q_shared, mmq_few_ds_layout(src0->type), ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
+                    ne11, ne12, ne13, stream);
+            }
+        } else {
+            src1_q.alloc(int64_t(ne12)*ne13*nunits*ncg*MMQ_FEW_Q8_1_INT4);
+            quantize_mmq_few_q8_1_cuda((const float *) src1->data, src1_q.get(), mmq_few_ds_layout(src0->type), ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
+                ne11, ne12, ne13, stream);
+        }
     }
+
+    const int4 * src1_q_data = src1_q_shared != nullptr ? (const int4 *) src1_q_shared : src1_q.get();
 
     switch (src0->type) {
         case GGML_TYPE_Q8_0:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q8_0>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q8_0>(src0, src1, dst, src1_q_data, pairs.get(), npairs_max, ncg, stream);
             break;
         case GGML_TYPE_Q3_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q3_K>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q3_K>(src0, src1, dst, src1_q_data, pairs.get(), npairs_max, ncg, stream);
             break;
         case GGML_TYPE_Q4_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q4_K>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q4_K>(src0, src1, dst, src1_q_data, pairs.get(), npairs_max, ncg, stream);
             break;
         case GGML_TYPE_Q5_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q5_K>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q5_K>(src0, src1, dst, src1_q_data, pairs.get(), npairs_max, ncg, stream);
             break;
         case GGML_TYPE_Q6_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q6_K>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q6_K>(src0, src1, dst, src1_q_data, pairs.get(), npairs_max, ncg, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ3_S>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ3_S>(src0, src1, dst, src1_q_data, pairs.get(), npairs_max, ncg, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_NL>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_NL>(src0, src1, dst, src1_q_data, pairs.get(), npairs_max, ncg, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_XS>(src0, src1, dst, src1_q.get(), pairs.get(), npairs_max, ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_XS>(src0, src1, dst, src1_q_data, pairs.get(), npairs_max, ncg, stream);
             break;
         default:
             GGML_ABORT("unsupported type for few-row MMQ");
     }
+}
+
+void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_q_few(ctx, src0, src1, ids, dst, nullptr, false);
 }
 
 // Min. number of src1 columns (MUL_MAT_ID: tokens) for the few-row MMQ, 0 if it is not used for this type, GPU and row length.
@@ -938,6 +960,17 @@ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * 
 
 void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_UNUSED_VARS(ctx, src0, src1, ids, dst);
+    GGML_ABORT("few-row MMQ is not supported on HIP or MUSA");
+}
+
+size_t ggml_cuda_mmq_few_shared_q8_size(const ggml_tensor * src0, const ggml_tensor * src1) {
+    GGML_UNUSED_VARS(src0, src1);
+    GGML_ABORT("few-row MMQ is not supported on HIP or MUSA");
+}
+
+void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        char * src1_q_shared, const bool quantize_src1) {
+    GGML_UNUSED_VARS(ctx, src0, src1, ids, dst, src1_q_shared, quantize_src1);
     GGML_ABORT("few-row MMQ is not supported on HIP or MUSA");
 }
 

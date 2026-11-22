@@ -9213,6 +9213,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     };
     std::vector<gb10_shared_q8_entry> gb10_shared_q8;
 
+    // a few-row MMQ copy of an F32 input shared by the MUL_MATs that read it for one weight type: the first reader
+    // quantizes it in the type's few-row layout, the later readers take the copy. The shape and strides stand in the
+    // entry, so views of one buffer at different shapes do not meet. A node that writes over the input stales the copy.
+    struct mmq_few_shared_q8_entry {
+        const ggml_tensor * src1;
+        ggml_type           type;
+        ggml_cuda_pool_alloc<char> * data;
+        int64_t ne10;
+        int64_t ne11;
+        int64_t ne12;
+        int64_t ne13;
+        size_t  nb11;
+        size_t  nb12;
+        size_t  nb13;
+        size_t  nbytes; // the input's whole extent
+        bool    quantized = false;
+    };
+    std::vector<mmq_few_shared_q8_entry> mmq_few_shared_q8;
+
     struct gb10_virtual_rms_entry {
         const ggml_tensor * normalized;
         ggml_tensor * residual;
@@ -9258,6 +9277,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // GGML_CUDA_MMVQ_Q8_1_PRODUCER_LEGACY=1: no kernel writes a copy beside its output, the first reader quantizes it
     static const bool mmvq_shared_q8_1_legacy   = ggml_env_switch("GGML_CUDA_MMVQ_SHARED_Q8_1_LEGACY");
     static const bool mmvq_q8_1_producer_legacy = ggml_env_switch("GGML_CUDA_MMVQ_Q8_1_PRODUCER_LEGACY");
+    static const bool mmvq_few_shared_q8_legacy = ggml_env_switch("GGML_CUDA_MMVQ_FEW_SHARED_Q8_1_LEGACY");
     const auto mmvq_shared_q8_1_candidate = [](const ggml_tensor * node) {
         if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || node->src[0] == nullptr ||
                 node->src[1] == nullptr || !ggml_is_quantized(node->src[0]->type) || node->src[1]->type != GGML_TYPE_F32 ||
@@ -9281,6 +9301,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         const auto it = mmvq_shared_q8_1_readers.find(src1->data);
         return it == mmvq_shared_q8_1_readers.end() ? 0 : it->second;
+    };
+
+    // the few-row readers of one input, by its weight type: an over-count only makes a copy nobody but the first
+    // reader takes, so the candidates need no dispatch checks here
+    std::map<const ggml_tensor *, std::array<int, GGML_TYPE_COUNT>> mmq_few_shared_q8_counts;
+    bool mmq_few_shared_q8_counted = false;
+    const auto mmq_few_shared_q8_count = [&]() {
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * candidate = cgraph->nodes[j];
+            if (candidate->op == GGML_OP_MUL_MAT && candidate->src[0] && candidate->src[1] &&
+                    ggml_is_quantized(candidate->src[0]->type) && candidate->src[1]->type == GGML_TYPE_F32) {
+                ++mmq_few_shared_q8_counts[candidate->src[1]][candidate->src[0]->type];
+            }
+        }
+        mmq_few_shared_q8_counted = true;
+    };
+    const auto mmq_few_shared_q8_consumer_count = [&](const ggml_tensor * src1, ggml_type type) {
+        if (!mmq_few_shared_q8_counted) {
+            mmq_few_shared_q8_count();
+        }
+        const auto it = mmq_few_shared_q8_counts.find(src1);
+        return it == mmq_few_shared_q8_counts.end() ? 0 : it->second[type];
     };
     cuda_ctx->mmvq_shared_q8_1.reset();
     std::fill(std::begin(cuda_ctx->mmvq_moe_ids), std::end(cuda_ctx->mmvq_moe_ids), nullptr);
@@ -9319,6 +9361,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             entry.remaining = gb10_shared_q8_consumer_count(entry.src1, entry.type);
         }
         for (auto & entry : cuda_ctx->mmvq_shared_q8_1.entries) {
+            entry.quantized = false;
+        }
+        for (auto & entry : mmq_few_shared_q8) {
             entry.quantized = false;
         }
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
@@ -9478,11 +9523,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // the nodes since the last iteration have run (or were fused, or folded into a node that ran), and a q8_1
                 // copy of an input any of them wrote over is stale
-                if (!cuda_ctx->mmvq_shared_q8_1.entries.empty()) {
+                if (!cuda_ctx->mmvq_shared_q8_1.entries.empty() || !mmq_few_shared_q8.empty()) {
                     for (int k = mmvq_shared_q8_1_seen; k < i; ++k) {
                         const ggml_tensor * ran = cgraph->nodes[k];
                         if (!ggml_cuda_is_view_or_noop(ran) && (ran->flags & GGML_TENSOR_FLAG_COMPUTE)) {
                             cuda_ctx->mmvq_shared_q8_1.written((const char *) ran->data, ggml_nbytes(ran), k);
+                            if (!mmq_few_shared_q8.empty()) {
+                                const char * wrote      = (const char *) ran->data;
+                                const size_t wrote_bytes = ggml_nbytes(ran);
+                                for (auto & entry : mmq_few_shared_q8) {
+                                    const char * in = (const char *) entry.src1->data;
+                                    if (entry.quantized && wrote < in + (ptrdiff_t) entry.nbytes && in < wrote + (ptrdiff_t) wrote_bytes) {
+                                        entry.quantized = false;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -9640,6 +9695,41 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (virtual_rms) {
                         --virtual_it->remaining;
                     }
+                    if (!is_concurrent_event_active) {
+                        try_launch_concurrent_event(node);
+                    }
+                    continue;
+                }
+
+                // An F32 input that several few-row MMQ MUL_MATs read for one weight type is quantized once in the
+                // type's few-row layout: the first reader makes the copy, the later readers take it. Writes over the
+                // input stale the copy, checked above. GGML_CUDA_MMVQ_FEW_SHARED_Q8_1_LEGACY=1 quantizes it at each
+                // reader.
+                if (!mmvq_few_shared_q8_legacy && !should_launch_concurrent_events && !is_concurrent_event_active &&
+                        node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
+                        node->src[1]->type == GGML_TYPE_F32 && ggml_is_quantized(node->src[0]->type) &&
+                        mmq_few_shared_q8_consumer_count(node->src[1], node->src[0]->type) > 1 &&
+                        ggml_cuda_should_use_mmq_few(node->src[0], node->src[1], nullptr, cc)) {
+                    const ggml_tensor * s1 = node->src[1];
+                    auto it = std::find_if(mmq_few_shared_q8.begin(), mmq_few_shared_q8.end(),
+                        [&](const mmq_few_shared_q8_entry & e) {
+                            return e.src1 == s1 && e.type == node->src[0]->type && e.ne10 == s1->ne[0] && e.ne11 == s1->ne[1] &&
+                                e.ne12 == s1->ne[2] && e.ne13 == s1->ne[3] && e.nb11 == size_t(s1->nb[1]) &&
+                                e.nb12 == size_t(s1->nb[2]) && e.nb13 == size_t(s1->nb[3]);
+                        });
+                    if (it == mmq_few_shared_q8.end()) {
+                        auto data = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(),
+                                ggml_cuda_mmq_few_shared_q8_size(node->src[0], node->src[1]));
+                        ggml_cuda_pool_alloc<char> * data_ptr = data.get();
+                        gb10_pool_allocations.push_back(std::move(data));
+                        mmq_few_shared_q8.push_back({ s1, node->src[0]->type, data_ptr,
+                            s1->ne[0], s1->ne[1], s1->ne[2], s1->ne[3],
+                            size_t(s1->nb[1]), size_t(s1->nb[2]), size_t(s1->nb[3]), ggml_nbytes(s1), false });
+                        it = std::prev(mmq_few_shared_q8.end());
+                    }
+                    const bool need_quantize = !it->quantized;
+                    ggml_cuda_mul_mat_q_few(*cuda_ctx, node->src[0], node->src[1], nullptr, node, it->data->get(), need_quantize);
+                    it->quantized = true;
                     if (!is_concurrent_event_active) {
                         try_launch_concurrent_event(node);
                     }

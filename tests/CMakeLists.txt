@@ -314,7 +314,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-llama-archs test-glm5next PROPERTIES TIMEOUT 3600)
     if (GGML_CUDA)
         # Inkling 2 under a two-rank tensor split on the first GPU against that GPU alone, sequence state included
-        foreach(inkling_case prefill decode chunks seq-cp state rollback graph-churn)
+        foreach(inkling_case prefill decode chunks seq-cp state rollback graph-churn compact-greedy)
             llama_test(test-llama-archs NAME test-inkling2-split-${inkling_case}
                 ARGS --inkling-split ${inkling_case} --inkling-split-device CUDA0,CUDA0 -s 1234)
         endforeach()

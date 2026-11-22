@@ -2276,6 +2276,16 @@ extern "C" {
             int                   k,
             int                   n_parts);
 
+    // Like top_k_candidates, but only the first n_vocab columns are valid. For a strict greedy scan in token order,
+    // first_nan keeps a NaN at global ID 0 as the highest-ranked record (the scan never replaces its initial NaN).
+    GGML_API struct ggml_tensor * ggml_top_k_candidates_bounded(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            int                   n_parts,
+            int                   n_vocab,
+            bool                  first_nan);
+
     // y = a*scale (scale broadcast over a, optional), each row of y scaled down to an L2 norm of at most threshold:
     // y * min(1, threshold/(|y| + eps))
     GGML_API struct ggml_tensor * ggml_norm_clip(

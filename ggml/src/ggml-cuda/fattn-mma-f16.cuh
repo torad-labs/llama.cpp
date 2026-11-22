@@ -66,10 +66,13 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(112, 112, 32, 128, 2,  64,  56,  56,  56, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(112, 112, 64, 128, 2,  64,  56,  56,  56, 2, true);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,  8, 128, 2, 128,  64,  64,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16, 128, 2,  64,  64,  64,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 2, true);
+    // Inkling 2 Mini (head 128, 3 Q heads a KV head, the dense deq read): more smaller blocks hide the latency of the
+    // quantized rows. Measured at 4 sessions x 38K tokens on an RTX 5080 (geo.py, three runs within 0.1%): decode +10.1%
+    // at 3 blocks an SM, +9.8% at 4, the 128-row tiles of the old line slower at every occupancy.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,  8, 128, 3, 128,  64,  64,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16, 128, 3,  64,  64,  64,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 3,  64,  64,  64,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 3,  64,  64,  64,  64, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128,  8,  64, 4,  64,  96,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 16,  64, 4,  32,  96,  64,  64, 2, true);
@@ -171,10 +174,12 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(112, 112, 32, 128, 2,  64,  56,  56,  56, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(112, 112, 64, 128, 2,  64,  56,  56,  56, 1, true);
 
+    // nstages 1 (the single-stage table): prefill's 64-token tile on Inkling 2 Mini, measured on an RTX 5080 (geo.py):
+    // 256 threads at 2 blocks an SM with 64 KV rows is +11.9%, three runs within 0.2%.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,  8,  64, 2,  32,  64,  64,  64, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16,  64, 2,  32,  64,  64,  64, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 256, 2,  64,  64,  64,  64, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128,  8,  64, 2,  32,  96,  64,  64, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 16,  64, 2,  32,  96,  64,  64, 1, true);
@@ -736,6 +741,18 @@ static constexpr __host__ __device__ int fattn_mma_tile_K_h2(
     return type_K == GGML_TYPE_F16 ? nbatch_fa*stride_tile_K : 0;
 }
 
+// A q4_0 or q8_0 K/V on a dense launch is read without an f16 copy of the cache in one of two ways.
+// raw: the GQA tiles (ncols2 > 1), K*Q on the int8 values (flash_attn_ext_raw_KQ).
+// deq dense: one Q head a tile (ncols2 == 1, a relative position bias a Q head), each tile's rows converted to f16 as they
+// load (flash_attn_ext_deq_dense_load_tile).
+static constexpr __host__ __device__ bool fattn_mma_raw_KV(const ggml_type type_K, const int ncols2, const bool use_sparse) {
+    return type_K != GGML_TYPE_F16 && !use_sparse && ncols2 > 1;
+}
+
+static constexpr __host__ __device__ bool fattn_mma_deq_dense(const ggml_type type_K, const int ncols2, const bool use_sparse) {
+    return type_K != GGML_TYPE_F16 && !use_sparse && ncols2 == 1;
+}
+
 template<ggml_type type, int D, int nwarps, int nbatch_fa>
 static __device__ __forceinline__ void flash_attn_ext_raw_load(
         const char * const __restrict__ KV, char * const __restrict__ tile_raw, const int stride_KV) {
@@ -965,6 +982,96 @@ static __device__ __forceinline__ void flash_attn_ext_deq_load_tile(
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// A dense K or V tile from a q4_0 or q8_0 cache, one Q head a tile (fattn_mma_deq_dense): the nbatch_fa rows from KV on.
+// As in flash_attn_ext_deq_load_tile, a raw row is copied asynchronously to the end of its own f16 row in the tile and
+// converted in place, so VRAM is read in the cache's size and the tile takes no shared memory beyond the f16 one.
+// A lane converts one block pair of one row and a warp whole rows: it reads all their raw words before it writes any.
+// A row past i_sup is not read and is zeros, as in the f16 load. The values are an f16 copy's
+// (flash_attn_ext_raw_dequant_pair), so the output is the copy's bit for bit.
+template<ggml_type type, int D, int nwarps, int nbatch_fa, int stride_tile, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_deq_dense_load_tile(
+        const char * const __restrict__ KV, half2 * const __restrict__ tile, const int stride_KV, const int i_sup) {
+#ifdef CP_ASYNC_AVAILABLE
+    constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
+    constexpr int row_bytes      = fattn_raw_row_bytes<type, D>();
+    // 16 byte copies where the row is a multiple of 16 bytes, else 8 (head size 128: 136 bytes of q8_0, 72 of q4_0)
+    constexpr int chunk          = row_bytes % 16 == 0 ? 16 : 8;
+    constexpr int chunks_per_row = row_bytes/chunk;
+    constexpr int nchunks        = nbatch_fa*chunks_per_row;
+    constexpr int stride_bytes   = stride_tile*sizeof(half2);
+    constexpr int raw_offset     = stride_bytes - row_bytes;
+    constexpr int pairs_per_row  = D/(2*QK8_0);
+    constexpr int pair_bytes     = 2*fattn_raw_block_bytes<type>();
+    constexpr int pair_words     = pair_bytes/sizeof(int);
+    constexpr int rows_per_warp  = warp_size/pairs_per_row;
+    constexpr int ngroups        = nbatch_fa/rows_per_warp;
+    static_assert(warp_size == 32, "bad warp_size");
+    static_assert(row_bytes > 0 && row_bytes % 8 == 0, "raw rows are copied in 8 or 16 byte chunks");
+    static_assert(stride_bytes % 16 == 0 && stride_bytes >= D*int(sizeof(half)) && raw_offset >= 0 && raw_offset % chunk == 0,
+        "the raw row must fit the end of its f16 row");
+    static_assert(D % (2*QK8_0) == 0 && warp_size % pairs_per_row == 0 && nbatch_fa % rows_per_warp == 0, "a warp converts whole rows");
+    static_assert(pair_bytes % sizeof(int) == 0 && raw_offset % sizeof(int) == 0, "the raw words are 4-byte aligned in the tile");
+
+    const unsigned int tile_32 = ggml_cuda_cvta_generic_to_shared(tile);
+
+#pragma unroll
+    for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
+        const int c = c0 + threadIdx.y*warp_size + threadIdx.x;
+
+        if (c0 + nwarps*warp_size > nchunks && c >= nchunks) {
+            break;
+        }
+
+        const int i = c / chunks_per_row;
+        const int k = c % chunks_per_row;
+        if (!oob_check || i < i_sup) {
+            if constexpr (chunk == 16) {
+                cp_async_cg_16<64>(tile_32 + i*stride_bytes + raw_offset + k*16, KV + int64_t(i)*stride_KV + k*16);
+            } else {
+                cp_async_ca_8(tile_32 + i*stride_bytes + raw_offset + k*8, KV + int64_t(i)*stride_KV + k*8);
+            }
+        }
+    }
+    cp_async_wait_all();
+    __syncthreads();
+
+    const int r  = threadIdx.x % rows_per_warp;
+    const int bp = threadIdx.x / rows_per_warp;
+#pragma unroll
+    for (int g0 = 0; g0 < ngroups; g0 += nwarps) {
+        const int g = g0 + threadIdx.y;
+
+        if (g0 + nwarps > ngroups && g >= ngroups) {
+            break;
+        }
+
+        const int i = rows_per_warp*g + r;
+
+        int w[pair_words];
+        const int * src = (const int *) ((const char *) tile + i*stride_bytes + raw_offset + bp*pair_bytes);
+#pragma unroll
+        for (int l = 0; l < pair_words; ++l) {
+            w[l] = src[l];
+        }
+        __syncwarp(); // the warp's rows are read before any of them is written
+
+        half2 * dst = tile + i*stride_tile + bp*QK8_0;
+        if (!oob_check || i < i_sup) {
+            flash_attn_ext_raw_dequant_pair<type>(w, dst);
+        } else {
+            const int4 zero = {0, 0, 0, 0};
+#pragma unroll
+            for (int l = 0; l < QK8_0; l += 4) {
+                *((int4 *) (dst + l)) = zero;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(KV, tile, stride_KV, i_sup);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 // K*Q for q4_0 or q8_0 K runs as int8 tensor core MMAs on the raw values, 4x the rate of the f16 MMA with f32
 // accumulation. Q is quantized to int8 with one scale per Q column; the Hadamard rotation applied to Q and K for a
 // quantized cache (llama-kv-cache.cpp, attn_rot_k) spreads each column over all D values, so one scale per column loses
@@ -1164,10 +1271,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols_cfg);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse);
     // raw: K*Q on the int8 values (the multi-stage pipeline); deq: the sparse K tile converted to f16 as it loads, V that tile
-    constexpr bool raw_KV          = type_K != GGML_TYPE_F16 && !use_sparse;
+    // deq dense: one Q head a tile, the dense K and V tiles converted to f16 as they load
+    constexpr bool raw_KV          = fattn_mma_raw_KV(type_K, ncols2, use_sparse);
+    constexpr bool deq_dense       = fattn_mma_deq_dense(type_K, ncols2, use_sparse);
     constexpr bool deq_K           = type_K != GGML_TYPE_F16 &&  use_sparse;
     static_assert((type_K != GGML_TYPE_F16) == (type_V != GGML_TYPE_F16), "K and V are both raw or both f16");
     static_assert(!raw_KV || cols_per_warp == 16, "raw K*Q needs 16 Q columns per warp");
+    static_assert(!deq_dense || (!V_is_K_view && nstages <= 1 && nbatch_K2 == DKQ/2 && nbatch_V2 == DV/2),
+        "a dense q4_0/q8_0 tile loads whole rows in one stage");
     static_assert(!deq_K || (V_is_K_view && nstages == 1 && nbatch_K2 == DKQ/2 && DV <= DKQ),
         "a sparse q4_0/q8_0 K tile loads whole rows in one stage and V reads it");
     // The next raw K tile loads as soon as K*Q has read this one, in flight beside this step's V through the softmax,
@@ -1231,6 +1342,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if constexpr (deq_K) {
                 flash_attn_ext_deq_load_tile<type_K, DKQ, nwarps, nbatch_fa, stride_tile_K>
                     ((const char *) K_h2, tile_K, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+            } else if constexpr (deq_dense) {
+                flash_attn_ext_deq_dense_load_tile<type_K, DKQ, nwarps, nbatch_fa, stride_tile_K, oob_check>
+                    ((const char *) K_h2 + int64_t(k_VKQ_0)*stride_K, tile_K, stride_K, k_VKQ_sup);
             } else {
                 const int k0_diff = min(k0_stop, DKQ/2) - k0_start; // Only load the real head size from global memory.
                 constexpr bool use_cp_async = nstages == 1;
@@ -1609,7 +1723,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         static_assert(DVp % (2*nbatch_V2) == 0, "bad loop size");
         const int i0_stop = i0_start + 2*nbatch_V2;
 
-        if constexpr (nstages <= 1) {
+        if constexpr (deq_dense) {
+            // V takes the tile K*Q has read, whole rows of it
+            flash_attn_ext_deq_dense_load_tile<type_V, DV, nwarps, nbatch_fa, stride_tile_V, oob_check>
+                ((const char *) V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, stride_V, k_VKQ_sup);
+            __syncthreads();
+        } else if constexpr (nstages <= 1) {
             const int i0_diff = min(i0_stop, DV) - i0_start; // Only load the real head size from global memory.
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
@@ -1869,7 +1988,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int ncols = ncols1 * ncols2;
     constexpr int ncols_cfg = ggml_cuda_fattn_mma_cfg_ncols(DKQ, DV, ncols1, ncols2);
     // raw K*Q (flash_attn_ext_raw_KQ) is written for the 16-column tiles, which mma_tile_sizes thins at 16 columns for some heads
-    constexpr int ncols_tile = type_K != GGML_TYPE_F16 && !use_sparse ? 64 : ncols_cfg;
+    constexpr int ncols_tile = fattn_mma_raw_KV(type_K, ncols2, use_sparse) ? 64 : ncols_cfg;
     using     T_A_KQ    = typename mma_tile_sizes<DKQ, ncols_tile>::T_A_KQ;
     using     T_B_KQ    = typename mma_tile_sizes<DKQ, ncols_tile>::T_B_KQ;
     using     T_C_KQ    = typename mma_tile_sizes<DKQ, ncols_tile>::T_C_KQ;
@@ -1909,7 +2028,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
     char  * tile_raw  = (char *) (tile_mask + ncols1*(nbatch_fa + 8)); // raw K/V only: raw K tile, then raw V tile
 
-    constexpr bool raw_KV = type_K != GGML_TYPE_F16 && !use_sparse; // a sparse q4_0/q8_0 K is converted as it loads
+    // a sparse q4_0/q8_0 K is converted as it loads, as is a dense one read one Q head a tile
+    constexpr bool raw_KV = fattn_mma_raw_KV(type_K, ncols2, use_sparse);
     T_B_KQ    Q_B[(Q_in_reg && !raw_KV ? DKQp/(2*T_B_KQ::J) : 1)];
     fattn_raw_Q8<DKQ> Q8; // Q for the int8 K*Q of raw K, used instead of Q_B
 #if defined(TURING_MMA_AVAILABLE)
@@ -2578,6 +2698,11 @@ static __global__ void flash_attn_ext_f16(
         NO_DEVICE_CODE;
         return;
     }
+    // one Q head a tile on a q4_0/q8_0 cache: head size 128 without a softcap, see ggml_cuda_fattn_mma_deq_dense
+    if (fattn_mma_deq_dense(type_K, ncols2, use_sparse) && (use_logit_softcap || DKQ != 128 || DV != 128)) {
+        NO_DEVICE_CODE;
+        return;
+    }
 
     if (!ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2) && use_sparse) {
         NO_DEVICE_CODE;
@@ -2779,7 +2904,7 @@ static fattn_mma_geometry ggml_cuda_fattn_mma_get_geometry(const int cc, const i
     const int cols_per_warp = std::min(ncols_cfg, get_cols_per_warp(cc));
     const int nwarps        = nthreads / warp_size;
 
-    constexpr bool raw_KV = type_K != GGML_TYPE_F16 && !use_sparse;
+    constexpr bool raw_KV = fattn_mma_raw_KV(type_K, ncols2, use_sparse); // else the f16 tile's layout, with no raw tile
     constexpr int  DKQp   = GGML_PAD(DKQ, 16);
 
     // KV tile strides must match flash_attn_ext_f16_iter / _process_tile: a q4_0/q8_0 K is written to unswizzled tiles.
@@ -2904,6 +3029,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     // A q4_0 or q8_0 K is raw (head size 256: the int8 K*Q of the multi-stage pipeline) or, on a sparse instance, read in
     // place (GLM's latent: ggml_cuda_fattn_mma_sparse_deq takes it for a sparse launch with V a view of K, and nothing else).
+    // raw_KV here is the host's side of both dense readings (fattn_mma_raw_KV, fattn_mma_deq_dense): K and V go to the
+    // kernel as the cache stores them.
     constexpr bool deq_K  = type_K != GGML_TYPE_F16 && ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2);
     constexpr bool raw_KV = type_K != GGML_TYPE_F16 && !deq_K;
 
@@ -3085,6 +3212,17 @@ extern DECL_FATTN_MMA_RAW_CASE(128, 128,  2, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(128, 128,  4, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(128, 128,  8, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_MMA_RAW_CASE(128, 128, 32, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+
+// One Q head a tile on a q4_0 or q8_0 cache of head size 128 (Inkling 2's relative position bias), converted as it loads
+// (flash_attn_ext_deq_dense_load_tile):
+extern DECL_FATTN_MMA_RAW_CASE(128, 128,  8, 1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128, 16, 1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128, 32, 1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128, 64, 1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128,  8, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128, 16, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128, 32, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_MMA_RAW_CASE(128, 128, 64, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 
 // GLM-5.3's sparse launch on a q4_0 or q8_0 latent cache, read in place (flash_attn_ext_deq_load_tile):
 extern DECL_FATTN_MMA_RAW_CASE(512, 512,  1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);

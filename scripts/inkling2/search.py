@@ -307,7 +307,7 @@ def arguments(argv=None):
         if name != "load":
             sub.add_argument("--out", type=Path, required=True, help="The search's folder: trials.jsonl, best.json, a folder a trial")
         if name in ("run", "apply"):
-            sub.add_argument("--profile", choices=sorted(serve.PROFILES), default="tensor-4-draft")
+            sub.add_argument("--profile", choices=sorted(serve.PROFILES), default="tensor-4")
             sub.add_argument("--tuned", type=Path, default=serve.TUNED, help="The settings file the launcher reads (default: its own)")
         if name in ("run", "log"):
             sub.add_argument("--experiment", default="llama.cpp/inkling2-decode", help="MLflow experiment the trials go to")

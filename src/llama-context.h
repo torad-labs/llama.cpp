@@ -339,6 +339,7 @@ public:
 
     void set_output_candidates(int32_t k);
     void set_seq_candidates(llama_seq_id seq_id, bool enable);
+    bool set_seq_greedy_candidates(llama_seq_id seq_id);
 
     // the MTP store (llama-ext.h): this context is the target, head its MTP head
     bool    nextn_bind(llama_context & head, int32_t n_keep);
@@ -497,7 +498,7 @@ private:
     // output rows as their largest logits (llama_set_output_candidates): a decode reads the records
     // ggml_top_k_candidates packed for a row, and the row's first reader cuts them to the k largest
     struct candidates_info {
-        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_DRAFT_RECORDS, ROW_CUT };
+        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_DRAFT_RECORDS, ROW_GREEDY_RECORDS, ROW_CUT };
 
         buffer_view<int64_t>     records = {nullptr, 0}; // [n_outputs][n_record]
         buffer_view<float>       logits  = {nullptr, 0}; // [n_outputs][k], the largest first
@@ -511,7 +512,7 @@ private:
 
         std::vector<uint64_t> keys; // scratch of a cut
 
-        std::set<llama_seq_id> seqs; // sequences whose rows are read as candidates
+        std::map<llama_seq_id, bool> seqs; // true for strict greedy, false for ordinary top-k
     };
 
     candidates_info cand;

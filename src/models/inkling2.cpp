@@ -574,7 +574,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     return cur;
 }
 
-void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
+void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks, bool candidates_only) {
     const bool tap_output = cparams.embeddings_layer_inp[n_layer];
     if (state_only && !tap_output) {
         // All attention and convolution state writes have been added to the graph.
@@ -613,6 +613,13 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     if (cap != 0.0f) {
         cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
     }
+    if (candidates_only) {
+        res->t_cand = ggml_top_k_candidates_bounded(ctx0, cur, cparams.n_out_candidates, cparams.n_logits_parts,
+            hparams.n_vocab_unpadded, true);
+        cb(res->t_cand, "result_candidates", -1);
+        ggml_build_forward_expand(gf, res->t_cand);
+        return;
+    }
     if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         // -sm tensor splits the padded vocabulary, which the slice below cuts in no ratio of the split: slice it whole
         cur = gather_channels(ctx0, cur);
@@ -631,5 +638,5 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     for (int il = 0; il < n_layer; ++il) {
         cur = build_layer(il, il, cur, blocks);
     }
-    build_output(cur, blocks);
+    build_output(cur, blocks, params.candidates_only);
 }

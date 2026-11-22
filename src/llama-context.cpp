@@ -2039,10 +2039,20 @@ void llama_context::set_output_candidates(int32_t k) {
 
 void llama_context::set_seq_candidates(llama_seq_id seq_id, bool enable) {
     if (enable) {
-        cand.seqs.insert(seq_id);
+        cand.seqs[seq_id] = false;
     } else {
         cand.seqs.erase(seq_id);
     }
+}
+
+bool llama_context::set_seq_greedy_candidates(llama_seq_id seq_id) {
+    const float cap = model.hparams.f_final_logit_softcapping;
+    if (model.arch != LLM_ARCH_INKLING2 || cparams.n_logits_parts <= 1 || cparams.embeddings ||
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || !(cap > 0.0f && std::isfinite(cap))) {
+        return false;
+    }
+    cand.seqs[seq_id] = true;
+    return true;
 }
 
 bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
@@ -2065,8 +2075,10 @@ bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
     float *       logits_row = cand.logits.data + j*cand.k;
     llama_token * ids_row    = cand.ids.data    + j*cand.k;
 
-    if (cand.state[j] == candidates_info::ROW_RECORDS || cand.state[j] == candidates_info::ROW_DRAFT_RECORDS) {
+    if (cand.state[j] == candidates_info::ROW_RECORDS || cand.state[j] == candidates_info::ROW_DRAFT_RECORDS ||
+            cand.state[j] == candidates_info::ROW_GREEDY_RECORDS) {
         const bool draft = cand.state[j] == candidates_info::ROW_DRAFT_RECORDS;
+        const bool greedy = cand.state[j] == candidates_info::ROW_GREEDY_RECORDS;
         // a record is a token id under its logit's bits. A key orders them as common_sampler_top_k_candidates orders a
         // whole row, by the logit and then the id: the logit's bits in the order of its value (-0 as +0, a NaN below every
         // number) over the id's complement
@@ -2085,6 +2097,11 @@ bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
                 id = model.output_draft_tokens[id];
             }
             uint32_t bits = (uint32_t) (record >> 32);
+            if (greedy && id == 0 && (bits & 0x7fffffffu) > 0x7f800000u) {
+                // Strict greedy starts on token 0 and cannot replace a NaN.
+                keys.assign(1, UINT32_MAX);
+                break;
+            }
             if (bits == 0x80000000u) {
                 bits = 0;
             }
@@ -3647,13 +3664,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             rows_whole = false;
             rows_cand  = true;
+            const bool greedy = model.arch == LLM_ARCH_INKLING2 && !t_logits;
             uint32_t row = n_outputs_prev;
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 if (!ubatch.output[i]) {
                     continue;
                 }
-                const bool as_cand = cand.seqs.count(ubatch.seq_id[i][0]) > 0;
+                const auto seq = cand.seqs.find(ubatch.seq_id[i][0]);
+                const bool as_cand = seq != cand.seqs.end() && seq->second == greedy;
                 cand.state[row++] = !as_cand ? candidates_info::ROW_WHOLE :
+                    greedy ? candidates_info::ROW_GREEDY_RECORDS :
                     res->t_logits_draft ? candidates_info::ROW_DRAFT_RECORDS : candidates_info::ROW_RECORDS;
                 rows_whole |= !as_cand;
             }
@@ -4553,6 +4573,24 @@ llm_graph_params llama_context::graph_params(
         const auto * iswa = dynamic_cast<const llama_memory_hybrid_iswa *>(memory.get());
         params.any_seqs = dynamic_cast<const llama_memory_hybrid *>(memory.get()) != nullptr ||
                           (model.arch == LLM_ARCH_INKLING2 && iswa && iswa->get_mem_recr()->is_fixed_rows());
+    }
+    if (model.arch == LLM_ARCH_INKLING2 && cparams.n_out_candidates > 0 && sampling.samplers.empty() &&
+            n_outputs > 0 && ubatch.output && ubatch.seq_id && ubatch.n_seq_id && !cand.seqs.empty()) {
+        bool all_greedy = true, any_top_k = false;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (!ubatch.output[i]) {
+                continue;
+            }
+            const auto seq = cand.seqs.find(ubatch.seq_id[i][0]);
+            const bool eligible = seq != cand.seqs.end();
+            all_greedy &= ubatch.n_seq_id[i] == 1 && eligible && seq->second;
+            any_top_k  |= eligible && !seq->second;
+        }
+        params.candidates_only = all_greedy;
+        if (!all_greedy && !any_top_k) {
+            params.cparams.n_out_candidates = 0;
+        }
+        return params;
     }
     params.candidates_only = model.arch == LLM_ARCH_GLM5NEXT && model.output_draft &&
                              cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.n_out_candidates > 0 &&
@@ -6705,6 +6743,10 @@ void llama_set_output_candidates(llama_context * ctx, int32_t k) {
 
 void llama_set_seq_candidates(llama_context * ctx, llama_seq_id seq_id, bool enable) {
     ctx->set_seq_candidates(seq_id, enable);
+}
+
+bool llama_set_seq_greedy_candidates(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->set_seq_greedy_candidates(seq_id);
 }
 
 llama_sampling_row llama_get_sampling_row_ith(llama_context * ctx, int32_t i) {

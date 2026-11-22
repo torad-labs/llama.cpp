@@ -5458,14 +5458,26 @@ struct ggml_tensor * ggml_top_k_candidates(
         struct ggml_tensor  * a,
         int                   k,
         int                   n_parts) {
+    return ggml_top_k_candidates_bounded(ctx, a, k, n_parts, 0, false);
+}
+
+struct ggml_tensor * ggml_top_k_candidates_bounded(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k,
+        int                   n_parts,
+        int                   n_vocab,
+        bool                  first_nan) {
     GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
     GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1 && a->ne[0] <= INT32_MAX);
-    GGML_ASSERT(k > 0 && n_parts > 0);
+    GGML_ASSERT(k > 0 && n_parts > 0 && n_vocab >= 0 && n_vocab <= a->ne[0]);
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, k, n_parts, a->ne[1]);
     result->op     = GGML_OP_TOP_K_CANDIDATES;
     result->src[0] = a;
     ggml_set_op_params_i32(result, 0, 0); // global column offset, set by the Meta backend
+    ggml_set_op_params_i32(result, 1, n_vocab);
+    ggml_set_op_params_i32(result, 2, first_nan);
     return result;
 }
 

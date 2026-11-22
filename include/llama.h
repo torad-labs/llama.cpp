@@ -1308,6 +1308,10 @@ extern "C" {
     LLAMA_API void llama_set_output_candidates(struct llama_context * ctx, int32_t k);
     LLAMA_API void llama_set_seq_candidates(struct llama_context * ctx, llama_seq_id seq_id, bool enable);
 
+    // Mark a sequence for strict greedy sampling from a bounded shortlist. Returns false if the context does not
+    // support it. A batch uses the compact head only when every output sequence has opted in.
+    LLAMA_API bool llama_set_seq_greedy_candidates(struct llama_context * ctx, llama_seq_id seq_id);
+
     //
     // NextN / speculative decoding API
     //
@@ -1653,6 +1657,10 @@ extern "C" {
     /// The chain ends in a coupled dist sampler and everything before it is applied on the host without changing its
     /// own state: a copy of it applied to another model's logits draws with the noise of the chain's next sample.
     LLAMA_API bool llama_sampler_chain_coupled(const struct llama_sampler * chain);
+
+    // Candidates sufficient for exact greedy selection: one plus the number of distinct static exclusions.
+    // Returns zero for a chain with any other active transform. The shortlist is sampled in token ID order.
+    LLAMA_API int32_t llama_sampler_chain_greedy_candidates(const struct llama_sampler * chain);
 
     /// The token the chain draws from a row of every token's logit (logits[id], n_vocab of them), as llama_sampler_apply
     /// over all of them as candidates draws it, in one vector pass that builds no candidates. Taken: a chain of a logit

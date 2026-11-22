@@ -1779,11 +1779,20 @@ struct test_case {
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
-                //for (int i = 0; i < (int) f1.size(); i++) {
-                //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
-                //}
-                //printf("\n");
-                //exit(1);
+                if (getenv("LLAMA_TEST_DUMP_MISMATCH")) {
+                    static thread_local int dumped = 0;
+                    const int64_t ne0 = t1->ne[0], ne1 = t1->ne[1];
+                    for (size_t j = 0; j < f1.size() && dumped < 30; j++) {
+                        if (fabs(f1[j] - f2[j]) > ud->tc->max_err(ud->backend1)) {
+                            printf("\n  mismatch[%zu] ne=[%lld,%lld,%lld] idx=[%lld,%lld,%lld] dev=%.6f ref=%.6f",
+                                   j, (long long) ne0, (long long) ne1, (long long) t1->ne[2],
+                                   (long long) (j % ne0), (long long) ((j/ne0) % ne1), (long long) (j/(ne0*ne1)),
+                                   f1[j], f2[j]);
+                            dumped++;
+                        }
+                    }
+                    dumped = 0;
+                }
                 ud->ok = false;
             }
             return true;
@@ -7434,7 +7443,7 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool skip = false) {
 
     std::random_device rd;
-    std::default_random_engine rng(rd());
+    std::default_random_engine rng(getenv("LLAMA_TEST_SEED") ? (unsigned) atoi(getenv("LLAMA_TEST_SEED")) : rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
             continue;
@@ -17042,6 +17051,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 6, 2048, nb, 1, 1025, GGML_TYPE_F16, true, true));
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos( 64, 4, 2,  600, nb, 3,   17));
         test_cases.emplace_back(new test_flash_attn_ext_rel_pos( 64, 4, 2,  608, nb, 3,   17, GGML_TYPE_F16, false, true));
+    }
+
+    // Inkling 2 Mini: 3 Q heads a K/V head on a q4_0 or q8_0 cache, read one Q head a tile without an f16 copy of K and V
+    // (ggml_cuda_fattn_mma_deq_dense). Every token tile, a cache that is no multiple of the KV step, several streams.
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 4, 9, 20, 64, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 3, 2048, nb, 1, 1025, type_KV));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 3, 1000, 4, 1, 1025, type_KV, false));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 3, 2304, 4, 3, 1025, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 3, 8192, 4, 1, 1025, type_KV, true, true));
+        // one and two rows on a cache of 4096 cells or more take the same read (GGML_CUDA_FATTN_DEQ_DENSE_MIN_KV)
+        for (int64_t nb : {1, 2}) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 3, 8192, nb, 1, 1025, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 8, 3, 4352, nb, 2, 1025, type_KV, false));
+        }
     }
 
     for (const bool packed : {false, true}) {

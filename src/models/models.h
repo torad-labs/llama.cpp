@@ -2649,7 +2649,7 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         // the output mix, the head and the logits; a state_only graph ends before them
-        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks, bool candidates_only = false);
 
         llm_graph_input_attn_kv_iswa * attn = nullptr;
         llm_graph_input_rs           * recr = nullptr;
