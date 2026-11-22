@@ -719,3 +719,33 @@ notes = [
   '2026-11-22 02:19 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 02:20 CT: 2026-11-22: home is the capture lane (allreduce pacing/arrival machinery), next batch after the current window; the wait audit draws from the 14-decode-stalls note plus tonight's captured-route work, and keeps host-read waits.",
 ]
+
+[[row]]
+id = 'kv-mask-prefill-build'
+title = 'Prefill builds no host KV mask; sequences carry their rows'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22 Marcos's verdict on the bottleneck experiment, routed by hyperparam: the host KV-mask building costs 68-115 ms a pass at prefill. Build the mask without the host sweep: a per-sequence row plus OR, or cells addressed by run, whichever measures cheaper. Masks stay bit-identical; GLM sees identical data, the dspark draft's shared rows and SWA masking included. A test named inkling-kvmask compares the new path against the current builder across multi-sequence, SWA, shared-row and GLM shapes. The host builder leaves the hot path or sits behind a default-off check switch. Evidence: prefill timing on a rented CloudRift 5090, in the row note. The KV-states lane holds src/llama-kv-cache.* until its staging completes."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-kvmask | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-kvmask --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-22 03:09 CT: added; 1 of 1 checks fail, as they should before the work',
+]
+
+[[row]]
+id = 'blackwell-kquant-mmq'
+title = 'Blackwell sm_120 MMQ takes the K-quants at prefill'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "2026-11-22 Marcos's verdict on the bottleneck experiment, routed by hyperparam: Blackwell sm_120 has no K-quant MMQ table/stream path for Q3_K/Q4_K/Q5_K, and prefill pays a 155 ms residual against the roofline's own floors. Build the sm_120 MMQ path for the three Inkling weight types at prefill row counts. GLM's IQ3_XXS entries and GLM 5.3 serving stay untouched; other models must not regress. Blackwell-first, no legacy-arch ceremony. Bit-identical output where the math allows; a measured divergence is allowed when the row note names it. A test named inkling-mmq-kquant judges the new path against the existing kernel at Inkling shapes. Compile and measure on a rented CloudRift 5090 (sm_120), never the four-card boxes."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-mmq-kquant | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-mmq-kquant --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  '2026-11-22 03:09 CT: added; 1 of 1 checks fail, as they should before the work',
+]
