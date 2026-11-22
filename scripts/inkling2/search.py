@@ -3,11 +3,16 @@
 
   search.py run    launch the profile once per trial, read its sessions' streams, keep each trial in <out>/trials.jsonl
   search.py load   read the same streams from a server that already runs (the load a profiler watches)
+  search.py propose  fit the model to the trials so far and print the settings it would try next
+  search.py explain  print why the fastest trials won, from the ledger each trial recorded
   search.py log    send the trials MLflow has not seen (MLFLOW_TRACKING_URI, MLFLOW_TRACKING_USERNAME, MLFLOW_TRACKING_PASSWORD)
   search.py apply  write the settings the search kept into tuned.json, which serve.py launches the profile with
 
 A setting is a launcher option (--draft-depth) or a variable of tunables.toml (LLAMA_SAMPLE_THREADS). Every setting is read
 at start, so a trial is one server start: the search walks one setting at a time and keeps a value that beats the best by --gain.
+The method around that walk is the search's own: --depths measures a trial at several context depths and keeps its worst
+(search_workload.py), --screen drops the knobs that cannot move the rate before the walk starts (search_screen.py), and
+--repeats re-measures a candidate that could win until its repeats agree, keeping their minimum (search_noise.py).
 """
 import argparse
 import base64
@@ -34,6 +39,11 @@ import measure as glm_measure
 
 sys.path.append(str(serve.ROOT / "scripts"))
 import ledger
+import search_evidence
+import search_model
+import search_noise
+import search_screen
+import search_workload
 
 # What a search tries, in the order it tries it: draft depth and whether to draft at all move a step's row count, so
 # they go before the settings whose best value depends on it.
@@ -122,11 +132,11 @@ def ledger_of(url):
     return found if isinstance(found, dict) and "slots" in found else None
 
 
-def measure(url, sessions, args):
-    """A warm round the rate does not count, then the measured rounds; the trial's rate is their median.
+def measure_at(url, sessions, args, context):
+    """One context depth: a warm round the rate does not count, then the measured rounds; the rate is their median.
     The engine's ledger over the measured rounds goes with it: where a step's time went, whatever the model."""
     sampling = {} if args.temperature is None else {"temperature": args.temperature}
-    rows = prompts(url, sessions, args.context)
+    rows = prompts(url, sessions, context)
     for _ in range(args.warm_rounds):
         read_round(url, rows, args.tokens, args.timeout, sampling)
     before = ledger_of(url)
@@ -136,6 +146,15 @@ def measure(url, sessions, args):
     return {**middle, "tokens_per_second": statistics.median(r["tokens_per_second"] for r in rounds),
             "rounds": [r["tokens_per_second"] for r in rounds], "prompt_tokens": statistics.median(len(row) for row in rows),
             "ledger": ledger.summary(ledger.difference(before, after)) if before and after else None}
+
+
+def measure(url, sessions, args):
+    """A trial over every depth --depths names, kept as its worst depth (search_workload.py: a configuration tuned
+    on one trace was up to twice as bad on another). One depth costs that depth and not the trial. With no --depths,
+    the trial is measured at --context alone, the depth the caller asked the load for."""
+    spec = getattr(args, "depths", "")
+    depths = search_workload.depths_from(spec) if spec.strip() else [getattr(args, "context", 0)]
+    return search_workload.run_depths(lambda depth: measure_at(url, sessions, args, depth), depths)
 
 
 def plan(base, settings):
@@ -230,6 +249,42 @@ def run(args):
              "baseline_tokens_per_second": baseline}, indent=1) + "\n")
 
     keep()
+
+    def confirm_candidate(settings, found):
+        """A candidate that could win is measured again until its repeats agree (search_noise.py); the record keeps
+        their minimum, and an unstable candidate loses its rate so a noisy draw cannot win the walk."""
+        repeats = args.repeats
+        max_repeats = args.max_repeats if args.max_repeats > 0 else repeats * 2
+        attempts = []
+        def draw():
+            attempts.append(run_trial(base, settings, args.out / f"{found['key']}-repeat{len(attempts) + 1}", args))
+            return attempts[-1]
+        try:
+            # the first trial already drawn is one of the repeats; confirm draws the rest
+            answer = search_noise.confirm(draw, repeats - 1, max_repeats=max(1, max_repeats - 1))
+        except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+            print(f"  a repeat of {settings} failed: {error}", flush=True)
+            return found
+        rates = [found["tokens_per_second"], *answer["rates"]]
+        stable = not search_noise.unstable(rates)
+        merged = {**found, "repeat_rates": rates, "stable": stable, "repeats": len(rates),
+                  "tokens_per_second": search_noise.aggregate(rates) if stable else None}
+        done[found["key"]].update(merged)
+        return merged
+
+    if args.screen:
+        def screened_rate(name, value):
+            try:
+                found = trial({name: value})
+                return found["tokens_per_second"] or 0.0
+            except ValueError:
+                return 0.0
+        verdict = search_screen.screen(space, screened_rate, top["tokens_per_second"],
+                                       response=args.gain, budget=args.screen_budget or None)
+        space = {name: space[name] for name in verdict["survivors"]}
+        print(f"screen: {len(verdict['survivors'])} of {len(verdict['survivors']) + len(verdict['screened_out'])} knobs "
+              f"can move the rate, {verdict['evaluations']} trials: {', '.join(verdict['survivors']) or 'none'}", flush=True)
+
     for _ in range(args.passes):
         for name, values in space.items():
             for value in values:
@@ -243,6 +298,12 @@ def run(args):
                 except ValueError as error:
                     print(f"  {name}={value} is no launch: {error}", flush=True)
                     continue
+                if (args.repeats > 1 and found["tokens_per_second"]
+                        and search_noise.needs_confirmation(found["tokens_per_second"], top["tokens_per_second"], args.gain)):
+                    found = confirm_candidate(settings, found)
+                    if not found.get("stable", True):
+                        print(f"  {name}={value} did not settle over {found['repeats']} repeats: "
+                              f"{[round(rate, 1) for rate in found['repeat_rates']]}", flush=True)
                 if found["tokens_per_second"] and found["tokens_per_second"] > top["tokens_per_second"] * (1 + args.gain):
                     best, top = settings, found
             keep()
@@ -308,6 +369,25 @@ def log(args):
     return 0
 
 
+def propose(args):
+    """The settings the model (search_model.py) would try next, given the trials so far: the GP over every knob at
+    once, so a combination two knobs only pay off in together can be found without walking the space to it."""
+    space = SPACE
+    if args.knob:
+        space = {name: values.split(",") for name, _, values in (knob.rpartition("=") for knob in args.knob)}
+    model = search_model.Model()
+    model.fit(trials_of(args.out))
+    print(json.dumps(model.propose(space, n=args.count, seed=args.seed), indent=1))
+    return 0
+
+
+def explain(args):
+    """Why the fastest trials won, from the engine's ledger each trial recorded (search_evidence.py): the per-feature
+    evidence of the top trials against the rest, and the trials whose window was not representative."""
+    print(json.dumps(search_evidence.explain(trials_of(args.out), top=args.top), indent=1))
+    return 0
+
+
 def apply(args):
     best = json.loads((args.out / "best.json").read_text())
     tuned = json.loads(args.tuned.read_text()) if args.tuned.is_file() else {}
@@ -324,7 +404,8 @@ def arguments(argv=None):
 
     def verb(name, *, rounds=False):
         sub = verbs.add_parser(name)
-        sub.set_defaults(act={"run": run, "load": load, "log": log, "apply": apply}[name])
+        sub.set_defaults(act={"run": run, "load": load, "log": log, "apply": apply,
+                              "propose": propose, "explain": explain}[name])
         if name != "load":
             sub.add_argument("--out", type=Path, required=True, help="The search's folder: trials.jsonl, best.json, a folder a trial")
         if name in ("run", "apply"):
@@ -340,6 +421,9 @@ def arguments(argv=None):
             sub.add_argument("--timeout", type=float, default=900, help="Seconds a session's stream may take (default: 900)")
             sub.add_argument("--context", type=int, default=0,
                              help="Tokens of source text each session's request follows, about (default: the request alone)")
+            sub.add_argument("--depths", default="",
+                             help="Context depths a trial is measured at, comma separated; the trial keeps its worst "
+                                  "(default: empty, --context alone)")
         return sub
 
     sub = verb("run", rounds=True)
@@ -354,10 +438,26 @@ def arguments(argv=None):
     sub.add_argument("--wrap", action="append", default=[], metavar="WORD", help="A word in front of the server command; repeat")
     sub.add_argument("--gain", type=float, default=0.02, help="How far a value must beat the best to replace it (default: 0.02)")
     sub.add_argument("--passes", type=int, default=1, help="Walks over the space (default: 1)")
+    sub.add_argument("--screen", action="store_true",
+                     help="Screen the knobs first (search_screen.py): two trials a knob, and only the knobs whose swing "
+                          "moves the rate by more than --gain enter the walk")
+    sub.add_argument("--screen-budget", type=int, default=0, help="Most trials the screen may spend (default: 0, no cap)")
+    sub.add_argument("--repeats", type=int, default=1,
+                     help="Measurements of a candidate that could beat the best, drawn until they agree; their minimum "
+                          "keeps the value (search_noise.py; default: 1, a single measurement)")
+    sub.add_argument("--max-repeats", type=int, default=0,
+                     help="Most draws a confirmation may take (default: 0, twice --repeats)")
     sub.add_argument("--startup-timeout", type=float, default=3600, help="Seconds a server may take to load (default: 3600)")
     sub = verb("load", rounds=True)
     sub.add_argument("--url", default="http://127.0.0.1:8103")
     sub.add_argument("--sessions", type=int, default=serve.SLOTS)
+    sub = verb("propose")
+    sub.add_argument("--knob", action="append", metavar="NAME=V1,V2",
+                     help="Propose over these settings in place of the default space; repeat for more")
+    sub.add_argument("--count", type=int, default=5, help="How many settings to propose (default: 5)")
+    sub.add_argument("--seed", type=int, default=0, help="The proposal's seed (default: 0; a fixed seed is deterministic)")
+    sub = verb("explain")
+    sub.add_argument("--top", type=int, default=5, help="Trials treated as the fast ones (default: 5)")
     verb("log")
     verb("apply")
     return parser.parse_args(argv)
