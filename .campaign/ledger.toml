@@ -457,6 +457,7 @@ checks = [
 ]
 notes = [
   '2026-11-21 19:59 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
+  "2026-11-22 01:54 CT: 2026-11-22 02:20 CT llamacpp-coordinator: steal from GLM's paced L2 issuer (TORAD b3fc826ad): an issue that follows the graph's nodes overshoots into the next op; a ring launch bumps a stop word and the issuer reads it, so the prefetch ends where the consumer begins (gate/up 125.15 -> 108.26 us a KDA layer, -2.3 pct kernel time). The same stop-word pattern fits the expert warm ahead of the ring/MoE launch on our path, per qgre's laws (warm rides no evict hint, dose cap measured).",
 ]
 
 [[row]]
@@ -473,6 +474,7 @@ checks = [
 notes = [
   '2026-11-21 20:45 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-21 21:12 CT claude-tensor4: 2026-11-22 claude-tensor4: eli review amendments (doc 15 sec 7). Add the model-side classifier (classify_mask, inkling2.cpp:193-211) AND the backend guards (fattn.cu:1459-1466, fattn-rel-mma.cuh:34-48) as co-equal work items - a finished kernel the dispatcher never feeds is the plan's likeliest failure. A just-forked session's near window spans the prefix run and the private run: the prefix kernel must subtract exactly that window. 3.3 is not bit-identical with bulk tiles (rescale cadence is per 16-cell tile): keep 16-cell tiles or gate on the KL capture. M7 must assert per-stream position monotonicity for the window ring.",
+  "2026-11-22 01:54 CT: 2026-11-22 02:20 CT llamacpp-coordinator: steal from GLM-5.3 DSA (TORAD 0b0e97b5d): FLASH_ATTN_EXT already carries a per-mask-row n_kv_max bound plus a compaction of each row's finite cells into an index list, and the MMA kernel loads K/V/mask by index over n_kv_max with the switch GGML_CUDA_FATTN_SPARSE_LEGACY. Inkling's far path has structural sparsity free (bias exactly zero beyond 1,023), so the same bound+compaction machinery can carry a row's finite cells (near window + private run) instead of scanning mask words. Borrow GLM's gating too: gather wins where K >= n_gather = min(n_tokens, 64/ncols2) * n_kv_max; it beat dense 0.25-0.99x on GLM's shapes and lost 1.13-1.27x under the gate.",
 ]
 
 [[row]]
@@ -507,6 +509,7 @@ checks = [
 ]
 notes = [
   '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-prefix test is registered',
+  "2026-11-22 01:54 CT: 2026-11-22 02:20 CT llamacpp-coordinator: two steals from GLM. (1) The DSA gather's gating formula and its measured crossover (TORAD 0b0e97b5d) give the criterion for when sharing a prefix tile across queries beats reading per query; the GLM kernel also shows the compaction cost being 3.6-11.2 us a layer, so the re-read saved must clear it. (2) GLM's kpool input rebuild (TORAD 0b7316af7) replaced eight host passes per token with mutation-logged per-sequence views (2048-65536 cached tokens: 12.9 -> 1.1 us at 2K, 458 -> 37.7 us at 64K); Inkling's per-step mask/distance building can adopt the same log-plus-views pattern instead of rescanning mask words.",
 ]
 
 [[row]]
@@ -537,6 +540,7 @@ checks = [
 ]
 notes = [
   '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-stack test is registered',
+  '2026-11-22 01:54 CT: 2026-11-22 02:20 CT llamacpp-coordinator: steal from GLM-5.3 KDA (TORAD 4fb2717c8): the concat-into-one-launch pattern - weights one stride apart, the shared input at channel stride 0 quantized once, one mul_mat_vec_q launch whose channels write their rows of the concat directly. Measured on GLM: 66.24 to 61.28 us a layer on a 5080. This is the working template for the Q-input stack (wq/wk/wv/attn_rel/sink read one normalized input); its test suite (MUL_MAT_CONCAT 25/25) shows the mutation cases to cover.',
 ]
 
 [[row]]
@@ -602,6 +606,7 @@ checks = [
 notes = [
   '2026-11-22 02:00 CT llamacpp-coordinator: added by hand edit (campaign add would build the tree on torad-server). Direction from Marcos: the seam conversion is math, it removes work, so it needs no A/B; correctness checks gate it and the four-card integration run supplies the numbers once. Existing mechanisms it builds on: staged tile decode of q8_0/V (fattn-rel-elem, kv-onebyte row), the few-row shared q8_1 activation quantize (one form reused per input), and the fusion rows that cut the number of seams.',
   '2026-11-22 01:53 CT: 2026-11-22 02:05 CT llamacpp-coordinator: evidence basis recorded from Marcos: this is not a hypothesis. The same approach is already proven in production - GLM and Bonsai improved inference time hugely with it, and quantizing activations for Bonsai gave an insane throughput boost without losing quality. A/B is therefore reserved for cases of genuine uncertainty or loose relation; for this row the gate is correctness, and speed is confirmed once at integration.',
+  '2026-11-22 01:54 CT: 2026-11-22 02:21 CT llamacpp-coordinator: production precedent in-fork for the seam approach (TORAD 5f1e3eebe): an F32 input read by several quantized products is quantized to q8_1 once by its first reader into a pool allocation and shared (GLM-5.3 KDA q/k/v, DSA q_a/kv_a, shared-expert gate/up); copy keyed by first byte, row length/count/stride, invalidated on in-place writes. This is the engine-level form of requantize-once-and-reuse the row asks for; the MUL_MAT_SHARED_SRC1 tests (96/96) are its mutation cases.',
 ]
 
 [[row]]
@@ -640,8 +645,8 @@ notes = [
 [[row]]
 id = 'search-methods-upgrades'
 title = 'The search upgrades its method: workload depth, knob screening, model selection, noise, ledger evidence, kernel sweeps'
-status = 'todo'
-owner = ''
+status = 'in_flight'
+owner = 'hyperparam'
 blocked_by = []
 guard = false
 spec = 'Marcos asked the hyperparam seat for all six search-method upgrades from the research table: (1) workload-depth worst-case trials, (2) knob screening before full sweeps, (3) model-based selection of the next trial, (4) noise repeats with min-aggregation, (5) ledger-evidence feedback into the search, (6) offline kernel-constant sweeps. Each upgrade is its own new file under scripts/inkling2 (search_workload.py, search_noise.py, search_screen.py, search_model.py, search_evidence.py) or scripts/hyperparameter (kernel_sweep.py), each with its own tests; nobody edits scripts/inkling2/search.py or any tracked file except the hyperparam seat, once, in its integration commit after all six report and are staged by name. An independent eli review on max effort follows integration. Kernel-constant sweeps verify on the rented CloudRift 5090s per the box policy; no four-card window is spent on them. The checks fail today because the modules do not exist yet.'
@@ -653,4 +658,5 @@ checks = [
 ]
 notes = [
   '2026-11-22 01:53 CT: added; 3 of 4 checks fail, as they should before the work',
+  '2026-11-22 01:53 CT hyperparam: claimed',
 ]
