@@ -38,10 +38,9 @@ What this means for serving:
   carried by the narrow cone, making router-path precision more consequential than its
   byte share suggests (§5, precision map).
 - The eleven short rows per layer look like a deliberate per-layer construction (the
-  constant count/norm is too precise for training noise). Whether they exist in the stock
-  checkpoint — i.e. architecture vs abliteration artifact — is testable from HF range
-  reads of both checkpoints' `ffn_gate_inp` tensors alone (~340 MB total) and is recorded
-  as an open question; no copy of the stock model exists on any allowed machine.
+  constant count/norm is too precise for training noise). Stock-vs-ablated provenance was
+  probed with ranged upstream reads and answered in **§11**: they are a fingerprint of the
+  derivative's own production pipeline, absent from stock.
 - No duplicate-expert merging lever exists in this pack. Whatever whole-expert placement
   wins must win through routing statistics, not similarity structure (§3).
 
@@ -247,8 +246,154 @@ capture gates anyway.
    under the hold — proposed diff only until Marcos releases the search-method freeze.
 5. **Router**: prefer §3's PCA bake over naive BF16 downcast; gate both on exact-top-k
    match rate against captured routes.
-6. **Open question worth ~340 MB of HF range reads:** are the 11 short router rows per
-   layer present in stock `thinkingmachines/Inkling-2-Small`, or an abliteration artifact?
+6. ~~Open question worth ~340 MB of HF range reads~~ **answered in §11**: stock shows
+   none of them; they belong to the derivative's own production pipeline.
+
+## 11. Provenance of the eleven rows
+
+*Added 2026-11-22 by the follow-up probe (`research_notes/inkling2-upstream-router-probe.py`):
+CPU-only ranged HTTP reads against huggingface.co, one [384×4608] tensor held at a time,
+artifacts under `~/.cache/inkling2-weightread/provenance/`. Upstream side is
+`thinkingmachines/Inkling-2-Small @ main` (commit pinned at read time below); served side
+is the cached exact F32 routers from §appendix. This answers §9.6.*
+
+**Verdict: conversion-fingerprint of the derivative — not architecture, and not our
+converter either.** Stock Inkling-2-Small has no trace of the pattern. The 528 rows were
+made inside the production of `benthecarman/Inkling-2-Small-abliterated` rev e4853745
+(doc 09: a fine-tune with a recorded "steering recipe"), and their membership is exactly
+the map of which experts' routing priority that steering suppressed.
+
+Branches stated before any fetch, so the experiment could fail honestly:
+
+1. Stock shows the same count/norm with overlapping indices → **architecture**, abliteration ruled out.
+2. Ablated-only pattern → **conversion fingerprint** plus the touched-expert map. ← measured here
+3. Overlap beyond chance but short of identity → both contributions, shares to be stated.
+4. Tensors unreachable → inconclusive-with-evidence-pending, blockers recorded.
+
+### What was read
+
+| Step | Detail |
+| --- | --- |
+| Format found | Upstream ships safetensors shards (24 × ~12–20 GB), NOT gguf; header = u64 length + JSON table, parsed from ≤256 KiB windows per shard. Router gates are `model.llm.layers.<L>.mlp.gate.weight`, bf16 [384, 4608] (`n_routed_experts=384` ✓ config). |
+| Byte discipline | Ranged GETs only: header windows, each router tensor's own 3,538,944 B span, and later row-level 9 KB gapfills. Router payload total 169,869,312 B; nothing full-tensor was materialized host-side; results checkpointed per layer as fetched (`fetched-layers.jsonl`). |
+| Commit pin | `X-Repo-Commit` at read time: `9d8efa6cf3c3c91953a8d3a…`; index/config/quant-config cached under `provenance/`. |
+| Served side | `routers.npz` exact F32 from the served pack (§appendix), compacted once to norms + probe rows so no stage re-materializes it. |
+
+### The numbers behind the verdict
+
+1. **Stock has zero of them.** All 18,432 upstream router rows sit in one tight family:
+   norm mean 70.3976 ± 0.3106 (min 64.4158, max 70.8420) — an unconstrained trained
+   matrix's signature (~1.04·√4608). Rows below 0.9: **0 of 48 layers**, and no bimodal
+   subpopulation anywhere (p0.1 percentile = 67.83). Served side: exactly 11 rows/layer ×
+   48 = 528 at 0.68633 ± 0.00005.
+2. **Same-index correspondence is perfect; directions are not.** Full 384×384 check on
+   layer 23: every upstream row's best match is its own index (identity 384/384), matched
+   cosine mean 0.850 spread [0.75, 0.87]; per-layer unit-sample cosines run 0.827–0.861
+   across all 48 layers. The difference matrix is broad-spectrum (top singular value share
+   3%, then ~1%), which is what trained drift looks like — a surgical projection would be
+   rank-1 dominant. Confirms doc 09's "fine-tune of the base model" relation from weights
+   alone.
+3. **The eleven carry no selection signature.** Upstream norm ranks of those indices are
+   flat (mean rank 179 vs chance 191; decile fractions ≈ chance). Drift magnitude AT those
+   indices equals background (matched cosine 0.8502 vs 0.8521 at ordinary rows; per-layer
+   gap −0.002 ± noise). Within the served pack they are not cone outliers either (within-set
+   pairwise cosine ≈ within-unit average, sampled layers), and cross-layer set overlap is
+   chance-level (mean 0.320 vs expected 0.315) with no recurring expert.
+
+### What the bytes say about how they were made
+
+- Served router values are **bit-exact on the fp16 lattice**: 99.967% of 3,847,680 sampled
+  values survive an f32→fp16→f32 round trip unchanged, and median adjacent-value gaps are
+  3.05e-5 = one fp16 ulp at |v|≈0.03. Stock routers are bf16 (100% by construction). So an
+  fp16 step exists somewhere in the derivative's production path despite its card claiming
+  "BF16 elsewhere" — a dtype fingerprint independent of everything above.
+- Unit rows sit at 1.00000 ± 0.00013 and short rows at 0.68633 ± 0.00005, same count in
+  every layer, arbitrary membership. That is the signature of a deterministic post-hoc rule
+  applied to already-normalized rows: standardize all router rows to unit norm, then scale a
+  chosen subset by a fixed factor α = 0.68633 (its complement √(1−α²) = 0.7272 would be the
+  implied removed component if one insists on reading it as projection; plain projection
+  cannot produce this, because it ties each touched row's norm to that row's own cosine and
+  leaves untouched rows near their raw ~70 norms).
+- Membership chosen from information outside router weights — activation/usage-style
+  attribution is the natural candidate. The exact rule is recorded in the derivative repo's
+  `trial.json`; that repository now gates anonymous reads (401 as of today), so the rule
+  itself stays unread and the claim stops where the evidence does.
+
+### What this changes for serving
+
+- There is **no designed routing prior** to exploit in placement or gating; §3's
+  amplitude-prior note stands, and any hot-set idea still waits on the M1 route histogram.
+- The eleven sets ARE the touched-expert map: those experts' gate logits were deliberately
+  reduced by ≈0.686 relative scale, making them lose top-8 contests more often. Treat them
+  as low-priority lanes for expert residency/placement until measured otherwise at depth.
+- Precision-map consequence (§5/§6.3): served routers carry only fp16 information content
+  though stored F32 — an f16 router path loses nothing measurable versus today's F32 SGEMM
+  reads and pairs with the layout-swizzle lever already proposed there.
+
+### Per-layer table
+
+Upstream short-row indices are empty in all 48 layers (count column = 0). Ablated-side
+eleven indices per layer (served pack, exact F32 read):
+
+| L | upstream | ablated eleven |
+| --- | --- | --- |
+|  0 | 0 | 45, 49, 102, 160, 186, 195, 319, 348, 366, 371, 373 |
+|  1 | 0 | 10, 22, 46, 71, 128, 142, 164, 199, 226, 235, 344 |
+|  2 | 0 | 14, 49, 98, 111, 150, 197, 241, 271, 276, 367, 375 |
+|  3 | 0 | 5, 90, 116, 203, 221, 247, 270, 287, 297, 344, 355 |
+|  4 | 0 | 24, 91, 164, 217, 249, 274, 283, 286, 313, 339, 344 |
+|  5 | 0 | 8, 39, 50, 64, 68, 124, 224, 243, 267, 327, 333 |
+|  6 | 0 | 104, 105, 109, 137, 223, 260, 282, 292, 298, 348, 382 |
+|  7 | 0 | 5, 27, 41, 127, 178, 223, 229, 269, 274, 301, 351 |
+|  8 | 0 | 66, 68, 74, 79, 112, 124, 132, 180, 301, 307, 364 |
+|  9 | 0 | 61, 75, 98, 183, 244, 256, 259, 270, 285, 322, 365 |
+| 10 | 0 | 2, 45, 55, 132, 145, 146, 151, 245, 269, 314, 360 |
+| 11 | 0 | 79, 98, 159, 201, 244, 258, 270, 289, 297, 316, 349 |
+| 12 | 0 | 34, 85, 105, 114, 179, 241, 267, 331, 345, 363, 372 |
+| 13 | 0 | 8, 44, 51, 144, 156, 199, 229, 264, 293, 347, 357 |
+| 14 | 0 | 68, 89, 105, 122, 142, 174, 179, 201, 312, 364, 369 |
+| 15 | 0 | 29, 54, 96, 101, 105, 117, 174, 192, 231, 245, 309 |
+| 16 | 0 | 9, 10, 51, 85, 90, 112, 215, 243, 363, 367, 377 |
+| 17 | 0 | 2, 7, 30, 67, 99, 100, 162, 168, 201, 334, 358 |
+| 18 | 0 | 46, 68, 118, 185, 207, 209, 229, 260, 275, 310, 331 |
+| 19 | 0 | 45, 81, 104, 193, 201, 232, 258, 318, 346, 370, 373 |
+| 20 | 0 | 55, 88, 163, 210, 218, 224, 237, 299, 300, 310, 329 |
+| 21 | 0 | 33, 64, 84, 158, 183, 189, 221, 227, 291, 348, 349 |
+| 22 | 0 | 30, 42, 86, 88, 94, 156, 168, 299, 332, 343, 345 |
+| 23 | 0 | 3, 5, 14, 70, 122, 144, 154, 156, 219, 284, 309 |
+| 24 | 0 | 4, 106, 130, 182, 185, 231, 235, 309, 351, 354, 358 |
+| 25 | 0 | 8, 9, 144, 164, 216, 237, 261, 289, 293, 349, 378 |
+| 26 | 0 | 29, 67, 70, 76, 118, 126, 150, 193, 241, 267, 335 |
+| 27 | 0 | 31, 38, 162, 173, 199, 212, 218, 283, 332, 357, 370 |
+| 28 | 0 | 7, 15, 22, 34, 72, 78, 111, 133, 190, 279, 373 |
+| 29 | 0 | 75, 95, 97, 156, 177, 210, 231, 321, 357, 372, 373 |
+| 30 | 0 | 32, 46, 89, 101, 114, 125, 161, 326, 338, 357, 378 |
+| 31 | 0 | 44, 88, 90, 107, 176, 242, 268, 278, 284, 318, 364 |
+| 32 | 0 | 33, 38, 50, 51, 82, 134, 231, 255, 302, 360, 372 |
+| 33 | 0 | 35, 76, 112, 154, 178, 196, 216, 225, 252, 305, 332 |
+| 34 | 0 | 96, 97, 101, 134, 158, 181, 187, 275, 316, 340, 351 |
+| 35 | 0 | 16, 66, 73, 116, 165, 173, 200, 281, 301, 325, 346 |
+| 36 | 0 | 36, 83, 107, 120, 122, 186, 275, 316, 320, 345, 353 |
+| 37 | 0 | 9, 60, 74, 81, 115, 150, 171, 216, 256, 292, 367 |
+| 38 | 0 | 33, 43, 53, 69, 190, 211, 287, 326, 335, 336, 382 |
+| 39 | 0 | 6, 34, 35, 72, 74, 142, 153, 183, 222, 257, 273 |
+| 40 | 0 | 63, 73, 90, 224, 230, 279, 281, 339, 351, 354, 357 |
+| 41 | 0 | 25, 28, 55, 64, 169, 237, 295, 316, 318, 357, 376 |
+| 42 | 0 | 43, 63, 173, 175, 235, 249, 285, 293, 305, 308, 331 |
+| 43 | 0 | 18, 49, 81, 89, 107, 108, 134, 136, 161, 320, 362 |
+| 44 | 0 | 14, 22, 108, 109, 116, 135, 250, 314, 317, 342, 353 |
+| 45 | 0 | 3, 13, 17, 44, 76, 98, 116, 133, 196, 275, 346 |
+| 46 | 0 | 23, 83, 134, 168, 212, 236, 275, 307, 313, 320, 340 |
+| 47 | 0 | 23, 59, 68, 125, 139, 153, 203, 319, 347, 357, 378 |
+
+### Method limits, stated
+
+Upstream was read once per tensor from byte ranges; its bf16→f32 cast is exact, so upstream
+norms are exact up to bf16 storage granularity. No stock-vs-derivative comparison of EXPERT
+FFN weights was attempted: experts are NVFP4 (L0–39) / MXFP8 (L40–47) in both checkpoints,
+and a dequantizing drift study over ~390 GB is a separate probe. Correspondence checks ran
+fully on layer 23 and through fixed seeded probe-row samples (24 unit rows/layer, same seed
+both sides) elsewhere; the fp16-lattice census sampled 12 of 48 layers deterministically.
 
 ## Provenance appendix
 
