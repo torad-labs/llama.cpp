@@ -313,7 +313,7 @@ notes = [
 id = 'inkling-optimize-moe-shapes'
 title = 'Expert paths proven at Inkling shapes'
 feature = 'inkling-optimize'
-status = 'in_flight'
+status = 'blocked'
 owner = 'claude-tensor4'
 blocked_by = []
 guard = false
@@ -342,6 +342,8 @@ notes = [
   "2026-11-21 20:05 CT claude-tensor4: 2026-11-22 claude-tensor4: the launcher consolidated to ONE profile per Marcos: tensor-4 carries the combined measured configuration (query-first + compact greedy + the shared quantize, all default-on with escape hatches), and tensor-4-draft/capacity/quality are removed - their settings and why they lost are in the serve.py comment block. The --draft flag now applies the draft layout directly (context 1572864, ubatch 256, q8_0 target KV); search.py's default profile is tensor-4. 26/26 launcher tests pass. Arms so far: stock 292.01, fast 425.61, fast-rl32 424.23, fast-legacyq8 422.44, fast-gb4 419.61, fast-gb16 426.75 - the combined profile stands.",
   "2026-11-21 20:07 CT claude-tensor4: 2026-11-22 claude-tensor4: CORRECTION to my earlier ranking - the architecture-shaped plan (kernels-shaped-to-the-architecture doc) demotes the K-quant ring: at the probe's 102 distinct experts a layer, a step reads about 18.6 GB of expert weights a card (10-12 ms of pure reads) against 12.8 ms measured - the expert path is already near its byte floor, and the Q3_K block-reuse attempt measured -7.5. The ring pays only near 70 distinct experts; M1 (distinct experts in a traced step) settles it with one number. The TMA design laws in my earlier note still hold for whichever kernel is built. The plan's priority for the bytes: 3.1 far-cells-no-bias + 3.3 run addressing first (exact), then 3.4 one-byte KV in the tile kernel (E4M3 no-scale is safe because K is clipped to 22.63 and V normalized to RMS 1 - both far inside E4M3's range), then 3.2 shared-prefix read-once, then 3.7/3.6 (the two F32 products and the stacked Q-input product), 3.5 the window ring.",
   '2026-11-22 00:48 CT: 2026-11-22 00:52 CT llamacpp-coordinator: no row note since 2026-11-21 17:28 CT (7h+). If the row is active on the CloudRift tree (~/inkling-small), add a progress note naming where the MUL_MAT_ID row-split bug stands and what the row needs next; if it is parked, say who holds it.',
+  "2026-11-22 01:44 CT: 2026-11-22 01:44 CT llamacpp-coordinator: no progress note from owner in 8+ hours and no live seat answers to codex/claude-tensor4; parking the row so the quiet-state is judgeable. Owner may reclaim with campaign claim + a progress note; the MUL_MAT_ID row-split bug and remaining checks stay documented in this row's earlier notes.",
+  '2026-11-22 01:44 CT: status blocked',
 ]
 
 [[row]]
@@ -566,6 +568,7 @@ checks = [
 ]
 notes = [
   '2026-11-22 00:28 CT: added; 2 of 2 checks fail, as they should before the work',
+  '2026-11-22 01:30 CT: 2026-11-22: GLM-shared code rule: the captured copy-engine route changes multi-card all-reduce shared with GLM 5.3; guarded behind GGML_CUDA_AR_COPY_ENGINE_CAPTURE/_LEGACY, both default off, so stock GLM behavior is preserved (guard choice, not copy).',
 ]
 
 [[row]]
@@ -582,13 +585,29 @@ checks = [
 ]
 notes = [
   '2026-11-22 00:40 CT: added; 1 of 2 checks fail, as they should before the work',
+  '2026-11-22 01:30 CT: 2026-11-22: GLM-shared code rule: the packed prefill lives only in the Inkling relative-prefill kernel (no GLM path reaches it) and is guarded behind GGML_CUDA_FATTN_REL_PACKED_PREFILL default off; stock behavior preserved either way.',
+]
+
+[[row]]
+id = 'inkling-optimize-seam-dequant'
+title = 'Tensor-core seams dequantize and requantize in one pass'
+status = 'todo'
+owner = ''
+blocked_by = []
+guard = false
+spec = "Marcos, 2026-11-22: dequantize at the tensor-core seams and requantize activations there, for memory management and compute together. Operands stay in their stored quantized form (weights, KV) and are converted to the MMA fragment form inside the tile/kernel that consumes them, never through a separate dequant pass or a materialized intermediate; an activation read by several products keeps one requantized form reused across them. This is a design law, not an experiment: no per-change speed A/B - correctness is the gate here, and speed is judged once on four cards at integration. Exactness: bit-identical where the arithmetic allows, otherwise the rounding is named on the row. Ships behind a switch that restores the old path until its parity proof lands, then defaults on per the shared-code law."
+checks = [
+  'git merge-base --is-ancestor d3c3e242c16b8cbf51400fad410cd69b22d64f35 HEAD && cmake -S . -B build-campaign -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF && ctest --test-dir build-campaign -N -R inkling-seam | grep -qE "Total Tests: [1-9]" && cmake --build build-campaign -j 8 && flock /run/user/1000/gpu0.lock env CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-campaign -R inkling-seam --no-tests=error --output-on-failure && ./build-campaign/bin/test-llama-archs -a inkling2',
+]
+notes = [
+  "2026-11-22 02:00 CT llamacpp-coordinator: added by hand edit (campaign add would build the tree on torad-server). Direction from Marcos: the seam conversion is math, it removes work, so it needs no A/B; correctness checks gate it and the four-card integration run supplies the numbers once. Existing mechanisms it builds on: staged tile decode of q8_0/V (fattn-rel-elem, kv-onebyte row), the few-row shared q8_1 activation quantize (one form reused per input), and the fusion rows that cut the number of seams.",
 ]
 
 [[row]]
 id = 'repo-tunables-clean'
 title = 'The tunables registry agrees with the source'
-status = 'todo'
-owner = ''
+status = 'in_flight'
+owner = 'llamacpp-coordinator'
 blocked_by = []
 guard = false
 spec = 'python3 scripts/tunables.py check reports no problems on main. Today it reports two: LLAMA_MOE_RANDOM_ROUTING is read in src/llama-context.cpp and not declared in tunables.toml; LLAMA_SERVER_DEBUG_PROXY_ALLOW_PRIVATE is declared in the registry and the source reads it nowhere by name. Fix by declaring or removing each entry in the direction the source moved, not by weakening the check.'
@@ -597,6 +616,9 @@ checks = [
 ]
 notes = [
   '2026-11-22 00:50 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-22 01:12 CT llamacpp-coordinator: claimed',
+  '2026-11-22 01:13 CT: 2026-11-22 01:22 CT llamacpp-coordinator: fixed on draft-speed in 4d46afebf (LLAMA_MOE_RANDOM_ROUTING declared; unread LLAMA_SERVER_DEBUG_PROXY_ALLOW_PRIVATE dropped). scripts/tunables.py check exits 0 on the regenerated tree. Row closes when the fix reaches main; inkling-query-first-decode then re-judges and closes too.',
+  "2026-11-22 01:46 CT: 2026-11-22 01:52 CT llamacpp-coordinator: two registry problems remain transient while builder work is parked: GGML_CUDA_FATTN_REL_ROWS_LEGACY declared with its rider parked (inkling-mini, decision DROP) and GGML_CUDA_MMQ_TMA declared while its kernel files are uncommitted (experts builder, staging to qgre lead). The ledger default flip 1ea77be0c (GGML_LEDGER default false, profiling opt-in) cleared hyperparam's part. Row closes when the parked knobs land or their declarations are parked with them.",
 ]
 
 [[row]]
