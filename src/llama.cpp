@@ -159,8 +159,8 @@ int64_t llama_time_us(void) {
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     const bool data_parallel = params.split_mode == LLAMA_SPLIT_MODE_DATA;
     const bool meta_split = params.split_mode == LLAMA_SPLIT_MODE_TENSOR || data_parallel;
-    if (data_parallel && model->arch != LLM_ARCH_GLM5NEXT) {
-        LLAMA_LOG_ERROR("%s: data parallelism currently requires glm5next\n", __func__);
+    if (data_parallel && model->arch != LLM_ARCH_GLM5NEXT && model->arch != LLM_ARCH_INKLING2) {
+        LLAMA_LOG_ERROR("%s: data parallelism currently requires glm5next or inkling2\n", __func__);
         return false;
     }
     if (data_parallel && params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern) {

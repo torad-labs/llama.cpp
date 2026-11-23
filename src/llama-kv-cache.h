@@ -18,6 +18,7 @@ struct llama_context;
 
 class llama_kpool_views;
 class llama_kv_runs;
+struct llama_kv_delta_state;
 
 // GLM-5-Next pooled-key cache: the sequences whose cached pooled keys a position mutation left stale. Pools group cells by
 // absolute position, so seq_add or seq_div regroups them while every cached key still looks complete. A ubatch holding a
@@ -180,6 +181,16 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    struct stage_plan {
+        uint32_t strm = 0;
+        uint32_t cell_count = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    };
+
+    uint32_t get_n_stage() const { return n_stage; }
+    bool stage_copy(llama_seq_id seq_id, uint32_t row, const std::function<ggml_backend_t(ggml_backend_dev_t)> & get_backend, stage_plan & plan) const;
+    void state_write_staged(llama_io_write_i & io, llama_seq_id seq_id, uint32_t row, const stage_plan & plan) const;
+
     //
     // llama_kv_cache specific API
     //
@@ -257,6 +268,15 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    bool          has_kv_mixed() const { return kv_mixed_hot_rows > 0; }
+    uint32_t      get_hot_extent() const { return kv_mixed_extent; }
+    ggml_tensor * get_hot_kv(ggml_context * ctx, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k_hot(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * hot_k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v_hot(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * hot_v_idxs, int32_t il) const;
+    ggml_tensor * build_input_hot_idxs(ggml_context * ctx, const llama_ubatch & ubatch, const char * name) const;
+    void          set_input_hot_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch) const;
+    void          kv_mixed_apply(const slot_info & sinfo, const llama_ubatch & ubatch);
+
     ggml_tensor * get_k_scale(int32_t il) const;
     ggml_tensor * get_v_scale(int32_t il) const;
 
@@ -323,17 +343,23 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn, ggml_backend_sched_t sched = nullptr) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     // the position of each cell in the ubatch's streams, -1 for an empty cell: [n_kv, n_stream]
     void set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // resident device-side inputs updated via pinned async delta uploads (single unified non-host stream)
+    ggml_tensor * get_resident_cell_pos() const;
+    void          sync_resident_cell_pos(ggml_tensor * dst, ggml_backend_sched_t sched, int64_t n_kv) const;
+    ggml_tensor * get_resident_kq_mask(int64_t n_kv, int64_t n_tokens) const;
+    bool          is_resident_kq_mask(const ggml_tensor * dst) const;
+
     // whether the runs of cells of each row's sequence (llama-kv-runs.h) fit n_max a row: a cache of one stream that owns
     // its cells, whose change log nothing else takes
     bool kv_runs_fit(const llama_ubatch & ubatch, uint32_t n_max) const;
     // the runs input of ggml_flash_attn_ext_set_kv_runs, after kv_runs_fit said yes to the ubatch
-    void set_input_kv_runs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kv_runs(ggml_tensor * dst, const llama_ubatch * ubatch, ggml_backend_sched_t sched = nullptr) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -366,6 +392,7 @@ private:
 
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
+        ggml_tensor * hot_kv = nullptr; // F16 [n_embd_k_gqa, 2*(hot_rows + 1), n_stream]
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -377,6 +404,12 @@ private:
 
     // the runs of cells a decode step reads (kv_runs_fit), made at the first call
     mutable std::shared_ptr<llama_kv_runs> kv_runs;
+
+    // persistent device storage and pinned staging for cell_pos, packed kq_mask and kv_runs delta uploads
+    mutable std::shared_ptr<llama_kv_delta_state> delta_state;
+
+    ggml_backend_buffer_type_t get_resident_buft() const;
+    void sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool block_uniform, ggml_backend_sched_t sched) const;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -403,6 +436,9 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+    uint32_t n_stage = 0;
+    std::vector<std::vector<ggml_tensor *>> k_stage; // [row][ikv]
+    std::vector<std::vector<ggml_tensor *>> v_stage; // [row][ikv]
 
     const bool is_indexer = false;
 
@@ -410,17 +446,22 @@ private:
     uint32_t n_rot_k = 0;
     uint32_t n_rot_v = 0;
 
-    // section 3.5 skeleton (doc 18): the global layers' mixed recency store behind LLAMA_INKLING2_KV_MIXED - an
-    // F16 hot pool per stream and layer for K and for V beside the cold buffers, and the cells whose writes a
-    // pending mirror still owes them
-    std::vector<std::vector<llama_kv_mixed_pool_ptr>> kv_mixed_k; // [stream][layer]
-    std::vector<std::vector<llama_kv_mixed_pool_ptr>> kv_mixed_v;
-    std::vector<std::pair<uint32_t, uint32_t>> kv_mixed_pending;  // (stream, cell)
+    // Doc 18 section 3.5 (LLAMA_INKLING2_KV_MIXED): pre-store F16 hot ring per global layer.
+    // Slot s holds K at row 2*s and V at row 2*s + 1; slot kv_mixed_hot_rows is an unread sink for cold-only tokens.
+    uint32_t                           kv_mixed_extent   = 0;
+    uint32_t                           kv_mixed_hot_rows = 0;
+    std::vector<std::vector<uint32_t>> kv_mixed_slot_to_cell; // [stream][slot] -> cell or UINT32_MAX
+    std::vector<std::vector<int32_t>>  kv_mixed_cell_to_slot; // [stream][cell] -> slot or -1
+    std::vector<uint64_t>              kv_mixed_cursor;       // [stream]
+    std::vector<int64_t>               kv_mixed_hot_k_idxs;
+    std::vector<int64_t>               kv_mixed_hot_v_idxs;
+    mutable bool                       kv_mixed_dirty_all = true;
+    mutable std::vector<uint32_t>      kv_mixed_dirty;
 
-    // route the pending mirrors into their pools, validating each cell against this cache as it stands now
-    void kv_mixed_flush();
-
-    // drop every stamp and pending mirror: restores rebuild the recency picture from what follows
+    bool kv_mixed_is_near(uint32_t strm, uint32_t cell) const;
+    void kv_mixed_mark_dirty(uint32_t strm, uint32_t cell) const;
+    void kv_mixed_unlink(uint32_t strm, const uint32_t * idxs, size_t n);
+    void kv_mixed_reset_stream(uint32_t strm);
     void kv_mixed_reset();
 
     // if all layers participating in the cache have constant head size, the value is stored here
@@ -592,6 +633,14 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
+    bool          has_kv_mixed() const;
+    uint32_t      get_hot_extent() const;
+    ggml_tensor * get_hot_kv(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * cpy_k_hot(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * hot_k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v_hot(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * hot_v_idxs, int32_t il) const;
+    ggml_tensor * build_input_hot_idxs(ggml_context * ctx, const llama_ubatch & ubatch, const char * name) const;
+    void          set_input_hot_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch) const;
+
     ggml_tensor * get_k_scale(int32_t il) const;
     ggml_tensor * get_v_scale(int32_t il) const;
 
@@ -619,7 +668,7 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn, ggml_backend_sched_t sched = nullptr) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     // the position of each cell in the ubatch's streams, -1 for an empty cell: [n_kv, n_stream]

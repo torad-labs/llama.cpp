@@ -257,6 +257,26 @@ public:
     const llm_graph_nextn nextn;
 };
 
+struct llm_cand_draw_entry {
+    float    inv_temp = 0.0f;
+    uint32_t seed     = 0;
+};
+
+class llm_graph_input_cand_draw : public llm_graph_input_i {
+public:
+    llm_graph_input_cand_draw(const std::map<llama_seq_id, llm_cand_draw_entry> * cand_draw)
+        : cand_draw(cand_draw) {}
+    virtual ~llm_graph_input_cand_draw() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * draw = nullptr; // I32 [2, n_outputs]
+
+    const std::map<llama_seq_id, llm_cand_draw_entry> * cand_draw = nullptr;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd, llama_rope_section_order rope_section_order = LLAMA_ROPE_SECTION_ORDER_TYXZ)
@@ -648,6 +668,8 @@ public:
 
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+    ggml_tensor * self_hot_k_idxs = nullptr; // I64 [n_batch], F16 hot-ring scatter for LLAMA_INKLING2_KV_MIXED
+    ggml_tensor * self_hot_v_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs_swa = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
@@ -664,6 +686,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    ggml_backend_sched_t sched = nullptr;
 };
 
 class llm_graph_input_attn_k_iswa : public llm_graph_input_i {
@@ -698,6 +721,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    ggml_backend_sched_t sched = nullptr;
 };
 
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
@@ -870,6 +894,7 @@ public:
     const llama_cparams cparams;
 
     const llama_memory_hybrid_iswa_context * mctx;
+    ggml_backend_sched_t sched = nullptr;
 };
 
 class llm_graph_input_sampling : public llm_graph_input_i {
@@ -959,6 +984,9 @@ struct llm_graph_params {
     // the next decodes build their graph again: no decode of a pass's last 25 steps was replayed on the Nov 10, 2026 box
     bool any_seqs = false;
     bool candidates_only = false;
+    bool candidates_first_nan = false;
+    bool candidates_sample = false;
+    const std::map<llama_seq_id, llm_cand_draw_entry> * cand_draw = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1051,6 +1079,8 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             cparams.n_out_candidates        == other.cparams.n_out_candidates        &&
             candidates_only                 == other.candidates_only                 &&
+            candidates_first_nan            == other.candidates_first_nan            &&
+            candidates_sample               == other.candidates_sample               &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
             h_nextn_dev   == other.h_nextn_dev   &&
@@ -1273,6 +1303,11 @@ struct llm_graph_context {
 
     // the MTP store this graph writes or reads, if any
     const llm_graph_nextn nextn;
+    const bool candidates_first_nan;
+    const bool candidates_sample;
+    const std::map<llama_seq_id, llm_cand_draw_entry> * cand_draw;
+
+    ggml_tensor * build_inp_cand_draw() const;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1492,6 +1527,9 @@ struct llm_graph_context {
         int32_t n_kv_max;
         bool low_mean_mask;
         ggml_tensor * kv_runs = nullptr; // the runs of cells each row reads, see ggml_flash_attn_ext_set_kv_runs
+        bool swa_runs = false;
+        ggml_tensor * hot_kv = nullptr;  // F16 hot KV pool [hd, nk, 2*(hot_rows + 1), ns]
+        int32_t hot_extent = 0;
     };
 
     ggml_tensor * build_attn_mha(

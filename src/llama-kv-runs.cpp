@@ -32,10 +32,15 @@ static bool run_extend(llama_kv_run & b, uint32_t c, llama_pos p, bool shared) {
 void llama_kv_runs::build(const llama_kv_cells & cells, llama_seq_id seq, seq_runs & sr) const {
     sr = seq_runs();
     const auto & pos = cells.positions();
+    // Keep 7 extra older cells on SWA so drafted verify groups (up to 8 tokens) retain their window.
+    const llama_pos pos_swa = n_swa > 0 ? std::max<llama_pos>(0, cells.seq_pos_max(seq) - 7) : -1;
     const uint32_t n_groups = (cells.used_max_p1() + 63)/64;
     for (uint32_t g = 0; g < n_groups; ++g) {
         for (uint64_t bits = cells.seq_cells64(seq, g); bits; bits &= bits - 1) {
             const uint32_t c = 64*g + ctz64(bits);
+            if (n_swa > 0 && llama_hparams::is_masked_swa(n_swa, swa_type, pos[c], pos_swa)) {
+                continue;
+            }
             const bool shared = cells.seq_count(c) > 1;
             if (sr.runs.empty() || !run_extend(sr.runs.back(), c, pos[c], shared)) {
                 sr.runs.push_back({c, pos[c], 1, 1, shared});
@@ -113,7 +118,30 @@ void llama_kv_runs::sync(const llama_kv_cells & cells) {
             sr.pos_end = pos[c];
             sr.cell_max = std::max(sr.cell_max, c);
         }
-        sr.built = !stale && sr.n_cells == cells.seq_n_cells(s);
+        if (!stale && n_swa > 0 && !added.empty()) {
+            // Trim cells older than the sliding window plus 7-token draft verify slack.
+            const llama_pos pos_swa = std::max<llama_pos>(0, sr.pos_end - 7);
+            for (size_t ri = 0; ri < sr.runs.size(); ) {
+                auto & b = sr.runs[ri];
+                while (b.len > 0 && llama_hparams::is_masked_swa(n_swa, swa_type, b.pos, pos_swa)) {
+                    b.cell += b.stride;
+                    b.pos  += 1;
+                    b.len  -= 1;
+                    sr.n_cells--;
+                }
+                if (b.len == 0) {
+                    sr.runs.erase(sr.runs.begin() + ri);
+                    if (sr.tail > ri) {
+                        sr.tail--;
+                    } else if (sr.tail == ri) {
+                        sr.tail = sr.runs.empty() ? 0 : sr.runs.size() - 1;
+                    }
+                } else {
+                    ++ri;
+                }
+            }
+        }
+        sr.built = !stale && (n_swa > 0 || sr.n_cells == cells.seq_n_cells(s));
     }
 }
 
@@ -137,16 +165,17 @@ void llama_kv_runs::write(const llama_kv_cells & cells, const llama_ubatch & uba
         GGML_ASSERT(lists[r] && seq_of[r] < 32 && "the step was classed by llama_kv_cache::kv_runs_fit");
     }
 
-    // the shared list: runs of stride 1 that two rows or more hold whole (rows of other sequences, or a token and its drafts),
-    // with the sequences of those rows, in cell order
+    // Shared list: stride-1 runs held whole by at least two distinct sequences (skipped on SWA).
     using key = std::tuple<uint32_t, llama_pos, uint32_t>;
     std::map<key, std::pair<uint32_t, uint32_t>> held; // sequences, rows
-    for (uint32_t r = 0; r < n_rows; ++r) {
-        for (const auto & b : *lists[r]) {
-            if (b.stride == 1) {
-                auto & h = held[{b.cell, b.pos, b.len}];
-                h.first |= 1u << seq_of[r];
-                h.second++;
+    if (n_swa == 0) {
+        for (uint32_t r = 0; r < n_rows; ++r) {
+            for (const auto & b : *lists[r]) {
+                if (b.stride == 1) {
+                    auto & h = held[{b.cell, b.pos, b.len}];
+                    h.first |= 1u << seq_of[r];
+                    h.second++;
+                }
             }
         }
     }
@@ -155,7 +184,9 @@ void llama_kv_runs::write(const llama_kv_cells & cells, const llama_ubatch & uba
     int32_t n_list = 0, at_list = 0;
     for (auto it = held.begin(); it != held.end();) {
         const auto & [cell, pos, len] = it->first;
-        if (it->second.second < 2 || n_list == n_entries - 2) {
+        const uint32_t seq_mask = it->second.first;
+        const bool multi_seq = (seq_mask & (seq_mask - 1u)) != 0;
+        if (!multi_seq || n_list == n_entries - 2) {
             it = held.erase(it);
             continue;
         }

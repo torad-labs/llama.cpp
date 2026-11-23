@@ -212,6 +212,19 @@ void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq
     mem_recr->state_read(io, seq_id, flags);
 }
 
+llama_memory_recurrent * llama_memory_hybrid_iswa::staged() {
+    static const bool kv_partial_legacy = ggml_env_switch("LLAMA_KV_PARTIAL_STATE_LEGACY");
+    if (kv_partial_legacy) {
+        return nullptr;
+    }
+    auto * rec = mem_recr->staged();
+    auto * swa = mem_attn->get_swa();
+    if (!rec || !swa || swa->get_n_stage() < rec->n_stage) {
+        return nullptr;
+    }
+    return rec;
+}
+
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {
     return mem_attn.get();
 }

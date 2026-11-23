@@ -158,6 +158,8 @@ public:
         std::fill(pos_max_g.begin(), pos_max_g.end(), -1);
 
         chg.all();
+        pos_chg.all();
+        mask_chg.all();
     }
 
     void reset_shift() {
@@ -288,7 +290,7 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
 
-            chg.add(idx);
+            log_pos(idx);
 
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(i + j);
@@ -324,7 +326,7 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
 
-            chg.add(idx);
+            log_pos(idx);
 
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(idx);
@@ -358,7 +360,7 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
-        chg.add(i);
+        log_pos(i);
 
         seq_pos_rm(i);
         seq[i].reset();
@@ -379,13 +381,14 @@ public:
         assert(pos[i] != -1);
         assert(seq_id >= 0);
 
-        chg.add(i);
+        log_seq(i);
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
 
         if (seq[i].none()) {
             pos[i] = -1;
+            pos_chg.add(i);
             ext[i].reset();
             shift[i] = 0;
 
@@ -423,7 +426,7 @@ public:
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
 
-        chg.add(i);
+        log_seq(i);
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -440,6 +443,7 @@ public:
             seq[i].reset();
 
             pos[i] = -1;
+            pos_chg.add(i);
             ext[i].reset();
             shift[i] = 0;
 
@@ -509,7 +513,7 @@ public:
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
 
-        chg.add(i);
+        log_seq(i);
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
@@ -631,6 +635,15 @@ public:
         return chg;
     }
 
+    // dedicated mutation logs for resident cell_pos and packed kq_mask delta uploads
+    const llama_kv_cells_log & pos_changes() const {
+        return pos_chg;
+    }
+
+    const llama_kv_cells_log & mask_changes() const {
+        return mask_chg;
+    }
+
     // Empty cells have position -1.
     const std::vector<llama_pos> & positions() const {
         return pos;
@@ -744,7 +757,7 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
-        chg.add(i);
+        log_pos(i);
 
         pos[i] = p;
 
@@ -764,7 +777,7 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
-        chg.add(i);
+        log_pos(i);
 
         seq_pos_rm(i);
 
@@ -799,7 +812,7 @@ public:
 
         const llama_pos p_old = pos[i];
 
-        chg.add(i);
+        log_pos(i);
 
         seq_pos_rm(i);
 
@@ -856,6 +869,19 @@ private:
     uint32_t seq_pd[LLAMA_MAX_SEQ] = {};
 
     llama_kv_cells_log chg;
+    llama_kv_cells_log pos_chg;
+    llama_kv_cells_log mask_chg;
+
+    void log_pos(uint32_t i) {
+        chg.add(i);
+        pos_chg.add(i);
+        mask_chg.add(i);
+    }
+
+    void log_seq(uint32_t i) {
+        chg.add(i);
+        mask_chg.add(i);
+    }
 
     // bit i of seq_bits[s] is set if cell i carries sequence s (the transpose of `seq`), used to build the cell lists
     // and the groups of seq_cells64(); allocated on the first cell of the sequence, so the copies made by cp() never
