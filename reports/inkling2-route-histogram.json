@@ -1,0 +1,2422 @@
+{
+ "schema_version": 1,
+ "generated_utc": "2026-11-22T09:58:54Z",
+ "generator": "scripts/inkling2/route_histogram.py",
+ "provenance_note": "CPU-side aggregation over stored MMQ_ROUTE serving traces (GGML_CUDA_MMQ_ROUTE_LOG) recorded during the 2026-11-18 tp4 four-card Inkling-2-Small-Q3_K_M windows. No GPU window was run.",
+ "model": {
+  "name": "Inkling-2-Small-Q3_K_M",
+  "n_experts": 384,
+  "top_k": 8,
+  "routed_layers": 48
+ },
+ "phase_boundary_cols": 256,
+ "uniform_mean_share_per_expert": 0.020833333,
+ "falsifier_threshold_x_uniform": 1.5,
+ "verdict": {
+  "measured_top1_share": null,
+  "branch": "c",
+  "label": "inconclusive_from_stores_breadth_measured",
+  "reason": "Every stored route record is a per-launch aggregate (cols, used); no expert identities exist in any store, so the top-1 share bar of 1.5x the uniform mean (0.03125) cannot be evaluated from bytes on disk. Measured breadth evidence IS recorded here per layer and phase.",
+  "decider_capture": "One window on a rented box with --expert-trace plus a producer variant that keeps a 384-bin per-site hit histogram across evals and dumps JSONL at teardown (the site name already carries the layer); >=1000 decode steps at shallow AND deep context. GLM_ROUTE_STATS multiplicity[64] during an Inkling window is a coarser fallback."
+ },
+ "totals": {
+  "launches": 87472,
+  "slot_draws": 649224192,
+  "raw_route_records": 699776,
+  "accounting_sum": 699776,
+  "product_repeats_deduped": 612304,
+  "device_repeats_or_other_nonfirst": 0,
+  "bad_cols_records": 0,
+  "unknown_site_records": 0,
+  "expert_hit_histograms_present": false
+ },
+ "stores": [
+  {
+   "path": "/home/marcos/Documents/dev/infra/rig/local-nvme/research/inkling2-tp4-20261118/stock-glm-pool-engine/expert-routes.jsonl",
+   "bytes": 7816896,
+   "sha256": "2bf3698cab1543f029c6cf8a8d5c81e98c8a9eb6173b6d5e1116b29224794cae",
+   "lines": 71428,
+   "raw_route_records": 71040,
+   "launches": 8880,
+   "product_repeats": 62160,
+   "device_repeat_records": 0,
+   "bad_cols": 0,
+   "unknown_sites": 0,
+   "end_notes": [
+    {
+     "ran": 17760,
+     "kept": 17760,
+     "capacity": 65536,
+     "ctx": 0
+    },
+    {
+     "ran": 17760,
+     "kept": 17760,
+     "capacity": 65536,
+     "ctx": 1
+    },
+    {
+     "ran": 17760,
+     "kept": 17760,
+     "capacity": 65536,
+     "ctx": 3
+    },
+    {
+     "ran": 17760,
+     "kept": 17760,
+     "capacity": 65536,
+     "ctx": 2
+    }
+   ]
+  },
+  {
+   "path": "/home/marcos/Documents/dev/infra/rig/local-nvme/research/inkling2-tp4-20261118/stock-default-pool-sliced/expert-routes.jsonl",
+   "bytes": 8432516,
+   "sha256": "37d7ce681b622d464c124f6f6205a29316e624196708e92b353d58f8a1b47c41",
+   "lines": 79492,
+   "raw_route_records": 79104,
+   "launches": 9888,
+   "product_repeats": 69216,
+   "device_repeat_records": 0,
+   "bad_cols": 0,
+   "unknown_sites": 0,
+   "end_notes": [
+    {
+     "ran": 19776,
+     "kept": 19776,
+     "capacity": 65536,
+     "ctx": 0
+    },
+    {
+     "ran": 19776,
+     "kept": 19776,
+     "capacity": 65536,
+     "ctx": 1
+    },
+    {
+     "ran": 19776,
+     "kept": 19776,
+     "capacity": 65536,
+     "ctx": 2
+    },
+    {
+     "ran": 19776,
+     "kept": 19776,
+     "capacity": 65536,
+     "ctx": 3
+    }
+   ]
+  },
+  {
+   "path": "/home/marcos/Documents/dev/infra/rig/local-nvme/research/inkling2-tp4-20261118/stock-prequalification-engine/expert-routes.jsonl",
+   "bytes": 28518600,
+   "sha256": "4ab704fa324318717b82321140ff3ca818e31ebb60d562d0f7813441caf58f88",
+   "lines": 262532,
+   "raw_route_records": 262144,
+   "launches": 32768,
+   "product_repeats": 229376,
+   "device_repeat_records": 0,
+   "bad_cols": 0,
+   "unknown_sites": 0,
+   "end_notes": [
+    {
+     "ran": 89280,
+     "kept": 65536,
+     "capacity": 65536,
+     "ctx": 0
+    },
+    {
+     "ran": 89280,
+     "kept": 65536,
+     "capacity": 65536,
+     "ctx": 1
+    },
+    {
+     "ran": 89280,
+     "kept": 65536,
+     "capacity": 65536,
+     "ctx": 2
+    },
+    {
+     "ran": 89280,
+     "kept": 65536,
+     "capacity": 65536,
+     "ctx": 3
+    }
+   ]
+  },
+  {
+   "path": "/home/marcos/Documents/dev/infra/rig/local-nvme/research/inkling2-tp4-20261118/stock-full-capacity-host/expert-routes.jsonl",
+   "bytes": 2713835,
+   "sha256": "8bbc25c59283e1524429f011f990304e1f56b5e6cfd1445042b58e46e84e279e",
+   "lines": 25733,
+   "raw_route_records": 25344,
+   "launches": 3168,
+   "product_repeats": 22176,
+   "device_repeat_records": 0,
+   "bad_cols": 0,
+   "unknown_sites": 0,
+   "end_notes": [
+    {
+     "ran": 6336,
+     "kept": 6336,
+     "capacity": 65536,
+     "ctx": 0
+    },
+    {
+     "ran": 6336,
+     "kept": 6336,
+     "capacity": 65536,
+     "ctx": 1
+    },
+    {
+     "ran": 6336,
+     "kept": 6336,
+     "capacity": 65536,
+     "ctx": 2
+    },
+    {
+     "ran": 6336,
+     "kept": 6336,
+     "capacity": 65536,
+     "ctx": 3
+    },
+    {
+     "ran": 0,
+     "kept": 0,
+     "capacity": 65536,
+     "ctx": 4
+    }
+   ]
+  },
+  {
+   "path": "/home/marcos/Documents/dev/infra/rig/local-nvme/research/inkling2-tp4-20261118/results/stock-shared-pool-engine/expert-routes.jsonl",
+   "bytes": 29275284,
+   "sha256": "ae284315c13075f41cb1de4103a816fd7aa1bdc72272451ec408494630563130",
+   "lines": 262532,
+   "raw_route_records": 262144,
+   "launches": 32768,
+   "product_repeats": 229376,
+   "device_repeat_records": 0,
+   "bad_cols": 0,
+   "unknown_sites": 0,
+   "end_notes": [
+    {
+     "ran": 186240,
+     "kept": 65536,
+     "capacity": 65536,
+     "ctx": 0
+    },
+    {
+     "ran": 186240,
+     "kept": 65536,
+     "capacity": 65536,
+     "ctx": 1
+    },
+    {
+     "ran": 186240,
+     "kept": 65536,
+     "capacity": 65536,
+     "ctx": 2
+    },
+    {
+     "ran": 186240,
+     "kept": 65536,
+     "capacity": 65536,
+     "ctx": 3
+    }
+   ]
+  }
+ ],
+ "phase_launch_share": {
+  "decode": 0.310042071,
+  "prefill": 0.689957929
+ },
+ "cols_histogram_by_phase": {
+  "decode": {
+   "96": 528,
+   "144": 48,
+   "160": 96,
+   "184": 12720,
+   "168": 48,
+   "136": 96,
+   "192": 48,
+   "176": 13296,
+   "112": 48,
+   "128": 48,
+   "224": 48,
+   "80": 48,
+   "208": 48
+  },
+  "prefill": {
+   "1984": 48,
+   "15872": 192,
+   "4960": 96,
+   "512": 288,
+   "16384": 19232,
+   "16352": 336,
+   "16288": 48,
+   "992": 96,
+   "5952": 48,
+   "1056": 48,
+   "472": 192,
+   "600": 48,
+   "552": 48,
+   "488": 96,
+   "448": 96,
+   "528": 96,
+   "496": 48,
+   "464": 96,
+   "432": 48,
+   "504": 48,
+   "536": 48,
+   "440": 48,
+   "520": 48,
+   "736": 48,
+   "8192": 38768,
+   "8160": 48,
+   "6944": 48,
+   "288": 48
+  }
+ },
+ "by_batch_size": [
+  {
+   "cols": 80,
+   "tokens_per_launch": 10,
+   "launches_decode": 48,
+   "ratio_to_uniform_mean_decode": 0.538681,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 96,
+   "tokens_per_launch": 12,
+   "launches_decode": 528,
+   "ratio_to_uniform_mean_decode": 0.556125,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 112,
+   "tokens_per_launch": 14,
+   "launches_decode": 48,
+   "ratio_to_uniform_mean_decode": 0.239516,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 128,
+   "tokens_per_launch": 16,
+   "launches_decode": 48,
+   "ratio_to_uniform_mean_decode": 0.476921,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 136,
+   "tokens_per_launch": 17,
+   "launches_decode": 96,
+   "ratio_to_uniform_mean_decode": 0.333514,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 144,
+   "tokens_per_launch": 18,
+   "launches_decode": 48,
+   "ratio_to_uniform_mean_decode": 0.435675,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 160,
+   "tokens_per_launch": 20,
+   "launches_decode": 96,
+   "ratio_to_uniform_mean_decode": 0.283854,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 168,
+   "tokens_per_launch": 21,
+   "launches_decode": 48,
+   "ratio_to_uniform_mean_decode": 0.39476,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 176,
+   "tokens_per_launch": 22,
+   "launches_decode": 13296,
+   "ratio_to_uniform_mean_decode": 0.198346,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 184,
+   "tokens_per_launch": 23,
+   "launches_decode": 12720,
+   "ratio_to_uniform_mean_decode": 0.527482,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 192,
+   "tokens_per_launch": 24,
+   "launches_decode": 48,
+   "ratio_to_uniform_mean_decode": 0.344261,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 208,
+   "tokens_per_launch": 26,
+   "launches_decode": 48,
+   "ratio_to_uniform_mean_decode": 0.435015,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 224,
+   "tokens_per_launch": 28,
+   "launches_decode": 48,
+   "ratio_to_uniform_mean_decode": 0.326817,
+   "launches_prefill": 0,
+   "ratio_to_uniform_mean_prefill": null
+  },
+  {
+   "cols": 288,
+   "tokens_per_launch": 36,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.308351
+  },
+  {
+   "cols": 432,
+   "tokens_per_launch": 54,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.504366
+  },
+  {
+   "cols": 440,
+   "tokens_per_launch": 55,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.502694
+  },
+  {
+   "cols": 448,
+   "tokens_per_launch": 56,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 96,
+   "ratio_to_uniform_mean_prefill": 0.505229
+  },
+  {
+   "cols": 464,
+   "tokens_per_launch": 58,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 96,
+   "ratio_to_uniform_mean_prefill": 0.484254
+  },
+  {
+   "cols": 472,
+   "tokens_per_launch": 59,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 192,
+   "ratio_to_uniform_mean_prefill": 0.415957
+  },
+  {
+   "cols": 488,
+   "tokens_per_launch": 61,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 96,
+   "ratio_to_uniform_mean_prefill": 0.486834
+  },
+  {
+   "cols": 496,
+   "tokens_per_launch": 62,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.531287
+  },
+  {
+   "cols": 504,
+   "tokens_per_launch": 63,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.50342
+  },
+  {
+   "cols": 512,
+   "tokens_per_launch": 64,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 288,
+   "ratio_to_uniform_mean_prefill": 0.324137
+  },
+  {
+   "cols": 520,
+   "tokens_per_launch": 65,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.499158
+  },
+  {
+   "cols": 528,
+   "tokens_per_launch": 66,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 96,
+   "ratio_to_uniform_mean_prefill": 0.489383
+  },
+  {
+   "cols": 536,
+   "tokens_per_launch": 67,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.515553
+  },
+  {
+   "cols": 552,
+   "tokens_per_launch": 69,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.509632
+  },
+  {
+   "cols": 600,
+   "tokens_per_launch": 75,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.494338
+  },
+  {
+   "cols": 736,
+   "tokens_per_launch": 92,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.44133
+  },
+  {
+   "cols": 992,
+   "tokens_per_launch": 124,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 96,
+   "ratio_to_uniform_mean_prefill": 0.214845
+  },
+  {
+   "cols": 1056,
+   "tokens_per_launch": 132,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.527031
+  },
+  {
+   "cols": 1984,
+   "tokens_per_launch": 248,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.344198
+  },
+  {
+   "cols": 4960,
+   "tokens_per_launch": 620,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 96,
+   "ratio_to_uniform_mean_prefill": 0.334175
+  },
+  {
+   "cols": 5952,
+   "tokens_per_launch": 744,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.479872
+  },
+  {
+   "cols": 6944,
+   "tokens_per_launch": 868,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.493056
+  },
+  {
+   "cols": 8160,
+   "tokens_per_launch": 1020,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.589627
+  },
+  {
+   "cols": 8192,
+   "tokens_per_launch": 1024,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 38768,
+   "ratio_to_uniform_mean_prefill": 0.523663
+  },
+  {
+   "cols": 15872,
+   "tokens_per_launch": 1984,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 192,
+   "ratio_to_uniform_mean_prefill": 0.502753
+  },
+  {
+   "cols": 16288,
+   "tokens_per_launch": 2036,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 48,
+   "ratio_to_uniform_mean_prefill": 0.450195
+  },
+  {
+   "cols": 16352,
+   "tokens_per_launch": 2044,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 336,
+   "ratio_to_uniform_mean_prefill": 0.461961
+  },
+  {
+   "cols": 16384,
+   "tokens_per_launch": 2048,
+   "launches_decode": 0,
+   "ratio_to_uniform_mean_decode": null,
+   "launches_prefill": 19232,
+   "ratio_to_uniform_mean_prefill": 0.396997
+  }
+ ],
+ "pooled_breadth": {
+  "decode": {
+   "launches": 27120,
+   "slot_draws": 4819968,
+   "used_mean": 52.21427,
+   "used_p10": 21,
+   "used_median": 42,
+   "used_p90": 103,
+   "ratio_to_uniform_mean": 0.363307,
+   "ratio_to_uniform_p10": 0.149264,
+   "ratio_to_uniform_p90": 0.705612,
+   "uniform_expected_at_mean_cols": 142.355521
+  },
+  "prefill": {
+   "launches": 60352,
+   "slot_draws": 644404224,
+   "used_mean": 183.289021,
+   "used_p10": 84,
+   "used_median": 187,
+   "used_p90": 262,
+   "ratio_to_uniform_mean": 0.480052,
+   "ratio_to_uniform_p10": 0.223958,
+   "ratio_to_uniform_p90": 0.682292,
+   "uniform_expected_at_mean_cols": 384.0
+  }
+ },
+ "per_layer": [
+  {
+   "layer": 0,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 61.541593,
+    "used_p10": 34,
+    "used_median": 39,
+    "used_p90": 116,
+    "ratio_to_uniform_mean": 0.429272,
+    "ratio_to_uniform_p10": 0.238839,
+    "ratio_to_uniform_p90": 0.787029,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 128.826709,
+    "used_p10": 61,
+    "used_median": 133,
+    "used_p90": 154,
+    "ratio_to_uniform_mean": 0.339001,
+    "ratio_to_uniform_p10": 0.158854,
+    "ratio_to_uniform_p90": 0.401042,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 1,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 55.122124,
+    "used_p10": 23,
+    "used_median": 28,
+    "used_p90": 118,
+    "ratio_to_uniform_mean": 0.384143,
+    "ratio_to_uniform_p10": 0.161567,
+    "ratio_to_uniform_p90": 0.800598,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 132.685215,
+    "used_p10": 43,
+    "used_median": 145,
+    "used_p90": 152,
+    "ratio_to_uniform_mean": 0.349176,
+    "ratio_to_uniform_p10": 0.111979,
+    "ratio_to_uniform_p90": 0.395833,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 2,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 61.467257,
+    "used_p10": 30,
+    "used_median": 36,
+    "used_p90": 125,
+    "ratio_to_uniform_mean": 0.429362,
+    "ratio_to_uniform_p10": 0.21074,
+    "ratio_to_uniform_p90": 0.863183,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 152.209062,
+    "used_p10": 65,
+    "used_median": 156,
+    "used_p90": 198,
+    "ratio_to_uniform_mean": 0.40042,
+    "ratio_to_uniform_p10": 0.169271,
+    "ratio_to_uniform_p90": 0.515625,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 3,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 64.311504,
+    "used_p10": 34,
+    "used_median": 45,
+    "used_p90": 127,
+    "ratio_to_uniform_mean": 0.449006,
+    "ratio_to_uniform_p10": 0.238839,
+    "ratio_to_uniform_p90": 0.861661,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 158.844197,
+    "used_p10": 93,
+    "used_median": 159,
+    "used_p90": 216,
+    "ratio_to_uniform_mean": 0.417809,
+    "ratio_to_uniform_p10": 0.244792,
+    "ratio_to_uniform_p90": 0.565104,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 4,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 68.143363,
+    "used_p10": 39,
+    "used_median": 49,
+    "used_p90": 125,
+    "ratio_to_uniform_mean": 0.475556,
+    "ratio_to_uniform_p10": 0.273962,
+    "ratio_to_uniform_p90": 0.848091,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 187.044515,
+    "used_p10": 96,
+    "used_median": 196,
+    "used_p90": 220,
+    "ratio_to_uniform_mean": 0.491196,
+    "ratio_to_uniform_p10": 0.252604,
+    "ratio_to_uniform_p90": 0.575521,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 5,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 66.982301,
+    "used_p10": 40,
+    "used_median": 47,
+    "used_p90": 128,
+    "ratio_to_uniform_mean": 0.466752,
+    "ratio_to_uniform_p10": 0.280987,
+    "ratio_to_uniform_p90": 0.868446,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 156.251987,
+    "used_p10": 79,
+    "used_median": 158,
+    "used_p90": 208,
+    "ratio_to_uniform_mean": 0.410878,
+    "ratio_to_uniform_p10": 0.208333,
+    "ratio_to_uniform_p90": 0.546875,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 6,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 46.483186,
+    "used_p10": 20,
+    "used_median": 31,
+    "used_p90": 105,
+    "ratio_to_uniform_mean": 0.322846,
+    "ratio_to_uniform_p10": 0.140493,
+    "ratio_to_uniform_p90": 0.712397,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 127.225755,
+    "used_p10": 83,
+    "used_median": 131,
+    "used_p90": 162,
+    "ratio_to_uniform_mean": 0.334141,
+    "ratio_to_uniform_p10": 0.216146,
+    "ratio_to_uniform_p90": 0.424479,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 7,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 48.670796,
+    "used_p10": 22,
+    "used_median": 32,
+    "used_p90": 106,
+    "ratio_to_uniform_mean": 0.338158,
+    "ratio_to_uniform_p10": 0.154543,
+    "ratio_to_uniform_p90": 0.719181,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 113.372814,
+    "used_p10": 70,
+    "used_median": 114,
+    "used_p90": 137,
+    "ratio_to_uniform_mean": 0.297833,
+    "ratio_to_uniform_p10": 0.184896,
+    "ratio_to_uniform_p90": 0.359375,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 8,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 48.761062,
+    "used_p10": 23,
+    "used_median": 44,
+    "used_p90": 98,
+    "ratio_to_uniform_mean": 0.339582,
+    "ratio_to_uniform_p10": 0.161567,
+    "ratio_to_uniform_p90": 0.664904,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 114.04372,
+    "used_p10": 85,
+    "used_median": 110,
+    "used_p90": 157,
+    "ratio_to_uniform_mean": 0.299454,
+    "ratio_to_uniform_p10": 0.221354,
+    "ratio_to_uniform_p90": 0.414062,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 9,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 46.224779,
+    "used_p10": 23,
+    "used_median": 32,
+    "used_p90": 97,
+    "ratio_to_uniform_mean": 0.321463,
+    "ratio_to_uniform_p10": 0.161567,
+    "ratio_to_uniform_p90": 0.658119,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 136.047695,
+    "used_p10": 64,
+    "used_median": 143,
+    "used_p90": 168,
+    "ratio_to_uniform_mean": 0.356748,
+    "ratio_to_uniform_p10": 0.166667,
+    "ratio_to_uniform_p90": 0.440104,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 10,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 44.047788,
+    "used_p10": 20,
+    "used_median": 30,
+    "used_p90": 96,
+    "ratio_to_uniform_mean": 0.305934,
+    "ratio_to_uniform_p10": 0.140493,
+    "ratio_to_uniform_p90": 0.651334,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 149.039746,
+    "used_p10": 64,
+    "used_median": 159,
+    "used_p90": 182,
+    "ratio_to_uniform_mean": 0.390555,
+    "ratio_to_uniform_p10": 0.166667,
+    "ratio_to_uniform_p90": 0.473958,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 11,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 43.745133,
+    "used_p10": 20,
+    "used_median": 28,
+    "used_p90": 84,
+    "ratio_to_uniform_mean": 0.304391,
+    "ratio_to_uniform_p10": 0.140493,
+    "ratio_to_uniform_p90": 0.569917,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 130.471383,
+    "used_p10": 46,
+    "used_median": 142,
+    "used_p90": 157,
+    "ratio_to_uniform_mean": 0.342257,
+    "ratio_to_uniform_p10": 0.119792,
+    "ratio_to_uniform_p90": 0.416667,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 12,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 47.860177,
+    "used_p10": 22,
+    "used_median": 30,
+    "used_p90": 102,
+    "ratio_to_uniform_mean": 0.33199,
+    "ratio_to_uniform_p10": 0.154543,
+    "ratio_to_uniform_p90": 0.692043,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 123.635135,
+    "used_p10": 55,
+    "used_median": 135,
+    "used_p90": 160,
+    "ratio_to_uniform_mean": 0.323832,
+    "ratio_to_uniform_p10": 0.143229,
+    "ratio_to_uniform_p90": 0.416667,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 13,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 61.316814,
+    "used_p10": 36,
+    "used_median": 44,
+    "used_p90": 120,
+    "ratio_to_uniform_mean": 0.426508,
+    "ratio_to_uniform_p10": 0.252888,
+    "ratio_to_uniform_p90": 0.814168,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 200.983307,
+    "used_p10": 118,
+    "used_median": 210,
+    "used_p90": 247,
+    "ratio_to_uniform_mean": 0.52632,
+    "ratio_to_uniform_p10": 0.307292,
+    "ratio_to_uniform_p90": 0.643229,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 14,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 64.679646,
+    "used_p10": 42,
+    "used_median": 48,
+    "used_p90": 119,
+    "ratio_to_uniform_mean": 0.449944,
+    "ratio_to_uniform_p10": 0.295036,
+    "ratio_to_uniform_p90": 0.807383,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 212.647854,
+    "used_p10": 123,
+    "used_median": 222,
+    "used_p90": 254,
+    "ratio_to_uniform_mean": 0.556768,
+    "ratio_to_uniform_p10": 0.320312,
+    "ratio_to_uniform_p90": 0.661458,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 15,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 58.437168,
+    "used_p10": 30,
+    "used_median": 39,
+    "used_p90": 116,
+    "ratio_to_uniform_mean": 0.406179,
+    "ratio_to_uniform_p10": 0.21074,
+    "ratio_to_uniform_p90": 0.787029,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 237.420509,
+    "used_p10": 113,
+    "used_median": 258,
+    "used_p90": 284,
+    "ratio_to_uniform_mean": 0.621258,
+    "ratio_to_uniform_p10": 0.294271,
+    "ratio_to_uniform_p90": 0.739583,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 16,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 59.80885,
+    "used_p10": 32,
+    "used_median": 41,
+    "used_p90": 114,
+    "ratio_to_uniform_mean": 0.416507,
+    "ratio_to_uniform_p10": 0.224789,
+    "ratio_to_uniform_p90": 0.773459,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 236.992846,
+    "used_p10": 105,
+    "used_median": 263,
+    "used_p90": 287,
+    "ratio_to_uniform_mean": 0.620108,
+    "ratio_to_uniform_p10": 0.273438,
+    "ratio_to_uniform_p90": 0.747396,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 17,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 55.145133,
+    "used_p10": 26,
+    "used_median": 34,
+    "used_p90": 113,
+    "ratio_to_uniform_mean": 0.383414,
+    "ratio_to_uniform_p10": 0.182641,
+    "ratio_to_uniform_p90": 0.766675,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 197.504769,
+    "used_p10": 78,
+    "used_median": 221,
+    "used_p90": 254,
+    "ratio_to_uniform_mean": 0.517338,
+    "ratio_to_uniform_p10": 0.205729,
+    "ratio_to_uniform_p90": 0.661458,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 18,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 45.067257,
+    "used_p10": 13,
+    "used_median": 21,
+    "used_p90": 105,
+    "ratio_to_uniform_mean": 0.31333,
+    "ratio_to_uniform_p10": 0.091321,
+    "ratio_to_uniform_p90": 0.712397,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 142.54372,
+    "used_p10": 39,
+    "used_median": 155,
+    "used_p90": 176,
+    "ratio_to_uniform_mean": 0.374024,
+    "ratio_to_uniform_p10": 0.101562,
+    "ratio_to_uniform_p90": 0.463542,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 19,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 50.532743,
+    "used_p10": 20,
+    "used_median": 33,
+    "used_p90": 110,
+    "ratio_to_uniform_mean": 0.351146,
+    "ratio_to_uniform_p10": 0.140493,
+    "ratio_to_uniform_p90": 0.74632,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 188.040541,
+    "used_p10": 59,
+    "used_median": 206,
+    "used_p90": 233,
+    "ratio_to_uniform_mean": 0.492454,
+    "ratio_to_uniform_p10": 0.15625,
+    "ratio_to_uniform_p90": 0.606771,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 20,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 49.941593,
+    "used_p10": 17,
+    "used_median": 31,
+    "used_p90": 106,
+    "ratio_to_uniform_mean": 0.346185,
+    "ratio_to_uniform_p10": 0.119419,
+    "ratio_to_uniform_p90": 0.719181,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 201.763116,
+    "used_p10": 55,
+    "used_median": 225,
+    "used_p90": 257,
+    "ratio_to_uniform_mean": 0.527853,
+    "ratio_to_uniform_p10": 0.143229,
+    "ratio_to_uniform_p90": 0.669271,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 21,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 53.049558,
+    "used_p10": 24,
+    "used_median": 36,
+    "used_p90": 106,
+    "ratio_to_uniform_mean": 0.368404,
+    "ratio_to_uniform_p10": 0.173113,
+    "ratio_to_uniform_p90": 0.719181,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 218.774245,
+    "used_p10": 84,
+    "used_median": 244,
+    "used_p90": 264,
+    "ratio_to_uniform_mean": 0.572295,
+    "ratio_to_uniform_p10": 0.21875,
+    "ratio_to_uniform_p90": 0.6875,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 22,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 59.884956,
+    "used_p10": 32,
+    "used_median": 44,
+    "used_p90": 110,
+    "ratio_to_uniform_mean": 0.41613,
+    "ratio_to_uniform_p10": 0.224789,
+    "ratio_to_uniform_p90": 0.74632,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 229.658983,
+    "used_p10": 82,
+    "used_median": 251,
+    "used_p90": 281,
+    "ratio_to_uniform_mean": 0.600729,
+    "ratio_to_uniform_p10": 0.213542,
+    "ratio_to_uniform_p90": 0.731771,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 23,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 55.187611,
+    "used_p10": 28,
+    "used_median": 42,
+    "used_p90": 103,
+    "ratio_to_uniform_mean": 0.38389,
+    "ratio_to_uniform_p10": 0.203715,
+    "ratio_to_uniform_p90": 0.698827,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 201.399841,
+    "used_p10": 87,
+    "used_median": 220,
+    "used_p90": 246,
+    "ratio_to_uniform_mean": 0.52722,
+    "ratio_to_uniform_p10": 0.226562,
+    "ratio_to_uniform_p90": 0.640625,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 24,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 50.669027,
+    "used_p10": 34,
+    "used_median": 41,
+    "used_p90": 96,
+    "ratio_to_uniform_mean": 0.352367,
+    "ratio_to_uniform_p10": 0.238839,
+    "ratio_to_uniform_p90": 0.651334,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 162.647059,
+    "used_p10": 67,
+    "used_median": 177,
+    "used_p90": 197,
+    "ratio_to_uniform_mean": 0.425545,
+    "ratio_to_uniform_p10": 0.174479,
+    "ratio_to_uniform_p90": 0.513021,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 25,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 58.8,
+    "used_p10": 38,
+    "used_median": 50,
+    "used_p90": 103,
+    "ratio_to_uniform_mean": 0.408865,
+    "ratio_to_uniform_p10": 0.266937,
+    "ratio_to_uniform_p90": 0.698827,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 217.899841,
+    "used_p10": 79,
+    "used_median": 241,
+    "used_p90": 263,
+    "ratio_to_uniform_mean": 0.569895,
+    "ratio_to_uniform_p10": 0.210938,
+    "ratio_to_uniform_p90": 0.684896,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 26,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 55.876106,
+    "used_p10": 28,
+    "used_median": 42,
+    "used_p90": 103,
+    "ratio_to_uniform_mean": 0.387481,
+    "ratio_to_uniform_p10": 0.196691,
+    "ratio_to_uniform_p90": 0.698827,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 222.747218,
+    "used_p10": 81,
+    "used_median": 241,
+    "used_p90": 283,
+    "ratio_to_uniform_mean": 0.58251,
+    "ratio_to_uniform_p10": 0.210938,
+    "ratio_to_uniform_p90": 0.736979,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 27,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 54.277876,
+    "used_p10": 28,
+    "used_median": 40,
+    "used_p90": 98,
+    "ratio_to_uniform_mean": 0.376616,
+    "ratio_to_uniform_p10": 0.196691,
+    "ratio_to_uniform_p90": 0.664904,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 212.863275,
+    "used_p10": 59,
+    "used_median": 233,
+    "used_p90": 267,
+    "ratio_to_uniform_mean": 0.556534,
+    "ratio_to_uniform_p10": 0.153646,
+    "ratio_to_uniform_p90": 0.695312,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 28,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 49.667257,
+    "used_p10": 16,
+    "used_median": 29,
+    "used_p90": 106,
+    "ratio_to_uniform_mean": 0.344825,
+    "ratio_to_uniform_p10": 0.112395,
+    "ratio_to_uniform_p90": 0.719181,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 218.8593,
+    "used_p10": 51,
+    "used_median": 245,
+    "used_p90": 268,
+    "ratio_to_uniform_mean": 0.572539,
+    "ratio_to_uniform_p10": 0.132812,
+    "ratio_to_uniform_p90": 0.697917,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 29,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 49.745133,
+    "used_p10": 23,
+    "used_median": 34,
+    "used_p90": 98,
+    "ratio_to_uniform_mean": 0.345935,
+    "ratio_to_uniform_p10": 0.161567,
+    "ratio_to_uniform_p90": 0.664904,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 209.559618,
+    "used_p10": 47,
+    "used_median": 229,
+    "used_p90": 259,
+    "ratio_to_uniform_mean": 0.548421,
+    "ratio_to_uniform_p10": 0.122396,
+    "ratio_to_uniform_p90": 0.674479,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 30,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 38.39292,
+    "used_p10": 17,
+    "used_median": 25,
+    "used_p90": 78,
+    "ratio_to_uniform_mean": 0.266955,
+    "ratio_to_uniform_p10": 0.119419,
+    "ratio_to_uniform_p90": 0.529209,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 154.605723,
+    "used_p10": 35,
+    "used_median": 169,
+    "used_p90": 193,
+    "ratio_to_uniform_mean": 0.404383,
+    "ratio_to_uniform_p10": 0.09375,
+    "ratio_to_uniform_p90": 0.502604,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 31,
+   "launch_share_of_all": 0.020840955,
+   "decode": {
+    "records": 565,
+    "used_mean": 49.438938,
+    "used_p10": 20,
+    "used_median": 31,
+    "used_p90": 104,
+    "ratio_to_uniform_mean": 0.343176,
+    "ratio_to_uniform_p10": 0.140493,
+    "ratio_to_uniform_p90": 0.705612,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1258,
+    "used_mean": 227.564388,
+    "used_p10": 67,
+    "used_median": 244,
+    "used_p90": 289,
+    "ratio_to_uniform_mean": 0.594932,
+    "ratio_to_uniform_p10": 0.174479,
+    "ratio_to_uniform_p90": 0.752604,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1823
+   }
+  },
+  {
+   "layer": 32,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 50.915044,
+    "used_p10": 19,
+    "used_median": 35,
+    "used_p90": 103,
+    "ratio_to_uniform_mean": 0.353888,
+    "ratio_to_uniform_p10": 0.133469,
+    "ratio_to_uniform_p90": 0.698827,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 229.257962,
+    "used_p10": 62,
+    "used_median": 256,
+    "used_p90": 283,
+    "ratio_to_uniform_mean": 0.599637,
+    "ratio_to_uniform_p10": 0.164062,
+    "ratio_to_uniform_p90": 0.736979,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 33,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 51.19823,
+    "used_p10": 21,
+    "used_median": 36,
+    "used_p90": 100,
+    "ratio_to_uniform_mean": 0.355752,
+    "ratio_to_uniform_p10": 0.147518,
+    "ratio_to_uniform_p90": 0.678473,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 232.281051,
+    "used_p10": 62,
+    "used_median": 258,
+    "used_p90": 290,
+    "ratio_to_uniform_mean": 0.607636,
+    "ratio_to_uniform_p10": 0.161458,
+    "ratio_to_uniform_p90": 0.755208,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 34,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 47.695575,
+    "used_p10": 19,
+    "used_median": 33,
+    "used_p90": 96,
+    "ratio_to_uniform_mean": 0.332423,
+    "ratio_to_uniform_p10": 0.133469,
+    "ratio_to_uniform_p90": 0.653219,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 208.047771,
+    "used_p10": 54,
+    "used_median": 226,
+    "used_p90": 261,
+    "ratio_to_uniform_mean": 0.544461,
+    "ratio_to_uniform_p10": 0.140625,
+    "ratio_to_uniform_p90": 0.679688,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 35,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 50.762832,
+    "used_p10": 22,
+    "used_median": 35,
+    "used_p90": 99,
+    "ratio_to_uniform_mean": 0.353972,
+    "ratio_to_uniform_p10": 0.154543,
+    "ratio_to_uniform_p90": 0.678473,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 207.15207,
+    "used_p10": 41,
+    "used_median": 233,
+    "used_p90": 254,
+    "ratio_to_uniform_mean": 0.542186,
+    "ratio_to_uniform_p10": 0.106771,
+    "ratio_to_uniform_p90": 0.661458,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 36,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 44.449558,
+    "used_p10": 20,
+    "used_median": 28,
+    "used_p90": 95,
+    "ratio_to_uniform_mean": 0.308966,
+    "ratio_to_uniform_p10": 0.140493,
+    "ratio_to_uniform_p90": 0.644549,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 168.289013,
+    "used_p10": 47,
+    "used_median": 180,
+    "used_p90": 210,
+    "ratio_to_uniform_mean": 0.440131,
+    "ratio_to_uniform_p10": 0.125,
+    "ratio_to_uniform_p90": 0.546875,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 37,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 47.299115,
+    "used_p10": 22,
+    "used_median": 29,
+    "used_p90": 100,
+    "ratio_to_uniform_mean": 0.3298,
+    "ratio_to_uniform_p10": 0.154543,
+    "ratio_to_uniform_p90": 0.678473,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 213.222134,
+    "used_p10": 69,
+    "used_median": 221,
+    "used_p90": 280,
+    "ratio_to_uniform_mean": 0.55792,
+    "ratio_to_uniform_p10": 0.179688,
+    "ratio_to_uniform_p90": 0.729167,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 38,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 49.541593,
+    "used_p10": 20,
+    "used_median": 31,
+    "used_p90": 103,
+    "ratio_to_uniform_mean": 0.344817,
+    "ratio_to_uniform_p10": 0.140493,
+    "ratio_to_uniform_p90": 0.698827,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 233.29379,
+    "used_p10": 78,
+    "used_median": 249,
+    "used_p90": 289,
+    "ratio_to_uniform_mean": 0.610304,
+    "ratio_to_uniform_p10": 0.203125,
+    "ratio_to_uniform_p90": 0.752604,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 39,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 52.911504,
+    "used_p10": 26,
+    "used_median": 38,
+    "used_p90": 105,
+    "ratio_to_uniform_mean": 0.368738,
+    "ratio_to_uniform_p10": 0.182641,
+    "ratio_to_uniform_p90": 0.712397,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 235.228503,
+    "used_p10": 93,
+    "used_median": 249,
+    "used_p90": 298,
+    "ratio_to_uniform_mean": 0.615191,
+    "ratio_to_uniform_p10": 0.244792,
+    "ratio_to_uniform_p90": 0.776042,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 40,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 49.265487,
+    "used_p10": 23,
+    "used_median": 32,
+    "used_p90": 99,
+    "ratio_to_uniform_mean": 0.342961,
+    "ratio_to_uniform_p10": 0.161567,
+    "ratio_to_uniform_p90": 0.671688,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 218.281051,
+    "used_p10": 61,
+    "used_median": 233,
+    "used_p90": 279,
+    "ratio_to_uniform_mean": 0.570907,
+    "ratio_to_uniform_p10": 0.158854,
+    "ratio_to_uniform_p90": 0.726563,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 41,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 51.656637,
+    "used_p10": 25,
+    "used_median": 34,
+    "used_p90": 99,
+    "ratio_to_uniform_mean": 0.359889,
+    "ratio_to_uniform_p10": 0.175617,
+    "ratio_to_uniform_p90": 0.671688,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 224.158439,
+    "used_p10": 57,
+    "used_median": 241,
+    "used_p90": 281,
+    "ratio_to_uniform_mean": 0.586641,
+    "ratio_to_uniform_p10": 0.148438,
+    "ratio_to_uniform_p90": 0.731771,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 42,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 50.743363,
+    "used_p10": 29,
+    "used_median": 38,
+    "used_p90": 98,
+    "ratio_to_uniform_mean": 0.352171,
+    "ratio_to_uniform_p10": 0.203715,
+    "ratio_to_uniform_p90": 0.664904,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 172.850318,
+    "used_p10": 45,
+    "used_median": 186,
+    "used_p90": 215,
+    "ratio_to_uniform_mean": 0.451936,
+    "ratio_to_uniform_p10": 0.117188,
+    "ratio_to_uniform_p90": 0.559896,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 43,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 53.953982,
+    "used_p10": 32,
+    "used_median": 42,
+    "used_p90": 101,
+    "ratio_to_uniform_mean": 0.375939,
+    "ratio_to_uniform_p10": 0.224789,
+    "ratio_to_uniform_p90": 0.685258,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 176.765127,
+    "used_p10": 86,
+    "used_median": 182,
+    "used_p90": 226,
+    "ratio_to_uniform_mean": 0.46322,
+    "ratio_to_uniform_p10": 0.226562,
+    "ratio_to_uniform_p90": 0.588542,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 44,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 49.676106,
+    "used_p10": 26,
+    "used_median": 34,
+    "used_p90": 101,
+    "ratio_to_uniform_mean": 0.345959,
+    "ratio_to_uniform_p10": 0.182641,
+    "ratio_to_uniform_p90": 0.685258,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 152.943471,
+    "used_p10": 69,
+    "used_median": 160,
+    "used_p90": 190,
+    "ratio_to_uniform_mean": 0.40111,
+    "ratio_to_uniform_p10": 0.179688,
+    "ratio_to_uniform_p90": 0.5,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 45,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 45.817699,
+    "used_p10": 20,
+    "used_median": 31,
+    "used_p90": 99,
+    "ratio_to_uniform_mean": 0.319139,
+    "ratio_to_uniform_p10": 0.140493,
+    "ratio_to_uniform_p90": 0.671688,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 156.972134,
+    "used_p10": 39,
+    "used_median": 174,
+    "used_p90": 193,
+    "ratio_to_uniform_mean": 0.411438,
+    "ratio_to_uniform_p10": 0.101562,
+    "ratio_to_uniform_p90": 0.502604,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 46,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 44.279646,
+    "used_p10": 23,
+    "used_median": 31,
+    "used_p90": 88,
+    "ratio_to_uniform_mean": 0.309206,
+    "ratio_to_uniform_p10": 0.161567,
+    "ratio_to_uniform_p90": 0.597056,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 135.261146,
+    "used_p10": 45,
+    "used_median": 150,
+    "used_p90": 165,
+    "ratio_to_uniform_mean": 0.354875,
+    "ratio_to_uniform_p10": 0.117188,
+    "ratio_to_uniform_p90": 0.432292,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  },
+  {
+   "layer": 47,
+   "launch_share_of_all": 0.02081809,
+   "decode": {
+    "records": 565,
+    "used_mean": 42.838938,
+    "used_p10": 19,
+    "used_median": 25,
+    "used_p90": 85,
+    "ratio_to_uniform_mean": 0.298802,
+    "ratio_to_uniform_p10": 0.133469,
+    "ratio_to_uniform_p90": 0.583487,
+    "uniform_expected_at_mean_cols": 142.355521,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "prefill": {
+    "records": 1256,
+    "used_mean": 129.951433,
+    "used_p10": 23,
+    "used_median": 147,
+    "used_p90": 166,
+    "ratio_to_uniform_mean": 0.341152,
+    "ratio_to_uniform_p10": 0.059896,
+    "ratio_to_uniform_p90": 0.434896,
+    "uniform_expected_at_mean_cols": 384.0,
+    "per_expert_hit_counts": null,
+    "top_k_shares": null,
+    "hhi": null,
+    "absent_because": "stored MMQ_ROUTE records are per-launch aggregates (cols/used); no expert identities exist on disk"
+   },
+   "all": {
+    "records": 1821
+   }
+  }
+ ],
+ "record_format_note": "Each stored record also carries tiles8=sum_e ceil(h_e/8), tiles=sum_e ceil(h_e/J) and the launch tile width j; on decode rows j=8 so those collapse. They are additional aggregates of the same hidden per-expert hit vector {h_e} that no store records directly, kept here as provenance only.",
+ "phase_caveat": "'decode'/'prefill' are batch-shape labels (cols vs PHASE_BOUNDARY), not serving-phase truths: a small prefill tail chunk can land in the small-batch bucket, and each window's ring kept only its first evals, whose phase mix differs by window. Compare by_batch_size rows before reading any pooled phase number.",
+ "depth_gap": {
+  "recorded": true,
+  "text": "Records carry (eval, site, cols, used) only; no context-position or prompt-depth metadata survives in any store, and each device context's record ring kept only its FIRST evals (capacity 65536/ctx, see stores[].end_notes ran/kept). Which phase those early evals belong to differs by window, so a shallow vs deep split is NOT derivable from disk today and is not extrapolated."
+ }
+}

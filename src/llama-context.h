@@ -158,12 +158,15 @@ struct llama_context {
     bool set_embeddings_nextn_dev(bool value);
     bool get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out);
     bool set_h_nextn_rows(int64_t row0, int64_t n_rows, const float * data);
+    bool copy_h_nextn_rows(int64_t src_row, int64_t dst_row, int64_t n_rows);
 
     // state rows read from the h_nextn device buffer of ctx_src, see llama_set_ctx_state_src()
     bool set_ctx_state_src(llama_context * ctx_src);
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_loop_passes(int32_t passes);
+    // a saved state carries cells laid out for the count it ran under; refuse one that restores into another
+    void check_state_loop_count() const;
     bool mtp_draft_step(int32_t step);
     bool set_mtp_graph_reuse(int32_t n_max);
     void set_causal_attn(bool value);
@@ -347,6 +350,8 @@ public:
     void set_output_candidates(int32_t k);
     void set_seq_candidates(llama_seq_id seq_id, bool enable);
     bool set_seq_greedy_candidates(llama_seq_id seq_id);
+    bool set_seq_temp_sample(llama_seq_id seq_id, float temp, uint32_t seed);
+    void set_seq_sample_seed(llama_seq_id seq_id, uint32_t seed);
 
     // the MTP store (llama-ext.h): this context is the target, head its MTP head
     bool    nextn_bind(llama_context & head, int32_t n_keep);
@@ -505,7 +510,8 @@ private:
     // output rows as their largest logits (llama_set_output_candidates): a decode reads the records
     // ggml_top_k_candidates packed for a row, and the row's first reader cuts them to the k largest
     struct candidates_info {
-        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_DRAFT_RECORDS, ROW_GREEDY_RECORDS, ROW_CUT };
+        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_DRAFT_RECORDS, ROW_GREEDY_RECORDS, ROW_SAMPLE_RECORDS, ROW_CUT, ROW_CUT_SAMPLE };
+        enum seq_mode : uint8_t { SEQ_TOP_K, SEQ_GREEDY, SEQ_TEMP_SAMPLE };
 
         buffer_view<int64_t>     records = {nullptr, 0}; // [n_outputs][n_record]
         buffer_view<float>       logits  = {nullptr, 0}; // [n_outputs][k], the largest first
@@ -519,7 +525,8 @@ private:
 
         std::vector<uint64_t> keys; // scratch of a cut
 
-        std::map<llama_seq_id, bool> seqs; // true for strict greedy, false for ordinary top-k
+        std::map<llama_seq_id, seq_mode>            seqs;
+        std::map<llama_seq_id, llm_cand_draw_entry> draw;
     };
 
     candidates_info cand;

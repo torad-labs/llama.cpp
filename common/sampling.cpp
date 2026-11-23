@@ -354,6 +354,7 @@ struct common_sampler {
     // that only lower logits, their window too (sampler_top_k_first)
     int32_t n_candidates = 0;
     int32_t n_greedy_candidates = 0;
+    float   pure_temp = 0.0f;
 
     // common_sampler_sample_coupled's copy of the chain, the tokens a drafter proposed that the copy has accepted since
     // it was made, whether it has drawn since the last of them, and the drafter's candidates. An accept, a reset or a
@@ -796,6 +797,9 @@ struct common_sampler * common_sampler_init(
     if (params.n_probs == 0 && params.top_k <= 0 && params.temp == 0.0f) {
         result->n_greedy_candidates = llama_sampler_chain_greedy_candidates(chain);
     }
+    if (params.n_probs == 0 && !params.coupled && !sampler_coupled()) {
+        result->pure_temp = llama_sampler_chain_pure_temp(chain);
+    }
 
     // a lazy grammar waiting for its trigger and a reasoning budget that is not forcing leave every logit as it is,
     // so while both stay so a backend-sampled token is the one the CPU chain would draw (common_sampler_backend_passive);
@@ -861,6 +865,14 @@ int32_t common_sampler_n_candidates(const struct common_sampler * gsmpl) {
 
 int32_t common_sampler_n_greedy_candidates(const struct common_sampler * gsmpl) {
     return gsmpl && !top_k_prefilter_legacy() ? gsmpl->n_greedy_candidates : 0;
+}
+
+float common_sampler_pure_temp(const struct common_sampler * gsmpl) {
+    return gsmpl && !top_k_prefilter_legacy() ? gsmpl->pure_temp : 0.0f;
+}
+
+uint32_t common_sampler_next_seed(struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->rng() : 0u;
 }
 
 bool common_output_candidates_legacy() {
@@ -940,6 +952,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     result->top_k_first  = gsmpl->top_k_first;
     result->n_candidates = gsmpl->n_candidates;
     result->n_greedy_candidates = gsmpl->n_greedy_candidates;
+    result->pure_temp    = gsmpl->pure_temp;
     return result;
 }
 
@@ -959,6 +972,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->top_k_first  = src->top_k_first;
     dst->n_candidates = src->n_candidates;
     dst->n_greedy_candidates = src->n_greedy_candidates;
+    dst->pure_temp    = src->pure_temp;
     dst->prev         = src->prev;
     dst->cur          = src->cur;
     dst->cur_p        = src->cur_p;

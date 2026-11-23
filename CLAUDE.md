@@ -25,6 +25,21 @@ Open work lives in `.campaign/ledger.toml`. Run `campaign help` for the verbs.
   items builds them and ends; it never commits, closes an item or reviews it.
 <!-- campaign:end -->
 
+## Changing shared code (Marcos, 2026-11-22)
+
+The goal is throughput and better engine management, not upstream compatibility. llama.cpp keeps its decode
+paths generic so every model and backend fits; this fork does not owe that.
+
+- Change anything the work needs: drop compatibility machinery, restructure how decode and the engine are run,
+  and write code made specifically for Inkling 2 Small where that makes it serve better.
+- The primary serving target is Inkling 2 Small. Inkling 2 Mini is served too and has its own lane; a kernel
+  or path shared by both architectures serves both, and the row note says which targets a change serves.
+- Two limits: GLM 5.3 serving must keep working, and other models must not be completely wrecked.
+- Prefer a model-specific path or a `..._LEGACY` switch when the shared version would hurt another served
+  model; when the change helps everyone and GLM stays green, land it shared without ceremony. Bit-identical
+  is the strongest proof when it comes for free, but a measured divergence is allowed when it is worth it.
+- Say what you changed, and the measurement behind it, in the commit message or row note.
+
 ## Boxes and GPUs (Marcos, 2026-11-22)
 
 - All builds, tests and dev runs go to the rented CloudRift box(s) with the RTX 5090s (`on-box`, ssh host

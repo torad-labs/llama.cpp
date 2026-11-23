@@ -568,6 +568,7 @@ struct glu_siglu_fn {
 
 template <typename T, typename F>
 static __global__ void glu_fn_kernel(const T * gate, const T * up, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, F fn) {
+    ggml_cuda_pdl_sync();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
     if (i >= k) {
         return;
@@ -590,8 +591,9 @@ static void glu_fn_cuda(const ggml_tensor * dst, const int64_t nc, F fn, cudaStr
     }
     const int64_t k = ggml_nelements(dst);
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
-    glu_fn_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(gate, up, (T *) dst->data, k, nc,
-        src0->nb[1] / sizeof(T), (src1 ? src1->nb[1] : src0->nb[1]) / sizeof(T), fn);
+    // PDL: the launch latency hides under the mat-vecs' tails; the kernel waits before reading.
+    ggml_cuda_kernel_launch(glu_fn_kernel<T, F>, {dim3(num_blocks), dim3(CUDA_GLU_BLOCK_SIZE), 0, stream}, gate, up,
+        (T *) dst->data, k, nc, src0->nb[1] / sizeof(T), (src1 ? src1->nb[1] : src0->nb[1]) / sizeof(T), fn);
 }
 
 template <typename F>

@@ -4477,6 +4477,43 @@ int32_t llama_sampler_chain_greedy_candidates(const struct llama_sampler * chain
     return greedy ? count : 0;
 }
 
+float llama_sampler_chain_pure_temp(const struct llama_sampler * chain) {
+    if (!chain || chain->iface != &llama_sampler_chain_i) {
+        return 0.0f;
+    }
+    const auto * p = static_cast<const llama_sampler_chain *>(chain->ctx);
+    if (p->is_init) {
+        return 0.0f;
+    }
+    bool has_temp = false, has_dist = false;
+    float temp = 1.0f;
+    for (const auto & s : p->samplers) {
+        const auto * iface = s.ptr->iface;
+        if (has_dist) {
+            return 0.0f;
+        }
+        if (iface == &llama_sampler_empty_i) {
+            continue;
+        }
+        if (!has_temp && iface == &llama_sampler_temp_i) {
+            temp     = static_cast<const llama_sampler_temp *>(s.ptr->ctx)->temp;
+            has_temp = true;
+        } else if (!has_temp && iface == &llama_sampler_temp_ext_i) {
+            const auto * t = static_cast<const llama_sampler_temp_ext *>(s.ptr->ctx);
+            if (t->delta > 0.0f) {
+                return 0.0f;
+            }
+            temp     = t->temp;
+            has_temp = true;
+        } else if (iface == &llama_sampler_dist_i && !static_cast<const llama_sampler_dist *>(s.ptr->ctx)->coupled) {
+            has_dist = true;
+        } else {
+            return 0.0f;
+        }
+    }
+    return (has_dist && temp >= 1e-3f && temp <= 1e3f && std::isfinite(temp)) ? temp : 0.0f;
+}
+
 // one-pass draws
 
 #ifdef LLAMA_SAMPLER_ROW_VEC

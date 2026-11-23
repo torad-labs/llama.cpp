@@ -10,16 +10,15 @@ format is still the KL capture against F16: these numbers only say which candida
 USAGE (the four-card box, the real model; about 16K to 32K tokens a state)
 -------------------------------------------------------------------------
 1. Serve with --slot-save-path, one slot, F16 caches, flash attention on. This is the tensor-4 launch with the pool
-   cut to one session (a quantized cache is rotated on store, and this script refuses it):
+   cut to one session. States saved from quantized caches parse too: rows of q4_0 or q8_0 decode on read into the
+   stored (rotated) domain the kernel sees, so statistics and format simulations run on deployed values rather than
+   F16 stand-ins, and the reader reports the header's rotation-on-store (n_rot_k 128 for K, n_rot_v 64 for V):
 
      mkdir -p /tmp/kvstates
      python3 scripts/inkling2/serve.py --profile tensor-4 --packs /srv/models/inkling-2-small-abliterated-q3km \\
          --server "$PWD/build/bin/llama-server" --no-draft --text-only --slots 1 --context 49152 \\
          --slot-context 40960 --cache-ram 0 --slot-save-path /tmp/kvstates --port 8103 &
      until curl -sf localhost:8103/health; do sleep 5; done
-
-   Without serve.py: llama-server -m MODEL -ngl 99 -sm tensor -fa on --cache-type-k f16 --cache-type-v f16 -c 49152
-   -np 1 --slot-save-path /tmp/kvstates (the directory must exist).
 
 2. Put one prompt of about 24K tokens in slot 0, then save the slot. K and V are about 32 KiB a token (8 layers x K
    and V x 2 KiB), so 24K tokens is 0.8 GiB of the file (it is larger by the window cache, 160 MiB, and the context
@@ -99,6 +98,26 @@ STATE_MAGIC = 0x67677371  # 'ggsq'
 STATE_VERSION = 4
 TOKEN_NULL = 0xFFFFFFFF
 TYPES = {0: ("f32", 4), 1: ("f16", 2), 30: ("bf16", 2)}
+# Quantized rows decode to f32 on read, in the stored (rotated) domain the kernel sees: per-block scale first,
+# then the values of one ggml block. GGML_CUDA_FATTN_REL_DECODE_* reads exactly these bytes on device.
+QUANT_TYPES = {8: ("q4_0", 18, 32), 13: ("q8_0", 34, 32)}  # id -> (name, block bytes, values a block)
+
+
+def _dequant_q(buf, name):
+    """One flat layer's quantized rows as float32 [values], blocks of d + q."""
+    n_blocks = buf.size // (QUANT_TYPES[8 if name == "q4_0" else 13][1])
+    b = buf.reshape(n_blocks, QUANT_TYPES[8 if name == "q4_0" else 13][1])
+    d = b[:, :2].copy().view("<f2").astype(np.float32).reshape(-1)   # one f16 scale a block; copy before view:
+    # the column slice is strided, and numpy only reinterprets itemsize on contiguous memory
+    if name == "q8_0":
+        return (b[:, 2:].view(np.int8).astype(np.float32) * d[:, None]).reshape(-1)
+    lo = (b[:, 2:] & 0x0F).astype(np.float32)
+    hi = (b[:, 2:] >> 4).astype(np.float32)
+    q = np.empty((n_blocks, 32), np.float32)
+    q[:, :16] = lo    # ggml's canonical q4_0: byte j holds value j in its low nibble and value j+16 in its
+    q[:, 16:] = hi    # high nibble (quantize_row_q4_0_ref, ggml-quants.c; the CUDA store in cpy-utils.cuh,
+                      # and device readers in fattn-rel-decode.cuh, all agree)
+    return ((q - 8.0) * d[:, None]).reshape(-1)
 
 HEAD_DIM = 128
 FIRST_GLOBAL_LAYER = 5  # the global layers are 5, 11, ..., 47 in Small and 5, 11, 17, 23 in Mini
@@ -230,9 +249,12 @@ class KVState:
                              "records before it are not in the layout this script reads")
         if v_trans:
             raise StateError(f"{self.path}: V is stored transposed (no flash attention); serve with -fa on")
-        if self.n_rot_k or self.n_rot_v:
-            raise StateError(f"{self.path}: the cache is rotated on store (n_rot_k={self.n_rot_k}, n_rot_v={self.n_rot_v}, a "
-                             "quantized cache type): the values are not the model's K and V; serve with F16 caches")
+        # A state from a rotated cache (n_rot_k/n_rot_v nonzero: a quantized type rotates by Walsh-Hadamard on store) is
+        # read as-is, in its stored domain: the rotation is orthogonal and Q is multiplied by the same rotation at
+        # attention time, so dot products and per-block relative errors computed on the stored values are exactly what
+        # the kernel sees; block scales sit along storage order either way. An orthogonal transform keeps each vector's
+        # L2 norm, so the bounds the self-check tests stand here too. The header still carries n_rot_k/n_rot_v and
+        # info()/render_text report them.
         self.n_layer = n_layer
         self.off = {"K": [], "V": []}
         types = {"K": set(), "V": set()}
@@ -246,14 +268,25 @@ class KVState:
         if len(both) != 1:
             raise StateError(f"{self.path}: layers differ in type or row size ({sorted(both)}): not supported")
         t, row = both.pop()
-        if t not in TYPES:
-            raise StateError(f"{self.path}: cache type id {t} is not F32, F16 or BF16; serve with F16 caches")
-        self.type_name, elem = TYPES[t]
-        if row % (elem * head_dim):
-            raise StateError(f"{self.path}: row of {row} bytes is not a whole number of heads of {head_dim} {self.type_name}")
-        self.row_bytes = row
-        self.n_heads = row // (elem * head_dim)
-        self.head_dim = head_dim
+        if t in QUANT_TYPES:
+            name, blk, vpb = QUANT_TYPES[t]
+            vals = row // blk * vpb
+            if row % blk or head_dim % vpb or vals % head_dim:
+                raise StateError(f"{self.path}: row of {row} bytes is not whole {name} blocks of "
+                                 f"{blk} bytes covering whole heads of {head_dim}")
+            self.type_name, self.row_bytes = name, row
+            self.n_heads = vals // head_dim
+            self.head_dim = head_dim
+        elif t not in TYPES:
+            raise StateError(f"{self.path}: cache type id {t} is not one of f32/f16/bf16/q4_0/q8_0")
+        else:
+            self.type_name, elem = TYPES[t]
+            if row % (elem * head_dim):
+                raise StateError(f"{self.path}: row of {row} bytes is not a whole number of heads of {head_dim} {self.type_name}")
+            self.row_bytes = row
+            self.n_heads = row // (elem * head_dim)
+            self.head_dim = head_dim
+
 
     def read(self, kind, layer, c0, c1):
         """Cells c0..c1 (file order) of one layer as float32 [cells, heads, head_dim]."""
@@ -263,6 +296,8 @@ class KVState:
             f.seek(self.off[kind][layer] + c0 * self.row_bytes)
             if f.readinto(memoryview(buf)) != buf.size:
                 raise StateError(f"{self.path}: short read of {kind} layer {layer}")
+        if self.type_name in ("q4_0", "q8_0"):
+            return _dequant_q(buf, self.type_name).reshape(n, self.n_heads, self.head_dim)
         if self.type_name == "bf16":
             x = (buf.view("<u2").astype(np.uint32) << 16).view(np.float32)
         else:
@@ -381,6 +416,53 @@ def layer_label(cfg, li):
     if cfg.layer_ids:
         return cfg.layer_ids[li] if li < len(cfg.layer_ids) else None
     return FIRST_GLOBAL_LAYER + GLOBAL_LAYER_STEP * li
+
+
+def eff_dim_pass(state, chunk_cells=4096, log=None):
+    """Per-head effective dimensionality of K and V in the stored (rotated) domain, per global layer.
+
+    The participation ratio ED = (sum eigenvalues)^2 / sum(eigenvalue^2) of one head's Gram matrix answers the
+    truncating-basis question: an ED near the head size means energy is spread and a low-rank basis before store
+    saves nothing worth its error; a small ED means most components are noise a truncation could drop. Also
+    reports how many components carry 90/95/99 percent of the energy."""
+    d = state.head_dim
+    fracs = (0.90, 0.95, 0.99)
+
+    def one(kind, li):
+        heads = state.n_heads
+        gram = np.zeros((heads, d, d), np.float64)
+        for c0 in range(0, state.cell_count, chunk_cells):
+            x = state.read(kind, li, c0, min(c0 + chunk_cells, state.cell_count))
+            gram += np.einsum("nhd,nhe->hde", x.astype(np.float64), x.astype(np.float64))
+        ed, n_frac = [], [[None] * len(fracs) for _ in range(heads)]
+        for h in range(heads):
+            lam = np.linalg.eigvalsh(gram[h])[::-1]
+            lam = np.maximum(lam, 0.0)
+            total = lam.sum()
+            if total <= 0:
+                ed.append(float(d)); [nf.__setitem__(i, float(d)) for i, nf in enumerate(n_frac[h])]
+                continue
+            ed.append(float(total ** 2 / np.square(lam).sum()))
+            cum = np.cumsum(lam) / total
+            for fi, f in enumerate(fracs):
+                n_frac[h][fi] = int(np.searchsorted(cum, f - 1e-12) + 1)
+        row = {"ed_mean": float(np.mean(ed)), "ed_min": float(min(ed)), "ed_max": float(max(ed))}
+        for fi, f in enumerate(fracs):
+            allv = [n_frac[h][fi] for h in range(heads)]
+            row[f"n{int(f*100)}_mean"] = float(np.mean(allv))
+            row[f"n{int(f*100)}_max"] = int(max(allv))
+        return row
+
+    out = []
+    for li in range(state.n_layer):
+        entry = {}
+        for kind in ("K", "V"):
+            t0 = time.time()
+            entry[kind] = one(kind, li)
+            if log:
+                log(f"  eff-dim {kind} layer {li + 1}/{state.n_layer} {time.time() - t0:.1f}s")
+        out.append(entry)
+    return out
 
 
 def collect_stats(state, cfg, log=None):
@@ -688,6 +770,11 @@ def analyze(states, cfg, log=None):
             log(f"state {si + 1}/{len(states)}: {state.path}")
         stats = collect_stats(state, cfg, log)
         all_stats.append(stats)
+        if getattr(cfg, "eff_dim", False):
+            e = eff_dim_pass(state, chunk_cells=cfg.chunk_cells, log=log)
+            res["states"][si]["eff_dim"] = [{"index": li, "layer_id": layer_label(cfg, li),
+                                             "K": e[li]["K"], "V": e[li]["V"]}
+                                            for li in range(state.n_layer)]
         layers = []
         for li in range(state.n_layer):
             e = {"index": li, "layer_id": layer_label(cfg, li)}
@@ -880,6 +967,10 @@ def parse_args(argv=None):
     p.add_argument("--formats", type=lambda s: s.split(","), default=[f.name for f in FORMATS],
                    help="formats to simulate, comma separated (default: all of " + ",".join(f.name for f in FORMATS) + ")")
     p.add_argument("--no-sim", action="store_true", help="statistics only")
+    p.add_argument("--eff-dim", action="store_true",
+                   help="per-head effective dimensionality (participation ratio of the Gram spectrum in the stored "
+                        "domain) per global layer for K and V: settles whether a truncating basis before store beats "
+                        "a flat low-bit format on bytes or error")
     p.add_argument("-q", "--quiet", action="store_true", help="no progress lines")
     cfg = p.parse_args(argv)
     unknown = set(cfg.formats) - {f.name for f in FORMATS}

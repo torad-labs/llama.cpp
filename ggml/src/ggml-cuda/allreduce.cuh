@@ -52,11 +52,22 @@ bool ggml_cuda_ar_reduce_owned(
     const int64_t         * len,
     int64_t                 period);
 
+// Whether this reduction would run over the copy engines yet can still be
+// captured whole: GGML_CUDA_AR_COPY_ENGINE_CAPTURE=1 opts it in -- its copies,
+// add kernels and cross-card guards then run as graph nodes and mapped-counter
+// probes, and the two-back pacing between reductions becomes an edge inside the
+// step's graph (doc 17 B). GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY=1 reverts to
+// the old refusal, so the route keeps running as live host-sliced segments.
+bool ggml_cuda_ar_capturable_copy_engine(
+    const ggml_cuda_ar_pipeline * pipeline,
+    const ggml_tensor           * t);
+
 // Whether the AllReduce of a tensor like t (same preconditions) can be captured
-// into a CUDA graph and replayed: it runs on the chunked kernel, which takes its
-// tokens and slots from the device, and not over the copy engines, whose
-// events the host syncs on.
+// into a CUDA graph and replayed: the chunked kernel always, which takes its
+// tokens and slots from the device; the copy-engine route only when
+// ggml_cuda_ar_capturable_copy_engine admits it.
 bool ggml_cuda_ar_capturable(
     const ggml_cuda_ar_pipeline * pipeline,
     const ggml_tensor           * t);
+
 

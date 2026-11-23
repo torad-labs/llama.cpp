@@ -35,6 +35,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// ready_y: a q8_1 copy of src1 already on the stream, laid out as mmvq_src1_q8_1 would make it; no quantize launch runs
+void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion, const char * ready_y);
+
 // Whether the MUL_MAT_ID mm (the up projection) fuses its gate (the gate's weights) and GLU past one token, with no
 // scales: the routed-expert ring takes the fused launch (ggml_cuda_mmvq_moe_usable) and keeps the tokens' vectors in
 // shared memory beside it (ggml_cuda_mmvq_moe_keeps_y), which the unfused launches keep too.

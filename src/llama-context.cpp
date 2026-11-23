@@ -27,8 +27,11 @@
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+
+#include "ggml-ledger.h"
 
 //
 // llama_context
@@ -97,7 +100,22 @@ struct llama_decode_phase_timer {
     struct timespec    t0;
     bool               on;
 
-    llama_decode_phase_timer(llama_decode_phase p) : phase(p), on(llama_time_decode()) {
+    // the ledger's slot of a phase (ggml-ledger.h): every decode's phases, with no switch to set
+    static int ledger_slot(llama_decode_phase p) {
+        static const struct slots {
+            int of[LLAMA_DECODE_PHASE_COUNT];
+            slots() {
+                for (int i = 0; i < LLAMA_DECODE_PHASE_COUNT; i++) {
+                    of[i] = i == LLAMA_DECODE_PHASE_DECODE_TOTAL
+                        ? ggml_ledger_slot("decode.total")
+                        : ggml_ledger_slot_of("decode", llama_decode_phase_name((llama_decode_phase) i));
+                }
+            }
+        } s;
+        return s.of[p];
+    }
+
+    llama_decode_phase_timer(llama_decode_phase p) : phase(p), on(llama_time_decode() || ggml_ledger_on()) {
         if (on) {
             clock_gettime(CLOCK_MONOTONIC, &t0);
         }
@@ -116,6 +134,10 @@ struct llama_decode_phase_timer {
         struct timespec t1;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         const double us = (t1.tv_sec - t0.tv_sec)*1e6 + (t1.tv_nsec - t0.tv_nsec)/1e3;
+        ggml_ledger_add(ledger_slot(phase), (int64_t) us);
+        if (!llama_time_decode()) {
+            return;
+        }
         static double sum[LLAMA_DECODE_PHASE_COUNT] = {};
         static int    cnt[LLAMA_DECODE_PHASE_COUNT] = {};
         sum[phase] += us;
@@ -142,6 +164,37 @@ struct llama_decode_phase_timer {
         }
     }
 };
+
+// The ledger's memory by owner (ggml-ledger.h): what a context holds on each device for its model's weights, for its
+// own state (the KV cache and recurrent state) and for compute buffers, read on the decoding thread every five
+// seconds at most. Contexts are numbered in the order they first decode: a server's target first, then its draft.
+static void llama_ledger_memory(const llama_context * ctx) {
+    if (!ggml_ledger_on()) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<const llama_context *, std::pair<int, int64_t>> seen;
+    const int64_t now = ggml_time_us();
+    int id = 0;
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const auto it = seen.try_emplace(ctx, (int) seen.size(), now - 10'000'000).first;
+        // the first eight contexts of a process: a server has a target and a draft, and a process that makes
+        // contexts without end would otherwise fill the ledger with their names
+        if (it->second.first >= 8 || now - it->second.second < 5'000'000) {
+            return;
+        }
+        it->second.second = now;
+        id = it->second.first;
+    }
+    const std::string base = "mem.ctx" + std::to_string(id) + ".";
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        const char * name = ggml_backend_buft_name(buft);
+        ggml_ledger_set(ggml_ledger_slot_of((base + "model_mib").c_str(), name), (int64_t) (mb.model >> 20));
+        ggml_ledger_set(ggml_ledger_slot_of((base + "context_mib").c_str(), name), (int64_t) (mb.context >> 20));
+        ggml_ledger_set(ggml_ledger_slot_of((base + "compute_mib").c_str(), name), (int64_t) (mb.compute >> 20));
+    }
+}
 
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
@@ -1358,6 +1411,12 @@ void llama_context::sched_reserve() {
             }
         }
         nextn_mode = LLM_GRAPH_NEXTN_NONE;
+        if (llama_model_is_inkling_draft(model) && graph_slot_mtp_seq_tokens > 0) {
+            // DSpark feed (embd) and full-block draft shapes share the already-reserved main buffers.
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                slot_buf_size[i] = std::max(slot_buf_size[i], ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
+            }
+        }
     }
     graph_slot_buf_limit = slot_buf_size;
 
@@ -2091,9 +2150,11 @@ void llama_context::set_output_candidates(int32_t k) {
 
 void llama_context::set_seq_candidates(llama_seq_id seq_id, bool enable) {
     if (enable) {
-        cand.seqs[seq_id] = false;
+        cand.seqs[seq_id] = candidates_info::SEQ_TOP_K;
+        cand.draw.erase(seq_id);
     } else {
         cand.seqs.erase(seq_id);
+        cand.draw.erase(seq_id);
     }
 }
 
@@ -2103,8 +2164,28 @@ bool llama_context::set_seq_greedy_candidates(llama_seq_id seq_id) {
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || !(cap > 0.0f && std::isfinite(cap))) {
         return false;
     }
-    cand.seqs[seq_id] = true;
+    cand.seqs[seq_id] = candidates_info::SEQ_GREEDY;
+    cand.draw.erase(seq_id);
     return true;
+}
+
+bool llama_context::set_seq_temp_sample(llama_seq_id seq_id, float temp, uint32_t seed) {
+    static const bool legacy = ggml_env_switch("LLAMA_INKLING2_GPU_SAMPLE_LEGACY");
+    if (legacy || model.arch != LLM_ARCH_INKLING2 || cparams.n_logits_parts < 1 || cparams.embeddings ||
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || cparams.n_seq_devices > 1 ||
+            !(temp >= 1e-3f && temp <= 1e3f && std::isfinite(temp))) {
+        return false;
+    }
+    cand.seqs[seq_id] = candidates_info::SEQ_TEMP_SAMPLE;
+    cand.draw[seq_id] = { 1.0f / temp, seed };
+    return true;
+}
+
+void llama_context::set_seq_sample_seed(llama_seq_id seq_id, uint32_t seed) {
+    const auto it = cand.draw.find(seq_id);
+    if (it != cand.draw.end()) {
+        it->second.seed = seed;
+    }
 }
 
 bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
@@ -2128,9 +2209,10 @@ bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
     llama_token * ids_row    = cand.ids.data    + j*cand.k;
 
     if (cand.state[j] == candidates_info::ROW_RECORDS || cand.state[j] == candidates_info::ROW_DRAFT_RECORDS ||
-            cand.state[j] == candidates_info::ROW_GREEDY_RECORDS) {
-        const bool draft = cand.state[j] == candidates_info::ROW_DRAFT_RECORDS;
+            cand.state[j] == candidates_info::ROW_GREEDY_RECORDS || cand.state[j] == candidates_info::ROW_SAMPLE_RECORDS) {
+        const bool draft  = cand.state[j] == candidates_info::ROW_DRAFT_RECORDS;
         const bool greedy = cand.state[j] == candidates_info::ROW_GREEDY_RECORDS;
+        const bool sample = cand.state[j] == candidates_info::ROW_SAMPLE_RECORDS;
         // a record is a token id under its logit's bits. A key orders them as common_sampler_top_k_candidates orders a
         // whole row, by the logit and then the id: the logit's bits in the order of its value (-0 as +0, a NaN below every
         // number) over the id's complement
@@ -2168,9 +2250,10 @@ bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
             }
         }
 
-        if (keys.size() > cand.k) {
-            std::nth_element(keys.begin(), keys.begin() + cand.k, keys.end(), std::greater<uint64_t>());
-            keys.resize(cand.k);
+        const size_t keep = sample ? 1 : (size_t) cand.k;
+        if (keys.size() > keep) {
+            std::nth_element(keys.begin(), keys.begin() + keep, keys.end(), std::greater<uint64_t>());
+            keys.resize(keep);
         }
         std::sort(keys.begin(), keys.end(), std::greater<uint64_t>());
 
@@ -2182,13 +2265,16 @@ bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
         }
 
         cand.count[j] = (uint32_t) keys.size();
-        cand.state[j] = candidates_info::ROW_CUT;
+        cand.state[j] = sample ? candidates_info::ROW_CUT_SAMPLE : candidates_info::ROW_CUT;
     }
 
     row.sampled_logits   = logits_row;
     row.candidates       = ids_row;
     row.n_sampled_logits = cand.count[j];
     row.n_candidates     = cand.count[j];
+    if (cand.state[j] == candidates_info::ROW_CUT_SAMPLE && cand.count[j] > 0) {
+        row.token = ids_row[0];
+    }
 
     return true;
 }
@@ -2434,7 +2520,10 @@ bool llama_context::h_nextn_dev_alloc() {
     };
     ctx_h_nextn_dev.reset(ggml_init(params));
 
-    h_nextn_dev = ggml_new_tensor_2d(ctx_h_nextn_dev.get(), GGML_TYPE_F32, model.hparams.n_embd_out(), cparams.n_batch + cparams.n_seq_max);
+    const int64_t n_extra_rows = model.arch == LLM_ARCH_DFLASH
+            ? (int64_t) cparams.n_seq_max * (std::max<uint32_t>(1, model.hparams.dflash_block_size) + 1)
+            : (int64_t) cparams.n_seq_max;
+    h_nextn_dev = ggml_new_tensor_2d(ctx_h_nextn_dev.get(), GGML_TYPE_F32, model.hparams.n_embd_out(), cparams.n_batch + n_extra_rows);
     ggml_set_name(h_nextn_dev, "h_nextn_dev");
 
     buf_h_nextn_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_h_nextn_dev.get(), ggml_backend_dev_buffer_type(h_nextn_dev_dev)));
@@ -2490,11 +2579,30 @@ bool llama_context::set_h_nextn_rows(int64_t row0, int64_t n_rows, const float *
     if (h_nextn_dev == nullptr || row0 < 0 || n_rows < 0 || row0 + n_rows > h_nextn_dev->ne[1]) {
         return false;
     }
+    if (ev_h_nextn_written_recorded) {
+        ggml_backend_event_synchronize(ev_h_nextn_written.get());
+    }
     // a reader may still read these rows
     if (ev_h_nextn_read_recorded) {
         ggml_backend_event_synchronize(ev_h_nextn_read.get());
     }
     ggml_backend_tensor_set(h_nextn_dev, data, row0*h_nextn_dev->nb[1], n_rows*h_nextn_dev->nb[1]);
+    return true;
+}
+
+bool llama_context::copy_h_nextn_rows(int64_t src_row, int64_t dst_row, int64_t n_rows) {
+    if (h_nextn_dev == nullptr || src_row < 0 || dst_row < 0 || n_rows < 0 ||
+            src_row + n_rows > h_nextn_dev->ne[1] || dst_row + n_rows > h_nextn_dev->ne[1]) {
+        return false;
+    }
+    if (ev_h_nextn_read_recorded) {
+        ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
+    }
+    if (!ggml_backend_meta_copy_rows_async(h_nextn_backend, h_nextn_dev, h_nextn_dev, src_row, dst_row, n_rows)) {
+        return false;
+    }
+    ggml_backend_event_record(ev_h_nextn_written.get(), h_nextn_backend);
+    ev_h_nextn_written_recorded = true;
     return true;
 }
 
@@ -2507,8 +2615,8 @@ bool llama_context::set_ctx_state_src(llama_context * ctx_src) {
 }
 
 bool llama_context::supports_state_row() const {
-    // the MTP graphs read the rows, see llm_graph_context::build_inp_embd_state()
-    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+    // MTP and DSpark/DFlash graphs read state rows via llm_graph_context::build_inp_embd_state()
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.arch != LLM_ARCH_DFLASH) {
         return false;
     }
 
@@ -2721,6 +2829,12 @@ bool llama_context::graph_devices_low() const {
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    {
+        static const int slot_rows = ggml_ledger_slot("decode.ubatch.rows");
+        static const int slot_seqs = ggml_ledger_slot("decode.ubatch.seqs");
+        ggml_ledger_add(slot_rows, ubatch.n_tokens);
+        ggml_ledger_add(slot_seqs, ubatch.n_seqs_unq);
+    }
     // Keep each ubatch's rows before its graph storage can be reused.
     mtp_index_capture();
     {
@@ -3400,7 +3514,13 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    ggml_ledger_step();
+    llama_ledger_memory(this);
     llama_decode_phase_timer t_decode(LLAMA_DECODE_PHASE_DECODE_TOTAL);
+    {
+        static const int slot_rows = ggml_ledger_slot("decode.rows");
+        ggml_ledger_add(slot_rows, (int64_t) batch_inp.tokens.size());
+    }
     llama_outputs_pending_guard pending{outputs_pending};
 
     // An unconsumed selection from an earlier decode is not a draft step.
@@ -3676,10 +3796,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     ggml_backend_t  state_backend = nullptr;
     if (state_src) {
         state_backend = backend_from_dev(state_src->h_nextn_dev_dev);
-        if (state_src->ev_h_nextn_written_recorded) {
-            ggml_backend_event_synchronize(state_src->ev_h_nextn_written.get());
-        } else {
-            state_src->synchronize();
+        if (state_src != this) {
+            if (state_src->ev_h_nextn_written_recorded) {
+                ggml_backend_event_synchronize(state_src->ev_h_nextn_written.get());
+            } else {
+                state_src->synchronize();
+            }
         }
     }
     const bool write_h_nextn = cparams.embeddings_nextn_dev && h_nextn_dev != nullptr;
@@ -3766,16 +3888,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             rows_whole = false;
             rows_cand  = true;
-            const bool greedy = model.arch == LLM_ARCH_INKLING2 && !t_logits;
+            const bool compact_only = model.arch == LLM_ARCH_INKLING2 && !t_logits;
             uint32_t row = n_outputs_prev;
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 if (!ubatch.output[i]) {
                     continue;
                 }
                 const auto seq = cand.seqs.find(ubatch.seq_id[i][0]);
-                const bool as_cand = seq != cand.seqs.end() && seq->second == greedy;
+                const bool has_seq   = seq != cand.seqs.end();
+                const bool is_greedy = has_seq && seq->second == candidates_info::SEQ_GREEDY &&
+                    (compact_only || (model.arch == LLM_ARCH_INKLING2 && ubatch.n_seq_id[i] == 1));
+                const bool is_sample = has_seq && seq->second == candidates_info::SEQ_TEMP_SAMPLE &&
+                    (compact_only || (model.arch == LLM_ARCH_INKLING2 && ubatch.n_seq_id[i] == 1));
+                const bool as_cand = is_greedy || is_sample ||
+                    (has_seq && seq->second == candidates_info::SEQ_TOP_K && !compact_only);
                 cand.state[row++] = !as_cand ? candidates_info::ROW_WHOLE :
-                    greedy ? candidates_info::ROW_GREEDY_RECORDS :
+                    is_sample ? candidates_info::ROW_SAMPLE_RECORDS :
+                    is_greedy ? candidates_info::ROW_GREEDY_RECORDS :
                     res->t_logits_draft ? candidates_info::ROW_DRAFT_RECORDS : candidates_info::ROW_RECORDS;
                 rows_whole |= !as_cand;
             }
@@ -4679,18 +4808,25 @@ llm_graph_params llama_context::graph_params(
     }
     if (model.arch == LLM_ARCH_INKLING2 && cparams.n_out_candidates > 0 && sampling.samplers.empty() &&
             n_outputs > 0 && ubatch.output && ubatch.seq_id && ubatch.n_seq_id && !cand.seqs.empty()) {
-        bool all_greedy = true, any_top_k = false;
+        bool all_compact = true, any_greedy = false, any_sample = false, any_cand = false;
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             if (!ubatch.output[i]) {
                 continue;
             }
             const auto seq = cand.seqs.find(ubatch.seq_id[i][0]);
-            const bool eligible = seq != cand.seqs.end();
-            all_greedy &= ubatch.n_seq_id[i] == 1 && eligible && seq->second;
-            any_top_k  |= eligible && !seq->second;
+            const bool eligible  = seq != cand.seqs.end();
+            const bool is_greedy = ubatch.n_seq_id[i] == 1 && eligible && seq->second == candidates_info::SEQ_GREEDY;
+            const bool is_sample = ubatch.n_seq_id[i] == 1 && eligible && seq->second == candidates_info::SEQ_TEMP_SAMPLE;
+            all_compact &= (is_greedy || is_sample);
+            any_greedy  |= is_greedy;
+            any_sample  |= is_sample;
+            any_cand    |= eligible;
         }
-        params.candidates_only = all_greedy;
-        if (!all_greedy && !any_top_k) {
+        params.candidates_only      = all_compact;
+        params.candidates_first_nan = any_greedy;
+        params.candidates_sample    = any_sample;
+        params.cand_draw            = any_sample ? &cand.draw : nullptr;
+        if (!any_cand) {
             params.cparams.n_out_candidates = 0;
         }
         return params;
@@ -5649,6 +5785,18 @@ private:
     const llama_memory_buffers & mbufs;
 };
 
+void llama_context::check_state_loop_count() const {
+    if (model.arch != LLM_ARCH_INKLING2_LOOP) {
+        return;
+    }
+    const uint32_t own = model.loop_own_passes();
+    const uint32_t passes = loop_passes ? loop_passes : own;
+    if (passes != own) {
+        throw std::runtime_error(format("inkling2_loop: state save/load with %u loop passes refuses, its cells do not restore into another slot layout (the model's own count: %u)",
+                passes, own));
+    }
+}
+
 size_t llama_context::state_get_size() {
     llama_io_write_dummy io(false);
     try {
@@ -5897,6 +6045,8 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
+    check_state_loop_count();
+
     // the rows written are those a restore may still copy
     state_async_wait(-1);
 
@@ -5927,6 +6077,8 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    check_state_loop_count();
+
     // the cells replaced here are those a save or a restore may still copy
     state_async_wait(-1);
 
@@ -5956,6 +6108,8 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    check_state_loop_count();
+
     // the rows written are those a restore of the sequence may still copy
     state_async_wait(seq_id);
 
@@ -5972,6 +6126,8 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    check_state_loop_count();
+
     // the cells removed here are those a save or a restore of the sequence may still copy
     state_async_wait(seq_id);
 
@@ -6691,6 +6847,10 @@ bool llama_set_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t 
     return ctx->set_h_nextn_rows(row0, n_rows, data);
 }
 
+bool llama_copy_embeddings_nextn_rows(llama_context * ctx, int64_t src_row, int64_t dst_row, int64_t n_rows) {
+    return ctx->copy_h_nextn_rows(src_row, dst_row, n_rows);
+}
+
 bool llama_set_ctx_state_src(llama_context * ctx, llama_context * ctx_src) {
     return ctx->set_ctx_state_src(ctx_src);
 }
@@ -6758,9 +6918,11 @@ bool llama_mtp_draft_step(llama_context * ctx, int32_t step) {
 }
 
 bool llama_context::set_mtp_graph_reuse(int32_t n_max) {
-    // the MTP head's context and the target that verifies its drafts: a verify of every sequence's n_max drafts is
-    // past 32 rows from 11 sessions at n_max 2, and rebuilt whenever its row count changed
-    if (model.arch != LLM_ARCH_GLM5NEXT || model.hparams.n_layer_nextn != 1 || n_max < 0) { return false; }
+    // Allow retained graph slots for multi-token verify shapes on GLM5NEXT MTP and Inkling DSpark.
+    const bool allow = (model.arch == LLM_ARCH_GLM5NEXT && model.hparams.n_layer_nextn == 1) ||
+                       (model.arch == LLM_ARCH_INKLING2 && model.hparams.n_layer_nextn == 0 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ||
+                       llama_model_is_inkling_draft(model);
+    if (!allow || n_max < 0) { return false; }
     const uint32_t seq_tokens = n_max == 0 ? 0 : std::min<uint64_t>(uint64_t(n_max) + 1, cparams.n_ubatch);
     if (seq_tokens != graph_slot_mtp_seq_tokens) {
         graph_slot_mtp_seq_tokens = seq_tokens;
@@ -6854,6 +7016,14 @@ void llama_set_seq_candidates(llama_context * ctx, llama_seq_id seq_id, bool ena
 
 bool llama_set_seq_greedy_candidates(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->set_seq_greedy_candidates(seq_id);
+}
+
+bool llama_set_seq_temp_sample(llama_context * ctx, llama_seq_id seq_id, float temp, uint32_t seed) {
+    return ctx->set_seq_temp_sample(seq_id, temp, seed);
+}
+
+void llama_set_seq_sample_seed(llama_context * ctx, llama_seq_id seq_id, uint32_t seed) {
+    ctx->set_seq_sample_seed(seq_id, seed);
 }
 
 llama_sampling_row llama_get_sampling_row_ith(llama_context * ctx, int32_t i) {

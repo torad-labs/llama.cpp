@@ -1104,6 +1104,10 @@ public:
     // optional, runs after the scale pass
     virtual void post_arch_tensors(llama_model_loader &) {}
 
+    // The trained loop count whose cache-slot layout a saved state was written under; 0 when the arch has no loop
+    // layout. State save/load refuses a context running any other count.
+    virtual uint32_t loop_own_passes() const { return 0; }
+
 protected:
     llama_model_params params;
 

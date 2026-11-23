@@ -1171,14 +1171,22 @@ static __global__ void mul_mat_vec_q_group(const mmvq_group group, const void * 
 }
 
 // Sorts the routes of up to 32 tokens with 8 experts each (256 keys, one a thread) by expert.
+// Local routes (expert >= 0) come first; absent routes (-1) sort to the tail; routes[n_routes] stores n_local.
 static __global__ void mmvq_sort_routes(const int32_t * ids, uint32_t stride, uint32_t n_routes, int32_t * routes) {
     __shared__ uint32_t keys[256];
+    __shared__ uint32_t warp_cnt[8];
     const uint32_t i = threadIdx.x;
     const uint32_t slot = i % 8, token = i / 8;
     uint32_t key = UINT32_MAX;
+    bool local = false;
     if (i < n_routes) {
         const int expert = ids[token*stride + slot];
-        key = (uint32_t(max(expert, -1) + 1) << 8) | i;
+        local = expert >= 0;
+        key = local ? ((uint32_t(expert) << 8) | i) : ((0xFFFFu << 8) | i);
+    }
+    const uint32_t wmask = __ballot_sync(0xffffffffu, local);
+    if ((i & 31u) == 0) {
+        warp_cnt[i >> 5] = __popc(wmask);
     }
     for (uint32_t width = 2; width <= 256; width *= 2) {
         for (uint32_t distance = width/2; distance; distance /= 2) {
@@ -1197,6 +1205,14 @@ static __global__ void mmvq_sort_routes(const int32_t * ids, uint32_t stride, ui
     }
     if (i < n_routes) {
         routes[i] = int32_t(key);
+    }
+    if (i == 0) {
+        uint32_t n_local = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            n_local += warp_cnt[w];
+        }
+        routes[n_routes] = int32_t(n_local);
     }
 }
 
@@ -1273,10 +1289,16 @@ static __global__ void mul_mat_vec_q_moe(
     ggml_cuda_pdl_sync();
     uint32_t channel_x;
     if constexpr (sorted) {
-        const uint32_t route = ids[blockIdx.y*blockDim.y + threadIdx.y];
+        const uint32_t n_local = uint32_t(ids[ncols_dst*8]);
+        const uint32_t route_idx = blockIdx.y*blockDim.y + threadIdx.y;
+        if (blockIdx.y*blockDim.y >= n_local || route_idx >= n_local) {
+            ggml_cuda_pdl_lc();
+            return;
+        }
+        const uint32_t route = uint32_t(ids[route_idx]);
         token_idx   = (route & 255u) / 8;
         channel_dst = route % 8;
-        channel_x   = (route >> 8) - 1;
+        channel_x   = route >> 8;
     } else {
         channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     }
@@ -2118,9 +2140,9 @@ bool ggml_cuda_mul_mat_vec_q_moe_gate_fuses(const ggml_tensor * mm, const ggml_t
         ggml_cuda_mmvq_moe_keeps_y(src0->type, src0->ne[0], /*gate =*/ true, y_bytes);
 }
 
-void ggml_cuda_mul_mat_vec_q(
+static void ggml_cuda_mul_mat_vec_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const char * ready_y) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -2246,8 +2268,8 @@ void ggml_cuda_mul_mat_vec_q(
     static const bool ring_quantize_check = ggml_env_switch("GGML_CUDA_MMVQ_MOE_QUANTIZE_CHECK");
 
     ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
-    char * src1_q8_1 = ring_quantizes && !ring_quantize_check ? nullptr :
-        mmvq_src1_q8_1(ctx, src1, src0->type, src1_q8_1_own);
+    char * src1_q8_1 = ready_y ? const_cast<char *>(ready_y) :
+        (ring_quantizes && !ring_quantize_check ? nullptr : mmvq_src1_q8_1(ctx, src1, src0->type, src1_q8_1_own));
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -2280,15 +2302,16 @@ void ggml_cuda_mul_mat_vec_q(
         src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1;
     const bool inkling_rows = ne02 == 384 &&
         ((src0->type == GGML_TYPE_Q3_K && ne00 == 4608 && (ne01 == 1024 || ne01 == 1152 || ne01 == 1536)) ||
-         (src0->type == GGML_TYPE_Q4_K && (ne00 == 512 || ne00 == 768) && ne01 == 4608) ||
+         ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) && (ne00 == 512 || ne00 == 768) && ne01 == 4608) ||
          (down_32 && ne00 == 576 && ne01 == 4608));
     const bool inkling_experts = ne02 == 96 && ne01 == 4608 &&
-        ((src0->type == GGML_TYPE_Q3_K && ne00 == 4608) || (src0->type == GGML_TYPE_Q4_K && ne00 == 2304));
+        ((src0->type == GGML_TYPE_Q3_K && ne00 == 4608) ||
+         ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) && ne00 == 2304));
     // Adjacent warps read the same expert rows when their tokens share a route.
-    if (sort_experts && ids && !fusion && ncols_dst >= sort_rows_min && ncols_dst <= sort_rows_max && nchannels_dst == 8 &&
+    if (sort_experts && ids && !fusion && ncols_dst >= sort_rows_min && ncols_dst <= sort_rows_max && ncols_dst <= 32 && nchannels_dst == 8 &&
             ne03 == 1 && ne3 == 1 && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL &&
             (inkling_rows || inkling_experts)) {
-        ggml_cuda_pool_alloc<int32_t> routes(ctx.pool(), ncols_dst*8);
+        ggml_cuda_pool_alloc<int32_t> routes(ctx.pool(), ncols_dst*8 + 1);
         mmvq_sort_routes<<<1, 256, 0, stream>>>(ids_d, ids_stride, uint32_t(ncols_dst*8), routes.get());
         const dim3 grid(ne01/2, ncols_dst), block(32, 8);
         const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
@@ -2301,6 +2324,7 @@ void ggml_cuda_mul_mat_vec_q(
         switch (src0->type) {
             case GGML_TYPE_Q3_K:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q3_K>{});   break;
             case GGML_TYPE_Q4_K:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_K>{});   break;
+            case GGML_TYPE_Q5_K:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q5_K>{});   break;
             case GGML_TYPE_IQ4_NL: launch(std::integral_constant<ggml_type, GGML_TYPE_IQ4_NL>{}); break;
             case GGML_TYPE_Q4_0:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{});   break;
             case GGML_TYPE_Q4_1:   launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_1>{});   break;
@@ -2401,6 +2425,19 @@ void ggml_cuda_mul_mat_vec_q(
     run(dst_d, false);
     mmvq_q8_sm120_compare_launch(dst_d, ref.get(), ne01, ncols_dst, nchannels_dst, ne3, stride_col_dst, stride_channel_dst,
         s3, stream);
+}
+
+// completes the overload family mmvq.cuh declares for callers that pass fusion args (with or without an
+// on-stream q8_1 copy of src1)
+void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                             const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, fusion, /*ready_y =*/ nullptr);
+}
+
+void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                             const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion,
+                             const char * ready_y) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, fusion, ready_y);
 }
 
 int ggml_cuda_mul_mat_vec_q_pq2_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, const int n,

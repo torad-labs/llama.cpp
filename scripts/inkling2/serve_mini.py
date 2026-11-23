@@ -44,6 +44,15 @@ MAX_LOOP_PASSES = 64  # the range the knob registry (tunables.toml) declares for
 #     79.7 / 201.8; q4_0 V 80.5 / 204.5), and q4_0 holds 1.97 times the tokens in the same memory, which is the long context. f16 V was
 #     fastest there (93.5 / 222.9) at 516 MiB more (15,462 against 14,946). Sliding-window layers at f16 (first build only, np 4): pool
 #     131,072 against 167,936 (-22%), score 89.0 against 79.4 at 78% of the load; no dev-build arm used them.
+#   KV quality settled q4_0 (2026-11-21, real RTX 5080, fixed build): top-16 next-token distributions at 464 positions
+#     (prose and tool-call JSON) in 20 real Claude Code contexts, 8K to 51K tokens, against f16 as reference. The raw runs
+#     again anywhere: research_notes/kv-quality.py with kv-quality-contexts.json (the 20 contexts saved as token ids),
+#     results in inkling-mini-5090-results/loop/kv-quality.json. f16 twice TV 0 (deterministic). Perturbation floor (f16
+#     at -ub 256, summation order only) TV 0.0136, match 0.983. q8_0/q8_0 0.0133 / 0.981: on the floor at every length.
+#     q4_0/q4_0 0.0208 / 0.972: +0.0072 [+0.0051, +0.0093] over the floor, flat from 8K to 51K, mostly prose word choice;
+#     no top token changed where f16 was sure (p >= 0.9, 324 positions incl. structural JSON), flips only at near-ties
+#     (p <= 0.57); no systematic loss of the real next token's probability. K and V cost the same, so q4_0 stays for its
+#     ~58K tokens a session at 4 sessions against q8_0's ~30K when one real Claude Code request carries ~18K of preamble.
 #   -np 4: the workload the score measures. Dev frontier, q4_0/q4_0: np 1 249,856, np 2 245,760, np 4 233,472, np 8 212,992 cells,
 #     about 5,100 a slot. np 8 read solo 52.7, pair 82.8, eight together 377.0, agent 151.3: eight together is not the four-session score.
 #   -c 233,472: the largest pool of that frontier at np 4 (237,568 did not load; sampled peak 15,573 MiB of 16,303; the first build

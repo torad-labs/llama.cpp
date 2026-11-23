@@ -1312,6 +1312,11 @@ extern "C" {
     // support it. A batch uses the compact head only when every output sequence has opted in.
     LLAMA_API bool llama_set_seq_greedy_candidates(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // Mark a sequence for distributed sharded-vocab GPU temperature sampling (exact Gumbel-Max per shard).
+    // Returns false if the context does not support it. Call llama_set_seq_sample_seed() before each decode step.
+    LLAMA_API bool llama_set_seq_temp_sample(struct llama_context * ctx, llama_seq_id seq_id, float temp, uint32_t seed);
+    LLAMA_API void llama_set_seq_sample_seed(struct llama_context * ctx, llama_seq_id seq_id, uint32_t seed);
+
     //
     // NextN / speculative decoding API
     //
@@ -1362,6 +1367,7 @@ extern "C" {
     // Copy rows of the h_nextn device buffer to or from host memory, ordered after the last decode and its readers
     LLAMA_API bool llama_get_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, float * out);
     LLAMA_API bool llama_set_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, const float * data);
+    LLAMA_API bool llama_copy_embeddings_nextn_rows(struct llama_context * ctx, int64_t src_row, int64_t dst_row, int64_t n_rows);
 
     // Read the state rows of batches (see llama_batch_ext_set_embd_state_row()) from the h_nextn device buffer of ctx_src.
     // Returns whether decode accepts batches with state rows.
@@ -1668,6 +1674,7 @@ extern "C" {
     // Candidates sufficient for exact greedy selection: one plus the number of distinct static exclusions.
     // Returns zero for a chain with any other active transform. The shortlist is sampled in token ID order.
     LLAMA_API int32_t llama_sampler_chain_greedy_candidates(const struct llama_sampler * chain);
+    LLAMA_API float   llama_sampler_chain_pure_temp(const struct llama_sampler * chain);
 
     /// The token the chain draws from a row of every token's logit (logits[id], n_vocab of them), as llama_sampler_apply
     /// over all of them as candidates draws it, in one vector pass that builds no candidates. Taken: a chain of a logit

@@ -21,9 +21,17 @@ static bool fattn_rel_elem_one_byte(const ggml_type type) {
 #endif
 }
 
-// The bytes a row's address must be a multiple of: q8_0 rows of 136 bytes are read 8 bytes at a time, the others 16.
+// q4_0 rides its own switch, so GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE keeps meaning exactly what it meant for q8_0 and
+// f8_e4m3. A gate outside these headers that wants it takes this helper too (see reports/kv-q40-dispatch-pending.md).
+static bool fattn_rel_elem_q4(const ggml_type type) {
+    static const bool on = ggml_env_switch("GGML_CUDA_FATTN_REL_DECODE_Q4");
+    return on && type == GGML_TYPE_Q4_0;
+}
+
+// The bytes a row's address must be a multiple of: rows that are not a multiple of 16 bytes (q8_0 of 136, q4_0 of 72) are
+// read 8 bytes at a time, the others 16.
 static size_t fattn_rel_elem_align(const ggml_type type) {
-    return type == GGML_TYPE_Q8_0 ? 8 : 16;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 ? 8 : 16;
 }
 
 template<> struct fattn_rel_elem<GGML_TYPE_F16> {
@@ -32,9 +40,17 @@ template<> struct fattn_rel_elem<GGML_TYPE_F16> {
     static __device__ __forceinline__ raw load(const char * row, const int part) {
         raw r;
         const int4 * src = (const int4 *) row + 8*part;
+        const uint64_t policy = ggml_cuda_l2_policy_evict_first();
+        if ((((uintptr_t) src) & 31u) == 0) {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            r.x[j] = src[j];
+            for (int j = 0; j < 4; ++j) {
+                ggml_cuda_ldg_256_evict_first(src + 2*j, policy, r.x[2*j + 0], r.x[2*j + 1]);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                r.x[j] = ggml_cuda_ldg_128_evict_first(src + j, policy);
+            }
         }
         return r;
     }
@@ -56,9 +72,10 @@ template<> struct fattn_rel_elem<GGML_TYPE_Q8_0> {
     static __device__ __forceinline__ raw load(const char * row, const int part) {
         raw r;
         const int2 * src = (const int2 *) row + 8*part;
+        const uint64_t policy = ggml_cuda_l2_policy_evict_first();
 #pragma unroll
         for (int j = 0; j < 9; ++j) {
-            r.x[j] = src[j];
+            r.x[j] = ggml_cuda_ldg_64_evict_first(src + j, policy);
         }
         return r;
     }
@@ -96,6 +113,65 @@ template<> struct fattn_rel_elem<GGML_TYPE_Q8_0> {
     }
 };
 
+// q4_0: 4 blocks of an f16 scale d and 16 bytes qs holding a nibble a value: values 0-15 of a block are the low nibbles of
+// qs, one per byte, and values 16-31 its high nibbles, as dequantize_row_q4_0 reads them. Part p is blocks 2p and 2p + 1,
+// their 36 bytes at row bytes 36p to 36p + 35, covered by the five 8-byte words from byte 32p (40 bytes). The store is the
+// dense path's flash_attn_ext_raw_dequant_pair<GGML_TYPE_Q4_0> on this half: the same words, the same halves.
+template<> struct fattn_rel_elem<GGML_TYPE_Q4_0> {
+    struct raw { int2 x[5]; };
+
+    static __device__ __forceinline__ raw load(const char * row, const int part) {
+        raw r;
+        const int2 * src = (const int2 *) row + 4*part; // part p's five words cover row bytes 32p to 32p + 39
+        const uint64_t policy = ggml_cuda_l2_policy_evict_first();
+#pragma unroll
+        for (int j = 0; j < 5; ++j) {
+            r.x[j] = ggml_cuda_ldg_64_evict_first(src + j, policy);
+        }
+        return r;
+    }
+
+    static __device__ __forceinline__ void store(const raw & r, const int part, int4 * dst) {
+        // the nine words of the two blocks start at word 0 of the load for part 0 and at word 1 for part 1. Block b keeps
+        // its scale in bytes 18b-18b+1 and its quants from byte 18b+2.
+        uint32_t w[9];
+#pragma unroll
+        for (int l = 0; l < 9; ++l) {
+            const int j = l + part;
+            w[l] = j % 2 == 0 ? (uint32_t) r.x[j/2].x : (uint32_t) r.x[j/2].y;
+        }
+        const half2 bias = make_half2(1032.0f, 1032.0f); // 0x6400 | q is 1024 + q, remove 1024 and the q4_0 offset 8
+        int qs[2][4];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            qs[0][l] = __byte_perm(w[l],     w[l + 1], 0x5432);
+            qs[1][l] = w[l + 5];
+        }
+        const half d[2] = {__ushort_as_half(w[0] & 0xFFFF), __ushort_as_half(uint32_t(w[4]) >> 16)};
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {
+            const half2 d2 = __half2half2(d[b]);
+            half2 lo[8]; // values 0-15 of the block, from the low nibbles
+            half2 hi[8]; // values 16-31 of the block, from the high nibbles
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int v = __byte_perm(qs[b][t], 0, h == 0 ? 0x4140 : 0x4342); // two bytes, one per half
+                    const int vlo = ( v       & 0x000F000F) | 0x64006400;
+                    const int vhi = ((v >> 4) & 0x000F000F) | 0x64006400;
+                    lo[2*t + h] = __hmul2(__hsub2(*((const half2 *) &vlo), bias), d2);
+                    hi[2*t + h] = __hmul2(__hsub2(*((const half2 *) &vhi), bias), d2);
+                }
+            }
+            ggml_cuda_memcpy_1<16>(dst + 4*b + 0, lo + 0);
+            ggml_cuda_memcpy_1<16>(dst + 4*b + 1, lo + 4);
+            ggml_cuda_memcpy_1<16>(dst + 4*b + 2, hi + 0);
+            ggml_cuda_memcpy_1<16>(dst + 4*b + 3, hi + 4);
+        }
+    }
+};
+
 #ifdef FATTN_REL_ELEM_F8
 // f8_e4m3 without a scale: a byte a value, 128 bytes a row. Every e4m3 value is exact in f16.
 template<> struct fattn_rel_elem<GGML_TYPE_F8_E4M3> {
@@ -104,9 +180,15 @@ template<> struct fattn_rel_elem<GGML_TYPE_F8_E4M3> {
     static __device__ __forceinline__ raw load(const char * row, const int part) {
         raw r;
         const int4 * src = (const int4 *) row + 4*part;
+        const uint64_t policy = ggml_cuda_l2_policy_evict_first();
+        if ((((uintptr_t) src) & 31u) == 0) {
+            ggml_cuda_ldg_256_evict_first(src + 0, policy, r.x[0], r.x[1]);
+            ggml_cuda_ldg_256_evict_first(src + 2, policy, r.x[2], r.x[3]);
+        } else {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            r.x[j] = src[j];
+            for (int j = 0; j < 4; ++j) {
+                r.x[j] = ggml_cuda_ldg_128_evict_first(src + j, policy);
+            }
         }
         return r;
     }

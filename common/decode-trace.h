@@ -12,6 +12,8 @@
 #include <string>
 #include <thread>
 
+#include "ggml-ledger.h"
+
 #if __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
 #define COMMON_DECODE_NVTX_AVAILABLE 1
@@ -48,16 +50,52 @@ inline void mark(const std::string & label) {
 #endif
 }
 
+// The value after "key=" in a label of "key=value key=value" words, or "" when the label has no such key.
+inline std::string label_value(const std::string & label, const char * key) {
+    const std::string word = std::string(key) + "=";
+    size_t at = label.rfind(word, 0) == 0 ? 0 : label.find(" " + word);
+    if (at == std::string::npos) {
+        return "";
+    }
+    at += word.size() + (at == 0 ? 0 : 1);
+    return label.substr(at, label.find(' ', at) - at);
+}
+
 struct range {
     bool on = enabled();
     std::string label;
+    // The ledger (ggml-ledger.h) takes every range as a stage of the server's step, trace or no trace: its time
+    // under "stage.<name>" and, where the label says how many, its rows under "stage.<name>.rows".
+    int ledger_slot = -1;
+    std::chrono::steady_clock::time_point ledger_t0;
 
-    explicit range(const char * text) { if (on) { begin(text); } }
-    explicit range(const std::string & text) { if (on) { begin(text); } }
+    explicit range(const char * text) { open(std::string(text)); }
+    explicit range(const std::string & text) { open(text); }
     template <typename MakeLabel>
-    explicit range(MakeLabel make_label) { if (on) { begin(make_label()); } }
+    explicit range(MakeLabel make_label) {
+        if (on || ggml_ledger_on()) {
+            open(make_label());
+        }
+    }
     range(const range &) = delete;
     range & operator=(const range &) = delete;
+
+    void open(const std::string & text) {
+        if (ggml_ledger_on()) {
+            const std::string stage = label_value(text, "stage");
+            if (!stage.empty()) {
+                ledger_slot = ggml_ledger_slot_of("stage", stage.c_str());
+                const std::string rows = label_value(text, "rows");
+                if (!rows.empty()) {
+                    ggml_ledger_add(ggml_ledger_slot_of("stage", (stage + ".rows").c_str()), std::atoll(rows.c_str()));
+                }
+                ledger_t0 = std::chrono::steady_clock::now();
+            }
+        }
+        if (on) {
+            begin(text);
+        }
+    }
 
     void begin(const std::string & text) {
         label = text;
@@ -73,6 +111,10 @@ struct range {
             nvtxRangePop();
 #endif
             emit("end", label);
+        }
+        if (ledger_slot >= 0) {
+            ggml_ledger_add(ledger_slot, std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - ledger_t0).count());
         }
     }
 };

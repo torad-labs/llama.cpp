@@ -988,7 +988,9 @@ static __device__ __forceinline__ void flash_attn_ext_deq_load_tile(
 // (flash_attn_ext_raw_dequant_pair), so the output is the copy's bit for bit.
 template<ggml_type type, int D, int nwarps, int nbatch_fa, int stride_tile, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_deq_dense_load_tile(
-        const char * const __restrict__ KV, half2 * const __restrict__ tile, const int stride_KV, const int i_sup) {
+        const char * const __restrict__ KV, half2 * const __restrict__ tile, const int stride_KV, const int i_sup,
+        const char * const __restrict__ hot_kv = nullptr, const int32_t * const __restrict__ hot_map = nullptr,
+        const size_t hot_nb1 = 0, const int k_VKQ_0 = 0, const bool is_v = false) {
 #ifdef CP_ASYNC_AVAILABLE
     constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
     constexpr int row_bytes      = fattn_raw_row_bytes<type, D>();
@@ -996,6 +998,8 @@ static __device__ __forceinline__ void flash_attn_ext_deq_dense_load_tile(
     constexpr int chunk          = row_bytes % 16 == 0 ? 16 : 8;
     constexpr int chunks_per_row = row_bytes/chunk;
     constexpr int nchunks        = nbatch_fa*chunks_per_row;
+    constexpr int hot_chunks     = D*int(sizeof(half))/16;
+    constexpr int nhot_chunks    = nbatch_fa*hot_chunks;
     constexpr int stride_bytes   = stride_tile*sizeof(half2);
     constexpr int raw_offset     = stride_bytes - row_bytes;
     constexpr int pairs_per_row  = D/(2*QK8_0);
@@ -1012,21 +1016,56 @@ static __device__ __forceinline__ void flash_attn_ext_deq_dense_load_tile(
 
     const unsigned int tile_32 = ggml_cuda_cvta_generic_to_shared(tile);
 
+    if (hot_map) {
 #pragma unroll
-    for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
-        const int c = c0 + threadIdx.y*warp_size + threadIdx.x;
-
-        if (c0 + nwarps*warp_size > nchunks && c >= nchunks) {
-            break;
+        for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
+            const int c = c0 + threadIdx.y*warp_size + threadIdx.x;
+            if (c0 + nwarps*warp_size > nchunks && c >= nchunks) {
+                break;
+            }
+            const int i = c / chunks_per_row;
+            const int k = c % chunks_per_row;
+            if ((!oob_check || i < i_sup) && hot_map[k_VKQ_0 + i] < 0) {
+                if constexpr (chunk == 16) {
+                    cp_async_cg_16<64>(tile_32 + i*stride_bytes + raw_offset + k*16, KV + int64_t(i)*stride_KV + k*16);
+                } else {
+                    cp_async_ca_8(tile_32 + i*stride_bytes + raw_offset + k*8, KV + int64_t(i)*stride_KV + k*8);
+                }
+            }
         }
+#pragma unroll
+        for (int hc0 = 0; hc0 < nhot_chunks; hc0 += nwarps*warp_size) {
+            const int hc = hc0 + threadIdx.y*warp_size + threadIdx.x;
+            if (hc0 + nwarps*warp_size > nhot_chunks && hc >= nhot_chunks) {
+                break;
+            }
+            const int i = hc / hot_chunks;
+            const int k = hc % hot_chunks;
+            if (!oob_check || i < i_sup) {
+                const int32_t hslot = hot_map[k_VKQ_0 + i];
+                if (hslot >= 0) {
+                    const char * src = hot_kv + (2*int64_t(hslot) + (is_v ? 1 : 0))*hot_nb1 + k*16;
+                    cp_async_cg_16<64>(tile_32 + i*stride_bytes + k*16, src);
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
+            const int c = c0 + threadIdx.y*warp_size + threadIdx.x;
 
-        const int i = c / chunks_per_row;
-        const int k = c % chunks_per_row;
-        if (!oob_check || i < i_sup) {
-            if constexpr (chunk == 16) {
-                cp_async_cg_16<64>(tile_32 + i*stride_bytes + raw_offset + k*16, KV + int64_t(i)*stride_KV + k*16);
-            } else {
-                cp_async_ca_8(tile_32 + i*stride_bytes + raw_offset + k*8, KV + int64_t(i)*stride_KV + k*8);
+            if (c0 + nwarps*warp_size > nchunks && c >= nchunks) {
+                break;
+            }
+
+            const int i = c / chunks_per_row;
+            const int k = c % chunks_per_row;
+            if (!oob_check || i < i_sup) {
+                if constexpr (chunk == 16) {
+                    cp_async_cg_16<64>(tile_32 + i*stride_bytes + raw_offset + k*16, KV + int64_t(i)*stride_KV + k*16);
+                } else {
+                    cp_async_ca_8(tile_32 + i*stride_bytes + raw_offset + k*8, KV + int64_t(i)*stride_KV + k*8);
+                }
             }
         }
     }
@@ -1044,28 +1083,34 @@ static __device__ __forceinline__ void flash_attn_ext_deq_dense_load_tile(
         }
 
         const int i = rows_per_warp*g + r;
+        const bool in_bounds = !oob_check || i < i_sup;
+        const bool is_hot = hot_map && in_bounds && hot_map[k_VKQ_0 + i] >= 0;
 
-        int w[pair_words];
-        const int * src = (const int *) ((const char *) tile + i*stride_bytes + raw_offset + bp*pair_bytes);
+        int w[pair_words] = {};
+        if (!is_hot) {
+            const int * src = (const int *) ((const char *) tile + i*stride_bytes + raw_offset + bp*pair_bytes);
 #pragma unroll
-        for (int l = 0; l < pair_words; ++l) {
-            w[l] = src[l];
+            for (int l = 0; l < pair_words; ++l) {
+                w[l] = src[l];
+            }
         }
         __syncwarp(); // the warp's rows are read before any of them is written
 
-        half2 * dst = tile + i*stride_tile + bp*QK8_0;
-        if (!oob_check || i < i_sup) {
-            flash_attn_ext_raw_dequant_pair<type>(w, dst);
-        } else {
-            const int4 zero = {0, 0, 0, 0};
+        if (!is_hot) {
+            half2 * dst = tile + i*stride_tile + bp*QK8_0;
+            if (in_bounds) {
+                flash_attn_ext_raw_dequant_pair<type>(w, dst);
+            } else {
+                const int4 zero = {0, 0, 0, 0};
 #pragma unroll
-            for (int l = 0; l < QK8_0; l += 4) {
-                *((int4 *) (dst + l)) = zero;
+                for (int l = 0; l < QK8_0; l += 4) {
+                    *((int4 *) (dst + l)) = zero;
+                }
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(KV, tile, stride_KV, i_sup);
+    GGML_UNUSED_VARS(KV, tile, stride_KV, i_sup, hot_kv, hot_map, hot_nb1, k_VKQ_0, is_v);
     NO_DEVICE_CODE;
 #endif // CP_ASYNC_AVAILABLE
 }
@@ -1342,7 +1387,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     ((const char *) K_h2, tile_K, stride_K, k_VKQ_0, k_VKQ_sup, indices);
             } else if constexpr (deq_dense) {
                 flash_attn_ext_deq_dense_load_tile<type_K, DKQ, nwarps, nbatch_fa, stride_tile_K, oob_check>
-                    ((const char *) K_h2 + int64_t(k_VKQ_0)*stride_K, tile_K, stride_K, k_VKQ_sup);
+                    ((const char *) K_h2 + int64_t(k_VKQ_0)*stride_K, tile_K, stride_K, k_VKQ_sup,
+                     rel.hot_kv, rel.hot_map, rel.hot_nb1, k_VKQ_0, false);
             } else {
                 const int k0_diff = min(k0_stop, DKQ/2) - k0_start; // Only load the real head size from global memory.
                 constexpr bool use_cp_async = nstages == 1;
@@ -1724,7 +1770,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (deq_dense) {
             // V takes the tile K*Q has read, whole rows of it
             flash_attn_ext_deq_dense_load_tile<type_V, DV, nwarps, nbatch_fa, stride_tile_V, oob_check>
-                ((const char *) V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, stride_V, k_VKQ_sup);
+                ((const char *) V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, stride_V, k_VKQ_sup,
+                 rel.hot_kv, rel.hot_map, rel.hot_nb1, k_VKQ_0, true);
             __syncthreads();
         } else if constexpr (nstages <= 1) {
             const int i0_diff = min(i0_stop, DV) - i0_start; // Only load the real head size from global memory.
@@ -2827,6 +2874,12 @@ static __global__ void flash_attn_ext_f16(
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q + int64_t(sequence)*ne01.z*rel.sink_stride : nullptr;
         auto rel_head = fattn_rel_pos_at(rel, zt_Q, sequence);
         rel_head.shift = rel.shift_sinks ? sinks_f : nullptr;
+        if (rel.hot_kv && rel.hot_map) {
+            const int seq_kv = ne13 < ne03 ? sequence / (ne03 / ne13) : sequence;
+            rel_head.hot_kv  = rel.hot_kv + int64_t(z_KV)*rel.hot_nb2 + int64_t(seq_kv)*rel.hot_nb3;
+            rel_head.hot_map = rel.hot_map + int64_t(sequence % rel.ne81)*rel.s_kv_pos;
+            rel_head.hot_nb1 = rel.hot_nb1;
+        }
         const int32_t * indices = use_sparse_arch ? sparse_indices + (int64_t(sequence % ne33)*ne31 + jt*ncols1)*ne11 :
                                   KV_rows_ptr ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
 
@@ -3048,7 +3101,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         if constexpr (raw_KV) {
             // kv_rows (ggml_flash_attn_ext_rows) names the K/V row of each mask column, which the raw loads do not read through:
             // such a launch takes the f16 kernel on converted K and V.
-            if (dst->op == GGML_OP_FLASH_ATTN_EXT && dst->src[5] != nullptr) {
+            if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
                 return;
             }

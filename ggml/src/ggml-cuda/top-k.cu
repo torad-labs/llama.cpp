@@ -384,6 +384,163 @@ static __global__ void topk_unmap(const int * cand_idx, const int * order, int *
     }
 }
 
+static __device__ __forceinline__ bool topk_k1_better(float val, int col, float best_val, int best_col) {
+    if (best_col < 0) {
+        return true;
+    }
+    const bool v_nan = isnan(val);
+    const bool b_nan = isnan(best_val);
+    if (v_nan != b_nan) {
+        return !v_nan;
+    }
+    if (v_nan) {
+        return col < best_col;
+    }
+    return val > best_val || (val == best_val && col < best_col);
+}
+
+static __global__ void topk_k1_stage1(const float * __restrict__ src, float * __restrict__ part_val,
+                                      int * __restrict__ part_idx, int * __restrict__ dst,
+                                      const int64_t ncols, const int ntiles, const int stride) {
+    constexpr int BLOCK = 256;
+    constexpr int NWARPS = BLOCK / WARP_SIZE;
+    __shared__ float s_val[NWARPS];
+    __shared__ int   s_idx[NWARPS];
+
+    const int row  = blockIdx.x / ntiles;
+    const int tidx = blockIdx.x % ntiles;
+    const int64_t col_beg = (int64_t) tidx * stride;
+    const int64_t col_end = col_beg + stride < ncols ? col_beg + stride : ncols;
+    const float * row_ptr = src + (size_t) row * ncols;
+
+    float best_val = -INFINITY;
+    int   best_col = -1;
+    for (int64_t col = col_beg + threadIdx.x; col < col_end; col += BLOCK) {
+        const float v = row_ptr[col];
+        if (topk_k1_better(v, (int) col, best_val, best_col)) {
+            best_val = v;
+            best_col = (int) col;
+        }
+    }
+
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        const float v = ggml_cuda_shfl_xor(best_val, offset, WARP_SIZE);
+        const int   c = ggml_cuda_shfl_xor(best_col, offset, WARP_SIZE);
+        if (c >= 0 && topk_k1_better(v, c, best_val, best_col)) {
+            best_val = v;
+            best_col = c;
+        }
+    }
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    if (lane == 0) {
+        s_val[warp] = best_val;
+        s_idx[warp] = best_col;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        best_val = lane < NWARPS ? s_val[lane] : -INFINITY;
+        best_col = lane < NWARPS ? s_idx[lane] : -1;
+#pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            const float v = ggml_cuda_shfl_xor(best_val, offset, WARP_SIZE);
+            const int   c = ggml_cuda_shfl_xor(best_col, offset, WARP_SIZE);
+            if (c >= 0 && topk_k1_better(v, c, best_val, best_col)) {
+                best_val = v;
+                best_col = c;
+            }
+        }
+        if (lane == 0) {
+            if (ntiles == 1) {
+                dst[row] = best_col >= 0 ? best_col : 0;
+            } else {
+                part_val[(size_t) row * ntiles + tidx] = best_val;
+                part_idx[(size_t) row * ntiles + tidx] = best_col;
+            }
+        }
+    }
+}
+
+static __global__ void topk_k1_stage2(const float * __restrict__ part_val, const int * __restrict__ part_idx,
+                                      int * __restrict__ dst, const int ntiles) {
+    constexpr int BLOCK = 128;
+    constexpr int NWARPS = BLOCK / WARP_SIZE;
+    __shared__ float s_val[NWARPS];
+    __shared__ int   s_idx[NWARPS];
+
+    const int row = blockIdx.x;
+    const float * vals = part_val + (size_t) row * ntiles;
+    const int   * idxs = part_idx + (size_t) row * ntiles;
+
+    float best_val = -INFINITY;
+    int   best_col = -1;
+    for (int i = threadIdx.x; i < ntiles; i += BLOCK) {
+        const int c = idxs[i];
+        if (c >= 0 && topk_k1_better(vals[i], c, best_val, best_col)) {
+            best_val = vals[i];
+            best_col = c;
+        }
+    }
+
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        const float v = ggml_cuda_shfl_xor(best_val, offset, WARP_SIZE);
+        const int   c = ggml_cuda_shfl_xor(best_col, offset, WARP_SIZE);
+        if (c >= 0 && topk_k1_better(v, c, best_val, best_col)) {
+            best_val = v;
+            best_col = c;
+        }
+    }
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    if (lane == 0) {
+        s_val[warp] = best_val;
+        s_idx[warp] = best_col;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        best_val = lane < NWARPS ? s_val[lane] : -INFINITY;
+        best_col = lane < NWARPS ? s_idx[lane] : -1;
+#pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            const float v = ggml_cuda_shfl_xor(best_val, offset, WARP_SIZE);
+            const int   c = ggml_cuda_shfl_xor(best_col, offset, WARP_SIZE);
+            if (c >= 0 && topk_k1_better(v, c, best_val, best_col)) {
+                best_val = v;
+                best_col = c;
+            }
+        }
+        if (lane == 0) {
+            dst[row] = best_col >= 0 ? best_col : 0;
+        }
+    }
+}
+
+static bool ggml_cuda_top_k_1(ggml_cuda_pool & pool, const float * src, int * dst,
+                              const int64_t ncols, const int64_t nrows, cudaStream_t stream) {
+    if (ncols <= 0 || nrows <= 0 || ncols > INT32_MAX || nrows > INT32_MAX) {
+        return false;
+    }
+    const int tile   = ncols >= 65536 ? 4096 : 2048;
+    const int ntiles = (nrows >= 128 || ncols <= tile) ? 1 : std::min<int>(128, (int) ((ncols + tile - 1) / tile));
+    const int stride = (int) ((ncols + ntiles - 1) / ntiles);
+    if (ntiles == 1) {
+        topk_k1_stage1<<<(unsigned int) nrows, 256, 0, stream>>>(src, nullptr, nullptr, dst, ncols, 1, stride);
+        return true;
+    }
+    ggml_cuda_pool_alloc<float> part_val(pool, (size_t) nrows * ntiles);
+    ggml_cuda_pool_alloc<int>   part_idx(pool, (size_t) nrows * ntiles);
+    topk_k1_stage1<<<(unsigned int) (nrows * ntiles), 256, 0, stream>>>(
+            src, part_val.get(), part_idx.get(), dst, ncols, ntiles, stride);
+    topk_k1_stage2<<<(unsigned int) nrows, 128, 0, stream>>>(part_val.get(), part_idx.get(), dst, ntiles);
+    return true;
+}
+
 static bool ggml_cuda_top_k_tiled(ggml_cuda_pool & pool, const float * src, int * dst,
                                   const int ncols, const int nrows, const int k,
                                   cudaStream_t stream) {
@@ -440,10 +597,15 @@ static __device__ __forceinline__ uint32_t topk_radix_warp_incl_scan(uint32_t v,
 // best, keys and columns, a second launch selects among (CAND: src_key/src_col are that first launch's out_key/out_col).
 // A tile narrower than k pads its candidates with key 0, below every float's key, so they are never taken.
 // ITEMS > 0: the segment's keys stay in registers (seg_len <= ITEMS*BLOCK); 0: every pass reads the segment again.
+static __device__ __forceinline__ float topk_apply_softcap(const float z, const float inv_cap, const float cap) {
+    return cap != 0.0f ? cap * tanhf(z * inv_cap) : z;
+}
+
 template <int ITEMS, bool CAND, bool CANONICAL = false>
 static __global__ void __launch_bounds__(TOPK_RADIX_BLOCK) topk_radix(
         const float * src, const uint32_t * src_key, const int * src_col, int * out_col, uint32_t * out_key,
-        const int64_t row_stride, const int seg_len, const int nseg, const int ncols, const int k, const bool first_nan) {
+        const int64_t row_stride, const int seg_len, const int nseg, const int ncols, const int k, const bool first_nan,
+        const float inv_cap, const float cap) {
     constexpr int BLOCK  = TOPK_RADIX_BLOCK;
     constexpr int NWARPS = BLOCK / WARP_SIZE;
     static_assert(NWARPS <= WARP_SIZE, "one warp scans the warps' sums");
@@ -472,7 +634,7 @@ static __global__ void __launch_bounds__(TOPK_RADIX_BLOCK) topk_radix(
         if constexpr (CAND) {
             return src_key[base + col];
         } else {
-            const float value = src[base + col];
+            const float value = topk_apply_softcap(src[base + col], inv_cap, cap);
             if constexpr (CANONICAL) {
                 // Keep numeric ties equal without changing the bits packed in the result.
                 if (isnan(value)) { return first_nan && col0 + col == 0 ? UINT32_MAX : 1u; }
@@ -629,15 +791,16 @@ static __global__ void __launch_bounds__(TOPK_RADIX_BLOCK) topk_radix(
 template <bool CAND, bool CANONICAL = false>
 static void topk_radix_launch(const int nblocks, const float * src, const uint32_t * src_key, const int * src_col,
                               int * out_col, uint32_t * out_key, const int64_t row_stride, const int seg_len,
-                              const int nseg, const int ncols, const int k, cudaStream_t stream, bool first_nan = false) {
+                              const int nseg, const int ncols, const int k, cudaStream_t stream, bool first_nan = false,
+                              const float inv_cap = 0.0f, const float cap = 0.0f) {
     if (seg_len <= 4*TOPK_RADIX_BLOCK) {
-        topk_radix<4, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan);
+        topk_radix<4, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan, inv_cap, cap);
     } else if (seg_len <= 8*TOPK_RADIX_BLOCK) {
-        topk_radix<8, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan);
+        topk_radix<8, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan, inv_cap, cap);
     } else if (seg_len <= 16*TOPK_RADIX_BLOCK) {
-        topk_radix<16, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan);
+        topk_radix<16, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan, inv_cap, cap);
     } else {
-        topk_radix<0, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan);
+        topk_radix<0, CAND, CANONICAL><<<nblocks, TOPK_RADIX_BLOCK, 0, stream>>>(src, src_key, src_col, out_col, out_key, row_stride, seg_len, nseg, ncols, k, first_nan, inv_cap, cap);
     }
 }
 
@@ -678,7 +841,8 @@ static bool ggml_cuda_top_k_radix(ggml_cuda_pool & pool, const float * src, int 
 }
 
 static __global__ void topk_pack_candidates(const float * src, const int * ids, uint64_t * dst,
-        const int ncols, const int k, const int count, const int parts, const int offset, const int64_t total) {
+        const int ncols, const int k, const int count, const int parts, const int offset, const int64_t total,
+        const float inv_cap, const float cap) {
     const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (i >= total) { return; }
     const int candidate = i % k;
@@ -687,13 +851,177 @@ static __global__ void topk_pack_candidates(const float * src, const int * ids, 
     uint64_t record = UINT32_MAX;
     if (part == 0 && candidate < count) {
         const int id = ids[row*count + candidate];
-        record = (uint64_t(__float_as_uint(src[row*ncols + id])) << 32) | uint32_t(offset + id);
+        const float val = topk_apply_softcap(src[row*ncols + id], inv_cap, cap);
+        record = (uint64_t(__float_as_uint(val)) << 32) | uint32_t(offset + id);
     }
     dst[i] = record;
 }
 
-void ggml_cuda_op_top_k_candidates(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src = dst->src[0];
+// 1-pass per-shard Gumbel-Max / greedy argmax for GGML_OP_TOP_K_CANDIDATES with draw_params:
+// inv_temp > 0: score = z*inv_temp + Gumbel(0,1) from SplitMix64(seed, global_id)
+// inv_temp <= 0 && !only_sampled: exact greedy argmax (matching topk_radix + first_nan)
+template <bool only_sampled>
+static __global__ void topk_gumbel_max_kernel(
+        const float * __restrict__ src, const int32_t * __restrict__ draw, uint64_t * __restrict__ dst,
+        const int stride, const int ncols, const int k, const int parts, const int offset, const bool first_nan,
+        const float inv_cap, const float cap) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const float    inv_temp = __int_as_float(draw[2*row + 0]);
+    const uint32_t seed     = (uint32_t) draw[2*row + 1];
+    if (only_sampled && !(inv_temp > 0.0f)) {
+        return;
+    }
+
+    uint64_t * out = dst + int64_t(row)*parts*k;
+    if (ncols <= 0) {
+        for (int i = tid; i < parts*k; i += blockDim.x) {
+            out[i] = UINT32_MAX;
+        }
+        return;
+    }
+
+    const float * vals = src + int64_t(row)*stride;
+    if (first_nan && offset == 0 && !(inv_temp > 0.0f)) {
+        const float v0 = topk_apply_softcap(vals[0], inv_cap, cap);
+        if (isnan(v0)) {
+            if (tid == 0) {
+                out[0] = (uint64_t(__float_as_uint(v0)) << 32) | 0u;
+            }
+            for (int i = tid + 1; i < parts*k; i += blockDim.x) {
+                out[i] = UINT32_MAX;
+            }
+            return;
+        }
+    }
+
+    const bool sample = inv_temp > 0.0f;
+    constexpr float inv2p32 = 2.3283064365386963e-10f;
+
+    float    best_s  = -INFINITY;
+    uint32_t best_id = UINT32_MAX;
+    bool     best_valid = false;
+
+    auto consider = [&](const float raw_z, const int col) {
+        const float z = topk_apply_softcap(raw_z, inv_cap, cap);
+        const uint32_t gid = uint32_t(offset + col);
+        float score;
+        bool  is_nan = isnan(z);
+        if (sample) {
+            if (is_nan || z == -INFINITY) {
+                score = -INFINITY;
+                is_nan = false;
+            } else {
+                uint64_t h = (uint64_t(seed) << 32) | uint64_t(gid);
+                h += 0x9e3779b97f4a7c15ull;
+                h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+                h = (h ^ (h >> 27)) * 0x94d049bb133111ebull;
+                h ^= h >> 31;
+                const uint32_t u32 = uint32_t(h >> 32);
+                const float e = (u32 < 0x80000000u)
+                    ? -log1pf(-((float) u32 + 0.5f) * inv2p32)
+                    : -logf(((float) (~u32) + 0.5f) * inv2p32);
+                score = z * inv_temp - logf(e);
+            }
+        } else {
+            score = z;
+        }
+
+        const bool better = !best_valid ||
+            (!is_nan && (isnan(best_s) || score > best_s || (!(score < best_s) && gid < best_id))) ||
+            (is_nan && isnan(best_s) && gid < best_id);
+        if (better) {
+            best_s     = score;
+            best_id    = gid;
+            best_valid = true;
+        }
+    };
+
+    const uint64_t policy = ggml_cuda_l2_policy_evict_first();
+    const int nvec = ((((uintptr_t) vals) & 15u) == 0) ? (ncols >> 2) : 0;
+    const int4 * vals4 = reinterpret_cast<const int4 *>(vals);
+    for (int v = tid; v < nvec; v += blockDim.x) {
+        const int4 raw = ggml_cuda_ldg_128_evict_first(vals4 + v, policy);
+        float z4[4];
+        memcpy(z4, &raw, sizeof(z4));
+        const int col0 = v << 2;
+        consider(z4[0], col0 + 0);
+        consider(z4[1], col0 + 1);
+        consider(z4[2], col0 + 2);
+        consider(z4[3], col0 + 3);
+    }
+    for (int col = (nvec << 2) + tid; col < ncols; col += blockDim.x) {
+        consider(vals[col], col);
+    }
+
+    // warp reduce
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        const float    os = __shfl_xor_sync(0xffffffffu, best_s, mask);
+        const uint32_t oi = __shfl_xor_sync(0xffffffffu, best_id, mask);
+        const int      ov = __shfl_xor_sync(0xffffffffu, best_valid ? 1 : 0, mask);
+        if (ov) {
+            const bool o_nan = isnan(os);
+            const bool b_nan = isnan(best_s);
+            const bool better = !best_valid ||
+                (!o_nan && (b_nan || os > best_s || (!(os < best_s) && oi < best_id))) ||
+                (o_nan && b_nan && oi < best_id);
+            if (better) {
+                best_s     = os;
+                best_id    = oi;
+                best_valid = true;
+            }
+        }
+    }
+
+    __shared__ float    s_score[8];
+    __shared__ uint32_t s_id[8];
+    __shared__ int      s_valid[8];
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (lane == 0) {
+        s_score[warp] = best_s;
+        s_id[warp]    = best_id;
+        s_valid[warp] = best_valid ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        best_valid = lane < 8 ? (s_valid[lane] != 0) : false;
+        best_s     = lane < 8 ? s_score[lane] : -INFINITY;
+        best_id    = lane < 8 ? s_id[lane]    : UINT32_MAX;
+        #pragma unroll
+        for (int mask = 4; mask > 0; mask >>= 1) {
+            const float    os = __shfl_xor_sync(0xffffffffu, best_s, mask);
+            const uint32_t oi = __shfl_xor_sync(0xffffffffu, best_id, mask);
+            const int      ov = __shfl_xor_sync(0xffffffffu, best_valid ? 1 : 0, mask);
+            if (ov) {
+                const bool o_nan = isnan(os);
+                const bool b_nan = isnan(best_s);
+                const bool better = !best_valid ||
+                    (!o_nan && (b_nan || os > best_s || (!(os < best_s) && oi < best_id))) ||
+                    (o_nan && b_nan && oi < best_id);
+                if (better) {
+                    best_s     = os;
+                    best_id    = oi;
+                    best_valid = true;
+                }
+            }
+        }
+        if (lane == 0) {
+            out[0] = best_valid ? ((uint64_t(__float_as_uint(best_s)) << 32) | best_id) : UINT32_MAX;
+        }
+    }
+    for (int i = tid + 1; i < parts*k; i += blockDim.x) {
+        out[i] = UINT32_MAX;
+    }
+}
+
+void ggml_cuda_op_top_k_candidates(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * src_override, float softcap) {
+    const ggml_tensor * src  = src_override ? src_override : dst->src[0];
+    const ggml_tensor * draw = dst->src[1];
     GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I64);
     GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
     const int stride = src->ne[0];
@@ -701,16 +1029,23 @@ void ggml_cuda_op_top_k_candidates(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int vocab = ggml_get_op_params_i32(dst, 1);
     const int ncols = vocab ? std::clamp(vocab - offset, 0, stride) : stride;
     const bool first_nan = offset == 0 && ggml_get_op_params_i32(dst, 2);
+    const float inv_cap = softcap != 0.0f ? 1.0f / softcap : 0.0f;
     const int nrows = dst->ne[2];
     const int k = dst->ne[0];
     const int count = std::min(k, ncols);
     const float * values = (const float *) src->data;
     cudaStream_t stream = ctx.stream();
+    if (draw != nullptr && k == 1 && nrows > 0) {
+        topk_gumbel_max_kernel<false><<<nrows, 256, 0, stream>>>(
+            values, (const int32_t *) draw->data, (uint64_t *) dst->data,
+            stride, ncols, k, dst->ne[1], offset, first_nan, inv_cap, softcap);
+        return;
+    }
     ggml_cuda_pool_alloc<int> ids(ctx.pool(), std::max(size_t(1), size_t(nrows)*count));
     if (count > 0 && nrows > 0) {
         if (ncols <= 16*TOPK_RADIX_BLOCK || 2*int64_t(count) > TOPK_RADIX_TILE) {
             topk_radix_launch<false, true>(nrows, values, nullptr, nullptr, ids.get(), nullptr,
-                                          stride, ncols, 1, ncols, count, stream, first_nan);
+                                          stride, ncols, 1, ncols, count, stream, first_nan, inv_cap, softcap);
         } else {
             const int tile = TOPK_RADIX_TILE;
             const int ntiles = (ncols + tile - 1) / tile;
@@ -718,7 +1053,7 @@ void ggml_cuda_op_top_k_candidates(ggml_backend_cuda_context & ctx, ggml_tensor 
             ggml_cuda_pool_alloc<uint32_t> keys(ctx.pool(), size_t(nrows)*ncand);
             ggml_cuda_pool_alloc<int> cols(ctx.pool(), size_t(nrows)*ncand);
             topk_radix_launch<false, true>(nrows*ntiles, values, nullptr, nullptr, cols.get(), keys.get(),
-                                          stride, tile, ntiles, ncols, count, stream, first_nan);
+                                          stride, tile, ntiles, ncols, count, stream, first_nan, inv_cap, softcap);
             topk_radix_launch<true>(nrows, nullptr, keys.get(), cols.get(), ids.get(), nullptr,
                                    ncand, ncand, 1, ncand, count, stream);
         }
@@ -726,7 +1061,12 @@ void ggml_cuda_op_top_k_candidates(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int64_t total = ggml_nelements(dst);
     if (total > 0) {
         topk_pack_candidates<<<(total + 255)/256, 256, 0, stream>>>(values, ids.get(), (uint64_t *) dst->data,
-            stride, k, count, dst->ne[1], offset, total);
+            stride, k, count, dst->ne[1], offset, total, inv_cap, softcap);
+    }
+    if (draw != nullptr && nrows > 0) {
+        topk_gumbel_max_kernel<true><<<nrows, 256, 0, stream>>>(
+            values, (const int32_t *) draw->data, (uint64_t *) dst->data,
+            stride, ncols, k, dst->ne[1], offset, first_nan, inv_cap, softcap);
     }
 }
 
@@ -745,6 +1085,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+
+    if (k == 1 && ggml_cuda_top_k_1(pool, src0_d, dst_d, ncols, nrows, stream)) {
+        return;
+    }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (ggml_cuda_top_k_radix(pool, src0_d, dst_d, ncols, nrows, k, cc, stream)) {

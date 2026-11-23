@@ -23,6 +23,9 @@ void llama_host_threads_set(int n);
 // for tests: the threads the last build that asked split across
 int llama_host_threads_last();
 
+// runs fn(t, userdata) on t = 0..n_threads-1 using a persistent worker pool (t = 0 on the caller)
+void llama_host_run(int n_threads, void (*fn)(int, void *), void * userdata);
+
 // fn(i0, i1, t) writes rows [i0, i1); t, from 0, tells the threads apart for their own counters. The calling thread takes
 // the first rows
 template <typename F>
@@ -35,24 +38,20 @@ void llama_host_rows(int64_t n_rows, int64_t row_bytes, F && fn) {
     }
 
     const int64_t chunk = (n_rows + n_threads - 1)/n_threads;
+    const int n_active  = (int) ((n_rows + chunk - 1)/chunk);
 
-    std::vector<std::thread> workers;
-    workers.reserve(n_threads - 1);
+    struct ctx_t {
+        F & fn;
+        int64_t n_rows;
+        int64_t chunk;
+    } ctx { fn, n_rows, chunk };
 
-    for (int64_t t = 1; t < n_threads; ++t) {
-        const int64_t i0 = t*chunk;
-        const int64_t i1 = std::min(n_rows, i0 + chunk);
-
-        if (i0 >= i1) {
-            break;
+    llama_host_run(n_active, [](int t, void * p) {
+        auto & c = *static_cast<ctx_t *>(p);
+        const int64_t i0 = (int64_t) t * c.chunk;
+        const int64_t i1 = std::min(c.n_rows, i0 + c.chunk);
+        if (i0 < i1) {
+            c.fn(i0, i1, t);
         }
-
-        workers.emplace_back([&fn, i0, i1, t]() { fn(i0, i1, (int) t); });
-    }
-
-    fn((int64_t) 0, std::min(chunk, n_rows), 0);
-
-    for (auto & w : workers) {
-        w.join();
-    }
+    }, &ctx);
 }

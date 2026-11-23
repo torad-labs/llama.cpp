@@ -36,13 +36,15 @@ static __global__ __launch_bounds__(F32_COLS_WARPS*WARP_SIZE, 1) void f32_cols(
     }
 
     float acc[rows][cpl] = {};
+    const uint64_t policy = ggml_cuda_l2_policy_evict_first();
     constexpr int64_t kstep = F32_COLS_WARPS*F32_COLS_KLANES*4;
 #pragma unroll 4
     for (int64_t k0 = (warp*F32_COLS_KLANES + kl)*4; k0 < k; k0 += kstep) {
         float4 av[rows];
 #pragma unroll
         for (int r = 0; r < rows; ++r) {
-            av[r] = __ldg((const float4 *) (ar[r] + k0));
+            const int4 raw = ggml_cuda_ldg_128_evict_first((const int4 *) (ar[r] + k0), policy);
+            memcpy(&av[r], &raw, sizeof(float4));
         }
 #pragma unroll
         for (int j = 0; j < cpl; ++j) {

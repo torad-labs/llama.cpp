@@ -471,7 +471,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
-    static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_kv_cache        ("cache_(k|v|hot_kv)_l\\d*");
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
@@ -643,8 +643,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     auto get_tensor_config = [&]() -> tensor_config {
         // the MTP store of the target's hidden rows (llama_set_nextn_source): a whole copy on every card, as the rows are.
-        // The same for the layer inputs a DFlash/DSpark draft reads (layer_inp_dev): a draft on one card reads its copy
-        if (tensor_name == "mtp_h_store" || tensor_name == "layer_inp_dev") {
+        // The same for the layer inputs a DFlash/DSpark draft reads (layer_inp_dev) and resident KV delta inputs
+        if (tensor_name == "mtp_h_store" || tensor_name == "layer_inp_dev" ||
+                tensor_name == "kv_resident_cell_pos" || tensor_name == "kv_resident_kq_mask") {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (is_inkling2 && std::regex_match(tensor_name, pattern_s_cache)) {
@@ -2568,8 +2569,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 // DSpark's Markov head adds head x (W x latent + b) to a block's logits on each of its steps (dflash.cpp
 // build_inkling2_head), which reads the whole LM head a step (1.85 GB in BF16 for Inkling 2) for a rank-256 correction.
-// The product head x [W | b] is made once here on the head's device, [rank + 1, n_vocab] in F16, and a step reads it (about
-// 100 MB) against [latent; 1]. LLAMA_DSPARK_HEAD_LEGACY=1: every step multiplies by the head.
+// The products head x W ([rank, n_vocab], aligned for mmvf/mmf/cuBLAS) and head x b ([n_vocab], F32) are made once here
+// on the head's device. LLAMA_DSPARK_HEAD_LEGACY=1: every step multiplies by the head.
 void llama_model_base::load_tensors_dspark_head() {
     auto * draft = dynamic_cast<llama_model_dflash *>(this);
     if (draft == nullptr || draft->dspark_markov_rank == 0 || !draft->dspark_hidden_out || !draft->dspark_hidden_out_b ||
@@ -2585,10 +2586,13 @@ void llama_model_base::load_tensors_dspark_head() {
     const int64_t rank = draft->dspark_markov_rank, n_embd = output->ne[0], n_vocab = output->ne[1];
     GGML_ASSERT(draft->dspark_hidden_out->ne[0] == rank && draft->dspark_hidden_out->ne[1] == n_embd);
 
-    ggml_init_params params = { ggml_tensor_overhead(), NULL, true };
+    const ggml_type head_type = output->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    ggml_init_params params = { 2*ggml_tensor_overhead(), NULL, true };
     ggml_context_ptr ctx { ggml_init(params) };
-    ggml_tensor * head_out = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, rank + 1, n_vocab);
-    ggml_set_name(head_out, "dspark_head_out.weight");
+    ggml_tensor * head_out   = ggml_new_tensor_2d(ctx.get(), head_type,     rank, n_vocab);
+    ggml_tensor * head_out_b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_vocab);
+    ggml_set_name(head_out,   "dspark_head_out.weight");
+    ggml_set_name(head_out_b, "dspark_head_out.bias");
     ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
     ggml_backend_ptr backend { ggml_backend_dev_init(dev, nullptr) };
     if (!buffer || !backend) {
@@ -2602,19 +2606,23 @@ void llama_model_base::load_tensors_dspark_head() {
     const int64_t rows_pass = 16384;
     for (int64_t v0 = 0; v0 < n_vocab; v0 += rows_pass) {
         const int64_t nv = std::min(rows_pass, n_vocab - v0);
-        ggml_init_params gparams = { 32*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
+        ggml_init_params gparams = { 48*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
         ggml_context_ptr gctx { ggml_init(gparams) };
         ggml_context * g = gctx.get();
         ggml_tensor * w  = ggml_cont(g, ggml_transpose(g, ggml_cast(g, draft->dspark_hidden_out, GGML_TYPE_F32))); // [n_embd, rank]
-        ggml_tensor * b  = ggml_reshape_2d(g, ggml_cast(g, draft->dspark_hidden_out_b, GGML_TYPE_F32), n_embd, 1);
-        ggml_tensor * wb = ggml_concat(g, w, b, 1);                                                                // [n_embd, rank + 1]
+        ggml_tensor * b  = ggml_reshape_2d(g, ggml_cast(g, draft->dspark_hidden_out_b, GGML_TYPE_F32), n_embd, 1); // [n_embd, 1]
         ggml_tensor * rows = ggml_view_2d(g, output, n_embd, nv, output->nb[1], v0*output->nb[1]);
-        ggml_tensor * product = ggml_mul_mat(g, rows, wb);                                                         // [nv, rank + 1]
-        ggml_prec_set_acc(product, GGML_PREC_F32);
-        ggml_tensor * dst = ggml_view_2d(g, head_out, rank + 1, nv, head_out->nb[1], v0*head_out->nb[1]);
-        ggml_tensor * out = ggml_cpy(g, ggml_cont(g, ggml_transpose(g, product)), dst);
+        ggml_tensor * prod_w = ggml_mul_mat(g, rows, w);                                                           // [nv, rank]
+        ggml_tensor * prod_b = ggml_mul_mat(g, rows, b);                                                           // [nv, 1]
+        ggml_prec_set_acc(prod_w, GGML_PREC_F32);
+        ggml_prec_set_acc(prod_b, GGML_PREC_F32);
+        ggml_tensor * dst_w = ggml_view_2d(g, head_out, rank, nv, head_out->nb[1], v0*head_out->nb[1]);
+        ggml_tensor * dst_b = ggml_view_1d(g, head_out_b, nv, v0*head_out_b->nb[0]);
+        ggml_tensor * out_w = ggml_cpy(g, ggml_cont(g, ggml_transpose(g, prod_w)), dst_w);
+        ggml_tensor * out_b = ggml_cpy(g, ggml_reshape_1d(g, prod_b, nv), dst_b);
         ggml_cgraph * gf = ggml_new_graph(g);
-        ggml_build_forward_expand(gf, out);
+        ggml_build_forward_expand(gf, out_w);
+        ggml_build_forward_expand(gf, out_b);
         ggml_gallocr_ptr galloc { ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())) };
         if (!ggml_gallocr_alloc_graph(galloc.get(), gf) || ggml_backend_graph_compute(backend.get(), gf) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("DSpark: the head's product with the Markov correction failed");
@@ -2623,7 +2631,8 @@ void llama_model_base::load_tensors_dspark_head() {
     ggml_backend_synchronize(backend.get());
     LLAMA_LOG_INFO("%s: %12s DSpark head product = %8.2f MiB\n", __func__, ggml_backend_buft_name(buft),
             ggml_backend_buffer_get_size(buffer.get())/1024.0/1024.0);
-    draft->dspark_head_out = head_out;
+    draft->dspark_head_out   = head_out;
+    draft->dspark_head_out_b = head_out_b;
     std::vector<ggml_backend_buffer_ptr> buffers;
     buffers.emplace_back(std::move(buffer));
     pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
@@ -3904,7 +3913,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // llama_memory_hybrid_iswa has no indexer cache, so SWA would silently lose it
                         GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
-                        if (arch == LLM_ARCH_INKLING2 && params.type_s != GGML_TYPE_F32) {
+                        if ((arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) && params.type_s != GGML_TYPE_F32) {
                             LLAMA_LOG_INFO("%s: Inkling 2 keeps its recurrent state in f32 (a conv state, as R): type_s %s is not used\n",
                                     __func__, ggml_type_name(params.type_s));
                         }

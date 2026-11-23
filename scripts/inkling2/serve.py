@@ -50,11 +50,15 @@ MAX_SLOTS = 256  # the engine's sequence limit (LLAMA_MAX_SEQ)
 #     tensor-4-quality  {SOURCE}-Q4_K_M-imatrix.gguf, f16 KV, context 2*SLOT_CONTEXT - a two-session quality box.
 PROFILES = {
     "tensor-4": {"pack": f"{SOURCE}-Q3_K_M-imatrix.gguf", "mmproj": "mmproj-F16.gguf",
-                 "context": 3014656, "slot_context": CODING_SLOT_CONTEXT, "kv": "f16", "cache_ram": 262144,
-                 "checkpoint_every": 32768, "expert_row_limit": 23, "bucket_prefill_kv": True,
+                 "context": 3014656, "slot_context": CODING_SLOT_CONTEXT, "kv": "f16", "swa_kv": "q8_0",
+                 "cache_ram": 262144, "keep_graphs": 32,
+                 "checkpoint_every": 32768, "checkpoint_rows": 2, "checkpoint_ram": 16384,
+                 "expert_row_limit": 23, "bucket_prefill_kv": True,
                  "stable_prefill": False, "sort_expert_rows": True,
-                 "prefix_copy": True, "mean_mask_decode": True, "reduction_route": "host-sliced", "host_owner_rows": True,
-                 "query_first_decode": True, "compact_greedy": True},
+                 "prefix_copy": True, "mean_mask_decode": True, "reduction_route": "host", "host_owner_rows": False,
+                 "query_first_decode": True, "compact_greedy": True,
+                 "kv_runs": True, "packed_prefill": True, "f32_few": True, "moe_fuse": True,
+                 "mmq_tma": True, "l2_persist": True, "ar_copy_capture": False},
 }
 
 
@@ -72,7 +76,7 @@ def arguments(argv=None):
     parser.add_argument("--draft", action=argparse.BooleanOptionalAction,
                         help="Use the paired native DSpark draft (default off; the flag also applies the draft "
                              "layout: context 1572864, ubatch 256, q8_0 target KV)")
-    parser.add_argument("--draft-layout", action="store_true",
+    parser.add_argument("--draft-layout", action=argparse.BooleanOptionalAction,
                         help="Apply the draft layout without a draft: the matched control of a draft A/B")
     parser.add_argument("--draft-model", type=Path, help="An explicit Inkling DSpark GGUF with its own vocabulary tensors")
     parser.add_argument("--draft-depth", type=int, choices=range(1, 8), default=3,
@@ -93,7 +97,8 @@ def arguments(argv=None):
     parser.add_argument("--context", type=int, help="Tokens in the shared pool (default: the profile's)")
     parser.add_argument("--slot-context", type=int,
                         help=f"Maximum input plus generation per session (tensor-4: {CODING_SLOT_CONTEXT}, other profiles: {SLOT_CONTEXT})")
-    parser.add_argument("--kv-cache", choices=["f16", "q8_0"], help="KV cache type (default: the profile's)")
+    parser.add_argument("--kv-cache", choices=["f16", "q8_0", "q4_0"],
+                        help="KV cache type (default: the profile's; q4_0 serves only the dense-path decode today)")
     parser.add_argument("--swa-kv-cache", choices=["f16", "q8_0"],
                         help="Override K and V precision in sliding-window layers (default: follow --kv-cache)")
     parser.add_argument("--attn-mask-bits", action=argparse.BooleanOptionalAction, default=True,
@@ -105,6 +110,8 @@ def arguments(argv=None):
     parser.add_argument("--sort-expert-rows", action=argparse.BooleanOptionalAction,
                         help="Group the 23-token batch by expert for eligible Blackwell Q3_K and Q4_K projections")
     parser.add_argument("--slot-save-path", type=Path, help="Directory for explicit server slot save/restore requests")
+    parser.add_argument("--prefix-bundle", type=Path,
+                        help="Verified shared-prefix KV bundle directory (doc 19); pins checked against pack/template/KV before launch")
     parser.add_argument("--mean-mask-decode", action=argparse.BooleanOptionalAction,
                         help="Try grouped SM120 F16 global attention for 23 decoding sessions with low average KV visibility")
     parser.add_argument("--query-first-decode", action=argparse.BooleanOptionalAction,
@@ -118,8 +125,8 @@ def arguments(argv=None):
     parser.add_argument("--ubatch-size", type=int,
                         help=f"Maximum tokens in one physical microbatch (1..{BATCH_SIZE}, default: {BATCH_SIZE} or {DRAFT_UBATCH_SIZE} with a draft)")
     parser.add_argument("--keep-graphs", "--kept-graphs", type=int, metavar="N",
-                        help="Keep up to N scheduler graphs (1..256) and reuse matching batch shapes across sessions "
-                             "with fixed convolution rows. The default uses the engine's graph limits.")
+                        help="Keep up to N scheduler graphs (0..256; 0 disables, tensor-4 default: 32) and reuse matching "
+                             "batch shapes across sessions with fixed convolution rows.")
     parser.add_argument("--expert-row-limit", type=expert_row_limit, metavar="N|auto",
                         help="Try the SM120 Q3_K/Q4_K/Q5_K routed matrix-vector kernel up to N rows (8..32); "
                              "auto uses the engine's dispatch (tensor-4: 23, otherwise auto)")
@@ -133,6 +140,28 @@ def arguments(argv=None):
                         help="Maximum rollback checkpoints per slot, also retained in RAM snapshots (engine default: 32)")
     parser.add_argument("--checkpoint-every", type=int, metavar="N",
                         help="Also save a checkpoint every N prompt tokens and at a fork (tensor-4: 32768, engine default: 0, off)")
+    parser.add_argument("--checkpoint-rows", type=int, metavar="N",
+                        help="Spare device staging windows for async SWA+recurrent checkpoints, 0..64 (tensor-4: 2, 0 disables)")
+    parser.add_argument("--checkpoint-ram", type=int, metavar="MIB",
+                        help="Live slot checkpoint host RAM cap in MiB (tensor-4: 16384, 0 removes cap)")
+    parser.add_argument("--kv-runs", action=argparse.BooleanOptionalAction,
+                        help="Enable run-addressed global decode and shared-prefix read-once (tensor-4 default: on)")
+    parser.add_argument("--packed-prefill", action=argparse.BooleanOptionalAction,
+                        help="Enable GQA-6x packed relative prefill (tensor-4 default: on)")
+    parser.add_argument("--f32-few", action=argparse.BooleanOptionalAction,
+                        help="Enable custom F32 few-column kernels for router and relative bias table (tensor-4 default: on)")
+    parser.add_argument("--moe-fuse", action=argparse.BooleanOptionalAction,
+                        help="Enable fused MoE router+SITU+weighted-sum decode chain (tensor-4 default: on)")
+    parser.add_argument("--mmq-tma", action=argparse.BooleanOptionalAction,
+                        help="Enable SM120 TMA tile MMQ kernel for K-quant projections (tensor-4 default: on)")
+    parser.add_argument("--l2-persist", action=argparse.BooleanOptionalAction,
+                        help="Pin hot Inkling 2 conv-state rings in persisting L2 on large-L2 cards (tensor-4 default: on)")
+    parser.add_argument("--ar-copy-capture", action=argparse.BooleanOptionalAction,
+                        help="Enable copy-engine whole-step CUDA graph capture with device-side pacing on host route (tensor-4 default: off)")
+    parser.add_argument("--prompt-shapes", type=int, choices=[1, 2, 4, 8, 16, 32], metavar="ROWS",
+                        help="Read prompts apart from decode replies in reusable power-of-two ubatches")
+    parser.add_argument("--prompt-shape-rows", type=int, choices=[64, 128, 256, 512, 1024, 2048], metavar="ROWS",
+                        help="Largest power-of-two prompt ubatch with --prompt-shapes (default: 256)")
     for direction in ("save", "restore"):
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument(f"--{direction}-async", dest=f"{direction}_async", action="store_true", default=True,
@@ -153,7 +182,7 @@ def arguments(argv=None):
                              "reductions feed convolutions that write persistent sequence state)")
     parser.add_argument("--reduction-route", choices=["host", "host-sliced", "engine"],
                         help="host sends reductions on the copy engines through host memory, the route GLM Tensor 4 "
-                             "read fastest on rented hosts. host-sliced stages only owned gather values. engine uses the routes it probes (tensor-4: host-sliced, otherwise host)")
+                             "read fastest on rented hosts. host-sliced stages only owned gather values. engine uses the routes it probes (tensor-4: host, otherwise host)")
     parser.add_argument("--tuned", type=Path, default=TUNED,
                         help="Settings a search kept, by profile; an option given here wins (default: tuned.json beside this file)")
     parser.add_argument("--dry-run", action="store_true")
@@ -167,9 +196,12 @@ def arguments(argv=None):
     args.tuned_env = {name: value for name, value in tuned.items() if not name.startswith("--")}
     profile = PROFILES[args.profile]
     for key, fallback in (("cache_ram", 32768), ("prefix_copy", False), ("mean_mask_decode", False), ("reduction_route", "host"),
-                          ("checkpoint_every", None), ("expert_row_limit", None), ("bucket_prefill_kv", False),
+                          ("checkpoint_every", None), ("checkpoint_rows", 0), ("checkpoint_ram", 0),
+                          ("keep_graphs", 0), ("expert_row_limit", None), ("bucket_prefill_kv", False),
                           ("stable_prefill", False), ("sort_expert_rows", False), ("query_first_decode", False),
-                          ("compact_greedy", False)):
+                          ("compact_greedy", False), ("kv_runs", False), ("packed_prefill", False),
+                          ("f32_few", False), ("moe_fuse", False), ("mmq_tma", False),
+                          ("l2_persist", False), ("ar_copy_capture", False)):
         if getattr(args, key) is None:
             setattr(args, key, profile.get(key, fallback))
     if args.expert_row_limit == "auto":
@@ -195,8 +227,11 @@ def make_plan(args):
             raise ValueError("a draft for a different target requires --draft-model")
         draft = args.packs / DRAFT
     draft_layout = draft is not None or args.draft_layout
+    kv = args.kv_cache or ("q8_0" if draft_layout else profile["kv"])
+    swa_kv = args.swa_kv_cache if args.swa_kv_cache is not None else profile.get("swa_kv")
     slots = args.slots if args.slots is not None else SLOTS
-    default_context = DRAFT_CONTEXT if draft_layout else profile["context"]
+    # Quantized target KV leaves room for the full pool alongside the DSpark draft on CUDA3.
+    default_context = (DRAFT_CONTEXT if kv == "f16" else profile["context"]) if draft_layout else profile["context"]
     context = args.context if args.context is not None else default_context
     slot_context = args.slot_context if args.slot_context is not None else profile.get("slot_context", SLOT_CONTEXT)
     if not 1 <= args.port <= 65535:
@@ -208,8 +243,14 @@ def make_plan(args):
         ubatch_size = DRAFT_UBATCH_SIZE if draft_layout else BATCH_SIZE
     if not 1 <= ubatch_size <= BATCH_SIZE:
         raise ValueError(f"ubatch-size must be 1..{BATCH_SIZE}")
-    if args.keep_graphs is not None and not 1 <= args.keep_graphs <= 256:
-        raise ValueError("keep-graphs must be 1..256")
+    if not 0 <= args.keep_graphs <= 256:
+        raise ValueError("keep-graphs must be 0..256")
+    if not 0 <= args.checkpoint_rows <= 64:
+        raise ValueError("checkpoint-rows must be 0..64")
+    if args.checkpoint_ram < 0 or args.checkpoint_ram > 1048576:
+        raise ValueError("checkpoint-ram must be 0..1048576")
+    if args.prompt_shape_rows is not None and args.prompt_shapes is None:
+        raise ValueError("prompt-shape-rows requires --prompt-shapes")
     if args.expert_row_limit is not None and not 8 <= args.expert_row_limit <= 32:
         raise ValueError("expert-row-limit must be 8..32")
     if not 256 <= slot_context < context:
@@ -228,13 +269,11 @@ def make_plan(args):
         raise ValueError("host must be a nonempty address without control characters")
     server = args.server.expanduser().resolve()
     model = own_path(args.model) if args.model else own_path(args.packs / profile["pack"])
-    kv = args.kv_cache or ("q8_0" if draft_layout else profile["kv"])
-    swa_kv = args.swa_kv_cache or ("f16" if draft_layout else None)
     argv = [str(server), "-m", model]
     if not args.text_only:
         argv += ["--mmproj", own_path(args.mmproj) if args.mmproj else own_path(args.packs / profile.get("mmproj", MMPROJ))]
     # Attention splits by heads (2 KV heads a card), so the caches split with them and are never mirrored
-    argv += ["-ngl", "99", "-sm", "tensor", "-ts", "1,1,1,1", "--jinja", "-fa", "on",
+    argv += ["-ngl", "99", "-sm", "tensor", "-ts", "1,1,1,1", "--jinja", "-fa", "on", "--poll", "0",
              "--cache-type-k", kv, "--cache-type-v", kv,
              "-b", str(BATCH_SIZE), "-ub", str(ubatch_size), "--prompt-step", str(args.prompt_step), "--prompt-chunk", "128"]
     if args.prompt_step_ms is not None:
@@ -267,10 +306,35 @@ def make_plan(args):
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
         # A session ends at slot-context tokens, and the graph reserved at load is sized for sessions that long
         "LLAMA_KV_SEQ_CELLS": str(slot_context),
+        "LLAMA_TOK_EMBD_GPU": "1",
         "LD_LIBRARY_PATH": str(server.parent),
     }
-    if args.slot_save_path:
-        argv += ["--slot-save-path", str(args.slot_save_path.resolve())]
+    slot_save_path = args.slot_save_path
+    if args.prefix_bundle is not None:
+        import importlib.util
+        pa_path = Path(__file__).resolve().parent / "prefix_artifact.py"
+        spec = importlib.util.spec_from_file_location("inkling2_prefix_artifact", pa_path)
+        assert spec is not None and spec.loader is not None
+        prefix_artifact = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prefix_artifact)
+        bundle_dir = args.prefix_bundle.expanduser().resolve()
+        try:
+            _, reasons = prefix_artifact.verify_bundle(
+                bundle_dir,
+                pack_name=Path(model).name,
+                template_sha256=TEMPLATE_SHA256,
+                kv_type=kv,
+                swa_kv_type=swa_kv or kv,
+                max_pool_cells=context,
+            )
+        except prefix_artifact.ArtifactError as exc:
+            raise ValueError(f"prefix-bundle invalid: {exc}") from exc
+        if reasons:
+            raise ValueError("prefix-bundle pin mismatch: " + "; ".join(reasons))
+        if slot_save_path is None:
+            slot_save_path = bundle_dir
+    if slot_save_path:
+        argv += ["--slot-save-path", str(slot_save_path.resolve())]
     if args.prefix_copy:
         env["LLAMA_SLOT_PREFIX_COPY"] = "1"
     if args.cache_ram != 0 and args.save_async:
@@ -291,16 +355,45 @@ def make_plan(args):
         env["LLAMA_INKLING2_COMPACT_GREEDY"] = "1"
     if args.reference_sinks:
         env["LLAMA_INKLING2_SHIFT_SINKS"] = "1"
-    if args.keep_graphs is not None:
-        env.update({"LLAMA_GRAPH_SLOTS": str(args.keep_graphs), "GGML_META_CAPTURE_GRAPHS": str(args.keep_graphs + 4),
+    if args.kv_runs:
+        env["LLAMA_INKLING2_KV_RUNS"] = "1"
+        env["GGML_CUDA_FATTN_REL_RUNS_SHARED"] = "1"
+    if args.packed_prefill:
+        env["GGML_CUDA_FATTN_REL_PACKED_PREFILL"] = "1"
+    if args.f32_few:
+        env["GGML_CUDA_F32_FEW"] = "1"
+    if args.moe_fuse and args.f32_few:
+        env["GGML_CUDA_MOE_FUSE"] = "1"
+    if args.mmq_tma:
+        env["GGML_CUDA_MMQ_TMA"] = "1"
+    if args.l2_persist:
+        env["GGML_CUDA_INKLING2_L2_PERSIST"] = "1"
+    if kv == "q8_0" or swa_kv == "q8_0":
+        env["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"] = "1"
+    if kv == "q4_0" or swa_kv == "q4_0":
+        env["GGML_CUDA_FATTN_REL_DECODE_Q4"] = "1"
+    if args.keep_graphs > 0:
+        env.update({"LLAMA_GRAPH_SLOTS": str(args.keep_graphs),
+                    "GGML_META_CAPTURE_GRAPHS": str(args.keep_graphs + 4 + args.checkpoint_rows),
                     "LLAMA_RS_FIXED_ROWS": "1", "LLAMA_GRAPH_ANY_SEQS": "1",
                     "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000"})
+    if args.checkpoint_rows > 0:
+        env["LLAMA_RS_STAGE_ROWS"] = str(args.checkpoint_rows)
+    if args.checkpoint_ram > 0:
+        env["LLAMA_CHECKPOINT_RAM_MIB"] = str(args.checkpoint_ram)
+    if args.prompt_shapes is not None:
+        env["LLAMA_PROMPT_SHAPES"] = "1"
+        if args.prompt_shapes != 32:
+            env["LLAMA_PROMPT_SHAPE_SMALL"] = str(args.prompt_shapes)
+        if args.prompt_shape_rows is not None:
+            env["LLAMA_PROMPT_SHAPE_ROWS"] = str(args.prompt_shape_rows)
     if args.expert_row_limit is not None:
         env["GGML_CUDA_MMVQ_KQUANT_MMID_MAX"] = str(args.expert_row_limit)
     if args.reduction_route in ("host", "host-sliced"):
         env.update({"GGML_CUDA_ALLREDUCE": "internal", "GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0",
-                    "GGML_CUDA_AR_COPY_THRESHOLD": "1", "GGML_CUDA_AR_COPY_PEER": "0",
-                    "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0"})
+                    "GGML_CUDA_AR_COPY_THRESHOLD": "1", "GGML_CUDA_AR_COPY_PEER": "0"})
+        if args.ar_copy_capture:
+            env["GGML_CUDA_AR_COPY_ENGINE_CAPTURE"] = "1"
     if args.host_owner_rows:
         if args.reduction_route == "engine" or args.reduction_wire != "bf16":
             raise ValueError("host-owner-rows requires a BF16 host or host-sliced route")
@@ -314,6 +407,7 @@ def make_plan(args):
         env["GGML_CUDA_AR_GATHER_HOST_SLICES"] = "1"
     if args.reduction_wire == "q8":
         env["GGML_CUDA_AR_WIRE_Q8"] = "1"
+        env["GGML_CUDA_AR_GATHER_Q8"] = "1"
     return argv, env
 
 

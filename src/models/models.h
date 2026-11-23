@@ -1711,7 +1711,8 @@ struct llama_model_dflash : public llama_model_base {
     ggml_tensor * dspark_norm         = nullptr;
     ggml_tensor * dspark_hidden_out   = nullptr;
     ggml_tensor * dspark_hidden_out_b = nullptr;
-    ggml_tensor * dspark_head_out     = nullptr; // output x [hidden_out | hidden_out_b], made at load (load_tensors_dspark_head)
+    ggml_tensor * dspark_head_out     = nullptr; // output x hidden_out, made at load (load_tensors_dspark_head)
+    ggml_tensor * dspark_head_out_b   = nullptr; // output x hidden_out_b in F32, made at load
 
     void load_hparams_lilicorr(llama_model_loader & ml);
     void load_hparams_dsv4(llama_model_loader & ml);
@@ -2670,8 +2671,17 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * rel_idx[2]  = {};
         int32_t       n_kv_max[2] = {};
         bool          low_mean[2] = {};
-        // the runs of cells the global layers read (LLAMA_INKLING2_KV_RUNS), or nullptr
-        ggml_tensor * kv_runs = nullptr;
+        // the runs of cells the global (0) and window (1) layers read (LLAMA_INKLING2_KV_RUNS), or nullptr
+        ggml_tensor * kv_runs[2]  = {};
+
+        // cached RMS-normalized finished block summaries for attn_res_mix
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> block_norms;
+        ggml_tensor * find_block_norm(ggml_tensor * block) const;
+
+        // last-layer prefill MoE pruning state
+        bool          prune_last_moe = false;
+        int64_t       prune_tail     = 0;
+        ggml_tensor * pruned_out_ids = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -2700,6 +2710,8 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
 
     // indexed by physical layer - core_start
     std::vector<loop_layer> loop_layers;
+
+    uint32_t loop_own_passes() const override { return n_passes; }
 
     // the passes a decode with these graph parameters runs, or an exception for a count this model cannot run
     uint32_t passes_for(const llm_graph_params & params) const;

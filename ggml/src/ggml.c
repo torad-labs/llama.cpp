@@ -5470,13 +5470,29 @@ struct ggml_tensor * ggml_top_k_candidates_bounded(
         int                   n_parts,
         int                   n_vocab,
         bool                  first_nan) {
+    return ggml_top_k_candidates_sample(ctx, a, NULL, k, n_parts, n_vocab, first_nan);
+}
+
+struct ggml_tensor * ggml_top_k_candidates_sample(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * draw_params,
+        int                   k,
+        int                   n_parts,
+        int                   n_vocab,
+        bool                  first_nan) {
     GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
     GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1 && a->ne[0] <= INT32_MAX);
     GGML_ASSERT(k > 0 && n_parts > 0 && n_vocab >= 0 && n_vocab <= a->ne[0]);
+    if (draw_params != NULL) {
+        GGML_ASSERT(draw_params->type == GGML_TYPE_I32 && ggml_is_contiguous(draw_params));
+        GGML_ASSERT(draw_params->ne[0] == 2 && draw_params->ne[1] == a->ne[1] && draw_params->ne[2] == 1 && draw_params->ne[3] == 1);
+    }
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, k, n_parts, a->ne[1]);
     result->op     = GGML_OP_TOP_K_CANDIDATES;
     result->src[0] = a;
+    result->src[1] = draw_params;
     ggml_set_op_params_i32(result, 0, 0); // global column offset, set by the Meta backend
     ggml_set_op_params_i32(result, 1, n_vocab);
     ggml_set_op_params_i32(result, 2, first_nan);
@@ -5529,12 +5545,18 @@ struct ggml_tensor * ggml_attn_res_mix(
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens);
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_i32(result, 2, 0);
     result->op     = GGML_OP_ATTN_RES_MIX;
     result->src[0] = query;
     for (int i = 0; i < n_sources; ++i) {
         result->src[1 + i] = sources[i];
     }
     return result;
+}
+
+void ggml_attn_res_mix_set_normed(struct ggml_tensor * tensor, int32_t n_normed) {
+    GGML_ASSERT(tensor && tensor->op == GGML_OP_ATTN_RES_MIX && n_normed >= 0);
+    ggml_set_op_params_i32(tensor, 2, n_normed);
 }
 
 // ggml_loop_control
@@ -5760,7 +5782,7 @@ void ggml_flash_attn_ext_add_rel_pos(
     GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos));
     GGML_ASSERT(q_pos->ne[0] == q->ne[1] && q_pos->ne[1] == q->ne[3] && q_pos->ne[2] == 1 && q_pos->ne[3] == 1);
     GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_pos));
-    GGML_ASSERT(kv_pos->ne[0] == k->ne[1] && q->ne[3] % kv_pos->ne[1] == 0 && kv_pos->ne[2] == 1 && kv_pos->ne[3] == 1);
+    GGML_ASSERT(kv_pos->ne[0] == k->ne[1] && q->ne[3] % kv_pos->ne[1] == 0 && (kv_pos->ne[2] == 1 || kv_pos->ne[2] == 2) && kv_pos->ne[3] == 1);
 
     a->src[6] = table;
     a->src[7] = q_pos;

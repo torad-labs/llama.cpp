@@ -53,6 +53,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply({"prompt": body["messages"][0]["content"]})
         if self.path == "/tokenize":
             return self.reply({"tokens": list(range(len(body["content"].split())))})
+        failure = os.environ.get("STAND_IN_COMPLETION_STATUS")
+        if failure:  # healthy process, failing completions: the measurement must carry the error, not lose it
+            self.send_response(int(failure))
+            self.end_headers()
+            self.wfile.write(b'{"error":{"message":"the completion endpoint is down"}}')
+            return
         self.send_response(200)
         self.end_headers()
         for n in range(body["n_predict"]):
@@ -146,6 +152,17 @@ class SearchRuns(unittest.TestCase):
         self.assertIn("exited 3", dead[0]["error"])
         self.assertEqual(len(self.trials()), 5)
 
+    def test_a_trial_records_the_settings_it_really_launched_with(self):
+        # the launcher renames its options before the engine sees them (--draft-depth becomes --spec-draft-n-max),
+        # so launched values must come from the launcher's own view, not from the engine command line
+        trials = self.trials()
+        walked = next((trial for trial in trials if trial["settings"].get("--draft-depth") == "5"), None)
+        self.assertIsNotNone(walked, "no trial walked --draft-depth=5")
+        self.assertEqual(walked["launched"]["--draft-depth"], "5")
+        baseline = next(trial for trial in trials if trial["settings"] == {})
+        self.assertEqual(baseline["launched"]["--draft-depth"], "3")   # the launcher's default, not "off"
+        self.assertEqual(baseline["launched"]["--draft"], "on")        # --option=--draft on every trial
+
     def test_a_trial_names_how_much_of_its_drafts_the_target_kept(self):
         self.assertEqual(self.trials()[0]["draft_accepted"], 0.5)
 
@@ -191,6 +208,28 @@ class SearchRuns(unittest.TestCase):
         # the kept settings come from the tuned file alone
         _, env = serve.make_plan(serve.arguments(["--profile", "tensor-4", "--draft", "--tuned", os.devnull]))
         self.assertNotIn("LLAMA_SAMPLE_THREADS", env)
+
+
+class SearchFailingCompletion(unittest.TestCase):
+    """A server that answers /health but fails /completion: the error travels unchanged (no TypeError on a None
+    error, no exit 0 with a null rate), and the search exits 2 with the server's message."""
+
+    def test_a_healthy_server_that_fails_its_completions_exits_2_with_its_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            server = Path(folder) / "llama-server"
+            server.write_text(STAND_IN)
+            server.chmod(0o755)
+            env = {key: value for key, value in os.environ.items() if not key.startswith("MLFLOW_")}
+            env["STAND_IN_LAUNCHES"] = str(Path(folder) / "launches")
+            env["STAND_IN_COMPLETION_STATUS"] = "500"
+            done = subprocess.run([sys.executable, search.__file__, "run", "--baseline", "--profile", "tensor-4",
+                                   "--option=--draft", "--server", str(server), "--port", "18105",
+                                   "--tokens", "8", "--rounds", "1", "--tuned", os.devnull,
+                                   "--out", str(Path(folder) / "out")], env=env, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("gave no rate", done.stderr)
+        self.assertIn("500", done.stderr)
+        self.assertNotIn("Traceback", done.stderr)
 
 
 class SearchLoad(unittest.TestCase):

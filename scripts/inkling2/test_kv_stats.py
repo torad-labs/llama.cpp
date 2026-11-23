@@ -350,13 +350,19 @@ class Parser(unittest.TestCase):
         want = (self.k[0].astype(F32).view(np.uint32) & 0xFFFF0000).view(F32)  # what 8 mantissa bits keep
         np.testing.assert_array_equal(st.read("K", 0, 0, 50).reshape(50, -1), want)
 
+    def test_rotated_on_store_parses_with_the_rotation_reported(self):
+        # a quantized cache stores its values rotated on store; the reader works in that stored domain
+        st = self.parse(build_state(self.k, self.v, n_rot=(128, 0)))
+        self.assertEqual((st.n_rot_k, st.n_rot_v), (128, 0))
+        np.testing.assert_array_equal(st.read("K", 1, 0, 50).reshape(50, -1), self.k[1].astype(F32))  # as stored
+        self.assertEqual(st.info()["n_rot_k"], 128)  # reported by info()
+
     def test_wrong_files_are_refused_with_a_reason(self):
         good = build_state(self.k, self.v)
         cases = [("magic", build_state(self.k, self.v, magic=0x12345678), "not a sequence state"),
                  ("version", build_state(self.k, self.v, version=3), "version 3"),
                  ("transposed", build_state(self.k, self.v, v_trans=1), "transposed"),
-                 ("rotated", build_state(self.k, self.v, n_rot=(128, 0)), "rotated"),
-                 ("q8_0", build_state(self.k, self.v, type_id=8), "not F32, F16 or BF16"),
+                 ("unknown-type", build_state(self.k, self.v, type_id=99), "is not one of f32/f16/bf16/q4_0/q8_0"),
                  ("truncated", good[:len(good) // 2], "ends inside"),
                  ("empty", good[:8], "ends inside")]
         for name, blob, text in cases:
@@ -431,6 +437,58 @@ class Statistics(unittest.TestCase):
                 self.assertAlmostEqual(got["vec_max"], float(norms.max()), places=5)
                 self.assertAlmostEqual(got["vec_min"], float(norms.min()), places=5)
                 self.assertEqual(got["violations"], 0)
+
+    def test_rotated_on_store_state_runs_statistics_and_holds_its_bounds(self):
+        # A deployed quantized cache stores its values rotated (Hadamard on store: K mixes its whole head,
+        # V within groups of values; the real model carries n_rot_k 128 and n_rot_v 64 at head size 128).
+        # An orthonormal rotation preserves per-vector norms, so the bounds hold and the vector-level
+        # statistics match the unrotated state's exactly; per-channel figures do not carry across and are
+        # deliberately not asserted here. The synthetic fixture keeps K-only rotation at its own head size.
+        def hadamard(n):
+            h = np.ones((1, 1), np.float32)
+            while h.shape[0] < n:
+                h = np.kron(h, np.array([[1.0, 1.0], [1.0, -1.0]], np.float32))
+            return h / np.sqrt(float(n))
+
+        kl = self.k.astype(np.float32)                      # (n_layer, cells, heads * head_dim), rows as stored
+        per = kl.shape[-1] // self.h                        # values a head: the rotation mixes one whole head
+        kr3 = kl.reshape(kl.shape[0], kl.shape[1], self.h, per) @ hadamard(per)
+        kr = kr3.reshape(kl.shape).astype(self.k.dtype)
+        blob = build_state(kr, self.v, self.pos, n_rot=(per, 0))
+        st = ks.KVState(write(self.dir.name, "rot.state", blob), HD)
+        rot = ks.collect_stats(st, cfg_for())
+        self.assertEqual((st.n_rot_k, st.n_rot_v), (HD, 0))
+        for li in range(len(rot)):
+            x = kr[li].astype(np.float64).reshape(self.n, self.h, per)  # the stored values are what the reader sees
+            norms = np.linalg.norm(x, axis=2)                           # one vector a cell and head, as everywhere else
+            got = rot[li]["K"]
+            self.assertAlmostEqual(got["vec_max"], float(norms.max()), places=5)
+            self.assertAlmostEqual(got["vec_min"], float(norms.min()), places=5)
+            self.assertEqual(got["n_cells"], self.n)
+            self.assertEqual(got["violations"], 0)
+            self.assertEqual(rot[li]["V"]["violations"], 0)
+
+    def test_eff_dim_rank_limited_and_isotropic(self):
+        # vectors confined to r dims give a participation ratio near r; isotropic gaussian noise gives one far
+        # above any truncation-friendly value at this cell count but below the head size itself.
+        rng = np.random.default_rng(31)
+        r = 4
+        n_layer = 2
+        base_k, base_v = make_kv(rng, n_layer, self.n, self.h)
+        k_low = base_k.astype(np.float32).reshape(n_layer, self.n, self.h, HD)
+        k_low[..., r:] = 0.0                       # every vector lives on the first r channels
+        knorm = np.linalg.norm(k_low, axis=-1, keepdims=True)
+        k_low = (k_low / np.maximum(knorm, 1e-9) * ks.K_NORM_MAX * 0.5).reshape(base_k.shape)
+        low = self.state(k=k_low.astype(np.float16), v=base_v, name="low.state")
+        iso = self.state(name="iso.state")     # distinct files: state() writes one name per call and the second
+                                               # write would otherwise overwrite the first before either is read
+        nl = low.n_layer
+        lo, iso_r = ks.eff_dim_pass(low), ks.eff_dim_pass(iso)
+        for li in range(nl):
+            self.assertLessEqual(lo[li]["K"]["ed_max"], r + 1.0)
+            self.assertEqual(int(round(lo[li]["K"]["n99_mean"])), r)
+            self.assertGreater(iso_r[li]["K"]["ed_min"], 12.0)
+            self.assertLess(iso_r[li]["K"]["ed_mean"], HD)
 
     def test_chunking_does_not_change_the_numbers(self):
         st = self.state()
@@ -698,6 +756,131 @@ class WholeRun(unittest.TestCase):
         self.assertNotIn("sim", res["states"][0])
         self.assertEqual(res["cross_states"], {})
         self.assertNotIn("Format simulation", text)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# quantized rows: an independent encoder (the oracle) against the reader's decoder
+# ---------------------------------------------------------------------------------------------------------------------
+
+def pack_q8_0(vals):
+    """Encode float values as q8_0 blocks; returns uint8 bytes. The engine writes the same layout."""
+    b = vals.reshape(-1, 32).astype(np.float32)
+    d = np.abs(b).max(axis=1) / 127.0
+    df = d.astype("<f2").astype(np.float32)                     # the stored scale is a half-rounded value
+    q = np.clip(np.rint(b / df[:, None]), -128, 127).astype(np.int8)
+    dbits = d.astype("<f2").view(np.uint8).reshape(-1, 2)       # its bits go on disk
+    return np.concatenate([dbits, q.view(np.uint8)], axis=1).reshape(-1)
+
+
+def pack_q4_0(vals):
+    """Encode float values as q4_0 blocks; decoded value i is d * (nibble_i - 8) with ggml's canonical row
+    order: byte j holds value j in its low nibble and value j+16 in its high nibble."""
+    b = vals.reshape(-1, 32).astype(np.float32)
+    d = np.abs(b).max(axis=1) / 7.5                             # keeps rint inside [0, 15] after the +8 shift
+    df = d.astype("<f2").astype(np.float32)
+    q = np.clip(np.rint(b / df[:, None]) + 8, 0, 15).astype(np.uint8)
+    qs = (q[:, :16] | (q[:, 16:] << 4)).astype(np.uint8)
+    dbits = d.astype("<f2").view(np.uint8).reshape(-1, 2)
+    return np.concatenate([dbits, qs], axis=1).reshape(-1)
+
+
+class QuantizedRows(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        rng = np.random.default_rng(97)
+        self.n_layer, self.n, self.h = 2, 60, 2
+        k = rng.standard_normal((self.n_layer, self.n, self.h * HD)) * 6.0
+        v = rng.standard_normal((self.n_layer, self.n, self.h * HD))
+        self.k = k.astype(np.float32) * np.minimum(
+            1.0, ks.K_NORM_MAX / (np.linalg.norm(k.astype(np.float32), axis=-1, keepdims=True) + 1e-6))
+        vh = v.astype(np.float32).reshape(v.shape[0], v.shape[1], self.h, HD)
+        self.v = (vh / np.sqrt((vh ** 2).mean(axis=-1, keepdims=True) + 1e-9)).reshape(v.shape)  # RMS 1 a head,
+        # like the engine's rms_norm before the store: mean over the head's values, not vector L2
+
+    def state_from(self, kb, vb, type_id, name="q.state", n_rot=(0, 0)):
+        blob = build_state(kb.astype(np.uint8), vb.astype(np.uint8), dtype=np.uint8,
+                           type_id=type_id, n_rot=n_rot)
+        return ks.KVState(write(self.dir.name, name, blob), HD)
+
+    def packed_layers(self, arr):  # (L, cells, h*HD) floats -> (L, cells, bytes-per-cell) uint8 of q8_0 blocks
+        rows = []
+        for l in range(arr.shape[0]):
+            flat = pack_q8_0(arr[l])
+            rows.append(flat.reshape(arr.shape[1], -1))
+        return np.stack(rows)
+
+    def byte_layers(self, flats):  # per-layer flat uint8 byte strings -> the same (L, cells, row_bytes) shape
+        return np.stack([b.reshape(self.n, -1) for b in flats])
+
+    def test_q8_0_rows_decode_to_the_encoded_values(self):
+        st = self.state_from(self.packed_layers(self.k), self.packed_layers(self.v), 13)
+        self.assertEqual(st.type_name, "q8_0")
+        for layer in range(self.n_layer):
+            d8 = pack_q8_0(self.k[layer]).reshape(-1, 34)
+            sc = d8[:, :2].copy().view("<f2").astype(np.float32).reshape(-1)   # one f16 scale a block
+            expect_k = (d8[:, 2:].view(np.int8).astype(np.float32) * sc[:, None]).reshape(-1, self.h * HD)
+            got = st.read("K", layer, 0, self.n).reshape(-1)
+            np.testing.assert_allclose(got.reshape(-1), expect_k.reshape(-1), rtol=1e-6, atol=1e-6)
+
+    def test_q4_0_rows_decode_to_the_encoded_values(self):
+        st = self.state_from(self.byte_layers([pack_q4_0(self.k[l]) for l in range(self.n_layer)]),
+                             self.byte_layers([pack_q4_0(self.v[l]) for l in range(self.n_layer)]), 8)
+        self.assertEqual(st.type_name, "q4_0")
+        for layer in range(self.n_layer):
+            d4 = pack_q4_0(self.k[layer]).reshape(-1, 18)
+            sc = d4[:, :2].copy().view("<f2").astype(np.float32).reshape(-1)   # one f16 scale a block
+            q = np.empty((d4.shape[0], 32), np.float32)
+            q[:, :16] = d4[:, 2:] & 0x0F                                       # byte j: value j low,
+            q[:, 16:] = d4[:, 2:] >> 4                                         # value j+16 high
+            expect_k = ((q - 8.0) * sc[:, None]).reshape(-1, self.h * HD)
+            got = st.read("K", layer, 0, self.n).reshape(-1)
+            np.testing.assert_allclose(got.reshape(-1), expect_k.reshape(-1), rtol=1e-6, atol=1e-6)
+
+    def test_q4_0_rows_decode_nibbles_low_then_high(self):
+        # a hand-built block settles byte order without the encoder: scale f16(1.0); under ggml's canonical
+        # q4_0 a byte j holds value j in its low nibble and value j+16 in its high nibble, so the row's first
+        # 16 values ride the low nibbles and values 16-31 the high ones (dequantize_row_q4_0,
+        # quantize_f32_q4_0_block, and the device readers in fattn-rel-{decode,elem}.cuh all agree).
+        rng = np.random.default_rng(5)
+        pa, pb = rng.permutation(16), rng.permutation(16)
+        exp = np.concatenate([pa.astype(np.float32), pb.astype(np.float32)]) - 8.0
+        blk = np.zeros((self.n * self.h, 18), np.uint8)
+        blk[:, 0] = 0x00                                            # f16 1.0 is 0x3C80: little-endian bytes 00 3C
+        blk[:, 1] = 0x3C
+        blk[:, 2:] = (pa | (pb << 4))[None, :]
+        blob_k = np.stack([blk.reshape(self.n, -1)] * self.n_layer)
+        st = self.state_from(blob_k, blob_k, 8)
+        got = st.read("K", 0, 0, self.n).reshape(-1)[:64].reshape(self.h, HD)  # first cell: two heads
+        np.testing.assert_allclose(got[0], exp, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(got[1], exp, rtol=1e-6, atol=1e-6)
+
+    def test_rotated_quantized_state_matches_unrotated_at_vector_level(self):
+        # the deployed pipeline rotates on store before quantizing; orthonormality keeps per-vector norms and
+        # therefore every bound intact across the two bases, which is what the kernel sees either way.
+        def hadamard(nv):
+            m = np.ones((1, 1), np.float32)
+            while m.shape[0] < nv:
+                m = np.kron(m, np.array([[1.0, 1.0], [1.0, -1.0]], np.float32))
+            return m / np.sqrt(float(nv))
+
+        kro = (self.k.astype(np.float32).reshape(self.n_layer, self.n, self.h, HD)
+               @ hadamard(HD)).reshape(self.k.shape)
+        plain = ks.KVState(write(self.dir.name, "p.q8",
+                                 build_state(self.packed_layers(self.k).astype(np.uint8),
+                                             self.packed_layers(self.v).astype(np.uint8),
+                                             dtype=np.uint8, type_id=13)), HD)
+        rot = ks.KVState(write(self.dir.name, "r.q8",
+                               build_state(self.packed_layers(kro).astype(np.uint8),
+                                           self.packed_layers(self.v).astype(np.uint8),
+                                           dtype=np.uint8, type_id=13, n_rot=(HD, 0))), HD)
+        pr, rr = ks.collect_stats(plain, cfg_for()), ks.collect_stats(rot, cfg_for())
+        for li in range(self.n_layer):
+            a, b = pr[li]["K"], rr[li]["K"]
+            self.assertAlmostEqual(a["vec_max"], b["vec_max"], delta=ks.K_NORM_MAX * 0.02)
+            self.assertAlmostEqual(a["vec_min"], b["vec_min"], delta=0.5)
+            self.assertEqual(b["violations"], 0)
+            self.assertEqual(rr[li]["V"]["violations"], 0)
 
 
 if __name__ == "__main__":
