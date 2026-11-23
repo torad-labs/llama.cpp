@@ -1,7 +1,7 @@
 #include "short-conv.cuh"
 
-static __global__ void short_conv_f32(const float * x, const float * w, const float * d, float * y, const int64_t k,
-        const int64_t channels, const int64_t n_t, const int64_t n_s, const int64_t sx1, const int64_t sx2,
+static __global__ void short_conv_f32(const float * x, const float * w, const float * d, const float * res, float * y,
+        const int64_t k, const int64_t channels, const int64_t n_t, const int64_t n_s, const int64_t sx1, const int64_t sx2,
         const int64_t sd1, const int64_t group, const float scale) {
     ggml_cuda_pdl_sync();
     const int64_t c = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
@@ -22,12 +22,14 @@ static __global__ void short_conv_f32(const float * x, const float * w, const fl
                 acc += xc[k - 1 - lag + t]*dt[lag];
             }
         }
-        y[(s*n_t + t)*channels + c] = scale*acc;
+        const int64_t out_idx = (s*n_t + t)*channels + c;
+        const float scaled = __fmul_rn(scale, acc);
+        y[out_idx] = res ? __fadd_rn(res[out_idx], scaled) : scaled;
     }
 }
 
 template<bool dynamic>
-static __global__ void short_conv_4_tiled(const float * x, const float * w, const float * d, float * y,
+static __global__ void short_conv_4_tiled(const float * x, const float * w, const float * d, const float * res, float * y,
         const int64_t channels, const int64_t n_t, const int64_t sx1, const int64_t sx2, const int64_t sd1,
         const int64_t group, const float scale) {
     constexpr int tile_size = 32;
@@ -56,14 +58,16 @@ static __global__ void short_conv_4_tiled(const float * x, const float * w, cons
                     acc += x1*dt[2];
                     acc += x0*dt[3];
                 }
-                tile[i][threadIdx.x] = scale*acc;
+                tile[i][threadIdx.x] = __fmul_rn(scale, acc);
             }
         }
         __syncthreads();
         const int64_t c = c0 + threadIdx.x;
         for (int i = threadIdx.y; i < tile_size; i += blockDim.y) {
             if (c < channels && t0 + i < n_t) {
-                y[(s*n_t + t0 + i)*channels + c] = tile[threadIdx.x][i];
+                const int64_t out_idx = (s*n_t + t0 + i)*channels + c;
+                const float scaled = tile[threadIdx.x][i];
+                y[out_idx] = res ? __fadd_rn(res[out_idx], scaled) : scaled;
             }
         }
         if (t0 + int64_t(gridDim.z)*tile_size < n_t) {
@@ -79,7 +83,7 @@ static __global__ void short_conv_4_tiled(const float * x, const float * w, cons
 template<int K, bool dynamic>
 static __global__ void short_conv_window_f32(const float * past, const int64_t sp0, const int64_t sp1,
         const int64_t sp2, const float * rows, const int64_t sr0, const int64_t sr1, const int64_t sr2,
-        const float * w, const float * d, float * y, float * window, const int64_t channels, const int64_t n_t,
+        const float * w, const float * d, const float * res, float * y, float * window, const int64_t channels, const int64_t n_t,
         const int64_t sd1, const int64_t group, const float scale) {
     ggml_cuda_pdl_sync();
     const int64_t c = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
@@ -116,15 +120,25 @@ static __global__ void short_conv_window_f32(const float * past, const int64_t s
                 acc += v[K - 1 - lag]*dt[lag];
             }
         }
-        y[(s*n_t + t)*channels + c] = scale*acc;
+        const int64_t out_idx = (s*n_t + t)*channels + c;
+        const float scaled = __fmul_rn(scale, acc);
+        y[out_idx] = res ? __fadd_rn(res[out_idx], scaled) : scaled;
     }
 }
 
-void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * residual, ggml_tensor * add_dst, cudaAccessPolicyWindow l2_window) {
+#else
+void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * residual, ggml_tensor * add_dst) {
+#endif
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * w = dst->src[1];
     const ggml_tensor * d = dst->src[2];
-    GGML_ASSERT(ggml_is_contiguous(dst));
+    ggml_tensor * out_t = add_dst ? add_dst : dst;
+    GGML_ASSERT(ggml_is_contiguous(out_t));
+    const float * res_d = residual ? (const float *) residual->data : nullptr;
     const int64_t k = w->ne[0];
     const int64_t channels = dst->ne[0];
     const int64_t n_t = dst->ne[1];
@@ -141,21 +155,25 @@ void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const int64_t sd1 = d ? d->nb[1]/f : 0;
         const int64_t group = d ? channels/(d->ne[0]/k) : 1;
         const float scale = ggml_get_op_params_f32(dst, 0);
+        ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+        lp.l2_window = l2_window;
+#endif
         // PDL: the launch latency hides under the CONCAT's and mat-vecs' tails; the kernel waits for their
         // writes in its body before reading them.
         if (k == 4) {
             auto kernel = d ? short_conv_window_f32<4, true> : short_conv_window_f32<4, false>;
-            ggml_cuda_kernel_launch(kernel, {grid, block, 0, ctx.stream()},
+            ggml_cuda_kernel_launch(kernel, lp,
                 (const float *) past->data, past->nb[0]/f, past->nb[1]/f,
                 past->nb[2]/f, (const float *) rows->data, rows->nb[0]/f, rows->nb[1]/f, rows->nb[2]/f,
-                (const float *) w->data, dp, (float *) dst->data, (float *) win->window->data, channels, n_t,
+                (const float *) w->data, dp, res_d, (float *) out_t->data, (float *) win->window->data, channels, n_t,
                 sd1, group, scale);
         } else {
             auto kernel = d ? short_conv_window_f32<3, true> : short_conv_window_f32<3, false>;
-            ggml_cuda_kernel_launch(kernel, {grid, block, 0, ctx.stream()},
+            ggml_cuda_kernel_launch(kernel, lp,
                 (const float *) past->data, past->nb[0]/f, past->nb[1]/f,
                 past->nb[2]/f, (const float *) rows->data, rows->nb[0]/f, rows->nb[1]/f, rows->nb[2]/f,
-                (const float *) w->data, dp, (float *) dst->data, (float *) win->window->data, channels, n_t,
+                (const float *) w->data, dp, res_d, (float *) out_t->data, (float *) win->window->data, channels, n_t,
                 sd1, group, scale);
         }
         return;
@@ -166,7 +184,7 @@ void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const dim3 grid((channels + 31)/32, n_s, std::min<int64_t>((n_t + 31)/32, 65535));
         auto kernel = d ? short_conv_4_tiled<true> : short_conv_4_tiled<false>;
         ggml_cuda_kernel_launch(kernel, {grid, block, 0, ctx.stream()}, (const float *) x->data, (const float *) w->data,
-            d ? (const float *) d->data : nullptr, (float *) dst->data, channels, n_t, x->nb[1]/f, x->nb[2]/f,
+            d ? (const float *) d->data : nullptr, res_d, (float *) out_t->data, channels, n_t, x->nb[1]/f, x->nb[2]/f,
             d ? d->nb[1]/f : 0, d ? channels/(d->ne[0]/4) : 1, ggml_get_op_params_f32(dst, 0));
         return;
     }
@@ -174,6 +192,6 @@ void ggml_cuda_op_short_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int64_t token_tiles = n_t < 8 ? 1 : (n_t + block.y - 1)/block.y;
     const dim3 grid((channels + block.x - 1)/block.x, n_s, std::min<int64_t>(token_tiles, 65535));
     ggml_cuda_kernel_launch(short_conv_f32, {grid, block, 0, ctx.stream()}, (const float *) x->data, (const float *) w->data,
-        d ? (const float *) d->data : nullptr, (float *) dst->data, k, channels, n_t, n_s, x->nb[1]/f, x->nb[2]/f,
+        d ? (const float *) d->data : nullptr, res_d, (float *) out_t->data, k, channels, n_t, n_s, x->nb[1]/f, x->nb[2]/f,
         d ? d->nb[1]/f : 0, d ? channels/(d->ne[0]/k) : 1, ggml_get_op_params_f32(dst, 0));
 }

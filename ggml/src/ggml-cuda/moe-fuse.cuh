@@ -18,3 +18,15 @@ void ggml_cuda_op_moe_router_topk(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_fwht_siglu_q8(ggml_backend_cuda_context & ctx,
         const ggml_tensor * x, const ggml_tensor * gate, ggml_tensor * dst_f32,
         block_q8_1 * q8_dst, int64_t q8_row_blocks);
+
+enum ggml_cuda_siglu_q8_mode {
+    GGML_CUDA_SIGLU_Q8_NONE    = 0,
+    GGML_CUDA_SIGLU_Q8_MMVQ    = 1,
+    GGML_CUDA_SIGLU_Q8_MMQ_FEW = 2,
+};
+
+// Optional 64/128-wide block FWHT + SIGLU + optional mmvq/mmq_few Q8_1 staging; dst_f32 is null when GLU is elided.
+void ggml_cuda_op_attn_siglu_fuse(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * x, const ggml_tensor * gate, float * dst_f32,
+        int rot_width, int ncols, int64_t tokens,
+        ggml_cuda_siglu_q8_mode q8_mode, ggml_type wo_type, void * q8_dst);

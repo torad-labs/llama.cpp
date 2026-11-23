@@ -83,7 +83,7 @@ struct attn_res_sources {
 // one block a token: the squared sum of each source and its dot with each query, reduced over the block, then the
 // softmax over the sources and the sum of the normalized sources it weights
 template <int n_query>
-static __global__ void attn_res_mix_f32(const attn_res_sources src, const int n_src, const float * query,
+static __global__ void attn_res_mix_f32(const attn_res_sources src, const int n_src, const int n_normed, const float * query,
         const int64_t query_stride, float * dst, const int64_t n_embd, const float scale, const float eps) {
     constexpr int n_val = 1 + n_query; // the squared sum, then the dots
     constexpr int n_warps = ATTN_RES_THREADS/WARP_SIZE;
@@ -97,10 +97,13 @@ static __global__ void attn_res_mix_f32(const attn_res_sources src, const int n_
 
     for (int s = 0; s < n_src; ++s) {
         const float * x = src.data[s] + t*src.stride[s];
+        const bool need_sq = s >= n_normed;
         float v[n_val] = {};
         for (int64_t i = threadIdx.x; i < n_embd; i += ATTN_RES_THREADS) {
             const float xi = x[i];
-            v[0] += xi*xi;
+            if (need_sq) {
+                v[0] += xi*xi;
+            }
 #pragma unroll
             for (int q = 0; q < n_query; ++q) {
                 v[1 + q] += xi*query[q*query_stride + i];
@@ -108,6 +111,9 @@ static __global__ void attn_res_mix_f32(const attn_res_sources src, const int n_
         }
 #pragma unroll
         for (int j = 0; j < n_val; ++j) {
+            if (j == 0 && !need_sq) {
+                continue;
+            }
             const float r = warp_reduce_sum(v[j]);
             if (lane == 0) {
                 partial[s*n_val + j][warp] = r;
@@ -122,13 +128,16 @@ static __global__ void attn_res_mix_f32(const attn_res_sources src, const int n_
         for (int s = 0; s < n_src; ++s) {
             float sq = 0.0f, dot = 0.0f;
             for (int w = 0; w < n_warps; ++w) {
-                sq  += partial[s*n_val][w];
+                if (s >= n_normed) {
+                    sq += partial[s*n_val][w];
+                }
                 dot += partial[s*n_val + 1 + q][w];
             }
-            const float score = scale*dot*rsqrtf(sq/n_embd + eps);
+            const float r = s < n_normed ? 1.0f : rsqrtf(sq/n_embd + eps);
+            const float score = scale*dot*r;
             weight[q][s] = score;
             if (q == 0) {
-                rms[s] = rsqrtf(sq/n_embd + eps);
+                rms[s] = r;
             }
             mx = fmaxf(mx, score);
         }
@@ -172,7 +181,7 @@ static constexpr int ATTN_RES_CACHED_THREADS = 512;
 // Keep the source rows in registers while each query computes its softmax over sources.
 template <int n_query>
 static __global__ __launch_bounds__(ATTN_RES_CACHED_THREADS) void attn_res_mix_4608(
-        const attn_res_sources src, int n_src, const float * query, float * dst, float scale, float eps) {
+        const attn_res_sources src, int n_src, int n_normed, const float * query, float * dst, float scale, float eps) {
     constexpr int n_warps = ATTN_RES_CACHED_THREADS/WARP_SIZE;
     constexpr int n_cols = ATTN_RES_WIDTH/ATTN_RES_CACHED_THREADS;
     static_assert(ATTN_RES_WIDTH % ATTN_RES_CACHED_THREADS == 0, "width must fill each block");
@@ -190,13 +199,16 @@ static __global__ __launch_bounds__(ATTN_RES_CACHED_THREADS) void attn_res_mix_4
             break;
         }
         const float * x = src.data[s] + t*src.stride[s];
+        const bool need_sq = s >= n_normed;
         float v[1 + n_query] = {};
 #pragma unroll
         for (int c = 0; c < n_cols; ++c) {
             const int i = c*ATTN_RES_CACHED_THREADS + threadIdx.x;
             const float xi = x[i];
             saved[s][c] = xi;
-            v[0] += xi*xi;
+            if (need_sq) {
+                v[0] += xi*xi;
+            }
 #pragma unroll
             for (int q = 0; q < n_query; ++q) {
                 v[1 + q] += xi*query[q*ATTN_RES_WIDTH + i];
@@ -204,6 +216,9 @@ static __global__ __launch_bounds__(ATTN_RES_CACHED_THREADS) void attn_res_mix_4
         }
 #pragma unroll
         for (int j = 0; j < 1 + n_query; ++j) {
+            if (j == 0 && !need_sq) {
+                continue;
+            }
             const float sum = warp_reduce_sum(v[j]);
             if (lane == 0) {
                 partial[s][j][warp] = sum;
@@ -217,11 +232,13 @@ static __global__ __launch_bounds__(ATTN_RES_CACHED_THREADS) void attn_res_mix_4
         if (lane < n_src) {
 #pragma unroll
             for (int w = 0; w < n_warps; ++w) {
-                sq  += partial[lane][0][w];
+                if (lane >= n_normed) {
+                    sq += partial[lane][0][w];
+                }
                 dot += partial[lane][1 + warp][w];
             }
         }
-        const float rms = rsqrtf(sq*(1.0f/ATTN_RES_WIDTH) + eps);
+        const float rms = lane < n_normed ? 1.0f : rsqrtf(sq*(1.0f/ATTN_RES_WIDTH) + eps);
         const float score = lane < n_src ? scale*dot*rms : -INFINITY;
         const float prob = expf(score - warp_reduce_max(score));
         const float sum = warp_reduce_sum(prob);
@@ -270,7 +287,7 @@ static __global__ __launch_bounds__(ATTN_RES_CACHED_THREADS) void attn_res_mix_4
 // requested before the PDL wait. The same in a single pass: 1.7 to 3.7 us.
 template <int n_query, int cols>
 static __global__ void __launch_bounds__(ATTN_RES_SPLIT_THREADS) attn_res_mix_split(const attn_res_sources src,
-        const int n_src, const float * query, const int64_t query_stride, float * dst, const int n_embd,
+        const int n_src, const int n_normed, const float * query, const int64_t query_stride, float * dst, const int n_embd,
         const float scale, const float eps, const bool query_first) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     constexpr int n_val = 1 + n_query; // the squared sum, then the dots
@@ -327,10 +344,13 @@ static __global__ void __launch_bounds__(ATTN_RES_SPLIT_THREADS) attn_res_mix_sp
         if (s >= n_src) {
             break;
         }
+        const bool need_sq = s >= n_normed;
         float v[n_val] = {};
 #pragma unroll
         for (int c = 0; c < cols; ++c) {
-            v[0] += x[s][c]*x[s][c];
+            if (need_sq) {
+                v[0] += x[s][c]*x[s][c];
+            }
 #pragma unroll
             for (int q = 0; q < n_query; ++q) {
                 v[1 + q] += x[s][c]*qv[q][c];
@@ -338,6 +358,9 @@ static __global__ void __launch_bounds__(ATTN_RES_SPLIT_THREADS) attn_res_mix_sp
         }
 #pragma unroll
         for (int j = 0; j < n_val; ++j) {
+            if (j == 0 && !need_sq) {
+                continue;
+            }
             const float r = warp_reduce_sum(v[j]);
             if (lane == 0) {
                 partial[s*n_val + j][warp] = r;
@@ -347,19 +370,27 @@ static __global__ void __launch_bounds__(ATTN_RES_SPLIT_THREADS) attn_res_mix_sp
     __syncthreads();
     const int n_sums = n_src*n_val;
     if (threadIdx.x < n_sums) {
+        const int s_idx = threadIdx.x / n_val;
+        const int j_idx = threadIdx.x % n_val;
         float sum = 0.0f;
-        for (int w = 0; w < n_warps; ++w) {
-            sum += partial[threadIdx.x][w];
+        if (j_idx != 0 || s_idx >= n_normed) {
+            for (int w = 0; w < n_warps; ++w) {
+                sum += partial[threadIdx.x][w];
+            }
         }
         block_sums[threadIdx.x] = sum;
     }
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
     cluster.sync();
     if (threadIdx.x < n_sums) {
+        const int s_idx = threadIdx.x / n_val;
+        const int j_idx = threadIdx.x % n_val;
         float sum = 0.0f;
+        if (j_idx != 0 || s_idx >= n_normed) {
 #pragma unroll
-        for (int r = 0; r < ATTN_RES_SPLIT_BLOCKS; ++r) {
-            sum += cluster.map_shared_rank(block_sums, r)[threadIdx.x];
+            for (int r = 0; r < ATTN_RES_SPLIT_BLOCKS; ++r) {
+                sum += cluster.map_shared_rank(block_sums, r)[threadIdx.x];
+            }
         }
         sums[threadIdx.x] = sum;
     }
@@ -371,7 +402,7 @@ static __global__ void __launch_bounds__(ATTN_RES_SPLIT_THREADS) attn_res_mix_sp
     for (int q = warp; q < n_query; q += n_warps) {
         const float sq    = lane < n_src ? sums[lane*n_val]         : 0.0f;
         const float dot   = lane < n_src ? sums[lane*n_val + 1 + q] : 0.0f;
-        const float rms   = rsqrtf(sq/n_embd + eps);
+        const float rms   = lane < n_normed ? 1.0f : rsqrtf(sq/n_embd + eps);
         const float score = lane < n_src ? scale*dot*rms : -INFINITY;
         const float prob  = expf(score - warp_reduce_max(score));
         const float sum   = warp_reduce_sum(prob);
@@ -404,7 +435,7 @@ static __global__ void __launch_bounds__(ATTN_RES_SPLIT_THREADS) attn_res_mix_sp
     }
     asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
 #else
-    GGML_UNUSED_VARS(src, n_src, query, query_stride, dst, n_embd, scale, eps, query_first);
+    GGML_UNUSED_VARS(src, n_src, n_normed, query, query_stride, dst, n_embd, scale, eps, query_first);
     NO_DEVICE_CODE;
 #endif // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
@@ -422,15 +453,18 @@ static int attn_res_split_cols(const int64_t n_embd) {
 }
 
 static bool attn_res_split_usable(const int device, const int64_t n_embd, const int n_query, const int64_t n_tokens) {
-    const int cc = ggml_cuda_info().devices[device].cc;
-    return !attn_res_mix_legacy() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER &&
+    const auto & dev = ggml_cuda_info().devices[device];
+    const int cc = dev.cc;
+    // GB203 (<= 96 SMs) faults on ld.shared::cluster; keep cluster split on GB202 (5090/PRO 6000) and Hopper.
+    const bool dsmem_ok = !(cc == GGML_CUDA_CC_BLACKWELL && dev.nsm <= 96);
+    return !attn_res_mix_legacy() && dsmem_ok && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER &&
         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_HOPPER && n_tokens <= ATTN_RES_SPLIT_MAX_TOKENS &&
         n_query >= 1 && n_query <= ATTN_RES_MAX_QUERY && attn_res_split_cols(n_embd) > 0;
 }
 
 // the cluster is 8 blocks for every shape, so a CUDA graph updated from another shape keeps the right cluster dims
 template <int n_query, int cols>
-static void attn_res_mix_split_launch(const attn_res_sources & src, const int n_src, const float * query,
+static void attn_res_mix_split_launch(const attn_res_sources & src, const int n_src, const int n_normed, const float * query,
         const int64_t query_stride, float * dst, const int n_embd, const int n_tokens, const float scale, const float eps,
         const bool query_first, cudaStream_t stream) {
     const auto kernel  = attn_res_mix_split<n_query, cols>;
@@ -451,18 +485,18 @@ static void attn_res_mix_split_launch(const attn_res_sources & src, const int n_
         attr[cfg.numAttrs].val.programmaticStreamSerializationAllowed = 1;
         ++cfg.numAttrs;
     }
-    CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, src, n_src, query, query_stride, dst, n_embd, scale, eps, query_first));
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, src, n_src, n_normed, query, query_stride, dst, n_embd, scale, eps, query_first));
 }
 
 template <int n_query>
-static void attn_res_mix_split_cuda(const int cols, const attn_res_sources & src, const int n_src, const float * query,
+static void attn_res_mix_split_cuda(const int cols, const attn_res_sources & src, const int n_src, const int n_normed, const float * query,
         const int64_t query_stride, float * dst, const int n_embd, const int n_tokens, const float scale, const float eps,
         const bool query_first, cudaStream_t stream) {
     switch (cols) {
-        case 1: attn_res_mix_split_launch<n_query, 1>(src, n_src, query, query_stride, dst, n_embd, n_tokens, scale, eps, query_first, stream); break;
-        case 2: attn_res_mix_split_launch<n_query, 2>(src, n_src, query, query_stride, dst, n_embd, n_tokens, scale, eps, query_first, stream); break;
-        case 3: attn_res_mix_split_launch<n_query, 3>(src, n_src, query, query_stride, dst, n_embd, n_tokens, scale, eps, query_first, stream); break;
-        case 4: attn_res_mix_split_launch<n_query, 4>(src, n_src, query, query_stride, dst, n_embd, n_tokens, scale, eps, query_first, stream); break;
+        case 1: attn_res_mix_split_launch<n_query, 1>(src, n_src, n_normed, query, query_stride, dst, n_embd, n_tokens, scale, eps, query_first, stream); break;
+        case 2: attn_res_mix_split_launch<n_query, 2>(src, n_src, n_normed, query, query_stride, dst, n_embd, n_tokens, scale, eps, query_first, stream); break;
+        case 3: attn_res_mix_split_launch<n_query, 3>(src, n_src, n_normed, query, query_stride, dst, n_embd, n_tokens, scale, eps, query_first, stream); break;
+        case 4: attn_res_mix_split_launch<n_query, 4>(src, n_src, n_normed, query, query_stride, dst, n_embd, n_tokens, scale, eps, query_first, stream); break;
         default: GGML_ABORT("attn_res_mix: %d columns a thread", cols);
     }
 }
@@ -479,13 +513,14 @@ void ggml_cuda_op_attn_res_mix(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         src.stride[n_src] = x->nb[1]/sizeof(float);
         ++n_src;
     }
-    const int64_t n_embd  = query->ne[0];
-    const int     n_query = query->ne[1];
-    const float   scale   = ggml_get_op_params_f32(dst, 0);
-    const float   eps     = ggml_get_op_params_f32(dst, 1);
-    const int64_t qs      = query->nb[1]/sizeof(float);
-    const float * q       = (const float *) query->data;
-    float *       d       = (float *) dst->data;
+    const int64_t n_embd   = query->ne[0];
+    const int     n_query  = query->ne[1];
+    const float   scale    = ggml_get_op_params_f32(dst, 0);
+    const float   eps      = ggml_get_op_params_f32(dst, 1);
+    const int     n_normed = ggml_get_op_params_i32(dst, 2);
+    const int64_t qs       = query->nb[1]/sizeof(float);
+    const float * q        = (const float *) query->data;
+    float *       d        = (float *) dst->data;
 #ifdef ATTN_RES_SPLIT
     if (attn_res_split_usable(ctx.device, n_embd, n_query, dst->ne[2])) {
         // whether the query is a weight, which no kernel before this one writes
@@ -497,10 +532,10 @@ void ggml_cuda_op_attn_res_mix(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         const int  cols        = attn_res_split_cols(n_embd);
         const int  n_tokens    = dst->ne[2];
         switch (n_query) {
-            case 1: attn_res_mix_split_cuda<1>(cols, src, n_src, q, qs, d, n_embd, n_tokens, scale, eps, query_first, ctx.stream()); break;
-            case 2: attn_res_mix_split_cuda<2>(cols, src, n_src, q, qs, d, n_embd, n_tokens, scale, eps, query_first, ctx.stream()); break;
-            case 3: attn_res_mix_split_cuda<3>(cols, src, n_src, q, qs, d, n_embd, n_tokens, scale, eps, query_first, ctx.stream()); break;
-            case 4: attn_res_mix_split_cuda<4>(cols, src, n_src, q, qs, d, n_embd, n_tokens, scale, eps, query_first, ctx.stream()); break;
+            case 1: attn_res_mix_split_cuda<1>(cols, src, n_src, n_normed, q, qs, d, n_embd, n_tokens, scale, eps, query_first, ctx.stream()); break;
+            case 2: attn_res_mix_split_cuda<2>(cols, src, n_src, n_normed, q, qs, d, n_embd, n_tokens, scale, eps, query_first, ctx.stream()); break;
+            case 3: attn_res_mix_split_cuda<3>(cols, src, n_src, n_normed, q, qs, d, n_embd, n_tokens, scale, eps, query_first, ctx.stream()); break;
+            case 4: attn_res_mix_split_cuda<4>(cols, src, n_src, n_normed, q, qs, d, n_embd, n_tokens, scale, eps, query_first, ctx.stream()); break;
         }
         return;
     }
@@ -510,19 +545,19 @@ void ggml_cuda_op_attn_res_mix(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const bool cache_sources = n_src > 2 || dst->ne[2] <= 512;
     if (cache_sources && n_embd == ATTN_RES_WIDTH && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL) {
         if (n_query == 1) {
-            attn_res_mix_4608<1><<<grid, ATTN_RES_CACHED_THREADS, 0, ctx.stream()>>>(src, n_src, q, d, scale, eps);
+            attn_res_mix_4608<1><<<grid, ATTN_RES_CACHED_THREADS, 0, ctx.stream()>>>(src, n_src, n_normed, q, d, scale, eps);
             return;
         }
         if (n_query == 3) {
-            attn_res_mix_4608<3><<<grid, ATTN_RES_CACHED_THREADS, 0, ctx.stream()>>>(src, n_src, q, d, scale, eps);
+            attn_res_mix_4608<3><<<grid, ATTN_RES_CACHED_THREADS, 0, ctx.stream()>>>(src, n_src, n_normed, q, d, scale, eps);
             return;
         }
     }
     switch (n_query) {
-        case 1: attn_res_mix_f32<1><<<grid, ATTN_RES_THREADS, 0, ctx.stream()>>>(src, n_src, q, qs, d, n_embd, scale, eps); break;
-        case 2: attn_res_mix_f32<2><<<grid, ATTN_RES_THREADS, 0, ctx.stream()>>>(src, n_src, q, qs, d, n_embd, scale, eps); break;
-        case 3: attn_res_mix_f32<3><<<grid, ATTN_RES_THREADS, 0, ctx.stream()>>>(src, n_src, q, qs, d, n_embd, scale, eps); break;
-        case 4: attn_res_mix_f32<4><<<grid, ATTN_RES_THREADS, 0, ctx.stream()>>>(src, n_src, q, qs, d, n_embd, scale, eps); break;
+        case 1: attn_res_mix_f32<1><<<grid, ATTN_RES_THREADS, 0, ctx.stream()>>>(src, n_src, n_normed, q, qs, d, n_embd, scale, eps); break;
+        case 2: attn_res_mix_f32<2><<<grid, ATTN_RES_THREADS, 0, ctx.stream()>>>(src, n_src, n_normed, q, qs, d, n_embd, scale, eps); break;
+        case 3: attn_res_mix_f32<3><<<grid, ATTN_RES_THREADS, 0, ctx.stream()>>>(src, n_src, n_normed, q, qs, d, n_embd, scale, eps); break;
+        case 4: attn_res_mix_f32<4><<<grid, ATTN_RES_THREADS, 0, ctx.stream()>>>(src, n_src, n_normed, q, qs, d, n_embd, scale, eps); break;
         default: GGML_ABORT("attn_res_mix: %d queries", n_query);
     }
 }

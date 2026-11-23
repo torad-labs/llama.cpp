@@ -40,9 +40,17 @@ template<> struct fattn_rel_elem<GGML_TYPE_F16> {
     static __device__ __forceinline__ raw load(const char * row, const int part) {
         raw r;
         const int4 * src = (const int4 *) row + 8*part;
+        const uint64_t policy = ggml_cuda_l2_policy_evict_first();
+        if ((((uintptr_t) src) & 31u) == 0) {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            r.x[j] = src[j];
+            for (int j = 0; j < 4; ++j) {
+                ggml_cuda_ldg_256_evict_first(src + 2*j, policy, r.x[2*j + 0], r.x[2*j + 1]);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                r.x[j] = ggml_cuda_ldg_128_evict_first(src + j, policy);
+            }
         }
         return r;
     }
@@ -64,9 +72,10 @@ template<> struct fattn_rel_elem<GGML_TYPE_Q8_0> {
     static __device__ __forceinline__ raw load(const char * row, const int part) {
         raw r;
         const int2 * src = (const int2 *) row + 8*part;
+        const uint64_t policy = ggml_cuda_l2_policy_evict_first();
 #pragma unroll
         for (int j = 0; j < 9; ++j) {
-            r.x[j] = src[j];
+            r.x[j] = ggml_cuda_ldg_64_evict_first(src + j, policy);
         }
         return r;
     }
@@ -114,9 +123,10 @@ template<> struct fattn_rel_elem<GGML_TYPE_Q4_0> {
     static __device__ __forceinline__ raw load(const char * row, const int part) {
         raw r;
         const int2 * src = (const int2 *) row + 4*part; // part p's five words cover row bytes 32p to 32p + 39
+        const uint64_t policy = ggml_cuda_l2_policy_evict_first();
 #pragma unroll
         for (int j = 0; j < 5; ++j) {
-            r.x[j] = src[j];
+            r.x[j] = ggml_cuda_ldg_64_evict_first(src + j, policy);
         }
         return r;
     }
@@ -170,9 +180,15 @@ template<> struct fattn_rel_elem<GGML_TYPE_F8_E4M3> {
     static __device__ __forceinline__ raw load(const char * row, const int part) {
         raw r;
         const int4 * src = (const int4 *) row + 4*part;
+        const uint64_t policy = ggml_cuda_l2_policy_evict_first();
+        if ((((uintptr_t) src) & 31u) == 0) {
+            ggml_cuda_ldg_256_evict_first(src + 0, policy, r.x[0], r.x[1]);
+            ggml_cuda_ldg_256_evict_first(src + 2, policy, r.x[2], r.x[3]);
+        } else {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            r.x[j] = src[j];
+            for (int j = 0; j < 4; ++j) {
+                r.x[j] = ggml_cuda_ldg_128_evict_first(src + j, policy);
+            }
         }
         return r;
     }

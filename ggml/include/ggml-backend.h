@@ -527,6 +527,12 @@ extern "C" {
     GGML_API bool ggml_backend_meta_read_rows(
         struct ggml_tensor * tensor, size_t offset, size_t size, ggml_backend_meta_rows_fn fn, void * userdata);
 
+    // Copy contiguous rows [src_row, src_row + n_rows) of src to [dst_row, dst_row + n_rows) of dst on device.
+    // Works for both identically split meta tensors and simple backend tensors.
+    GGML_API bool ggml_backend_meta_copy_rows_async(
+        ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst,
+        int64_t src_row, int64_t dst_row, int64_t n_rows);
+
     //
     // Utils
     //

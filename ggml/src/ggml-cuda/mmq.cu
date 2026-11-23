@@ -273,9 +273,13 @@ static void ggml_cuda_mul_mat_q_impl(
             // 8 used) the measured best at 1024 and 512 tokens a ubatch, J 48 and 32. GGML_CUDA_MMQ_MOE_TILES_LEGACY:
             // the width for n_tokens columns.
             if (!ggml_cuda_mmq_moe_tiles_legacy()) {
+                static const bool kquant_spread_legacy = ggml_env_switch("GGML_CUDA_MMQ_KQUANT_SPREAD_LEGACY");
+                const bool kquant_bw = !kquant_spread_legacy && cc == GGML_CUDA_CC_BLACKWELL &&
+                    (src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K);
                 const int64_t n_experts = n_experts_total > 0 ? n_experts_total : ne02;
                 const double  mean   = double(ne12*n_expert_used) / double(n_experts);
-                const int64_t spread = int64_t(std::ceil(mean + 3.0*std::sqrt(mean)));
+                const double  sigma  = kquant_bw ? 2.0 : 3.0;
+                const int64_t spread = int64_t(std::ceil(mean + sigma*std::sqrt(mean)));
                 const int64_t ncols  = ggml_cuda_mmq_moe_ncols() > 0 ? ggml_cuda_mmq_moe_ncols() : spread;
                 ncols_opt = std::min({ne12, int64_t(128), ncols});
             }

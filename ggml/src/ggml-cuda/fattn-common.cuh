@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "ggml-attn-mask.h"
 
 #include <cstdint>
 
@@ -24,6 +25,11 @@ struct fattn_rel_pos {
     const float   * table = nullptr; // nullptr: no bias
     const int32_t * q_pos = nullptr;
     const int32_t * kv_pos = nullptr;
+    const char    * hot_kv = nullptr;
+    const int32_t * hot_map = nullptr;
+    size_t hot_nb1 = 0;
+    size_t hot_nb2 = 0;
+    size_t hot_nb3 = 0;
     int32_t extent = 0;
     int32_t sink_stride = 0;         // query-specific sinks, in floats per row
     int32_t s_head = 0;              // table strides in floats
@@ -46,6 +52,9 @@ struct fattn_rel_pos_head {
     const float   * shift = nullptr;
     const int32_t * q_pos = nullptr;
     const int32_t * kv_pos = nullptr;
+    const char    * hot_kv = nullptr;
+    const int32_t * hot_map = nullptr;
+    size_t hot_nb1 = 0;
     int32_t extent = 0;
     int32_t sink_stride = 0;
     int32_t s_row = 0;
@@ -1596,6 +1605,34 @@ struct fattn_sparse_launch {
     const int32_t * counts      = nullptr; // the rows' counts, with indices
 };
 
+static __global__ void fattn_rel_hot_overlay_f16(
+        half * __restrict__ k_f16, half * __restrict__ v_f16,
+        const char * __restrict__ hot_kv, const int32_t * __restrict__ hot_map,
+        const int64_t dk, const int64_t n_kv, const int64_t map_streams, const size_t map_nb1,
+        const size_t k_nb1, const size_t k_nb2, const size_t k_nb3,
+        const size_t v_nb1, const size_t v_nb2, const size_t v_nb3,
+        const size_t hot_nb1, const size_t hot_nb2, const size_t hot_nb3) {
+    const int64_t cell = int64_t(blockIdx.x)*blockDim.y + threadIdx.y;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    if (cell >= n_kv) {
+        return;
+    }
+    const int32_t * map = (const int32_t *) ((const char *) hot_map + (strm % map_streams)*map_nb1);
+    const int32_t hslot = map[cell];
+    if (hslot < 0) {
+        return;
+    }
+    const half * hk = (const half *) (hot_kv + (2*int64_t(hslot) + 0)*hot_nb1 + head*hot_nb2 + strm*hot_nb3);
+    const half * hv = (const half *) (hot_kv + (2*int64_t(hslot) + 1)*hot_nb1 + head*hot_nb2 + strm*hot_nb3);
+    half * dk_dst = k_f16 ? (half *) ((char *) k_f16 + cell*k_nb1 + head*k_nb2 + strm*k_nb3) : nullptr;
+    half * dv_dst = v_f16 ? (half *) ((char *) v_f16 + cell*v_nb1 + head*v_nb2 + strm*v_nb3) : nullptr;
+    for (int64_t d = threadIdx.x; d < dk; d += blockDim.x) {
+        if (dk_dst) { dk_dst[d] = hk[d]; }
+        if (dv_dst) { dv_dst[d] = hv[d]; }
+    }
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1616,7 +1653,7 @@ void launch_fattn(
     const ggml_tensor * sinks   = dst->src[9] ? dst->src[9] : dst->src[4];
     const ggml_tensor * direct = dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE ? dst->src[5] : nullptr;
     const ggml_tensor * sparse_shape = direct ? direct : mask;
-    const ggml_tensor * kv_rows = dst->op == GGML_OP_FLASH_ATTN_EXT ? dst->src[5] : nullptr; // src[5] of a sparse op is its indices
+    const ggml_tensor * kv_rows = ggml_flash_attn_ext_get_kv_rows(dst);
 
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
@@ -1774,6 +1811,22 @@ void launch_fattn(
                 nb23 = V->ne[2] * nb22;
             }
             V_data = (char *) V_f16;
+        }
+    }
+
+    const ggml_tensor * hot_kv = ggml_flash_attn_ext_get_hot_kv(KQV);
+    if (hot_kv && KQV->src[8] && KQV->src[8]->ne[2] == 2 && (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16)) {
+        const int32_t * hot_map = (const int32_t *) ((const char *) KQV->src[8]->data + KQV->src[8]->nb[2]);
+        half * k_dst = (need_f16_K && K->type != GGML_TYPE_F16 && f16_extra.K != 0) ? (half *) f16_extra.K : nullptr;
+        half * v_dst = (need_f16_V && V->type != GGML_TYPE_F16 && f16_extra.V != 0) ? (half *) f16_extra.V : nullptr;
+        if (k_dst || v_dst) {
+            const dim3 threads(32, 4);
+            const dim3 blocks((K->ne[1] + threads.y - 1)/threads.y, K->ne[2], K->ne[3]);
+            fattn_rel_hot_overlay_f16<<<blocks, threads, 0, main_stream>>>(
+                k_dst, v_dst, (const char *) hot_kv->data, hot_map,
+                K->ne[0], K->ne[1], KQV->src[8]->ne[1], KQV->src[8]->nb[1],
+                nb11, nb12, nb13, nb21, nb22, nb23,
+                hot_kv->nb[1], hot_kv->nb[2], hot_kv->nb[3]);
         }
     }
 
@@ -2044,6 +2097,13 @@ void launch_fattn(
         rel.s_q_pos  = q_pos->nb[1] / sizeof(int32_t);
         rel.s_kv_pos = kv_pos->nb[1] / sizeof(int32_t);
         rel.ne81     = kv_pos->ne[1];
+        if (hot_kv && kv_pos->ne[2] == 2 && !need_f16_K && !need_f16_V) {
+            rel.hot_kv  = (const char *) hot_kv->data;
+            rel.hot_map = (const int32_t *) ((const char *) kv_pos->data + kv_pos->nb[2]);
+            rel.hot_nb1 = hot_kv->nb[1];
+            rel.hot_nb2 = hot_kv->nb[2];
+            rel.hot_nb3 = hot_kv->nb[3];
+        }
     }
 
     GGML_ASSERT(block_dim.x % warp_size == 0);

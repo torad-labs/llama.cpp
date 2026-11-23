@@ -154,6 +154,78 @@ static __device__ __forceinline__ void ggml_cuda_prefetch_l2(const void * p) {
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// SM80+ L2 eviction policy helpers for streamed weights and cold KV reads.
+static __device__ __forceinline__ uint64_t ggml_cuda_l2_policy_evict_first() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    uint64_t policy;
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    return policy;
+#else
+    return 0;
+#endif
+}
+
+static __device__ __forceinline__ int2 ggml_cuda_ldg_64_evict_first(const int2 * p, const uint64_t policy) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    int2 out;
+    asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
+        : "=r"(out.x), "=r"(out.y) : "l"(p), "l"(policy));
+    return out;
+#else
+    GGML_UNUSED(policy);
+    return *p;
+#endif
+}
+
+static __device__ __forceinline__ int4 ggml_cuda_ldg_128_evict_first(const int4 * p, const uint64_t policy) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    int4 out;
+    asm volatile("ld.global.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
+        : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w) : "l"(p), "l"(policy));
+    return out;
+#else
+    GGML_UNUSED(policy);
+    return *p;
+#endif
+}
+
+// SM120 native 256-bit global load/store (requires 32-byte aligned pointer).
+static __device__ __forceinline__ void ggml_cuda_ldg_256_evict_first(const void * p, const uint64_t policy, int4 & lo, int4 & hi) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
+    asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
+        : "=r"(lo.x), "=r"(lo.y), "=r"(lo.z), "=r"(lo.w), "=r"(hi.x), "=r"(hi.y), "=r"(hi.z), "=r"(hi.w)
+        : "l"(p), "l"(policy));
+#else
+    const int4 * p4 = (const int4 *) p;
+    lo = ggml_cuda_ldg_128_evict_first(p4 + 0, policy);
+    hi = ggml_cuda_ldg_128_evict_first(p4 + 1, policy);
+#endif
+}
+
+static __device__ __forceinline__ void ggml_cuda_ldg_256(const void * p, int4 & lo, int4 & hi) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
+    asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+        : "=r"(lo.x), "=r"(lo.y), "=r"(lo.z), "=r"(lo.w), "=r"(hi.x), "=r"(hi.y), "=r"(hi.z), "=r"(hi.w)
+        : "l"(p));
+#else
+    const int4 * p4 = (const int4 *) p;
+    lo = p4[0];
+    hi = p4[1];
+#endif
+}
+
+static __device__ __forceinline__ void ggml_cuda_stg_256(void * p, const int4 lo, const int4 hi) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
+    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+        :: "l"(p), "r"(lo.x), "r"(lo.y), "r"(lo.z), "r"(lo.w), "r"(hi.x), "r"(hi.y), "r"(hi.z), "r"(hi.w)
+        : "memory");
+#else
+    int4 * p4 = (int4 *) p;
+    p4[0] = lo;
+    p4[1] = hi;
+#endif
+}
+
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
 #if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaGridDependencySynchronize();
@@ -2368,6 +2440,27 @@ struct ggml_cuda_graph_key_hash {
     }
 };
 
+// Inkling 2's fused MoE chain (fuse-moe.cu, plan 17 C3): one evaluation's scratch and the hand-off from the chain launch
+// to the expert products it feeds. The graph runs its layers in order, so one set of buffers serves them all.
+struct ggml_cuda_moe_fuse_scratch {
+    char *          q8_cur          = nullptr; // the chain's q8_1 copy of the expert input
+    block_q8_1 *    q8_glu          = nullptr; // the gate/up launch's q8_1 copy of the GLU output
+    int32_t *       routes          = nullptr; // the sorted routes of the ids tensor
+    int32_t *       local_ids       = nullptr; // [n_used, n_tokens] local expert ids in [0, count) or -1
+    unsigned int *  flag            = nullptr; // the chain's arrival counter, zero before each launch
+    int64_t         n_tokens        = 0;
+    int64_t         n_used          = 0;
+    int32_t         local_ids_first = 0;
+    int32_t         local_ids_count = 0;
+    const void *    q8_cur_src      = nullptr; // the tensor q8_cur holds, while a gate/up launch may read it
+    const void *    q8_glu_src      = nullptr; // the tensor q8_glu holds, while the down launch may read it
+    const int32_t * routes_ids      = nullptr; // the ids tensor the routes were sorted from
+    const int32_t * local_ids_src   = nullptr; // ids->data while gate/up may consume local_ids
+    const int32_t * down_local_ids  = nullptr; // ids->data while down may consume local_ids
+    bool            tma_chain       = false;   // chain skipped q8_cur and routes for TMA gate/up
+    bool            tma_glu         = false;   // gate/up ran via TMA, so q8_glu was not materialized yet
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -2641,6 +2734,7 @@ struct ggml_backend_cuda_context {
     // ring launch there reading the same ids reads them before its dependency wait (mmvq-moe.cu). A graph's tensor is
     // written once, and ggml-alloc hands its bytes on only past its last reader.
     const ggml_tensor * mmvq_moe_ids[GGML_CUDA_MAX_STREAMS] = {};
+    ggml_cuda_moe_fuse_scratch moe_fuse; // Inkling 2's fused MoE chain (fuse-moe.cu), one graph evaluation's
     ggml_cuda_ssm_conv_ab_slots ssm_conv_ab_slots;
     ggml_cuda_hc_front_tickets hc_front_tickets;
     ggml_cuda_route_stats route_stats;

@@ -44,6 +44,8 @@ static inline bool fattn_fp8_accum() {
     return on;
 }
 
+static constexpr int FATTN_FP8_MAX_PARTS = 256;
+
 #if defined(BLACKWELL_MMA_AVAILABLE)
 
 // One e4m3 value: value = code * 2^(sf - 127). sf 0 with code 0 is exact zero.
@@ -248,7 +250,8 @@ __device__ __forceinline__ uint32_t fattn_fp8_swizzle(uint32_t row, uint32_t col
 
 // A warp's own fold scratch: the 16-row x 64-B A image, the 8-row x 64-B B image (also the scale table's
 // 32 x 16 B span), and the four scale words the block sum leaves for the MMAs to load.
-struct alignas(16) fattn_fp8_fold_stage {
+// 64-byte alignment ensures every warp's stage[warp].a starts on a 64-byte boundary for swizzled XOR addressing.
+struct alignas(64) fattn_fp8_fold_stage {
     uint8_t  a[16 * 64];
     uint8_t  b[8 * 64];
     uint32_t sf[4];
@@ -301,12 +304,12 @@ __device__ __forceinline__ fattn_fp8_two fattn_fp8_fold32(uint32_t slot, int lan
     const uint32_t a_base = (uint32_t) __cvta_generic_to_shared(s.a);
     const uint32_t b_base = (uint32_t) __cvta_generic_to_shared(s.b);
     const uint32_t sf_addr = (uint32_t) __cvta_generic_to_shared(s.sf);
-    const uint32_t a_addr = a_base + fattn_fp8_swizzle<64>((uint32_t) (lane % 16), (uint32_t) (lane / 16));
+    const uint32_t a_off = fattn_fp8_swizzle<64>((uint32_t) (lane % 16), (uint32_t) (lane / 16));
     const uint32_t b_addr = b_base + fattn_fp8_swizzle<64>((uint32_t) (lane % 8), (uint32_t) (lane / 8));
 
     uint32_t a0[4], a1[4], b01[4];
-    fattn_fp8_ldmatrix4(a0, a_addr);
-    fattn_fp8_ldmatrix4(a1, a_addr ^ 32u);   // the row's other K32 block: the lo codes at bytes 32..63
+    fattn_fp8_ldmatrix4(a0, a_base + a_off);
+    fattn_fp8_ldmatrix4(a1, a_base + (a_off ^ 32u));   // the row's other K32 block: the lo codes at bytes 32..63
     fattn_fp8_ldmatrix4(b01, b_addr);
 
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -320,22 +323,28 @@ __device__ __forceinline__ fattn_fp8_two fattn_fp8_fold32(uint32_t slot, int lan
     return fattn_fp8_encode_two(__shfl_sync(0xFFFFFFFFu, c[0], 0));
 }
 
-// The element fold: n two-term slot words of ONE element (n <= 256: streams, slices, partial banks),
-// folded in groups of 32 - each group's sum exits two-term into lane `group` - then the retained group
-// sums fold once more, one exit. The caller stages every warp on its own scratch and passes its lane.
-// Lanes past n feed the exact zero pair.
-__device__ __forceinline__ fattn_fp8_two fattn_fp8_fold_slots(
-        const uint32_t * slots, int n, int lane, fattn_fp8_fold_stage & s) {
+// One partial scaled by a f32 weight (the merge's per-stream softmax factor): the product enters the fold
+// as a fresh two-term pair. A product is not an accumulation, so this is a plain multiply and one encode.
+__device__ __forceinline__ uint32_t fattn_fp8_scale_slot(uint32_t slot, float w) {
+    const fattn_fp8_two p = fattn_fp8_slot_unpack(slot);
+    const float x = fattn_fp8_decode(p.hi) + fattn_fp8_decode(p.lo);
+    return fattn_fp8_slot_pack(fattn_fp8_encode_two(w * x));
+}
+
+// The element fold over lane-supplied group slots: lane_value(g) is the lane's slot of group g (the merge
+// scales each partial first, so it cannot read a plane). Groups of 32, each group's sum exiting two-term
+// into lane `group`, then the retained group sums once more, one exit. n <= 256.
+template <typename LaneValue>
+__device__ __forceinline__ fattn_fp8_two fattn_fp8_fold_groups(
+        int n, int lane, fattn_fp8_fold_stage & s, LaneValue lane_value) {
     const int groups = (n + FATTN_FP8_GROUP - 1) / FATTN_FP8_GROUP;
     if (groups > FATTN_FP8_GROUPS_MAX) {
         __trap();   // the two-round fold holds 256 partials; a wider bank is a contract change
     }
-    const uint32_t zero = fattn_fp8_slot_pack(fattn_fp8_zero_two());
     fattn_fp8_two group = fattn_fp8_zero_two();
     fattn_fp8_two retained = fattn_fp8_zero_two();
     for (int g = 0; g < groups; ++g) {
-        const int i = g * FATTN_FP8_GROUP + lane;
-        group = fattn_fp8_fold32(i < n ? slots[i] : zero, lane, s);
+        group = fattn_fp8_fold32(lane_value(g), lane, s);
         if (lane == g) {
             retained = group;
         }
@@ -345,6 +354,17 @@ __device__ __forceinline__ fattn_fp8_two fattn_fp8_fold_slots(
         return group;
     }
     return fattn_fp8_fold32(fattn_fp8_slot_pack(retained), lane, s);
+}
+
+// The same fold over a plane of slot words: slots[i] is partial i of the element. The caller stages every
+// warp on its own scratch and passes its lane. Lanes past n feed the exact zero pair.
+__device__ __forceinline__ fattn_fp8_two fattn_fp8_fold_slots(
+        const uint32_t * slots, int n, int lane, fattn_fp8_fold_stage & s) {
+    const uint32_t zero = fattn_fp8_slot_pack(fattn_fp8_zero_two());
+    return fattn_fp8_fold_groups(n, lane, s, [&](int g) {
+        const int i = g * FATTN_FP8_GROUP + lane;
+        return i < n ? slots[i] : zero;
+    });
 }
 
 // ── the one-hot per-term fold ────────────────────────────────────────────────────────────────────────────

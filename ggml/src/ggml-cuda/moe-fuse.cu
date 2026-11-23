@@ -1,4 +1,6 @@
 #include "moe-fuse.cuh"
+#include "mmq.cuh"
+#include "quantize.cuh"
 
 #include <cmath>
 
@@ -34,9 +36,12 @@ struct moe_router_norm_args {
 };
 
 template <int n_expert, bool has_bias>
-__global__ void moe_router_topk_cuda(const float * cur, const float * router, int32_t * ids, float * weights,
-                                     const float * bias, float * logits_scratch, unsigned int * flags,
-                                     const int n_embd, const int n_used, const moe_router_norm_args norm) {
+__global__ void moe_router_topk_cuda(const float * cur, const float * router,
+                                     int32_t * ids, float * weights,
+                                     const float * bias, float * logits_scratch,
+                                     unsigned int * flags,
+                                     const int n_embd, const int n_used, const int ids_stride,
+                                     const moe_router_norm_args norm) {
     constexpr int chunks_per_token = n_expert / MOE_ROUTER_CHUNK;
 
     ggml_cuda_pdl_sync();
@@ -136,7 +141,7 @@ __global__ void moe_router_topk_cuda(const float * cur, const float * router, in
         }
     }
 
-    ids     += (int64_t) t * n_expert;
+    ids     += (int64_t) t * ids_stride;
     weights += (int64_t) t * n_used;
 
     float wt_sum = 0.f;
@@ -241,13 +246,16 @@ void ggml_cuda_op_moe_router_topk(ggml_backend_cuda_context & ctx,
         const ggml_tensor * cur, const ggml_tensor * router, ggml_tensor * ids, ggml_tensor * weights,
         const ggml_tensor * bias, bool with_norm, bool norm_eps, float clamp_val, float scale_val) {
     GGML_ASSERT(cur->type == GGML_TYPE_F32 && router->type == GGML_TYPE_F32);
-    GGML_ASSERT(ids->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == ids->ne[0] && weights->ne[2] == cur->ne[1] && ggml_is_contiguous(weights));
 
     constexpr int n_expert = 128;
 
-    const int n_embd   = (int) router->ne[0];
-    const int n_tokens = (int) cur->ne[1];
-    const int n_used   = (int) weights->ne[0];
+    const int n_embd     = (int) router->ne[0];
+    const int n_tokens   = (int) cur->ne[1];
+    const int n_used     = (int) ids->ne[0];
+    const int ids_stride = (int) (ids->nb[1] / sizeof(int32_t));
+    GGML_ASSERT(n_used >= 1 && n_used <= n_expert && ids_stride >= n_used);
 
     constexpr int chunks_per_token = n_expert / MOE_ROUTER_CHUNK;
 
@@ -268,12 +276,12 @@ void ggml_cuda_op_moe_router_topk(ggml_backend_cuda_context & ctx,
         ggml_cuda_kernel_launch(moe_router_topk_cuda<n_expert, true>, launch_params,
             (const float *) cur->data, (const float *) router->data, (int32_t *) ids->data,
             (float *) weights->data, (const float *) bias->data, logits_scratch, flags,
-            n_embd, n_used, norm);
+            n_embd, n_used, ids_stride, norm);
     } else {
         ggml_cuda_kernel_launch(moe_router_topk_cuda<n_expert, false>, launch_params,
             (const float *) cur->data, (const float *) router->data, (int32_t *) ids->data,
             (float *) weights->data, (const float *) nullptr, logits_scratch, flags,
-            n_embd, n_used, norm);
+            n_embd, n_used, ids_stride, norm);
     }
 }
 
@@ -430,4 +438,277 @@ void ggml_cuda_op_fwht_siglu_q8(ggml_backend_cuda_context & ctx,
             GGML_ABORT("the matcher only takes block-path widths");
     }
 #undef MOE_FWHT_SIGLU_CASE
+}
+
+// One warp computes 128 channels in registers (two 64-wide or one 128-wide FWHT block, or unrotated) before any store.
+template <int rot_width>
+static __device__ __forceinline__ void attn_siglu_eval_128(
+        const float * x_base, const float * gate_base, const float scale, float (&reg)[4]) {
+    static_assert(rot_width == 0 || rot_width == 64 || rot_width == 128, "invalid rot_width");
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    float g[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float xv = x_base[j * WARP_SIZE + lane];
+        reg[j] = rot_width > 0 ? xv * scale : xv;
+        g[j]   = gate_base[j * WARP_SIZE + lane];
+    }
+
+    if constexpr (rot_width > 0) {
+#pragma unroll
+        for (int h = 1; h < WARP_SIZE; h *= 2) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float val  = reg[j];
+                const float val2 = ggml_cuda_shfl_xor(val, h, WARP_SIZE);
+                reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 4; j += 2) {
+            const float x0 = reg[j];
+            const float y0 = reg[j + 1];
+            reg[j]     = x0 + y0;
+            reg[j + 1] = x0 - y0;
+        }
+        if constexpr (rot_width == 128) {
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const float x0 = reg[k];
+                const float y0 = reg[k + 2];
+                reg[k]     = x0 + y0;
+                reg[k + 2] = x0 - y0;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        reg[j] = reg[j] / (1.0f + expf(-g[j]));
+    }
+}
+
+// Matches quantize_mmq_few_store in quantize.cu instruction for instruction.
+template <mmq_q8_1_ds_layout ds_layout>
+static __device__ __forceinline__ void attn_siglu_mmq_few_store(const float4 xi, int4 * yg, const int iu, const int g) {
+    float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
+    amax = warp_reduce_max<8>(amax);
+
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x*d_inv);
+    q.y = roundf(xi.y*d_inv);
+    q.z = roundf(xi.z*d_inv);
+    q.w = roundf(xi.w*d_inv);
+    const float d = 1.0f / d_inv;
+
+    [[maybe_unused]] float sum = 0.0f;
+    if constexpr (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = d*warp_reduce_sum<8>(float(q.x + q.y + q.z + q.w));
+    }
+
+    const int s = iu / QK8_1;
+    const int k = iu % QK8_1;
+    ((int *) (yg + (s/2)*WARP_SIZE + 4*g + (k % 16)/4))[2*(s % 2) + k/16] = *(const int *) &q;
+    if (k == 0) {
+        int4 * ds = yg + 4*WARP_SIZE + 4*(g/2) + s/2;
+        if constexpr (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+            ((float *) ds)[2*(s % 2) + g % 2] = d;
+        } else {
+            ((half2 *) ds)[2*(s % 2) + g % 2] = make_half2(d, sum);
+        }
+    }
+}
+
+template <int rot_width>
+__launch_bounds__(64)
+static __global__ void attn_siglu_f32_cuda(
+        const float * x, const float * gate, float * dst_f32, const int ncols, const float scale) {
+    ggml_cuda_pdl_sync();
+
+    const int64_t row_off = (int64_t) blockIdx.x * ncols;
+    const int     base    = (int) blockIdx.y * QK_K + (threadIdx.x / WARP_SIZE) * 128;
+    const int     lane    = threadIdx.x % WARP_SIZE;
+
+    float reg[4];
+    attn_siglu_eval_128<rot_width>(x + row_off + base, gate + row_off + base, scale, reg);
+
+    float * dst_base = dst_f32 + row_off + base;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        dst_base[j * WARP_SIZE + lane] = reg[j];
+    }
+}
+
+template <int rot_width>
+__launch_bounds__(64)
+static __global__ void attn_siglu_q8_1_cuda(
+        const float * x, const float * gate, float * dst_f32, block_q8_1 * q8,
+        const int ncols, const int real_units, const int q8_row_blocks, const float scale) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    const int64_t col  = blockIdx.x;
+    const int     u    = blockIdx.y;
+    const int     warp = threadIdx.x / WARP_SIZE;
+    const int     lane = threadIdx.x % WARP_SIZE;
+
+    block_q8_1 * q8_w = q8 + col * q8_row_blocks + u * 8 + warp * 4;
+    if (u >= real_units) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            q8_w[b].qs[lane] = 0;
+            if (lane == 0) {
+                q8_w[b].ds = make_half2(0.0f, 0.0f);
+            }
+        }
+        return;
+    }
+
+    const int64_t row_off = col * ncols;
+    const int     base    = u * QK_K + warp * 128;
+
+    float reg[4];
+    attn_siglu_eval_128<rot_width>(x + row_off + base, gate + row_off + base, scale, reg);
+
+    if (dst_f32 != nullptr) {
+        float * dst_base = dst_f32 + row_off + base;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            dst_base[j * WARP_SIZE + lane] = reg[j];
+        }
+    }
+
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const float  xi   = reg[b];
+        const float  amax = warp_reduce_max<QK8_1>(fabsf(xi));
+        const float  d    = amax / 127.0f;
+        const int8_t q    = amax == 0.0f ? 0 : roundf(xi / d);
+        const int    sum  = warp_reduce_sum<QK8_1>((int) q);
+        q8_w[b].qs[lane] = q;
+        if (lane == 0) {
+            q8_w[b].ds = make_half2(d, d * sum);
+        }
+    }
+}
+
+template <int rot_width, mmq_q8_1_ds_layout ds_layout>
+__launch_bounds__(64)
+static __global__ void attn_siglu_mmq_few_cuda(
+        const float * x, const float * gate, float * dst_f32, int4 * vy,
+        const int ncols, const int tokens, const float scale) {
+    __shared__ __align__(16) float s_unit[QK_K];
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    const int col  = blockIdx.x;
+    const int u    = blockIdx.y;
+    const int tid  = threadIdx.x;
+    const int warp = tid / WARP_SIZE;
+    const int lane = tid % WARP_SIZE;
+
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (col < tokens) {
+        const int64_t row_off = (int64_t) col * ncols;
+        const int     base    = u * QK_K + warp * 128;
+
+        float reg[4];
+        attn_siglu_eval_128<rot_width>(x + row_off + base, gate + row_off + base, scale, reg);
+
+        if (dst_f32 != nullptr) {
+            float * dst_base = dst_f32 + row_off + base;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                dst_base[j * WARP_SIZE + lane] = reg[j];
+            }
+        }
+
+        float * s_w = s_unit + warp * 128;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            s_w[j * WARP_SIZE + lane] = reg[j];
+        }
+        __syncwarp();
+        xi = ((const float4 *) s_w)[lane];
+    }
+
+    const int ncg = gridDim.x / MMQ_FEW_NCOLS;
+    int4 * yg = vy + ((int64_t) u * ncg + col / MMQ_FEW_NCOLS) * MMQ_FEW_Q8_1_INT4;
+    attn_siglu_mmq_few_store<ds_layout>(xi, yg, tid * 4, col % MMQ_FEW_NCOLS);
+}
+
+template <int rot_width>
+static void attn_siglu_fuse_launch_rot(ggml_backend_cuda_context & ctx,
+        const float * x_d, const float * gate_d, float * dst_f32,
+        const int ncols, const int64_t tokens, const float scale,
+        const ggml_cuda_siglu_q8_mode q8_mode, const ggml_type wo_type, void * q8_dst) {
+    cudaStream_t stream = ctx.stream();
+    const dim3 block(64, 1, 1);
+
+    if (q8_mode == GGML_CUDA_SIGLU_Q8_NONE) {
+        GGML_ASSERT(dst_f32 != nullptr);
+        const dim3 grid((unsigned) tokens, (unsigned) (ncols / QK_K), 1);
+        const ggml_cuda_kernel_launch_params lp(grid, block, 0, stream);
+        ggml_cuda_kernel_launch(attn_siglu_f32_cuda<rot_width>, lp, x_d, gate_d, dst_f32, ncols, scale);
+        return;
+    }
+
+    GGML_ASSERT(q8_dst != nullptr);
+    if (q8_mode == GGML_CUDA_SIGLU_Q8_MMVQ) {
+        static_assert(MATRIX_ROW_PADDING % QK_K == 0, "MATRIX_ROW_PADDING must be a multiple of QK_K");
+        const int real_units    = ncols / QK_K;
+        const int pad_units     = GGML_PAD(ncols, MATRIX_ROW_PADDING) / QK_K;
+        const int q8_row_blocks = pad_units * (QK_K / QK8_1);
+        const dim3 grid((unsigned) tokens, (unsigned) pad_units, 1);
+        const ggml_cuda_kernel_launch_params lp(grid, block, 0, stream);
+        ggml_cuda_kernel_launch(attn_siglu_q8_1_cuda<rot_width>, lp,
+            x_d, gate_d, dst_f32, (block_q8_1 *) q8_dst, ncols, real_units, q8_row_blocks, scale);
+        return;
+    }
+
+    GGML_ASSERT(q8_mode == GGML_CUDA_SIGLU_Q8_MMQ_FEW && tokens <= INT_MAX - MMQ_FEW_NCOLS);
+    const dim3 grid((unsigned) GGML_PAD(tokens, MMQ_FEW_NCOLS), (unsigned) (ncols / QK_K), 1);
+    const ggml_cuda_kernel_launch_params lp(grid, block, 0, stream);
+    switch (mmq_get_q8_1_ds_layout(wo_type)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            ggml_cuda_kernel_launch((attn_siglu_mmq_few_cuda<rot_width, MMQ_Q8_1_DS_LAYOUT_D4>), lp,
+                x_d, gate_d, dst_f32, (int4 *) q8_dst, ncols, (int) tokens, scale);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            ggml_cuda_kernel_launch((attn_siglu_mmq_few_cuda<rot_width, MMQ_Q8_1_DS_LAYOUT_DS4>), lp,
+                x_d, gate_d, dst_f32, (int4 *) q8_dst, ncols, (int) tokens, scale);
+            break;
+        default:
+            GGML_ABORT("unsupported ds_layout for attn_siglu_mmq_few_cuda");
+    }
+}
+
+void ggml_cuda_op_attn_siglu_fuse(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * x, const ggml_tensor * gate, float * dst_f32,
+        const int rot_width, const int ncols, const int64_t tokens,
+        const ggml_cuda_siglu_q8_mode q8_mode, const ggml_type wo_type, void * q8_dst) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(ncols >= QK_K && ncols % QK_K == 0 && tokens >= 1);
+    GGML_ASSERT(rot_width == 0 || ((rot_width == 64 || rot_width == 128) && ncols % rot_width == 0));
+
+    const float * x_d    = (const float *) x->data;
+    const float * gate_d = (const float *) gate->data;
+    const float   scale  = rot_width > 0 ? 1.0f / sqrtf((float) rot_width) : 1.0f;
+
+    switch (rot_width) {
+        case 0:
+            attn_siglu_fuse_launch_rot<0>(ctx, x_d, gate_d, dst_f32, ncols, tokens, scale, q8_mode, wo_type, q8_dst);
+            break;
+        case 64:
+            attn_siglu_fuse_launch_rot<64>(ctx, x_d, gate_d, dst_f32, ncols, tokens, scale, q8_mode, wo_type, q8_dst);
+            break;
+        case 128:
+            attn_siglu_fuse_launch_rot<128>(ctx, x_d, gate_d, dst_f32, ncols, tokens, scale, q8_mode, wo_type, q8_dst);
+            break;
+        default:
+            GGML_ABORT("unsupported rot_width");
+    }
 }

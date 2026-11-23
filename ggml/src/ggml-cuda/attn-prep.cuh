@@ -15,21 +15,22 @@ bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op);
 //   q tail (C1)    ggml_cuda_op_attn_prep_clip_fwht:  NORM_CLIP -> MUL(tau)? -> reshape -> MUL_MAT(hadamard hint)
 //   rel tail (D1)  ggml_cuda_op_attn_prep_rel_table: NORM_CLIP -> MUL(tau)? -> MUL_MAT(rel bias)
 //   k/v tails      ggml_cuda_op_attn_prep_kv_tail:   SHORT_CONV -> reshapes -> NORM_CLIP(null)/RMS_NORM ->
-//                                                                    reshape -> MUL_MAT(hadamard hint)
+//                                                                    (reshape -> MUL_MAT(hadamard hint))? -> SET_ROWS?
 //   state store    ggml_cuda_op_attn_prep_state_store: CONCAT(dim 1) chain -> snapshot view/cont -> SET_ROWS
 
-// C1: clip (and the tau mul it feeds) with the Hadamard rotation that consumes it, per head row of n elements.
+// C1: clip (and the tau mul it feeds) with optional Hadamard rotation, per head row of n elements.
 bool ggml_cuda_op_attn_prep_clip_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
-        const ggml_tensor * mul, ggml_tensor * mm);
+        const ggml_tensor * mul, ggml_tensor * out, bool do_fwht = true);
 
 // D1: the relative-position rows' clip and their bias-table matmul in one kernel after the rel mat-vec.
 bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
         const ggml_tensor * mul, ggml_tensor * table);
 
-// C2/C3: a K or V epilogue from the window's sources to its rotated rows; window is the claimed CONCAT (written by
-// this kernel beside its output) when win is given, otherwise an already materialized tensor it only reads.
-bool ggml_cuda_op_attn_prep_kv_tail(ggml_backend_cuda_context & ctx, const ggml_tensor * conv, ggml_tensor * mm,
-        const ggml_cuda_short_conv_window * win);
+// C2/C3: a K or V epilogue from the window's sources with optional Hadamard rotation and KV SET_ROWS scatter.
+bool ggml_cuda_op_attn_prep_kv_tail(ggml_backend_cuda_context & ctx, const ggml_tensor * conv,
+        const ggml_tensor * norm, ggml_tensor * out, const ggml_cuda_short_conv_window * win,
+        bool do_fwht = true, const ggml_tensor * set_rows = nullptr,
+        const ggml_tensor * hot_set_rows = nullptr, bool write_f32_dst = true);
 
 // E1: the state store. parts are the layer's window pieces in channel order (base first), window their dim-1 join,
 // snapshot the view of it whose columns replace the cache rows, and set_rows the SET_ROWS into the recurrent cache
@@ -39,5 +40,11 @@ struct attn_prep_store_parts {
     int                 m = 0;
 };
 
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+bool ggml_cuda_op_attn_prep_state_store(ggml_backend_cuda_context & ctx, const attn_prep_store_parts & parts,
+        const ggml_tensor * window, const ggml_tensor * snapshot, const ggml_tensor * set_rows,
+        cudaAccessPolicyWindow l2_window = {});
+#else
 bool ggml_cuda_op_attn_prep_state_store(ggml_backend_cuda_context & ctx, const attn_prep_store_parts & parts,
         const ggml_tensor * window, const ggml_tensor * snapshot, const ggml_tensor * set_rows);
+#endif

@@ -20,8 +20,7 @@
 // reads it once, but costs twice the tile work where the rows share nothing (the four sessions apart, every sliding layer).
 // GGML_CUDA_FATTN_REL_ROWS_LEGACY=1: the dense kernels, or the bounded and low-mean ones the model's hints pick, as before.
 
-constexpr int fattn_rel_rows_max       = 8;    // rows a step
-constexpr int fattn_rel_rows_parts_max = 1024; // streams, which the merge holds a weight each of
+constexpr int fattn_rel_rows_max = 8; // rows a step
 
 // The shapes the path takes. GQA 6 on q8_0 is Inkling 2 Small's, which keeps its own classes and kernels. f16 caches
 // keep theirs too: this path exists to read a quantized pool's cells.
@@ -36,7 +35,8 @@ static bool fattn_rel_rows_takes(const int device, const ggml_tensor * dst) {
     const auto * v = dst->src[2];
     const auto * mask = dst->src[3];
     const auto * table = dst->src[6];
-    if (legacy || dst->op != GGML_OP_FLASH_ATTN_EXT || !mask || !table || !dst->src[9] || dst->src[5]) {
+    const ggml_tensor * hot_kv = ggml_flash_attn_ext_get_hot_kv(dst);
+    if (legacy || dst->op != GGML_OP_FLASH_ATTN_EXT || !mask || !table || !dst->src[9] || (dst->src[5] && !hot_kv)) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[device].cc;
@@ -78,6 +78,9 @@ static bool fattn_rel_rows_takes(const int device, const ggml_tensor * dst) {
         if ((t->view_src ? t->view_offs : 0) % align != 0 || t->nb[1] % align != 0 || t->nb[2] % align != 0) {
             return false;
         }
+    }
+    if (hot_kv && ((hot_kv->view_src ? hot_kv->view_offs : 0) % 16 != 0 || hot_kv->nb[1] % 16 != 0 || hot_kv->nb[2] % 16 != 0)) {
+        return false;
     }
     return true;
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -137,75 +140,6 @@ static size_t fattn_rel_rows_alloc_size(const int device, const ggml_tensor * ds
     return GGML_PAD(ggml_nbytes(dst), 128) + size_t(dst->ne[1])*dst->ne[2]*fattn_rel_rows_streams(device, dst)*130*sizeof(float);
 }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-// The parts of a (row, query head) merged by a block of fattn_rel_rows_merge_lanes x 128 threads: the largest part
-// maximum (the sink's logit among them: the sink is a part of weight 1 and no value), each part's weight, then lane l of
-// value d sums the parts l, l + lanes, ... and the lanes' sums are added in their order. fattn_rel_decode_merge folds the
-// parts one after another, a memory round trip each.
-constexpr int fattn_rel_rows_merge_lanes = 4;
-
-static __global__ void __launch_bounds__(fattn_rel_rows_merge_lanes*128) fattn_rel_rows_merge(
-        const float * __restrict__ partial, const float * __restrict__ sinks, float * __restrict__ out, const int n_parts) {
-    constexpr int lanes = fattn_rel_rows_merge_lanes, nthreads = lanes*128, nwarps = nthreads/WARP_SIZE;
-    const int d = threadIdx.x, lane = threadIdx.y, tid = lane*128 + d;
-    const int row = blockIdx.y*gridDim.x + blockIdx.x;
-    partial += int64_t(row)*n_parts*130;
-    __shared__ float weight[fattn_rel_rows_parts_max];
-    __shared__ float reduce[nwarps];
-    __shared__ float sums[lanes][128];
-
-    const float sink = sinks ? sinks[row] : 0.0f;
-    float maximum = sink;
-    for (int i = tid; i < n_parts; i += nthreads) {
-        maximum = fmaxf(maximum, partial[i*130]);
-    }
-    maximum = warp_reduce_max(maximum);
-    if (tid % WARP_SIZE == 0) {
-        reduce[tid/WARP_SIZE] = maximum;
-    }
-    __syncthreads();
-    maximum = reduce[0];
-#pragma unroll
-    for (int w = 1; w < nwarps; ++w) {
-        maximum = fmaxf(maximum, reduce[w]);
-    }
-    __syncthreads();
-
-    float denominator = 0.0f;
-    for (int i = tid; i < n_parts; i += nthreads) {
-        const float w = expf(partial[i*130] - maximum);
-        weight[i] = w;
-        denominator += w*partial[i*130 + 1];
-    }
-    denominator = warp_reduce_sum(denominator);
-    if (tid % WARP_SIZE == 0) {
-        reduce[tid/WARP_SIZE] = denominator;
-    }
-    __syncthreads();
-
-    float sum = 0.0f;
-#pragma unroll 4
-    for (int i = lane; i < n_parts; i += lanes) {
-        sum += weight[i]*partial[i*130 + 2 + d];
-    }
-    sums[lane][d] = sum;
-    __syncthreads();
-    if (lane == 0) {
-        denominator = expf(sink - maximum);
-#pragma unroll
-        for (int w = 0; w < nwarps; ++w) {
-            denominator += reduce[w];
-        }
-        sum = sums[0][d];
-#pragma unroll
-        for (int l = 1; l < lanes; ++l) {
-            sum += sums[l][d];
-        }
-        out[int64_t(row)*128 + d] = sum/denominator;
-    }
-}
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-
 static void ggml_cuda_fattn_rel_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     const auto * q = dst->src[0];
@@ -219,14 +153,18 @@ static void ggml_cuda_fattn_rel_rows(ggml_backend_cuda_context & ctx, ggml_tenso
     memcpy(&scale, dst->op_params, sizeof(scale));
     const auto * sinks = (const float *) dst->src[9]->data;
     const bool shift = ggml_cuda_fattn_shift_query_sinks();
+    const bool fp8 = fattn_rel_fp8_partials(ctx, n_streams);
+    const ggml_tensor * hot_kv = ggml_flash_attn_ext_get_hot_kv(dst);
+    const int32_t * hot_map = (hot_kv && dst->src[8]->ne[2] == 2)
+        ? (const int32_t *) ((const char *) dst->src[8]->data + dst->src[8]->nb[2]) : nullptr;
     fattn_rel_rows_kernel(dst)<<<dim3(n_streams, k->ne[2], q->ne[1]), WARP_SIZE, 0, ctx.stream()>>>(
             (const char *) q->data, (const char *) k->data, (const char *) v->data,
             (const uint32_t *) dst->src[3]->data, (const float *) dst->src[6]->data,
             (const int32_t *) dst->src[7]->data, (const int32_t *) dst->src[8]->data, shift ? sinks : nullptr, partial,
             scale, k->ne[1], dst->src[6]->ne[0], q->ne[2]/k->ne[2], 1, 0,
-            q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2]);
-    fattn_rel_rows_merge<<<dim3(q->ne[2], q->ne[1]), dim3(128, fattn_rel_rows_merge_lanes), 0, ctx.stream()>>>(
-            partial, shift ? nullptr : sinks, (float *) dst->data, n_streams);
+            q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2], fp8,
+            hot_kv ? (const char *) hot_kv->data : nullptr, hot_kv ? hot_kv->nb[1] : 0, hot_kv ? hot_kv->nb[2] : 0, hot_map);
+    fattn_rel_launch_merge(ctx, dst, partial, n_streams, shift ? nullptr : sinks, (float *) dst->data);
     CUDA_CHECK(cudaGetLastError());
 #else
     GGML_UNUSED_VARS(ctx, dst);

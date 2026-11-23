@@ -1045,7 +1045,15 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
-static bool ggml_gallocr_reserve_n_impl(
+static __thread uint64_t g_gallocr_measure_epoch = 0;
+static uint64_t g_gallocr_next_epoch = 0;
+
+uint64_t ggml_gallocr_measure_epoch(void);
+uint64_t ggml_gallocr_measure_epoch(void) {
+    return g_gallocr_measure_epoch;
+}
+
+static bool ggml_gallocr_reserve_n_inner(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
@@ -1207,6 +1215,15 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     return true;
+}
+
+static bool ggml_gallocr_reserve_n_impl(
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+    const uint64_t prev = g_gallocr_measure_epoch;
+    g_gallocr_measure_epoch = __atomic_add_fetch(&g_gallocr_next_epoch, 1, __ATOMIC_RELAXED);
+    const bool ok = ggml_gallocr_reserve_n_inner(galloc, graph, node_buffer_ids, leaf_buffer_ids, no_alloc);
+    g_gallocr_measure_epoch = prev;
+    return ok;
 }
 
 void ggml_gallocr_reserve_n_size(

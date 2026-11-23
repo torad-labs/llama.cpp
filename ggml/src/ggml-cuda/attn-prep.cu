@@ -5,14 +5,20 @@
 // anything they wrote, and no copy node sits between a fused kernel and its consumers (the fusion consumes exactly the
 // nodes whose launches it replaces).
 
-#define ATTN_PREP_MAX_ROWS 1024
+#define ATTN_PREP_MAX_ROWS 65536
 
 // The Hadamard butterfly of fwht.cu's register kernel, in the same order and sign convention: the low element of a
 // pair takes x + y, the high one x - y. A row of N is spread over NT threads, reg[j] holding columns j*NT + tid;
 // partners past the row's thread count sit in other registers of the same thread.
 template <int N, int NT>
-__device__ __forceinline__ void attn_prep_fwht(float (&reg)[N/NT]) {
+__device__ __forceinline__ void attn_prep_fwht(float * reg) {
     constexpr int NE = N/NT;
+    const float scale = 1.0f / sqrtf(float(N));
+
+#pragma unroll
+    for (int j = 0; j < NE; ++j) {
+        reg[j] *= scale;
+    }
 
 #pragma unroll
     for (int h = 1; h < NT && h < N; h *= 2) {
@@ -59,7 +65,7 @@ __device__ __forceinline__ float attn_prep_factor(const bool clip, const float s
 // C1: each row of x, one head's channels in one token, is scaled by its head's row of scale, clipped to an L2 norm of
 // at most threshold, multiplied by its token's tau and rotated with fwht.cu's butterfly, where the graph had
 // NORM_CLIP -> MUL(tau)? -> reshape -> MUL_MAT(hadamard hint).
-template <int N>
+template <int N, bool do_fwht>
 static __global__ void attn_prep_clip_fwht_f32(const float * x, const float * scale, const float * tau,
         const int64_t st2, float * dst, const int ne1, const int64_t rows, const float threshold, const float eps) {
     constexpr int NT = N >= 32 ? 32 : 16;
@@ -74,7 +80,7 @@ static __global__ void attn_prep_clip_fwht_f32(const float * x, const float * sc
     // x is a contiguous [N, ne1, ne2]: its flat row order enumerates the head i1 = r % ne1 fastest
     const float * xr = x + r*N;
     const float * sr = scale ? scale + (r % ne1)*N : nullptr;
-    const float   tr = tau ? tau[(r/ne1)*st2] : 0.0f;
+    const float   tr = tau ? tau[(r/ne1)*st2] : 1.0f;
 
     float reg[NE];
     float sum = 0.0f;
@@ -93,7 +99,9 @@ static __global__ void attn_prep_clip_fwht_f32(const float * x, const float * sc
         reg[j] *= factor;
     }
 
-    attn_prep_fwht<N, NT>(reg);
+    if constexpr (do_fwht) {
+        attn_prep_fwht<N, NT>(reg);
+    }
     float * dr = dst + r*N;
 #pragma unroll
     for (int j = 0; j < NE; ++j) {
@@ -102,12 +110,13 @@ static __global__ void attn_prep_clip_fwht_f32(const float * x, const float * sc
 }
 
 bool ggml_cuda_op_attn_prep_clip_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
-        const ggml_tensor * mul, ggml_tensor * mm) {
+        const ggml_tensor * mul, ggml_tensor * mm, bool do_fwht) {
     const ggml_tensor * a     = norm->src[0];
     const ggml_tensor * scale = norm->src[1];
 
     if (!a || !mm || a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || a->nb[0] != sizeof(float) ||
-            a->ne[3] != 1 || !ggml_cuda_op_mul_mat_use_fwht(mm)) {
+            a->ne[3] != 1 || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) ||
+            (do_fwht && !ggml_cuda_op_mul_mat_use_fwht(mm))) {
         return false;
     }
     const int64_t n    = a->ne[0];
@@ -117,7 +126,7 @@ bool ggml_cuda_op_attn_prep_clip_fwht(ggml_backend_cuda_context & ctx, const ggm
         return false;
     }
     if (scale && (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) ||
-            scale->ne[0] != a->ne[0] || scale->ne[1] != a->ne[1])) {
+            scale->ne[0] != a->ne[0] || scale->ne[1] != a->ne[1] || scale->ne[2] != 1 || scale->ne[3] != 1)) {
         return false;
     }
 
@@ -147,22 +156,17 @@ bool ggml_cuda_op_attn_prep_clip_fwht(ggml_backend_cuda_context & ctx, const ggm
     const dim3 grid((unsigned) ((rows + block.y - 1)/block.y));
     const ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
 
+    auto launch = [&](auto width) {
+        constexpr int W = decltype(width)::value;
+        auto kernel = do_fwht ? attn_prep_clip_fwht_f32<W, true> : attn_prep_clip_fwht_f32<W, false>;
+        ggml_cuda_kernel_launch(kernel, params, (const float *) a->data,
+            scale ? (const float *) scale->data : nullptr, tau_d, st2, (float *) mm->data,
+            (int) a->ne[1], rows, threshold, eps);
+    };
     switch (n) {
-        case 16:
-            ggml_cuda_kernel_launch(attn_prep_clip_fwht_f32<16>, params, (const float *) a->data,
-                scale ? (const float *) scale->data : nullptr, tau_d, st2, (float *) mm->data,
-                (int) a->ne[1], rows, threshold, eps);
-            break;
-        case 64:
-            ggml_cuda_kernel_launch(attn_prep_clip_fwht_f32<64>, params, (const float *) a->data,
-                scale ? (const float *) scale->data : nullptr, tau_d, st2, (float *) mm->data,
-                (int) a->ne[1], rows, threshold, eps);
-            break;
-        default:
-            ggml_cuda_kernel_launch(attn_prep_clip_fwht_f32<128>, params, (const float *) a->data,
-                scale ? (const float *) scale->data : nullptr, tau_d, st2, (float *) mm->data,
-                (int) a->ne[1], rows, threshold, eps);
-            break;
+        case 16: launch(std::integral_constant<int, 16>{}); break;
+        case 64: launch(std::integral_constant<int, 64>{}); break;
+        default: launch(std::integral_constant<int, 128>{}); break;
     }
     return true;
 }
@@ -194,7 +198,7 @@ static __global__ void attn_prep_rel_table_f32(const float * x, const float * sc
     }
     sum = attn_prep_row_sum<WARP_SIZE>(sum);
 
-    const float factor = attn_prep_factor(true, sum, nrel, threshold, eps)*(tau ? tau[(r/ne1)*st2] : 0.0f);
+    const float factor = attn_prep_factor(true, sum, nrel, threshold, eps)*(tau ? tau[(r/ne1)*st2] : 1.0f);
     __syncwarp();
     for (int d = threadIdx.x; d < nrel; d += WARP_SIZE) {
         sv[d] *= factor;
@@ -225,7 +229,7 @@ bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggm
     }
     // the matmul reads a real weight: [n_rel, extent], f32, contiguous, its columns the table's rows
     const ggml_tensor * bias = table->src[0];
-    if (!bias || bias->op == GGML_OP_NONE || bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
+    if (!bias || !bias->data || bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
             bias->ne[0] != a->ne[0]) {
         return false;
     }
@@ -236,7 +240,7 @@ bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggm
         return false;
     }
     if (scale && (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) ||
-            scale->ne[0] != a->ne[0] || scale->ne[1] != a->ne[1])) {
+            scale->ne[0] != a->ne[0] || scale->ne[1] != a->ne[1] || scale->ne[2] != 1 || scale->ne[3] != 1)) {
         return false;
     }
 
@@ -268,8 +272,15 @@ bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggm
 
 // C2/C3: a K or V epilogue. One warp per rotated row (this stream's head fastest, then tokens and sequences): the
 // depthwise convolution from the window's sources (the claimed CONCAT's two sides, or a materialized x), then the
-// weightless norm clip or rms norm over the head's channels, then fwht.cu's butterfly. The warps whose row is their
+// weightless norm clip or rms norm over the head's channels, then fwht.cu's butterfly (1xN or 2x64 inside 128), and
+// optional fused SET_ROWS into the F16/Q8_0 KV cache (plus optional F16 hot_kv). The warps whose row is their
 // sequence's first token also write the joined window the state store reads, exactly as the skipped CONCAT would have.
+enum attn_prep_kv_dst_kind : int {
+    ATTN_PREP_KV_DST_NONE = 0,
+    ATTN_PREP_KV_DST_F16  = 1,
+    ATTN_PREP_KV_DST_Q8_0 = 2,
+};
+
 struct attn_prep_kv_args {
     const float * past = nullptr; // [k-1, ch, ns] f32, strides in floats
     int64_t sp0 = 0, sp1 = 0, sp2 = 0;
@@ -283,15 +294,31 @@ struct attn_prep_kv_args {
     const float * dyn  = nullptr; // [k*nk, nt*ns] or null: taps h*k .. h*k+k-1 of merged token t'
     int64_t sd1 = 0;
     float * dst = nullptr;
+    char *        kv_dst      = nullptr;
+    const char *  kv_idxs     = nullptr;
+    size_t        kv_nb1      = 0;
+    size_t        kv_idx_nb0  = 0;
+    char *        hot_dst     = nullptr;
+    const char *  hot_idxs    = nullptr;
+    size_t        hot_nb1     = 0;
+    size_t        hot_idx_nb0 = 0;
     int   nk = 0, nt = 0, ns = 0;
     int   klen = 0;
-    bool  split     = false; // read past/rows rather than xpx
-    bool  write_win = false; // fill win as the skipped CONCAT would have
-    bool  clip      = false; // a norm clip with threshold rather than an rms norm with eps
+    bool  split       = false; // read past/rows rather than xpx
+    bool  write_win   = false; // fill win as the skipped CONCAT would have
+    bool  clip        = false; // a norm clip with threshold rather than an rms norm with eps
+    bool  kv_idx_i32  = false;
+    bool  hot_idx_i32 = false;
     float conv_scale = 1.0f, threshold = 1.0f, eps = 0.0f;
 };
 
-template <int N>
+static __device__ __forceinline__ int64_t attn_prep_load_idx(const char * base, const size_t nb0,
+        const bool is_i32, const int tp) {
+    const char * p = base + size_t(tp)*nb0;
+    return is_i32 ? (int64_t) *(const int32_t *) p : *(const int64_t *) p;
+}
+
+template <int N, int ROT_W, attn_prep_kv_dst_kind KV_KIND>
 static __global__ void attn_prep_kv_tail_f32(const attn_prep_kv_args p) {
     constexpr int NT = N >= 32 ? 32 : 16;
     constexpr int NE = N/NT;
@@ -345,11 +372,68 @@ static __global__ void attn_prep_kv_tail_f32(const attn_prep_kv_args p) {
         reg[j] *= factor;
     }
 
-    attn_prep_fwht<N, NT>(reg);
-    float * dr = p.dst + rr*N;
+    if constexpr (ROT_W == N && ROT_W > 0) {
+        attn_prep_fwht<N, NT>(reg);
+    } else if constexpr (ROT_W == 64 && N == 128) {
+        attn_prep_fwht<64, NT>(reg + 0);
+        attn_prep_fwht<64, NT>(reg + 2);
+    } else {
+        static_assert(ROT_W == 0, "unsupported Hadamard width");
+    }
+
+    if (p.dst) {
+        float * dr = p.dst + rr*N;
 #pragma unroll
-    for (int j = 0; j < NE; ++j) {
-        dr[j*NT + threadIdx.x] = reg[j];
+        for (int j = 0; j < NE; ++j) {
+            dr[j*NT + threadIdx.x] = reg[j];
+        }
+    }
+
+    if constexpr (KV_KIND == ATTN_PREP_KV_DST_F16) {
+        const int64_t dst_row = attn_prep_load_idx(p.kv_idxs, p.kv_idx_nb0, p.kv_idx_i32, tp);
+        if (dst_row >= 0) {
+            half * hr = (half *) (p.kv_dst + size_t(dst_row)*p.kv_nb1) + cb;
+#pragma unroll
+            for (int j = 0; j < NE; ++j) {
+                hr[j*NT + threadIdx.x] = __float2half(reg[j]);
+            }
+        }
+        if (p.hot_dst) {
+            const int64_t hot_row = attn_prep_load_idx(p.hot_idxs, p.hot_idx_nb0, p.hot_idx_i32, tp);
+            if (hot_row >= 0) {
+                half * hr = (half *) (p.hot_dst + size_t(hot_row)*p.hot_nb1) + cb;
+#pragma unroll
+                for (int j = 0; j < NE; ++j) {
+                    hr[j*NT + threadIdx.x] = __float2half(reg[j]);
+                }
+            }
+        }
+    } else if constexpr (KV_KIND == ATTN_PREP_KV_DST_Q8_0) {
+        static_assert(N >= QK8_0 && NT == QK8_0 && N % QK8_0 == 0, "Q8_0 requires 32-lane warp blocks");
+        const int64_t dst_row = attn_prep_load_idx(p.kv_idxs, p.kv_idx_nb0, p.kv_idx_i32, tp);
+        if (dst_row >= 0) {
+            block_q8_0 * br = (block_q8_0 *) (p.kv_dst + size_t(dst_row)*p.kv_nb1) + h*NE;
+#pragma unroll
+            for (int j = 0; j < NE; ++j) {
+                const float amax = warp_reduce_max<QK8_0>(fabsf(reg[j]));
+                const float d    = amax / ((1 << 7) - 1);
+                const float id   = d ? 1.0f/d : 0.0f;
+                br[j].qs[threadIdx.x] = roundf(reg[j]*id);
+                if (threadIdx.x == 0) {
+                    br[j].d = __float2half(d);
+                }
+            }
+        }
+        if (p.hot_dst) {
+            const int64_t hot_row = attn_prep_load_idx(p.hot_idxs, p.hot_idx_nb0, p.hot_idx_i32, tp);
+            if (hot_row >= 0) {
+                half * hr = (half *) (p.hot_dst + size_t(hot_row)*p.hot_nb1) + cb;
+#pragma unroll
+                for (int j = 0; j < NE; ++j) {
+                    hr[j*NT + threadIdx.x] = __float2half(reg[j]);
+                }
+            }
+        }
     }
 
     // a sequence's window is written by its first token's warps, one per head over that head's channels only: where
@@ -366,24 +450,40 @@ static __global__ void attn_prep_kv_tail_f32(const attn_prep_kv_args p) {
     }
 }
 
-bool ggml_cuda_op_attn_prep_kv_tail(ggml_backend_cuda_context & ctx, const ggml_tensor * conv, ggml_tensor * mm,
-        const ggml_cuda_short_conv_window * win) {
+bool ggml_cuda_op_attn_prep_kv_tail(ggml_backend_cuda_context & ctx, const ggml_tensor * conv,
+        const ggml_tensor * norm, ggml_tensor * out, const ggml_cuda_short_conv_window * win,
+        bool do_fwht, const ggml_tensor * set_rows, const ggml_tensor * hot_set_rows, bool write_f32_dst) {
+    if (!conv || !norm || !out || (!write_f32_dst && !set_rows) || (hot_set_rows && !set_rows)) {
+        return false;
+    }
     const ggml_tensor * x = conv->src[0];
     const ggml_tensor * w = conv->src[1];
     const ggml_tensor * d = conv->src[2];
 
     if (!x || !w || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
-            conv->ne[3] != 1 || conv->data == nullptr || w->data == nullptr || !mm ||
-            !ggml_cuda_op_mul_mat_use_fwht(mm)) {
+            conv->ne[3] != 1 || conv->data == nullptr || w->data == nullptr ||
+            out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) || (write_f32_dst && out->data == nullptr) ||
+            (do_fwht && !ggml_cuda_op_mul_mat_use_fwht(out))) {
         return false;
     }
-    const int   k    = (int) w->ne[0];
-    const int64_t ch = conv->ne[0];
-    const int64_t nt = conv->ne[1];
-    const int64_t ns = conv->ne[2];
-    const int64_t N  = mm->src[0]->ne[0]; // the rotation's width: one head's channels
-    if ((k != 3 && k != 4) || (N != 16 && N != 64 && N != 128) || ch % N != 0 || nt < 1 ||
-            ggml_nelements(mm) != ch*nt*ns) {
+    const int     k         = (int) w->ne[0];
+    const int64_t ch        = conv->ne[0];
+    const int64_t nt        = conv->ne[1];
+    const int64_t ns        = conv->ne[2];
+    const int64_t N         = norm->ne[0];
+    const int64_t rot_width = do_fwht ? out->src[0]->ne[0] : 0;
+    if ((k != 3 && k != 4) || (N != 16 && N != 64 && N != 128) || ch % N != 0 || nt < 1 || ns < 1 ||
+            norm->ne[1] != ch/N || ggml_nelements(norm) != ch*nt*ns || ggml_nelements(out) != ch*nt*ns) {
+        return false;
+    }
+    if (do_fwht) {
+        const ggml_tensor * rot = out->src[0];
+        if (!rot || rot->ne[0] != rot->ne[1] || rot->ne[2] != 1 || rot->ne[3] != 1 || out->ne[0] != rot_width ||
+                (rot_width != N && !(N == 128 && rot_width == 64))) {
+            return false;
+        }
+    }
+    if (N >= 32 && ggml_cuda_info().devices[ctx.device].warp_size != 32) {
         return false;
     }
     const int64_t nk   = ch/N;
@@ -391,17 +491,98 @@ bool ggml_cuda_op_attn_prep_kv_tail(ggml_backend_cuda_context & ctx, const ggml_
     if (rows > ATTN_PREP_MAX_ROWS*(int64_t) 8) {
         return false;
     }
+    if (d && (d->type != GGML_TYPE_F32 || d->data == nullptr || d->nb[0] != sizeof(float) ||
+            d->nb[1] % sizeof(float) != 0 || d->ne[0] != k*nk || d->ne[1] != nt*ns ||
+            d->ne[2] != 1 || d->ne[3] != 1)) {
+        return false;
+    }
+
+    auto check_set_rows = [&](const ggml_tensor * sr, bool hot) -> bool {
+        if (!sr || sr->op != GGML_OP_SET_ROWS || sr->data == nullptr ||
+                sr->ne[0] != ch || sr->ne[2] != 1 || sr->ne[3] != 1 || !ggml_is_contiguous_rows(sr)) {
+            return false;
+        }
+        if (hot) {
+            if (sr->type != GGML_TYPE_F16) {
+                return false;
+            }
+        } else if (sr->type == GGML_TYPE_Q8_0) {
+            if (N < QK8_0 || N % QK8_0 != 0) {
+                return false;
+            }
+        } else if (sr->type != GGML_TYPE_F16) {
+            return false;
+        }
+        if (reinterpret_cast<uintptr_t>(sr->data) % alignof(half) != 0 || sr->nb[1] % alignof(half) != 0) {
+            return false;
+        }
+        const ggml_tensor * src0 = sr->src[0];
+        const ggml_tensor * idxs = sr->src[1];
+        if (!src0 || src0->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0) ||
+                src0->ne[0] != ch || src0->ne[1] != nt*ns || src0->ne[2] != 1 || src0->ne[3] != 1) {
+            return false;
+        }
+        const ggml_tensor * base = src0;
+        while (base && base != out && (base->op == GGML_OP_VIEW || base->op == GGML_OP_RESHAPE) && base->view_offs == 0) {
+            base = base->src[0];
+        }
+        if (base != out) {
+            return false;
+        }
+        if (!idxs || idxs->data == nullptr || (idxs->type != GGML_TYPE_I64 && idxs->type != GGML_TYPE_I32) ||
+                idxs->ne[0] != nt*ns || idxs->ne[1] != 1 || idxs->ne[2] != 1 || idxs->ne[3] != 1) {
+            return false;
+        }
+        const size_t idx_ts = ggml_type_size(idxs->type);
+        if (reinterpret_cast<uintptr_t>(idxs->data) % idx_ts != 0 || idxs->nb[0] % idx_ts != 0) {
+            return false;
+        }
+        return true;
+    };
+
+    if (set_rows && !check_set_rows(set_rows, /*hot=*/false)) {
+        return false;
+    }
+    if (hot_set_rows && !check_set_rows(hot_set_rows, /*hot=*/true)) {
+        return false;
+    }
 
     attn_prep_kv_args p;
     p.wtap = (const float *) w->data;
     p.dyn  = d ? (const float *) d->data : nullptr;
     p.sd1  = d ? d->nb[1]/sizeof(float) : 0;
-    p.dst  = (float *) mm->data;
+    p.dst  = write_f32_dst ? (float *) out->data : nullptr;
     p.nk   = (int) nk;
     p.nt   = (int) nt;
     p.ns   = (int) ns;
     p.klen = k;
     p.conv_scale = ggml_get_op_params_f32(conv, 0);
+    p.clip = norm->op == GGML_OP_NORM_CLIP;
+    if (p.clip) {
+        memcpy(&p.threshold, norm->op_params + 0, sizeof(float));
+        memcpy(&p.eps,       norm->op_params + 1, sizeof(float));
+    } else {
+        memcpy(&p.eps, norm->op_params + 0, sizeof(float));
+    }
+
+    attn_prep_kv_dst_kind kv_kind = ATTN_PREP_KV_DST_NONE;
+    if (set_rows) {
+        const ggml_tensor * idxs = set_rows->src[1];
+        kv_kind       = set_rows->type == GGML_TYPE_Q8_0 ? ATTN_PREP_KV_DST_Q8_0 : ATTN_PREP_KV_DST_F16;
+        p.kv_dst      = (char *) set_rows->data;
+        p.kv_idxs     = (const char *) idxs->data;
+        p.kv_nb1      = set_rows->nb[1];
+        p.kv_idx_nb0  = idxs->nb[0];
+        p.kv_idx_i32  = idxs->type == GGML_TYPE_I32;
+    }
+    if (hot_set_rows) {
+        const ggml_tensor * hidxs = hot_set_rows->src[1];
+        p.hot_dst     = (char *) hot_set_rows->data;
+        p.hot_idxs    = (const char *) hidxs->data;
+        p.hot_nb1     = hot_set_rows->nb[1];
+        p.hot_idx_nb0 = hidxs->nb[0];
+        p.hot_idx_i32 = hidxs->type == GGML_TYPE_I32;
+    }
 
     if (win) {
         // the CONCAT was skipped by the evaluator: this kernel reads its two sides and writes the joined window it
@@ -435,15 +616,46 @@ bool ggml_cuda_op_attn_prep_kv_tail(ggml_backend_cuda_context & ctx, const ggml_
     const dim3 block(N >= 32 ? 32 : 16, N >= 32 ? 4 : 8);
     const dim3 grid((unsigned) ((rows + block.y - 1)/block.y));
     const ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
+    auto launch = [&](auto width, auto rot_w) {
+        constexpr int W = decltype(width)::value;
+        constexpr int R = decltype(rot_w)::value;
+        switch (kv_kind) {
+            case ATTN_PREP_KV_DST_NONE:
+                ggml_cuda_kernel_launch(attn_prep_kv_tail_f32<W, R, ATTN_PREP_KV_DST_NONE>, params, p);
+                break;
+            case ATTN_PREP_KV_DST_F16:
+                ggml_cuda_kernel_launch(attn_prep_kv_tail_f32<W, R, ATTN_PREP_KV_DST_F16>, params, p);
+                break;
+            case ATTN_PREP_KV_DST_Q8_0:
+                if constexpr (W >= QK8_0) {
+                    ggml_cuda_kernel_launch(attn_prep_kv_tail_f32<W, R, ATTN_PREP_KV_DST_Q8_0>, params, p);
+                }
+                break;
+        }
+    };
     switch (N) {
         case 16:
-            ggml_cuda_kernel_launch(attn_prep_kv_tail_f32<16>, params, p);
+            if (rot_width == 16) {
+                launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 16>{});
+            } else {
+                launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 0>{});
+            }
             break;
         case 64:
-            ggml_cuda_kernel_launch(attn_prep_kv_tail_f32<64>, params, p);
+            if (rot_width == 64) {
+                launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 64>{});
+            } else {
+                launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 0>{});
+            }
             break;
         default:
-            ggml_cuda_kernel_launch(attn_prep_kv_tail_f32<128>, params, p);
+            if (rot_width == 128) {
+                launch(std::integral_constant<int, 128>{}, std::integral_constant<int, 128>{});
+            } else if (rot_width == 64) {
+                launch(std::integral_constant<int, 128>{}, std::integral_constant<int, 64>{});
+            } else {
+                launch(std::integral_constant<int, 128>{}, std::integral_constant<int, 0>{});
+            }
             break;
     }
     return true;
@@ -493,8 +705,14 @@ static __global__ void attn_prep_state_store_kernel(const attn_prep_store_args a
     }
 }
 
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+bool ggml_cuda_op_attn_prep_state_store(ggml_backend_cuda_context & ctx, const attn_prep_store_parts & parts,
+        const ggml_tensor * window, const ggml_tensor * snapshot, const ggml_tensor * set_rows,
+        cudaAccessPolicyWindow l2_window) {
+#else
 bool ggml_cuda_op_attn_prep_state_store(ggml_backend_cuda_context & ctx, const attn_prep_store_parts & parts,
         const ggml_tensor * window, const ggml_tensor * snapshot, const ggml_tensor * set_rows) {
+#endif
     if (!set_rows || set_rows->op != GGML_OP_SET_ROWS || parts.m < 2 || parts.m > 8 ||
             !window || window->type != GGML_TYPE_F32 || !ggml_is_contiguous(window) ||
             window->ne[3] != 1 || !window->data) {
@@ -542,12 +760,17 @@ bool ggml_cuda_op_attn_prep_state_store(ggml_backend_cuda_context & ctx, const a
     if (ncols < 1 || ncols*sum_ch != states->ne[0] || ncols > cols) {
         return false;
     }
-    if (!snapshot || !ggml_is_contiguous(snapshot) || snapshot->view_src != window ||
-            snapshot->view_offs % window->nb[1] != 0) {
+    if (!snapshot || snapshot->view_src != window || snapshot->type != GGML_TYPE_F32 ||
+            snapshot->ne[0] != ncols || snapshot->ne[1] != sum_ch || snapshot->ne[2] != ns || snapshot->ne[3] != 1 ||
+            snapshot->nb[0] != window->nb[0] || snapshot->nb[1] != window->nb[1] || snapshot->nb[2] != window->nb[2] ||
+            snapshot->view_offs % window->nb[0] != 0) {
         return false;
     }
     a.ncols = (int) ncols;
-    a.c0    = snapshot->view_offs/window->nb[1];
+    a.c0    = snapshot->view_offs/window->nb[0];
+    if (a.c0 + ncols > cols) {
+        return false;
+    }
     a.total = ncols*sum_ch*ns;
     if (a.total/256 > INT32_MAX) {
         return false;
@@ -555,7 +778,10 @@ bool ggml_cuda_op_attn_prep_state_store(ggml_backend_cuda_context & ctx, const a
 
     const dim3 block(256);
     const dim3 grid((unsigned) ((a.total + block.x - 1)/block.x));
-    const ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
+    ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
+#if defined(GGML_CUDA_USE_L2_WINDOW)
+    params.l2_window = l2_window;
+#endif
     const int64_t * ids_d = (const int64_t *) ids->data;
     if (set_rows->type == GGML_TYPE_F16) {
         ggml_cuda_kernel_launch(attn_prep_state_store_kernel<half>, params, a, ids_d,

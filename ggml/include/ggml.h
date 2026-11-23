@@ -2287,6 +2287,19 @@ extern "C" {
             int                   n_vocab,
             bool                  first_nan);
 
+    // Like top_k_candidates_bounded, with an optional mirrored draw_params tensor (I32 [2, rows]):
+    // draw_params[0, r] = bitcast float inv_temp, draw_params[1, r] = uint32 seed.
+    // Rows with inv_temp > 0 return a single exact Gumbel-Max (score, global_id) record per shard;
+    // rows with inv_temp == 0 run standard top-k / greedy candidate selection.
+    GGML_API struct ggml_tensor * ggml_top_k_candidates_sample(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * draw_params,
+            int                   k,
+            int                   n_parts,
+            int                   n_vocab,
+            bool                  first_nan);
+
     // y = a*scale (scale broadcast over a, optional), each row of y scaled down to an L2 norm of at most threshold:
     // y * min(1, threshold/(|y| + eps))
     GGML_API struct ggml_tensor * ggml_norm_clip(
@@ -2308,6 +2321,9 @@ extern "C" {
             int                   n_sources,
             float                 scale,
             float                 eps);
+
+    // mark the first n_normed sources as already RMS-normalized
+    GGML_API void ggml_attn_res_mix_set_normed(struct ggml_tensor * tensor, int32_t n_normed);
 
     // a looped layer's controller: a cross-pass message mixed into its input, gated on both (Inkling 2 Loop). For token t,
     // with r = rms_norm(cur[:, t], eps) ++ rms_norm(message[:, t], eps) and z = down r,
