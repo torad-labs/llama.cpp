@@ -18451,6 +18451,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel_runs(6, 23, 196608, 65536, 128, 32, 0, 0, GGML_TYPE_Q8_0));
 
+    // Inkling 2 Mini's decode (ggml_cuda_fattn_rel_rows): 1 to 8 sessions of a shared pool on a q4_0 or q8_0 cache, 3
+    // query heads a KV head: decode's interleave and a prompt's chunks, a copied prefix, a sliding layer's window, pools
+    // of a few words to Mini's four sessions of 20K, a row that sees nothing, and 16 to 24 columns at other GQA
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 2, 3, 4, 5, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 4096, nb, std::max<int64_t>(nb, 4), 1));
+            test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 4608, nb, std::max<int64_t>(nb, 4), 1, 0, 1024));
+            test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 512, nb, 8, 16));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 20480, 4, 4, 512, 4096));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 20480, 1, 1, 512, 0, 0, false));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 81920, 4, 4, 512));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 29696, 4, 4, 512, 17408));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 1280, 1, 1, 1, 0, 1024));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 256, 2, 2, 512));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 8, 3, 32, 1, 1, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 2, 8, 4096, 3, 4, 16));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_rows(type, 4, 2, 4096, 8, 8, 1, 0, 0, false));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel_rows(GGML_TYPE_Q4_0, 2, 6, 4096, 4, 4, 1));
 
     // flash attention over a list of K/V rows per slice (unified KV cache)
     for (int64_t nb : {1, 3, 8, 64, 512}) {
