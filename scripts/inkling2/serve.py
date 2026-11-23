@@ -58,7 +58,7 @@ PROFILES = {
                  "prefix_copy": True, "mean_mask_decode": True, "reduction_route": "host", "host_owner_rows": False,
                  "query_first_decode": True, "compact_greedy": True,
                  "kv_runs": True, "packed_prefill": True, "f32_few": True, "moe_fuse": True,
-                 "mmq_tma": True, "l2_persist": True, "ar_copy_capture": False},
+                 "mmq_tma": True, "l2_persist": True, "ar_copy_capture": True},
 }
 
 
@@ -157,7 +157,7 @@ def arguments(argv=None):
     parser.add_argument("--l2-persist", action=argparse.BooleanOptionalAction,
                         help="Pin hot Inkling 2 conv-state rings in persisting L2 on large-L2 cards (tensor-4 default: on)")
     parser.add_argument("--ar-copy-capture", action=argparse.BooleanOptionalAction,
-                        help="Enable copy-engine whole-step CUDA graph capture with device-side pacing on host route (tensor-4 default: off)")
+                        help="Enable copy-engine whole-step CUDA graph capture with device-side pacing on host route (tensor-4 default: on)")
     parser.add_argument("--prompt-shapes", type=int, choices=[1, 2, 4, 8, 16, 32], metavar="ROWS",
                         help="Read prompts apart from decode replies in reusable power-of-two ubatches")
     parser.add_argument("--prompt-shape-rows", type=int, choices=[64, 128, 256, 512, 1024, 2048], metavar="ROWS",
