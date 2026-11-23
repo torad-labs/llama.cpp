@@ -1584,7 +1584,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     bool sample_from_anchor = true;
     bool inkling = false;
     bool context_on_device = false;
+    bool context_ring_on_device = false;
+    bool trim_block = false;
     bool cand_rows = false;
+    int64_t ring_base = 0;
     size_t context_rows = 0;
     std::vector<llama_pos> context_pos;
     std::vector<float> context_embd;
@@ -1644,6 +1647,9 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             /* .greedy          = */ inkling,
         });
         if (inkling) {
+            llama_set_mtp_graph_reuse(this->params.ctx_tgt, this->params.n_max);
+            llama_set_mtp_graph_reuse(this->params.ctx_dft, block_size - 1);
+            trim_block = ggml_env_switch("LLAMA_DSPARK_TRIM_BLOCK");
             context_on_device = llama_set_embeddings_nextn_dev(this->params.ctx_dft, true);
             cand_rows = this->params.backend_sampling && !common_output_candidates_legacy();
             // the graph draws each step from the k candidates the host reads, so a sampled draft needs them
@@ -1657,6 +1663,11 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
                 draw_state.assign(size_t(n_seq)*block_size*n_embd_dec, 0.0f);
                 LOG_INF("%s: - Inkling2 DSpark samples its draft from the %d largest logits a row\n", __func__, draw_k);
             }
+            if (context_on_device && draw_k == 0 && llama_set_ctx_state_src(this->params.ctx_dft, this->params.ctx_dft)) {
+                context_ring_on_device = true;
+                ring_base = llama_n_batch(this->params.ctx_dft);
+                LOG_INF("%s: - Inkling2 DSpark anchor ring stays on device\n", __func__);
+            }
             if (cand_rows) {
                 llama_set_output_candidates(this->params.ctx_dft, std::max(1, draw_k));
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1667,6 +1678,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     }
 
     ~common_speculative_impl_draft_dspark() override {
+        if (inkling) {
+            llama_set_mtp_graph_reuse(params.ctx_tgt, 0);
+            llama_set_mtp_graph_reuse(params.ctx_dft, 0);
+        }
         if (cand_rows) {
             llama_set_output_candidates(params.ctx_dft, 0);
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1693,6 +1708,35 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         }
         const int32_t keep = std::min<int32_t>(n_chunk, context_rows);
         const int32_t start = first + n_chunk - keep;
+        if (context_ring_on_device) {
+            // Coalesce contiguous ring-slot runs (at most two copies per sequence for consecutive positions).
+            const size_t seq_base = size_t(seq_id)*context_rows;
+            int32_t i = 0;
+            while (i < keep) {
+                const llama_pos pos0 = batch_inject.tokens[start + i].pos[0];
+                if (pos0 < 0) {
+                    ++i;
+                    continue;
+                }
+                const size_t slot0 = size_t(pos0) % context_rows;
+                int32_t run = 1;
+                while (i + run < keep && slot0 + (size_t) run < context_rows) {
+                    const llama_pos pos = batch_inject.tokens[start + i + run].pos[0];
+                    if (pos < 0 || size_t(pos) % context_rows != slot0 + (size_t) run) {
+                        break;
+                    }
+                    ++run;
+                }
+                const bool ok = llama_copy_embeddings_nextn_rows(
+                        params.ctx_dft, start + i, ring_base + (int64_t) (seq_base + slot0), run);
+                for (int32_t j = 0; j < run; ++j) {
+                    const llama_pos pos = batch_inject.tokens[start + i + j].pos[0];
+                    context_pos[seq_base + slot0 + j] = ok ? pos : -1;
+                }
+                i += run;
+            }
+            return;
+        }
         const float * tail = nullptr;
         if (context_on_device) {
             if (llama_get_embeddings_nextn_rows(params.ctx_dft, start, keep, context_tail.data())) {
@@ -1723,7 +1767,15 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         const size_t embd_bytes = context_rows*n_embd_dec*sizeof(float);
         data.resize(pos_bytes + embd_bytes);
         std::memcpy(data.data(), context_pos.data() + row, pos_bytes);
-        std::memcpy(data.data() + pos_bytes, context_embd.data() + row*n_embd_dec, embd_bytes);
+        if (context_ring_on_device) {
+            if (!llama_get_embeddings_nextn_rows(params.ctx_dft, ring_base + (int64_t) row, (int64_t) context_rows,
+                    reinterpret_cast<float *>(data.data() + pos_bytes))) {
+                data.clear();
+                return false;
+            }
+        } else {
+            std::memcpy(data.data() + pos_bytes, context_embd.data() + row*n_embd_dec, embd_bytes);
+        }
         return true;
     }
 
@@ -1736,7 +1788,14 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         const size_t embd_bytes = context_rows*n_embd_dec*sizeof(float);
         if (data.size() == pos_bytes + embd_bytes) {
             std::memcpy(context_pos.data() + row, data.data(), pos_bytes);
-            std::memcpy(context_embd.data() + row*n_embd_dec, data.data() + pos_bytes, embd_bytes);
+            if (context_ring_on_device) {
+                if (!llama_set_embeddings_nextn_rows(params.ctx_dft, ring_base + (int64_t) row, (int64_t) context_rows,
+                        reinterpret_cast<const float *>(data.data() + pos_bytes))) {
+                    std::fill_n(context_pos.data() + row, context_rows, -1);
+                }
+            } else {
+                std::memcpy(context_embd.data() + row*n_embd_dec, data.data() + pos_bytes, embd_bytes);
+            }
         } else {
             std::fill_n(context_pos.data() + row, context_rows, -1);
         }
@@ -1773,6 +1832,9 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
                 }
             }
 
+            const int32_t n_block_tokens = inkling
+                    ? (trim_block ? std::min<int32_t>(block_size, params.n_max + 1) : block_size)
+                    : params.n_max + (sample_from_anchor ? 0 : 1);
             // a block row past the anchor carries its draw to the graph: the row's uniform and the inverse temperature,
             // which is 0 for a sequence the target samples greedily (the graph then keeps the first maximum)
             float * draw = nullptr;
@@ -1785,22 +1847,25 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
                     draw_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
                 }
                 std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-                for (int32_t i = 1; i < block_size; ++i) {
+                for (int32_t i = 1; i < n_block_tokens; ++i) {
                     draw[size_t(i)*n_embd_dec + 0] = sample && i <= params.n_max ?
                         std::min(uniform(draw_rng[seq_id]), std::nextafter(1.0f, 0.0f)) : 0.0f;
                     draw[size_t(i)*n_embd_dec + 1] = sample ? 1.0f/dp.temp : 0.0f;
                 }
             }
 
-            const int32_t n_block_tokens = inkling ? block_size : params.n_max + (sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 const bool output = !inkling || i <= params.n_max;
                 const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
                 if (inkling) {
-                    const float * state = draw && i > 0 ? draw + size_t(i)*n_embd_dec : context_embd.data() + context_row*n_embd_dec;
-                    batch.set_embd_state(idx, {state, 1, size_t(n_embd_dec)});
+                    if (context_ring_on_device) {
+                        batch.set_embd_state_row(idx, (int32_t) (ring_base + context_row));
+                    } else {
+                        const float * state = draw && i > 0 ? draw + size_t(i)*n_embd_dec : context_embd.data() + context_row*n_embd_dec;
+                        batch.set_embd_state(idx, {state, 1, size_t(n_embd_dec)});
+                    }
                 }
             }
         }
@@ -2547,8 +2612,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        llama_set_mtp_graph_reuse(ctx_dft, this->params.n_max);
-        llama_set_mtp_graph_reuse(ctx_tgt, this->params.n_max);
+        if (llama_set_mtp_graph_reuse(ctx_dft, this->params.n_max)) {
+            llama_set_mtp_graph_reuse(ctx_tgt, this->params.n_max);
+        }
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
         timing = this->params.mtp_adaptive > 0.0f && !is_mem_shared && !chain_heads && !decode_only &&
             !ggml_env_switch("LLAMA_MTP_TIMING_LEGACY");
@@ -4419,21 +4485,8 @@ void common_speculative_sample_and_accept_batch(
         }
     };
 
-    // this thread is one of them
-    const size_t n_workers = seqs.empty() ? 0 : std::min(seqs.size(), (size_t) std::max(n_threads, 1)) - 1;
-    std::vector<std::thread> workers;
-    workers.reserve(n_workers);
-    for (size_t i = 0; i < n_workers; ++i) {
-        try {
-            workers.emplace_back(work);
-        } catch (const std::system_error &) {
-            break; // no thread to be had: the ones started and this one take what is left
-        }
-    }
-    work();
-    for (auto & worker : workers) {
-        worker.join();
-    }
+    const int n_active = seqs.empty() ? 1 : (int) std::min(seqs.size(), (size_t) std::max(n_threads, 1));
+    common_parallel_for(n_active, [&](int) { work(); });
 }
 
 // initialization of the speculative decoding system

@@ -148,6 +148,8 @@ int32_t common_sampler_backend_top_k(const struct common_sampler * gsmpl);
 // included; 0 when it reads every token's. A context may give the rows as that many candidates (llama_set_output_candidates)
 int32_t common_sampler_n_candidates(const struct common_sampler * gsmpl);
 int32_t common_sampler_n_greedy_candidates(const struct common_sampler * gsmpl);
+float   common_sampler_pure_temp(const struct common_sampler * gsmpl);
+uint32_t common_sampler_next_seed(struct common_sampler * gsmpl);
 
 // LLAMA_OUTPUT_CANDIDATES_LEGACY=1: no context gives rows as candidates; a row is read whole or cut by its own sampler graph
 bool common_output_candidates_legacy();

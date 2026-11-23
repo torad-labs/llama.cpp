@@ -725,6 +725,7 @@ struct server_slot {
 
     // the context gives this slot's rows as the candidates its chain reads (llama_set_seq_candidates)
     bool cand_rows = false;
+    bool cand_temp_sample = false;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -797,6 +798,7 @@ struct server_slot {
 
         llama_set_seq_candidates(ctx_tgt, id, false);
         cand_rows = false;
+        cand_temp_sample = false;
 
         // clear alora start
         alora_invocation_start = -1;
@@ -825,6 +827,7 @@ struct server_slot {
         if (cand_rows && !common_sampler_backend_passive(smpl.get())) {
             llama_set_seq_candidates(ctx_tgt, id, false);
             cand_rows = false;
+            cand_temp_sample = false;
             SLT_INF(*this, "%s", "grammar or reasoning budget constrains the next token, reading every logit\n");
         }
     }
@@ -3166,8 +3169,17 @@ private:
                     common_sampler_backend_passive(slot.smpl.get()) ? common_sampler_n_greedy_candidates(slot.smpl.get()) : 0;
             const bool greedy = n_greedy > 0 && n_greedy <= cand_k_max &&
                     llama_set_seq_greedy_candidates(ctx_tgt, slot.id);
+            const float pure_temp = candidates_enabled && !slot.backend_sampler && !slot.cand_rows && !greedy &&
+                    !slot.can_speculate() && !need_pre_sample_logits && pull_k.empty() && !lens_on &&
+                    common_sampler_backend_passive(slot.smpl.get()) ? common_sampler_pure_temp(slot.smpl.get()) : 0.0f;
+            const bool temp_sample = pure_temp > 0.0f &&
+                    llama_set_seq_temp_sample(ctx_tgt, slot.id, pure_temp, 0);
+            slot.cand_temp_sample = temp_sample;
             if (greedy) {
                 n_cand = n_greedy;
+                slot.cand_rows = true;
+            } else if (temp_sample) {
+                n_cand = 1;
                 slot.cand_rows = true;
             } else {
                 llama_set_seq_candidates(ctx_tgt, slot.id, slot.cand_rows);
@@ -4290,6 +4302,42 @@ private:
         }
 
         slot.prompt.checkpoints.push_back(std::move(ckpt));
+
+        static const size_t ckpt_ram_cap = (size_t) ggml_env_int("LLAMA_CHECKPOINT_RAM_MIB") * 1024 * 1024;
+        if (ckpt_ram_cap > 0) {
+            auto total_ckpt_bytes = [&]() {
+                std::unordered_set<const common_prompt_checkpoint *> seen;
+                size_t total = 0;
+                for (const auto & s : slots) {
+                    for (const auto & c : s.prompt.checkpoints) {
+                        if (c && seen.insert(c.get()).second) {
+                            total += c->size();
+                        }
+                    }
+                }
+                return total;
+            };
+            while (total_ckpt_bytes() > ckpt_ram_cap) {
+                server_slot * victim_slot = nullptr;
+                for (auto & s : slots) {
+                    const size_t min_keep = (&s == &slot) ? 1 : 0;
+                    if (s.prompt.checkpoints.size() <= min_keep) {
+                        continue;
+                    }
+                    if (!victim_slot || s.t_last_used < victim_slot->t_last_used) {
+                        victim_slot = &s;
+                    }
+                }
+                if (!victim_slot) {
+                    break;
+                }
+                const auto & old = *victim_slot->prompt.checkpoints.front();
+                SLT_WRN(*victim_slot, "evicting checkpoint for LLAMA_CHECKPOINT_RAM_MIB cap (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        old.n_tokens, (float) old.size() / 1024 / 1024);
+                victim_slot->checkpoint_spare(victim_slot->prompt.checkpoints.front());
+                victim_slot->prompt.checkpoints.erase(victim_slot->prompt.checkpoints.begin());
+            }
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %s buffers, "
@@ -6620,6 +6668,20 @@ private:
                             " position_min=" + std::to_string(first) + " position_max=" + std::to_string(last));
                 }
             }
+            for (auto & slot : slots) {
+                if (slot.cand_temp_sample && slot.cand_rows && slot.smpl) {
+                    bool slot_has_out = false;
+                    for (int i = off; i < off + (int) batch.view.size(); ++i) {
+                        if (batch.tokens[i].id_slot == slot.id && batch.tokens[i].output) {
+                            slot_has_out = true;
+                            break;
+                        }
+                    }
+                    if (slot_has_out) {
+                        llama_set_seq_sample_seed(ctx_tgt, slot.id, common_sampler_next_seed(slot.smpl.get()));
+                    }
+                }
+            }
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -6738,7 +6800,7 @@ private:
 
     std::vector<cpu_sample_result> sample_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
         const int n_threads_max = std::min(params_base.cpuparams.n_threads, sample_threads_max());
-        if (n_threads_max < 2 || n_batch_tokens < 4 || !pull_k.empty() ||
+        if (n_threads_max < 2 || n_batch_tokens < 2 || !pull_k.empty() ||
                 llama_vocab_n_tokens(vocab) < 128*1024) {
             return {};
         }
@@ -6764,7 +6826,7 @@ private:
                 jobs.push_back({slot.id, slot.smpl.get(), row});
             }
         }
-        if (jobs.size() < 4) {
+        if (jobs.size() < 2) {
             return {};
         }
         // One thread a row, so every row is sampled in one round: 23 sessions on four RTX PRO 6000 measured
@@ -6777,8 +6839,8 @@ private:
         });
         std::vector<cpu_sample_result> results(slots.size());
         // Each worker reads a completed logit row and changes only its slot's sampler.
-        auto sample = [&](size_t start) {
-            for (size_t i = start; i < jobs.size(); i += n_threads) {
+        common_parallel_for(n_threads, [&](int start) {
+            for (size_t i = (size_t) start; i < jobs.size(); i += (size_t) n_threads) {
                 const auto & entry = jobs[i];
                 auto & result = results[entry.slot];
                 try {
@@ -6787,15 +6849,7 @@ private:
                     result.error = std::current_exception();
                 }
             }
-        };
-        std::vector<std::future<void>> workers(n_threads - 1);
-        for (int i = 1; i < n_threads; ++i) {
-            workers[i - 1] = std::async(std::launch::async | std::launch::deferred, sample, i);
-        }
-        sample(0);
-        for (int i = 1; i < n_threads; ++i) {
-            workers[i - 1].get();
-        }
+        });
         return results;
     }
 

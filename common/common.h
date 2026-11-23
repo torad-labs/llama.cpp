@@ -864,6 +864,20 @@ struct common_params {
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
 
+// runs fn(t, userdata) on t = 0..n_threads-1 using a persistent worker pool (t = 0 on the caller)
+void common_parallel_run(int n_threads, void (*fn)(int, void *), void * userdata);
+
+template <typename F>
+void common_parallel_for(int n_threads, F && fn) {
+    if (n_threads <= 1) {
+        fn(0);
+        return;
+    }
+    common_parallel_run(n_threads, [](int t, void * p) {
+        (*static_cast<F *>(p))(t);
+    }, &fn);
+}
+
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
