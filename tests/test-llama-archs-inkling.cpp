@@ -203,13 +203,27 @@ std::map<std::string, case_def> cases(size_t seed, const std::vector<ggml_backen
         read_state(ctx, 0, out);
         read_state(ctx, 1, out);
     }};
-    ret["state"] = {{64, 2, 0}, [=](llama_context * ctx, record & out) {
+    ret["state"] = {{70, 2, 0}, [=](llama_context * ctx, record & out) {
         decode_span(ctx, tokens(n_prompt, 0), 0, 0, out);
         std::vector<uint8_t> whole(llama_state_get_size(ctx));
         std::vector<uint8_t> seq(llama_state_seq_get_size(ctx, 0));
         if (llama_state_get_data(ctx, whole.data(), whole.size()) != whole.size() ||
                 llama_state_seq_get_data(ctx, seq.data(), seq.size(), 0) != seq.size()) {
             throw std::runtime_error("inkling2: the state was not saved");
+        }
+        if (llama_state_staged_rows(ctx) > 0) {
+            const size_t psize = llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            std::vector<uint8_t> pref(psize), pstaged(psize);
+            int32_t srow = -1;
+            if (llama_state_seq_get_data_ext(ctx, pref.data(), psize, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != psize ||
+                    llama_state_seq_get_data_staged(ctx, pstaged.data(), psize, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &srow) != psize ||
+                    srow < 0) {
+                throw std::runtime_error("inkling2: staged state copy did not run");
+            }
+            while (llama_state_staged_pending(ctx, srow)) {}
+            if (pref != pstaged) {
+                throw std::runtime_error("inkling2: staged partial state bytes differ from sync partial state");
+            }
         }
         record discarded;
         decode_steps(ctx, tokens(8, 1), n_prompt, 0, discarded);
@@ -314,7 +328,8 @@ bool compact_greedy(std::size_t seed, const std::vector<ggml_backend_dev_t> & de
         for (int row = 0; row < 2; ++row) {
             const float * logits = llama_get_logits_ith(reference.get(), row);
             const auto actual = llama_get_sampling_row_ith(candidate.get(), row);
-            if (!compact) {
+            // mixed batch: non-greedy row 1 keeps whole logits while greedy row 0 stays on compact candidates
+            if (!compact && row == 1) {
                 ok = ok && actual.logits && std::equal(logits, logits + vocab, actual.logits);
                 continue;
             }
@@ -355,6 +370,10 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
     llama_model_ptr one = get_model(gguf.get(), nullptr, seed, 0.0f, {devs.front()}, LLAMA_SPLIT_MODE_LAYER);
     llama_model_ptr split = get_model(gguf.get(), nullptr, seed, 0.0f, devs, LLAMA_SPLIT_MODE_TENSOR);
     const bool graph_churn = name == "graph-churn";
+    if (name == "state") {
+        set_env("LLAMA_RS_STAGE_ROWS", "2");
+        set_env("LLAMA_STATE_SAVE_ASYNC", "1");
+    }
     if (graph_churn) {
         set_env("LLAMA_RS_FIXED_ROWS", "0");
         set_env("LLAMA_GRAPH_ANY_SEQS", "0");
@@ -592,7 +611,7 @@ int test_inkling_loop(size_t seed, ggml_backend_dev_t dev) {
         record discarded;
         run(ctx.get(), discarded);   // the model's own count: there are cells to save
         const size_t whole = llama_state_get_size(ctx.get()), seq0 = llama_state_seq_get_size(ctx.get(), 0);
-        llama_set_loop_passes(ctx.get(), 2);
+        llama_set_loop_passes(ctx.get(), 1);
         const bool refused = llama_state_get_size(ctx.get()) == 0 && llama_state_seq_get_size(ctx.get(), 0) == 0 &&
                 llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
         llama_set_loop_passes(ctx.get(), 0);

@@ -274,7 +274,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
 endif()
 
-llama_build(test-llama-archs.cpp llama-archs-gguf.cpp test-llama-archs-inkling.cpp test-llama-archs-inkling-paths.cpp)
+llama_build(test-llama-archs.cpp llama-archs-gguf.cpp test-llama-archs-inkling.cpp test-llama-archs-inkling-paths.cpp
+    test-inkling-archs-data.cpp)
 # section 3.5 skeleton (doc 18-global-kv-off-f16.md): the mixed recency store's pools and dense read merge
 llama_build(test-llama-kv-mixed.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
@@ -320,6 +321,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             llama_test(test-llama-archs NAME test-inkling2-split-${inkling_case}
                 ARGS --inkling-split ${inkling_case} --inkling-split-device CUDA0,CUDA0 -s 1234)
         endforeach()
+        # Inkling 2 under -sm data (sequence-parallel rows, the experts partitioned a rank) against that GPU alone: a
+        # prefill of one sequence a rank, a decode step after it, and a chunk that ends mid-sequence, two and four ranks
+        llama_test(test-llama-archs NAME test-inkling2-data-2ranks ARGS --inkling-data CUDA0,CUDA0 -s 1234)
+        llama_test(test-llama-archs NAME test-inkling2-data-4ranks ARGS --inkling-data CUDA0,CUDA0,CUDA0,CUDA0 -s 1234)
         # the synthetic Inkling 2 against the host with its router and relative-bias table on the split-K and short-K
         # kernels
         llama_test(test-llama-archs NAME test-inkling-f32-model ARGS -a inkling2 -s 1234)
@@ -387,9 +392,25 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         set(inkling_kvmix_test test-inkling-kvmix-${inkling_path_name})
         llama_test(test-llama-kv-mixed NAME ${inkling_kvmix_test} ARGS ${inkling_path_device})
         set_tests_properties(${inkling_kvmix_test} PROPERTIES ENVIRONMENT "LLAMA_INKLING2_KV_MIXED=1")
+        # Doc 18 section 3.5 end-to-end: pre-store F16 hot ring on q4_0 global KV (all-near matches F16 < 1e-4;
+        # mixed near/far matches CPU across prefill, kv_runs shared+private, drafted verify, and restore)
+        foreach(inkling_case unified decode)
+            set(inkling_kvmix_near_test test-inkling-kvmix-near-${inkling_path_name}-${inkling_case})
+            llama_test(test-llama-archs NAME ${inkling_kvmix_near_test}
+                ARGS --inkling-path kv-mixed-near/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+            set_tests_properties(${inkling_kvmix_near_test} PROPERTIES ENVIRONMENT
+                "GGML_CUDA_FATTN_REL_DECODE_Q4=1;GGML_CUDA_FATTN_REL_PACKED_PREFILL=1")
+        endforeach()
+        foreach(inkling_case prompt served drafted restore)
+            set(inkling_kvmix_live_test test-inkling-kvmix-live-${inkling_path_name}-${inkling_case})
+            llama_test(test-llama-archs NAME ${inkling_kvmix_live_test}
+                ARGS --inkling-path kv-mixed/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+            set_tests_properties(${inkling_kvmix_live_test} PROPERTIES ENVIRONMENT
+                "GGML_CUDA_FATTN_REL_DECODE_Q4=1;GGML_CUDA_FATTN_REL_PACKED_PREFILL=1;GGML_CUDA_FATTN_REL_RUNS_SHARED=1;GGML_CUDA_FATTN_REL_RUNS_GROUP=3")
+        endforeach()
         # the global layers' decode by the runs of cells each row reads against its mask (LLAMA_INKLING2_KV_RUNS), and on
         # a GPU with the shared runs read once for groups of 3 rows (GGML_CUDA_FATTN_REL_RUNS_SHARED)
-        foreach(inkling_case runs served restore)
+        foreach(inkling_case runs served restore drafted)
             llama_test(test-llama-archs NAME test-inkling-far-${inkling_path_name}-${inkling_case}
                 ARGS --inkling-path far/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
             if (NOT inkling_path_device STREQUAL "CPU")
@@ -398,6 +419,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
                 set_tests_properties(test-inkling-prefix-${inkling_path_name}-${inkling_case} PROPERTIES ENVIRONMENT
                     "GGML_CUDA_FATTN_REL_RUNS_SHARED=1;GGML_CUDA_FATTN_REL_RUNS_GROUP=3")
             endif()
+        endforeach()
+        # sliding-window direct ring runs on q8_0 SWA cache against mask legacy (including drafted verify groups)
+        foreach(inkling_case runs served drafted)
+            set(inkling_ring_test test-inkling-ring-${inkling_path_name}-${inkling_case})
+            llama_test(test-llama-archs NAME ${inkling_ring_test}
+                ARGS --inkling-path ring/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+            set_tests_properties(${inkling_ring_test} PROPERTIES ENVIRONMENT "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
         endforeach()
         # and on a q8_0 or f8_e4m3 global cache (GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE)
         foreach(inkling_kv q8_0 e4m3)
@@ -741,6 +769,17 @@ if (GGML_CUDA)
         -p "n_mats=384,n_used=8,b=0,m=4608,n=23,k=576,")
     set_tests_properties(test-inkling-moe-even-split-rows-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
         ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
+    # [experts] the expert MMQ's TMA tile path (mmq-tma-tiles.cu, GGML_CUDA_MMQ_TMA): Inkling 2's Q3_K gate/up and Q4_K
+    # down expert products at the served tensor-4 by-expert shapes against the host, with the switch on over the expert
+    # row kernel and with it off on that row kernel itself
+    add_test(NAME test-inkling-mmq-tma-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID,MUL_MAT_ID_PARTITION
+        -p "(type_a=q3_K,.*n_mats=384,n_used=8,b=1,m=(1024|1152|2304),n=(3|23),k=4608,|type_a=q4_K,.*n_mats=384,n_used=8,b=0,m=4608,n=12,k=2304,)")
+    set_tests_properties(test-inkling-mmq-tma-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_MMQ_TMA=1")
+    add_test(NAME test-inkling-mmq-tma-row-kernel-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID,MUL_MAT_ID_PARTITION
+        -p "(type_a=q3_K,.*n_mats=384,n_used=8,b=1,m=(1024|1152|2304),n=(3|23),k=4608,|type_a=q4_K,.*n_mats=384,n_used=8,b=0,m=4608,n=12,k=2304,)")
+    set_tests_properties(test-inkling-mmq-tma-row-kernel-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23")
     add_test(NAME test-inkling-norm-clip-cuda0 COMMAND test-backend-ops test -b CUDA0 -o NORM_CLIP)
     # the few-row K-quant group launch (Inkling 2's Q-input products) against the host, and against each matrix's own
     # launch bit for bit
@@ -812,17 +851,27 @@ if (GGML_CUDA)
     # reference arm runs the row kernels the fused launches copy.
     # guarded: test-inkling-moe-fuse.cpp is not in this commit (fusions lane still uncommitted)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-inkling-moe-fuse.cpp)
-    llama_build(test-inkling-moe-fuse.cpp LINK ggml)
+    llama_build(test-inkling-moe-fuse.cpp LINK ggml Threads::Threads)
     add_test(NAME inkling-fuse-chain-ref-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-ref.bin)
     add_test(NAME inkling-fuse-chain-fused-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-fused.bin)
     add_test(NAME inkling-fuse-chain-exact COMMAND ${CMAKE_COMMAND} -E compare_files
         ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-ref.bin ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-fused.bin)
-    set_tests_properties(inkling-fuse-chain-ref-cuda0 PROPERTIES LABELS "main"
+    set_tests_properties(inkling-fuse-chain-ref-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
         ENVIRONMENT "GGML_CUDA_MOE_FUSE=0;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
-    set_tests_properties(inkling-fuse-chain-fused-cuda0 PROPERTIES LABELS "main"
+    set_tests_properties(inkling-fuse-chain-fused-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
         ENVIRONMENT "GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
     set_tests_properties(inkling-fuse-chain-exact PROPERTIES LABELS "main"
         DEPENDS "inkling-fuse-chain-ref-cuda0;inkling-fuse-chain-fused-cuda0")
+    add_test(NAME inkling-fuse-chain-tma-ref-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-tma-ref.bin)
+    add_test(NAME inkling-fuse-chain-tma-fused-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-tma-fused.bin)
+    add_test(NAME inkling-fuse-chain-tma-exact COMMAND ${CMAKE_COMMAND} -E compare_files
+        ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-tma-ref.bin ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-tma-fused.bin)
+    set_tests_properties(inkling-fuse-chain-tma-ref-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MOE_FUSE=0;GGML_CUDA_MMQ_TMA=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
+    set_tests_properties(inkling-fuse-chain-tma-fused-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMQ_TMA=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
+    set_tests_properties(inkling-fuse-chain-tma-exact PROPERTIES LABELS "main"
+        DEPENDS "inkling-fuse-chain-tma-ref-cuda0;inkling-fuse-chain-tma-fused-cuda0")
     endif()
     # [fp8] the e4m3 hi+lo pair algebra and the block-scaled folds of GGML_CUDA_FATTN_FP8_ACCUM, on the device
     # (campaign row inkling-fp8-accumulation; the primitives live in ggml/src/ggml-cuda/fattn-rel-fp8-pair.cuh):
@@ -839,9 +888,29 @@ if (GGML_CUDA)
     # the block-scaled QMMA (kind::mxf8f6f4, ue8m0 scales) is an sm_120a feature: ptxas refuses it on
     # plain sm_120, which a configure that overrides CMAKE_CUDA_ARCHITECTURES would otherwise hand this file
     set_target_properties(test-inkling-fp8-pair PROPERTIES CUDA_ARCHITECTURES 120a)
+    # line info so compute-sanitizer names the source line of a fault inside the fold or the merge pattern
+    target_compile_options(test-inkling-fp8-pair PRIVATE -lineinfo)
     llama_test(test-inkling-fp8-pair NAME test-inkling-fp8-pair-cuda0)
     set_tests_properties(test-inkling-fp8-pair-cuda0 PROPERTIES LABELS "main" SKIP_RETURN_CODE 77)
     endif()
+    # [fp8] the relative decode with the accumulator's pair planes: every partial writer (tile, one-cell and
+    # runs kernels) stores two-term slots and the merge folds them on the block-scaled MMA; e4m3 K/V rides the
+    # tile kernel so the KV type and the accumulator meet on one path, every relative case against the host
+    # (the same cases run switch-off elsewhere in the suite and hold the f32 planes there)
+    add_test(NAME test-inkling-kv-fp8acc-tile-cuda0 COMMAND test-backend-ops test -b CUDA0 -o FLASH_ATTN_EXT
+        -p "hs=128,.*type_KV=f8_e4m3")
+    set_tests_properties(test-inkling-kv-fp8acc-tile-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_FATTN_FP8_ACCUM=1;GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
+    # [experts] the Blackwell sm_120 MMQ rows for the K-quants (mmq-config-blackwell.cuh, campaign row
+    # blackwell-kquant-mmq): the six served prefill products (384 experts, top 8, 1,024 rows, gate/up and down in
+    # Q3_K/Q4_K/Q5_K) through the CUDA backend against the CPU backend on the same bytes, within the quantized
+    # NMSE bound test-backend-ops allows, plus one 16-row pass that keeps the Ampere widths honest; skips with no
+    # CUDA device, and it is what judges that row
+    llama_build_and_test(test-inkling-mmq-kquant.cpp LINK ggml Threads::Threads)
+    set_tests_properties(test-inkling-mmq-kquant PROPERTIES LABELS "main" TIMEOUT 3600)
+    llama_test(test-inkling-mmq-kquant NAME test-inkling-mmq-tma-kquant-cuda0 ARGS --tma)
+    set_tests_properties(test-inkling-mmq-tma-kquant-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_MMQ_TMA=1")
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
@@ -908,9 +977,12 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
         llama_test(test-backend-meta-split NAME test-backend-meta-reduction-queue ARGS --reduction-queue)
         set_tests_properties(test-backend-meta-reduction-queue PROPERTIES SKIP_RETURN_CODE 77)
         # inkling-execution-ar-capture: the copy-engine route captured whole against segments only, bit for bit,
-        # on logical ranks (two of them through pinned staging, four card-to-card by default)
+        # on real ranks (skips where fewer than two distinct GPUs serve the box); its fallback companion proves a
+        # refused capture lands back on the live route and completes
         llama_test(test-backend-meta-split NAME test-inkling-ar-capture ARGS --ar-capture)
         set_tests_properties(test-inkling-ar-capture PROPERTIES SKIP_RETURN_CODE 77)
+        llama_test(test-backend-meta-split NAME test-inkling-ar-capture-fallback ARGS --ar-fallback)
+        set_tests_properties(test-inkling-ar-capture-fallback PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     add_test(NAME test-backend-meta-candidates COMMAND test-backend-meta-split --candidates)
     if (GGML_CPU)

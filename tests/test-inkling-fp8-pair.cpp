@@ -124,6 +124,148 @@ __global__ void k_fold32(const uint32_t * slots, uint32_t * out) {
 #endif
 }
 
+// k_merge_pattern: the rel-decode merge's body (4 warps, per-warp stages, per-stream weights from the
+// plane's word 0, the denominator folded by warp 0, 32 elements a warp) over one row's plane of n_parts
+// slots, with a mode probe to bisect a fault in it:
+//   mode 0 the full merge; mode 1 the denominator fold only; mode 2 element folds on RAW slots (no weight
+//   scaling); mode 3 the shell only (max, weights, one scale-slot encode an element, no fold at all).
+__global__ void k_merge_pattern(const uint32_t * partial, const float * sinks, float * out, int n_parts, int mode,
+                                int i0, int i1) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    __shared__ fattn_fp8_fold_stage stage[4];
+    __shared__ float max_all_sh, denom_sh;
+    __shared__ float weight_sh[FATTN_FP8_GROUPS_MAX * FATTN_FP8_GROUP];
+    const int row = blockIdx.y*gridDim.x + blockIdx.x;
+    const uint32_t * base = partial + int64_t(row)*n_parts*130;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const float seed = sinks ? sinks[row] : 0.0f;
+    if (threadIdx.x == 0) {
+        float m = seed;
+        for (int i = 0; i < n_parts; ++i) {
+            m = fmaxf(m, __uint_as_float(base[i*130]));
+        }
+        max_all_sh = m;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_parts; i += blockDim.x) {
+        weight_sh[i] = expf(__uint_as_float(base[i*130]) - max_all_sh);
+    }
+    __syncthreads();
+    const uint32_t zero = fattn_fp8_slot_pack(fattn_fp8_zero_two());
+    if (mode == 8) {
+        // scan: name the words whose pair decode is not finite (the fold traps on those)
+        __shared__ int bad;
+        if (threadIdx.x == 0) {
+            bad = 0;
+        }
+        __syncthreads();
+        for (int i = lane; i < n_parts; i += 32) {
+            for (int e = warp*32; e < warp*32 + 32; ++e) {
+                const uint32_t w = base[i*130 + 2 + e];
+                const fattn_fp8_two u = fattn_fp8_slot_unpack(w);
+                const float xh = fattn_fp8_decode(u.hi), xl = fattn_fp8_decode(u.lo);
+                if (xh != xh || xl != xl || fabsf(xh) > FLT_MAX || fabsf(xl) > FLT_MAX) {
+                    const int k = atomicAdd(&bad, 1);
+                    if (k < 3) {
+                        printf("BAD row %d part %d elem %d word %08x hi %a lo %a\n", row, i, e, w,
+                               (double) xh, (double) xl);
+                    }
+                }
+            }
+        }
+        if (lane == 0) {
+            for (int e = warp*32; e < warp*32 + 32; ++e) {
+                out[int64_t(row)*128 + e] = 0.0f;
+            }
+        }
+        return;
+    }
+    if (mode == 3) {
+        if (lane == 0) {
+            for (int e = 0; e < 32; ++e) {
+                const int element = warp*32 + e;
+                out[int64_t(row)*128 + element] =
+                    __uint_as_float(fattn_fp8_scale_slot(base[2 + element], weight_sh[0]));
+            }
+        }
+        return;
+    }
+    if (mode <= 1 && warp == 0) {
+        const fattn_fp8_two d = fattn_fp8_fold_groups(n_parts, lane, stage[0], [&](int g) {
+            const int i = g*FATTN_FP8_GROUP + lane;
+            return i < n_parts ? fattn_fp8_scale_slot(base[i*130 + 1], weight_sh[i]) : zero;
+        });
+        if (lane == 0) {
+            denom_sh = expf(seed - max_all_sh) + fattn_fp8_decode(d.hi) + fattn_fp8_decode(d.lo);
+        }
+    } else if (threadIdx.x == 0) {
+        denom_sh = 1.0f;
+    }
+    __syncthreads();
+    if (mode == 1) {
+        if (lane == 0) {
+            for (int e = 0; e < 32; ++e) {
+                out[int64_t(row)*128 + warp*32 + e] = denom_sh;
+            }
+        }
+        return;
+    }
+    // mode 7 folds ONE group of raw slots, mode 6 one element of raw slots, mode 2 all 32 elements,
+    // mode 9 the same folds of only the parts in [i0, i1), mode 10 device-encoded synthetic slots.
+    const int e_end = mode == 6 ? 1 : 32;
+    const int n_fold = mode == 7 ? FATTN_FP8_GROUP : n_parts;
+    for (int e = 0; e < e_end; ++e) {
+        const int element = warp*32 + e;
+        const fattn_fp8_two o = fattn_fp8_fold_groups(n_fold, lane, stage[warp], [&](int g) {
+            const int i = g*FATTN_FP8_GROUP + lane;
+            if (mode == 10) {
+                return i < n_fold ? fattn_fp8_slot_pack(fattn_fp8_encode_two((float) i - 16.0f)) : zero;
+            }
+            if (mode == 9) {
+                return (i < n_fold && i >= i0 && i < i1) ? base[i*130 + 2 + element] : zero;
+            }
+            return i < n_fold ? ((mode == 2 || mode == 6 || mode == 7) ? base[i*130 + 2 + element]
+                                            : fattn_fp8_scale_slot(base[i*130 + 2 + element], weight_sh[i]))
+                               : zero;
+        });
+        if (lane == 0) {
+            out[int64_t(row)*128 + element] = (fattn_fp8_decode(o.hi) + fattn_fp8_decode(o.lo)) / denom_sh;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(partial, sinks, out, n_parts, mode, i0, i1);
+#endif
+}
+
+// k_fold_pattern: the merge's fold shape on synthetic slots (no plane read): each warp folds `elements`
+// elements of n device-encoded slots, one stage a warp. The minimal repro of the merge's 256-part fault.
+__global__ void k_fold_pattern(float * out, int n, int elements, int warp_mask, int sync_flag) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    __shared__ fattn_fp8_fold_stage stage[4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const uint32_t zero = fattn_fp8_slot_pack(fattn_fp8_zero_two());
+    for (int e = 0; e < elements; ++e) {
+        if (sync_flag) {
+            __syncthreads();
+        }
+        if ((warp_mask >> warp) & 1) {
+            const fattn_fp8_two o = fattn_fp8_fold_groups(n, lane, stage[warp], [&](int g) {
+                const int i = g*FATTN_FP8_GROUP + lane;
+                return i < n ? fattn_fp8_slot_pack(fattn_fp8_encode_two((float) i - 16.0f)) : zero;
+            });
+            if (lane == 0) {
+                out[warp*32 + e] = fattn_fp8_decode(o.hi) + fattn_fp8_decode(o.lo);
+            }
+        }
+        if (sync_flag) {
+            __syncthreads();
+        }
+    }
+#else
+    GGML_UNUSED_VARS(out, n, elements, warp_mask, sync_flag);
+#endif
+}
+
 // k_fold_slots: one warp an element with n slot partials (groups of 32 then the group sums).
 __global__ void k_fold_slots(const uint32_t * slots, int n, uint32_t * out) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -522,6 +664,191 @@ int main() {
         std::printf("sum_terms one-term (16 terms): worst rel %.3e (the terms' own 3-bit rounding)\n", worst);
         cudaFree(d_v); cudaFree(d_out);
     }
+
+    // -- the fold shape of the merge: synthetic slots, warp count and part count varied --
+    {
+        struct fold_case { int threads; int n; int elements; int mask; int sync; };
+        const fold_case cases[7] = {
+            {32, 256, 32, 1, 0},    // control: one warp
+            {64, 256, 32, 2, 0},    // warp 1 alone, its own stage
+            {64, 256, 32, 3, 1},    // two warps, serialized per element
+            {64, 256, 1, 3, 0},     // two warps, one element
+            {96, 256, 32, 7, 0},    // three warps
+            {128, 32, 32, 15, 0},   // four warps, one group
+            {128, 256, 32, 15, 0},  // four warps (the known failure)
+        };
+        for (const fold_case & fc : cases) {
+            float * d_out;
+            cudaMalloc(&d_out, 4*32 * sizeof(float));
+            k_fold_pattern<<<1, fc.threads>>>(d_out, fc.n, fc.elements, fc.mask, fc.sync);
+            const cudaError_t err = cudaDeviceSynchronize();
+            CHECK(err == cudaSuccess, "k_fold_pattern(%d threads, %d parts, mask %d): %s", fc.threads, fc.n,
+                  fc.mask, cudaGetErrorString(err));
+            if (err == cudaSuccess) {
+                std::vector<float> out(4*32);
+                cudaMemcpy(out.data(), d_out, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                std::printf("fold pattern (%d threads, %3d parts, mask %2d, sync %d): out[0] %a out[32] %a out[64] %a\n",
+                            fc.threads, fc.n, fc.mask, fc.sync, (double) out[0], (double) out[32], (double) out[64]);
+            } else {
+                std::printf("fold pattern (%d threads, %3d parts, mask %2d, sync %d): LAUNCH FAILED\n",
+                            fc.threads, fc.n, fc.mask, fc.sync);
+                cudaFree(d_out);
+                break;
+            }
+            cudaFree(d_out);
+        }
+    }
+
+    // -- the merge pattern: the rel-decode merge's own body over a synthetic plane, last so a fault in it
+    // cannot poison the cases above --
+    // 4 warps on 128 threads, one stage a warp, per-part softmax weights from the plane's word 0, the
+    // denominator folded by warp 0, 32 elements a warp. Mode probes bisect a fault inside the merge: 3 the
+    // shell (max, weights, one scale-slot encode an element), 2 element folds on raw slots, 1 the
+    // denominator fold, 0 the full merge held against a double sum of the scaled partials.
+    {
+        struct merge_ref {
+            std::vector<uint32_t> plane;
+            std::vector<float> sinks;
+            std::vector<double> out, l1, den;
+        };
+        auto make_plane = [&](int np, int rows, bool sink) {
+            merge_ref mr;
+            mr.plane.assign((size_t) rows*np*130, 0u);
+            mr.sinks.assign(rows, 0.0f);
+            mr.out.assign((size_t) rows*128, 0.0);
+            mr.l1.assign((size_t) rows*128, 0.0);
+            mr.den.assign(rows, 0.0);
+            for (int r = 0; r < rows; ++r) {
+                mr.sinks[r] = sink ? (float) (2.5 + r) : 0.0f;
+                std::vector<float> vals((size_t) np*129), maxi(np);
+                for (int i = 0; i < np; ++i) {
+                    maxi[i] = (float) std::uniform_real_distribution<double>(0.0, 4.0)(rng);
+                    vals[(size_t) i*129] = (float) std::uniform_real_distribution<double>(0.5, 30.0)(rng);
+                    for (int e = 0; e < 128; ++e) {
+                        vals[(size_t) i*129 + 1 + e] = frand(rng, -3.0, 0.5);
+                    }
+                }
+                std::vector<uint32_t> slots;
+                encode_slots(vals, slots);
+                const double seed = sink ? (double) mr.sinks[r] : 0.0;
+                double max_all = seed;
+                for (int i = 0; i < np; ++i) {
+                    max_all = std::fmax(max_all, (double) maxi[i]);
+                }
+                mr.den[r] = std::exp(seed - max_all);
+                for (int i = 0; i < np; ++i) {
+                    ((float *) mr.plane.data())[(size_t) (r*np + i)*130] = maxi[i];
+                    for (int k = 0; k < 129; ++k) {
+                        mr.plane[(size_t) (r*np + i)*130 + 1 + k] = slots[(size_t) i*129 + k];
+                    }
+                    const double weight = std::exp((double) maxi[i] - max_all);
+                    mr.den[r] += weight * host_two(slots[(size_t) i*129]);
+                    for (int e = 0; e < 128; ++e) {
+                        const double t = weight * host_two(slots[(size_t) i*129 + 1 + e]);
+                        mr.out[(size_t) r*128 + e] += t;
+                        mr.l1[(size_t) r*128 + e] += std::fabs(t);
+                    }
+                }
+            }
+            return mr;
+        };
+        auto run = [&](const merge_ref & mr, int np, int rows, int mode, bool check, int i0 = 0, int i1 = 1 << 30) {
+            uint32_t * d_plane; float * d_sinks; float * d_out;
+            cudaMalloc(&d_plane, mr.plane.size() * sizeof(uint32_t));
+            cudaMalloc(&d_sinks, rows * sizeof(float));
+            cudaMalloc(&d_out, (size_t) rows*128 * sizeof(float));
+            cudaMemcpy(d_plane, mr.plane.data(), mr.plane.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_sinks, mr.sinks.data(), rows * sizeof(float), cudaMemcpyHostToDevice);
+            k_merge_pattern<<<dim3(1, rows), 128>>>(d_plane, d_sinks, d_out, np, mode, i0, i1);
+            const cudaError_t err = cudaDeviceSynchronize();
+            const bool ok = err == cudaSuccess;
+            CHECK(ok, "k_merge_pattern(%d parts, mode %d): %s", np, mode, cudaGetErrorString(err));
+            if (ok && check) {
+                std::vector<float> out((size_t) rows*128);
+                cudaMemcpy(out.data(), d_out, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                double worst = 0.0;
+                for (int r = 0; r < rows; ++r) {
+                    for (int e = 0; e < 128; ++e) {
+                        const double want = mr.out[(size_t) r*128 + e] / mr.den[r];
+                        const double d = std::fabs((double) out[(size_t) r*128 + e] - want);
+                        worst = std::fmax(worst, d / std::fmax(mr.l1[(size_t) r*128 + e] / mr.den[r], 1e-30));
+                        CHECK(d <= (mr.l1[(size_t) r*128 + e] + std::fabs(mr.den[r])*1e-3) / std::fabs(mr.den[r])
+                                        * std::pow(2.0, -6.0) + 1e-30,
+                              "merge(%d parts) row %d element %d: got %a want %a", np, r, e,
+                              (double) out[(size_t) r*128 + e], want);
+                    }
+                }
+                std::printf("merge pattern (%3d parts, mode %d): worst rel %.3e\n", np, mode, worst);
+            } else {
+                std::printf("merge pattern (%3d parts, mode %d): %s\n", np, mode,
+                            ok ? "ran" : "LAUNCH FAILED");
+            }
+            cudaFree(d_plane); cudaFree(d_sinks); cudaFree(d_out);
+            return ok;
+        };
+        const merge_ref big = make_plane(256, 2, true);
+        {
+            // the host's own view of the same words: a valid encode never decodes to non-finite
+            int bad = 0;
+            for (size_t w = 0; w < big.plane.size(); ++w) {
+                const uint32_t v = big.plane[w];
+                if (v == 0u) {
+                    continue;
+                }
+                const double hi = host_pair((uint8_t) (v & 0xFF), (uint8_t) ((v >> 16) & 0xFF));
+                const double lo = host_pair((uint8_t) ((v >> 8) & 0xFF), (uint8_t) ((v >> 24) & 0xFF));
+                if (!std::isfinite(hi) || !std::isfinite(lo)) {
+                    if (bad < 3) {
+                        std::printf("HOST BAD word %zu: %08x hi %a lo %a\n", w, v, hi, lo);
+                    }
+                    ++bad;
+                }
+            }
+            std::printf("host plane scan: %d bad of %zu words\n", bad, big.plane.size());
+        }
+        bool alive = true;
+        for (int mode : {8, 3, 10}) {   // scan, shell, device-synthetic folds (no plane read)
+            if (!alive) {
+                break;
+            }
+            alive = run(big, 256, 2, mode, false);
+        }
+        if (alive) {
+            if (!run(big, 256, 2, 9, false)) {   // raw folds of parts [0,256): the fault is in the data
+                int lo = 0, hi = 256;
+                while (hi - lo > 1) {
+                    const int mid = (lo + hi) / 2;
+                    if (!run(big, 256, 2, 9, false, lo, mid)) {
+                        hi = mid;
+                    } else if (!run(big, 256, 2, 9, false, mid, hi)) {
+                        lo = mid;
+                    } else {
+                        std::printf("merge probe: the fault needs BOTH halves of parts [%d,%d)\n", lo, hi);
+                        break;
+                    }
+                }
+                if (hi - lo == 1) {
+                    std::printf("merge probe: the fault lives in part %d\n", lo);
+                }
+            } else {
+                std::printf("merge probe: parts [0,256) raw folds ran\n");
+            }
+        }
+        if (alive) {
+            for (int mode : {2, 1, 0}) {
+                if (!alive) {
+                    break;
+                }
+                alive = run(big, 256, 2, mode, mode == 0);
+            }
+        }
+        if (alive) {
+            run(make_plane(256, 2, true), 256, 2, 0, true);
+            run(make_plane(64, 2, false), 64, 2, 0, true);
+            run(make_plane(8, 1, false), 8, 1, 0, true);
+        }
+    }
+
 
     if (g_failures != 0) {
         std::printf("test-inkling-fp8-pair: %d failure(s)\n", g_failures);

@@ -124,6 +124,48 @@ std::string runs_kind(const ggml_tensor * t) {
     return t->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_get_kv_runs(t) ? "attention by runs" : "";
 }
 
+std::string swa_ring_kind(const ggml_tensor * t) {
+    return t->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_get_kv_runs(t) &&
+        ggml_flash_attn_ext_is_swa_runs(t) ? "swa ring runs" : "";
+}
+
+std::string kv_mixed_kind(const ggml_tensor * t) {
+    return t->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_get_hot_kv(t) ? "hot F16 mixed KV" : "";
+}
+
+std::function<void(llama_context_params &, bool)> kv_mixed_on(const char * hot_cells, bool use_runs) {
+    return [=](llama_context_params & params, bool legacy) {
+        params.attn_mask_bits = true;
+        params.type_k_swa = params.type_v_swa = GGML_TYPE_F16;
+        if (use_runs) {
+            setenv("LLAMA_INKLING2_KV_RUNS", "1", 1);
+        } else {
+            unsetenv("LLAMA_INKLING2_KV_RUNS");
+        }
+        if (legacy) {
+            params.type_k = params.type_v = GGML_TYPE_F16;
+            unsetenv("LLAMA_INKLING2_KV_MIXED");
+            unsetenv("LLAMA_INKLING2_KV_MIXED_HOT");
+        } else {
+            params.type_k = params.type_v = GGML_TYPE_Q4_0;
+            setenv("LLAMA_INKLING2_KV_MIXED", "1", 1);
+            setenv("LLAMA_INKLING2_KV_MIXED_HOT", hot_cells, 1);
+        }
+    };
+}
+
+void swa_ring_on(llama_context_params & params, bool legacy) {
+    params.attn_mask_bits = true;
+    params.type_k = params.type_v = GGML_TYPE_F16;
+    params.type_k_swa = params.type_v_swa = GGML_TYPE_Q8_0;
+    setenv("LLAMA_INKLING2_KV_RUNS", "1", 1);
+    if (legacy) {
+        setenv("LLAMA_INKLING2_SWA_RUNS_LEGACY", "1", 1);
+    } else {
+        unsetenv("LLAMA_INKLING2_SWA_RUNS_LEGACY");
+    }
+}
+
 // the global decode by runs of cells (LLAMA_INKLING2_KV_RUNS, read as each graph is built) with packed masks
 void kv_runs_on(llama_context_params & params, bool legacy) {
     params.attn_mask_bits = true;
@@ -212,6 +254,9 @@ const std::map<std::string, feature> & features() {
         {"far", {nullptr, {"attention by runs"}, runs_kind, kv_runs_on, tolerance, 0.0, served_heads}},
         {"far-q8_0", {nullptr, {"attention by runs"}, runs_kind, kv_runs_one_byte(GGML_TYPE_Q8_0), tolerance, 0.0, served_heads}},
         {"far-e4m3", {nullptr, {"attention by runs"}, runs_kind, kv_runs_one_byte(GGML_TYPE_F8_E4M3), tolerance, 0.0, served_heads}},
+        {"ring", {nullptr, {"swa ring runs"}, swa_ring_kind, swa_ring_on, tolerance, 0.0, served_heads}},
+        {"kv-mixed-near", {nullptr, {"hot F16 mixed KV"}, kv_mixed_kind, kv_mixed_on("2048", false), tolerance, tolerance}},
+        {"kv-mixed", {nullptr, {"hot F16 mixed KV"}, kv_mixed_kind, kv_mixed_on("1024", true), q4_0_rounding, q4_0_on_host, served_heads}},
     };
     return all;
 }
