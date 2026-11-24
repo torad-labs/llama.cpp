@@ -2016,6 +2016,46 @@ struct ggml_cuda_l2_issue_stop {
     }
 };
 
+// Device-side arrival counters for ordering-only stream handoffs (fork/join, side-stream L2 warm).
+// Each slot sits on its own 64-byte cache line (16 uint32_t stride). Allocated before graph evaluation.
+struct ggml_cuda_arrival_counters {
+    static constexpr int stride_u32 = 16;
+    static constexpr int n_slots    = 4;
+    enum slot_id {
+        SLOT_FORK    = 0,
+        SLOT_JOIN    = 1,
+        SLOT_L2_FORK = 2,
+        SLOT_L2_JOIN = 3,
+    };
+
+    uint32_t * ptr = nullptr;
+    uint32_t   seq[n_slots] = {};
+
+    void ensure() {
+        if (ptr == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ptr, (size_t) n_slots * stride_u32 * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemset(ptr, 0, (size_t) n_slots * stride_u32 * sizeof(uint32_t)));
+            for (int i = 0; i < n_slots; ++i) {
+                seq[i] = 0;
+            }
+        }
+    }
+
+    void release() {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+            ptr = nullptr;
+        }
+        for (int i = 0; i < n_slots; ++i) {
+            seq[i] = 0;
+        }
+    }
+
+    uint32_t * slot(slot_id id) const {
+        return ptr != nullptr ? ptr + (size_t) id * stride_u32 : nullptr;
+    }
+};
+
 // The q8_1 copies of the F32 inputs that two or more quantized MUL_MAT / MUL_MAT_ID of one graph evaluation read on
 // mul_mat_vec_q (the q, k and v projections of one input; a shared expert's and the routed experts' gate/up): the first
 // reader quantizes into a pool allocation the evaluation holds (ggml_cuda_graph_evaluate_and_capture makes it before
@@ -2742,7 +2782,9 @@ struct ggml_backend_cuda_context {
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
+    bool        l2_issue_counter = false; // the open issuer forked through device arrival counters
     ggml_cuda_l2_issue_stop l2_issue_stop;
+    ggml_cuda_arrival_counters arrival_counters;
     bool        l2_persisting = false;   // a launch was given a persisting L2 window (ggml_cuda_l2_persist_window)
     const ggml_cgraph * l2_graph_next = nullptr; // the graph after the next computed, while it computes (ggml_backend_graph_next)
     const ggml_cgraph * ar_hc_graph = nullptr;

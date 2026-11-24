@@ -83,6 +83,76 @@ static __device__ __forceinline__ void mmq_tma_load(void * dst, const CUtensorMa
         : "memory");
 }
 
+// Tensor-map L2 prefetch before dependency wait: no SMEM destination, no mbarrier, no evict_last.
+static __device__ __forceinline__ void mmq_tma_prefetch_tile(const CUtensorMap * map, const int x, const int y) {
+    asm volatile(
+        "cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];"
+        :: "l"((uint64_t) map), "r"(x), "r"(y)
+        : "memory");
+}
+
+// Warp 0 warms this CTA's leading routed expert tiles in consumer walk order before ggml_cuda_pdl_sync().
+// Uses the dynamic SMEM scratch temporarily; all warps hit __syncthreads() before any TMA copy writes SMEM.
+static __device__ __forceinline__ void mmq_tma_prewait_warm(
+        char * s_scratch, const CUtensorMap * map,
+        const int32_t * ids, const int nentries, const int n_used, const int ids_stride,
+        const int n_experts, const int n_row_tiles, const int64_t expert_chunks, const int64_t half_chunks,
+        const int box_rows, const bool paired_halves, const int max_tiles_per_cta) {
+    if (max_tiles_per_cta <= 0 || threadIdx.y != 0 || n_experts <= 0 || n_experts > 512) {
+        return;
+    }
+    constexpr int MASK_WORDS = 16;
+    uint32_t * mask    = reinterpret_cast<uint32_t *>(s_scratch);
+    uint16_t * experts = reinterpret_cast<uint16_t *>(mask + MASK_WORDS);
+    const int  lane    = threadIdx.x;
+    if (lane < MASK_WORDS) {
+        mask[lane] = 0u;
+    }
+    __syncwarp();
+    for (int i = lane; i < nentries; i += WARP_SIZE) {
+        const int32_t e = __ldcg(&ids[(i / n_used) * ids_stride + (i % n_used)]);
+        if (e >= 0 && e < n_experts) {
+            atomicOr(&mask[e >> 5], 1u << (e & 31));
+        }
+    }
+    __syncwarp();
+    uint32_t w   = lane < MASK_WORDS ? mask[lane] : 0u;
+    int      cnt = __popc(w);
+    int      inc = cnt;
+#pragma unroll
+    for (int off = 1; off < MASK_WORDS; off <<= 1) {
+        const int up = __shfl_up_sync(0xFFFFFFFFu, inc, off);
+        if (lane >= off) {
+            inc += up;
+        }
+    }
+    int base = inc - cnt;
+    while (w != 0u) {
+        const int bit = __ffs(w) - 1;
+        experts[base++] = (uint16_t) (lane * 32 + bit);
+        w &= w - 1u;
+    }
+    const int n_unique = __shfl_sync(0xFFFFFFFFu, inc, MASK_WORDS - 1);
+    __syncwarp();
+    if (lane != 0 || n_unique <= 0) {
+        return;
+    }
+    const int total_tiles = n_unique * n_row_tiles;
+    const int t_begin     = (int) (((int64_t) total_tiles * blockIdx.x) / gridDim.x);
+    const int t_end       = (int) (((int64_t) total_tiles * (blockIdx.x + 1)) / gridDim.x);
+    const int t_lim       = min(t_end, t_begin + max_tiles_per_cta);
+    for (int t = t_begin; t < t_lim; ++t) {
+        const int u  = t / n_row_tiles;
+        const int rt = t % n_row_tiles;
+        const int e  = (int) experts[u];
+        const int y0 = (int) ((int64_t) e * expert_chunks + (int64_t) rt * box_rows);
+        mmq_tma_prefetch_tile(map, 0, y0);
+        if (paired_halves) {
+            mmq_tma_prefetch_tile(map, 0, (int) ((int64_t) y0 + half_chunks));
+        }
+    }
+}
+
 // Weight stream is read once a step: evict_first, matching the fork's other TMA weight loads.
 static __device__ __forceinline__ uint64_t mmq_tma_evict_first() {
     uint64_t policy;
@@ -306,12 +376,42 @@ static __device__ __forceinline__ void mmq_tma_vec_dot_q45_K(const char * const 
     }
 }
 
+struct mmq_tma_warm_args {
+    const int32_t * ids               = nullptr;
+    int             nentries          = 0;
+    int             n_used            = 0;
+    int             ids_stride        = 0;
+    int             n_experts         = 0;
+    int             max_tiles_per_cta = 0;
+    unsigned int *  l2_issue_stop     = nullptr;
+};
+
+static int mmq_tma_prewait_tiles_per_cta(const int device, const int grid_x, const int tile_step_bytes,
+                                         const bool ids_ready, const int n_experts) {
+    if (!ids_ready || grid_x <= 0 || tile_step_bytes <= 0 || n_experts <= 0 || n_experts > 512) {
+        return 0;
+    }
+    if (!ggml_env_switch("GGML_CUDA_L2_EXPERT_WARM")) {
+        return 0;
+    }
+    const double dose_mib = ggml_env_float("GGML_CUDA_L2_EXPERT_WARM_MIB");
+    if (dose_mib <= 0.0) {
+        return 0;
+    }
+    const auto & dev      = ggml_cuda_info().devices[device];
+    const double l2_frac  = ggml_env_float("GGML_CUDA_L2_ISSUE_L2_FRAC");
+    const int64_t l2_cap  = dev.l2_bytes > 0 ? (int64_t) (l2_frac * (double) dev.l2_bytes) : (int64_t) (dose_mib * 1024.0 * 1024.0);
+    const int64_t cap_b   = std::min<int64_t>(l2_cap, (int64_t) (dose_mib * 1024.0 * 1024.0));
+    const int total_tiles = (int) (cap_b / tile_step_bytes);
+    return std::max(1, total_tiles / grid_x);
+}
+
 // Persistent 2-slot double-buffered Q3_K TMA kernel (9 balanced warps x 2 units = 18 units).
 static __global__ __launch_bounds__(MMQ_TMA_Q3K_NWARPS*WARP_SIZE, 1)
 void mul_mat_q_tma_q3_K(const __grid_constant__ CUtensorMap map, const int4 * y, float * dst,
                         const int nrows_x, const int64_t expert_chunks, const int ncols_dst,
                         const int stride_col_dst, const int64_t stride_channel_dst,
-                        const int * pairs, const int * npairs_ptr) {
+                        const int * pairs, const int * npairs_ptr, const mmq_tma_warm_args warm) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
     constexpr int NWARPS = MMQ_TMA_Q3K_NWARPS;
     constexpr int REDUCE_FLOATS = (NWARPS - 1)*4*WARP_SIZE;
@@ -327,7 +427,16 @@ void mul_mat_q_tma_q3_K(const __grid_constant__ CUtensorMap map, const int4 * y,
     const int lane = threadIdx.x;
     const int tid  = warp*WARP_SIZE + lane;
 
+    if (warm.max_tiles_per_cta > 0) {
+        mmq_tma_prewait_warm(s_dyn, &map, warm.ids, warm.nentries, warm.n_used, warm.ids_stride,
+            warm.n_experts, nrows_x / MMQ_TMA_TILE_ROWS, expert_chunks, 0, MMQ_TMA_BOX, false, warm.max_tiles_per_cta);
+    }
+
     ggml_cuda_pdl_sync();
+
+    if (warm.l2_issue_stop != nullptr && blockIdx.x == 0 && tid == 0) {
+        atomicAdd(warm.l2_issue_stop, 1u);
+    }
 
     const int npairs      = *npairs_ptr;
     const int n_row_tiles = nrows_x / MMQ_TMA_TILE_ROWS;
@@ -441,7 +550,7 @@ void mul_mat_q_tma_q3_K(const __grid_constant__ CUtensorMap map, const int4 * y,
 
     ggml_cuda_pdl_lc();
 #else
-    GGML_UNUSED_VARS(map, y, dst, nrows_x, expert_chunks, ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr);
+    GGML_UNUSED_VARS(map, y, dst, nrows_x, expert_chunks, ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, warm);
     NO_DEVICE_CODE;
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
 }
@@ -453,7 +562,8 @@ void mul_mat_q_tma_q3_K_gate_up_situ(
         const __grid_constant__ CUtensorMap map, const int4 * y, float * dst,
         const int n_ff, const int64_t expert_chunks, const int64_t half_chunks,
         const int ncols_dst, const int stride_col_dst, const int64_t stride_channel_dst,
-        const int * pairs, const int * npairs_ptr, const float beta, const float lb) {
+        const int * pairs, const int * npairs_ptr, const float beta, const float lb,
+        const mmq_tma_warm_args warm) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
     constexpr int NWARPS = MMQ_TMA_Q3K_NWARPS;
     constexpr int REDUCE_FLOATS = (NWARPS - 1)*4*WARP_SIZE;
@@ -469,7 +579,16 @@ void mul_mat_q_tma_q3_K_gate_up_situ(
     const int lane = threadIdx.x;
     const int tid  = warp*WARP_SIZE + lane;
 
+    if (warm.max_tiles_per_cta > 0) {
+        mmq_tma_prewait_warm(s_dyn, &map, warm.ids, warm.nentries, warm.n_used, warm.ids_stride,
+            warm.n_experts, n_ff / MMQ_TMA_TILE_ROWS, expert_chunks, half_chunks, MMQ_TMA_BOX, true, warm.max_tiles_per_cta);
+    }
+
     ggml_cuda_pdl_sync();
+
+    if (warm.l2_issue_stop != nullptr && blockIdx.x == 0 && tid == 0) {
+        atomicAdd(warm.l2_issue_stop, 1u);
+    }
 
     const int npairs      = *npairs_ptr;
     const int n_row_tiles = n_ff / MMQ_TMA_TILE_ROWS;
@@ -605,7 +724,7 @@ void mul_mat_q_tma_q3_K_gate_up_situ(
     ggml_cuda_pdl_lc();
 #else
     GGML_UNUSED_VARS(map, y, dst, n_ff, expert_chunks, half_chunks, ncols_dst, stride_col_dst, stride_channel_dst,
-        pairs, npairs_ptr, beta, lb);
+        pairs, npairs_ptr, beta, lb, warm);
     NO_DEVICE_CODE;
 #endif
 }
@@ -617,7 +736,7 @@ void mul_mat_q_tma_q45_K(const __grid_constant__ CUtensorMap map, const int4 * y
                          const int nrows_x, const int64_t expert_rows, const int nunits,
                          const int row_bytes, const int tile_bytes, const int tile_stride,
                          const int ncols_dst, const int stride_col_dst, const int64_t stride_channel_dst,
-                         const int * pairs, const int * npairs_ptr) {
+                         const int * pairs, const int * npairs_ptr, const mmq_tma_warm_args warm) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
     constexpr int UNIT_BYTES    = type == GGML_TYPE_Q4_K ? MMQ_TMA_Q4K_UNIT_BYTES : MMQ_TMA_Q5K_UNIT_BYTES;
     constexpr int REDUCE_FLOATS = (NWARPS - 1)*4*WARP_SIZE;
@@ -633,7 +752,16 @@ void mul_mat_q_tma_q45_K(const __grid_constant__ CUtensorMap map, const int4 * y
     const int lane = threadIdx.x;
     const int tid  = warp*WARP_SIZE + lane;
 
+    if (warm.max_tiles_per_cta > 0) {
+        mmq_tma_prewait_warm(s_dyn, &map, warm.ids, warm.nentries, warm.n_used, warm.ids_stride,
+            warm.n_experts, nrows_x / MMQ_TMA_TILE_ROWS, expert_rows, 0, MMQ_TMA_TILE_ROWS, false, warm.max_tiles_per_cta);
+    }
+
     ggml_cuda_pdl_sync();
+
+    if (warm.l2_issue_stop != nullptr && blockIdx.x == 0 && tid == 0) {
+        atomicAdd(warm.l2_issue_stop, 1u);
+    }
 
     const int npairs      = *npairs_ptr;
     const int n_row_tiles = nrows_x / MMQ_TMA_TILE_ROWS;
@@ -761,7 +889,7 @@ void mul_mat_q_tma_q45_K(const __grid_constant__ CUtensorMap map, const int4 * y
     ggml_cuda_pdl_lc();
 #else
     GGML_UNUSED_VARS(map, y, dst, nrows_x, expert_rows, nunits, row_bytes, tile_bytes, tile_stride,
-        ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr);
+        ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, warm);
     NO_DEVICE_CODE;
 #endif
 }
@@ -860,7 +988,8 @@ static void launch_mul_mat_q_tma_q45_K(
         const int device, const CUtensorMap & map, const int4 * y, float * dst,
         const int nrows_x, const int64_t expert_rows, const int nunits, const int row_bytes,
         const int ncols_dst, const int stride_col_dst, const int64_t stride_channel_dst,
-        const int * pairs, const int * npairs_ptr, const int npairs_max, cudaStream_t stream) {
+        const int * pairs, const int * npairs_ptr, const int npairs_max,
+        mmq_tma_warm_args warm, const bool ids_ready, cudaStream_t stream) {
     const int tile_bytes  = MMQ_TMA_TILE_ROWS * row_bytes;
     const int tile_stride = ((tile_bytes + 127) / 128) * 128;
     const size_t smem_bytes = (size_t) (2*tile_stride) + 2*sizeof(uint64_t) +
@@ -871,12 +1000,13 @@ static void launch_mul_mat_q_tma_q45_K(
     const int nsm = ggml_cuda_info().devices[device].nsm;
     const int max_tiles = (nrows_x / MMQ_TMA_TILE_ROWS) * npairs_max;
     const int grid_x = std::max(1, std::min(nsm * OCC, max_tiles));
+    warm.max_tiles_per_cta = mmq_tma_prewait_tiles_per_cta(device, grid_x, tile_bytes, ids_ready, warm.n_experts);
     const dim3 grid((unsigned) grid_x, 1, 1);
     const dim3 block(WARP_SIZE, NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(grid, block, smem_bytes, stream);
     ggml_cuda_kernel_launch(mul_mat_q_tma_q45_K<type, NWARPS, OCC, SINGLE_UNIT>, params,
         map, y, dst, nrows_x, expert_rows, nunits, row_bytes, tile_bytes, tile_stride,
-        ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr);
+        ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, warm);
 }
 
 template <ggml_type type>
@@ -884,17 +1014,18 @@ static void dispatch_mul_mat_q_tma_q45_K(
         const int device, const CUtensorMap & map, const int4 * y, float * dst,
         const int nrows_x, const int64_t expert_rows, const int nunits, const int row_bytes,
         const int ncols_dst, const int stride_col_dst, const int64_t stride_channel_dst,
-        const int * pairs, const int * npairs_ptr, const int npairs_max, cudaStream_t stream) {
+        const int * pairs, const int * npairs_ptr, const int npairs_max,
+        const mmq_tma_warm_args & warm, const bool ids_ready, cudaStream_t stream) {
     if (nunits == 9) {
         // 9 warps x 1 unit/warp: 0% warp imbalance, y cached in regs across row tiles of each pair.
         launch_mul_mat_q_tma_q45_K<type, 9, 1, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
-            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, warm, ids_ready, stream);
     } else if (nunits == 6) {
         launch_mul_mat_q_tma_q45_K<type, 6, 2, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
-            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, warm, ids_ready, stream);
     } else if (nunits == 4) {
         launch_mul_mat_q_tma_q45_K<type, 4, 2, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
-            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, warm, ids_ready, stream);
     } else {
         GGML_ABORT("unexpected nunits %d for Q4_K/Q5_K TMA", nunits);
     }
@@ -963,7 +1094,7 @@ static bool mmq_tma_q45_shape_ok(const ggml_tensor * w, int & nunits, int & row_
 }
 
 bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                          const ggml_tensor * ids, ggml_tensor * dst) {
+                          const ggml_tensor * ids, ggml_tensor * dst, const bool ids_ready) {
     static const bool enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
     if (!enabled || src0 == nullptr || ids == nullptr) {
         return false;
@@ -1025,6 +1156,14 @@ bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         is_q3k ? MMQ_Q8_1_DS_LAYOUT_D4 : MMQ_Q8_1_DS_LAYOUT_DS4, ne10, src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float),
         src1->ne[1], src0->ne[2], n_expert_used, n_tokens, ids->nb[1]/sizeof(int32_t), npairs_max, stream, npairs_ptr);
 
+    mmq_tma_warm_args warm;
+    warm.ids           = (const int32_t *) ids->data;
+    warm.nentries      = (int) nentries;
+    warm.n_used        = (int) n_expert_used;
+    warm.ids_stride    = (int) (ids->nb[1]/sizeof(int32_t));
+    warm.n_experts     = (int) src0->ne[2];
+    warm.l2_issue_stop = ctx.l2_issue_stop.ptr;
+
     if (is_q3k) {
         constexpr size_t smem_bytes = (size_t) (2*MMQ_TMA_TILE_STRIDE) + 2*sizeof(uint64_t) +
             (size_t) (2*(MMQ_TMA_Q3K_NWARPS - 1)*4*WARP_SIZE)*sizeof(float);
@@ -1032,22 +1171,24 @@ bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         mmq_tma_ensure_smem(ctx.device, mul_mat_q_tma_q3_K, max_smem_q3k, smem_bytes);
         const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
         const int max_tiles = (int) (src0->ne[1]/MMQ_TMA_TILE_ROWS) * npairs_max;
-        const dim3 grid((unsigned) std::max(1, std::min(nsm, max_tiles)), 1, 1);
+        const int grid_x = std::max(1, std::min(nsm, max_tiles));
+        warm.max_tiles_per_cta = mmq_tma_prewait_tiles_per_cta(ctx.device, grid_x, MMQ_TMA_TILE_BYTES, ids_ready, warm.n_experts);
+        const dim3 grid((unsigned) grid_x, 1, 1);
         const dim3 block(WARP_SIZE, MMQ_TMA_Q3K_NWARPS, 1);
         const ggml_cuda_kernel_launch_params params(grid, block, smem_bytes, stream);
         ggml_cuda_kernel_launch(mul_mat_q_tma_q3_K, params, *map, (const int4 *) src1_q.get(), (float *) dst->data,
             (int) src0->ne[1], (int64_t) (src0->nb[2]/MMQ_TMA_CHUNK), (int) dst->ne[1],
-            (int) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)), pairs.get(), npairs_ptr);
+            (int) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)), pairs.get(), npairs_ptr, warm);
     } else if (src0->type == GGML_TYPE_Q4_K) {
         dispatch_mul_mat_q_tma_q45_K<GGML_TYPE_Q4_K>(ctx.device, *map, (const int4 *) src1_q.get(), (float *) dst->data,
             (int) src0->ne[1], (int64_t) (src0->nb[2]/q45_row_bytes), q45_nunits, q45_row_bytes,
             (int) dst->ne[1], (int) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)),
-            pairs.get(), npairs_ptr, npairs_max, stream);
+            pairs.get(), npairs_ptr, npairs_max, warm, ids_ready, stream);
     } else {
         dispatch_mul_mat_q_tma_q45_K<GGML_TYPE_Q5_K>(ctx.device, *map, (const int4 *) src1_q.get(), (float *) dst->data,
             (int) src0->ne[1], (int64_t) (src0->nb[2]/q45_row_bytes), q45_nunits, q45_row_bytes,
             (int) dst->ne[1], (int) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)),
-            pairs.get(), npairs_ptr, npairs_max, stream);
+            pairs.get(), npairs_ptr, npairs_max, warm, ids_ready, stream);
     }
     return true;
 }
@@ -1130,13 +1271,23 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
 
     const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
     const int max_tiles = (int) (n_ff/MMQ_TMA_TILE_ROWS) * npairs_max;
-    const dim3 grid((unsigned) std::max(1, std::min(nsm, max_tiles)), 1, 1);
+    const int grid_x = std::max(1, std::min(nsm, max_tiles));
+    // local_ids is guaranteed ready before pdl_sync only if zero_non_owned ran after quantize/local_ids.
+    mmq_tma_warm_args warm;
+    warm.ids               = local_ids;
+    warm.nentries          = (int) nentries;
+    warm.n_used            = (int) n_expert_used;
+    warm.ids_stride        = (int) n_expert_used;
+    warm.n_experts         = count;
+    warm.max_tiles_per_cta = mmq_tma_prewait_tiles_per_cta(ctx.device, grid_x, 2*MMQ_TMA_TILE_BYTES, zero_non_owned, count);
+    warm.l2_issue_stop     = ctx.l2_issue_stop.ptr;
+    const dim3 grid((unsigned) grid_x, 1, 1);
     const dim3 block(WARP_SIZE, MMQ_TMA_Q3K_NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(grid, block, smem_bytes, stream);
     ggml_cuda_kernel_launch(mul_mat_q_tma_q3_K_gate_up_situ, params, *map, (const int4 *) src1_q.get(), (float *) glu->data,
         (int) n_ff, (int64_t) (w->nb[2]/MMQ_TMA_CHUNK), (int64_t) (n_ff*MMQ_TMA_ROW_BYTES/MMQ_TMA_CHUNK),
         (int) glu->ne[1], (int) (glu->nb[1]/sizeof(float)), (int64_t) (glu->nb[2]/sizeof(float)),
-        pairs.get(), npairs_ptr, beta, lb);
+        pairs.get(), npairs_ptr, beta, lb, warm);
     return true;
 }
 
@@ -1210,16 +1361,27 @@ bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const 
         MMQ_Q8_1_DS_LAYOUT_DS4, x->ne[0], x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
         x->ne[1], count, n_expert_used, n_tokens, n_expert_used, npairs_max, stream, npairs_ptr);
 
+    // When precomputed_local_ids is set, moe_router_chain wrote local_ids before gate_up_situ finished,
+    // so local_ids is already visible before down's ggml_cuda_pdl_sync().
+    mmq_tma_warm_args warm;
+    warm.ids           = local_ids;
+    warm.nentries      = (int) nentries;
+    warm.n_used        = (int) n_expert_used;
+    warm.ids_stride    = (int) n_expert_used;
+    warm.n_experts     = count;
+    warm.l2_issue_stop = ctx.l2_issue_stop.ptr;
+    const bool prewait_ok = precomputed_local_ids != nullptr;
+
     if (w->type == GGML_TYPE_Q4_K) {
         dispatch_mul_mat_q_tma_q45_K<GGML_TYPE_Q4_K>(ctx.device, *map, (const int4 *) src1_q.get(), tmp_down.get(),
             (int) n_embd, (int64_t) (w->nb[2]/row_bytes), nunits, row_bytes,
             (int) n_expert_used, (int) n_embd, (int64_t) (n_expert_used*n_embd),
-            pairs.get(), npairs_ptr, npairs_max, stream);
+            pairs.get(), npairs_ptr, npairs_max, warm, prewait_ok, stream);
     } else {
         dispatch_mul_mat_q_tma_q45_K<GGML_TYPE_Q5_K>(ctx.device, *map, (const int4 *) src1_q.get(), tmp_down.get(),
             (int) n_embd, (int64_t) (w->nb[2]/row_bytes), nunits, row_bytes,
             (int) n_expert_used, (int) n_embd, (int64_t) (n_expert_used*n_embd),
-            pairs.get(), npairs_ptr, npairs_max, stream);
+            pairs.get(), npairs_ptr, npairs_max, warm, prewait_ok, stream);
     }
 
     const dim3 sum_grid((unsigned) ((n_embd/4 + 255)/256), (unsigned) n_tokens, 1);
@@ -1234,8 +1396,8 @@ bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const 
 #else
 
 bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                          const ggml_tensor * ids, ggml_tensor * dst) {
-    GGML_UNUSED_VARS(ctx, src0, src1, ids, dst);
+                          const ggml_tensor * ids, ggml_tensor * dst, const bool ids_ready) {
+    GGML_UNUSED_VARS(ctx, src0, src1, ids, dst, ids_ready);
     return false;
 }
 

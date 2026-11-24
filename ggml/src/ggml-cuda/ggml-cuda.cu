@@ -1254,6 +1254,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         l2_issue_stop.release();
     }
+    if (arrival_counters.ptr != nullptr) {
+        ggml_cuda_set_device(device);
+        arrival_counters.release();
+    }
     if (ssm_conv_ab_slots.ptr != nullptr) {
         ggml_cuda_set_device(device);
         ssm_conv_ab_slots.release();
@@ -4098,23 +4102,88 @@ static ggml_cuda_l2_issue_plan ggml_cuda_l2_issue_plan_of(ggml_backend_cuda_cont
     return plan;
 }
 
+// Device-side arrival counter kernels for ordering-only stream handoffs (no host wait, no CUDA event).
+static __global__ void ggml_cuda_arrival_signal_kernel(uint32_t * ctr) {
+    if (threadIdx.x == 0) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        asm volatile("red.release.gpu.global.add.u32 [%0], 1;" :: "l"(ctr) : "memory");
+#else
+        __threadfence();
+        atomicAdd(ctr, 1u);
+#endif
+    }
+}
+
+static __global__ void ggml_cuda_arrival_wait_kernel(const uint32_t * ctr, const uint32_t target) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    for (;;) {
+        uint32_t val;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(val) : "l"(ctr) : "memory");
+#else
+        val = *(const volatile uint32_t *) ctr;
+        __threadfence();
+#endif
+        if ((int32_t) (val - target) >= 0) {
+            return;
+        }
+#ifdef GGML_USE_HIP
+        __builtin_amdgcn_s_sleep(4);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        __nanosleep(64);
+#endif
+    }
+}
+
+static uint32_t ggml_cuda_arrival_signal(ggml_backend_cuda_context & ctx,
+                                         ggml_cuda_arrival_counters::slot_id slot, cudaStream_t stream) {
+    const uint32_t next = ++ctx.arrival_counters.seq[slot];
+    ggml_cuda_arrival_signal_kernel<<<1, 32, 0, stream>>>(ctx.arrival_counters.slot(slot));
+    CUDA_CHECK(cudaGetLastError());
+    return next;
+}
+
+static void ggml_cuda_arrival_wait(ggml_backend_cuda_context & ctx,
+                                   ggml_cuda_arrival_counters::slot_id slot, const uint32_t target,
+                                   cudaStream_t stream) {
+    ggml_cuda_arrival_wait_kernel<<<1, 32, 0, stream>>>(ctx.arrival_counters.slot(slot), target);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Starts the issuer for r on its own stream, after all that the evaluation's stream has been given so far. It stops at the
 // first launch that bumps the context's stop word (ggml_cuda_l2_issue_stop: a routed-expert ring, whose reads would share
 // DRAM with it: GLM-5.3's proxy at 3 tokens on an RTX 5070 Ti, the issue after the attention output ran ~25 us into the
 // gate/up, 125.0 us against 108.5 with no issuer, where the shared expert it brought into L2 gained back 9.2).
 // GGML_CUDA_L2_ISSUE_STOP_LEGACY=1: it runs its length.
-static void ggml_cuda_l2_issue_fork(ggml_backend_cuda_context & ctx, const ggml_cuda_l2_ranges & r, const double rate_gbs) {
-    static const bool stop_legacy = ggml_env_switch("GGML_CUDA_L2_ISSUE_STOP_LEGACY");
-    if (ctx.l2_issue_fork == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.l2_issue_fork, cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.l2_issue_join, cudaEventDisableTiming));
+static void ggml_cuda_l2_side_fork(ggml_backend_cuda_context & ctx, const bool capturing, cudaStream_t & side) {
+    side = ctx.stream(ctx.device, GGML_CUDA_L2_ISSUE_STREAM);
+    const bool use_counter = !capturing && !ggml_env_switch("GGML_CUDA_COUNTER_SYNC_LEGACY") &&
+                             ctx.arrival_counters.ptr != nullptr;
+    if (use_counter) {
+        const uint32_t target = ggml_cuda_arrival_signal(ctx, ggml_cuda_arrival_counters::SLOT_L2_FORK, ctx.stream());
+        ggml_cuda_arrival_wait(ctx, ggml_cuda_arrival_counters::SLOT_L2_FORK, target, side);
+        ctx.l2_issue_counter = true;
+    } else {
+        if (ctx.l2_issue_fork == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.l2_issue_fork, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.l2_issue_join, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(ctx.l2_issue_fork, ctx.stream()));
+        CUDA_CHECK(cudaStreamWaitEvent(side, ctx.l2_issue_fork, 0));
+        ctx.l2_issue_counter = false;
     }
-    cudaStream_t side = ctx.stream(ctx.device, GGML_CUDA_L2_ISSUE_STREAM);
-    CUDA_CHECK(cudaEventRecord(ctx.l2_issue_fork, ctx.stream()));
-    CUDA_CHECK(cudaStreamWaitEvent(side, ctx.l2_issue_fork, 0));
+    ctx.l2_issue_open = true;
+}
+
+static void ggml_cuda_l2_issue_fork(ggml_backend_cuda_context & ctx, const ggml_cuda_l2_ranges & r,
+                                    const double rate_gbs, const bool capturing) {
+    static const bool stop_legacy = ggml_env_switch("GGML_CUDA_L2_ISSUE_STOP_LEGACY");
+    cudaStream_t side = nullptr;
+    ggml_cuda_l2_side_fork(ctx, capturing, side);
     ggml_cuda_l2_issue(r, rate_gbs, ggml_cuda_info().devices[ctx.device].nsm, stop_legacy ? nullptr : ctx.l2_issue_stop.ptr,
                        side);
-    ctx.l2_issue_open = true;
 }
 
 // The evaluation's stream waits for the issuers started on it (a capture ends only with every fork joined)
@@ -4122,9 +4191,130 @@ static void ggml_cuda_l2_issue_join(ggml_backend_cuda_context & ctx) {
     if (!ctx.l2_issue_open) {
         return;
     }
-    CUDA_CHECK(cudaEventRecord(ctx.l2_issue_join, ctx.stream(ctx.device, GGML_CUDA_L2_ISSUE_STREAM)));
-    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ctx.l2_issue_join, 0));
-    ctx.l2_issue_open = false;
+    cudaStream_t side = ctx.stream(ctx.device, GGML_CUDA_L2_ISSUE_STREAM);
+    if (ctx.l2_issue_counter && ctx.arrival_counters.ptr != nullptr) {
+        const uint32_t target = ggml_cuda_arrival_signal(ctx, ggml_cuda_arrival_counters::SLOT_L2_JOIN, side);
+        ggml_cuda_arrival_wait(ctx, ggml_cuda_arrival_counters::SLOT_L2_JOIN, target, ctx.stream());
+    } else {
+        CUDA_CHECK(cudaEventRecord(ctx.l2_issue_join, side));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ctx.l2_issue_join, 0));
+    }
+    ctx.l2_issue_open    = false;
+    ctx.l2_issue_counter = false;
+}
+
+// Plan of early routed-expert L2 tensor prefetches (inkling-optimize-l2-warm): once a layer's router ids complete,
+// warm the routed expert weight tiles into L2 through cp.async.bulk.prefetch.tensor up to the MiB dose cap, stopped
+// by ctx.l2_issue_stop when the consumer starts reading weights.
+struct ggml_cuda_l2_expert_warm_plan {
+    struct entry {
+        int                 trigger_after; // fire once node index > trigger_after (-1: at graph start)
+        int                 consumer_idx;  // skip warm if node index already passed this MUL_MAT_ID
+        const ggml_tensor * weight;
+        const ggml_tensor * ids;
+        int32_t             first;
+        int32_t             count;
+        bool                paired_halves;
+    };
+    std::vector<entry> entries;
+    double             dose_mib = 0.0;
+    double             rate_gbs = 0.0;
+};
+
+static ggml_cuda_l2_expert_warm_plan ggml_cuda_l2_expert_warm_plan_of(
+        ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    ggml_cuda_l2_expert_warm_plan plan;
+    if (!ggml_env_switch("GGML_CUDA_L2_EXPERT_WARM")) {
+        return plan;
+    }
+    const double dose_mib = ggml_env_float("GGML_CUDA_L2_EXPERT_WARM_MIB");
+    if (dose_mib <= 0.0) {
+        return plan;
+    }
+    const auto & dev = ggml_cuda_info().devices[ctx.device];
+    if (!GGML_CUDA_CC_IS_NVIDIA(dev.cc) || dev.cc < GGML_CUDA_CC_HOPPER ||
+            dev.dram_gbs <= 0.0 || dev.l2_bytes == 0) {
+        return plan;
+    }
+    const size_t set_aside = ggml_cuda_l2_set_aside[ctx.device].load(std::memory_order_acquire);
+    const size_t avail_l2  = dev.l2_bytes - (set_aside == SIZE_MAX ? 0 : std::min(set_aside, dev.l2_bytes));
+    const double l2_frac   = ggml_env_float("GGML_CUDA_L2_ISSUE_L2_FRAC");
+    const double rate_frac = ggml_env_float("GGML_CUDA_L2_ISSUE_RATE_FRAC");
+    const double cap_mib   = (l2_frac * (double) avail_l2) / (1024.0 * 1024.0);
+    plan.dose_mib          = std::min(dose_mib, cap_mib);
+    plan.rate_gbs          = rate_frac * dev.dram_gbs;
+    if (plan.dose_mib <= 0.0 || plan.rate_gbs <= 0.0) {
+        return plan;
+    }
+
+    // Map each compute tensor to its node index so we can find when router ids are ready.
+    std::unordered_map<const ggml_tensor *, int> node_idx;
+    node_idx.reserve(cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        node_idx[cgraph->nodes[i]] = i;
+    }
+    auto producer_of = [&](const ggml_tensor * t) {
+        while (t != nullptr && (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+                t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) && t->view_src != nullptr) {
+            t = t->view_src;
+        }
+        auto it = node_idx.find(t);
+        return it != node_idx.end() ? it->second : -1;
+    };
+
+    const bool moe_fuse = ggml_env_switch("GGML_CUDA_MOE_FUSE");
+    std::unordered_set<const ggml_tensor *> seen_mm_ids;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                node->src[0] == nullptr || node->src[2] == nullptr) {
+            continue;
+        }
+        const ggml_tensor * w   = node->src[0];
+        const ggml_tensor * ids = node->src[2];
+        if (ids->type != GGML_TYPE_I32 || ids->ne[1] < 1 || ids->ne[1] > MMVQ_MMID_CEILING || w->ne[2] < 2) {
+            continue;
+        }
+        if (!seen_mm_ids.insert(ids).second) {
+            // Subsequent MUL_MAT_ID sharing ids (down) warms via in-kernel pre-wait PDL instead of
+            // forking a side-stream wait that would occupy an SM while gate/up runs.
+            continue;
+        }
+        const int trigger = producer_of(ids);
+
+        const bool paired_halves = moe_fuse && (i + 3 < cgraph->n_nodes) &&
+            cgraph->nodes[i + 1]->op == GGML_OP_VIEW && cgraph->nodes[i + 1]->view_src == node &&
+            cgraph->nodes[i + 2]->op == GGML_OP_VIEW && cgraph->nodes[i + 2]->view_src == node &&
+            cgraph->nodes[i + 3]->op == GGML_OP_GLU  && ggml_get_glu_op(cgraph->nodes[i + 3]) == GGML_GLU_OP_SITU;
+        const int32_t first = ggml_get_op_params_i32(node, 2) > 0 ? ggml_get_op_params_i32(node, 1) : 0;
+        const int32_t count = (int32_t) w->ne[2];
+        plan.entries.push_back({ trigger, i, w, ids, first, count, paired_halves });
+    }
+    std::stable_sort(plan.entries.begin(), plan.entries.end(),
+        [](const auto & a, const auto & b) { return a.trigger_after < b.trigger_after; });
+    return plan;
+}
+
+static bool ggml_cuda_l2_expert_warm_fork(ggml_backend_cuda_context & ctx,
+                                          const ggml_cuda_l2_expert_warm_plan::entry & e,
+                                          const double dose_mib, const double rate_gbs, const bool capturing) {
+    static const bool stop_legacy = ggml_env_switch("GGML_CUDA_L2_ISSUE_STOP_LEGACY");
+    ggml_cuda_l2_expert_warm_args args;
+    args.device        = ctx.device;
+    args.weight        = e.weight;
+    args.ids           = e.ids;
+    args.first         = e.first;
+    args.count         = e.count;
+    args.paired_halves = e.paired_halves;
+    args.dose_mib      = dose_mib;
+    args.rate_gbs      = rate_gbs;
+    args.stop          = stop_legacy ? nullptr : ctx.l2_issue_stop.ptr;
+    if (!ggml_cuda_l2_warm_experts_supported(args)) {
+        return false;
+    }
+    cudaStream_t side = nullptr;
+    ggml_cuda_l2_side_fork(ctx, capturing, side);
+    return ggml_cuda_l2_warm_experts(args, side);
 }
 
 static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
@@ -4830,7 +5020,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         // [experts] the expert MMQ's weight tiles through TMA where Blackwell has them, off by default
-        if (ggml_cuda_mmq_tma_id(ctx, src0, src1, ids, dst)) {
+        const bool tma_ids_ready = !(ids->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                                   ctx.mmvq_moe_ids[ctx.curr_stream_no] == ids;
+        if (ggml_cuda_mmq_tma_id(ctx, src0, src1, ids, dst, tma_ids_ready)) {
+            ctx.mmvq_moe_ids[ctx.curr_stream_no] = ids;
             return;
         }
         // up to 24 tokens few-row MMQ is faster than MMQ, on DGX Spark also faster than MMVQ
@@ -10980,6 +11173,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         return !env || std::atoi(env) != 0;
     }();
 
+    bool concurrent_event_counter = false;
+    const bool capturing_eval = use_cuda_graph || cuda_ctx->outer_capture;
+    const bool counter_sync_legacy = ggml_env_switch("GGML_CUDA_COUNTER_SYNC_LEGACY");
+
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
             concurrent_event = &stream_ctx.concurrent_events[node];
@@ -10990,11 +11187,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             cudaStream_t main_stream = cuda_ctx->stream();  // this should be stream 0
             GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
-            CUDA_CHECK(cudaEventRecord(concurrent_event->fork_event, main_stream));
+            if (!capturing_eval && !counter_sync_legacy && cuda_ctx->arrival_counters.ptr != nullptr) {
+                const uint32_t target = ggml_cuda_arrival_signal(*cuda_ctx, ggml_cuda_arrival_counters::SLOT_FORK, main_stream);
+                for (int i = 1; i <= concurrent_event->n_streams; ++i) {
+                    cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
+                    ggml_cuda_arrival_wait(*cuda_ctx, ggml_cuda_arrival_counters::SLOT_FORK, target, stream);
+                }
+                concurrent_event_counter = true;
+            } else {
+                CUDA_CHECK(cudaEventRecord(concurrent_event->fork_event, main_stream));
 
-            for (int i = 1; i <= concurrent_event->n_streams; ++i) {
-                cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
-                CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event));
+                for (int i = 1; i <= concurrent_event->n_streams; ++i) {
+                    cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
+                    CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event));
+                }
+                concurrent_event_counter = false;
             }
         }
     };
@@ -11094,16 +11301,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // next graph while this one is captured alone (its capture must join every fork before it ends)
             const ggml_cuda_l2_issue_plan l2_plan = should_launch_concurrent_events ? ggml_cuda_l2_issue_plan{} :
                 ggml_cuda_l2_issue_plan_of(*cuda_ctx, cgraph, use_cuda_graph ? nullptr : cuda_ctx->l2_graph_next);
-            int  l2_due     = -1;
-            bool l2_crossed = false;
+            const ggml_cuda_l2_expert_warm_plan l2_expert_plan = should_launch_concurrent_events ? ggml_cuda_l2_expert_warm_plan{} :
+                ggml_cuda_l2_expert_warm_plan_of(*cuda_ctx, cgraph);
+            size_t l2_expert_next = 0;
+            int    l2_due         = -1;
+            bool   l2_crossed     = false;
             const auto l2_issue_due = [&](const int i) {
                 if (l2_due >= 0 && i > l2_plan.issues[l2_due].last) {
-                    ggml_cuda_l2_issue_fork(*cuda_ctx, l2_plan.issues[l2_due].ranges, l2_plan.rate_gbs);
+                    ggml_cuda_l2_issue_fork(*cuda_ctx, l2_plan.issues[l2_due].ranges, l2_plan.rate_gbs, capturing_eval);
                     l2_crossed = l2_plan.issues[l2_due].crosses;
                     l2_due     = -1;
                 }
                 if (i < (int) l2_plan.at.size() && l2_plan.at[i] >= 0) {
                     l2_due = l2_plan.at[i];
+                }
+                while (l2_expert_next < l2_expert_plan.entries.size() &&
+                        i > l2_expert_plan.entries[l2_expert_next].trigger_after) {
+                    const auto & entry = l2_expert_plan.entries[l2_expert_next];
+                    if (i <= entry.consumer_idx && ggml_cuda_l2_expert_warm_fork(*cuda_ctx, entry,
+                            l2_expert_plan.dose_mib, l2_expert_plan.rate_gbs, capturing_eval)) {
+                        l2_crossed = false;
+                    }
+                    ++l2_expert_next;
                 }
             };
 
@@ -11137,15 +11356,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                     if (node == concurrent_event->join_node) {
                         cuda_ctx->curr_stream_no = 0;
-                        for (int i = 1; i <= concurrent_event->n_streams; ++i) {
-                            // Wait on join events of forked streams in the main stream
-                            CUDA_CHECK(cudaEventRecord(concurrent_event->join_events[i - 1],
-                                                       cuda_ctx->stream(cuda_ctx->device, i)));
-                            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[i - 1]));
+                        if (concurrent_event_counter && cuda_ctx->arrival_counters.ptr != nullptr) {
+                            uint32_t join_target = 0;
+                            for (int i = 1; i <= concurrent_event->n_streams; ++i) {
+                                join_target = ggml_cuda_arrival_signal(
+                                    *cuda_ctx, ggml_cuda_arrival_counters::SLOT_JOIN, cuda_ctx->stream(cuda_ctx->device, i));
+                            }
+                            if (concurrent_event->n_streams > 0) {
+                                ggml_cuda_arrival_wait(
+                                    *cuda_ctx, ggml_cuda_arrival_counters::SLOT_JOIN, join_target, cuda_ctx->stream());
+                            }
+                        } else {
+                            for (int i = 1; i <= concurrent_event->n_streams; ++i) {
+                                // Wait on join events of forked streams in the main stream
+                                CUDA_CHECK(cudaEventRecord(concurrent_event->join_events[i - 1],
+                                                           cuda_ctx->stream(cuda_ctx->device, i)));
+                                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[i - 1]));
+                            }
                         }
 
                         is_concurrent_event_active = false;
                         concurrent_event           = nullptr;
+                        concurrent_event_counter   = false;
                     } else {
                         GGML_ASSERT (concurrent_event->stream_mapping.find(node) != concurrent_event->stream_mapping.end());
                         cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
@@ -11560,6 +11792,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
     cuda_ctx->ssm_conv_ab_slots.ensure();
     cuda_ctx->l2_issue_stop.ensure();
+    cuda_ctx->arrival_counters.ensure();
     cuda_ctx->hc_front_tickets.ensure();
     cuda_ctx->route_stats.ensure();
     cuda_ctx->mmq_route_log.ensure();
@@ -11700,6 +11933,7 @@ static void ggml_backend_cuda_capture_begin(ggml_backend_t backend) {
     cuda_ctx->pq2_tile_counters.ensure(); // before a capture can begin
     cuda_ctx->ssm_conv_ab_slots.ensure();
     cuda_ctx->l2_issue_stop.ensure();
+    cuda_ctx->arrival_counters.ensure();
     cuda_ctx->hc_front_tickets.ensure();
     cuda_ctx->route_stats.ensure();
     cuda_ctx->mmq_route_log.ensure();

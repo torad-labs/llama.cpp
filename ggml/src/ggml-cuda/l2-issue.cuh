@@ -55,3 +55,24 @@ struct ggml_cuda_l2_ranges {
 // end of the graph. NVIDIA from sm_90 (cp.async.bulk.prefetch.L2); nothing elsewhere.
 void ggml_cuda_l2_issue(const ggml_cuda_l2_ranges & r, double rate_gbs, int nsm, const unsigned int * stop,
                         cudaStream_t stream);
+
+// Routed-expert L2 warming through cp.async.bulk.prefetch.tensor (no SMEM destination, no mbarrier, no evict_last).
+// Reads routed expert ids on the device, deduplicates in ascending local expert order, and warms tiles in consumer
+// wave order up to dose_mib, paced at rate_gbs and stopped when *stop changes.
+struct ggml_cuda_l2_expert_warm_args {
+    int                  device        = 0;
+    const ggml_tensor *  weight        = nullptr;
+    const ggml_tensor *  ids           = nullptr;
+    int32_t              first         = 0;
+    int32_t              count         = 0;
+    bool                 paired_halves = false;
+    double               dose_mib      = 24.0;
+    double               rate_gbs      = 0.0;
+    const unsigned int * stop          = nullptr;
+};
+
+// Returns true if the tensor-prefetch warm kernel supports this device, weight layout, and ids shape.
+bool ggml_cuda_l2_warm_experts_supported(const ggml_cuda_l2_expert_warm_args & args);
+
+// Returns true if the tensor-prefetch warm kernel was launched on stream; false if the arch or shape is unsupported.
+bool ggml_cuda_l2_warm_experts(const ggml_cuda_l2_expert_warm_args & args, cudaStream_t stream);
