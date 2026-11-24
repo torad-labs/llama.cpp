@@ -43,3 +43,10 @@ int test_inkling_loop(size_t seed, ggml_backend_dev_t dev);
 // --inkling-stack <devs>: Inkling 2's products of the Q input as one few-row launch against one launch each, on devs
 // (one device, or a tensor split over several)
 int test_inkling_stack(size_t seed, const std::vector<ggml_backend_dev_t> & devs);
+
+// --inkling-delta-upload <devs>: verify Inkling 2 dirty-range delta uploads + batched small H2D inputs bit-for-bit
+// against legacy full uploads across single-device and Meta tensor-split ranks
+int test_inkling_delta_upload(size_t seed, const std::vector<ggml_backend_dev_t> & devs);
+
+// --inkling-delta-bench <devs>: benchmark before/after upload bytes, spans and step latency on large Inkling 2 pools
+int test_inkling_delta_bench(size_t seed, const std::vector<ggml_backend_dev_t> & devs);

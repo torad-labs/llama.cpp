@@ -333,6 +333,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         # GPU and under a two-rank tensor split on it (GGML_CUDA_MMQ_FEW_GROUP_LEGACY)
         llama_test(test-llama-archs NAME test-inkling-stack-cuda0 ARGS --inkling-stack CUDA0 -s 1234)
         llama_test(test-llama-archs NAME test-inkling-stack-split-cuda0 ARGS --inkling-stack CUDA0,CUDA0 -s 1234)
+        # Inkling 2 dirty-range delta uploads + batched small H2D inputs verified bit-for-bit against legacy full writes
+        llama_test(test-llama-archs NAME test-inkling-delta-upload        ARGS --inkling-delta-upload CUDA0 -s 1234)
+        llama_test(test-llama-archs NAME test-inkling-delta-upload-split2 ARGS --inkling-delta-upload CUDA0,CUDA0 -s 1234)
+        llama_test(test-llama-archs NAME test-inkling-delta-upload-split4 ARGS --inkling-delta-upload CUDA0,CUDA0,CUDA0,CUDA0 -s 1234)
     endif()
     # Inkling 2's optimized paths against the paths they replaced, on the CPU and the GPU: the relative bias inside the
     # attention kernel (rel), the layer's fused ops (fuse), its short convolutions (conv), and its quantized KV caches

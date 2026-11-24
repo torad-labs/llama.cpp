@@ -59,7 +59,11 @@
 
 #include "llama-archs-gguf.h"
 #include "../ggml/src/ggml-attn-mask.h"
+#include "../src/llama-kv-runs.h"
+#include "../src/llama-memory-hybrid-iswa.h"
+#include "../src/llama-model.h"
 
+#include <chrono>
 #include <optional>
 #include <algorithm>
 #include <array>
@@ -759,4 +763,762 @@ int test_inkling_stack(size_t seed, const std::vector<ggml_backend_dev_t> & devs
             ok ? "the same" : "not the same", expected.size() == actual.size() ? nmse(expected, actual) : INFINITY);
     fprintf(stderr, "%s inkling2 stack\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
+}
+
+namespace {
+
+struct delta_obs {
+    struct cache_obs {
+        int64_t n_kv = 0;
+        int64_t pos_planes = 0;
+        int64_t mask_words = 0;
+        int64_t mask_rows = 0;
+        int64_t runs_entries = 0;
+        int64_t runs_rows_p1 = 0;
+        bool saw_resident_pos = false;
+        bool saw_resident_mask = false;
+        bool saw_resident_runs = false;
+    };
+
+    const llama_kv_cache * kv[2] = {};
+    cache_obs obs[2] = {};
+
+    void reset_step() {
+        obs[0] = {};
+        obs[1] = {};
+    }
+};
+
+bool observe_delta(ggml_tensor * t, bool ask, void * user_data) {
+    if (!ask || t->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+    auto * d = static_cast<delta_obs *>(user_data);
+    for (int i = 0; i < 2; ++i) {
+        if (!d->kv[i]) {
+            continue;
+        }
+        const ggml_tensor * pos  = t->src[8];
+        const ggml_tensor * mask = t->src[3];
+        const ggml_tensor * runs = ggml_flash_attn_ext_get_kv_runs(t);
+        const bool is_swa = i == 1;
+        // Match global vs SWA layer via runs flag when present, else via resident tensor identity or extent.
+        bool match = false;
+        if (pos && pos->view_src && pos->view_src == d->kv[i]->get_resident_cell_pos()) {
+            match = true;
+        } else if (mask && d->kv[i]->is_resident_kq_mask(mask)) {
+            match = true;
+        } else if (runs && d->kv[i]->is_resident_kv_runs(runs)) {
+            match = true;
+        } else if (t->src[6] && ((t->src[6]->ne[0] <= 128) == is_swa)) {
+            match = true;
+        }
+        if (!match) {
+            continue;
+        }
+        auto & o = d->obs[i];
+        if (pos) {
+            o.n_kv = pos->ne[0];
+            o.pos_planes = pos->ne[2];
+            if (pos->view_src && pos->view_src == d->kv[i]->get_resident_cell_pos()) {
+                o.saw_resident_pos = true;
+            }
+        }
+        if (mask && mask->type == GGML_TYPE_I16) {
+            o.mask_words = mask->ne[0];
+            o.mask_rows  = mask->ne[1];
+            if (d->kv[i]->is_resident_kq_mask(mask)) {
+                o.saw_resident_mask = true;
+            }
+        }
+        if (runs) {
+            o.runs_entries = runs->ne[1];
+            o.runs_rows_p1 = runs->ne[2];
+            if (d->kv[i]->is_resident_kv_runs(runs)) {
+                o.saw_resident_runs = true;
+            }
+        }
+    }
+    return false;
+}
+
+bool verify_resident_buffers(llama_context * ctx, const delta_obs & d,
+        const std::vector<std::array<int32_t, 3>> & last_rows, const char * tag) {
+    auto * mem = dynamic_cast<llama_memory_hybrid_iswa *>(llama_get_memory(ctx));
+    if (!mem) {
+        fprintf(stderr, "FAIL delta %s: missing hybrid_iswa memory\n", tag);
+        return false;
+    }
+    const auto & hparams = static_cast<const llama_model *>(llama_get_model(ctx))->hparams;
+    llama_kv_cache * kvs[2] = { mem->get_mem_attn()->get_base(), mem->get_mem_attn()->get_swa() };
+
+    // Build a synthetic ubatch describing last_rows for host ground-truth mask & kv_runs checks.
+    const uint32_t nt = (uint32_t) last_rows.size();
+    std::vector<llama_token> tok(nt);
+    std::vector<llama_pos> pos_vec(nt);
+    std::vector<int32_t> n_seq_id(nt, 1);
+    std::vector<llama_seq_id> seq_storage(nt);
+    std::vector<llama_seq_id *> seq_id_ptrs(nt);
+    std::vector<llama_seq_id> seq_unq;
+    std::vector<int32_t> seq_idx(LLAMA_MAX_SEQ, -1);
+    for (uint32_t i = 0; i < nt; ++i) {
+        tok[i] = last_rows[i][0];
+        pos_vec[i] = last_rows[i][1];
+        seq_storage[i] = last_rows[i][2];
+        seq_id_ptrs[i] = &seq_storage[i];
+        if (seq_idx[seq_storage[i]] < 0) {
+            seq_idx[seq_storage[i]] = (int32_t) seq_unq.size();
+            seq_unq.push_back(seq_storage[i]);
+        }
+    }
+    llama_ubatch ub = {};
+    ub.n_tokens = nt;
+    ub.n_seqs = (uint32_t) seq_unq.size();
+    ub.n_seqs_unq = (uint32_t) seq_unq.size();
+    ub.token = tok.data();
+    ub.pos = pos_vec.data();
+    ub.n_seq_id = n_seq_id.data();
+    ub.seq_id = seq_id_ptrs.data();
+    ub.seq_id_unq = seq_unq.data();
+    ub.seq_idx = seq_idx.data();
+
+    for (int i = 0; i < 2; ++i) {
+        const auto * kv = kvs[i];
+        const auto & o  = d.obs[i];
+        const auto & cells = kv->get_cells(0);
+        const char * cname = i == 0 ? "global" : "swa";
+
+        // 1. Verify kv_resident_cell_pos (plane 0 + plane 1 when kv_mixed).
+        if (o.saw_resident_pos && o.n_kv > 0) {
+            ggml_tensor * cp = kv->get_resident_cell_pos();
+            std::vector<int32_t> gpu_p0((size_t) o.n_kv);
+            ggml_backend_tensor_get(cp, gpu_p0.data(), 0, (size_t) o.n_kv * sizeof(int32_t));
+            const auto & host_pos = cells.positions();
+            for (int64_t c = 0; c < o.n_kv; ++c) {
+                if (gpu_p0[(size_t) c] != host_pos[(size_t) c]) {
+                    fprintf(stderr, "FAIL delta %s [%s]: cell_pos p0 mismatch at cell %lld (gpu=%d host=%d)\n",
+                            tag, cname, (long long) c, gpu_p0[(size_t) c], host_pos[(size_t) c]);
+                    return false;
+                }
+            }
+            if (o.pos_planes == 2 && kv->has_kv_mixed()) {
+                std::vector<int32_t> gpu_p1((size_t) o.n_kv);
+                ggml_backend_tensor_get(cp, gpu_p1.data(), cp->nb[2], (size_t) o.n_kv * sizeof(int32_t));
+                ggml_context_ptr ref_ctx(ggml_init({ ggml_tensor_overhead(), nullptr, true }));
+                ggml_tensor * ref_t = ggml_new_tensor_3d(ref_ctx.get(), GGML_TYPE_I32, o.n_kv, 1, 2);
+                ggml_backend_buffer_ptr ref_buf(ggml_backend_alloc_ctx_tensors_from_buft(ref_ctx.get(), ggml_backend_cpu_buffer_type()));
+                kv->set_input_cell_pos(ref_t, &ub);
+                const int32_t * host_p1 = (const int32_t *) ((const char *) ref_t->data + ref_t->nb[2]);
+                for (int64_t c = 0; c < o.n_kv; ++c) {
+                    if (gpu_p1[(size_t) c] != host_p1[c]) {
+                        fprintf(stderr, "FAIL delta %s [%s]: cell_pos p1 (hot_map) mismatch at cell %lld (gpu=%d host=%d)\n",
+                                tag, cname, (long long) c, gpu_p1[(size_t) c], host_p1[c]);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // 2. Verify kv_resident_kq_mask against host llama_kv_cache_set_input_kq_mask.
+        if (o.saw_resident_mask && o.mask_words > 0 && o.mask_rows == (int64_t) nt) {
+            ggml_tensor * km = kv->get_resident_kq_mask(o.mask_words * 16, o.mask_rows);
+            const size_t nbytes = (size_t) (o.mask_words * o.mask_rows) * sizeof(uint16_t);
+            std::vector<uint16_t> gpu_mask((size_t) (o.mask_words * o.mask_rows));
+            ggml_backend_tensor_get(km, gpu_mask.data(), 0, nbytes);
+
+            std::vector<uint16_t> host_mask((size_t) (o.mask_words * o.mask_rows), 0);
+            ggml_tensor host_t = {};
+            host_t.type = GGML_TYPE_I16;
+            host_t.ne[0] = o.mask_words;
+            host_t.ne[1] = o.mask_rows;
+            host_t.ne[2] = 1;
+            host_t.ne[3] = 1;
+            host_t.nb[0] = sizeof(uint16_t);
+            host_t.nb[1] = (size_t) o.mask_words * sizeof(uint16_t);
+            host_t.nb[2] = host_t.nb[1] * (size_t) o.mask_rows;
+            host_t.nb[3] = host_t.nb[2];
+            host_t.data  = host_mask.data();
+
+            std::vector<llama_kv_cells> v_cells_ref(1);
+            // llama_kv_cache_set_input_kq_mask only reads cells const; pass via a lightweight copy of cells.
+            v_cells_ref[0] = cells;
+            std::vector<uint32_t> s2s(LLAMA_MAX_SEQ, 0);
+            const uint32_t n_swa_cur = i == 1 ? hparams.n_swa : 0;
+            const llama_swa_type swa_cur = i == 1 ? hparams.swa_type : LLAMA_SWA_TYPE_NONE;
+            llama_kv_cache_set_input_kq_mask(&host_t, &ub, true, hparams, v_cells_ref, s2s,
+                    n_swa_cur, swa_cur, true, false, nullptr, false, false);
+            if (memcmp(gpu_mask.data(), host_mask.data(), nbytes) != 0) {
+                for (size_t idx = 0; idx < gpu_mask.size(); ++idx) {
+                    if (gpu_mask[idx] != host_mask[idx]) {
+                        fprintf(stderr, "FAIL delta %s [%s]: kq_mask mismatch at row %zu word %zu (gpu=0x%04x host=0x%04x)\n",
+                                tag, cname, idx / (size_t) o.mask_words, idx % (size_t) o.mask_words,
+                                gpu_mask[idx], host_mask[idx]);
+                        break;
+                    }
+                }
+                return false;
+            }
+        }
+
+        // 3. Verify kv_resident_kv_runs against full legacy write_kv_runs_host() on the cache's kv_runs.
+        if (o.saw_resident_runs && o.runs_entries >= 2 && o.runs_rows_p1 == (int64_t) nt + 1) {
+            ggml_tensor * kr = kv->get_resident_kv_runs(o.runs_entries, o.runs_rows_p1);
+            const size_t nelems = (size_t) (4 * o.runs_entries * o.runs_rows_p1);
+            std::vector<int32_t> gpu_runs(nelems);
+            ggml_backend_tensor_get(kr, gpu_runs.data(), 0, nelems * sizeof(int32_t));
+
+            std::vector<int32_t> host_runs(nelems, 0);
+            kv->write_kv_runs_host(ub, host_runs.data(), o.runs_entries);
+            if (memcmp(gpu_runs.data(), host_runs.data(), nelems * sizeof(int32_t)) != 0) {
+                for (size_t idx = 0; idx < nelems; ++idx) {
+                    if (gpu_runs[idx] != host_runs[idx]) {
+                        fprintf(stderr, "FAIL delta %s [%s]: kv_runs mismatch at elem %zu (slice %zu entry %zu lane %zu: gpu=%d host=%d)\n",
+                                tag, cname, idx, idx / (size_t) (4 * o.runs_entries),
+                                (idx / 4) % (size_t) o.runs_entries, idx % 4, gpu_runs[idx], host_runs[idx]);
+                        break;
+                    }
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+int test_inkling_delta_upload(size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+    // 16 query heads, 8 KV heads (head_dim 128, gqa 2): splits cleanly across 1, 2, and 4 ranks.
+    auto make_fixture = [&]() {
+        auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+        kv_writer ms(LLM_ARCH_INKLING2, gguf.get());
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, 16u);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, 8u);
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH, 128u);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, 128u);
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT, 1024u);
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW, 64u);
+        return gguf;
+    };
+
+    const bool is_gpu = std::none_of(devs.begin(), devs.end(), [](ggml_backend_dev_t d) {
+        return ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    });
+    auto gguf = make_fixture();
+    llama_model_ptr model = get_model(gguf.get(), nullptr, seed, 0.1f, devs,
+            devs.size() > 1 ? LLAMA_SPLIT_MODE_TENSOR : LLAMA_SPLIT_MODE_LAYER);
+
+    struct scenario_cfg {
+        const char * name;
+        bool kv_mixed;
+        bool kv_runs;
+    };
+    std::vector<scenario_cfg> scenarios = {
+        { "unified-runs", false, true },
+    };
+    if (devs.size() == 1 && is_gpu) {
+        scenarios.push_back({ "kv-mixed", true, true });
+    }
+
+    bool all_ok = true;
+    const auto tokens = [seed](uint32_t n, size_t salt) { return get_tokens(n, 128, seed + salt); };
+
+    for (const auto & sc : scenarios) {
+        llama_kv_cache::llama_kv_delta_stats leg_steady[2] = {};
+        llama_kv_cache::llama_kv_delta_stats opt_steady[2] = {};
+        bool saw_res_pos[2] = { false, false };
+        bool saw_res_mask[2] = { false, false };
+        bool saw_res_runs[2] = { false, false };
+
+        auto run_mode = [&](bool delta_legacy, bool batch_legacy, std::vector<float> & logits_out) -> bool {
+            set_env("LLAMA_INKLING2_DELTA_INPUTS_LEGACY",  delta_legacy ? "1" : nullptr);
+            set_env("GGML_SCHED_BATCH_INPUTS_LEGACY",      batch_legacy ? "1" : nullptr);
+            const bool legacy = delta_legacy;
+            set_env("LLAMA_INKLING2_KV_RUNS",             sc.kv_runs ? "1" : nullptr);
+            set_env("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE", sc.kv_runs ? "1" : nullptr);
+            set_env("GGML_CUDA_FATTN_REL_DECODE_Q4",      (sc.kv_runs && sc.kv_mixed) ? "1" : nullptr);
+            set_env("LLAMA_KV_PAD_SHARED",                "8192");
+            set_env("LLAMA_INKLING2_KV_MIXED",            sc.kv_mixed ? "1" : nullptr);
+            set_env("LLAMA_INKLING2_KV_MIXED_HOT",        sc.kv_mixed ? "64" : nullptr);
+            set_env("LLAMA_GRAPH_SLOTS",                  "8");
+            set_env("LLAMA_RS_FIXED_ROWS",                "1");
+            set_env("LLAMA_GRAPH_ANY_SEQS",               "1");
+
+            delta_obs obs;
+            llama_context_params params = llama_context_default_params();
+            params.n_ctx = 16384;
+            params.n_batch = 1024;
+            params.n_ubatch = 256;
+            params.n_seq_max = 12;
+            params.n_rs_seq = 4;
+            params.kv_unified = true;
+            params.attn_mask_bits = true;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            params.type_k = params.type_v = sc.kv_mixed ? GGML_TYPE_Q4_0 : GGML_TYPE_F16;
+            params.type_k_swa = params.type_v_swa = sc.kv_mixed ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+            params.n_threads = params.n_threads_batch = 4;
+            params.cb_eval = observe_delta;
+            params.cb_eval_user_data = &obs;
+
+            llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+            if (!ctx) {
+                fprintf(stderr, "FAIL delta %s: context creation failed\n", sc.name);
+                return false;
+            }
+            auto * mem = dynamic_cast<llama_memory_hybrid_iswa *>(llama_get_memory(ctx.get()));
+            llama_kv_cache * kvs[2] = { mem->get_mem_attn()->get_base(), mem->get_mem_attn()->get_swa() };
+            obs.kv[0] = kvs[0];
+            obs.kv[1] = kvs[1];
+
+            auto step = [&](const std::vector<std::array<int32_t, 3>> & rows, const char * tag,
+                    bool check_bufs, const std::optional<std::vector<size_t>> & out_rows = std::nullopt) -> bool {
+                obs.reset_step();
+                decode(ctx.get(), rows, logits_out, out_rows);
+                if (!legacy && is_gpu) {
+                    for (int i = 0; i < 2; ++i) {
+                        saw_res_pos[i]  |= obs.obs[i].saw_resident_pos;
+                        saw_res_mask[i] |= obs.obs[i].saw_resident_mask;
+                        saw_res_runs[i] |= obs.obs[i].saw_resident_runs;
+                    }
+                    if (check_bufs && !verify_resident_buffers(ctx.get(), obs, rows, tag)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            // Phase 1: Shared-prefix prefill (> n_ubatch triggers multi-ubatch prepare()) + seq_cp.
+            // Fill > 4096 total cells so n_kv pads to 8192 and exercises global + SWA kv_runs too.
+            const uint32_t prefix_len = 512;
+            if (!step(span(tokens(prefix_len, 1), 0, 0), "prefix", false, std::vector<size_t>{ prefix_len - 1 })) {
+                return false;
+            }
+            const int n_seqs = 10;
+            for (int s = 1; s < n_seqs; ++s) {
+                llama_memory_seq_cp(mem, 0, s, 0, prefix_len);
+            }
+            std::vector<int32_t> next_pos(n_seqs, (int32_t) prefix_len);
+            for (int s = 0; s < n_seqs; ++s) {
+                const uint32_t slen = 360 + 8 * s;
+                if (!step(span(tokens(slen, 10 + s), next_pos[s], s), "suffix", false, std::vector<size_t>{ slen - 1 })) {
+                    return false;
+                }
+                next_pos[s] += (int32_t) slen;
+            }
+
+            // Phase 2: Warmup + 6 steady-state multi-sequence decode steps (exercises kv_runs + delta pos/mask).
+            llama_kv_cache::llama_kv_delta_stats acc_steady[2] = {};
+            auto add_stats = [](llama_kv_cache::llama_kv_delta_stats::kind_t & dst,
+                    const llama_kv_cache::llama_kv_delta_stats::kind_t & src) {
+                dst.calls         += src.calls;
+                dst.full_uploads  += src.full_uploads;
+                dst.delta_uploads += src.delta_uploads;
+                dst.spans         += src.spans;
+                dst.bytes         += src.bytes;
+            };
+            for (int st = 0; st < 8; ++st) {
+                std::vector<std::array<int32_t, 3>> rows;
+                for (int s = 0; s < n_seqs; ++s) {
+                    rows.push_back({ tokens(1, 100 + 16 * st + s)[0], next_pos[s]++, s });
+                }
+                if (st >= 2) {
+                    kvs[0]->reset_delta_stats();
+                    kvs[1]->reset_delta_stats();
+                }
+                obs.reset_step();
+                decode(ctx.get(), rows, logits_out);
+                if (st >= 2) {
+                    for (int i = 0; i < 2; ++i) {
+                        const auto s = kvs[i]->get_delta_stats();
+                        add_stats(acc_steady[i].cell_pos, s.cell_pos);
+                        add_stats(acc_steady[i].kq_mask,  s.kq_mask);
+                        add_stats(acc_steady[i].kv_runs,  s.kv_runs);
+                    }
+                }
+                if (!legacy && is_gpu) {
+                    for (int i = 0; i < 2; ++i) {
+                        saw_res_pos[i]  |= obs.obs[i].saw_resident_pos;
+                        saw_res_mask[i] |= obs.obs[i].saw_resident_mask;
+                        saw_res_runs[i] |= obs.obs[i].saw_resident_runs;
+                    }
+                    if (!verify_resident_buffers(ctx.get(), obs, rows, "steady-decode")) {
+                        return false;
+                    }
+                }
+            }
+            for (int i = 0; i < 2; ++i) {
+                (legacy ? leg_steady[i] : opt_steady[i]) = acc_steady[i];
+            }
+
+            // Phase 3: Interleaved 1-row then 10-row decode (verifies inactive-row preservation).
+            if (!step({{ tokens(1, 300)[0], next_pos[0]++, 0 }}, "single-row", true)) {
+                return false;
+            }
+            {
+                std::vector<std::array<int32_t, 3>> rows;
+                for (int s = 0; s < n_seqs; ++s) {
+                    rows.push_back({ tokens(1, 310 + s)[0], next_pos[s]++, s });
+                }
+                if (!step(rows, "resume-10-row", true)) {
+                    return false;
+                }
+            }
+
+            // Phase 4: Drafted / non-tip multi-token step (4 seqs x 4 tokens), rollback last 2 on seq 1, then tip decode.
+            {
+                std::vector<std::array<int32_t, 3>> rows;
+                for (int s = 0; s < 4; ++s) {
+                    const auto r = span(tokens(4, 340 + s), next_pos[s], s);
+                    rows.insert(rows.end(), r.begin(), r.end());
+                    next_pos[s] += 4;
+                }
+                if (!step(rows, "drafted", true)) {
+                    return false;
+                }
+            }
+            if (!llama_memory_seq_rm(mem, 1, next_pos[1] - 2, -1)) {
+                fprintf(stderr, "FAIL delta %s: draft rollback seq_rm refused\n", sc.name);
+                return false;
+            }
+            next_pos[1] -= 2;
+            {
+                std::vector<std::array<int32_t, 3>> rows;
+                for (int s = 0; s < n_seqs; ++s) {
+                    rows.push_back({ tokens(1, 360 + s)[0], next_pos[s]++, s });
+                }
+                if (!step(rows, "post-draft-tip", true)) {
+                    return false;
+                }
+            }
+
+            // Phase 5: 3-token draft on seq 1 + 1-token rollback + full seq removal & reuse + seq_add (when supported).
+            {
+                const auto r = span(tokens(3, 390), next_pos[1], 1);
+                next_pos[1] += 3;
+                if (!step(r, "draft-seq1", true)) {
+                    return false;
+                }
+            }
+            if (!llama_memory_seq_rm(mem, 1, next_pos[1] - 1, -1)) {
+                fprintf(stderr, "FAIL delta %s: single-step rollback seq_rm refused\n", sc.name);
+                return false;
+            }
+            next_pos[1] -= 1;
+            llama_memory_seq_rm(mem, n_seqs - 1, -1, -1);
+            next_pos[n_seqs - 1] = 0;
+            if (!step(span(tokens(20, 400), 0, n_seqs - 1), "fresh-slot", false, std::vector<size_t>{ 19 })) {
+                return false;
+            }
+            next_pos[n_seqs - 1] = 20;
+            if (llama_memory_can_shift(mem)) {
+                llama_memory_seq_add(mem, 2, 100, -1, 4);
+                next_pos[2] += 4;
+            }
+            {
+                std::vector<std::array<int32_t, 3>> rows;
+                for (int s = 0; s < n_seqs; ++s) {
+                    rows.push_back({ tokens(1, 420 + s)[0], next_pos[s]++, s });
+                }
+                if (!step(rows, "post-rm-add", true)) {
+                    return false;
+                }
+            }
+
+            // Phase 6: Per-sequence state save/restore + seq_keep + full state save/clear/restore.
+            std::vector<uint8_t> seq_blob(llama_state_seq_get_size(ctx.get(), 0));
+            const size_t seq_written = llama_state_seq_get_data(ctx.get(), seq_blob.data(), seq_blob.size(), 0);
+            if (seq_written == 0) {
+                fprintf(stderr, "FAIL delta %s: seq state save failed\n", sc.name);
+                return false;
+            }
+            llama_memory_seq_keep(mem, 1);
+            if (!step({{ tokens(1, 450)[0], next_pos[1]++, 1 }}, "post-seq-keep", true)) {
+                return false;
+            }
+            if (llama_state_seq_set_data(ctx.get(), seq_blob.data(), seq_written, 3) != seq_written) {
+                fprintf(stderr, "FAIL delta %s: seq state restore failed\n", sc.name);
+                return false;
+            }
+            next_pos[3] = next_pos[0];
+            if (!step({{ tokens(1, 460)[0], next_pos[1]++, 1 }, { tokens(1, 461)[0], next_pos[3]++, 3 }}, "post-seq-restore", true)) {
+                return false;
+            }
+
+            std::vector<uint8_t> full_blob(llama_state_get_size(ctx.get()));
+            const size_t full_written = llama_state_get_data(ctx.get(), full_blob.data(), full_blob.size());
+            if (full_written == 0) {
+                fprintf(stderr, "FAIL delta %s: full state save failed\n", sc.name);
+                return false;
+            }
+            llama_memory_clear(mem, true);
+            if (!step(span(tokens(16, 470), 0, 0), "post-clear-small", true, std::vector<size_t>{ 15 })) {
+                return false;
+            }
+            if (!step({{ tokens(1, 471)[0], 16, 0 }}, "post-clear-decode", true)) {
+                return false;
+            }
+            if (llama_state_set_data(ctx.get(), full_blob.data(), full_written) != full_written) {
+                fprintf(stderr, "FAIL delta %s: full state restore failed\n", sc.name);
+                return false;
+            }
+            if (!step({{ tokens(1, 480)[0], next_pos[1]++, 1 }, { tokens(1, 481)[0], next_pos[3]++, 3 }}, "post-full-restore", true)) {
+                return false;
+            }
+
+            // Phase 7: Simulate input_lost() invalidation and verify clean recovery.
+            if (!legacy) {
+                kvs[0]->invalidate_delta_state();
+                kvs[1]->invalidate_delta_state();
+            }
+            if (!step({{ tokens(1, 490)[0], next_pos[1]++, 1 }, { tokens(1, 491)[0], next_pos[3]++, 3 }}, "post-invalidate", true)) {
+                return false;
+            }
+            if (!step({{ tokens(1, 492)[0], next_pos[1]++, 1 }, { tokens(1, 493)[0], next_pos[3]++, 3 }}, "post-invalidate-delta", true)) {
+                return false;
+            }
+            return true;
+        };
+
+        std::vector<float> expected, leg_batch, actual;
+        const bool ok_leg = run_mode(true,  true,  expected);
+        const bool ok_lb  = run_mode(true,  false, leg_batch);
+        const bool ok_opt = run_mode(false, false, actual);
+
+        const bool exact_batch = ok_leg && ok_lb && !expected.empty() &&
+            expected.size() == leg_batch.size() &&
+            memcmp(expected.data(), leg_batch.data(), expected.size() * sizeof(float)) == 0;
+        const bool bit_exact = ok_leg && ok_opt && !expected.empty() &&
+            expected.size() == actual.size() &&
+            memcmp(expected.data(), actual.data(), expected.size() * sizeof(float)) == 0;
+        const double diff_nmse = expected.size() == actual.size() ? nmse(expected, actual) : INFINITY;
+        float max_diff = 0.0f;
+        if (ok_leg && ok_opt && expected.size() == actual.size()) {
+            for (size_t i = 0; i < expected.size(); ++i) {
+                max_diff = std::max(max_diff, std::fabs(expected[i] - actual[i]));
+            }
+        }
+        // Moving mask/cell_pos out of the compute buffer shifts gallocr offsets, which can toggle D1 fusion aliasing by 1 ULP.
+        const bool exact_logits = exact_batch && (bit_exact || (ok_leg && ok_opt && !expected.empty() &&
+            expected.size() == actual.size() && diff_nmse <= 1e-14 && max_diff <= 1e-6f));
+
+        set_env("LLAMA_INKLING2_DELTA_INPUTS_LEGACY",  nullptr);
+        set_env("GGML_SCHED_BATCH_INPUTS_LEGACY",      nullptr);
+        set_env("LLAMA_INKLING2_KV_RUNS",              nullptr);
+        set_env("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE", nullptr);
+        set_env("GGML_CUDA_FATTN_REL_DECODE_Q4",       nullptr);
+        set_env("LLAMA_KV_PAD_SHARED",                 nullptr);
+        set_env("LLAMA_INKLING2_KV_MIXED",             nullptr);
+        set_env("LLAMA_INKLING2_KV_MIXED_HOT",         nullptr);
+        set_env("LLAMA_GRAPH_SLOTS",                   nullptr);
+        set_env("LLAMA_RS_FIXED_ROWS",                 nullptr);
+        set_env("LLAMA_GRAPH_ANY_SEQS",                nullptr);
+
+        const uint64_t leg_bytes =
+            leg_steady[0].cell_pos.bytes + leg_steady[0].kq_mask.bytes + leg_steady[0].kv_runs.bytes +
+            leg_steady[1].cell_pos.bytes + leg_steady[1].kq_mask.bytes + leg_steady[1].kv_runs.bytes;
+        const uint64_t opt_bytes =
+            opt_steady[0].cell_pos.bytes + opt_steady[0].kq_mask.bytes + opt_steady[0].kv_runs.bytes +
+            opt_steady[1].cell_pos.bytes + opt_steady[1].kq_mask.bytes + opt_steady[1].kv_runs.bytes;
+
+        const bool resident_used = !is_gpu || (saw_res_pos[0] && saw_res_pos[1] && saw_res_mask[0] && saw_res_mask[1] &&
+            (!sc.kv_runs || (saw_res_runs[0] && saw_res_runs[1])));
+        const bool bytes_reduced = !is_gpu || (leg_bytes > 0 && opt_bytes > 0 && opt_bytes * 10 < leg_bytes &&
+            opt_steady[0].cell_pos.full_uploads == 0 && opt_steady[1].cell_pos.full_uploads == 0 &&
+            opt_steady[0].kq_mask.full_uploads  == 0 && opt_steady[1].kq_mask.full_uploads  == 0 &&
+            (!sc.kv_runs || (opt_steady[0].kv_runs.full_uploads == 0 && opt_steady[1].kv_runs.full_uploads == 0)));
+
+        fprintf(stderr, "inkling2 delta-upload [%s] on %zu rank(s): %zu logits, exact=%d (bit_exact=%d batch_exact=%d max_abs=%g NMSE %g), "
+                "steady_bytes legacy=%llu delta=%llu (%.2fx), resident=%d (pos=%d/%d mask=%d/%d runs=%d/%d), zero_full=%d\n",
+                sc.name, devs.size(), expected.size(), exact_logits ? 1 : 0, bit_exact ? 1 : 0, exact_batch ? 1 : 0,
+                max_diff, diff_nmse,
+                (unsigned long long) leg_bytes, (unsigned long long) opt_bytes,
+                opt_bytes > 0 ? (double) leg_bytes / (double) opt_bytes : 0.0,
+                resident_used ? 1 : 0,
+                saw_res_pos[0] ? 1 : 0, saw_res_pos[1] ? 1 : 0,
+                saw_res_mask[0] ? 1 : 0, saw_res_mask[1] ? 1 : 0,
+                saw_res_runs[0] ? 1 : 0, saw_res_runs[1] ? 1 : 0,
+                bytes_reduced ? 1 : 0);
+        fprintf(stderr, "  breakdown (6 steady steps, global+swa): cell_pos %llu->%llu B, kq_mask %llu->%llu B, kv_runs %llu->%llu B\n",
+                (unsigned long long) (leg_steady[0].cell_pos.bytes + leg_steady[1].cell_pos.bytes),
+                (unsigned long long) (opt_steady[0].cell_pos.bytes + opt_steady[1].cell_pos.bytes),
+                (unsigned long long) (leg_steady[0].kq_mask.bytes + leg_steady[1].kq_mask.bytes),
+                (unsigned long long) (opt_steady[0].kq_mask.bytes + opt_steady[1].kq_mask.bytes),
+                (unsigned long long) (leg_steady[0].kv_runs.bytes + leg_steady[1].kv_runs.bytes),
+                (unsigned long long) (opt_steady[0].kv_runs.bytes + opt_steady[1].kv_runs.bytes));
+
+        all_ok = all_ok && exact_logits && resident_used && bytes_reduced;
+    }
+
+    fprintf(stderr, "%s inkling2 delta-upload on %zu rank(s)\n", all_ok ? "OK" : "FAIL", devs.size());
+    return all_ok ? 0 : 1;
+}
+
+int test_inkling_delta_bench(size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+    // 2-layer synthetic Inkling 2 (1 global + 1 SWA) with 8 KV heads (splits cleanly across 1, 2, and 4 ranks).
+    auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+    kv_writer ms(LLM_ARCH_INKLING2, gguf.get());
+    ms.add_kv(LLM_KV_BLOCK_COUNT, 2u);
+    ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>{ 0u, 1u });
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, 16u);
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, 8u);
+    ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH, 128u);
+    ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, 128u);
+    ms.add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT, 1024u);
+    ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW, 1024u);
+
+    llama_model_ptr model = get_model(gguf.get(), nullptr, seed, 0.1f, devs,
+            devs.size() > 1 ? LLAMA_SPLIT_MODE_TENSOR : LLAMA_SPLIT_MODE_LAYER);
+
+    const auto tokens = [seed](uint32_t n, size_t salt) { return get_tokens(n, 128, seed + salt); };
+
+    struct mode_cfg {
+        const char * name;
+        bool delta_legacy;
+        bool batch_legacy;
+    };
+    const mode_cfg modes[] = {
+        { "legacy-full",  true,  true  },
+        { "delta-only",   false, true  },
+        { "delta+batch",  false, false },
+    };
+
+    // 262,144 cells (~1 MB cell_pos, ~754 KB mask) and 1,048,576 cells (~4.2 MB cell_pos, ~3.0 MB mask).
+    struct pool_cfg {
+        uint32_t n_ctx;
+        uint32_t per_seq_fill; // > n_ctx/2 total cells so pad_dense_shared expands n_kv to n_ctx
+    };
+    const pool_cfg pools[] = {
+        { 262144u,  5800u  },
+        { 1048576u, 23000u },
+    };
+    for (const auto & pc : pools) {
+        const uint32_t n_ctx = pc.n_ctx;
+        fprintf(stderr, "\n=== Inkling 2 delta upload benchmark: pool=%u cells, 23 seqs, %zu rank(s) ===\n",
+                n_ctx, devs.size());
+        const std::string pad_str = std::to_string(n_ctx);
+        for (const auto & m : modes) {
+            set_env("LLAMA_INKLING2_DELTA_INPUTS_LEGACY",  m.delta_legacy ? "1" : nullptr);
+            set_env("GGML_SCHED_BATCH_INPUTS_LEGACY",      m.batch_legacy ? "1" : nullptr);
+            set_env("LLAMA_INKLING2_KV_RUNS",              "1");
+            set_env("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE", "1");
+            set_env("LLAMA_KV_PAD_SHARED",                 pad_str.c_str());
+            set_env("LLAMA_GRAPH_SLOTS",                   "32");
+            set_env("LLAMA_RS_FIXED_ROWS",                 "1");
+            set_env("LLAMA_GRAPH_ANY_SEQS",                "1");
+
+            llama_context_params params = llama_context_default_params();
+            params.n_ctx = n_ctx;
+            params.n_batch = 4096;
+            params.n_ubatch = 2048;
+            params.n_seq_max = 23;
+            params.kv_unified = true;
+            params.swa_full = false;
+            params.attn_mask_bits = true;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            params.type_k = params.type_v = GGML_TYPE_F16;
+            params.type_k_swa = params.type_v_swa = GGML_TYPE_Q8_0;
+            params.n_threads = params.n_threads_batch = 3;
+
+            llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+            if (!ctx) {
+                fprintf(stderr, "SKIP %s at pool=%u (context alloc failed)\n", m.name, n_ctx);
+                continue;
+            }
+            auto * mem = dynamic_cast<llama_memory_hybrid_iswa *>(llama_get_memory(ctx.get()));
+            llama_kv_cache * kv0 = mem->get_mem_attn()->get_base();
+            llama_kv_cache * kv1 = mem->get_mem_attn()->get_swa();
+
+            std::vector<float> discard;
+            const uint32_t prefix_len = 2048;
+            decode(ctx.get(), span(tokens(prefix_len, 1), 0, 0), discard, std::vector<size_t>{});
+            for (int s = 1; s < 23; ++s) {
+                llama_memory_seq_cp(mem, 0, s, 0, prefix_len);
+            }
+            std::vector<int32_t> next_pos(23, (int32_t) prefix_len);
+            for (int s = 0; s < 23; ++s) {
+                uint32_t rem = pc.per_seq_fill;
+                while (rem > 0) {
+                    const uint32_t chunk = std::min<uint32_t>(rem, params.n_batch);
+                    decode(ctx.get(), span(tokens(chunk, 20 + s * 16 + rem), next_pos[s], s), discard, std::vector<size_t>{});
+                    next_pos[s] += (int32_t) chunk;
+                    rem -= chunk;
+                }
+            }
+
+            // Warmup 5 decode steps (23 rows each).
+            for (int w = 0; w < 5; ++w) {
+                std::vector<std::array<int32_t, 3>> rows;
+                for (int s = 0; s < 23; ++s) {
+                    rows.push_back({ tokens(1, 500 + w * 23 + s)[0], next_pos[s]++, s });
+                }
+                decode(ctx.get(), rows, discard, std::vector<size_t>{});
+            }
+
+            // Measure 30 steady-state 23-seq decode steps.
+            kv0->reset_delta_stats();
+            kv1->reset_delta_stats();
+            const int n_steps = 30;
+            std::vector<double> step_us;
+            step_us.reserve(n_steps);
+            for (int st = 0; st < n_steps; ++st) {
+                std::vector<std::array<int32_t, 3>> rows;
+                for (int s = 0; s < 23; ++s) {
+                    rows.push_back({ tokens(1, 1000 + st * 23 + s)[0], next_pos[s]++, s });
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                decode(ctx.get(), rows, discard, std::vector<size_t>{});
+                const auto t1 = std::chrono::steady_clock::now();
+                step_us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            }
+            const auto st0 = kv0->get_delta_stats();
+            const auto st1 = kv1->get_delta_stats();
+            std::sort(step_us.begin(), step_us.end());
+            const double med_us = step_us[n_steps / 2];
+            const double mean_us = std::accumulate(step_us.begin(), step_us.end(), 0.0) / n_steps;
+            const double b_pos  = (double) (st0.cell_pos.bytes + st1.cell_pos.bytes) / n_steps;
+            const double b_mask = (double) (st0.kq_mask.bytes  + st1.kq_mask.bytes)  / n_steps;
+            const double b_runs = (double) (st0.kv_runs.bytes  + st1.kv_runs.bytes)  / n_steps;
+            const double spans  = (double) (st0.cell_pos.spans + st1.cell_pos.spans +
+                                            st0.kq_mask.spans  + st1.kq_mask.spans +
+                                            st0.kv_runs.spans  + st1.kv_runs.spans) / n_steps;
+
+            fprintf(stderr, "  decode23 %-12s: med=%7.1f us mean=%7.1f us | bytes/step total=%9.0f (pos=%8.0f mask=%8.0f runs=%7.0f) spans=%.1f full=%llu\n",
+                    m.name, med_us, mean_us, b_pos + b_mask + b_runs, b_pos, b_mask, b_runs, spans,
+                    (unsigned long long) (st0.cell_pos.full_uploads + st1.cell_pos.full_uploads +
+                                          st0.kq_mask.full_uploads  + st1.kq_mask.full_uploads +
+                                          st0.kv_runs.full_uploads  + st1.kv_runs.full_uploads));
+
+            // Measure 512-token prefill steps (5 chunks on seq 0).
+            kv0->reset_delta_stats();
+            kv1->reset_delta_stats();
+            const int n_prefill = 5;
+            std::vector<double> pf_us;
+            for (int p = 0; p < n_prefill; ++p) {
+                const auto r = span(tokens(512, 3000 + p), next_pos[0], 0);
+                next_pos[0] += 512;
+                const auto t0 = std::chrono::steady_clock::now();
+                decode(ctx.get(), r, discard, std::vector<size_t>{});
+                const auto t1 = std::chrono::steady_clock::now();
+                pf_us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            }
+            const auto p0 = kv0->get_delta_stats();
+            const auto p1 = kv1->get_delta_stats();
+            std::sort(pf_us.begin(), pf_us.end());
+            fprintf(stderr, "  prefill512 %-10s: med=%7.1f us | pos_bytes/step=%9.0f mask_bytes/step=%9.0f full_pos=%llu\n",
+                    m.name, pf_us[n_prefill / 2],
+                    (double) (p0.cell_pos.bytes + p1.cell_pos.bytes) / n_prefill,
+                    (double) (p0.kq_mask.bytes  + p1.kq_mask.bytes)  / n_prefill,
+                    (unsigned long long) (p0.cell_pos.full_uploads + p1.cell_pos.full_uploads));
+        }
+    }
+
+    set_env("LLAMA_INKLING2_DELTA_INPUTS_LEGACY",  nullptr);
+    set_env("GGML_SCHED_BATCH_INPUTS_LEGACY",      nullptr);
+    set_env("LLAMA_INKLING2_KV_RUNS",              nullptr);
+    set_env("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE", nullptr);
+    set_env("LLAMA_KV_PAD_SHARED",                 nullptr);
+    set_env("LLAMA_GRAPH_SLOTS",                   nullptr);
+    set_env("LLAMA_RS_FIXED_ROWS",                 nullptr);
+    set_env("LLAMA_GRAPH_ANY_SEQS",                nullptr);
+    return 0;
 }

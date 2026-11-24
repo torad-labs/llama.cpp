@@ -408,3 +408,336 @@ bool ggml_cuda_set_tensor_n(int device,
         const size_t * sizes, size_t n_tensors) {
     return ggml_cuda_copy_tensor_n(device, cudaMemcpyHostToDevice, tensors, data, offsets, sizes, n_tensors);
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+struct ggml_cuda_inline_copy_desc {
+    unsigned char * dst;
+    uint32_t        src_off;
+    uint32_t        size;
+};
+
+struct ggml_cuda_inline_copy_batch {
+    static constexpr size_t max_copies  = 64;
+    static constexpr size_t max_payload = 2560;
+
+    uint32_t count;
+    uint32_t pad[3];
+    ggml_cuda_inline_copy_desc descs[max_copies];
+    uint32_t payload[max_payload / 4];
+};
+
+static_assert(sizeof(ggml_cuda_inline_copy_batch) <= 4096, "inline batch exceeds CUDA parameter limit");
+
+static __global__ void ggml_cuda_batch_copy_inline_kernel(ggml_cuda_inline_copy_batch batch) {
+    const uint32_t idx = blockIdx.x;
+    if (idx >= batch.count) {
+        return;
+    }
+    const ggml_cuda_inline_copy_desc desc = batch.descs[idx];
+    unsigned char * dst = desc.dst;
+    const uint32_t off = desc.src_off;
+    const uint32_t sz  = desc.size;
+
+    if (sz == 2 && (off & 1u) == 0 && ((uintptr_t) dst & 1u) == 0) {
+        if (threadIdx.x == 0) {
+            const uint32_t w = batch.payload[off >> 2];
+            *(uint16_t *) dst = (uint16_t) (w >> ((off & 2u) * 8u));
+        }
+        return;
+    }
+
+    uint32_t tail = 0;
+    if (sz >= 4 && (off & 3u) == 0 && ((uintptr_t) dst & 3u) == 0) {
+        const uint32_t n4 = sz >> 2;
+        uint32_t * dst4 = (uint32_t *) dst;
+        const uint32_t off4 = off >> 2;
+        for (uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+            dst4[i] = batch.payload[off4 + i];
+        }
+        tail = n4 << 2;
+    }
+    for (uint32_t i = tail + threadIdx.x; i < sz; i += blockDim.x) {
+        const uint32_t pos = off + i;
+        const uint32_t w = batch.payload[pos >> 2];
+        dst[i] = (unsigned char) (w >> ((pos & 3u) * 8u));
+    }
+}
+#endif
+
+bool ggml_cuda_set_tensor_n_async(ggml_backend_cuda_context & ctx,
+        ggml_tensor * const * tensors, const void * const * data, const size_t * offsets,
+        const size_t * sizes, size_t n_tensors, bool allow_pinned) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(tensors);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offsets);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(n_tensors);
+    GGML_UNUSED(allow_pinned);
+    return false;
+#else
+    if (ctx.outer_capture) {
+        return false;
+    }
+
+    constexpr size_t stack_cap = 64;
+    std::pair<uintptr_t, uintptr_t> stack_ranges[stack_cap];
+    std::vector<std::pair<uintptr_t, uintptr_t>> heap_ranges;
+    size_t n_nonempty = 0;
+    bool sorted = true;
+    uintptr_t prev_end = 0;
+
+    if (n_tensors > stack_cap) {
+        heap_ranges.reserve(n_tensors);
+    }
+
+    for (size_t i = 0; i < n_tensors; ++i) {
+        if (sizes[i] == 0) {
+            continue;
+        }
+        const uintptr_t addr = (uintptr_t) tensors[i]->data + offsets[i];
+        GGML_ASSERT(addr <= UINTPTR_MAX - sizes[i]);
+        const uintptr_t end = addr + sizes[i];
+        sorted = sorted && (n_nonempty == 0 || prev_end <= addr);
+        prev_end = end;
+        if (n_tensors <= stack_cap) {
+            stack_ranges[n_nonempty] = { addr, end };
+        } else {
+            heap_ranges.emplace_back(addr, end);
+        }
+        ++n_nonempty;
+    }
+
+    if (n_nonempty == 0) {
+        return true;
+    }
+    if (n_nonempty == 1) {
+        return false;
+    }
+
+    // Batch kernels write blocks in arbitrary order, so decline overlapping destination ranges.
+    if (!sorted) {
+        if (n_tensors <= stack_cap) {
+            std::sort(stack_ranges, stack_ranges + n_nonempty);
+            for (size_t i = 1; i < n_nonempty; ++i) {
+                if (stack_ranges[i].first < stack_ranges[i - 1].second) {
+                    return false;
+                }
+            }
+        } else {
+            std::sort(heap_ranges.begin(), heap_ranges.end());
+            for (size_t i = 1; i < heap_ranges.size(); ++i) {
+                if (heap_ranges[i].first < heap_ranges[i - 1].second) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    const cudaStream_t stream = ctx.stream();
+
+    // Fast path 1: pack small batches directly into kernel parameter space (zero H2D API calls).
+    if (n_nonempty <= ggml_cuda_inline_copy_batch::max_copies) {
+        size_t needed = 0;
+        bool fits_inline = true;
+        for (size_t i = 0; i < n_tensors; ++i) {
+            const size_t sz = sizes[i];
+            if (sz == 0) {
+                continue;
+            }
+            const size_t align = sz >= 4 ? 4 : (sz >= 2 ? 2 : 1);
+            const size_t off = (needed + align - 1) & ~(align - 1);
+            if (off + sz > ggml_cuda_inline_copy_batch::max_payload) {
+                fits_inline = false;
+                break;
+            }
+            needed = off + sz;
+        }
+        if (fits_inline) {
+            ggml_cuda_inline_copy_batch batch;
+            batch.count = 0;
+            batch.pad[0] = batch.pad[1] = batch.pad[2] = 0;
+            size_t used = 0;
+            unsigned char * payload_bytes = (unsigned char *) batch.payload;
+            for (size_t i = 0; i < n_tensors; ++i) {
+                const size_t sz = sizes[i];
+                if (sz == 0) {
+                    continue;
+                }
+                const size_t align = sz >= 4 ? 4 : (sz >= 2 ? 2 : 1);
+                const size_t off = (used + align - 1) & ~(align - 1);
+                if (off > used) {
+                    memset(payload_bytes + used, 0, off - used);
+                }
+                memcpy(payload_bytes + off, data[i], sz);
+                batch.descs[batch.count++] = {
+                    (unsigned char *) tensors[i]->data + offsets[i],
+                    (uint32_t) off,
+                    (uint32_t) sz,
+                };
+                used = off + sz;
+            }
+            const size_t used_pad = (used + 3) & ~(size_t) 3;
+            if (used_pad > used) {
+                memset(payload_bytes + used, 0, used_pad - used);
+            }
+            ggml_cuda_batch_copy_inline_kernel<<<batch.count, 64, 0, stream>>>(batch);
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        }
+    }
+
+    // Fast path 2: pack larger batches into 2-slot pinned host staging + single H2D + scatter kernel.
+    auto & stage = ctx.async_batch_stage;
+    if (!allow_pinned || stage.failed) {
+        return false;
+    }
+
+    constexpr size_t max_bytes  = ggml_backend_cuda_context::ggml_cuda_async_batch_stage::max_bytes;
+    constexpr size_t max_single = max_bytes / 2;
+
+    size_t n_small = 0;
+    for (size_t i = 0; i < n_tensors; ++i) {
+        if (sizes[i] > 0 && sizes[i] <= max_single) {
+            ++n_small;
+        }
+    }
+    if (n_small < 2) {
+        return false;
+    }
+
+    const size_t nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    std::vector<size_t> chunk_idx;
+    chunk_idx.reserve(n_small);
+    size_t chunk_payload = 0;
+    size_t max_copy_size = 0;
+    bool flushed_any = false;
+    bool stage_broken = false;
+
+    auto flush_chunk = [&]() {
+        if (chunk_idx.empty()) {
+            return;
+        }
+        const size_t k = chunk_idx.size();
+        const size_t desc_bytes = GGML_PAD(k * sizeof(ggml_cuda_batch_copy_descriptor), 16);
+        const size_t total_bytes = desc_bytes + chunk_payload;
+        auto & st = stage.slots[stage.cur_slot];
+
+        if (st.event == nullptr) {
+            if (cudaEventCreateWithFlags(&st.event, cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                stage.failed = true;
+                stage_broken = true;
+                return;
+            }
+        }
+        if (st.recorded) {
+            CUDA_CHECK(cudaEventSynchronize(st.event));
+            st.recorded = false;
+        }
+        if (st.cap < total_bytes) {
+            const size_t new_cap = std::min(max_bytes, std::max<size_t>(total_bytes, std::max<size_t>(st.cap * 2, 64 * 1024)));
+            unsigned char * new_host = nullptr;
+            if (cudaMallocHost((void **) &new_host, new_cap) != cudaSuccess) {
+                (void) cudaGetLastError();
+                stage.failed = true;
+                stage_broken = true;
+                return;
+            }
+            if (st.host != nullptr) {
+                CUDA_CHECK(cudaFreeHost(st.host));
+            }
+            st.host = new_host;
+            st.cap = new_cap;
+        }
+        if (stage.dev_cap < total_bytes) {
+            const size_t new_cap = std::min(max_bytes, std::max<size_t>(total_bytes, std::max<size_t>(stage.dev_cap * 2, 64 * 1024)));
+            unsigned char * new_dev = nullptr;
+            if (cudaMalloc((void **) &new_dev, new_cap) != cudaSuccess) {
+                (void) cudaGetLastError();
+                stage.failed = true;
+                stage_broken = true;
+                return;
+            }
+            if (stage.dev_buf != nullptr) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                CUDA_CHECK(cudaFree(stage.dev_buf));
+            }
+            stage.dev_buf = new_dev;
+            stage.dev_cap = new_cap;
+        }
+
+        auto * descs = (ggml_cuda_batch_copy_descriptor *) st.host;
+        size_t off = desc_bytes;
+        for (size_t j = 0; j < k; ++j) {
+            const size_t i = chunk_idx[j];
+            const size_t sz = sizes[i];
+            memcpy(st.host + off, data[i], sz);
+            descs[j] = {
+                stage.dev_buf + off,
+                (unsigned char *) tensors[i]->data + offsets[i],
+                sz,
+            };
+            off += GGML_PAD(sz, 16);
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(stage.dev_buf, st.host, total_bytes, cudaMemcpyHostToDevice, stream));
+        const size_t useful = std::max<size_t>(1, (max_copy_size + 255) / 256);
+        const size_t blocks_per_copy = std::min<size_t>(useful, std::min<size_t>(UINT16_MAX, std::max<size_t>(1, (nsm + k - 1) / k)));
+        const dim3 blocks((unsigned int) k, (unsigned int) blocks_per_copy);
+        ggml_cuda_batch_copy_kernel<<<blocks, 256, 0, stream>>>((const ggml_cuda_batch_copy_descriptor *) stage.dev_buf, k);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(st.event, stream));
+        st.recorded = true;
+        stage.cur_slot ^= 1;
+        flushed_any = true;
+
+        chunk_idx.clear();
+        chunk_payload = 0;
+        max_copy_size = 0;
+    };
+
+    for (size_t i = 0; i < n_tensors; ++i) {
+        const size_t sz = sizes[i];
+        if (sz == 0 || sz > max_single) {
+            continue;
+        }
+        const size_t sz_pad = GGML_PAD(sz, 16);
+        const size_t next_desc = GGML_PAD((chunk_idx.size() + 1) * sizeof(ggml_cuda_batch_copy_descriptor), 16);
+        if (!chunk_idx.empty() && next_desc + chunk_payload + sz_pad > max_bytes) {
+            flush_chunk();
+            if (stage_broken) {
+                break;
+            }
+        }
+        chunk_idx.push_back(i);
+        chunk_payload += sz_pad;
+        max_copy_size = std::max(max_copy_size, sz);
+    }
+
+    if (!stage_broken) {
+        flush_chunk();
+    }
+
+    if (stage_broken) {
+        if (!flushed_any) {
+            return false;
+        }
+        // Previous chunks already ran; emit any unqueued small items directly.
+        const size_t first_left = chunk_idx.empty() ? n_tensors : chunk_idx.front();
+        for (size_t i = first_left; i < n_tensors; ++i) {
+            if (sizes[i] > 0 && sizes[i] <= max_single) {
+                CUDA_CHECK(cudaMemcpyAsync((char *) tensors[i]->data + offsets[i], data[i], sizes[i], cudaMemcpyHostToDevice, stream));
+            }
+        }
+    }
+
+    for (size_t i = 0; i < n_tensors; ++i) {
+        if (sizes[i] > max_single) {
+            CUDA_CHECK(cudaMemcpyAsync((char *) tensors[i]->data + offsets[i], data[i], sizes[i], cudaMemcpyHostToDevice, stream));
+        }
+    }
+    return true;
+#endif
+}

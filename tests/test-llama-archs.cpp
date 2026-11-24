@@ -326,6 +326,8 @@ static void usage(char ** argv) {
     LOG("  --inkling-window <dev>   Compare Inkling 2 sessions that share one cache with each session alone, on <dev>\n");
     LOG("  --inkling-loop <dev>     Test the run-time pass count of Inkling 2 Loop (counts, reuse, validation, slot sizing) on <dev>\n");
     LOG("  --inkling-stack <devs>   Compare Inkling 2's Q-input products as one launch with one launch each, on <devs> (two: -sm tensor)\n");
+    LOG("  --inkling-delta-upload <devs>  Verify Inkling 2 delta uploads and batched small H2D inputs bit-for-bit on <devs>\n");
+    LOG("  --inkling-delta-bench <devs>   Benchmark Inkling 2 delta uploads vs legacy full writes on <devs>\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -4420,6 +4422,8 @@ int main(int argc, char ** argv) {
     std::string inkling_window; // --inkling-window <device>
     std::string inkling_loop; // --inkling-loop <device>
     std::string inkling_stack; // --inkling-stack <devs>
+    std::string inkling_delta_upload; // --inkling-delta-upload <devs>
+    std::string inkling_delta_bench; // --inkling-delta-bench <devs>
     bool glm_alias_only = false;
     bool glm_kpool_only = false;
     bool glm_nextn_only = false;
@@ -4482,6 +4486,16 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--inkling-stack") == 0) {
             if (i + 1 == argc) return 1;
             inkling_stack = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--inkling-delta-upload") == 0) {
+            if (i + 1 == argc) return 1;
+            inkling_delta_upload = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--inkling-delta-bench") == 0) {
+            if (i + 1 == argc) return 1;
+            inkling_delta_bench = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--glm-shared-buffers-device") == 0) { // the tensor split's ranks, as --glm-tensor-device
@@ -4659,6 +4673,26 @@ int main(int argc, char ** argv) {
                 ranks.push_back(device);
             }
             return test_inkling_stack(seed, ranks);
+        }
+        if (!inkling_delta_upload.empty()) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> ranks;
+            for (const auto & name : string_split<std::string>(inkling_delta_upload, ',')) {
+                const auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) throw std::runtime_error("Inkling delta upload device is unavailable: " + name);
+                ranks.push_back(device);
+            }
+            return test_inkling_delta_upload(seed, ranks);
+        }
+        if (!inkling_delta_bench.empty()) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> ranks;
+            for (const auto & name : string_split<std::string>(inkling_delta_bench, ',')) {
+                const auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) throw std::runtime_error("Inkling delta bench device is unavailable: " + name);
+                ranks.push_back(device);
+            }
+            return test_inkling_delta_bench(seed, ranks);
         }
         if (!shared_device.empty()) {
             ggml_backend_load_all();

@@ -871,7 +871,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
     if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
-        mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+        mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn, sched);
     }
 }
 
@@ -879,6 +879,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
     this->mctx = mctx;
+    this->sched = params.sched;
 
     const bool ok_idxs = self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
@@ -897,16 +898,29 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     return ok_idxs && ok_mask;
 }
 
+void llm_graph_input_attn_kv::input_lost() {
+    if (mctx && mctx->get_kv()) {
+        mctx->get_kv()->invalidate_delta_state();
+    }
+}
+
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
-    mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+    mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn, sched);
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
     mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    sched = params.sched;
 
     return can_reuse_impl(params);
+}
+
+void llm_graph_input_attn_k::input_lost() {
+    if (mctx && mctx->get_kv()) {
+        mctx->get_kv()->invalidate_delta_state();
+    }
 }
 
 bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
@@ -1183,6 +1197,7 @@ bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
 
     // the parent class operates on the base cache context
     this->mctx = mctx_msa->get_base();
+    this->sched = params.sched;
 
     bool res = true;
 
@@ -1201,18 +1216,30 @@ void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
 
     // leave unallocated when the top-k layers use the indexer mask
     if (self_attn_mask_mla.raw->buffer) {
-        mctx->get_mla()->set_input_attn_mask(self_attn_mask_mla, ubatch, cparams.causal_attn);
+        mctx->get_mla()->set_input_attn_mask(self_attn_mask_mla, ubatch, cparams.causal_attn, sched);
     }
 
     mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
 
-    mctx->get_lid()->set_input_attn_mask(self_attn_mask_lid, ubatch, cparams.causal_attn);
+    mctx->get_lid()->set_input_attn_mask(self_attn_mask_lid, ubatch, cparams.causal_attn, sched);
 }
 
 bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
     mctx = static_cast<const llama_kv_cache_dsa_context *>(params.mctx);
+    sched = params.sched;
 
     return can_reuse_impl(params);
+}
+
+void llm_graph_input_attn_k_dsa::input_lost() {
+    if (mctx) {
+        if (mctx->get_mla() && mctx->get_mla()->get_kv()) {
+            mctx->get_mla()->get_kv()->invalidate_delta_state();
+        }
+        if (mctx->get_lid() && mctx->get_lid()->get_kv()) {
+            mctx->get_lid()->get_kv()->invalidate_delta_state();
+        }
+    }
 }
 
 bool llm_graph_input_attn_k_dsa::can_reuse_impl(const llm_graph_params & params) {
@@ -1235,8 +1262,10 @@ void llm_graph_input_attn_k_dsa_iswa::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_attn_k_dsa_iswa::can_reuse(const llm_graph_params & params) {
     mctx = static_cast<const llama_kv_cache_dsa_iswa_context *>(params.mctx);
 
-    inp_dsa->mctx = mctx->get_dsa();
-    inp_swa->mctx = mctx->get_swa();
+    inp_dsa->mctx  = mctx->get_dsa();
+    inp_dsa->sched = params.sched;
+    inp_swa->mctx  = mctx->get_swa();
+    inp_swa->sched = params.sched;
 
     bool res = true;
 
@@ -1244,6 +1273,11 @@ bool llm_graph_input_attn_k_dsa_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_swa->can_reuse_impl(params);
 
     return res;
+}
+
+void llm_graph_input_attn_k_dsa_iswa::input_lost() {
+    inp_dsa->input_lost();
+    inp_swa->input_lost();
 }
 
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
@@ -1310,6 +1344,17 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_attn_kv_iswa::input_lost() {
+    if (mctx) {
+        if (mctx->get_base() && mctx->get_base()->get_kv()) {
+            mctx->get_base()->get_kv()->invalidate_delta_state();
+        }
+        if (mctx->get_swa() && mctx->get_swa()->get_kv()) {
+            mctx->get_swa()->get_kv()->invalidate_delta_state();
+        }
+    }
+}
+
 void llm_graph_input_attn_k_iswa::set_input(const llama_ubatch * ubatch) {
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
@@ -1317,20 +1362,21 @@ void llm_graph_input_attn_k_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     // the kq mask guards on its own buffer: shared cells leave idxs unbacked while the mask stays live
-    mctx->get_base()->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+    mctx->get_base()->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn, sched);
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
         mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
     }
 
-    mctx->get_swa()->set_input_attn_mask(self_attn_mask_swa, ubatch, cparams.causal_attn);
+    mctx->get_swa()->set_input_attn_mask(self_attn_mask_swa, ubatch, cparams.causal_attn, sched);
 }
 
 bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
 
     this->mctx = mctx;
+    this->sched = params.sched;
 
     bool res = true;
 
@@ -1353,6 +1399,17 @@ bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     return res;
+}
+
+void llm_graph_input_attn_k_iswa::input_lost() {
+    if (mctx) {
+        if (mctx->get_base() && mctx->get_base()->get_kv()) {
+            mctx->get_base()->get_kv()->invalidate_delta_state();
+        }
+        if (mctx->get_swa() && mctx->get_swa()->get_kv()) {
+            mctx->get_swa()->get_kv()->invalidate_delta_state();
+        }
+    }
 }
 
 static void dsv4_set_i64(ggml_tensor * dst, const std::vector<int64_t> & src) {
@@ -1691,7 +1748,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
     // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
-    mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+    mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn, sched);
 
     inp_rs->set_input_rs(mctx->get_recr(), ubatch);
 }
@@ -1700,6 +1757,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
 
     this->mctx = mctx;
+    this->sched = params.sched;
 
     bool res = true;
 
@@ -1713,6 +1771,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mem_hybrid::input_lost() {
+    if (mctx && mctx->get_attn() && mctx->get_attn()->get_kv()) {
+        mctx->get_attn()->get_kv()->invalidate_delta_state();
+    }
+}
+
 // TODO: Hybrid input classes are a bit redundant.
 // Instead of creating a hybrid input, the graph can simply create 2 separate inputs.
 // Refactoring is required in the future.
@@ -1721,7 +1785,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     // unallocated when no layer reads it: the pooled indexer's sparse attention leaves it out (build_attn_sparse)
     if (inp_attn->self_attn_mask.raw->buffer) {
-        mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+        mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn, sched);
     }
 
     inp_rs->set_input_rs(mctx->get_recr(), ubatch);
@@ -1731,6 +1795,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
 
     this->mctx = mctx;
+    this->sched = params.sched;
 
     const bool ok_idxs = inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
@@ -1746,6 +1811,12 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     }
 
     return ok_idxs && ok_mask && ok_rs;
+}
+
+void llm_graph_input_mem_hybrid_k::input_lost() {
+    if (mctx && mctx->get_attn() && mctx->get_attn()->get_kv()) {
+        mctx->get_attn()->get_kv()->invalidate_delta_state();
+    }
 }
 
 void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
@@ -1814,6 +1885,18 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
 
     return res;
+}
+
+void llm_graph_input_mem_hybrid_iswa::input_lost() {
+    if (mctx && mctx->get_attn()) {
+        const auto * attn_ctx = mctx->get_attn();
+        if (attn_ctx->get_base() && attn_ctx->get_base()->get_kv()) {
+            attn_ctx->get_base()->get_kv()->invalidate_delta_state();
+        }
+        if (attn_ctx->get_swa() && attn_ctx->get_swa()->get_kv()) {
+            attn_ctx->get_swa()->get_kv()->invalidate_delta_state();
+        }
+    }
 }
 
 void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
@@ -4095,6 +4178,7 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    inp->sched = sched;
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -4255,6 +4339,7 @@ llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    inp->sched = sched;
 
     return (llm_graph_input_attn_k *) res->add_input(std::move(inp));
 }
@@ -4759,6 +4844,7 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_context *>(mctx);
 
     auto inp = build_attn_inp_k_dsa_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    inp->sched = sched;
 
     return (llm_graph_input_attn_k_dsa *) res->add_input(std::move(inp));
 }
@@ -4767,9 +4853,11 @@ llm_graph_input_attn_k_dsa_iswa * llm_graph_context::build_attn_inp_k_dsa_iswa()
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_iswa_context *>(mctx);
 
     auto inp_dsa = build_attn_inp_k_dsa_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_dsa());
+    inp_dsa->sched = sched;
 
     // build_attn_inp_k_impl rejects SWA caches, so construct the input directly
     auto inp_swa = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur->get_swa());
+    inp_swa->sched = sched;
 
     inp_swa->self_k_idxs = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
 
@@ -4784,6 +4872,7 @@ llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_
     const auto * mctx_cur = static_cast<const llama_kv_cache_msa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_msa>(hparams, cparams, mctx_cur);
+    inp->sched = sched;
 
     const auto * mctx_base = mctx_cur->get_base();
     const auto * mctx_idx  = mctx_cur->get_idx();
@@ -4849,6 +4938,7 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_k_iswa>(hparams, cparams, mctx_cur);
+    inp->sched = sched;
 
     {
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
@@ -5255,8 +5345,10 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    inp_attn->sched = sched;
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+    inp->sched = sched;
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
 }
@@ -5266,8 +5358,10 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    inp_attn->sched = sched;
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+    inp->sched = sched;
 
     return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
 }

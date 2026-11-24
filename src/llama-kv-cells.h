@@ -388,7 +388,7 @@ public:
 
         if (seq[i].none()) {
             pos[i] = -1;
-            pos_chg.add(i);
+            log_pos_only(i);
             ext[i].reset();
             shift[i] = 0;
 
@@ -443,7 +443,7 @@ public:
             seq[i].reset();
 
             pos[i] = -1;
-            pos_chg.add(i);
+            log_pos_only(i);
             ext[i].reset();
             shift[i] = 0;
 
@@ -643,6 +643,10 @@ public:
     const llama_kv_cells_log & mask_changes() const {
         return mask_chg;
     }
+
+    // Pause change logging during dry-run slot checks (prepare() restores all cells).
+    void pause_logging_push() { ++log_pause_depth; }
+    void pause_logging_pop()  { assert(log_pause_depth > 0); --log_pause_depth; }
 
     // Empty cells have position -1.
     const std::vector<llama_pos> & positions() const {
@@ -871,14 +875,28 @@ private:
     llama_kv_cells_log chg;
     llama_kv_cells_log pos_chg;
     llama_kv_cells_log mask_chg;
+    uint32_t           log_pause_depth = 0;
 
     void log_pos(uint32_t i) {
+        if (log_pause_depth > 0) {
+            return;
+        }
         chg.add(i);
         pos_chg.add(i);
         mask_chg.add(i);
     }
 
+    void log_pos_only(uint32_t i) {
+        if (log_pause_depth > 0) {
+            return;
+        }
+        pos_chg.add(i);
+    }
+
     void log_seq(uint32_t i) {
+        if (log_pause_depth > 0) {
+            return;
+        }
         chg.add(i);
         mask_chg.add(i);
     }
