@@ -1511,63 +1511,67 @@ static size_t ggml_cuda_flash_attn_ext_device_alloc_size(int device, const ggml_
 }
 
 // The first launch of each kernel on each K type, at debug level: the inkling-kvg tests read which kernel a cache type takes.
-static void ggml_cuda_fattn_note_kernel(const best_fattn_kernel kernel, const ggml_type type) {
-    static std::atomic<uint8_t> seen[GGML_TYPE_COUNT];
-    int bit;
-    const char * name;
-    switch (kernel) {
-        case BEST_FATTN_KERNEL_TILE:        bit = 0; name = "TILE";        break;
-        case BEST_FATTN_KERNEL_VEC:         bit = 1; name = "VEC";         break;
-        case BEST_FATTN_KERNEL_MMA_F16:     bit = 2; name = "MMA_F16";     break;
-        case BEST_FATTN_KERNEL_REL_DECODE:  bit = 3; name = "REL_DECODE";  break;
-        case BEST_FATTN_KERNEL_REL_SHORT:   bit = 4; name = "REL_SHORT";   break;
-        case BEST_FATTN_KERNEL_REL_PREFILL: bit = 5; name = "REL_PREFILL"; break;
-        case BEST_FATTN_KERNEL_REL_ROWS:    bit = 6; name = "REL_ROWS";    break;
-        default: return;
-    }
-    const uint8_t mask = uint8_t(1u << bit);
+// The relative decode names the kernel it hands the step to: REL_RUNS, REL_MMA or REL_DECODE (one cell a warp).
+enum ggml_cuda_fattn_note {
+    FATTN_NOTE_TILE, FATTN_NOTE_VEC, FATTN_NOTE_MMA_F16, FATTN_NOTE_REL_SHORT, FATTN_NOTE_REL_PREFILL, FATTN_NOTE_REL_ROWS,
+    FATTN_NOTE_REL_RUNS, FATTN_NOTE_REL_MMA, FATTN_NOTE_REL_DECODE,
+};
+
+static void ggml_cuda_fattn_note_kernel(const ggml_cuda_fattn_note note, const ggml_type type) {
+    static const char * names[] = {
+        "TILE", "VEC", "MMA_F16", "REL_SHORT", "REL_PREFILL", "REL_ROWS", "REL_RUNS", "REL_MMA", "REL_DECODE"};
+    static std::atomic<uint16_t> seen[GGML_TYPE_COUNT];
+    const uint16_t mask = uint16_t(1u << note);
     if ((int) type < 0 || (int) type >= GGML_TYPE_COUNT || (seen[type].load(std::memory_order_relaxed) & mask) ||
             (seen[type].fetch_or(mask, std::memory_order_relaxed) & mask)) {
         return;
     }
-    GGML_LOG_DEBUG("ggml_cuda_fattn: kernel %s on K %s\n", name, ggml_type_name(type));
+    GGML_LOG_DEBUG("ggml_cuda_fattn: kernel %s on K %s\n", names[note], ggml_type_name(type));
 }
 
 static void ggml_cuda_flash_attn_ext_device(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
-    ggml_cuda_fattn_note_kernel(kernel, dst->src[1]->type);
-    switch (kernel) {
+    const ggml_type kt = dst->src[1]->type;
+    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_REL_PREFILL:
+            ggml_cuda_fattn_note_kernel(FATTN_NOTE_REL_PREFILL, kt);
             ggml_cuda_flash_attn_ext_rel_prefill(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_SHORT:
+            ggml_cuda_fattn_note_kernel(FATTN_NOTE_REL_SHORT, kt);
             ggml_cuda_fattn_rel_short(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_ROWS:
+            ggml_cuda_fattn_note_kernel(FATTN_NOTE_REL_ROWS, kt);
             ggml_cuda_fattn_rel_rows(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_DECODE:
             // the runs of cells the model gives, read by address (ggml_flash_attn_ext_set_kv_runs)
             if (fattn_rel_runs_takes(ctx.device, dst) && fattn_rel_runs_aligned(dst)) {
+                ggml_cuda_fattn_note_kernel(FATTN_NOTE_REL_RUNS, kt);
                 ggml_cuda_fattn_rel_runs(ctx, dst);
                 break;
             }
             if (fattn_rel_mma_shapes(ctx.device, dst) && fattn_rel_mma_aligned(dst)) {
+                ggml_cuda_fattn_note_kernel(FATTN_NOTE_REL_MMA, kt);
                 ggml_cuda_fattn_rel_mma(ctx, dst);
             } else {
+                ggml_cuda_fattn_note_kernel(FATTN_NOTE_REL_DECODE, kt);
                 ggml_cuda_fattn_rel_decode(ctx, dst);
             }
             break;
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
+            ggml_cuda_fattn_note_kernel(FATTN_NOTE_TILE, kt);
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
+            ggml_cuda_fattn_note_kernel(FATTN_NOTE_VEC, kt);
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
+            ggml_cuda_fattn_note_kernel(FATTN_NOTE_MMA_F16, kt);
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }

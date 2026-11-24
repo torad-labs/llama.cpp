@@ -96,6 +96,45 @@ class TestJudge(unittest.TestCase):
         self.assertIn("device_sm_120", fa.judge(ev)["verdict"]["failed"])
 
 
+class TestSpoofing(unittest.TestCase):
+    def test_failed_reference_run_fails(self):
+        ev = evidence()
+        ev["runs"]["model_off_served"]["rc"] = 1
+        ev["runs"]["model_off_served"]["lines"] = [l.replace("OK inkling2", "FAIL inkling2")
+                                                   for l in model_lines(999.0, 95)]
+        self.assertIn("model_served_ok", fa.judge(ev)["verdict"]["failed"])
+
+    def test_reference_without_figure_fails(self):
+        ev = evidence()
+        ev["runs"]["model_off_restore"]["lines"] = [l for l in model_lines(3.0e-5, 95) if "NMSE" not in l]
+        failed = fa.judge(ev)["verdict"]["failed"]
+        self.assertIn("model_restore_ok", failed)
+        self.assertIn("model_restore_engaged", failed)
+
+    def test_missing_argmax_in_both_runs_fails(self):
+        ev = evidence()
+        for w in ("on", "off"):
+            ev["runs"]["model_%s_served" % w]["lines"] = [l for l in ev["runs"]["model_%s_served" % w]["lines"]
+                                                         if "argmax" not in l]
+        self.assertIn("model_served_greedy_parity", fa.judge(ev)["verdict"]["failed"])
+
+    def test_tile_fail_line_fails_even_with_full_count(self):
+        ev = evidence()
+        ev["runs"]["tile_ops"]["lines"] = ["  FLASH_ATTN_EXT(hs=128,type_KV=f8_e4m3): FAIL", "  62/62 tests passed"]
+        self.assertIn("tile_ops_all_passed", fa.judge(ev)["verdict"]["failed"])
+
+    def test_any_rel_decode_sub_kernel_counts(self):
+        ev = evidence()
+        for c in fa.MODEL_CASES:
+            ev["runs"]["model_on_" + c]["lines"] = [l.replace("REL_DECODE", "REL_MMA")
+                                                   for l in ev["runs"]["model_on_" + c]["lines"]]
+        self.assertTrue(fa.judge(ev)["verdict"]["pass"])
+
+    def test_decode_and_mma_headers_are_sources(self):
+        self.assertIn("ggml/src/ggml-cuda/fattn-rel-decode.cuh", fa.SOURCES)
+        self.assertIn("ggml/src/ggml-cuda/fattn-rel-mma.cuh", fa.SOURCES)
+
+
 class TestCheck(unittest.TestCase):
     def check(self, ev):
         with tempfile.TemporaryDirectory() as tmp:

@@ -100,15 +100,17 @@ class StoreCounts(object):
         self.end_notes = []          # MMQ_ROUTE_END lines: ring capacity ran/kept facts
         self.hist_records = 0        # MMQ_ROUTE_HIST lines read
         self.hists = []              # (ctx, layer or None, experts_total, launches, hits); not in as_dict
+        self.site_experts = set()    # (experts, experts_total) of the MMQ_ROUTE_SITE lines
 
     def as_dict(self):
         d = dict(self.__dict__)
         d["end_notes"] = list(d["end_notes"])
         del d["hists"]
+        d["site_experts"] = sorted(list(e) for e in d["site_experts"])
         return d
 
 
-def parse_store(path):
+def parse_store(path, top_k=TOP_K):
     """Stream one store; yield launch dicts {layer, cols, used}. Bounded memory.
     Dedupe: first record per (eval, layer); later ones count as repeats only."""
     counts = StoreCounts()
@@ -136,7 +138,9 @@ def parse_store(path):
                     except ValueError:
                         continue
                     layer = parse_site_layer(str(j.get("name", "")))
-                    ctx_sites[(int(j.get("ctx", -1)), int(j["site"]))] = (layer, int(j.get("experts_total", 0)))
+                    experts, experts_total = int(j.get("experts", 0)), int(j.get("experts_total", 0))
+                    ctx_sites[(int(j.get("ctx", -1)), int(j["site"]))] = (layer, experts_total, experts)
+                    counts.site_experts.add((experts, experts_total))
                     if layer is not None:
                         sites[int(j["site"])] = layer
                 else:
@@ -165,13 +169,20 @@ def parse_store(path):
                 counts.product_repeats += 1
                 continue
             seen.add(key)
-            if cols % TOP_K != 0 or cols <= 0:
+            if cols % top_k != 0 or cols <= 0:
                 counts.bad_cols += 1
                 continue
             counts.launches += 1
             launches.append((layer, phase_of(cols), cols, used))
     for (ctx, site, n_launch, hits) in raw_hists:
-        layer, experts_total = ctx_sites.get((ctx, site), (None, 0))
+        layer, experts_total, experts = ctx_sites.get((ctx, site), (None, 0, 0))
+        if experts and len(hits) < experts:
+            # ggml_cuda_mmq_route_log keeps hist_bins (512) bins a site: past them the experts were not counted
+            raise SystemExit("%s: context %d site %d has %d experts but its histogram holds %d bins; the CUDA "
+                             "histogram counts only the first ggml_cuda_mmq_route_log::hist_bins experts"
+                             % (path, ctx, site, experts, len(hits)))
+        if not hits or any(v < 0 for v in hits):
+            raise SystemExit("%s: context %d site %d has an empty or negative histogram" % (path, ctx, site))
         counts.hists.append((ctx, layer, experts_total, n_launch, hits))
     return launches, counts
 
@@ -194,6 +205,23 @@ def layer_hit_stats(hits, top_k):
         "uniform_noise_top1_share": round(top_k * (slots / float(len(hits)) + math.sqrt(slots / float(len(hits)) *
                                           2.0 * math.log(len(hits)))) / slots, 9) if slots else None,
         "hhi": round(sum((h / float(slots)) ** 2 for h in hits), 9) if slots else None,
+    }
+
+
+def hist_verdict(layers_out, top_k, n_experts):
+    """Branch (a) or (b) from the per-layer hit statistics; the same function judges in build and in check."""
+    bar = round(1.5 * float(top_k) / n_experts, 9)
+    hit_rows = [r for r in layers_out if r.get("expert_hits")]
+    top1 = max(r["expert_hits"]["top1_share"] for r in hit_rows)
+    hot_layers = [r["layer"] for r in hit_rows if r["expert_hits"]["top1_share"] >= bar]
+    return {
+        "measured_top1_share": top1,
+        "branch": "a" if hot_layers else "b",
+        "label": "hot_expert_present" if hot_layers else "near_uniform_no_hot_expert",
+        "hot_layers": hot_layers,
+        "replication_bar_top1_share": bar,
+        # a capture this small reaches the bar by chance: read branch (a) as unproven until it is larger
+        "sample_noise_reaches_bar": any(r["expert_hits"]["uniform_noise_top1_share"] >= bar for r in hit_rows),
     }
 
 
@@ -258,11 +286,11 @@ def sha256_file(path, cap_bytes=None):
     return h.hexdigest()
 
 
-def by_cols_table(by_cols_ratios):
+def by_cols_table(by_cols_ratios, top_k=TOP_K):
     """Per batch size: launch counts and mean breadth ratio per phase."""
     table = []
     for cols in sorted(by_cols_ratios):
-        row = {"cols": cols, "tokens_per_launch": cols // TOP_K}
+        row = {"cols": cols, "tokens_per_launch": cols // top_k}
         for phase in ("decode", "prefill"):
             rs = by_cols_ratios[cols].get(phase) or []
             row["launches_" + phase] = len(rs)
@@ -271,7 +299,23 @@ def by_cols_table(by_cols_ratios):
     return table
 
 
-def build(stores, out_path, top_k=TOP_K):
+def resolve_n_experts(n_experts, layer_hits, site_experts):
+    """The expert count: given, else the histograms', else the site lines' (all ranks' where the ranks hold different
+    experts), else Inkling 2 Small's 384. Sources that disagree are an error, not a guess."""
+    if n_experts:
+        return n_experts
+    from_hits = {len(h) for h in layer_hits.values()}
+    if len(from_hits) > 1:
+        raise SystemExit("histograms disagree on the expert count: %s" % sorted(from_hits))
+    if from_hits:
+        return from_hits.pop()
+    from_sites = {total or experts for (experts, total) in site_experts if total or experts}
+    if len(from_sites) > 1:
+        raise SystemExit("site lines disagree on the expert count: %s; pass --n-experts" % sorted(from_sites))
+    return from_sites.pop() if from_sites else N_EXPERTS
+
+
+def build(stores, out_path, top_k=TOP_K, n_experts=None):
     per_layer_launches = {}   # layer -> phase -> list of used
     cols_hist = {"decode": {}, "prefill": {}}
     all_used = {"decode": [], "prefill": []}      # pooled across layers (breadth rollup)
@@ -287,11 +331,14 @@ def build(stores, out_path, top_k=TOP_K):
     unknown_sites_total = 0
 
     hist_entries = []
+    site_experts = set()
+    every_launch = []
 
     for path in stores:
         if not os.path.exists(path):
             raise SystemExit("missing store: %s" % path)
-        launches, counts = parse_store(path)
+        launches, counts = parse_store(path, top_k)
+        site_experts |= counts.site_experts
         meta = {
             "path": path,
             "bytes": os.path.getsize(path),
@@ -319,27 +366,30 @@ def build(stores, out_path, top_k=TOP_K):
             all_used[phase].append((cols, used))
             bucket = cols_hist[phase]
             bucket[str(cols)] = bucket.get(str(cols), 0) + 1
-            e_uniform = uniform_expected_distinct(N_EXPERTS, TOP_K, cols // TOP_K)
-            if e_uniform > 0:
-                by_cols_ratios.setdefault(cols, {}).setdefault(phase, []).append(used / e_uniform)
+            every_launch.append((phase, cols, used))
+
+    hist_counts = {"unknown_site": 0, "sliced_experts": 0, "site_repeats": 0, "device_repeats": 0}
+    layer_hits = merge_hists(hist_entries, hist_counts)
+    n_experts = resolve_n_experts(n_experts, layer_hits, site_experts)
+    if any(len(h) != n_experts for h in layer_hits.values()):
+        raise SystemExit("histograms of %s experts against a model of %d"
+                         % (sorted({len(h) for h in layer_hits.values()}), n_experts))
+    hist_present = any(sum(h) > 0 for h in layer_hits.values())
+
+    for (phase, cols, used) in every_launch:
+        e_uniform = uniform_expected_distinct(n_experts, top_k, cols // top_k)
+        if e_uniform > 0:
+            by_cols_ratios.setdefault(cols, {}).setdefault(phase, []).append(used / e_uniform)
 
     # ratios are computed per record against that record's own uniform expectation
     def ratios(pairs):
         out = []
         for cols, used in pairs:
-            tokens = cols // TOP_K
-            e_uniform = uniform_expected_distinct(N_EXPERTS, TOP_K, tokens)
+            tokens = cols // top_k
+            e_uniform = uniform_expected_distinct(n_experts, top_k, tokens)
             if e_uniform > 0:
                 out.append(used / e_uniform)
         return out
-
-    hist_counts = {"unknown_site": 0, "sliced_experts": 0, "site_repeats": 0, "device_repeats": 0}
-    layer_hits = merge_hists(hist_entries, hist_counts)
-    n_hist_experts = {len(h) for h in layer_hits.values()}
-    if len(n_hist_experts) > 1:
-        raise SystemExit("histograms disagree on the expert count: %s" % sorted(n_hist_experts))
-    n_experts = n_hist_experts.pop() if n_hist_experts else N_EXPERTS
-    hist_present = any(sum(h) > 0 for h in layer_hits.values())
 
     layers_out = []
     layer_share_sum = 0.0
@@ -366,7 +416,7 @@ def build(stores, out_path, top_k=TOP_K):
                 "ratio_to_uniform_p10": rs.get("p10"),
                 "ratio_to_uniform_p90": rs.get("p90"),
                 "uniform_expected_at_mean_cols":
-                    round(uniform_expected_distinct(N_EXPERTS, TOP_K, mean_cols // TOP_K), 6)
+                    round(uniform_expected_distinct(n_experts, top_k, mean_cols // top_k), 6)
                     if mean_cols else None,
                 # absent by construction from these stores; named, not extrapolated:
                 "per_expert_hit_counts": None,
@@ -400,30 +450,19 @@ def build(stores, out_path, top_k=TOP_K):
             "ratio_to_uniform_p10": st_r.get("p10"),
             "ratio_to_uniform_p90": st_r.get("p90"),
             "uniform_expected_at_mean_cols":
-                round(uniform_expected_distinct(N_EXPERTS, TOP_K,
-                                                (sum(c for c, _u in all_used[phase]) // max(1, len(all_used[phase]))) // TOP_K), 6)
+                round(uniform_expected_distinct(n_experts, top_k,
+                                                (sum(c for c, _u in all_used[phase]) // max(1, len(all_used[phase]))) // top_k), 6)
                 if all_used[phase] else None,
         }
 
-    bar = round(1.5 * float(top_k) / n_experts, 9)
     if hist_present:
-        top1 = max(r["expert_hits"]["top1_share"] for r in layers_out if r["expert_hits"])
-        hot_layers = [r["layer"] for r in layers_out if r["expert_hits"] and r["expert_hits"]["top1_share"] >= bar]
-        verdict = {
-            "measured_top1_share": top1,
-            "branch": "a" if hot_layers else "b",
-            "label": "hot_expert_present" if hot_layers else "near_uniform_no_hot_expert",
-            "hot_layers": hot_layers,
-            "replication_bar_top1_share": bar,
-            # a capture this small reaches the bar by chance: read branch (a) as unproven until it is larger
-            "sample_noise_reaches_bar": any(r["expert_hits"]["uniform_noise_top1_share"] >= bar
-                                            for r in layers_out if r["expert_hits"]),
-            "reason": ("the hottest expert of the hottest layer takes %.6f of that layer's tokens, against the bar "
-                       "of 1.5x the uniform share (%.6f): %s"
-                       % (top1, bar, "the GLM hot-expert replication may transfer; layers %s are hot" % hot_layers
-                          if hot_layers else "no hot leader exists, so GLM's hot-expert replication does not "
-                          "transfer and no engine work follows")),
-        }
+        verdict = hist_verdict(layers_out, top_k, n_experts)
+        verdict["reason"] = ("the hottest expert of the hottest layer takes %.6f of that layer's tokens, against the bar "
+                             "of 1.5x the uniform share (%.6f): %s"
+                             % (verdict["measured_top1_share"], verdict["replication_bar_top1_share"],
+                                "the GLM hot-expert replication may transfer; layers %s are hot" % verdict["hot_layers"]
+                                if verdict["hot_layers"] else "no hot leader exists, so GLM's hot-expert replication "
+                                "does not transfer and no engine work follows"))
     else:
         verdict = {
             # branch (a)/(b) need per-expert shares; disk stores cannot produce them
@@ -471,7 +510,7 @@ def build(stores, out_path, top_k=TOP_K):
             for p in ("decode", "prefill")
         },
         "cols_histogram_by_phase": cols_hist,
-        "by_batch_size": by_cols_table(by_cols_ratios),
+        "by_batch_size": by_cols_table(by_cols_ratios, top_k),
         "pooled_breadth": pooled,
         "per_layer": layers_out,
         "record_format_note":
@@ -585,25 +624,30 @@ def check(path):
     v = d["verdict"]
     bar = round(1.5 * float(top_k) / n_experts, 9)
     if totals["expert_hit_histograms_present"]:
-        top1s = []
+        hit_rows = []
         for row in d["per_layer"]:
             eh = row.get("expert_hits")
             if not eh:
                 continue
-            again = layer_hit_stats(eh["hits"], top_k)
-            for k in ("slot_draws", "top1_share", "top8_shares", "hhi", "n_experts"):
-                if again[k] != eh[k]:
+            hits = eh.get("hits")
+            if not isinstance(hits, list) or not hits or not all(isinstance(h, int) and h >= 0 for h in hits) \
+                    or sum(hits) == 0:
+                problems.append("layer %d: expert_hits holds no valid hit counts" % row["layer"])
+                continue
+            again = layer_hit_stats(hits, top_k)
+            for k, want in again.items():
+                if eh.get(k) != want:
                     problems.append("layer %d: expert_hits %s does not follow from its hits" % (row["layer"], k))
-            if eh["n_experts"] != n_experts:
-                problems.append("layer %d: %d experts, model says %d" % (row["layer"], eh["n_experts"], n_experts))
-            top1s.append(again["top1_share"])
-        if not top1s:
-            problems.append("hit histograms present but no layer carries expert_hits")
-        elif v["measured_top1_share"] != max(top1s):
-            problems.append("measured_top1_share %r is not the hottest layer's %r" % (v["measured_top1_share"], max(top1s)))
-        elif v["branch"] != ("a" if max(top1s) >= bar else "b"):
-            problems.append("verdict branch %r does not follow from top-1 share %r against bar %r"
-                            % (v["branch"], max(top1s), bar))
+            if len(hits) != n_experts:
+                problems.append("layer %d: %d experts, model says %d" % (row["layer"], len(hits), n_experts))
+            hit_rows.append({"layer": row["layer"], "expert_hits": again})
+        if not hit_rows:
+            problems.append("hit histograms present but no layer carries valid expert_hits")
+        else:
+            want = hist_verdict(hit_rows, top_k, n_experts)
+            for k, val in want.items():
+                if v.get(k) != val:
+                    problems.append("verdict %s %r does not follow from the hits (%r)" % (k, v.get(k), val))
     else:
         if v["measured_top1_share"] is not None:
             problems.append("no hit histograms on disk but a top-1 share was claimed")
@@ -626,13 +670,15 @@ def main():
                    help="validate the artifact's internal consistency and exit; PATH "
                         "defaults to --evidence / --out when given bare as --check")
     p.add_argument("--top-k", type=int, default=TOP_K, help="routed experts a token (Inkling 2 Small: 8)")
+    p.add_argument("--n-experts", type=int, default=None,
+                   help="experts of the model; default: the histograms', else the site lines'")
     args = p.parse_args()
 
     if args.check is True:
         sys.exit(check(args.out))
     if args.check:
         sys.exit(check(args.check))
-    artifact = build(args.stores, args.out, args.top_k)
+    artifact = build(args.stores, args.out, args.top_k, args.n_experts)
     pooled = artifact["pooled_breadth"]
     dec = pooled["decode"]
     print(json.dumps({
@@ -641,7 +687,8 @@ def main():
         "slot_draws_total": artifact["totals"]["slot_draws"],
         "decode_launches": dec["launches"] if isinstance(dec, dict) else None,
         "decode_ratio_to_uniform_mean":
-            round(dec["ratio_to_uniform_mean"], 6) if isinstance(dec, dict) else None,
+            round(dec["ratio_to_uniform_mean"], 6)
+            if isinstance(dec, dict) and dec.get("ratio_to_uniform_mean") is not None else None,
         "out": args.out,
     }))
 

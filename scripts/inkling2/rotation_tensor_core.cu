@@ -5,6 +5,10 @@
 // block Hadamard with fp32 accumulate; the butterfly arm copies fwht_block_transform<512, 256> verbatim.
 // Both arms write f32 or fused q8_1 blocks, quantized as ggml/src/ggml-cuda/quantize.cu does.
 //
+// The shared arms read the one Sylvester H_512 every block shares (256 KB) and put the block's signs on the
+// input, which is the true basis of the rotation; the per-block arms read nine signed copies (2.25 MB). The cuBLAS
+// arms run the same product as a tuned bf16 tensor-core GEMM against the shared H_512.
+//
 // Modes:
 //   --device                          device properties as JSON
 //   --measure --rows A,B,.. --seed N  timed arms per shape, error figures, checksums
@@ -27,12 +31,15 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <mma.h>
 
 using namespace nvcuda;
 
 #define CU_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "cuda error %s at line %d\n", cudaGetErrorString(e_), __LINE__); exit(3); } } while (0)
+#define CUBLAS_CHECK(x) do { cublasStatus_t s_ = (x); if (s_ != CUBLAS_STATUS_SUCCESS) { \
+    fprintf(stderr, "cublas error %d at line %d\n", (int) s_, __LINE__); exit(3); } } while (0)
 
 constexpr int WIDTH = 4608;              // hidden width
 constexpr int BLOCK = 512;               // rotation block (power of two, the engine's block Hadamard)
@@ -66,7 +73,7 @@ static __host__ __device__ inline int rot_sign(uint32_t idx, uint32_t seed) {
 struct sample_pos { int row, col; };
 static std::vector<sample_pos> sample_positions(int rows) {
     return {{0, 0}, {0, 1}, {0, BLOCK - 1}, {0, BLOCK}, {rows / 2, 100},
-            {rows - 1, WIDTH - 1}, {1, 2304}, {rows / 2, WIDTH - 1}};
+            {rows - 1, WIDTH - 1}, {std::min(1, rows - 1), 2304}, {rows / 2, WIDTH - 1}};
 }
 
 static inline float bf16_round_host(float v) {
@@ -100,6 +107,29 @@ __global__ void fill_input_kernel(float * x, long long n, uint32_t seed) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         x[i] = rot_input((uint32_t) i, seed);
+    }
+}
+
+// The shared basis: H_512 (row-major, int8) followed by the nine blocks' signs, as one stream. Also H_512 in bf16.
+__global__ void init_shared_basis_kernel(int8_t * hshared, __nv_bfloat16 * h_bf16, uint32_t seed) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < BLOCK * BLOCK) {
+        const int i = idx / BLOCK;
+        const int j = idx % BLOCK;
+        const int h = (__popc((unsigned) (i & j)) & 1) ? -1 : 1;
+        hshared[idx] = (int8_t) h;
+        h_bf16[idx] = __float2bfloat16((float) h);
+    } else if (idx < BLOCK * BLOCK + NBLK * BLOCK) {
+        hshared[idx] = (int8_t) rot_sign((uint32_t) (idx - BLOCK * BLOCK), seed);
+    }
+}
+
+// The cuBLAS arms' input: each element times its block's sign, rounded to bf16 (exact for the sign).
+__global__ void sign_bf16_kernel(const float * __restrict__ x, const float * __restrict__ signs_f,
+                                 __nv_bfloat16 * __restrict__ xs, long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        xs[i] = __float2bfloat16(x[i] * signs_f[i % WIDTH]);
     }
 }
 
@@ -233,7 +263,8 @@ template <bool FP16> static __device__ __forceinline__ typename tc_in<FP16>::typ
 
 // Tensor-core arm: BM rows x BN columns of one 512-block, K = 512. FROM_BASIS reads the stored int8 basis;
 // otherwise the signed Sylvester entry is generated from the indices.
-template <int BM, int BN, int WARPS, bool FROM_BASIS, bool QUANT, bool FP16 = false>
+// SHARED: basis is the shared H_512 and the block's signs multiply the input instead (same products, bit for bit).
+template <int BM, int BN, int WARPS, bool FROM_BASIS, bool QUANT, bool FP16 = false, bool SHARED = false>
 __global__ __launch_bounds__(WARPS * 32) void tc_rotation_kernel(
         const float * __restrict__ src, const int8_t * __restrict__ basis, const int8_t * __restrict__ signs,
         float * __restrict__ dst, block_q8_1_s * __restrict__ q8, int rows, float scale) {
@@ -265,8 +296,11 @@ __global__ __launch_bounds__(WARPS * 32) void tc_rotation_kernel(
             const int mm = t / BK;
             const int kk = t % BK;
             const int row = m0 + mm;
-            A_s[mm][kk] = tc_cvt<FP16>(row < rows ?
-                src[(int64_t) row * WIDTH + b * BLOCK + kc * BK + kk] : 0.0f);
+            float xv = row < rows ? src[(int64_t) row * WIDTH + b * BLOCK + kc * BK + kk] : 0.0f;
+            if (SHARED) {
+                xv *= (float) signs[b * BLOCK + kc * BK + kk];
+            }
+            A_s[mm][kk] = tc_cvt<FP16>(xv);
         }
         for (int t = tid; t < BK * BN; t += NT) {
             const int kk = t / BN;
@@ -274,7 +308,9 @@ __global__ __launch_bounds__(WARPS * 32) void tc_rotation_kernel(
             const int i  = kc * BK + kk;
             const int j  = n_in_blk + nn;
             int8_t v;
-            if (FROM_BASIS) {
+            if (FROM_BASIS && SHARED) {
+                v = basis[(int64_t) i * BLOCK + j];
+            } else if (FROM_BASIS) {
                 v = basis[((int64_t) b * BLOCK + i) * BLOCK + j];
             } else {
                 const int sg = (int) signs[b * BLOCK + i];
@@ -353,8 +389,10 @@ __global__ __launch_bounds__(128) void copy_kernel(const float * __restrict__ sr
     *(float4 *) (dst + i) = *(const float4 *) (src + i);
 }
 
-// Floor of any stored-basis rotation: every basis byte read once with 16-byte loads, one word out a block.
+// Floor of a stored-basis rotation's read: every byte of the basis read once with 16-byte loads, reduced in the block,
+// one word stored a block.
 __global__ __launch_bounds__(256) void basis_stream_kernel(const int4 * __restrict__ basis, long long n16, int * __restrict__ out) {
+    __shared__ int warp_acc[8];
     int acc = 0;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (long long) gridDim.x * blockDim.x) {
         const int4 v = basis[i];
@@ -364,8 +402,20 @@ __global__ __launch_bounds__(256) void basis_stream_kernel(const int4 * __restri
         acc ^= __shfl_xor_sync(0xffffffff, acc, o);
     }
     if (threadIdx.x % 32 == 0) {
-        atomicXor(out + blockIdx.x, acc);
+        warp_acc[threadIdx.x / 32] = acc;
     }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int a = 0;
+        for (int w = 0; w < 8; ++w) {
+            a ^= warp_acc[w];
+        }
+        out[blockIdx.x] = a;
+    }
+}
+
+static unsigned stream_blocks(long long n16) {
+    return (unsigned) std::min<long long>(680, (n16 + 255) / 256);
 }
 
 __global__ void dequant_kernel(const block_q8_1_s * __restrict__ q8, float * __restrict__ out, long long n) {
@@ -555,13 +605,24 @@ static void time_arms(std::vector<arm> & arms, cudaStream_t stream, cudaEvent_t 
 
 static const char * CONFIG_NAMES[3] = {"bm16_bn64_w4", "bm16_bn128_w8", "bm32_bn128_w8"};
 
-template <int BM, int BN, int WARPS, bool FROM_BASIS, bool QUANT, bool FP16 = false>
+template <int BM, int BN, int WARPS, bool FROM_BASIS, bool QUANT, bool FP16 = false, bool SHARED = false>
 static void launch_tc(const float * x, const int8_t * basis, const int8_t * signs, float * dst,
                       block_q8_1_s * q8, int rows, float scale, cudaStream_t stream) {
     const dim3 grid(WIDTH / BN, (rows + BM - 1) / BM, 1);
-    tc_rotation_kernel<BM, BN, WARPS, FROM_BASIS, QUANT, FP16><<<grid, WARPS * 32, 0, stream>>>(
+    tc_rotation_kernel<BM, BN, WARPS, FROM_BASIS, QUANT, FP16, SHARED><<<grid, WARPS * 32, 0, stream>>>(
         x, basis, signs, dst, q8, rows, scale);
     CU_CHECK(cudaGetLastError());
+}
+
+static constexpr size_t CUBLAS_WS_BYTES = 32u << 20;
+static cublasHandle_t g_cublas = nullptr;
+
+// Y_b = (s_b * X_b) H_512 * scale for the nine blocks, row-major X and Y: column-major C = H^T X^T with H symmetric.
+static void launch_cublas(const __nv_bfloat16 * xs, const __nv_bfloat16 * h, float * y, int rows, float scale) {
+    const float beta = 0.0f;
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, BLOCK, rows, BLOCK, &scale,
+        h, CUDA_R_16BF, BLOCK, 0, xs, CUDA_R_16BF, WIDTH, BLOCK, &beta, y, CUDA_R_32F, WIDTH, BLOCK, NBLK,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
 
 struct buffers {
@@ -579,6 +640,13 @@ struct buffers {
     block_q8_1_s * q8_gen = nullptr;
     block_q8_1_s * q8_h = nullptr;
     int8_t * basis = nullptr;
+    int8_t * hshared = nullptr;          // H_512 then the nine blocks' signs
+    __nv_bfloat16 * h_bf16 = nullptr;    // H_512 for cuBLAS
+    __nv_bfloat16 * xs_bf16 = nullptr;   // signed bf16 input for cuBLAS
+    float * y_sh = nullptr;
+    float * y_cub = nullptr;
+    float * scratch_out = nullptr;
+    void  * cublas_ws = nullptr;
     int8_t * signs = nullptr;
     float  * signs_f = nullptr;
     double * scratch = nullptr;
@@ -603,6 +671,13 @@ static void alloc_buffers(buffers & b, int max_rows) {
     CU_CHECK(cudaMalloc(&b.q8_gen, nq * sizeof(block_q8_1_s)));
     CU_CHECK(cudaMalloc(&b.q8_h, nq * sizeof(block_q8_1_s)));
     CU_CHECK(cudaMalloc(&b.basis, (size_t) NBLK * BLOCK * BLOCK));
+    CU_CHECK(cudaMalloc(&b.hshared, (size_t) BLOCK * BLOCK + NBLK * BLOCK));
+    CU_CHECK(cudaMalloc(&b.h_bf16, (size_t) BLOCK * BLOCK * sizeof(__nv_bfloat16)));
+    CU_CHECK(cudaMalloc(&b.xs_bf16, n * sizeof(__nv_bfloat16)));
+    CU_CHECK(cudaMalloc(&b.y_sh, n * sizeof(float)));
+    CU_CHECK(cudaMalloc(&b.y_cub, n * sizeof(float)));
+    CU_CHECK(cudaMalloc(&b.scratch_out, 1024 * sizeof(int)));
+    CU_CHECK(cudaMalloc(&b.cublas_ws, CUBLAS_WS_BYTES));
     CU_CHECK(cudaMalloc(&b.signs, (size_t) NBLK * BLOCK));
     CU_CHECK(cudaMalloc(&b.signs_f, (size_t) NBLK * BLOCK * sizeof(float)));
     CU_CHECK(cudaMalloc(&b.scratch, 8 * sizeof(double)));
@@ -614,6 +689,8 @@ static void free_buffers(buffers & b) {
     cudaFree(b.y_h); cudaFree(b.deq_h);
     cudaFree(b.q8_ref); cudaFree(b.q8_tc); cudaFree(b.q8_gen); cudaFree(b.q8_h);
     cudaFree(b.basis); cudaFree(b.signs); cudaFree(b.signs_f); cudaFree(b.scratch);
+    cudaFree(b.hshared); cudaFree(b.h_bf16); cudaFree(b.xs_bf16); cudaFree(b.y_sh); cudaFree(b.y_cub);
+    cudaFree(b.scratch_out); cudaFree(b.cublas_ws);
 }
 
 static void init_data(buffers & b, int max_rows, uint32_t seed, cudaStream_t stream) {
@@ -621,6 +698,9 @@ static void init_data(buffers & b, int max_rows, uint32_t seed, cudaStream_t str
     fill_input_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(b.x, n, seed);
     const long long nb = (long long) NBLK * BLOCK * BLOCK;
     init_basis_kernel<<<(unsigned) ((nb + 255) / 256), 256, 0, stream>>>(b.basis, b.signs, b.signs_f, seed);
+    const int ns = BLOCK * BLOCK + NBLK * BLOCK;
+    init_shared_basis_kernel<<<(ns + 255) / 256, 256, 0, stream>>>(b.hshared, b.h_bf16, seed);
+    sign_bf16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(b.x, b.signs_f, b.xs_bf16, n);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaStreamSynchronize(stream));
 }
@@ -635,7 +715,27 @@ static void build_arms(std::vector<arm> & arms, buffers & b, int rows, float sca
         copy_kernel<<<grid_fwht, 128, 0, stream>>>(b.x, b.y_gen); }});
     arms.push_back({"basis_stream", [&b, stream]() {
         const long long n16 = (long long) NBLK * BLOCK * BLOCK / 16;
-        basis_stream_kernel<<<680, 256, 0, stream>>>((const int4 *) b.basis, n16, (int *) b.deq_gen); }});
+        basis_stream_kernel<<<stream_blocks(n16), 256, 0, stream>>>((const int4 *) b.basis, n16, (int *) b.scratch_out); }});
+    arms.push_back({"basis_stream_shared", [&b, stream]() {
+        const long long n16 = ((long long) BLOCK * BLOCK + NBLK * BLOCK) / 16;
+        basis_stream_kernel<<<stream_blocks(n16), 256, 0, stream>>>((const int4 *) b.hshared, n16, (int *) b.scratch_out); }});
+    arms.push_back({"cublas_gemm", [&b, rows, scale]() { launch_cublas(b.xs_bf16, b.h_bf16, b.y_cub, rows, scale); }});
+    arms.push_back({"cublas_full", [&b, rows, scale, stream]() {
+        const long long n = (long long) rows * WIDTH;
+        sign_bf16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(b.x, b.signs_f, b.xs_bf16, n);
+        launch_cublas(b.xs_bf16, b.h_bf16, b.y_cub, rows, scale); }});
+    arms.push_back({std::string("tc_shared_f32/") + CONFIG_NAMES[0], [&b, rows, scale, stream]() {
+        launch_tc<16, 64, 4, true, false, false, true>(b.x, b.hshared, b.signs, b.y_sh, nullptr, rows, scale, stream); }});
+    arms.push_back({std::string("tc_shared_q8/") + CONFIG_NAMES[0], [&b, rows, scale, stream]() {
+        launch_tc<16, 64, 4, true, true, false, true>(b.x, b.hshared, b.signs, nullptr, b.q8_tc, rows, scale, stream); }});
+    arms.push_back({std::string("tc_shared_f32/") + CONFIG_NAMES[1], [&b, rows, scale, stream]() {
+        launch_tc<16, 128, 8, true, false, false, true>(b.x, b.hshared, b.signs, b.y_sh, nullptr, rows, scale, stream); }});
+    arms.push_back({std::string("tc_shared_q8/") + CONFIG_NAMES[1], [&b, rows, scale, stream]() {
+        launch_tc<16, 128, 8, true, true, false, true>(b.x, b.hshared, b.signs, nullptr, b.q8_tc, rows, scale, stream); }});
+    arms.push_back({std::string("tc_shared_f32/") + CONFIG_NAMES[2], [&b, rows, scale, stream]() {
+        launch_tc<32, 128, 8, true, false, false, true>(b.x, b.hshared, b.signs, b.y_sh, nullptr, rows, scale, stream); }});
+    arms.push_back({std::string("tc_shared_q8/") + CONFIG_NAMES[2], [&b, rows, scale, stream]() {
+        launch_tc<32, 128, 8, true, true, false, true>(b.x, b.hshared, b.signs, nullptr, b.q8_tc, rows, scale, stream); }});
 
     arms.push_back({std::string("tc_basis_f32/") + CONFIG_NAMES[0], [&b, rows, scale, stream]() {
         launch_tc<16, 64, 4, true, false>(b.x, b.basis, b.signs, b.y_tc, nullptr, rows, scale, stream); }});
@@ -686,6 +786,8 @@ struct run_results {
     cmp_result tc16_vs_ref;
     cmp_result q8_h_err;
     cmp_result q8_h_vs_ref;
+    cmp_result shared_vs_tc;
+    cmp_result cub_vs_ref;
     cmp_result q8_tc_vs_f32; // quantized tensor-core result against the f32 rotation: the error the matmul sees
     cmp_result q8_h_vs_f32;
     std::vector<float> samples_ref, samples_tc;
@@ -702,12 +804,16 @@ static run_results compute_errors(buffers & b, int rows, float scale, cudaStream
     launch_tc<16, 128, 8, true, true>(b.x, b.basis, b.signs, nullptr, b.q8_tc, rows, scale, stream);
     launch_tc<16, 128, 8, true, false, true>(b.x, b.basis, b.signs, b.y_h, nullptr, rows, scale, stream);
     launch_tc<16, 128, 8, true, true, true>(b.x, b.basis, b.signs, nullptr, b.q8_h, rows, scale, stream);
+    launch_tc<16, 128, 8, true, false, false, true>(b.x, b.hshared, b.signs, b.y_sh, nullptr, rows, scale, stream);
+    launch_cublas(b.xs_bf16, b.h_bf16, b.y_cub, rows, scale);
     CU_CHECK(cudaStreamSynchronize(stream));
 
     run_results r;
     r.tc_vs_ref = compare_dev(b.y_tc, b.y_ref, n, b.scratch);
     r.tc16_vs_ref = compare_dev(b.y_h, b.y_ref, n, b.scratch);
     r.gen_vs_tc = compare_dev(b.y_gen, b.y_tc, n, b.scratch);
+    r.shared_vs_tc = compare_dev(b.y_sh, b.y_tc, n, b.scratch);
+    r.cub_vs_ref = compare_dev(b.y_cub, b.y_ref, n, b.scratch);
     r.y_ref_checksum = compare_dev(b.y_ref, b.y_ref, n, b.scratch);
     r.y_tc_checksum = compare_dev(b.y_tc, b.y_tc, n, b.scratch);
     r.y_gen_checksum = compare_dev(b.y_gen, b.y_gen, n, b.scratch);
@@ -858,7 +964,7 @@ static replay_shape_results replay_shape(int rows, uint32_t seed) {
     r.q8_diff_rel = drefq > 0.0 ? std::sqrt(qdsum / drefq) : 0.0;
     r.q8_ratio = r.q8_ref_rel > 0.0 ? r.q8_diff_rel / r.q8_ref_rel : 0.0;
     r.rel_l2_fp16 = r.ref_sumsq > 0.0 ? std::sqrt(dsum16 / r.ref_sumsq) : 0.0;
-    r.q8_fp16_rel = r.ref_sumsq > 0.0 ? std::sqrt(fp16q / r.ref_sumsq) : 0.0;
+    r.q8_fp16_rel = r.sim16_sumsq > 0.0 ? std::sqrt(fp16q / r.sim16_sumsq) : 0.0;
     r.q8_fp16_diff_rel = drefq > 0.0 ? std::sqrt(qdsum16 / drefq) : 0.0;
     r.q8_fp16_ratio = r.q8_ref_rel > 0.0 ? r.q8_fp16_diff_rel / r.q8_ref_rel : 0.0;
     r.q8_sim_vs_f32 = r.ref_sumsq > 0.0 ? std::sqrt(simt / r.ref_sumsq) : 0.0;
@@ -924,6 +1030,8 @@ static void print_shape_metrics(const run_results & rr) {
     printf("\"tc16_vs_f32\":{\"rel_l2\":%.17g,\"max_abs\":%.17g},",
            rel_l2(rr.tc16_vs_ref), rr.tc16_vs_ref.maxabs_d);
     printf("\"gen_vs_tc_max_abs\":%.17g,", rr.gen_vs_tc.maxabs_d);
+    printf("\"shared_vs_tc_max_abs\":%.17g,", rr.shared_vs_tc.maxabs_d);
+    printf("\"cublas_vs_f32\":{\"rel_l2\":%.17g,\"max_abs\":%.17g},", rel_l2(rr.cub_vs_ref), rr.cub_vs_ref.maxabs_d);
     printf("\"q8\":{\"ref_rel\":%.17g,\"tc_rel\":%.17g,\"tc_vs_ref\":%.17g,\"ratio\":%.17g,\"tc_vs_f32\":%.17g},",
            rel_l2(rr.q8_ref_err), rel_l2(rr.q8_tc_err), rel_l2(rr.q8_tc_vs_ref),
            rel_l2(rr.q8_ref_err) > 0 ? rel_l2(rr.q8_tc_vs_ref) / rel_l2(rr.q8_ref_err) : 0.0,
@@ -1027,6 +1135,10 @@ int main(int argc, char ** argv) {
     buffers b;
     alloc_buffers(b, max_rows);
     init_data(b, max_rows, seed, stream);
+    CUBLAS_CHECK(cublasCreate(&g_cublas));
+    CUBLAS_CHECK(cublasSetStream(g_cublas, stream));
+    // a workspace of its own, so a captured GEMM never allocates
+    CUBLAS_CHECK(cublasSetWorkspace(g_cublas, b.cublas_ws, CUBLAS_WS_BYTES));
 
     printf("{\"seed\":%u,\"device\":", seed);
     print_device_json(di);
@@ -1060,6 +1172,7 @@ int main(int argc, char ** argv) {
     }
     printf("]}\n");
 
+    CUBLAS_CHECK(cublasDestroy(g_cublas));
     free_buffers(b);
     CU_CHECK(cudaEventDestroy(e0));
     CU_CHECK(cudaEventDestroy(e1));

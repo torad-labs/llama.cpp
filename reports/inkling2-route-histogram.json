@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "generated_utc": "2026-11-22T09:58:54Z",
+ "generated_utc": "2026-11-24T13:14:23Z",
  "generator": "scripts/inkling2/route_histogram.py",
  "provenance_note": "CPU-side aggregation over stored MMQ_ROUTE serving traces (GGML_CUDA_MMQ_ROUTE_LOG) recorded during the 2026-11-18 tp4 four-card Inkling-2-Small-Q3_K_M windows. No GPU window was run.",
  "model": {
@@ -28,7 +28,14 @@
   "device_repeats_or_other_nonfirst": 0,
   "bad_cols_records": 0,
   "unknown_site_records": 0,
-  "expert_hit_histograms_present": false
+  "expert_hit_histograms_present": false,
+  "hist_records": 0,
+  "hist_dropped": {
+   "unknown_site": 0,
+   "sliced_experts": 0,
+   "site_repeats": 0,
+   "device_repeats": 0
+  }
  },
  "stores": [
   {
@@ -67,6 +74,13 @@
      "capacity": 65536,
      "ctx": 2
     }
+   ],
+   "hist_records": 0,
+   "site_experts": [
+    [
+     384,
+     0
+    ]
    ]
   },
   {
@@ -105,6 +119,13 @@
      "capacity": 65536,
      "ctx": 3
     }
+   ],
+   "hist_records": 0,
+   "site_experts": [
+    [
+     384,
+     0
+    ]
    ]
   },
   {
@@ -143,6 +164,13 @@
      "capacity": 65536,
      "ctx": 3
     }
+   ],
+   "hist_records": 0,
+   "site_experts": [
+    [
+     384,
+     0
+    ]
    ]
   },
   {
@@ -187,6 +215,13 @@
      "capacity": 65536,
      "ctx": 4
     }
+   ],
+   "hist_records": 0,
+   "site_experts": [
+    [
+     384,
+     0
+    ]
    ]
   },
   {
@@ -225,6 +260,13 @@
      "capacity": 65536,
      "ctx": 3
     }
+   ],
+   "hist_records": 0,
+   "site_experts": [
+    [
+     384,
+     0
+    ]
    ]
   }
  ],
@@ -671,7 +713,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 1,
@@ -708,7 +751,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 2,
@@ -745,7 +789,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 3,
@@ -782,7 +827,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 4,
@@ -819,7 +865,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 5,
@@ -856,7 +903,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 6,
@@ -893,7 +941,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 7,
@@ -930,7 +979,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 8,
@@ -967,7 +1017,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 9,
@@ -1004,7 +1055,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 10,
@@ -1041,7 +1093,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 11,
@@ -1078,7 +1131,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 12,
@@ -1115,7 +1169,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 13,
@@ -1152,7 +1207,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 14,
@@ -1189,7 +1245,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 15,
@@ -1226,7 +1283,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 16,
@@ -1263,7 +1321,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 17,
@@ -1300,7 +1359,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 18,
@@ -1337,7 +1397,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 19,
@@ -1374,7 +1435,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 20,
@@ -1411,7 +1473,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 21,
@@ -1448,7 +1511,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 22,
@@ -1485,7 +1549,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 23,
@@ -1522,7 +1587,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 24,
@@ -1559,7 +1625,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 25,
@@ -1596,7 +1663,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 26,
@@ -1633,7 +1701,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 27,
@@ -1670,7 +1739,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 28,
@@ -1707,7 +1777,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 29,
@@ -1744,7 +1815,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 30,
@@ -1781,7 +1853,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 31,
@@ -1818,7 +1891,8 @@
    },
    "all": {
     "records": 1823
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 32,
@@ -1855,7 +1929,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 33,
@@ -1892,7 +1967,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 34,
@@ -1929,7 +2005,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 35,
@@ -1966,7 +2043,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 36,
@@ -2003,7 +2081,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 37,
@@ -2040,7 +2119,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 38,
@@ -2077,7 +2157,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 39,
@@ -2114,7 +2195,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 40,
@@ -2151,7 +2233,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 41,
@@ -2188,7 +2271,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 42,
@@ -2225,7 +2309,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 43,
@@ -2262,7 +2347,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 44,
@@ -2299,7 +2385,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 45,
@@ -2336,7 +2423,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 46,
@@ -2373,7 +2461,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   },
   {
    "layer": 47,
@@ -2410,7 +2499,8 @@
    },
    "all": {
     "records": 1821
-   }
+   },
+   "expert_hits": null
   }
  ],
  "record_format_note": "Each stored record also carries tiles8=sum_e ceil(h_e/8), tiles=sum_e ceil(h_e/J) and the launch tile width j; on decode rows j=8 so those collapse. They are additional aggregates of the same hidden per-expert hit vector {h_e} that no store records directly, kept here as provenance only.",

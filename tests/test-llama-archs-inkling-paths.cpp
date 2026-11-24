@@ -103,7 +103,7 @@ struct feature {
     double vs_legacy = tolerance; // the bar against the legacy path
     double vs_host = 0.0;         // when set, the bar against the same path on the CPU, run on a device
     std::function<void(gguf_context *)> fixture = nullptr; // a change to the fixture model
-    std::vector<std::string> kernels = {}; // on a device, the CUDA attention kernels the optimized path must take
+    std::vector<std::string> kernels = {}; // on a device, the CUDA kernels the optimized path must take ('|' separates alternatives)
 };
 
 // an attention node by the types of the cache it reads
@@ -259,9 +259,14 @@ void add_kvg(std::map<std::string, feature> & all) {
                     kv_runs_on(params, false);
                 }
             }, t == GGML_TYPE_Q4_0 ? q4_0_rounding : tolerance, 0.0, served_heads};
-            if (p != "bucket") {
-                f.kernels = {std::string("kernel ") + (p == "short" ? "REL_SHORT" : "REL_DECODE") + " on K " +
-                    ggml_type_name(t)};
+            // the runs path must read by runs (REL_RUNS); the low-mean and drafted steps take the tile or by-cell decode
+            const std::string on_k = std::string(" on K ") + ggml_type_name(t);
+            if (p == "short") {
+                f.kernels = {"kernel REL_SHORT" + on_k};
+            } else if (p == "runs") {
+                f.kernels = {"kernel REL_RUNS" + on_k};
+            } else if (p != "bucket") {
+                f.kernels = {"kernel REL_MMA" + on_k + "|kernel REL_DECODE" + on_k};
             }
             all[std::string("kvg-") + path + "-" + tname] = f;
         }
@@ -673,8 +678,14 @@ int test_inkling_path(const std::string & path, size_t seed, ggml_backend_dev_t 
     }
     if (!on_host) {
         for (const auto & k : f.kernels) {
-            const bool took = std::any_of(klog.lines.begin(), klog.lines.end(),
-                    [&](const std::string & line) { return line.find(k) != std::string::npos; });
+            bool took = false;
+            for (size_t at = 0; at <= k.size() && !took;) {
+                const size_t bar = std::min(k.find('|', at), k.size());
+                const std::string alt = k.substr(at, bar - at);
+                took = std::any_of(klog.lines.begin(), klog.lines.end(),
+                        [&](const std::string & line) { return line.find(alt) != std::string::npos; });
+                at = bar + 1;
+            }
             fprintf(stderr, "inkling2 %s: %s %s\n", path.c_str(), k.c_str(), took ? "ran" : "did NOT run");
             ran = ran && took;
         }

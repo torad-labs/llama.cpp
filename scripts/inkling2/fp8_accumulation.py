@@ -32,8 +32,13 @@ ROW = "inkling-fp8-accumulation"
 # the sources the evidence was measured from; a change to any of them makes the evidence stale
 SOURCES = [
     "ggml/src/ggml-cuda/fattn-rel-fp8-pair.cuh",
+    "ggml/src/ggml-cuda/fattn-rel-decode.cuh",
+    "ggml/src/ggml-cuda/fattn-rel-mma.cuh",
     "tests/test-inkling-fp8-pair.cpp",
 ]
+
+# the relative decode kernels whose partials the pair path carries (ggml_cuda_fattn's sub-kernel tags)
+REL_DECODE_FAMILY = ("REL_RUNS", "REL_MMA", "REL_DECODE")
 
 # bars fixed before the measurement
 BAR_PAIR_GAIN = 4.0      # hi+lo error must be at least this many times below hi alone (the unit test's own bar)
@@ -135,13 +140,19 @@ def judge(ev):
     for case in MODEL_CASES:
         on = parse_model(runs["model_on_" + case]["lines"])
         off = parse_model(runs["model_off_" + case]["lines"])
+        rc_on, rc_off = runs["model_on_" + case]["rc"], runs["model_off_" + case]["rc"]
         model[case] = {
             "on": on, "off": off,
-            "rc_on": runs["model_on_" + case]["rc"], "rc_off": runs["model_off_" + case]["rc"],
+            "rc_on": rc_on, "rc_off": rc_off,
+            # both runs finished and judged themselves OK with a figure each: the reference is no reference otherwise
+            "both_ran": rc_on == 0 and rc_off == 0 and on["ok"] and off["ok"] and
+                        on.get("nmse") is not None and off.get("nmse") is not None,
             # the pair path moved values: else the switch did not reach this case's merge
-            "engaged": on.get("nmse") is not None and on.get("nmse") != off.get("nmse"),
-            "greedy_parity_vs_f32_accum": on.get("argmax_agree") == off.get("argmax_agree"),
-            "rel_decode_on_e4m3": "REL_DECODE f8_e4m3" in on["kernels"],
+            "engaged": on.get("nmse") is not None and off.get("nmse") is not None and on["nmse"] != off["nmse"],
+            "greedy_parity_vs_f32_accum": on.get("argmax_agree") is not None and
+                                          on.get("argmax_agree") == off.get("argmax_agree") and
+                                          on.get("rows") == off.get("rows") and bool(on.get("rows")),
+            "rel_decode_on_e4m3": any(k + " f8_e4m3" in on["kernels"] for k in REL_DECODE_FAMILY),
         }
 
     checks = {
@@ -150,12 +161,12 @@ def judge(ev):
         "pair_gain_at_least_bar": pair.get("pair_gain", 0.0) >= BAR_PAIR_GAIN,
         "single_lane_fold_exact": pair.get("fold32_exact_lanes") == 32,
         "tile_ops_all_passed": runs["tile_ops"]["rc"] == 0 and ops["total"] is not None and ops["total"] > 0
-                               and ops["passed"] == ops["total"],
+                               and ops["passed"] == ops["total"] and ops["fail_lines"] == 0,
         "archs_inkling2_passed": runs["archs_inkling2"]["rc"] == 0,
     }
     for case in MODEL_CASES:
         m = model[case]
-        checks["model_%s_ok" % case] = m["rc_on"] == 0 and m["on"]["ok"] and m["on"].get("nmse", 1.0) <= BAR_MODEL_NMSE
+        checks["model_%s_ok" % case] = m["both_ran"] and m["on"]["nmse"] <= BAR_MODEL_NMSE
         checks["model_%s_engaged" % case] = m["engaged"] and m["rel_decode_on_e4m3"]
         checks["model_%s_greedy_parity" % case] = m["greedy_parity_vs_f32_accum"]
 

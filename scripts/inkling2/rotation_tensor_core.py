@@ -26,8 +26,10 @@ growth an independent input error of half the q8_1 error gives (sqrt(1 + 0.5^2) 
 judged the difference between the two quantized results against the q8_1 error (bar 0.5); that difference
 counts every element whose q8_1 bin flips under a tiny input change as a full step, even where both bins are
 equally close to the true value, so it is kept in the evidence as a figure and does not decide. The
-tensor-core rotation must also be faster than the butterfly at 23 rows, in both the rotation-only and the
-rotation-plus-q8 chains.
+quickest tensor-core rotation (the prototype on either basis or generated, or cuBLAS) must also be faster than the
+butterfly at 23 rows, in both the rotation-only and the rotation-plus-q8 chains. When it is not, the verdict names
+why: the true shared basis read alone loses (basis_read_cost), a tuned cuBLAS GEMM of the product loses
+(tensor_core_matmul_cost), or only the prototype loses (prototype_kernel_cost).
 """
 
 import argparse
@@ -57,7 +59,7 @@ NBLK = WIDTH // BLOCK
 ROUNDS = 40
 
 # fixed at the run's design; the check compiles with exactly these
-NVCC_FLAGS = ["-O3", "-std=c++17", "-arch=sm_120a"]
+NVCC_FLAGS = ["-O3", "-std=c++17", "-arch=sm_120a", "-lcublas"]
 
 # bars fixed before the measurement
 BAR_Q8_EXTRA_RATIO = 0.5   # bf16 q8_1 result vs f32 q8_1 result / q8_1 quantization error (a figure only)
@@ -257,40 +259,56 @@ def median_of(shape, arm):
     return stats_of(st["samples_us"])["median_us"]
 
 
-def primary_config(shape):
-    """The quickest stored-basis tensor-core configuration at this shape. Chosen from the measurement."""
+def best_config(shape, family):
+    """The quickest configuration of a tensor-core family at this shape. Chosen from the measurement."""
     best, best_us = None, None
     for cfg in CONFIGS:
-        arm = "tc_basis_f32/" + cfg
+        arm = family + "/" + cfg
         if arm in arm_map(shape):
             us = median_of(shape, arm)
             if best_us is None or us < best_us:
                 best, best_us = cfg, us
-    require(best is not None, "no tensor-core arm at rows %d" % shape["rows"])
+    require(best is not None, "no %s arm at rows %d" % (family, shape["rows"]))
     return best
+
+
+def primary_config(shape):
+    """The quickest shared-basis prototype configuration: the stored-basis candidate on the true basis."""
+    return best_config(shape, "tc_shared_f32")
 
 
 def derived_for(shape):
     cfg = primary_config(shape)
     cfg2 = "bm16_bn128_w8"  # the configuration the error figures are computed with
-    return {
+    d = {
         "primary_config": cfg,
+        "tc_shared_f32_us": median_of(shape, "tc_shared_f32/" + cfg),
+        "tc_shared_q8_us": median_of(shape, "tc_shared_q8/" + cfg),
         "tc_basis_f32_us": median_of(shape, "tc_basis_f32/" + cfg),
         "tc_gen_f32_us": median_of(shape, "tc_gen_f32/" + cfg),
         "tc_basis_q8_us": median_of(shape, "tc_basis_q8/" + cfg),
         "tc_gen_q8_us": median_of(shape, "tc_gen_q8/" + cfg),
+        "cublas_gemm_us": median_of(shape, "cublas_gemm"),
+        "cublas_full_us": median_of(shape, "cublas_full"),
         "fwht_f32_us": median_of(shape, "fwht_f32"),
         "fwht_q8_us": median_of(shape, "fwht_q8"),
-        "basis_read_us": median_of(shape, "tc_basis_f32/" + cfg) - median_of(shape, "tc_gen_f32/" + cfg),
+        "basis_read_us": median_of(shape, "tc_shared_f32/" + cfg) - median_of(shape, "tc_gen_f32/" + cfg),
         "copy_floor_us": median_of(shape, "copy_f32"),
-        "basis_stream_floor_us": median_of(shape, "basis_stream"),
+        "basis_stream_shared_floor_us": median_of(shape, "basis_stream_shared"),
+        "basis_stream_per_block_us": median_of(shape, "basis_stream"),
         "error_config": cfg2,
     }
+    # every tensor-core way to the rotation from the f32 input, and to its q8_1 (only the prototype fuses the q8_1)
+    d["best_tc_f32_us"] = min(d["tc_shared_f32_us"], d["tc_basis_f32_us"], d["tc_gen_f32_us"], d["cublas_full_us"],
+                              d["cublas_gemm_us"])
+    d["best_tc_q8_us"] = min(d["tc_shared_q8_us"], d["tc_basis_q8_us"], d["tc_gen_q8_us"])
+    return d
 
 
-def basis_read_bytes(rows, cfg):
+def basis_read_bytes(rows, cfg, shared=True):
     bm = {"bm16_bn64_w4": 16, "bm16_bn128_w8": 16, "bm32_bn128_w8": 32}[cfg]
-    return ((rows + bm - 1) // bm) * NBLK * BLOCK * BLOCK
+    tiles = (rows + bm - 1) // bm
+    return tiles * BLOCK * BLOCK + NBLK * BLOCK if shared else tiles * NBLK * BLOCK * BLOCK
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -315,12 +333,14 @@ def judge(measure):
     error_pass = (growth <= BAR_Q8_TOTAL_GROWTH) and (tc_rel <= BAR_ROTATION_REL)
     fp16_pass = (growth16 is not None) and (growth16 <= BAR_Q8_TOTAL_GROWTH)
 
-    cost_pass_rotation = der["tc_basis_f32_us"] < der["fwht_f32_us"]
-    cost_pass_q8 = der["tc_basis_q8_us"] < der["fwht_q8_us"]
+    cost_pass_rotation = der["best_tc_f32_us"] < der["fwht_f32_us"]
+    cost_pass_q8 = der["best_tc_q8_us"] < der["fwht_q8_us"]
     cost_pass = cost_pass_rotation and cost_pass_q8
-    generated_keeps_win = der["tc_gen_f32_us"] < der["fwht_f32_us"]
-    # no stored-basis kernel can read the basis faster than one coalesced pass over it
-    read_floor_loses = der["basis_stream_floor_us"] >= der["fwht_f32_us"]
+    # the row's second falsifier on the true basis: one coalesced pass over H_512 and the signs against the butterfly
+    read_floor_loses = der["basis_stream_shared_floor_us"] >= der["fwht_f32_us"]
+    # a tuned tensor-core GEMM of the same product (cuBLAS, bf16 input already signed, fp32 accumulate)
+    tuned_matmul_loses = der["cublas_gemm_us"] >= der["fwht_f32_us"]
+    headroom_us = der["fwht_f32_us"] - max(der["copy_floor_us"], der["basis_stream_shared_floor_us"])
 
     if not error_pass:
         decided_by = "bf16_input_rounding"
@@ -331,36 +351,45 @@ def judge(measure):
             reason += ("; the fp16 input path passes at %.2f %%, so the arithmetic is sound only with an "
                        "11-mantissa-bit input" % (100.0 * growth16))
     elif not cost_pass:
-        decided_by = "basis_read_cost" if (generated_keeps_win or read_floor_loses) else "prototype_kernel_cost"
-        reason = ("the tensor-core rotation with the basis read costs %.3f us against the butterfly's %.3f us "
-                  "at 23 rows (q8 chain %.3f against %.3f)"
-                  % (der["tc_basis_f32_us"], der["fwht_f32_us"], der["tc_basis_q8_us"], der["fwht_q8_us"]))
         if read_floor_loses:
-            reason += ("; one coalesced pass over the basis alone costs %.3f us, so no stored-basis kernel can "
-                       "beat the butterfly at this shape" % der["basis_stream_floor_us"])
-        elif generated_keeps_win:
-            reason += "; without the basis read it costs %.3f us, so the read is what loses" % der["tc_gen_f32_us"]
+            decided_by = "basis_read_cost"
+        elif tuned_matmul_loses:
+            decided_by = "tensor_core_matmul_cost"
         else:
-            reason += ("; one pass over the basis costs %.3f us, below the butterfly, so the loss is this "
-                       "prototype kernel's (%.3f us without the read), not the read's" %
-                       (der["basis_stream_floor_us"], der["tc_gen_f32_us"]))
+            decided_by = "prototype_kernel_cost"
+        reason = ("at 23 rows the quickest tensor-core rotation costs %.3f us against the butterfly's %.3f us "
+                  "(cuBLAS GEMM alone %.3f us, with the sign and bf16 pass %.3f us; prototype on the shared basis "
+                  "%.3f us; q8 chain %.3f against %.3f)"
+                  % (der["best_tc_f32_us"], der["fwht_f32_us"], der["cublas_gemm_us"], der["cublas_full_us"],
+                     der["tc_shared_f32_us"], der["best_tc_q8_us"], der["fwht_q8_us"]))
+        if read_floor_loses:
+            reason += ("; one pass over the 260.5 KB shared basis alone costs %.3f us, so no stored-basis kernel can "
+                       "beat the butterfly" % der["basis_stream_shared_floor_us"])
+        elif tuned_matmul_loses:
+            reason += ("; the basis read is not what loses (one pass over the 260.5 KB shared basis costs %.3f us), a "
+                       "tuned tensor-core GEMM of the product does" % der["basis_stream_shared_floor_us"])
+        else:
+            reason += "; a tuned GEMM would win, the prototype kernel is what loses"
     else:
         decided_by = "none"
         reason = ("the tensor-core rotation costs %.3f us against the butterfly's %.3f us at 23 rows and "
                   "raises the q8_1 error against the f32 rotation by %.2f %% (bar %.2f %%)"
-                  % (der["tc_basis_f32_us"], der["fwht_f32_us"], 100.0 * growth, 100.0 * BAR_Q8_TOTAL_GROWTH))
+                  % (der["best_tc_f32_us"], der["fwht_f32_us"], 100.0 * growth, 100.0 * BAR_Q8_TOTAL_GROWTH))
 
-    reason += ("; the butterfly sits %.3f us above a plain copy of the same bytes (%.3f us), the most any "
-               "rotation kernel can save here" % (der["fwht_f32_us"] - der["copy_floor_us"], der["copy_floor_us"]))
+    reason += ("; the butterfly sits %.3f us above the larger of a plain copy of the same bytes (%.3f us) and the "
+               "shared basis read (%.3f us), the most any stored-basis rotation can save at this seam"
+               % (headroom_us, der["copy_floor_us"], der["basis_stream_shared_floor_us"]))
 
     prompt = {}
     for rows in (128, 512, 2048):
         if rows in out["shapes"]:
             der_s = out["shapes"][rows]
             prompt[rows] = {
-                "tc_over_fwht": der_s["tc_basis_f32_us"] / der_s["fwht_f32_us"],
-                "tc_basis_f32_us": der_s["tc_basis_f32_us"],
+                "best_tc_over_fwht": der_s["best_tc_f32_us"] / der_s["fwht_f32_us"],
+                "cublas_gemm_us": der_s["cublas_gemm_us"],
+                "best_tc_f32_us": der_s["best_tc_f32_us"],
                 "fwht_f32_us": der_s["fwht_f32_us"],
+                "gemm_gflop": 2.0 * rows * WIDTH * BLOCK / 1e9,
             }
 
     return {
@@ -381,13 +410,21 @@ def judge(measure):
                 "fp16_input_passes": fp16_pass,
             },
             "basis_read_cost": {
-                "decode_rotation_us": der["tc_basis_f32_us"],
                 "decode_fwht_us": der["fwht_f32_us"],
-                "decode_generated_us": der["tc_gen_f32_us"],
-                "decode_basis_read_us": der["basis_read_us"],
-                "decode_basis_stream_floor_us": der["basis_stream_floor_us"],
+                "decode_shared_basis_stream_floor_us": der["basis_stream_shared_floor_us"],
+                "decode_per_block_basis_stream_us": der["basis_stream_per_block_us"],
                 "decode_copy_floor_us": der["copy_floor_us"],
-                "read_floor_alone_loses": bool(read_floor_loses),
+                "decode_prototype_shared_us": der["tc_shared_f32_us"],
+                "decode_prototype_generated_us": der["tc_gen_f32_us"],
+                "decode_prototype_basis_read_us": der["basis_read_us"],
+                "headroom_us": headroom_us,
+                "fired": bool(read_floor_loses),
+            },
+            "tensor_core_cost": {
+                "decode_best_tc_us": der["best_tc_f32_us"],
+                "decode_cublas_gemm_us": der["cublas_gemm_us"],
+                "decode_cublas_full_us": der["cublas_full_us"],
+                "tuned_matmul_loses": bool(tuned_matmul_loses),
                 "fired": not cost_pass,
             },
         },
@@ -444,8 +481,10 @@ def cmd_measure(args):
                 "name": "MoE activation rotation and q8_1 quantize at hidden width 4608",
                 "baseline_kernel": ("fwht.cu fwht_cuda_block<512, 256, float, true>: the transform, scale and "
                                     "sign multiply copied verbatim, one block per (row, 512-block), one launch"),
-                "candidate_kernel": ("bf16 wmma matmul against the signed block Hadamard, block 512, nine "
-                                     "blocks, fp32 accumulate, one launch"),
+                "candidate_kernel": ("bf16 tensor-core matmul against the block Hadamard, block 512, nine blocks, "
+                                     "fp32 accumulate: the prototype wmma kernel on the shared H_512 with the signs "
+                                     "on the input (and on nine signed copies, and with the entries generated), and "
+                                     "cuBLAS GemmStridedBatchedEx against the shared H_512"),
                 "moe_fuse_cu_present": (ROOT / "ggml/src/ggml-cuda/moe-fuse.cu").is_file(),
                 "note": ("the butterfly body is the one fwht_siglu_q8_cuda runs (moe-fuse.cu "
                          "moe_fwht_block_transform is a copy of fwht.cu's block transform); the SiLU gate and the "
@@ -465,13 +504,14 @@ def cmd_measure(args):
                 "q8_block": 32,
             },
             "basis": {
-                "unique_bytes": NBLK * BLOCK * BLOCK,
-                "unique_mib": NBLK * BLOCK * BLOCK / (1024 * 1024),
-                "read_bytes_per_launch": {
+                "unique_bytes": BLOCK * BLOCK + NBLK * BLOCK,
+                "per_block_copies_bytes": NBLK * BLOCK * BLOCK,
+                "read_bytes_per_launch_shared": {
                     str(r): {cfg: basis_read_bytes(r, cfg) for cfg in CONFIGS} for r in rows
                 },
-                "note": ("stored int8, nine 512x512 blocks = 2.36 MB, L2-resident; the generated variant "
-                         "computes the signed Sylvester entry from the indices and reads no basis"),
+                "note": ("the true basis is one Sylvester H_512 (256 KB int8) shared by the nine blocks plus their "
+                         "sign vectors (4.5 KB); the per-block arms read nine signed copies (2.25 MB) and are kept "
+                         "as figures. The generated variant computes the entry from the indices and reads no basis"),
             },
             "gpu_state": {"before": gpu_before, "ready": gpu_ready, "after": gpu_after,
                           "during_including_this_measurement": watch.summary()},
@@ -529,6 +569,11 @@ def cross_check(measure, replay, tag="measure"):
             w("y_h sumsq", c["y_h"]["sumsq"], r["sim16"]["sumsq"], 2e-4)
         require(e["gen_vs_tc_max_abs"] == 0.0,
                 "%s rows %d: the generated and stored bases differ (max abs %.17g)" % (tag, rows, e["gen_vs_tc_max_abs"]))
+        require(e["shared_vs_tc_max_abs"] == 0.0,
+                "%s rows %d: the shared and per-block bases differ (max abs %.17g)" % (tag, rows, e["shared_vs_tc_max_abs"]))
+        cub = e["cublas_vs_f32"]["rel_l2"]
+        require(cub <= BAR_ROTATION_REL and cub <= 2.0 * e["tc_vs_f32"]["rel_l2"] + 1e-6,
+                "%s rows %d: the cuBLAS rotation is %.6g relative against the f32 rotation" % (tag, rows, cub))
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -666,16 +711,20 @@ def cmd_check(args):
             print("FAIL: the row is answered negatively by %s" % ev["verdict"]["decided_by"])
             print("      " + ev["verdict"]["reason"])
             print("      error_pass=%s cost_pass=%s" % (ev["verdict"]["error_pass"], ev["verdict"]["cost_pass"]))
+            for rows_s in ev["measure"]["shapes"]:
+                d = ev["derived"]["shapes"][str(rows_s["rows"])]
+                print("      rows %-4d  best tc %.3f us  cublas %.3f us  fwht %.3f us" %
+                      (rows_s["rows"], d["best_tc_f32_us"], d["cublas_gemm_us"], d["fwht_f32_us"]))
             return 1
 
-        print("PASS: evidence is real and neither falsifier fired")
+        print("PASS: evidence is real and the tensor-core rotation wins")
         print("      seam: " + ev["seam"]["name"])
         print("      " + ev["verdict"]["reason"])
         for rows_s in ev["measure"]["shapes"]:
             d = ev["derived"]["shapes"][str(rows_s["rows"])]
-            print("      rows %-4d  tc_basis %.3f us  tc_gen %.3f us  fwht %.3f us  q8 chain %.3f / %.3f us"
-                  % (rows_s["rows"], d["tc_basis_f32_us"], d["tc_gen_f32_us"], d["fwht_f32_us"],
-                     d["tc_basis_q8_us"], d["fwht_q8_us"]))
+            print("      rows %-4d  best tc %.3f us  cublas %.3f us  shared %.3f us  fwht %.3f us  q8 chain %.3f / %.3f us"
+                  % (rows_s["rows"], d["best_tc_f32_us"], d["cublas_gemm_us"], d["tc_shared_f32_us"], d["fwht_f32_us"],
+                     d["best_tc_q8_us"], d["fwht_q8_us"]))
         f = ev["falsifiers"]["bf16_input_rounding"]
         print("      bf16: rotation error %.4f%%, q8 error growth vs the f32 rotation %.2f%% (bar %.2f%%); fp16 %.2f%%"
               % (100.0 * f["rotation_rel_l2"], 100.0 * f["q8_total_growth"], 100.0 * f["bar_q8_total_growth"],
@@ -717,9 +766,9 @@ def cmd_run(args):
     print(v["reason"])
     for s in ev["measure"]["shapes"]:
         d = ev["derived"]["shapes"][str(s["rows"])]
-        print("rows %-4d tc_basis %.3f us  tc_gen %.3f us  fwht %.3f us  q8 chain %.3f / %.3f us"
-              % (s["rows"], d["tc_basis_f32_us"], d["tc_gen_f32_us"], d["fwht_f32_us"],
-                 d["tc_basis_q8_us"], d["fwht_q8_us"]))
+        print("rows %-4d best tc %.3f us  cublas %.3f us  shared %.3f us  fwht %.3f us  floors copy %.3f / basis %.3f us"
+              % (s["rows"], d["best_tc_f32_us"], d["cublas_gemm_us"], d["tc_shared_f32_us"], d["fwht_f32_us"],
+                 d["copy_floor_us"], d["basis_stream_shared_floor_us"]))
     return 0
 
 

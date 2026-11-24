@@ -1,16 +1,18 @@
 {
  "row": "inkling-fp8-accumulation",
- "generated_at": "2026-11-24T08:48:36Z",
+ "generated_at": "2026-11-24T14:57:57Z",
  "host": "riftvm",
  "device": {
   "name": "NVIDIA GeForce RTX 5090",
   "compute_cap": "12.0",
   "driver": "580.159.03"
  },
- "build_dir": "/home/riftuser/build-ws4-kv-gates-fp8-rot",
- "git_head": "8eb2311cd62ff316744b3d6f6022c819be6d628e",
+ "build_dir": "/home/riftuser/build-rev-ws4",
+ "git_head": "a968a389cf8f201fa7aa3e0b93ef3e8baea0fddd",
  "source_sha256": {
   "ggml/src/ggml-cuda/fattn-rel-fp8-pair.cuh": "98e82364346c620122e50dfafe959502f7f04f7dbc738027c0e52ae835d29477",
+  "ggml/src/ggml-cuda/fattn-rel-decode.cuh": "dbe80a196047eb7df81fcfb979225ecc410abce58b767e4b55c486ad75f84b28",
+  "ggml/src/ggml-cuda/fattn-rel-mma.cuh": "a27c0f43c4d4b80e25d098fd3a278431a94195d7375b7b02dfaec8ec869e6e3f",
   "tests/test-inkling-fp8-pair.cpp": "d4fb31eb4e86caf1ff42957b0556a4399835628c5ffbc9c365aaa9a5812ab972"
  },
  "switch": "GGML_CUDA_FATTN_FP8_ACCUM=1",
@@ -18,11 +20,11 @@
  "runs": {
   "pair": {
    "cmd": [
-    "/home/riftuser/build-ws4-kv-gates-fp8-rot/bin/test-inkling-fp8-pair"
+    "/home/riftuser/build-rev-ws4/bin/test-inkling-fp8-pair"
    ],
    "env": {},
    "rc": 0,
-   "seconds": 1.488,
+   "seconds": 1.7,
    "lines": [
     "encode: 4094 values, mean hi err 5.557e-01, mean two-term err 1.177e-02",
     "fold32: 32/32 single-lane exact, x32 worst rel 1.221e-03, mixed worst rel 5.507e-04",
@@ -52,7 +54,7 @@
   },
   "tile_ops": {
    "cmd": [
-    "/home/riftuser/build-ws4-kv-gates-fp8-rot/bin/test-backend-ops",
+    "/home/riftuser/build-rev-ws4/bin/test-backend-ops",
     "test",
     "-b",
     "CUDA0",
@@ -66,15 +68,15 @@
     "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE": "1"
    },
    "rc": 0,
-   "seconds": 8.625,
+   "seconds": 8.08,
    "lines": [
     "  8/8 tests passed",
-    "ggml_cuda_fattn: kernel REL_DECODE on K f8_e4m3"
+    "ggml_cuda_fattn: kernel REL_MMA on K f8_e4m3"
    ]
   },
   "model_on_served": {
    "cmd": [
-    "/home/riftuser/build-ws4-kv-gates-fp8-rot/bin/test-llama-archs",
+    "/home/riftuser/build-rev-ws4/bin/test-llama-archs",
     "--inkling-path",
     "kv1b-e4m3/served",
     "--inkling-path-device",
@@ -89,15 +91,15 @@
     "GGML_CUDA_FATTN_FP8_ACCUM": "1"
    },
    "rc": 0,
-   "seconds": 2.373,
+   "seconds": 2.259,
    "lines": [
-    "0.01.644.758 D ggml_cuda_fattn: kernel MMA_F16 on K f16",
-    "0.01.758.655 D ggml_cuda_fattn: kernel REL_DECODE on K f16",
+    "0.01.591.690 D ggml_cuda_fattn: kernel MMA_F16 on K f16",
+    "0.01.681.577 D ggml_cuda_fattn: kernel REL_MMA on K f16",
     "inkling2 kv1b-e4m3/served on CUDA0: 27 K f8_e4m3, V f8_e4m3 nodes ran",
     "inkling2 kv1b-e4m3/served on CUDA0: 4 K f8_e4m3, V f8_e4m3, low-mean decode nodes ran",
     "inkling2 kv1b-e4m3/served: 0 of them off the device",
     "inkling2 kv1b-e4m3/served: ggml_cuda_fattn: kernel MMA_F16 on K f8_e4m3",
-    "inkling2 kv1b-e4m3/served: ggml_cuda_fattn: kernel REL_DECODE on K f8_e4m3",
+    "inkling2 kv1b-e4m3/served: ggml_cuda_fattn: kernel REL_MMA on K f8_e4m3",
     "inkling2 kv1b-e4m3/served: 14848 logits, NMSE 1.63725e-06 (at most 0.0001)",
     "inkling2 kv1b-e4m3/served: argmax agrees on 116 of 116 rows",
     "OK inkling2 kv1b-e4m3/served"
@@ -105,7 +107,7 @@
   },
   "model_off_served": {
    "cmd": [
-    "/home/riftuser/build-ws4-kv-gates-fp8-rot/bin/test-llama-archs",
+    "/home/riftuser/build-rev-ws4/bin/test-llama-archs",
     "--inkling-path",
     "kv1b-e4m3/served",
     "--inkling-path-device",
@@ -119,15 +121,15 @@
     "LLAMA_INKLING2_MEAN_POOL_MIN": "8192"
    },
    "rc": 0,
-   "seconds": 2.366,
+   "seconds": 2.244,
    "lines": [
-    "0.01.650.474 D ggml_cuda_fattn: kernel MMA_F16 on K f16",
-    "0.01.756.705 D ggml_cuda_fattn: kernel REL_DECODE on K f16",
+    "0.01.576.994 D ggml_cuda_fattn: kernel MMA_F16 on K f16",
+    "0.01.668.170 D ggml_cuda_fattn: kernel REL_MMA on K f16",
     "inkling2 kv1b-e4m3/served on CUDA0: 27 K f8_e4m3, V f8_e4m3 nodes ran",
     "inkling2 kv1b-e4m3/served on CUDA0: 4 K f8_e4m3, V f8_e4m3, low-mean decode nodes ran",
     "inkling2 kv1b-e4m3/served: 0 of them off the device",
     "inkling2 kv1b-e4m3/served: ggml_cuda_fattn: kernel MMA_F16 on K f8_e4m3",
-    "inkling2 kv1b-e4m3/served: ggml_cuda_fattn: kernel REL_DECODE on K f8_e4m3",
+    "inkling2 kv1b-e4m3/served: ggml_cuda_fattn: kernel REL_MMA on K f8_e4m3",
     "inkling2 kv1b-e4m3/served: 14848 logits, NMSE 1.5866e-06 (at most 0.0001)",
     "inkling2 kv1b-e4m3/served: argmax agrees on 116 of 116 rows",
     "OK inkling2 kv1b-e4m3/served"
@@ -135,7 +137,7 @@
   },
   "model_on_restore": {
    "cmd": [
-    "/home/riftuser/build-ws4-kv-gates-fp8-rot/bin/test-llama-archs",
+    "/home/riftuser/build-rev-ws4/bin/test-llama-archs",
     "--inkling-path",
     "kv1b-e4m3/restore",
     "--inkling-path-device",
@@ -150,15 +152,15 @@
     "GGML_CUDA_FATTN_FP8_ACCUM": "1"
    },
    "rc": 0,
-   "seconds": 2.372,
+   "seconds": 2.245,
    "lines": [
-    "0.01.637.908 D ggml_cuda_fattn: kernel MMA_F16 on K f16",
-    "0.01.745.180 D ggml_cuda_fattn: kernel REL_DECODE on K f16",
+    "0.01.585.046 D ggml_cuda_fattn: kernel MMA_F16 on K f16",
+    "0.01.673.477 D ggml_cuda_fattn: kernel REL_MMA on K f16",
     "inkling2 kv1b-e4m3/restore on CUDA0: 27 K f8_e4m3, V f8_e4m3 nodes ran",
     "inkling2 kv1b-e4m3/restore on CUDA0: 4 K f8_e4m3, V f8_e4m3, low-mean decode nodes ran",
     "inkling2 kv1b-e4m3/restore: 0 of them off the device",
     "inkling2 kv1b-e4m3/restore: ggml_cuda_fattn: kernel MMA_F16 on K f8_e4m3",
-    "inkling2 kv1b-e4m3/restore: ggml_cuda_fattn: kernel REL_DECODE on K f8_e4m3",
+    "inkling2 kv1b-e4m3/restore: ggml_cuda_fattn: kernel REL_MMA on K f8_e4m3",
     "inkling2 kv1b-e4m3/restore: 14848 logits, NMSE 1.99767e-06 (at most 0.0001)",
     "inkling2 kv1b-e4m3/restore: argmax agrees on 116 of 116 rows",
     "OK inkling2 kv1b-e4m3/restore"
@@ -166,7 +168,7 @@
   },
   "model_off_restore": {
    "cmd": [
-    "/home/riftuser/build-ws4-kv-gates-fp8-rot/bin/test-llama-archs",
+    "/home/riftuser/build-rev-ws4/bin/test-llama-archs",
     "--inkling-path",
     "kv1b-e4m3/restore",
     "--inkling-path-device",
@@ -180,15 +182,15 @@
     "LLAMA_INKLING2_MEAN_POOL_MIN": "8192"
    },
    "rc": 0,
-   "seconds": 2.424,
+   "seconds": 2.252,
    "lines": [
-    "0.01.680.327 D ggml_cuda_fattn: kernel MMA_F16 on K f16",
-    "0.01.793.740 D ggml_cuda_fattn: kernel REL_DECODE on K f16",
+    "0.01.585.558 D ggml_cuda_fattn: kernel MMA_F16 on K f16",
+    "0.01.675.657 D ggml_cuda_fattn: kernel REL_MMA on K f16",
     "inkling2 kv1b-e4m3/restore on CUDA0: 27 K f8_e4m3, V f8_e4m3 nodes ran",
     "inkling2 kv1b-e4m3/restore on CUDA0: 4 K f8_e4m3, V f8_e4m3, low-mean decode nodes ran",
     "inkling2 kv1b-e4m3/restore: 0 of them off the device",
     "inkling2 kv1b-e4m3/restore: ggml_cuda_fattn: kernel MMA_F16 on K f8_e4m3",
-    "inkling2 kv1b-e4m3/restore: ggml_cuda_fattn: kernel REL_DECODE on K f8_e4m3",
+    "inkling2 kv1b-e4m3/restore: ggml_cuda_fattn: kernel REL_MMA on K f8_e4m3",
     "inkling2 kv1b-e4m3/restore: 14848 logits, NMSE 1.55734e-06 (at most 0.0001)",
     "inkling2 kv1b-e4m3/restore: argmax agrees on 116 of 116 rows",
     "OK inkling2 kv1b-e4m3/restore"
@@ -196,7 +198,7 @@
   },
   "archs_inkling2": {
    "cmd": [
-    "/home/riftuser/build-ws4-kv-gates-fp8-rot/bin/test-llama-archs",
+    "/home/riftuser/build-rev-ws4/bin/test-llama-archs",
     "-a",
     "inkling2"
    ],
@@ -204,7 +206,7 @@
     "GGML_CUDA_FATTN_FP8_ACCUM": "1"
    },
    "rc": 0,
-   "seconds": 2.811,
+   "seconds": 2.616,
    "lines": [
     "|     Model arch.|                                  Device|Config|   NMSE vs. CPU|Roundtrip|    Mixed batch|"
    ]
@@ -272,9 +274,9 @@
     "ok": true,
     "kernels": [
      "MMA_F16 f16",
-     "REL_DECODE f16",
+     "REL_MMA f16",
      "MMA_F16 f8_e4m3",
-     "REL_DECODE f8_e4m3"
+     "REL_MMA f8_e4m3"
     ],
     "nmse": 1.63725e-06,
     "nmse_bar": 0.0001,
@@ -285,9 +287,9 @@
     "ok": true,
     "kernels": [
      "MMA_F16 f16",
-     "REL_DECODE f16",
+     "REL_MMA f16",
      "MMA_F16 f8_e4m3",
-     "REL_DECODE f8_e4m3"
+     "REL_MMA f8_e4m3"
     ],
     "nmse": 1.5866e-06,
     "nmse_bar": 0.0001,
@@ -296,6 +298,7 @@
    },
    "rc_on": 0,
    "rc_off": 0,
+   "both_ran": true,
    "engaged": true,
    "greedy_parity_vs_f32_accum": true,
    "rel_decode_on_e4m3": true
@@ -305,9 +308,9 @@
     "ok": true,
     "kernels": [
      "MMA_F16 f16",
-     "REL_DECODE f16",
+     "REL_MMA f16",
      "MMA_F16 f8_e4m3",
-     "REL_DECODE f8_e4m3"
+     "REL_MMA f8_e4m3"
     ],
     "nmse": 1.99767e-06,
     "nmse_bar": 0.0001,
@@ -318,9 +321,9 @@
     "ok": true,
     "kernels": [
      "MMA_F16 f16",
-     "REL_DECODE f16",
+     "REL_MMA f16",
      "MMA_F16 f8_e4m3",
-     "REL_DECODE f8_e4m3"
+     "REL_MMA f8_e4m3"
     ],
     "nmse": 1.55734e-06,
     "nmse_bar": 0.0001,
@@ -329,6 +332,7 @@
    },
    "rc_on": 0,
    "rc_off": 0,
+   "both_ran": true,
    "engaged": true,
    "greedy_parity_vs_f32_accum": true,
    "rel_decode_on_e4m3": true
