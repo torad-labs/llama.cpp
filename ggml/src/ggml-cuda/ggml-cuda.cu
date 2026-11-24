@@ -1288,6 +1288,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (kept > 0) {
             CUDA_CHECK(cudaMemcpy(records.data(), mmq_route_log.records, kept*sizeof(records[0]), cudaMemcpyDeviceToHost));
         }
+        constexpr int hist_row = ggml_cuda_mmq_route_log::hist_bins + 1;
+        std::vector<unsigned long long> hist;
+        if (mmq_route_log.hist != nullptr) {
+            hist.resize((size_t) ggml_cuda_mmq_route_log::hist_sites*hist_row);
+            CUDA_CHECK(cudaMemcpy(hist.data(), mmq_route_log.hist, hist.size()*sizeof(hist[0]), cudaMemcpyDeviceToHost));
+        }
         // a tensor's name is any bytes: as a JSON string, so that no name can end the string or the line early
         const auto quoted = [](const std::string & name) {
             std::string out = "\"";
@@ -1317,6 +1323,17 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                      ggml_type_name((ggml_type) site.type), site.n_expert, site.n_expert_total,
                      site.paired ? "true" : "false");
             text += line;
+        }
+        for (size_t i = 0; !hist.empty() && i < mmq_route_log.sites.size() && i < (size_t) ggml_cuda_mmq_route_log::hist_sites; ++i) {
+            const unsigned long long * h = hist.data() + i*hist_row;
+            const int bins = std::min(mmq_route_log.sites[i].n_expert, ggml_cuda_mmq_route_log::hist_bins);
+            snprintf(line, sizeof(line), "MMQ_ROUTE_HIST {\"ctx\":%d,\"device\":%d,\"site\":%zu,\"launches\":%llu,\"bins\":%d,\"hits\":[",
+                     ctx, device, i, h[ggml_cuda_mmq_route_log::hist_bins], bins);
+            text += line;
+            for (int e = 0; e < bins; ++e) {
+                text += (e ? "," : "") + std::to_string(h[e]);
+            }
+            text += "]}\n";
         }
         for (uint32_t i = 0; i < kept; ++i) {
             const auto & r = records[i];
@@ -1358,6 +1375,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
         CUDA_CHECK(cudaFree(mmq_route_log.records));
         CUDA_CHECK(cudaFree(mmq_route_log.head));
+        if (mmq_route_log.hist != nullptr) {
+            CUDA_CHECK(cudaFree(mmq_route_log.hist));
+        }
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {

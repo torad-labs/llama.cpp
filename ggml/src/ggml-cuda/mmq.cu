@@ -510,7 +510,8 @@ int64_t ggml_cuda_mmq_moe_ncols() {
 static __global__ void mmq_moe_route_kernel(const ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int ntiles,
                                             const int n_expert, const int J, const uint32_t site,
                                             unsigned int * __restrict__ head,
-                                            ggml_cuda_mmq_route_log::record * __restrict__ records, const uint32_t capacity) {
+                                            ggml_cuda_mmq_route_log::record * __restrict__ records, const uint32_t capacity,
+                                            unsigned long long * __restrict__ hist) {
     extern __shared__ int cols[];
     __shared__ unsigned int total, used, tiles8, tiles;
     if (threadIdx.x == 0) {
@@ -534,6 +535,19 @@ static __global__ void mmq_moe_route_kernel(const ggml_cuda_mm_id_tile_spec * __
     }
     atomicAdd(&tiles, t);
     __syncthreads();
+
+    if (hist != nullptr && site < (uint32_t) ggml_cuda_mmq_route_log::hist_sites) {
+        constexpr int bins = ggml_cuda_mmq_route_log::hist_bins;
+        unsigned long long * h = hist + (size_t) site*(bins + 1);
+        for (int e = threadIdx.x; e < n_expert && e < bins; e += blockDim.x) {
+            if (cols[e] > 0) {
+                atomicAdd(h + e, (unsigned long long) cols[e]);
+            }
+        }
+        if (threadIdx.x == 0) {
+            atomicAdd(h + bins, 1ull);
+        }
+    }
 
     unsigned int c = 0, u = 0, t8 = 0;
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
@@ -563,7 +577,7 @@ void ggml_cuda_mmq_moe_route_record(const ggml_cuda_mm_id_tile_spec * tile_spec,
                                     cudaStream_t stream) {
     GGML_ASSERT(n_expert*sizeof(int) <= 48*1024);
     mmq_moe_route_kernel<<<1, 256, n_expert*sizeof(int), stream>>>(tile_spec, ntiles, n_expert, J, site, log.head,
-                                                                  log.records, log.capacity);
+                                                                  log.records, log.capacity, log.hist);
     CUDA_CHECK(cudaGetLastError());
 }
 

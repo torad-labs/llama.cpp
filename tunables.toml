@@ -453,12 +453,13 @@ param = [
   { name = "LLAMA_SPEC_FEED_WAIT_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "common", about = "a DFlash or DSpark draft reads the context rows of a feed right after it, so the host waits for the draft's decode before it samples the verified rows" },
   { name = "LLAMA_SPEC_REJECT_SERIAL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "server", output = "same", about = "a draft that came with its distribution is verified by rejection in post_decode, slot after slot, instead of side by side with the other slots' verification" },
 
-  # ---- Shared: diagnostics (31)
+  # ---- Shared: diagnostics (32)
   { name = "GGML_CUDA_COUNT_INFLIGHT", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_DP_EXPERT_STATS", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_GRAPH_DEBUG", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_GRAPH_MEM_STATS", available = true, set = "env", type = "bool", default = true, kind = "diag", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_L2_PERSIST_CHECK", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "shared", layer = "cuda" },
+  { name = "GGML_CUDA_MMQ_ROUTE_HIST", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "shared", layer = "cuda", about = "with GGML_CUDA_MMQ_ROUTE_LOG on, each routed MMQ site also keeps a per-expert hit histogram, written as MMQ_ROUTE_HIST lines (route_histogram.py reads them)" },
   { name = "GGML_CUDA_MMQ_ROUTE_LOG", available = false, set = "env", type = "int", kind = "diag", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_MMQ_ROUTE_LOG_FILE", available = false, set = "env", type = "str", kind = "diag", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_MMVQ_MOE_QUANTIZE_CHECK", available = true, set = "env", type = "bool", default = false, kind = "diag", scope = "shared", layer = "cuda" },

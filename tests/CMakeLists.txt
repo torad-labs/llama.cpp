@@ -390,6 +390,41 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
                     "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;LLAMA_INKLING2_MEAN_MASK_DECODE=1;LLAMA_INKLING2_MEAN_POOL_MIN=8192")
             endforeach()
         endforeach()
+        # doc 18 section 3.2 (campaign row inkling-optimize-kv-gates): each fast path on a q8_0, q4_0 or f8_e4m3 global
+        # cache against F16 on the same path, and on a GPU the attention kernel the path names on the quantized cache.
+        # f8_e4m3 runs without GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE where the path does not need it, so its by-element
+        # decode is what takes the low-mean and drafted steps; q4_0 rides GGML_CUDA_FATTN_REL_DECODE_Q4
+        if (NOT inkling_path_device STREQUAL "CPU")
+            foreach(inkling_kv q8_0 q4_0 e4m3)
+                set(inkling_kvg_type "")
+                if (inkling_kv STREQUAL "q4_0")
+                    set(inkling_kvg_type "GGML_CUDA_FATTN_REL_DECODE_Q4=1")
+                endif()
+                set(inkling_kvg_runs "GGML_CUDA_FATTN_REL_QUERY_FIRST=1;GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
+                if (inkling_kv STREQUAL "q4_0")
+                    set(inkling_kvg_runs "GGML_CUDA_FATTN_REL_QUERY_FIRST=1;GGML_CUDA_FATTN_REL_DECODE_Q4=1")
+                endif()
+                foreach(inkling_kvg mean:served group:drafted short:unified runs:runs bucket:bucket)
+                    string(REPLACE ":" ";" inkling_kvg_pair ${inkling_kvg})
+                    list(GET inkling_kvg_pair 0 inkling_kvg_path)
+                    list(GET inkling_kvg_pair 1 inkling_kvg_case)
+                    set(inkling_kvg_test test-inkling-kvg-${inkling_kvg_path}-${inkling_kv})
+                    llama_test(test-llama-archs NAME ${inkling_kvg_test}
+                        ARGS --inkling-path kvg-${inkling_kvg_path}-${inkling_kv}/${inkling_kvg_case}
+                             --inkling-path-device ${inkling_path_device} -s 1234)
+                    if (inkling_kvg_path STREQUAL "mean")
+                        set(inkling_kvg_env "LLAMA_INKLING2_MEAN_MASK_DECODE=1;LLAMA_INKLING2_MEAN_POOL_MIN=8192;${inkling_kvg_type}")
+                    elseif (inkling_kvg_path STREQUAL "runs")
+                        set(inkling_kvg_env "${inkling_kvg_runs}")
+                    elseif (inkling_kvg_path STREQUAL "bucket")
+                        set(inkling_kvg_env "LLAMA_INKLING2_BUCKET_PREFILL_KV=1")
+                    else()
+                        set(inkling_kvg_env "${inkling_kvg_type}")
+                    endif()
+                    set_tests_properties(${inkling_kvg_test} PROPERTIES LABELS "main" ENVIRONMENT "${inkling_kvg_env}")
+                endforeach()
+            endforeach()
+        endif()
         # section 3.5 skeleton (doc 18-global-kv-off-f16.md): the mixed recency store's dual pools route stores by
         # recency and its dense read merge serves every cell from exactly one source - all-hot and all-cold fixtures
         # equal their single pool bit for bit, evictions fall back to cold exactly
