@@ -233,4 +233,14 @@ This codebase is yours: what it's for and how it's built are your calls, and you
 
 ## Campaign
 
-Open work in this fork lives in `.campaign/ledger.toml`. The working rules are in the Campaign section of [CLAUDE.md](CLAUDE.md).
+This repo uses the `campaign` CLI (`campaign hand`, `campaign status`, `.campaign/settings.toml`). See the Campaign section of [CLAUDE.md](CLAUDE.md).
+
+## Kernel Work Model Allowlist (Marcos, 2026-11-24)
+
+Only these models are allowed on kernel work (building, debugging, or reviewing):
+- Gemini: Carbon, Neon (use Neon for difficult tasks)
+- GPT: Astra 6.2 or Sol 6.2
+- Claude: Opus 5.5
+- Muse: Muse Wonder Full 1.0
+
+NO OTHER MODEL IS EVER ALLOWED TO WORK ON KERNELS (never Fable 5.2, never Grok 4.7). See [CLAUDE.md](CLAUDE.md) for canonical model IDs.
