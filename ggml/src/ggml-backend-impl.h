@@ -182,6 +182,9 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) asynchronous batched write; non-overlapping ranges may run in parallel
+        void (*set_tensor_n_async)(ggml_backend_t backend, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors);
     };
 
     struct ggml_backend {

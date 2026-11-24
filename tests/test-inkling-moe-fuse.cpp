@@ -37,6 +37,7 @@ struct model_weights {
     ggml_tensor *         bias    = nullptr;
     ggml_tensor *         gate_up = nullptr;
     ggml_tensor *         down    = nullptr;
+    ggml_tensor *         down_q5 = nullptr;
     std::vector<float>    h_router;
     std::vector<float>    h_bias;
 };
@@ -117,6 +118,7 @@ static bool init_weights(model_weights & W, ggml_backend_t dev_backend, int n_th
     W.bias    = ggml_new_tensor_1d(W.ctx, GGML_TYPE_F32, n_expert);
     W.gate_up = ggml_new_tensor_3d(W.ctx, GGML_TYPE_Q3_K, n_embd, 2*n_ff, n_local);
     W.down    = ggml_new_tensor_3d(W.ctx, GGML_TYPE_Q4_K, n_ff, n_embd, n_local);
+    W.down_q5 = ggml_new_tensor_3d(W.ctx, GGML_TYPE_Q5_K, n_ff, n_embd, n_local);
 
     W.buf = ggml_backend_alloc_ctx_tensors(W.ctx, dev_backend);
     if (W.buf == nullptr) {
@@ -137,6 +139,7 @@ static bool init_weights(model_weights & W, ggml_backend_t dev_backend, int n_th
     ggml_backend_tensor_set(W.bias,   W.h_bias.data(),   0, W.h_bias.size()*sizeof(float));
     quantize_rows(W.gate_up, 99,  n_threads);
     quantize_rows(W.down,    123, n_threads);
+    quantize_rows(W.down_q5, 157, n_threads);
     return true;
 }
 
@@ -166,7 +169,7 @@ static void cpu_rms_norm(const std::vector<float> & x, int64_t n_tokens, float e
     }
 }
 
-static layer build(const model_weights & W, int64_t n_tokens, bool computed_cur) {
+static layer build(const model_weights & W, int64_t n_tokens, bool computed_cur, bool use_q5_down = false) {
     layer L;
     ggml_init_params params = { 512*ggml_tensor_overhead() + 8*ggml_graph_overhead(), nullptr, true };
     L.ctx = ggml_init(params);
@@ -193,7 +196,7 @@ static layer build(const model_weights & W, int64_t n_tokens, bool computed_cur)
                              L.gate_up->nb[1], L.gate_up->nb[2], n_ff*L.gate_up->nb[0]);
     L.glu     = ggml_situ_split(ctx, L.gate_v, L.up_v, situ_beta, situ_lb);
 
-    L.down = ggml_mul_mat_id(ctx, W.down, L.glu, L.ids);
+    L.down = ggml_mul_mat_id(ctx, use_q5_down ? W.down_q5 : W.down, L.glu, L.ids);
     L.wmul = ggml_mul(ctx, L.down, L.weights);
 
     ggml_mul_mat_id_set_expert_range(L.gate_up, (int32_t) first, (int32_t) n_expert);
@@ -330,22 +333,25 @@ static float situ(double gate, double up) {
     return (float) (act*(situ_lb > 0.0f ? situ_lb*tanh(up/situ_lb) : up));
 }
 
-// Exact DS4 Q4_K dot matching quantize_mmq_few_store<DS4> + mmq_tma_vec_dot_q4_K (ds.y rounded to fp16 per 32-elem sub-block).
-static float dot_q4_k_ds4(ggml_tensor * w, int64_t expert, int64_t row, const float * x) {
+// Exact DS4 Q4_K/Q5_K dot matching quantize_mmq_few_store<DS4> + mmq_tma_vec_dot_q45_K.
+static float dot_q45_k_ds4(ggml_tensor * w, int64_t expert, int64_t row, const float * x) {
+    const bool is_q5 = w->type == GGML_TYPE_Q5_K;
+    const size_t blk_bytes = is_q5 ? 176 : 144;
     const int64_t per = w->ne[0];
     const int64_t n_blocks = per / 256;
-    std::vector<uint8_t> raw((size_t) n_blocks * 144);
+    std::vector<uint8_t> raw((size_t) n_blocks * blk_bytes);
     ggml_backend_tensor_get(w, raw.data(), (size_t) expert*w->nb[2] + row*w->nb[1], raw.size());
     float total = 0.0f;
     for (int64_t b = 0; b < n_blocks; ++b) {
-        const uint8_t * blk = raw.data() + b * 144;
+        const uint8_t * blk = raw.data() + (size_t) b * blk_bytes;
         ggml_fp16_t d_h, m_h;
         memcpy(&d_h, blk + 0, sizeof(ggml_fp16_t));
         memcpy(&m_h, blk + 2, sizeof(ggml_fp16_t));
         const float d4 = ggml_fp16_to_fp32(d_h);
         const float m4 = ggml_fp16_to_fp32(m_h);
         const uint8_t * sc_b = blk + 4;
-        const uint8_t * qs   = blk + 16;
+        const uint8_t * qh   = is_q5 ? (blk + 16) : nullptr;
+        const uint8_t * qs   = is_q5 ? (blk + 48) : (blk + 16);
         float sum_d = 0.0f;
         float sum_m = 0.0f;
         for (int s = 0; s < 8; ++s) {
@@ -362,9 +368,12 @@ static float dot_q4_k_ds4(ggml_tensor * w, int64_t expert, int64_t row, const fl
             int c_dot = 0;
             for (int i = 0; i < 32; ++i) {
                 const int q_i = amax == 0.0f ? 0 : (int) std::round(xb[i] * d_inv);
-                const int nib = (qs[32 * (s / 2) + i] >> (4 * (s % 2))) & 0xF;
+                int q_w = (qs[32 * (s / 2) + i] >> (4 * (s % 2))) & 0xF;
+                if (is_q5 && ((qh[i] >> s) & 1)) {
+                    q_w += 16;
+                }
                 sum_q += q_i;
-                c_dot += nib * q_i;
+                c_dot += q_w * q_i;
             }
             const float ds_x = ggml_fp16_to_fp32(ggml_fp32_to_fp16(d_q));
             const float ds_y = ggml_fp16_to_fp32(ggml_fp32_to_fp16(d_q * (float) sum_q));
@@ -378,7 +387,8 @@ static float dot_q4_k_ds4(ggml_tensor * w, int64_t expert, int64_t row, const fl
 
 static float cpu_weighted_sum_elem(const model_weights & W, const std::vector<float> & cur,
         const std::vector<int32_t> & ids, const std::vector<float> & weights, int64_t t, int64_t out_row,
-        bool tma_d4 = false) {
+        bool tma_d4 = false, bool use_q5_down = false) {
+    ggml_tensor * w_down = use_q5_down ? W.down_q5 : W.down;
     std::vector<float> row_gate, row_up, row_qd, glu_s(n_ff), glu_qd, down_row;
     quantize_q8_1_row(cur.data() + t*n_embd, n_embd, row_qd, tma_d4);
     float acc = 0.0f;
@@ -392,10 +402,10 @@ static float cpu_weighted_sum_elem(const model_weights & W, const std::vector<fl
                 glu_s[j] = situ(dot(row_gate, row_qd), dot(row_up, row_qd));
             }
             if (tma_d4) {
-                v = dot_q4_k_ds4(W.down, e, out_row, glu_s.data());
+                v = dot_q45_k_ds4(w_down, e, out_row, glu_s.data());
             } else {
                 quantize_q8_1_row(glu_s.data(), n_ff, glu_qd, false);
-                row_to_float(W.down, e, out_row, down_row);
+                row_to_float(w_down, e, out_row, down_row);
                 v = (float) dot(glu_qd, down_row);
             }
         }
@@ -447,6 +457,85 @@ int main(int argc, char ** argv) {
     }
 
     int failed = 0;
+
+    // Pass 0: Q5_K down before Q4_K down (mirrors Inkling 2 layers 0-2 -> 3-47) so both fused Q5_K down
+    // (including glu_sole_tma_down) and per-kernel >48 KiB SMEM opt-in ordering are exercised.
+    for (int sub = 0; sub < 2; ++sub) {
+        constexpr int64_t n_tokens = 23;
+        const bool computed_cur = sub == 1;
+        layer L = build(W, n_tokens, computed_cur, /*use_q5_down=*/true);
+        ggml_backend_buffer_t buf = nullptr;
+        ggml_gallocr_t galloc = nullptr;
+        bool alloc_ok = false;
+        if (!computed_cur) {
+            buf = ggml_backend_alloc_ctx_tensors(L.ctx, dev_backend);
+            alloc_ok = buf != nullptr;
+        } else {
+            galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(dev_backend));
+            alloc_ok = ggml_gallocr_alloc_graph(galloc, L.gf);
+        }
+        if (!alloc_ok) {
+            printf("FAIL: no buffer for Q5_K pass sub=%d\n", sub);
+            if (galloc) { ggml_gallocr_free(galloc); }
+            if (buf)    { ggml_backend_buffer_free(buf); }
+            ggml_free(L.ctx);
+            failed++;
+            continue;
+        }
+        std::vector<float> cur_raw, cur_norm;
+        fill_cur(n_tokens, cur_raw);
+        ggml_backend_tensor_set(L.cur_in, cur_raw.data(), 0, cur_raw.size()*sizeof(float));
+
+        const unsigned char sentinel = 0xA5;
+        ggml_tensor * watched[] = { L.probs, L.gate_up, L.down, L.wmul, L.adds[0], L.adds[n_used - 3] };
+        if (!computed_cur) {
+            for (ggml_tensor * t : watched) {
+                fill_tensor(t, sentinel);
+            }
+            fill_tensor(L.glu, sentinel);
+            fill_tensor(L.out, sentinel);
+        }
+
+        if (ggml_backend_graph_compute(dev_backend, L.gf) != GGML_STATUS_SUCCESS) {
+            printf("FAIL: Q5_K pass sub=%d compute failed\n", sub);
+            failed++;
+        } else {
+            if (!computed_cur) {
+                bool elided = true;
+                for (ggml_tensor * t : watched) {
+                    elided = elided && is_tensor(t, sentinel);
+                }
+                const bool dispatch_ok = elided == fused_arm;
+                printf("q5_K %s%s arm: intermediates %s, expected %s: %s\n",
+                    fused_arm ? "fused" : "unfused", tma_arm ? "+tma" : "",
+                    elided ? "untouched" : "written", fused_arm ? "untouched" : "written", dispatch_ok ? "ok" : "FAIL");
+                failed += !dispatch_ok;
+            }
+            std::vector<float> out(n_embd*n_tokens);
+            ggml_backend_tensor_get(L.out, out.data(), 0, out.size()*sizeof(float));
+            fwrite(out.data(), sizeof(float), out.size(), f);
+
+            const std::vector<float> * cur_ref = &cur_raw;
+            if (computed_cur) {
+                cpu_rms_norm(cur_raw, n_tokens, 1e-5f, cur_norm);
+                cur_ref = &cur_norm;
+            }
+            std::vector<float> c_logits, c_weights;
+            std::vector<int32_t> c_ids;
+            cpu_router(*cur_ref, W.h_router, W.h_bias, n_tokens, c_logits, c_ids, c_weights);
+            const float expect_q5 = cpu_weighted_sum_elem(W, *cur_ref, c_ids, c_weights, 11, 777, tma_arm, /*use_q5_down=*/true);
+            const double got_q5   = out[11*n_embd + 777];
+            const double rel_q5   = std::fabs(got_q5 - expect_q5) / std::max(1e-6, std::fabs((double) expect_q5));
+            const double tol_q5   = tma_arm ? 3e-3 : (computed_cur ? 5e-4 : 5e-5);
+            printf("q5_K sub=%d down+sum: out[11][777] %f against %.6f, rel err %.2e: %s\n",
+                sub, got_q5, (double) expect_q5, rel_q5, rel_q5 < tol_q5 ? "ok" : "FAIL");
+            failed += rel_q5 >= tol_q5;
+        }
+
+        if (galloc) { ggml_gallocr_free(galloc); }
+        if (buf)    { ggml_backend_buffer_free(buf); }
+        ggml_free(L.ctx);
+    }
 
     // Pass 1: 23 tokens with disjoint tensor buffers, checking intermediate sentinel elision,
     // cross-rank non-owned GLU zeroing, router exactness, SITU samples, and down+weighted sum.

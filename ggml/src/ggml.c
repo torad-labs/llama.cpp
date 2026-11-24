@@ -5781,7 +5781,9 @@ void ggml_flash_attn_ext_add_rel_pos(
     GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[2] == q->ne[1] && table->ne[3] == q->ne[3]);
     GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos));
     GGML_ASSERT(q_pos->ne[0] == q->ne[1] && q_pos->ne[1] == q->ne[3] && q_pos->ne[2] == 1 && q_pos->ne[3] == 1);
-    GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_pos));
+    GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && ggml_is_contiguous_rows(kv_pos) &&
+        (kv_pos->ne[1] == 1 || kv_pos->nb[1] >= (size_t) kv_pos->ne[0]*sizeof(int32_t)) &&
+        (kv_pos->ne[2] == 1 || kv_pos->nb[2] >= (size_t) kv_pos->ne[1]*kv_pos->nb[1]));
     GGML_ASSERT(kv_pos->ne[0] == k->ne[1] && q->ne[3] % kv_pos->ne[1] == 0 && (kv_pos->ne[2] == 1 || kv_pos->ne[2] == 2) && kv_pos->ne[3] == 1);
 
     a->src[6] = table;

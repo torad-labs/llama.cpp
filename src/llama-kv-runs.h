@@ -35,6 +35,10 @@ public:
     // On global caches, stride-1 runs shared by at least two sequences go to the shared list.
     void write(const llama_kv_cells & cells, const llama_ubatch & ubatch, int32_t * data, int64_t n_entries);
 
+    // Same layout as write(), but only writes active entries [0 .. active_counts[s]) per slice without zeroing tails.
+    void write_active(const llama_kv_cells & cells, const llama_ubatch & ubatch, int32_t * data, int64_t n_entries,
+            std::vector<int32_t> & active_counts);
+
 private:
     struct seq_runs {
         std::vector<llama_kv_run> runs;

@@ -19,6 +19,13 @@ bool ggml_cuda_set_tensor_n_staged(int device,
         const ggml_tensor * const * tensors, const void * const * data, const size_t * offsets,
         const size_t * sizes, size_t n_tensors);
 
+struct ggml_backend_cuda_context;
+
 bool ggml_cuda_set_tensor_n(int device,
         ggml_tensor * const * tensors, const void * const * data, const size_t * offsets,
         const size_t * sizes, size_t n_tensors);
+
+// Async batched H2D writes on ctx.stream(). Returns false if caller should fall back to sequential copies.
+bool ggml_cuda_set_tensor_n_async(ggml_backend_cuda_context & ctx,
+        ggml_tensor * const * tensors, const void * const * data, const size_t * offsets,
+        const size_t * sizes, size_t n_tensors, bool allow_pinned);

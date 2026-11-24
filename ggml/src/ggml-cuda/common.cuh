@@ -2751,6 +2751,64 @@ struct ggml_backend_cuda_context {
     // the graphs computed meanwhile are evaluated into it, with no CUDA graph of their own
     bool outer_capture = false;
 
+    // Per-context staging for async batched H2D tensor writes (batch-copy.cu).
+    struct ggml_cuda_async_batch_stage {
+        static constexpr size_t max_bytes = 4*1024*1024;
+        static constexpr int    n_slots   = 4;
+
+        struct slot_t {
+            unsigned char * host     = nullptr;
+            size_t          cap      = 0;
+            cudaEvent_t     event    = nullptr;
+            bool            recorded = false;
+        };
+
+        unsigned char * dev_buf        = nullptr;
+        size_t          dev_cap        = 0;
+        slot_t          slots[n_slots] = {};
+        int             cur_slot       = 0;
+        bool            failed         = false;
+
+        bool active() const {
+            if (dev_buf != nullptr) {
+                return true;
+            }
+            for (const auto & s : slots) {
+                if (s.host != nullptr || s.event != nullptr) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void release() {
+            for (auto & s : slots) {
+                if (s.recorded && s.event != nullptr) {
+                    (void) cudaEventSynchronize(s.event);
+                    s.recorded = false;
+                }
+                if (s.event != nullptr) {
+                    CUDA_CHECK(cudaEventDestroy(s.event));
+                    s.event = nullptr;
+                }
+                if (s.host != nullptr) {
+                    CUDA_CHECK(cudaFreeHost(s.host));
+                    s.host = nullptr;
+                    s.cap = 0;
+                }
+            }
+            if (dev_buf != nullptr) {
+                CUDA_CHECK(cudaFree(dev_buf));
+                dev_buf = nullptr;
+                dev_cap = 0;
+            }
+            cur_slot = 0;
+            failed = false;
+        }
+    };
+
+    ggml_cuda_async_batch_stage async_batch_stage;
+
     ~ggml_backend_cuda_context();
 
     // the current stream's PQ2_0 tile counter, or nullptr before the first graph evaluation made them

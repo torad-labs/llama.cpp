@@ -135,6 +135,7 @@ static int run_tma_shapes(ggml_backend_t cuda, ggml_backend_t cpu, int n_threads
     };
     const tma_shape shapes[] = {
         { GGML_TYPE_Q3_K, 4608, 4608, true,  "tma by-expert gate_up q3_k" },
+        { GGML_TYPE_Q5_K, 2304, 4608, false, "tma by-expert down q5_k"    },
         { GGML_TYPE_Q4_K, 2304, 4608, false, "tma by-expert down q4_k"    },
     };
     static constexpr int32_t first   = 96;

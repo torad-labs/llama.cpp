@@ -350,16 +350,37 @@ public:
     void set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // resident device-side inputs updated via pinned async delta uploads (single unified non-host stream)
+    struct llama_kv_delta_stats {
+        struct kind_t {
+            uint64_t calls         = 0;
+            uint64_t full_uploads  = 0;
+            uint64_t delta_uploads = 0;
+            uint64_t spans         = 0;
+            uint64_t bytes         = 0;
+        };
+
+        kind_t cell_pos;
+        kind_t kq_mask;
+        kind_t kv_runs;
+    };
+
     ggml_tensor * get_resident_cell_pos() const;
     void          sync_resident_cell_pos(ggml_tensor * dst, ggml_backend_sched_t sched, int64_t n_kv) const;
     ggml_tensor * get_resident_kq_mask(int64_t n_kv, int64_t n_tokens) const;
     bool          is_resident_kq_mask(const ggml_tensor * dst) const;
+    ggml_tensor * get_resident_kv_runs(int64_t n_entries, int64_t n_rows_p1, int64_t cap_rows_p1 = 65) const;
+    bool          is_resident_kv_runs(const ggml_tensor * dst) const;
+    void          invalidate_delta_state() const;
+
+    llama_kv_delta_stats get_delta_stats() const { return delta_stats; }
+    void                 reset_delta_stats() const { delta_stats = {}; }
 
     // whether the runs of cells of each row's sequence (llama-kv-runs.h) fit n_max a row: a cache of one stream that owns
     // its cells, whose change log nothing else takes
     bool kv_runs_fit(const llama_ubatch & ubatch, uint32_t n_max) const;
     // the runs input of ggml_flash_attn_ext_set_kv_runs, after kv_runs_fit said yes to the ubatch
     void set_input_kv_runs(ggml_tensor * dst, const llama_ubatch * ubatch, ggml_backend_sched_t sched = nullptr) const;
+    void write_kv_runs_host(const llama_ubatch & ubatch, int32_t * data, int64_t n_entries) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -407,9 +428,13 @@ private:
 
     // persistent device storage and pinned staging for cell_pos, packed kq_mask and kv_runs delta uploads
     mutable std::shared_ptr<llama_kv_delta_state> delta_state;
+    mutable llama_kv_delta_stats delta_stats;
+    const bool delta_inputs_legacy = false;
+    const bool batch_delta_spans   = true;
 
     ggml_backend_buffer_type_t get_resident_buft() const;
     void sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool block_uniform, ggml_backend_sched_t sched) const;
+    void sync_resident_kv_runs(ggml_tensor * dst, const llama_ubatch * ubatch, ggml_backend_sched_t sched) const;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;

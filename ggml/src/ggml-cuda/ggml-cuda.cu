@@ -1262,6 +1262,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         hc_front_tickets.release();
     }
+    if (async_batch_stage.active()) {
+        ggml_cuda_set_device(device);
+        async_batch_stage.release();
+    }
     if (route_stats.ptr != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -4738,7 +4742,7 @@ static void ggml_cuda_mul_mat_id_partition(ggml_backend_cuda_context & ctx, cons
     const bool vector_ok = ggml_is_quantized(src0->type) && mm->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc);
     static const bool mmq_tma_enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
     const bool try_tma = !fusion && !paired && mmq_tma_enabled &&
-        (src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K) &&
+        (src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) &&
         mm->ne[2] >= 2 && mm->ne[2] <= 32;
     const bool use_mmq_few = !fusion && !paired && !try_tma && ggml_cuda_should_use_mmq_few(src0, src1, ids, cc);
     const bool vector = !try_tma && !use_mmq_few && vector_ok;
@@ -5422,6 +5426,47 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+}
+
+static void ggml_backend_cuda_set_tensor_n_async(ggml_backend_t backend, struct ggml_tensor * const * tensors,
+        const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_backend_buffer_type_t dev_buft = ggml_backend_cuda_buffer_type(cuda_ctx->device);
+    bool plain = !cuda_ctx->outer_capture;
+    const ggml_tensor * prev = nullptr;
+    for (size_t i = 0; i < n_tensors && plain; i++) {
+        if (sizes[i] == 0) {
+            continue;
+        }
+        ggml_tensor * t = tensors[i];
+        if (t == prev) {
+            continue;
+        }
+        prev = t;
+        if (ggml_cuda_buffer_is_host_mapped(t)) {
+            plain = false;
+            break;
+        }
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr || buf->buft != dev_buft) {
+            plain = false;
+            break;
+        }
+        ggml_cuda_q8_register(buf, t);
+        if (ggml_cuda_q8_layout_of(t).base) {
+            plain = false;
+            break;
+        }
+    }
+    if (plain && ggml_cuda_set_tensor_n_async(*cuda_ctx, tensors, data, offsets, sizes, n_tensors, !ggml_cuda_pinned_memory_disabled())) {
+        return;
+    }
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (sizes[i] > 0) {
+            ggml_backend_cuda_set_tensor_async(backend, tensors[i], data[i], offsets[i], sizes[i]);
+        }
+    }
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -8286,7 +8331,7 @@ static int ggml_cuda_try_moe_gate_up_situ(ggml_backend_cuda_context & ctx, const
         ggml_node_get_use_count(cgraph, i + 3) == 1 &&
         next_mm != nullptr && next_mm->op == GGML_OP_MUL_MAT_ID &&
         next_mm->type == GGML_TYPE_F32 && ggml_is_contiguous(next_mm) &&
-        next_mm->src[0] != nullptr && next_mm->src[0]->type == GGML_TYPE_Q4_K &&
+        next_mm->src[0] != nullptr && (next_mm->src[0]->type == GGML_TYPE_Q4_K || next_mm->src[0]->type == GGML_TYPE_Q5_K) &&
         next_mm->src[0]->ne[0] == 2304 && next_mm->src[0]->ne[1] == 4608 &&
         next_mm->src[0]->ne[2] == count && next_mm->src[0]->ne[3] == 1 &&
         ggml_is_contiguous(next_mm->src[0]) && ((uintptr_t) next_mm->src[0]->data % 16) == 0 &&
@@ -8368,7 +8413,8 @@ static int ggml_cuda_try_moe_experts_weighted_sum(ggml_backend_cuda_context & ct
     // only where the launch it replaces is mul_mat_vec_q_moe itself (or Blackwell TMA when GGML_CUDA_MMQ_TMA=1)
     static const bool mmq_tma = ggml_env_switch("GGML_CUDA_MMQ_TMA");
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    const bool tma_ok = mmq_tma && cc == GGML_CUDA_CC_BLACKWELL && w->type == GGML_TYPE_Q4_K &&
+    const bool tma_ok = mmq_tma && cc == GGML_CUDA_CC_BLACKWELL &&
+        (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_K) &&
         n_tokens >= 2 && n_tokens <= MMVQ_MMID_CEILING;
     const bool vector_ref = n_tokens >= 2 &&
         (ggml_get_op_params_i32(node, 2) > 0 ? n_tokens <= get_mmvq_mmid_max_batch(w->type, cc) :
@@ -12216,6 +12262,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .set_tensor_n_async      = */ ggml_backend_cuda_set_tensor_n_async,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

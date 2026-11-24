@@ -458,6 +458,14 @@ public:
             ggml_backend_tensor_set(pruned_out_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
         }
     }
+
+    void input_lost() override {
+        for (int i = 0; i < 2; ++i) {
+            if (cache[i] && cache[i]->get_kv()) {
+                cache[i]->get_kv()->invalidate_delta_state();
+            }
+        }
+    }
 };
 
 ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il) {
@@ -695,7 +703,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs(const llm_graph_params &
         if (base_pos && (!want_hot_map || base_pos->ne[2] == 2)) {
             const int64_t n_kv_cur = rel->cache[i]->get_n_kv();
             rel_idx[i] = rel->pos[i] = want_hot_map
-                ? ggml_view_3d(ctx0, base_pos, n_kv_cur, 1, 2, n_kv_cur*sizeof(int32_t), n_kv_cur*sizeof(int32_t), 0)
+                ? ggml_view_3d(ctx0, base_pos, n_kv_cur, 1, 2, base_pos->nb[1], base_pos->nb[2], 0)
                 : ggml_view_2d(ctx0, base_pos, n_kv_cur, 1, base_pos->nb[1], 0);
             rel->resident_pos[i] = true;
         } else {
@@ -715,8 +723,17 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs(const llm_graph_params &
     const bool use_tau = rel->use_tau = rel->needs_tau(params);
     for (int i = 0; i < 2; ++i) {
         if (rel->classify_runs(params, i)) {
-            kv_runs[i] = rel->runs[i] = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, rel->runs_max[i] + 2, n_tokens + 1);
-            ggml_set_input(kv_runs[i]);
+            const int64_t n_entries = rel->runs_max[i] + 2;
+            const int64_t cap_rows_p1 = cparams.rel_query_group ? 257 : 65;
+            ggml_tensor * base_runs = n_stream == 1 && cparams.n_seq_devices == 1 && !rel->cache[i]->is_full() ?
+                    rel->cache[i]->get_kv()->get_resident_kv_runs(n_entries, n_tokens + 1, cap_rows_p1) : nullptr;
+            if (base_runs) {
+                kv_runs[i] = rel->runs[i] = ggml_view_3d(ctx0, base_runs, 4, n_entries, n_tokens + 1,
+                        4*sizeof(int32_t), 4*n_entries*sizeof(int32_t), 0);
+            } else {
+                kv_runs[i] = rel->runs[i] = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_entries, n_tokens + 1);
+                ggml_set_input(kv_runs[i]);
+            }
         }
     }
     res->add_input(std::move(rel));

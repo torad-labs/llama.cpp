@@ -94,6 +94,8 @@ llama_kv_cache::llama_kv_cache(
                      bool   is_indexer,
                      bool   host_mapped) :
     model(model), hparams(hparams), v_trans(v_trans),
+    delta_inputs_legacy(ggml_env_switch("LLAMA_INKLING2_DELTA_INPUTS_LEGACY")),
+    batch_delta_spans(!ggml_env_switch("GGML_SCHED_BATCH_INPUTS_LEGACY")),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -990,6 +992,21 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
+
+    // Dry-run placement restores every cell before returning, so keep cell logs clean.
+    struct log_pause_all {
+        llama_kv_cells_vec & cells;
+        explicit log_pause_all(llama_kv_cells_vec & v) : cells(v) {
+            for (auto & c : cells) {
+                c.pause_logging_push();
+            }
+        }
+        ~log_pause_all() {
+            for (auto & c : cells) {
+                c.pause_logging_pop();
+            }
+        }
+    } pause_logs(v_cells);
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
@@ -3072,36 +3089,58 @@ bool llama_kv_cache_set_input_kq_mask(
 }
 
 static constexpr int64_t LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS = 32;
-
-static bool llama_kv_delta_inputs_legacy() {
-    static const bool legacy = ggml_env_switch("LLAMA_INKLING2_DELTA_INPUTS_LEGACY");
-    return legacy;
-}
+static constexpr int64_t LLAMA_KV_RESIDENT_KV_RUNS_MAX_CAP  = 512 * 1024;
 
 struct llama_kv_delta_buf {
+    struct slot_t {
+        ggml_backend_event_t              uploaded       = nullptr;
+        bool                              upload_pending = false;
+        ggml_backend_buffer_t             stage_buf      = nullptr;
+        uint8_t                         * stage_ptr      = nullptr;
+        size_t                            stage_cap      = 0;
+        std::vector<uint8_t>              stage_vec;
+        std::vector<std::vector<uint8_t>> spill;
+    };
+
     ggml_context          * ctx            = nullptr;
     ggml_backend_buffer_t   buffer         = nullptr;
     ggml_tensor           * tensor         = nullptr;
     ggml_backend_t          upload_backend = nullptr;
-    ggml_backend_event_t    uploaded       = nullptr;
-    bool                    upload_pending = false;
-    ggml_backend_buffer_t   stage_buf      = nullptr;
-    uint8_t               * stage_ptr      = nullptr;
-    size_t                  stage_cap      = 0;
+    slot_t                  slots[2]       = {};
+    int                     cur_slot       = 0;
     size_t                  stage_used     = 0;
-    std::vector<uint8_t>    stage_vec;
-    std::vector<std::vector<uint8_t>> spill;
+    bool                    batch_spans    = true;
+
+    std::vector<ggml_tensor *> pending_tensors;
+    std::vector<const void *>  pending_data;
+    std::vector<size_t>        pending_offsets;
+    std::vector<size_t>        pending_sizes;
+
+    void release_slots() {
+        for (auto & sl : slots) {
+            if (sl.upload_pending && sl.uploaded) {
+                ggml_backend_event_synchronize(sl.uploaded);
+                sl.upload_pending = false;
+            }
+            if (sl.uploaded) {
+                ggml_backend_event_free(sl.uploaded);
+                sl.uploaded = nullptr;
+            }
+            if (sl.stage_buf) {
+                ggml_backend_buffer_free(sl.stage_buf);
+                sl.stage_buf = nullptr;
+            }
+            sl.stage_ptr = nullptr;
+            sl.stage_cap = 0;
+            sl.stage_vec.clear();
+            sl.spill.clear();
+        }
+        cur_slot = 0;
+        stage_used = 0;
+    }
 
     ~llama_kv_delta_buf() {
-        if (upload_pending && uploaded) {
-            ggml_backend_event_synchronize(uploaded);
-        }
-        if (uploaded) {
-            ggml_backend_event_free(uploaded);
-        }
-        if (stage_buf) {
-            ggml_backend_buffer_free(stage_buf);
-        }
+        release_slots();
         if (buffer) {
             ggml_backend_buffer_free(buffer);
         }
@@ -3112,82 +3151,101 @@ struct llama_kv_delta_buf {
 
     void begin_upload(ggml_backend_t backend, size_t need_bytes = 0) {
         GGML_ASSERT(backend != nullptr);
-        if (upload_pending && uploaded) {
-            ggml_backend_event_synchronize(uploaded);
-            upload_pending = false;
-        }
         if (upload_backend != backend) {
-            if (uploaded) {
-                ggml_backend_event_free(uploaded);
-                uploaded = nullptr;
-            }
-            if (stage_buf) {
-                ggml_backend_buffer_free(stage_buf);
-                stage_buf = nullptr;
-                stage_ptr = nullptr;
-                stage_cap = 0;
-            }
+            release_slots();
             upload_backend = backend;
             ggml_backend_dev_t dev = ggml_backend_get_device(backend);
             if (dev) {
-                uploaded = ggml_backend_event_new(dev);
+                for (auto & sl : slots) {
+                    sl.uploaded = ggml_backend_event_new(dev);
+                }
             }
         }
-        if (need_bytes > stage_cap) {
-            const size_t new_cap = std::max<size_t>(need_bytes, std::max<size_t>(stage_cap * 2, 65536));
-            if (stage_buf) {
-                ggml_backend_buffer_free(stage_buf);
-                stage_buf = nullptr;
-                stage_ptr = nullptr;
-                stage_cap = 0;
+        auto & sl = slots[cur_slot];
+        if (sl.upload_pending && sl.uploaded) {
+            ggml_backend_event_synchronize(sl.uploaded);
+            sl.upload_pending = false;
+        }
+        if (need_bytes > sl.stage_cap) {
+            const size_t new_cap = std::max<size_t>(need_bytes, std::max<size_t>(sl.stage_cap * 2, 65536));
+            if (sl.stage_buf) {
+                ggml_backend_buffer_free(sl.stage_buf);
+                sl.stage_buf = nullptr;
+                sl.stage_ptr = nullptr;
+                sl.stage_cap = 0;
             }
             ggml_backend_dev_t dev = ggml_backend_get_device(backend);
             ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
             if (host_buft) {
-                stage_buf = ggml_backend_buft_alloc_buffer(host_buft, new_cap);
-                if (stage_buf) {
-                    stage_ptr = (uint8_t *) ggml_backend_buffer_get_base(stage_buf);
-                    stage_cap = new_cap;
+                sl.stage_buf = ggml_backend_buft_alloc_buffer(host_buft, new_cap);
+                if (sl.stage_buf) {
+                    sl.stage_ptr = (uint8_t *) ggml_backend_buffer_get_base(sl.stage_buf);
+                    sl.stage_cap = new_cap;
                 }
             }
-            if (!stage_ptr) {
-                stage_vec.resize(new_cap);
-                stage_ptr = stage_vec.data();
-                stage_cap = new_cap;
+            if (!sl.stage_ptr) {
+                sl.stage_vec.resize(new_cap);
+                sl.stage_ptr = sl.stage_vec.data();
+                sl.stage_cap = new_cap;
             }
         }
         stage_used = 0;
-        spill.clear();
+        sl.spill.clear();
+        pending_tensors.clear();
+        pending_data.clear();
+        pending_offsets.clear();
+        pending_sizes.clear();
     }
 
     void upload_to(ggml_tensor * dst, size_t byte_offset, const void * src, size_t nbytes) {
         if (nbytes == 0) {
             return;
         }
+        auto & sl = slots[cur_slot];
         const size_t aligned = (stage_used + 15) & ~size_t(15);
         uint8_t * dst_stage = nullptr;
-        if (stage_ptr && aligned + nbytes <= stage_cap) {
-            dst_stage = stage_ptr + aligned;
+        if (sl.stage_ptr && aligned + nbytes <= sl.stage_cap) {
+            dst_stage = sl.stage_ptr + aligned;
             stage_used = aligned + nbytes;
         } else {
-            spill.emplace_back(nbytes);
-            dst_stage = spill.back().data();
+            sl.spill.emplace_back(nbytes);
+            dst_stage = sl.spill.back().data();
         }
         std::memcpy(dst_stage, src, nbytes);
-        ggml_backend_tensor_set_async(upload_backend, dst, dst_stage, byte_offset, nbytes);
+        pending_tensors.push_back(dst);
+        pending_data.push_back(dst_stage);
+        pending_offsets.push_back(byte_offset);
+        pending_sizes.push_back(nbytes);
     }
 
     void end_upload() {
-        if (stage_used == 0 && spill.empty()) {
+        const size_t n = pending_tensors.size();
+        if (n == 0) {
             return;
         }
-        if (uploaded) {
-            ggml_backend_event_record(uploaded, upload_backend);
-            upload_pending = true;
+        if (batch_spans && n >= 2) {
+            ggml_backend_tensor_set_n_async(upload_backend, pending_tensors.data(), pending_data.data(),
+                    pending_offsets.data(), pending_sizes.data(), n);
+        } else {
+            for (size_t i = 0; i < n; ++i) {
+                ggml_backend_tensor_set_async(upload_backend, pending_tensors[i], pending_data[i],
+                        pending_offsets[i], pending_sizes[i]);
+            }
+        }
+        pending_tensors.clear();
+        pending_data.clear();
+        pending_offsets.clear();
+        pending_sizes.clear();
+
+        auto & sl = slots[cur_slot];
+        if (sl.uploaded) {
+            ggml_backend_event_record(sl.uploaded, upload_backend);
+            sl.upload_pending = true;
+            cur_slot ^= 1;
         } else {
             ggml_backend_synchronize(upload_backend);
             stage_used = 0;
-            spill.clear();
+            sl.spill.clear();
         }
     }
 };
@@ -3196,10 +3254,10 @@ struct llama_kv_delta_state {
     llama_kv_delta_buf    cell_pos;
     bool                  cell_pos_synced = false;
     size_t                cell_pos_hi     = 0;
-    size_t                cell_pos_n_kv   = 0;
     std::vector<uint32_t> pos_dirty;
 
     bool                  hot_map_synced  = false;
+    size_t                hot_map_hi      = 0;
     std::vector<int32_t>  hot_map_shadow;
     std::vector<uint32_t> hot_active;
     std::vector<uint32_t> hot_cand;
@@ -3219,12 +3277,21 @@ struct llama_kv_delta_state {
     std::vector<uint32_t> mask_dirty;
     std::vector<size_t>   dirty_words;
 
-    llama_kv_delta_buf   kv_runs_stage;
-    std::vector<int32_t> kv_runs_host;
+    llama_kv_delta_buf    kv_runs;
+    int64_t               kv_runs_cap_entries = 0;
+    int64_t               kv_runs_n_entries   = 0;
+    std::vector<int32_t>  kv_runs_shadow;
+    std::vector<int32_t>  kv_runs_tmp;
+    std::vector<int32_t>  kv_runs_active;
+    std::vector<int32_t>  kv_runs_slice_len;
+    std::vector<uint8_t>  kv_runs_slice_valid;
+
+    llama_kv_delta_buf    kv_runs_stage;
+    std::vector<int32_t>  kv_runs_host;
 };
 
 ggml_backend_buffer_type_t llama_kv_cache::get_resident_buft() const {
-    if (n_stream != 1 || other != nullptr || layers.empty() || llama_kv_delta_inputs_legacy()) {
+    if (n_stream != 1 || other != nullptr || layers.empty() || delta_inputs_legacy) {
         return nullptr;
     }
     ggml_backend_buffer_type_t buft = nullptr;
@@ -3243,6 +3310,22 @@ ggml_backend_buffer_type_t llama_kv_cache::get_resident_buft() const {
         }
     }
     return buft;
+}
+
+void llama_kv_cache::invalidate_delta_state() const {
+    if (!delta_state) {
+        return;
+    }
+    const size_t n_cells = v_cells.empty() ? 0 : v_cells[0].size();
+    delta_state->cell_pos_synced = false;
+    delta_state->cell_pos_hi     = n_cells;
+    delta_state->hot_map_synced  = false;
+    delta_state->hot_map_hi      = n_cells;
+    delta_state->kq_mask_n_words = 0;
+    for (auto & rs : delta_state->kq_rows) {
+        rs.valid = false;
+    }
+    std::fill(delta_state->kv_runs_slice_valid.begin(), delta_state->kv_runs_slice_valid.end(), uint8_t(0));
 }
 
 ggml_tensor * llama_kv_cache::get_resident_cell_pos() const {
@@ -3272,11 +3355,12 @@ ggml_tensor * llama_kv_cache::get_resident_cell_pos() const {
             return nullptr;
         }
         ggml_backend_buffer_clear(cp.buffer, 0xFF);
-        cells.pos_changes().track(std::max<uint32_t>(256, cells.size()/64));
+        cp.batch_spans = batch_delta_spans;
+        cells.pos_changes().track(std::min<uint32_t>(cells.size(), std::max<uint32_t>(4096, cells.size()/32)));
         delta_state->cell_pos_synced = false;
         delta_state->cell_pos_hi     = 0;
-        delta_state->cell_pos_n_kv   = 0;
         delta_state->hot_map_synced  = false;
+        delta_state->hot_map_hi      = 0;
         std::fill(std::begin(delta_state->hot_seq_tip), std::end(delta_state->hot_seq_tip), -1);
     }
     return cp.tensor;
@@ -3288,8 +3372,10 @@ void llama_kv_cache::sync_resident_cell_pos(ggml_tensor * dst, ggml_backend_sche
     const auto & pos   = cells.positions();
     GGML_ASSERT(n_kv <= (int64_t) cells.size());
 
-    cells.pos_changes().track(std::max<uint32_t>(256, cells.size()/64));
-    bool listed = cells.pos_changes().take(delta_state->pos_dirty) && delta_state->cell_pos_synced;
+    delta_stats.cell_pos.calls++;
+
+    cells.pos_changes().track(std::min<uint32_t>(cells.size(), std::max<uint32_t>(4096, cells.size()/32)));
+    const bool p0_listed = cells.pos_changes().take(delta_state->pos_dirty) && delta_state->cell_pos_synced;
 
     ggml_backend_t backend = sched ? ggml_backend_sched_get_tensor_backend(sched, dst) : nullptr;
     if (!backend && sched) {
@@ -3299,21 +3385,67 @@ void llama_kv_cache::sync_resident_cell_pos(ggml_tensor * dst, ggml_backend_sche
     auto & cp = delta_state->cell_pos;
     const bool want_hot = dst && dst->ne[2] == 2 && has_kv_mixed();
     if (!want_hot && delta_state->hot_map_synced) {
-        delta_state->cell_pos_hi = std::max(delta_state->cell_pos_hi, 2 * delta_state->cell_pos_n_kv);
-        listed = false;
         delta_state->hot_map_synced = false;
     }
 
+    auto build_ranges = [](const std::vector<uint32_t> & d, std::vector<std::pair<size_t, size_t>> & out,
+            size_t & raw_bytes, size_t & stage_bytes) {
+        for (size_t idx = 0; idx < d.size(); ) {
+            const size_t lo = d[idx];
+            size_t hi = lo + 1;
+            ++idx;
+            while (idx < d.size() && d[idx] <= hi + 16) {
+                hi = d[idx] + 1;
+                ++idx;
+            }
+            const size_t nb = (hi - lo) * sizeof(int32_t);
+            out.emplace_back(lo, hi);
+            raw_bytes   += nb;
+            stage_bytes += (nb + 15) & ~size_t(15);
+        }
+    };
+
+    std::vector<std::pair<size_t, size_t>> p0_ranges, p1_ranges;
+    size_t raw_bytes = 0;
+    size_t stage_bytes = 0;
+    bool did_full = false;
+
+    // Plane 0: cell positions across [0 .. cells.size()), never colliding with plane 1 at cp.tensor->nb[2].
+    if (!p0_listed) {
+        const size_t hi = std::min<size_t>(cells.size(),
+                std::max<size_t>({ (size_t) n_kv, (size_t) cells.used_max_p1(), delta_state->cell_pos_hi }));
+        delta_state->cell_pos_hi     = cells.used_max_p1();
+        delta_state->cell_pos_synced = true;
+        if (hi > 0) {
+            const size_t nb = hi * sizeof(llama_pos);
+            p0_ranges.emplace_back(0, hi);
+            raw_bytes   += nb;
+            stage_bytes += (nb + 15) & ~size_t(15);
+            did_full = true;
+        }
+    } else {
+        auto & dirty = delta_state->pos_dirty;
+        if (!dirty.empty()) {
+            std::sort(dirty.begin(), dirty.end());
+            dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
+            delta_state->cell_pos_hi = std::max<size_t>({ delta_state->cell_pos_hi, (size_t) cells.used_max_p1(), (size_t) dirty.back() + 1 });
+            build_ranges(dirty, p0_ranges, raw_bytes, stage_bytes);
+        }
+    }
+
+    // Plane 1 (kv_mixed hot_map): fixed offset at cp.tensor->nb[2], independent of n_kv.
+    const size_t plane1_off = want_hot ? cp.tensor->nb[2] : 0;
     if (want_hot) {
         if (delta_state->hot_map_shadow.size() != cells.size()) {
             delta_state->hot_map_shadow.assign(cells.size(), -1);
             delta_state->hot_active.clear();
             delta_state->hot_map_synced = false;
+            delta_state->hot_map_hi     = cells.size();
         }
         const auto & s2c = kv_mixed_slot_to_cell[0];
         const auto & c2s = kv_mixed_cell_to_slot[0];
         auto want_slot = [&](uint32_t c) -> int32_t {
-            if (c >= (uint32_t) n_kv) {
+            if (c >= cells.size()) {
                 return -1;
             }
             const int32_t slot = c2s[c];
@@ -3321,17 +3453,18 @@ void llama_kv_cache::sync_resident_cell_pos(ggml_tensor * dst, ggml_backend_sche
                 ? slot : -1;
         };
 
-        const size_t plane1_off = (size_t) n_kv * sizeof(int32_t);
-        if (!listed || !delta_state->hot_map_synced || delta_state->cell_pos_n_kv != (size_t) n_kv) {
+        if (!p0_listed || !delta_state->hot_map_synced) {
             for (const uint32_t c : delta_state->hot_active) {
                 delta_state->hot_map_shadow[c] = -1;
             }
             delta_state->hot_active.clear();
+            size_t max_hot_p1 = 0;
             for (uint32_t slot = 0; slot < kv_mixed_hot_rows; ++slot) {
                 const uint32_t c = s2c[slot];
-                if (c < (uint32_t) n_kv && c2s[c] == (int32_t) slot && kv_mixed_is_near(0, c)) {
+                if (c < cells.size() && c2s[c] == (int32_t) slot && kv_mixed_is_near(0, c)) {
                     delta_state->hot_map_shadow[c] = (int32_t) slot;
                     delta_state->hot_active.push_back(c);
+                    max_hot_p1 = std::max<size_t>(max_hot_p1, (size_t) c + 1);
                 }
             }
             for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -3339,193 +3472,125 @@ void llama_kv_cache::sync_resident_cell_pos(ggml_tensor * dst, ggml_backend_sche
             }
             kv_mixed_dirty.clear();
             kv_mixed_dirty_all = false;
-            delta_state->cell_pos_n_kv   = (size_t) n_kv;
-            delta_state->cell_pos_hi     = cells.used_max_p1();
-            delta_state->cell_pos_synced = true;
-            delta_state->hot_map_synced  = true;
-            if (n_kv > 0) {
-                const size_t nbytes = (size_t) n_kv * sizeof(int32_t);
-                if (backend) {
-                    cp.begin_upload(backend, 2 * ((nbytes + 15) & ~size_t(15)));
-                    cp.upload_to(cp.tensor, 0,          pos.data(),                         nbytes);
-                    cp.upload_to(cp.tensor, plane1_off, delta_state->hot_map_shadow.data(), nbytes);
-                    cp.end_upload();
-                } else {
-                    ggml_backend_tensor_set(cp.tensor, pos.data(),                         0,          nbytes);
-                    ggml_backend_tensor_set(cp.tensor, delta_state->hot_map_shadow.data(), plane1_off, nbytes);
-                }
-            }
-            return;
-        }
-
-        auto & p0_dirty = delta_state->pos_dirty;
-        p0_dirty.erase(std::remove_if(p0_dirty.begin(), p0_dirty.end(), [&](uint32_t c) {
-            return c >= (uint32_t) n_kv;
-        }), p0_dirty.end());
-        if (!p0_dirty.empty()) {
-            std::sort(p0_dirty.begin(), p0_dirty.end());
-            p0_dirty.erase(std::unique(p0_dirty.begin(), p0_dirty.end()), p0_dirty.end());
-        }
-
-        auto & cand = delta_state->hot_cand;
-        cand.clear();
-        if (kv_mixed_dirty_all) {
-            cand.insert(cand.end(), delta_state->hot_active.begin(), delta_state->hot_active.end());
-            for (uint32_t slot = 0; slot < kv_mixed_hot_rows; ++slot) {
-                if (s2c[slot] < (uint32_t) n_kv) {
-                    cand.push_back(s2c[slot]);
-                }
+            const size_t hi_hot = std::min<size_t>(cells.size(),
+                    std::max<size_t>({ (size_t) n_kv, max_hot_p1, delta_state->hot_map_hi }));
+            delta_state->hot_map_hi     = max_hot_p1;
+            delta_state->hot_map_synced = true;
+            if (hi_hot > 0) {
+                const size_t nb = hi_hot * sizeof(int32_t);
+                p1_ranges.emplace_back(0, hi_hot);
+                raw_bytes   += nb;
+                stage_bytes += (nb + 15) & ~size_t(15);
+                did_full = true;
             }
         } else {
-            cand.swap(kv_mixed_dirty);
-            const llama_pos ext = (llama_pos) kv_mixed_extent;
-            for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                const llama_pos old_tip = delta_state->hot_seq_tip[s];
-                const llama_pos new_tip = cells.seq_pos_max(s);
-                if (new_tip == old_tip || new_tip < 0) {
-                    continue;
+            auto & cand = delta_state->hot_cand;
+            cand.clear();
+            if (kv_mixed_dirty_all) {
+                cand.insert(cand.end(), delta_state->hot_active.begin(), delta_state->hot_active.end());
+                for (uint32_t slot = 0; slot < kv_mixed_hot_rows; ++slot) {
+                    if (s2c[slot] < cells.size()) {
+                        cand.push_back(s2c[slot]);
+                    }
                 }
-                const llama_pos lo = old_tip < 0 ? std::max<llama_pos>(0, new_tip - ext + 1)
-                    : std::max<llama_pos>(0, std::min(old_tip, new_tip) - ext + 1);
-                const llama_pos hi = old_tip < 0 ? new_tip + 1 : std::max(old_tip, new_tip) - ext + 1;
-                if (hi > lo) {
-                    const auto & sp = cells.seq_pos_get(s);
-                    for (auto it = sp.lower_bound({ lo, 0 }); it != sp.end() && it->first < hi; ++it) {
-                        const uint32_t c = it->second;
-                        if (c < (uint32_t) n_kv && (c2s[c] >= 0 || delta_state->hot_map_shadow[c] >= 0)) {
-                            cand.push_back(c);
+            } else {
+                cand.swap(kv_mixed_dirty);
+                const llama_pos ext = (llama_pos) kv_mixed_extent;
+                bool seq_emptied = false;
+                for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                    const llama_pos old_tip = delta_state->hot_seq_tip[s];
+                    const llama_pos new_tip = cells.seq_pos_max(s);
+                    if (new_tip == old_tip) {
+                        continue;
+                    }
+                    if (new_tip < 0) {
+                        seq_emptied = true;
+                        continue;
+                    }
+                    const llama_pos lo = old_tip < 0 ? std::max<llama_pos>(0, new_tip - ext + 1)
+                        : std::max<llama_pos>(0, std::min(old_tip, new_tip) - ext + 1);
+                    const llama_pos hi = old_tip < 0 ? new_tip + 1 : std::max(old_tip, new_tip) - ext + 1;
+                    if (hi > lo) {
+                        const auto & sp = cells.seq_pos_get(s);
+                        for (auto it = sp.lower_bound({ lo, 0 }); it != sp.end() && it->first < hi; ++it) {
+                            const uint32_t c = it->second;
+                            if (c < cells.size() && (c2s[c] >= 0 || delta_state->hot_map_shadow[c] >= 0)) {
+                                cand.push_back(c);
+                            }
                         }
                     }
                 }
-            }
-        }
-        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            delta_state->hot_seq_tip[s] = cells.seq_pos_max(s);
-        }
-        kv_mixed_dirty.clear();
-        kv_mixed_dirty_all = false;
-
-        auto & p1_dirty = delta_state->hot_plane_dirty;
-        p1_dirty.clear();
-        if (!cand.empty()) {
-            std::sort(cand.begin(), cand.end());
-            cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
-            for (const uint32_t c : cand) {
-                if (c >= (uint32_t) n_kv) {
-                    continue;
+                if (seq_emptied) {
+                    cand.insert(cand.end(), delta_state->hot_active.begin(), delta_state->hot_active.end());
                 }
-                const int32_t old_v = delta_state->hot_map_shadow[c];
-                const int32_t new_v = want_slot(c);
-                if (new_v != old_v) {
-                    delta_state->hot_map_shadow[c] = new_v;
-                    if (old_v < 0 && new_v >= 0) {
-                        delta_state->hot_active.push_back(c);
+            }
+            for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                delta_state->hot_seq_tip[s] = cells.seq_pos_max(s);
+            }
+            kv_mixed_dirty.clear();
+            kv_mixed_dirty_all = false;
+
+            auto & p1_dirty = delta_state->hot_plane_dirty;
+            p1_dirty.clear();
+            if (!cand.empty()) {
+                std::sort(cand.begin(), cand.end());
+                cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+                for (const uint32_t c : cand) {
+                    if (c >= cells.size()) {
+                        continue;
                     }
-                    p1_dirty.push_back(c);
+                    const int32_t old_v = delta_state->hot_map_shadow[c];
+                    const int32_t new_v = want_slot(c);
+                    if (new_v != old_v) {
+                        delta_state->hot_map_shadow[c] = new_v;
+                        if (old_v < 0 && new_v >= 0) {
+                            delta_state->hot_active.push_back(c);
+                        }
+                        p1_dirty.push_back(c);
+                    }
+                }
+                if (delta_state->hot_active.size() > 2 * (size_t) kv_mixed_hot_rows) {
+                    auto & ha = delta_state->hot_active;
+                    ha.erase(std::remove_if(ha.begin(), ha.end(), [&](uint32_t c) {
+                        return delta_state->hot_map_shadow[c] < 0;
+                    }), ha.end());
                 }
             }
-            if (delta_state->hot_active.size() > 2 * (size_t) kv_mixed_hot_rows) {
-                auto & ha = delta_state->hot_active;
-                ha.erase(std::remove_if(ha.begin(), ha.end(), [&](uint32_t c) {
-                    return delta_state->hot_map_shadow[c] < 0;
-                }), ha.end());
+            if (!p1_dirty.empty()) {
+                delta_state->hot_map_hi = std::max<size_t>(delta_state->hot_map_hi, (size_t) p1_dirty.back() + 1);
+                build_ranges(p1_dirty, p1_ranges, raw_bytes, stage_bytes);
             }
         }
+    }
 
-        delta_state->cell_pos_hi = std::max<size_t>(delta_state->cell_pos_hi, cells.used_max_p1());
-        if (p0_dirty.empty() && p1_dirty.empty()) {
-            return;
-        }
-
-        auto build_ranges = [](const std::vector<uint32_t> & d, std::vector<std::pair<size_t, size_t>> & out, size_t & bytes) {
-            for (size_t idx = 0; idx < d.size(); ) {
-                const size_t lo = d[idx];
-                size_t hi = lo + 1;
-                ++idx;
-                while (idx < d.size() && d[idx] <= hi + 16) {
-                    hi = d[idx] + 1;
-                    ++idx;
-                }
-                out.emplace_back(lo, hi);
-                bytes += ((hi - lo) * sizeof(int32_t) + 15) & ~size_t(15);
-            }
-        };
-
-        std::vector<std::pair<size_t, size_t>> p0_ranges, p1_ranges;
-        size_t total_bytes = 0;
-        build_ranges(p0_dirty, p0_ranges, total_bytes);
-        build_ranges(p1_dirty, p1_ranges, total_bytes);
-
-        if (backend) {
-            cp.begin_upload(backend, total_bytes);
-            for (const auto & [lo, hi] : p0_ranges) {
-                cp.upload_to(cp.tensor, lo * sizeof(llama_pos), pos.data() + lo, (hi - lo) * sizeof(llama_pos));
-            }
-            for (const auto & [lo, hi] : p1_ranges) {
-                cp.upload_to(cp.tensor, plane1_off + lo * sizeof(int32_t), delta_state->hot_map_shadow.data() + lo, (hi - lo) * sizeof(int32_t));
-            }
-            cp.end_upload();
-        } else {
-            for (const auto & [lo, hi] : p0_ranges) {
-                ggml_backend_tensor_set(cp.tensor, pos.data() + lo, lo * sizeof(llama_pos), (hi - lo) * sizeof(llama_pos));
-            }
-            for (const auto & [lo, hi] : p1_ranges) {
-                ggml_backend_tensor_set(cp.tensor, delta_state->hot_map_shadow.data() + lo, plane1_off + lo * sizeof(int32_t), (hi - lo) * sizeof(int32_t));
-            }
-        }
+    const size_t n_spans = p0_ranges.size() + p1_ranges.size();
+    if (n_spans == 0) {
         return;
     }
 
-    if (!listed) {
-        const size_t hi = std::min<size_t>(cells.size(),
-                std::max<size_t>({ (size_t) n_kv, (size_t) cells.used_max_p1(), delta_state->cell_pos_hi }));
-        delta_state->cell_pos_hi     = cells.used_max_p1();
-        delta_state->cell_pos_synced = true;
-        if (hi > 0) {
-            const size_t nbytes = hi * sizeof(llama_pos);
-            if (backend) {
-                cp.begin_upload(backend, nbytes);
-                cp.upload_to(cp.tensor, 0, pos.data(), nbytes);
-                cp.end_upload();
-            } else {
-                ggml_backend_tensor_set(cp.tensor, pos.data(), 0, nbytes);
-            }
-        }
-        return;
+    if (did_full) {
+        delta_stats.cell_pos.full_uploads++;
+    } else {
+        delta_stats.cell_pos.delta_uploads++;
     }
-
-    auto & dirty = delta_state->pos_dirty;
-    if (dirty.empty()) {
-        return;
-    }
-    std::sort(dirty.begin(), dirty.end());
-    dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
-
-    // coalesce nearby dirty cell positions (gap <= 16 ints = 64 bytes)
-    std::vector<std::pair<size_t, size_t>> ranges;
-    size_t total_bytes = 0;
-    for (size_t idx = 0; idx < dirty.size(); ) {
-        const size_t lo = dirty[idx];
-        size_t hi = lo + 1;
-        ++idx;
-        while (idx < dirty.size() && dirty[idx] <= hi + 16) {
-            hi = dirty[idx] + 1;
-            ++idx;
-        }
-        ranges.emplace_back(lo, hi);
-        total_bytes += ((hi - lo) * sizeof(llama_pos) + 15) & ~size_t(15);
-    }
-    delta_state->cell_pos_hi = std::max<size_t>(delta_state->cell_pos_hi, cells.used_max_p1());
+    delta_stats.cell_pos.spans += n_spans;
+    delta_stats.cell_pos.bytes += raw_bytes;
 
     if (backend) {
-        cp.begin_upload(backend, total_bytes);
-        for (const auto & [lo, hi] : ranges) {
+        cp.begin_upload(backend, stage_bytes);
+        for (const auto & [lo, hi] : p0_ranges) {
             cp.upload_to(cp.tensor, lo * sizeof(llama_pos), pos.data() + lo, (hi - lo) * sizeof(llama_pos));
+        }
+        for (const auto & [lo, hi] : p1_ranges) {
+            cp.upload_to(cp.tensor, plane1_off + lo * sizeof(int32_t), delta_state->hot_map_shadow.data() + lo, (hi - lo) * sizeof(int32_t));
         }
         cp.end_upload();
     } else {
-        for (const auto & [lo, hi] : ranges) {
+        for (const auto & [lo, hi] : p0_ranges) {
             ggml_backend_tensor_set(cp.tensor, pos.data() + lo, lo * sizeof(llama_pos), (hi - lo) * sizeof(llama_pos));
+        }
+        for (const auto & [lo, hi] : p1_ranges) {
+            ggml_backend_tensor_set(cp.tensor, delta_state->hot_map_shadow.data() + lo, plane1_off + lo * sizeof(int32_t), (hi - lo) * sizeof(int32_t));
         }
     }
 }
@@ -3559,7 +3624,8 @@ ggml_tensor * llama_kv_cache::get_resident_kq_mask(int64_t n_kv, int64_t n_token
             return nullptr;
         }
         ggml_backend_buffer_clear(km.buffer, 0);
-        cells.mask_changes().track(std::max<uint32_t>(256, cells.size()/64));
+        km.batch_spans = batch_delta_spans;
+        cells.mask_changes().track(std::min<uint32_t>(cells.size(), std::max<uint32_t>(4096, cells.size()/32)));
         delta_state->kq_mask_n_words = 0;
         for (auto & rs : delta_state->kq_rows) {
             rs = {};
@@ -3576,6 +3642,8 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
     GGML_ASSERT(delta_state && delta_state->kq_mask.tensor && dst->type == GGML_TYPE_I16 && dst->ne[3] == 1);
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens > 0 && n_tokens <= LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS);
+
+    delta_stats.kq_mask.calls++;
 
     const size_t n_words = (size_t) dst->ne[0];
     const auto & cells   = v_cells[0];
@@ -3595,7 +3663,7 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
     auto & km     = delta_state->kq_mask;
     auto & shadow = delta_state->kq_mask_shadow;
 
-    cells.mask_changes().track(std::max<uint32_t>(256, cells.size()/64));
+    cells.mask_changes().track(std::min<uint32_t>(cells.size(), std::max<uint32_t>(4096, cells.size()/32)));
     const bool listed = cells.mask_changes().take(delta_state->mask_dirty);
 
     const bool standard_window = causal_attn && swa_type == LLAMA_SWA_TYPE_STANDARD &&
@@ -3629,6 +3697,9 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
         llama_kv_cache_set_input_kq_mask(&host_view, ubatch, causal_attn, hparams, v_cells, seq_to_stream, n_swa, swa_type,
                 scan_cells, seq_bits, nullptr, block_uniform);
         const size_t nbytes = n_tokens * n_words * sizeof(uint16_t);
+        delta_stats.kq_mask.full_uploads++;
+        delta_stats.kq_mask.spans++;
+        delta_stats.kq_mask.bytes += nbytes;
         if (backend) {
             km.begin_upload(backend, nbytes);
             km.upload_to(km.tensor, 0, shadow.data(), nbytes);
@@ -3651,9 +3722,26 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
     if (listed && !dirty.empty()) {
         std::sort(dirty.begin(), dirty.end());
         dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
-        // inactive rows will not receive these mutations, so mark them invalid
+        // Preserve cached inactive rows unless a dirty cell actually flips one of their bits.
         for (uint32_t k = n_tokens; k < LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS; ++k) {
-            delta_state->kq_rows[k].valid = false;
+            auto & rs = delta_state->kq_rows[k];
+            if (!rs.valid) {
+                continue;
+            }
+            const uint16_t * row_ptr = shadow.data() + k * n_words;
+            for (const uint32_t cell : dirty) {
+                const size_t w = cell / 16;
+                if (w >= n_words) {
+                    continue;
+                }
+                const uint16_t mask_bit = uint16_t(1u << (cell % 16));
+                const bool was_set = (row_ptr[w] & mask_bit) != 0;
+                const bool live = !cells.is_empty(cell) && cells.seq_has(cell, rs.seq) && cells.pos_get(cell) >= rs.p_min;
+                if (live != was_set) {
+                    rs.valid = false;
+                    break;
+                }
+            }
         }
     }
 
@@ -3663,7 +3751,9 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
         size_t nbytes;
     };
     std::vector<upload_span> spans;
+    size_t raw_bytes   = 0;
     size_t total_bytes = 0;
+    bool did_full = false;
 
     for (uint32_t r = 0; r < n_tokens; ++r) {
         const llama_seq_id seq = ubatch->seq_id[r][0];
@@ -3717,6 +3807,7 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
                     }
                     const size_t nb = (w1 - w0) * sizeof(uint16_t);
                     spans.push_back({ (r * n_words + w0) * sizeof(uint16_t), row_ptr + w0, nb });
+                    raw_bytes   += nb;
                     total_bytes += (nb + 15) & ~size_t(15);
                 }
             }
@@ -3725,13 +3816,23 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
             rs = { seq, p_min, true, true };
             const size_t nb = n_words * sizeof(uint16_t);
             spans.push_back({ r * n_words * sizeof(uint16_t), row_ptr, nb });
+            raw_bytes   += nb;
             total_bytes += (nb + 15) & ~size_t(15);
+            did_full = true;
         }
     }
 
     if (spans.empty()) {
         return;
     }
+    if (did_full) {
+        delta_stats.kq_mask.full_uploads++;
+    } else {
+        delta_stats.kq_mask.delta_uploads++;
+    }
+    delta_stats.kq_mask.spans += spans.size();
+    delta_stats.kq_mask.bytes += raw_bytes;
+
     if (backend) {
         km.begin_upload(backend, total_bytes);
         for (const auto & sp : spans) {
@@ -3741,6 +3842,178 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
     } else {
         for (const auto & sp : spans) {
             ggml_backend_tensor_set(km.tensor, sp.ptr, sp.byte_off, sp.nbytes);
+        }
+    }
+}
+
+ggml_tensor * llama_kv_cache::get_resident_kv_runs(int64_t n_entries, int64_t n_rows_p1, int64_t cap_rows_p1) const {
+    if (n_entries < 2 || n_rows_p1 < 2) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t buft = get_resident_buft();
+    if (!buft) {
+        return nullptr;
+    }
+    const int64_t need = n_entries * n_rows_p1;
+    if (need > LLAMA_KV_RESIDENT_KV_RUNS_MAX_CAP) {
+        return nullptr;
+    }
+    if (!delta_state) {
+        delta_state = std::make_shared<llama_kv_delta_state>();
+    }
+    auto & kr = delta_state->kv_runs;
+    if (!kr.tensor) {
+        const int64_t min_rows = std::max<int64_t>(cap_rows_p1, 65);
+        const int64_t cap = std::min<int64_t>(LLAMA_KV_RESIDENT_KV_RUNS_MAX_CAP,
+                std::max<int64_t>(need, n_entries * min_rows));
+        kr.ctx = ggml_init({ ggml_tensor_overhead(), nullptr, true });
+        if (!kr.ctx) {
+            return nullptr;
+        }
+        kr.tensor = ggml_new_tensor_1d(kr.ctx, GGML_TYPE_I32, 4 * cap);
+        ggml_set_name(kr.tensor, "kv_resident_kv_runs");
+        kr.buffer = ggml_backend_alloc_ctx_tensors_from_buft(kr.ctx, buft);
+        if (!kr.buffer) {
+            ggml_free(kr.ctx);
+            kr.ctx    = nullptr;
+            kr.tensor = nullptr;
+            return nullptr;
+        }
+        ggml_backend_buffer_clear(kr.buffer, 0);
+        kr.batch_spans = batch_delta_spans;
+        delta_state->kv_runs_cap_entries = cap;
+        delta_state->kv_runs_n_entries   = n_entries;
+        delta_state->kv_runs_shadow.assign((size_t) (4 * cap), 0);
+        const size_t max_slices = (size_t) (cap / n_entries);
+        delta_state->kv_runs_slice_len.assign(max_slices, 0);
+        delta_state->kv_runs_slice_valid.assign(max_slices, uint8_t(1));
+    }
+    if (need > delta_state->kv_runs_cap_entries) {
+        return nullptr;
+    }
+    return kr.tensor;
+}
+
+bool llama_kv_cache::is_resident_kv_runs(const ggml_tensor * dst) const {
+    return dst && delta_state && delta_state->kv_runs.tensor && dst->view_src == delta_state->kv_runs.tensor;
+}
+
+void llama_kv_cache::sync_resident_kv_runs(ggml_tensor * dst, const llama_ubatch * ubatch, ggml_backend_sched_t sched) const {
+    GGML_ASSERT(delta_state && delta_state->kv_runs.tensor && kv_runs);
+    const int64_t n_entries = dst->ne[1];
+    const int64_t n_rows_p1 = dst->ne[2];
+    GGML_ASSERT(n_entries * n_rows_p1 <= delta_state->kv_runs_cap_entries);
+
+    delta_stats.kv_runs.calls++;
+
+    if (delta_state->kv_runs_n_entries != n_entries) {
+        delta_state->kv_runs_n_entries = n_entries;
+        const size_t max_slices = (size_t) (delta_state->kv_runs_cap_entries / n_entries);
+        delta_state->kv_runs_slice_len.assign(max_slices, 0);
+        delta_state->kv_runs_slice_valid.assign(max_slices, uint8_t(0));
+    }
+
+    auto & tmp    = delta_state->kv_runs_tmp;
+    auto & active = delta_state->kv_runs_active;
+    auto & shadow = delta_state->kv_runs_shadow;
+    tmp.resize((size_t) (4 * n_entries * n_rows_p1));
+    kv_runs->write_active(v_cells[0], *ubatch, tmp.data(), n_entries, active);
+
+    struct upload_span {
+        size_t          byte_off;
+        const int32_t * ptr;
+        size_t          nbytes;
+    };
+    std::vector<upload_span> spans;
+    size_t raw_bytes   = 0;
+    size_t stage_bytes = 0;
+    bool did_full = false;
+    static const int32_t zero4[4] = { 0, 0, 0, 0 };
+
+    for (int64_t s = 0; s < n_rows_p1; ++s) {
+        const int32_t cur_len = active[(size_t) s];
+        int32_t * sh = shadow.data() + 4 * n_entries * s;
+        const int32_t * tm = tmp.data() + 4 * n_entries * s;
+
+        if (!delta_state->kv_runs_slice_valid[(size_t) s]) {
+            std::fill_n(sh, (size_t) (4 * n_entries), 0);
+            std::memcpy(sh, tm, (size_t) cur_len * 4 * sizeof(int32_t));
+            delta_state->kv_runs_slice_valid[(size_t) s] = 1;
+            delta_state->kv_runs_slice_len[(size_t) s]   = cur_len;
+            const size_t nb = (size_t) n_entries * 4 * sizeof(int32_t);
+            spans.push_back({ (size_t) (s * n_entries) * 16, sh, nb });
+            raw_bytes   += nb;
+            stage_bytes += nb;
+            did_full = true;
+            continue;
+        }
+
+        const int32_t old_len  = delta_state->kv_runs_slice_len[(size_t) s];
+        const int32_t scan_len = std::max(cur_len, old_len);
+        delta_state->kv_runs_slice_len[(size_t) s] = cur_len;
+
+        int32_t span_lo = -1;
+        int32_t span_hi = -1;
+        auto flush_span = [&]() {
+            if (span_lo < 0) {
+                return;
+            }
+            const size_t nb = (size_t) (span_hi - span_lo) * 16;
+            spans.push_back({ (size_t) (s * n_entries + span_lo) * 16, sh + 4 * span_lo, nb });
+            raw_bytes   += nb;
+            stage_bytes += nb;
+            span_lo = -1;
+            span_hi = -1;
+        };
+
+        for (int32_t e = 0; e < scan_len; ++e) {
+            const int32_t * want = e < cur_len ? (tm + 4 * e) : zero4;
+            int32_t * cur = sh + 4 * e;
+            if (cur[0] != want[0] || cur[1] != want[1] || cur[2] != want[2] || cur[3] != want[3]) {
+                cur[0] = want[0];
+                cur[1] = want[1];
+                cur[2] = want[2];
+                cur[3] = want[3];
+                if (span_lo < 0) {
+                    span_lo = e;
+                    span_hi = e + 1;
+                } else if (e <= span_hi + 2) {
+                    span_hi = e + 1;
+                } else {
+                    flush_span();
+                    span_lo = e;
+                    span_hi = e + 1;
+                }
+            }
+        }
+        flush_span();
+    }
+
+    if (spans.empty()) {
+        return;
+    }
+    if (did_full) {
+        delta_stats.kv_runs.full_uploads++;
+    } else {
+        delta_stats.kv_runs.delta_uploads++;
+    }
+    delta_stats.kv_runs.spans += spans.size();
+    delta_stats.kv_runs.bytes += raw_bytes;
+
+    auto & kr = delta_state->kv_runs;
+    ggml_backend_t backend = sched ? ggml_backend_sched_get_tensor_backend(sched, dst) : nullptr;
+    if (!backend && sched) {
+        backend = ggml_backend_sched_get_tensor_backend(sched, kr.tensor);
+    }
+    if (backend) {
+        kr.begin_upload(backend, stage_bytes);
+        for (const auto & sp : spans) {
+            kr.upload_to(kr.tensor, sp.byte_off, sp.ptr, sp.nbytes);
+        }
+        kr.end_upload();
+    } else {
+        for (const auto & sp : spans) {
+            ggml_backend_tensor_set(kr.tensor, sp.ptr, sp.byte_off, sp.nbytes);
         }
     }
 }
@@ -3785,6 +4058,11 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
 
         llama_kv_cache_set_input_kq_mask(dst, ubatch, causal_attn, hparams, v_cells, seq_to_stream, n_swa, swa_type, scan_cells, seq_bits,
                 rows, attn_mask.block_uniform);
+
+        delta_stats.kq_mask.calls++;
+        delta_stats.kq_mask.full_uploads++;
+        delta_stats.kq_mask.spans++;
+        delta_stats.kq_mask.bytes += ggml_nbytes(dst);
 
         //const int64_t t_end = ggml_time_us();
 
@@ -3850,6 +4128,8 @@ void llama_kv_cache::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * 
         const auto & cells = v_cells.at(strm);
         GGML_ASSERT(n_kv <= cells.size());
         ggml_backend_tensor_set(dst, cells.positions().data(), s*dst->nb[1], n_kv*sizeof(llama_pos));
+        delta_stats.cell_pos.spans++;
+        delta_stats.cell_pos.bytes += (size_t) n_kv * sizeof(llama_pos);
         if (dst->ne[2] == 2) {
             std::fill(hot_map.begin(), hot_map.end(), -1);
             if (has_kv_mixed() && strm < kv_mixed_slot_to_cell.size()) {
@@ -3863,8 +4143,12 @@ void llama_kv_cache::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * 
                 }
             }
             ggml_backend_tensor_set(dst, hot_map.data(), s*dst->nb[1] + dst->nb[2], n_kv*sizeof(int32_t));
+            delta_stats.cell_pos.spans++;
+            delta_stats.cell_pos.bytes += (size_t) n_kv * sizeof(int32_t);
         }
     }
+    delta_stats.cell_pos.calls++;
+    delta_stats.cell_pos.full_uploads++;
 }
 
 bool llama_kv_cache::kv_runs_fit(const llama_ubatch & ubatch, uint32_t n_max) const {
@@ -3886,7 +4170,15 @@ bool llama_kv_cache::kv_runs_fit(const llama_ubatch & ubatch, uint32_t n_max) co
 
 void llama_kv_cache::set_input_kv_runs(ggml_tensor * dst, const llama_ubatch * ubatch, ggml_backend_sched_t sched) const {
     GGML_ASSERT(kv_runs && dst->type == GGML_TYPE_I32 && dst->ne[0] == 4 && dst->ne[2] == ubatch->n_tokens + 1);
+    if (is_resident_kv_runs(dst)) {
+        sync_resident_kv_runs(dst, ubatch, sched);
+        return;
+    }
     const size_t nbytes = ggml_nbytes(dst);
+    delta_stats.kv_runs.calls++;
+    delta_stats.kv_runs.full_uploads++;
+    delta_stats.kv_runs.spans++;
+    delta_stats.kv_runs.bytes += nbytes;
     if (!delta_state) {
         delta_state = std::make_shared<llama_kv_delta_state>();
     }
@@ -3896,12 +4188,18 @@ void llama_kv_cache::set_input_kv_runs(ggml_tensor * dst, const llama_ubatch * u
     ggml_backend_t backend = sched ? ggml_backend_sched_get_tensor_backend(sched, dst) : nullptr;
     if (backend && dst->buffer && !ggml_backend_buffer_is_host(dst->buffer)) {
         auto & st = delta_state->kv_runs_stage;
+        st.batch_spans = batch_delta_spans;
         st.begin_upload(backend, nbytes);
         st.upload_to(dst, 0, data.data(), nbytes);
         st.end_upload();
     } else {
         ggml_backend_tensor_set(dst, data.data(), 0, nbytes);
     }
+}
+
+void llama_kv_cache::write_kv_runs_host(const llama_ubatch & ubatch, int32_t * data, int64_t n_entries) const {
+    GGML_ASSERT(kv_runs);
+    kv_runs->write(v_cells[0], ubatch, data, n_entries);
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

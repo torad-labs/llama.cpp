@@ -528,6 +528,37 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
     backend->iface.get_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
+void ggml_backend_tensor_set_n_async(ggml_backend_t backend, struct ggml_tensor * const * tensors,
+        const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    GGML_ASSERT(backend);
+    if (n_tensors == 0) {
+        return;
+    }
+    if (n_tensors == 1) {
+        if (sizes[0] > 0) {
+            ggml_backend_tensor_set_async(backend, tensors[0], data[0], offsets[0], sizes[0]);
+        }
+        return;
+    }
+    for (size_t i = 0; i < n_tensors; i++) {
+        GGML_ASSERT(tensors[i] != NULL);
+        if (sizes[i] == 0) {
+            continue;
+        }
+        GGML_ASSERT(tensors[i]->data != NULL && "tensor not allocated");
+        GGML_ASSERT(offsets[i] + sizes[i] <= ggml_nbytes(tensors[i]) && "tensor write out of bounds");
+    }
+    if (backend->iface.set_tensor_n_async != NULL) {
+        backend->iface.set_tensor_n_async(backend, tensors, data, offsets, sizes, n_tensors);
+        return;
+    }
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (sizes[i] > 0) {
+            ggml_backend_tensor_set_async(backend, tensors[i], data[i], offsets[i], sizes[i]);
+        }
+    }
+}
+
 void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -1234,6 +1265,7 @@ struct ggml_backend_sched {
     // staging slot (host memory of the backend's device) and set asynchronously on the backend's stream, which runs it
     // after the work still reading the destination; the two slots alternate per compute, each waited on before its reuse
     bool async_inputs;
+    bool batch_inputs;
     bool staging_off[GGML_SCHED_MAX_BACKENDS]; // the backend has no host buffer type, events or async set in its compute's queue
     struct {
         ggml_backend_buffer_t buf;
@@ -2225,8 +2257,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 // GGML_SCHED_ASYNC_INPUTS_LEGACY=1: every input is copied after its split's backend has finished all its work (the
 // behaviour before the staging slots)
 static bool ggml_backend_sched_async_inputs_legacy() {
-    static const bool legacy = ggml_env_switch("GGML_SCHED_ASYNC_INPUTS_LEGACY");
-    return legacy;
+    return ggml_env_switch("GGML_SCHED_ASYNC_INPUTS_LEGACY");
+}
+
+// GGML_SCHED_BATCH_INPUTS_LEGACY=1: each staged input is uploaded via its own set_tensor_async call
+static bool ggml_backend_sched_batch_inputs_legacy() {
+    return ggml_env_switch("GGML_SCHED_BATCH_INPUTS_LEGACY");
 }
 
 // inputs up to this size go through a staging slot; a larger one keeps the synchronous copy, whose wait costs about as
@@ -2466,6 +2502,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         bool staged = false;
+        constexpr size_t max_stage_batch = 64;
+        struct ggml_tensor * stage_tensors[max_stage_batch];
+        const void *         stage_data   [max_stage_batch];
+        size_t               stage_offsets[max_stage_batch];
+        size_t               stage_sizes  [max_stage_batch];
+        size_t               n_stage_batch = 0;
+        auto flush_stage_batch = [&]() {
+            if (n_stage_batch > 0) {
+                ggml_backend_tensor_set_n_async(split_backend, stage_tensors, stage_data, stage_offsets, stage_sizes, n_stage_batch);
+                n_stage_batch = 0;
+            }
+        };
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
@@ -2482,7 +2530,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_synchronize(ggml_backend_sched_get_tensor_backend(sched, input));
                     }
                     memcpy(data, input->data, nbytes);
-                    ggml_backend_tensor_set_async(split_backend, input_cpy, data, 0, nbytes);
+                    if (sched->batch_inputs && split_backend->iface.set_tensor_n_async != NULL) {
+                        if (n_stage_batch == max_stage_batch) {
+                            flush_stage_batch();
+                        }
+                        stage_tensors[n_stage_batch] = input_cpy;
+                        stage_data   [n_stage_batch] = data;
+                        stage_offsets[n_stage_batch] = 0;
+                        stage_sizes  [n_stage_batch] = nbytes;
+                        n_stage_batch++;
+                    } else {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, data, 0, nbytes);
+                    }
                     staging_used[split_backend_id] += GGML_PAD(nbytes, 64);
                     staged = true;
                     continue;
@@ -2490,6 +2549,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, input);
             }
         }
+        flush_stage_batch();
         // after the copies above, which may read host memory reused by the copies of the next split
         // before the weights, whose copy callback may queue large uploads
         ggml_backend_sched_prefetch_inputs(sched, split_id);
@@ -2581,6 +2641,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
     sched->async_inputs = sched->n_copies == 1 && !ggml_backend_sched_async_inputs_legacy();
+    sched->batch_inputs = sched->async_inputs && !ggml_backend_sched_batch_inputs_legacy();
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)

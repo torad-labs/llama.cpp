@@ -154,7 +154,8 @@ const std::vector<llama_kv_run> * llama_kv_runs::get(const llama_kv_cells & cell
     return sr.runs.size() <= n_max ? &sr.runs : nullptr;
 }
 
-void llama_kv_runs::write(const llama_kv_cells & cells, const llama_ubatch & ubatch, int32_t * data, int64_t n_entries) {
+void llama_kv_runs::write_active(const llama_kv_cells & cells, const llama_ubatch & ubatch, int32_t * data, int64_t n_entries,
+        std::vector<int32_t> & active_counts) {
     const uint32_t n_rows = ubatch.n_tokens;
     std::vector<const std::vector<llama_kv_run> *> lists(n_rows);
     std::vector<uint32_t> seq_of(n_rows);
@@ -179,7 +180,7 @@ void llama_kv_runs::write(const llama_kv_cells & cells, const llama_ubatch & uba
             }
         }
     }
-    std::fill(data, data + 4*n_entries*(n_rows + 1), 0);
+    active_counts.resize(n_rows + 1);
     int32_t * list = data + 4*n_entries*n_rows;
     int32_t n_list = 0, at_list = 0;
     for (auto it = held.begin(); it != held.end();) {
@@ -201,7 +202,14 @@ void llama_kv_runs::write(const llama_kv_cells & cells, const llama_ubatch & uba
     }
     list[0] = n_list;
     list[1] = at_list;
-    list[4*(1 + n_list) + 2] = at_list;
+    list[2] = 0;
+    list[3] = 0;
+    int32_t * list_end = list + 4*(1 + n_list);
+    list_end[0] = 0;
+    list_end[1] = 0;
+    list_end[2] = at_list;
+    list_end[3] = 0;
+    active_counts[n_rows] = n_list + 2;
 
     // each row: the runs of the shared list first, then the others, in cell order as the sequence holds them
     for (uint32_t r = 0; r < n_rows; ++r) {
@@ -226,6 +234,18 @@ void llama_kv_runs::write(const llama_kv_cells & cells, const llama_ubatch & uba
         row[1] = at;
         row[2] = n_shared;
         row[3] = int32_t(seq_of[r]);
-        row[4*(1 + n) + 2] = at;
+        int32_t * row_end = row + 4*(1 + n);
+        row_end[0] = 0;
+        row_end[1] = 0;
+        row_end[2] = at;
+        row_end[3] = 0;
+        active_counts[r] = n + 2;
     }
+}
+
+void llama_kv_runs::write(const llama_kv_cells & cells, const llama_ubatch & ubatch, int32_t * data, int64_t n_entries) {
+    const uint32_t n_rows = ubatch.n_tokens;
+    std::fill(data, data + 4*n_entries*(n_rows + 1), 0);
+    std::vector<int32_t> active_counts;
+    write_active(cells, ubatch, data, n_entries, active_counts);
 }

@@ -333,6 +333,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         # GPU and under a two-rank tensor split on it (GGML_CUDA_MMQ_FEW_GROUP_LEGACY)
         llama_test(test-llama-archs NAME test-inkling-stack-cuda0 ARGS --inkling-stack CUDA0 -s 1234)
         llama_test(test-llama-archs NAME test-inkling-stack-split-cuda0 ARGS --inkling-stack CUDA0,CUDA0 -s 1234)
+        # Inkling 2 dirty-range delta uploads + batched small H2D inputs verified bit-for-bit against legacy full writes
+        llama_test(test-llama-archs NAME test-inkling-delta-upload        ARGS --inkling-delta-upload CUDA0 -s 1234)
+        llama_test(test-llama-archs NAME test-inkling-delta-upload-split2 ARGS --inkling-delta-upload CUDA0,CUDA0 -s 1234)
+        llama_test(test-llama-archs NAME test-inkling-delta-upload-split4 ARGS --inkling-delta-upload CUDA0,CUDA0,CUDA0,CUDA0 -s 1234)
     endif()
     # Inkling 2's optimized paths against the paths they replaced, on the CPU and the GPU: the relative bias inside the
     # attention kernel (rel), the layer's fused ops (fuse), its short convolutions (conv), and its quantized KV caches
@@ -911,6 +915,32 @@ if (GGML_CUDA)
     llama_test(test-inkling-mmq-kquant NAME test-inkling-mmq-tma-kquant-cuda0 ARGS --tma)
     set_tests_properties(test-inkling-mmq-tma-kquant-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
         ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_MMQ_TMA=1")
+    # Blackwell K-quant staged MMQ (kquant-staged-kernel) and 23-row TMA MoE parity across 0/3/8 repeated experts and 1024/1536/4608 shards
+    llama_build(test-inkling-kquant-tile.cpp LINK ggml Threads::Threads)
+    add_test(NAME test-inkling-kquant-tile-staged-cuda0 COMMAND test-inkling-kquant-tile ${CMAKE_CURRENT_BINARY_DIR}/inkling-kquant-tile-staged.bin)
+    add_test(NAME test-inkling-kquant-tile-legacy-cuda0 COMMAND test-inkling-kquant-tile ${CMAKE_CURRENT_BINARY_DIR}/inkling-kquant-tile-legacy.bin)
+    add_test(NAME test-inkling-kquant-tile-exact COMMAND ${CMAKE_COMMAND} -E compare_files
+        ${CMAKE_CURRENT_BINARY_DIR}/inkling-kquant-tile-staged.bin ${CMAKE_CURRENT_BINARY_DIR}/inkling-kquant-tile-legacy.bin)
+    set_tests_properties(test-inkling-kquant-tile-staged-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMQ_KQUANT_STAGED_LEGACY=0")
+    set_tests_properties(test-inkling-kquant-tile-legacy-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMQ_KQUANT_STAGED_LEGACY=1")
+    set_tests_properties(test-inkling-kquant-tile-exact PROPERTIES LABELS "main"
+        DEPENDS "test-inkling-kquant-tile-staged-cuda0;test-inkling-kquant-tile-legacy-cuda0")
+    llama_test(test-inkling-kquant-tile NAME test-inkling-moe-tma-23row-cuda0 ARGS --tma-23)
+    set_tests_properties(test-inkling-moe-tma-23row-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_MMQ_TMA=1")
+    # Blackwell K-quant-scoped J rule (kquant-j-rule): pins GLM IQ3_XXS selections unchanged and verifies live sm_120 dispatch
+    set_source_files_properties(test-inkling-kquant-jrule.cpp PROPERTIES LANGUAGE CUDA)
+    llama_build(test-inkling-kquant-jrule.cpp LINK ggml)
+    target_include_directories(test-inkling-kquant-jrule PRIVATE ${CUDAToolkit_INCLUDE_DIRS}
+        ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    add_test(NAME test-inkling-kquant-jrule-cuda0 COMMAND test-inkling-kquant-jrule ${CMAKE_CURRENT_BINARY_DIR}/inkling-kquant-jrule.jsonl)
+    add_test(NAME test-inkling-kquant-jrule-legacy-cuda0 COMMAND test-inkling-kquant-jrule ${CMAKE_CURRENT_BINARY_DIR}/inkling-kquant-jrule-legacy.jsonl)
+    set_tests_properties(test-inkling-kquant-jrule-cuda0 PROPERTIES LABELS "main"
+        ENVIRONMENT "GGML_CUDA_MMQ_KQUANT_SPREAD_LEGACY=0")
+    set_tests_properties(test-inkling-kquant-jrule-legacy-cuda0 PROPERTIES LABELS "main"
+        ENVIRONMENT "GGML_CUDA_MMQ_KQUANT_SPREAD_LEGACY=1")
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)

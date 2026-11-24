@@ -4164,6 +4164,79 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
 }
 
+static void ggml_backend_meta_set_tensor_n_async(ggml_backend_t backend, struct ggml_tensor * const * tensors,
+        const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    struct rank_batch {
+        std::vector<ggml_tensor *> tensors;
+        std::vector<const void *>  data;
+        std::vector<size_t>        offsets;
+        std::vector<size_t>        sizes;
+
+        void push(ggml_tensor * t, const void * d, size_t off, size_t sz) {
+            tensors.push_back(t);
+            data.push_back(d);
+            offsets.push_back(off);
+            sizes.push_back(sz);
+        }
+
+        void clear() {
+            tensors.clear();
+            data.clear();
+            offsets.clear();
+            sizes.clear();
+        }
+    };
+    std::vector<rank_batch> per_rank(n_backends);
+    bool has_pending = false;
+
+    auto flush = [&]() {
+        if (!has_pending) {
+            return;
+        }
+        for (size_t rank = 0; rank < n_backends; rank++) {
+            auto & b = per_rank[rank];
+            if (b.tensors.empty()) {
+                continue;
+            }
+            ggml_backend_tensor_set_n_async(
+                ggml_backend_meta_simple_backend(backend, rank),
+                b.tensors.data(), b.data.data(), b.offsets.data(), b.sizes.data(), b.tensors.size());
+            b.clear();
+        }
+        has_pending = false;
+    };
+
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (sizes[i] == 0) {
+            continue;
+        }
+        ggml_tensor * tensor = tensors[i];
+        const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+        if (ggml_backend_meta_outer_ranges(tensor, split_state, n_backends, offsets[i], sizes[i],
+                [&](size_t rank, size_t local, size_t source, size_t bytes) {
+                    per_rank[rank].push(
+                        ggml_backend_meta_buffer_simple_tensor(tensor, rank),
+                        (const char *) data[i] + source, local, bytes);
+                    has_pending = true;
+                })) {
+            continue;
+        }
+        if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            for (size_t rank = 0; rank < n_backends; rank++) {
+                per_rank[rank].push(
+                    ggml_backend_meta_buffer_simple_tensor(tensor, rank),
+                    data[i], offsets[i], sizes[i]);
+            }
+            has_pending = true;
+            continue;
+        }
+        flush();
+        ggml_backend_meta_set_tensor_async(backend, tensor, data[i], offsets[i], sizes[i]);
+    }
+    flush();
+}
+
 static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
         const ggml_tensor * src, ggml_tensor * dst) {
     if (!backend_src || !backend_dst || !ggml_backend_is_meta(backend_src) || !ggml_backend_is_meta(backend_dst) ||
@@ -5205,6 +5278,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_record            = */ ggml_backend_meta_event_record,
     /* .event_wait              = */ ggml_backend_meta_event_wait,
     /* .graph_optimize          = */ nullptr,
+    /* .set_tensor_n_async      = */ ggml_backend_meta_set_tensor_n_async,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

@@ -772,7 +772,7 @@ static __global__ void quantize_mmq_few_q8_1(
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_few_id_q8_1(
         const float * x_ptr, const int32_t * ids, void * vy_ptr, int * pairs, const int64_t ne00, const int64_t s11, const int64_t s12,
-        const int ne11, const int n_experts, const int n_expert_used, const int64_t si1, const int npairs_max) {
+        const int ne11, const int n_experts, const int n_expert_used, const int64_t si1, const int npairs_max, int * npairs_out) {
     // per expert: bit t set if token t uses it and the index of its first pair; then the total number of pairs
     extern __shared__ unsigned int data_mmq_few_id[];
     unsigned int * tokens = data_mmq_few_id;
@@ -841,6 +841,9 @@ static __global__ void quantize_mmq_few_id_q8_1(
         for (int p = npairs + threadIdx.x; p < npairs_max; p += blockDim.x) {
             pairs[p*MMQ_FEW_PAIR_INTS + 1] = 0;
         }
+        if (threadIdx.x == 0 && npairs_out != nullptr) {
+            *npairs_out = npairs;
+        }
     }
 
     const int     e  = expert_of(blockIdx.x);
@@ -864,7 +867,7 @@ __launch_bounds__(256)
 static __global__ void quantize_mmq_few_id_bcast_q8_1(
         const float * x_ptr, const int32_t * ids_ptr, void * vy_ptr, int * pairs_ptr,
         const int nunits, const int64_t s12, const int n_experts, const int n_expert_used,
-        const int n_tokens, const int64_t si1, const int npairs_max) {
+        const int n_tokens, const int64_t si1, const int npairs_max, int * npairs_out) {
     using ds_t = typename std::conditional<ds_layout == MMQ_Q8_1_DS_LAYOUT_D4, float, half2>::type;
     static_assert(sizeof(ds_t) == sizeof(int), "unexpected ds_t size");
 
@@ -954,6 +957,9 @@ static __global__ void quantize_mmq_few_id_bcast_q8_1(
         for (int p = npairs + threadIdx.x; p < npairs_max; p += blockDim.x) {
             pairs[p*MMQ_FEW_PAIR_INTS + 1] = 0;
         }
+        if (threadIdx.x == 0 && npairs_out != nullptr) {
+            *npairs_out = npairs;
+        }
     }
 
     if (n_active == 0) {
@@ -1030,7 +1036,8 @@ void quantize_mmq_few_q8_1_cuda(
 
 void quantize_mmq_few_id_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, int * pairs, const mmq_q8_1_ds_layout ds_layout, const int64_t ne00, const int64_t s11, const int64_t s12,
-        const int64_t ne11, const int64_t n_experts, const int64_t n_expert_used, const int64_t n_tokens, const int64_t si1, const int64_t npairs_max, cudaStream_t stream) {
+        const int64_t ne11, const int64_t n_experts, const int64_t n_expert_used, const int64_t n_tokens, const int64_t si1, const int64_t npairs_max, cudaStream_t stream,
+        int * npairs_out) {
     GGML_ASSERT(ne00 % QK_K == 0);
     GGML_ASSERT(n_tokens <= 32); // one bit per token
 
@@ -1045,11 +1052,11 @@ void quantize_mmq_few_id_q8_1_cuda(
         switch (ds_layout) {
             case MMQ_Q8_1_DS_LAYOUT_D4:
                 ggml_cuda_kernel_launch(quantize_mmq_few_id_bcast_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>, launch_params,
-                    x, ids, vy, pairs, (int) nunits, s12, (int) n_experts, (int) n_expert_used, (int) n_tokens, si1, (int) npairs_max);
+                    x, ids, vy, pairs, (int) nunits, s12, (int) n_experts, (int) n_expert_used, (int) n_tokens, si1, (int) npairs_max, npairs_out);
                 break;
             case MMQ_Q8_1_DS_LAYOUT_DS4:
                 ggml_cuda_kernel_launch(quantize_mmq_few_id_bcast_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>, launch_params,
-                    x, ids, vy, pairs, (int) nunits, s12, (int) n_experts, (int) n_expert_used, (int) n_tokens, si1, (int) npairs_max);
+                    x, ids, vy, pairs, (int) nunits, s12, (int) n_experts, (int) n_expert_used, (int) n_tokens, si1, (int) npairs_max, npairs_out);
                 break;
             default:
                 GGML_ABORT("fatal error");
@@ -1066,11 +1073,11 @@ void quantize_mmq_few_id_q8_1_cuda(
     switch (ds_layout) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             ggml_cuda_kernel_launch(quantize_mmq_few_id_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>, launch_params,
-                x, ids, vy, pairs, ne00, s11, s12, (int) ne11, (int) n_experts, (int) n_expert_used, si1, (int) npairs_max);
+                x, ids, vy, pairs, ne00, s11, s12, (int) ne11, (int) n_experts, (int) n_expert_used, si1, (int) npairs_max, npairs_out);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             ggml_cuda_kernel_launch(quantize_mmq_few_id_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>, launch_params,
-                x, ids, vy, pairs, ne00, s11, s12, (int) ne11, (int) n_experts, (int) n_expert_used, si1, (int) npairs_max);
+                x, ids, vy, pairs, ne00, s11, s12, (int) ne11, (int) n_experts, (int) n_expert_used, si1, (int) npairs_max, npairs_out);
             break;
         default:
             GGML_ABORT("fatal error");

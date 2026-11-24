@@ -508,6 +508,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void input_lost() override;
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
@@ -528,6 +529,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    ggml_backend_sched_t sched = nullptr;
 };
 
 // V-less input for the KV cache
@@ -547,6 +549,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void input_lost() override;
 
     // like can_reuse, but does not re-bind mctx
     bool can_reuse_impl(const llm_graph_params & params);
@@ -561,6 +564,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    ggml_backend_sched_t sched = nullptr;
 };
 
 class llm_graph_input_attn_k_dsa : public llm_graph_input_i {
@@ -578,6 +582,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void input_lost() override;
 
     // like can_reuse, but does not re-bind mctx
     bool can_reuse_impl(const llm_graph_params & params);
@@ -597,6 +602,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_dsa_context * mctx;
+    ggml_backend_sched_t sched = nullptr;
 };
 
 // DSA input (full-attention layers + indexer) with K-only input for the SWA layers
@@ -615,6 +621,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void input_lost() override;
 
     llm_graph_input_attn_k_dsa * get_dsa() const { return inp_dsa.get(); }
     llm_graph_input_attn_k     * get_swa() const { return inp_swa.get(); }
@@ -660,6 +667,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void input_lost() override;
 
     ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
     ggml_tensor * get_v_idxs()     const { return self_v_idxs; }
@@ -704,6 +712,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void input_lost() override;
 
     ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
     ggml_tensor * get_k_idxs_swa() const { return self_k_idxs_swa; }
@@ -828,6 +837,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void input_lost() override;
 
     std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
@@ -838,6 +848,7 @@ public:
     const llama_cparams cparams;
 
     const llama_memory_hybrid_context * mctx;
+    ggml_backend_sched_t sched = nullptr;
 };
 
 class llm_graph_input_mem_hybrid_k : public llm_graph_input_i {
@@ -856,6 +867,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void input_lost() override;
 
     std::unique_ptr<llm_graph_input_attn_k> inp_attn;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
@@ -866,6 +878,7 @@ public:
     const llama_cparams cparams;
 
     const llama_memory_hybrid_context * mctx;
+    ggml_backend_sched_t sched = nullptr;
 };
 
 class llm_graph_input_mem_hybrid_iswa : public llm_graph_input_i {
@@ -884,6 +897,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void input_lost() override;
 
     std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn;
     std::unique_ptr<llm_graph_input_rs>          inp_rs;
