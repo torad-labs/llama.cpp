@@ -1,6 +1,6 @@
 # Inkling 2 integrated throughput: baseline vs integrated switches (RTX 5090)
 
-Measured 2026-11-24, 18:24-19:24 UTC (12:24-13:24 Chicago time), on the CloudRift
+Measured 2026-11-24, 18:24-19:40 UTC (12:24-13:40 Chicago time), on the CloudRift
 RTX 5090 box (ssh host `buildbox`, host `riftvm`) through `on-box`. Every number below
 is single-card and synthetic. Read the limits section before quoting any of it.
 
@@ -13,9 +13,17 @@ is single-card and synthetic. Read the limits section before quoting any of it.
   floor at 23 rows with 8 of 384 experts occupied, against a 387-408 us/step floor
   for every non-TMA arm (-41 to -43% by best observed). The route gate alone and
   L2 warming alone do not move that floor.
-- End-to-end decode on the synthetic `test-llama-archs` fixture shows no measurable
-  change in either direction. That is the expected result on that fixture (see limits)
-  and neither confirms nor contradicts served-model throughput.
+- The shipping default (device sync on, every opt-in off) shows no single-sequence
+  regression. Two calmer reruns settled the noisy first fixture run: pooled across
+  22 paired repetitions the default arm sits at 0.996x the legacy-sync baseline
+  (slower in 11 of 22), and TMA alone at +0.08% median against baseline. See Tier BB.
+- With every opt-in on, the integrated arm pays a real, reproducible cost on the
+  1-sequence toy fixture only: -9.3% decode throughput against the default arm
+  (paired ratio 0.908, slower in 14 of 15). It follows `GGML_CUDA_L2_EXPERT_WARM`
+  (about -7 points) plus `LLAMA_INKLING2_ROUTER_BAKE` (about -2 points) - the
+  costs that follow those switches in a zero-benefit case (2 tiny F32 experts, a
+  step that is almost all host overhead). No such cost appears at served shapes
+  (Tiers RG, BO).
 - Device arrival-counter sync (WS-3) shows no measurable single-card effect in any
   tier here. Its benefit was host sync calls on multi-rank paths, which a single
   card does not exercise.
@@ -54,23 +62,32 @@ WS-3 made device arrival-counter sync the default. The `sync` arm isolates that 
 difference (baseline vs sync is the WS-3 sync delta and also serves as a noise control).
 Each per-switch arm is measured against `sync`. A second short run added `tma-warm` and
 `route-tma` arms (same columns, the two named switches on) to check one interaction.
+Two later 1-sequence fixture reruns reused these arms; the second attributing run
+compared `sync`, `bake`, `warm`, and `integrated`.
 
 Method: fresh process per repetition, arms round-robin within each tier, one timed
 command at a time under its own `flock /tmp/buildbox-gpu.lock`, and `nvidia-smi`
 checked idle before every timed command (no other compute app was ever seen; the
-cross-lab verifier's GPU work and this bench hold the same lock). 184 timed runs in
-the main run and 36 in the interaction run, all exit 0. Logs on the box:
-`/tmp/inkbench/run.7fD7qW1n` (main) and `/tmp/inkbench/rg-interaction` (interaction),
-drivers `/tmp/inkbench/bench2.log` and `/tmp/inkbench/bench3.log`.
+cross-lab verifier's GPU work and this bench hold the same lock). The two 1-sequence
+reruns rotated the starting arm each round. 184 timed runs in the main run, 36 in
+the interaction run, 75 in the 1-sequence rerun, and 60 in the attribution run, all
+exit 0. Logs on the box: `/tmp/inkbench/run.7fD7qW1n` (main),
+`/tmp/inkbench/rg-interaction` (interaction), `/tmp/inkbench/bb-pl1-rerun`
+(1-sequence rerun), and `/tmp/inkbench/bb-pl1-attr` (attribution), drivers
+`/tmp/inkbench/bench2.log` through `/tmp/inkbench/bench5.log`.
 
 ## Exact commands (on-box)
 
-Launch (both runs detached on the box, marker at the end):
+Launch (all runs detached on the box, marker at the end):
 
 ```sh
 on-box sh -c 'rm -f /tmp/inkbench/DONE2; nohup sh -c "bash /tmp/inkbench/run-throughput-bench.sh > /tmp/inkbench/bench2.log 2>&1; touch /tmp/inkbench/DONE2" >/dev/null 2>&1 & echo launched'
 on-box sh -c 'rm -f /tmp/inkbench/DONE3; nohup sh -c "bash /tmp/inkbench/run-rg-interaction.sh > /tmp/inkbench/bench3.log 2>&1; touch /tmp/inkbench/DONE3" >/dev/null 2>&1 & echo launched'
+on-box sh -c 'rm -f /tmp/inkbench/DONE4; nohup sh -c "bash /tmp/inkbench/run-bb-pl1-rerun.sh > /tmp/inkbench/bench4.log 2>&1; touch /tmp/inkbench/DONE4" >/dev/null 2>&1 & echo launched'
+on-box sh -c 'rm -f /tmp/inkbench/DONE5; nohup sh -c "bash /tmp/inkbench/run-bb-pl1-attr.sh > /tmp/inkbench/bench5.log 2>&1; touch /tmp/inkbench/DONE5" >/dev/null 2>&1 & echo launched'
 ```
+
+The 1-sequence rerun ran 19:29-19:34 UTC and the attribution run 19:36-19:40 UTC.
 
 Fixture written once, under the GPU lock, fixed seed:
 
@@ -94,7 +111,8 @@ flock /tmp/buildbox-gpu.lock env <ARM-ENV> $B/bin/test-inkling-route-gate /dev/n
 ```
 
 Tier BB, end-to-end decode on the synthetic fixture (built-in 16-token warmup;
-7 processes per arm and shape):
+7 processes per arm and shape in the main run, then two 15-process-per-arm reruns
+at pl=1 with the starting arm rotated each round):
 
 ```sh
 flock /tmp/buildbox-gpu.lock env <ARM-ENV> $B/bin/llama-batched-bench -m /tmp/inkbench/fixture1234/inkling2-moe.gguf -ngl 99 -c 2048 -b 2048 -ub 512 -npp 128 -ntg 512 -npl 1
@@ -212,12 +230,72 @@ ms/step is pl / S_TG (one batched decode step across pl sequences).
 | | tma | 6287.15 [5295.58, 10185.72] | 3.658 | -1.9% |
 | | integrated | 7620.82 [3628.91, 11223.25] | 3.018 | +19.0% |
 
-Reading: no measurable change. The integrated delta flips sign between the two
-shapes (-17.5% at pl=1, +19.0% at pl=23), the inert sync control at pl=1 is -31.3%,
-per-arm ranges span 2-3x, and warm alone at pl=23 (-26.8%) contradicts the integrated
-arm that contains it (+19.0%). The fixture is host-launch-bound (a 3-block, 512-wide
-model), so these medians mostly record host scheduling and clock state on a shared
-box. Nothing here is evidence about the served model, in either direction.
+The main run alone cannot settle pl=1. Per-arm ranges span 2-3x, and on this fixture
+`route` and `tma` are functionally identical to `sync` (neither switch can fire on
+2 F32 experts at these dims), yet their three medians span 320.78 to 431.17 t/s
+(1.34x) - wider than the integrated arm's -17.5% against baseline. The median in
+this report that did not reproduce was a Tier RG dense-case median, not this 1-seq
+median; pl=1 had no rerun, so it got two. Per-repetition pl=1 values from the main
+run, in repetition order (S_TG t/s):
+
+- baseline: 466.78, 278.50, 267.20, 726.51, 519.77, 574.39, 402.39
+- sync (the shipping default): 369.76, 289.18, 320.78, 369.87, 624.75, 313.51, 217.47
+- route (identical-config control): 389.60, 270.18, 326.07, 455.54, 634.37, 522.83, 219.05
+- tma: 297.71, 264.24, 464.69, 531.30, 431.17, 351.94, 534.17
+- integrated: 301.09, 400.61, 385.17, 469.65, 250.18, 294.29, 467.76
+
+1-sequence rerun (15 fresh processes per arm, starting arm rotated each round,
+19:29-19:34 UTC). Paired ratio is the median of arm/reference S_TG within the same
+repetition round, which cancels round-level host and clock state:
+
+| Arm | TG t/s median [min, max] | ms/step | Delta vs baseline | Paired vs baseline |
+| --- | --- | --- | --- | --- |
+| baseline | 587.51 [307.24, 678.69] | 1.702 | - | - |
+| sync (shipping default) | 558.16 [288.60, 700.58] | 1.792 | -5.00% | 1.002, faster in 8 of 15 |
+| tma | 587.98 [392.2, 673.5] | 1.701 | +0.08% | - |
+| integrated | 528.53 [353.04, 643.25] | 1.892 | -10.04% | 0.903, slower in 10 of 15 |
+
+The `route` control median was 567.07 t/s (-3.48%), so the three identical-config
+arms (sync, route, tma) span 1.053x by median in this rerun. Per-repetition values
+(S_TG t/s, repetition order):
+
+- baseline: 587.5, 506.6, 456.2, 307.2, 359.9, 428.7, 543.8, 661.1, 674.1, 599.8,
+  665.5, 591.2, 609.2, 567.3, 678.7
+- sync: 501.5, 533.1, 512.8, 525.3, 659.3, 288.6, 617.2, 700.6, 544.9, 594.3,
+  558.2, 539.4, 610.2, 573.9, 661.1
+- tma: 392.2, 427.1, 392.9, 653.0, 591.2, 664.8, 644.6, 570.9, 611.6, 515.4,
+  588.0, 494.7, 635.1, 577.7, 673.5
+- integrated: 485.6, 353.0, 535.7, 408.1, 436.0, 643.2, 574.8, 485.2, 443.4, 541.5,
+  546.8, 551.9, 528.5, 529.8, 486.9
+
+Pooling the main run and this rerun (22 paired rounds) settles the two arms that
+matter for the merge: the shipping default sits at 0.996x baseline (slower in 11
+of 22, a dead heat), and tma at 1.013x the shipping default (slower in 10 of 22).
+Neither shows a 1-sequence regression. The integrated arm still pointed slower,
+but its main-run paired comparison against sync had pointed the other way (1.201,
+slower in 3 of 7), so a calm-box attribution run separated the two switches that
+can act on this fixture (19:36-19:40 UTC, 15 processes per arm):
+
+| Arm | TG t/s median [min, max] | ms/step | Delta vs sync | Paired vs sync |
+| --- | --- | --- | --- | --- |
+| sync (shipping default) | 802.65 [699.56, 828.19] | 1.246 | - | - |
+| bake | 788.76 [747.17, 806.96] | 1.268 | -1.73% | 0.977, slower in 13 of 15 |
+| warm | 744.78 [711.74, 758.46] | 1.343 | -7.21% | 0.927, slower in 14 of 15 |
+| integrated | 727.86 [711.41, 746.10] | 1.374 | -9.32% | 0.908, slower in 14 of 15 |
+
+The two single-switch paired ratios multiply to the integrated ratio
+(0.977 x 0.927 = 0.906 vs 0.908 measured), so the cost is additive:
+`GGML_CUDA_L2_EXPERT_WARM` carries about 7 of the 9 points and
+`LLAMA_INKLING2_ROUTER_BAKE` about 2. Pooling main and attribution runs against
+sync gives bake 0.982 (slower in 14 of 22), warm 0.925 (18 of 22), integrated
+0.912 (17 of 22). This is a fixture-only result: the step is about 1.25 ms of
+mostly host and launch overhead for a 3-block, 512-wide model whose 2 tiny F32
+experts are always resident, so the warm plan's per-step side work is pure
+overhead and the bake has no benefit to offset the small cost that follows it. At
+served shapes the same
+switches show no cost (Tier RG floors, Tier BO above). The reruns cover pl=1 only;
+pl=23 remains unresolved noise (integrated +19.0% against warm alone at -26.8% in
+the main run) and no claim is made from it.
 
 ## Output identity
 
@@ -232,36 +310,49 @@ box. Nothing here is evidence about the served model, in either direction.
 
 - **GGML_CUDA_MMQ_TMA moved.** -14.3% on the stable 23-row Q3_K gate/up tier and the
   220-230 us sparse floor in the MoE step. No effect on the Q4_K down slice. This is
-  the only switch with a measurable single-card decode gain in this bench.
+  the only switch with a measurable single-card decode gain in this bench. It also
+  shows no 1-sequence regression: +0.08% median against baseline in the 15-rep
+  rerun and a pooled paired 1.013x against the shipping default over 22 rounds.
 - **GGML_CUDA_MOE_ROUTE_GATE did not move anything measurable here.** Its floors match
   baseline at every occupancy in the MoE step (395.3 vs 387.4 at 23 rows/8 occupied;
   3713.3 vs 3700.3 at 128 rows/384 occupied), it cannot fire in the other two tiers,
   and its output is bit-identical. That does not prove it is worthless - its case is
   prompt-route counting at served batch shapes - but this bench gives it no win.
-- **GGML_CUDA_L2_EXPERT_WARM did not move anything measurable here.** Floors and the
-  BO deltas (-0.7% gate, -4.4% down inside overlapping ranges) match baseline. In
-  these harnesses the expert weights are re-read every step from a small working
-  set, which is not the cold-weight regime the prefetch targets.
-- **LLAMA_INKLING2_ROUTER_BAKE did not move anything measurable here.** Bake alone:
-  -6.7% (pl=1) and +2.0% (pl=23) against a -31.3% / +2.2% control. On the served
+- **GGML_CUDA_L2_EXPERT_WARM: no served-shape effect, a real toy-fixture cost.**
+  Floors and the BO deltas (-0.7% gate, -4.4% down inside overlapping ranges) match
+  baseline. In these harnesses the expert weights are re-read every step from a
+  small working set, which is not the cold-weight regime the prefetch targets. On
+  the 1-sequence toy fixture, where it can only pay its fixed per-step cost, it
+  measures -7.21% against the default arm (paired 0.927, slower in 14 of 15;
+  pooled 0.925 over 22 rounds). That prices its overhead in the zero-benefit case,
+  not a served-shape regression.
+- **LLAMA_INKLING2_ROUTER_BAKE: no served-shape effect, a small toy-fixture cost.**
+  Bake alone measures -1.73% against the default arm at 1 sequence on the fixture
+  (paired 0.977, slower in 13 of 15; pooled 0.982 over 22 rounds). On the served
   model its purpose is keeping the fused router chain at 4608 wide; this fixture's
-  router is 512 by 2.
+  router is 512 by 2, so again only fixed cost shows.
 - **WS-3 device arrival-counter sync did not move anything measurable here.**
-  Baseline vs sync is inside noise in every tier (BO: -2.4% / +0.7%). A single card
-  has no cross-rank arrival to pace, so this bench cannot price it.
+  Baseline vs sync is inside noise in every tier (BO: -2.4% / +0.7%; 1-sequence
+  fixture pooled paired 0.996 over 22 rounds, slower in 11 of 22). The shipping
+  default carries no 1-sequence regression. A single card has no cross-rank
+  arrival to pace, so this bench cannot price its benefit.
 - **Combined (integrated) is TMA at sparse decode and unresolvable at dense shapes.**
   Where routing is sparse at 23 rows it matches TMA alone. Where most experts are
   occupied, the main run's medians suggested a cost that the interaction rerun did
-  not reproduce; by floor the dense difference is at most about 2%.
+  not reproduce; by floor the dense difference is at most about 2%. On the
+  1-sequence toy fixture the all-on arm pays -9.32% against the default arm
+  (paired 0.908), the sum of the warm and bake fixed costs above. That arm is not
+  the shipping default.
 
 ## Limits
 
 - **Synthetic everything.** Tier BB runs a 3-block, 512-wide, 2-expert F32 toy whose
   experts cannot trigger the route gate (needs 384 experts and K-quant named
-  weights), the TMA path (needs K-quant expert shapes), or L2 warming (no routed
-  expert tiles worth warming). Tier RG and BO use served shapes but formula-generated
-  routes and weights, no attention, no KV, no sampler. No number here is a served
-  Inkling 2 decode tok/s.
+  weights) or the TMA path (needs K-quant expert shapes), and give L2 warming and
+  the router bake no possible benefit to offset their fixed costs (2 tiny
+  always-resident experts, a 512 by 2 router). Tier RG and BO use served shapes but
+  formula-generated routes and weights, no attention, no KV, no sampler. No number
+  here is a served Inkling 2 decode tok/s.
 - **Single card.** Tensor-split serving, cross-rank all-reduce, and the arrival
   counters' pacing benefit are all untested by design on this box.
 - **Not everything can be turned off.** WS-1's fixes and the WS-4 f8_e4m3 KV gate
@@ -271,9 +362,13 @@ box. Nothing here is evidence about the served model, in either direction.
 - **Clock and host noise.** The card idles at 127 MHz and the box CPU was shared
   with other sessions' builds during parts of the run. GPU access was serialized by
   the per-command flock and idle-checked before every run, but short-process tiers
-  (RG, BB) still show discrete clock levels and 2-3x spreads. Their medians are
-  reported with spreads and floors so the reader can see the noise; only Tier BO
-  (about 3900-7700 internal runs per process) resolves differences under about 10%.
+  (RG, BB) in the main run still show discrete clock levels and 2-3x spreads. Their
+  medians are reported with spreads and floors so the reader can see the noise. The
+  two later 1-sequence BB reruns ran on a calmer box with tight spreads (the
+  attribution run's default arm spans 699.56-828.19 t/s) and rotated starts, so
+  their paired ratios resolve fixture-level fixed costs of a few percent. Only
+  Tier BO (about 3900-7700 internal runs per process) resolves served-shape
+  differences under about 10%.
 - **Occupancy is synthetic.** The sparse case (8 of 384 experts) and dense case
   (184-384 of 384) bracket served decode; where a real 23-session step lands
   between them depends on the served router's correlation, which this bench does
@@ -286,7 +381,11 @@ box. Nothing here is evidence about the served model, in either direction.
 For the combined-flags question: on the shapes that look like served Inkling 2
 decode, turning everything on buys the TMA win (about 14% on the 23-row Q3_K
 gate/up expert product, and the matching sparse-step floor drop) and costs nothing
-measurable anywhere else this bench can resolve. The route gate, L2 warming,
-router bake, and device sync may each earn their keep under served serving
-conditions, but on this single-card synthetic bench they are indistinguishable
-from noise.
+measurable at those shapes. The one cost this bench does resolve is on the toy
+fixture at 1 sequence, where the all-on arm pays about 9% against the shipping
+default in overhead that follows L2 warming and the router bake, with no benefit
+those switches could return on that fixture. The shipping default itself,
+and TMA alone, show no 1-sequence regression (pooled paired 0.996 and 1.013 over
+22 rounds). The route gate, L2 warming, router bake, and device sync may each earn
+their keep under served serving conditions, but at served shapes on this
+single-card synthetic bench they are indistinguishable from noise.
