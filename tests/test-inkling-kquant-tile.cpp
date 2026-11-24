@@ -297,8 +297,9 @@ static int run_tma_23_suite(ggml_backend_t cuda, ggml_backend_t cpu, int n_threa
     };
     const tma_cfg cfgs[] = {
         { GGML_TYPE_Q3_K, 4608, 4608,  96,  96, 384, true,  "tma23 q3_K 96/384 m=4608"  },
-        { GGML_TYPE_Q4_K, 2304, 4608,  96,  96, 384, false, "tma23 q4_K 96/384 k=2304"  },
+        // Run Q5_K (58.9 KiB SMEM) before Q4_K (49.7 KiB SMEM) at k=2304 to verify per-kernel SMEM opt-in.
         { GGML_TYPE_Q5_K, 2304, 4608,  96,  96, 384, false, "tma23 q5_K 96/384 k=2304"  },
+        { GGML_TYPE_Q4_K, 2304, 4608,  96,  96, 384, false, "tma23 q4_K 96/384 k=2304"  },
         { GGML_TYPE_Q3_K, 4608, 1024, 384,   0, 384, true,  "tma23 q3_K 384/384 m=1024" },
         { GGML_TYPE_Q3_K, 4608, 1536, 384,   0, 384, true,  "tma23 q3_K 384/384 m=1536" },
         { GGML_TYPE_Q4_K, 1024, 4608, 384,   0, 384, false, "tma23 q4_K 384/384 k=1024" },

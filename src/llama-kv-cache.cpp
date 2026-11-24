@@ -3846,7 +3846,7 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
     }
 }
 
-ggml_tensor * llama_kv_cache::get_resident_kv_runs(int64_t n_entries, int64_t n_rows_p1) const {
+ggml_tensor * llama_kv_cache::get_resident_kv_runs(int64_t n_entries, int64_t n_rows_p1, int64_t cap_rows_p1) const {
     if (n_entries < 2 || n_rows_p1 < 2) {
         return nullptr;
     }
@@ -3863,8 +3863,9 @@ ggml_tensor * llama_kv_cache::get_resident_kv_runs(int64_t n_entries, int64_t n_
     }
     auto & kr = delta_state->kv_runs;
     if (!kr.tensor) {
+        const int64_t min_rows = std::max<int64_t>(cap_rows_p1, 65);
         const int64_t cap = std::min<int64_t>(LLAMA_KV_RESIDENT_KV_RUNS_MAX_CAP,
-                std::max<int64_t>(need, n_entries * 65));
+                std::max<int64_t>(need, n_entries * min_rows));
         kr.ctx = ggml_init({ ggml_tensor_overhead(), nullptr, true });
         if (!kr.ctx) {
             return nullptr;

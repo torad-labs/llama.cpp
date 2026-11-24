@@ -368,7 +368,7 @@ public:
     void          sync_resident_cell_pos(ggml_tensor * dst, ggml_backend_sched_t sched, int64_t n_kv) const;
     ggml_tensor * get_resident_kq_mask(int64_t n_kv, int64_t n_tokens) const;
     bool          is_resident_kq_mask(const ggml_tensor * dst) const;
-    ggml_tensor * get_resident_kv_runs(int64_t n_entries, int64_t n_rows_p1) const;
+    ggml_tensor * get_resident_kv_runs(int64_t n_entries, int64_t n_rows_p1, int64_t cap_rows_p1 = 65) const;
     bool          is_resident_kv_runs(const ggml_tensor * dst) const;
     void          invalidate_delta_state() const;
 

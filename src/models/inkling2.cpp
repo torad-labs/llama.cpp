@@ -724,8 +724,9 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs(const llm_graph_params &
     for (int i = 0; i < 2; ++i) {
         if (rel->classify_runs(params, i)) {
             const int64_t n_entries = rel->runs_max[i] + 2;
+            const int64_t cap_rows_p1 = cparams.rel_query_group ? 257 : 65;
             ggml_tensor * base_runs = n_stream == 1 && cparams.n_seq_devices == 1 && !rel->cache[i]->is_full() ?
-                    rel->cache[i]->get_kv()->get_resident_kv_runs(n_entries, n_tokens + 1) : nullptr;
+                    rel->cache[i]->get_kv()->get_resident_kv_runs(n_entries, n_tokens + 1, cap_rows_p1) : nullptr;
             if (base_runs) {
                 kv_runs[i] = rel->runs[i] = ggml_view_3d(ctx0, base_runs, 4, n_entries, n_tokens + 1,
                         4*sizeof(int32_t), 4*n_entries*sizeof(int32_t), 0);

@@ -588,7 +588,7 @@ bool ggml_cuda_set_tensor_n_async(ggml_backend_cuda_context & ctx,
         }
     }
 
-    // Fast path 2: pack larger batches into 2-slot pinned host staging + single H2D + scatter kernel.
+    // Fast path 2: pack larger batches into multi-slot pinned host staging + single H2D + scatter kernel.
     auto & stage = ctx.async_batch_stage;
     if (!allow_pinned || stage.failed) {
         return false;
@@ -690,7 +690,7 @@ bool ggml_cuda_set_tensor_n_async(ggml_backend_cuda_context & ctx,
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(st.event, stream));
         st.recorded = true;
-        stage.cur_slot ^= 1;
+        stage.cur_slot = (stage.cur_slot + 1) % ggml_backend_cuda_context::ggml_cuda_async_batch_stage::n_slots;
         flushed_any = true;
 
         chunk_idx.clear();

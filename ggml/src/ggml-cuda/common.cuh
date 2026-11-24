@@ -2754,6 +2754,7 @@ struct ggml_backend_cuda_context {
     // Per-context staging for async batched H2D tensor writes (batch-copy.cu).
     struct ggml_cuda_async_batch_stage {
         static constexpr size_t max_bytes = 4*1024*1024;
+        static constexpr int    n_slots   = 4;
 
         struct slot_t {
             unsigned char * host     = nullptr;
@@ -2762,16 +2763,22 @@ struct ggml_backend_cuda_context {
             bool            recorded = false;
         };
 
-        unsigned char * dev_buf  = nullptr;
-        size_t          dev_cap  = 0;
-        slot_t          slots[2] = {};
-        int             cur_slot = 0;
-        bool            failed   = false;
+        unsigned char * dev_buf        = nullptr;
+        size_t          dev_cap        = 0;
+        slot_t          slots[n_slots] = {};
+        int             cur_slot       = 0;
+        bool            failed         = false;
 
         bool active() const {
-            return dev_buf != nullptr ||
-                slots[0].host != nullptr || slots[0].event != nullptr ||
-                slots[1].host != nullptr || slots[1].event != nullptr;
+            if (dev_buf != nullptr) {
+                return true;
+            }
+            for (const auto & s : slots) {
+                if (s.host != nullptr || s.event != nullptr) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         void release() {

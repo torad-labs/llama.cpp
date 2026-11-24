@@ -837,11 +837,11 @@ static __global__ void mmq_tma_weighted_sum_kernel(
 
 // Opt in to >48 KiB dynamic SMEM per kernel and device, safe inside CUDA graph capture.
 template <typename KernelFn>
-static void mmq_tma_ensure_smem(const int device, KernelFn kernel_fn, const size_t smem_bytes) {
+static void mmq_tma_ensure_smem(const int device, KernelFn kernel_fn,
+        std::atomic<int> (&max_smem)[GGML_CUDA_MAX_DEVICES], const size_t smem_bytes) {
     if (smem_bytes <= 48*1024) {
         return;
     }
-    static std::atomic<int> max_smem[GGML_CUDA_MAX_DEVICES];
     const int need = (int) smem_bytes;
     int prev = max_smem[device].load(std::memory_order_acquire);
     if (need <= prev) {
@@ -865,7 +865,8 @@ static void launch_mul_mat_q_tma_q45_K(
     const int tile_stride = ((tile_bytes + 127) / 128) * 128;
     const size_t smem_bytes = (size_t) (2*tile_stride) + 2*sizeof(uint64_t) +
         (size_t) (2*(NWARPS - 1)*4*WARP_SIZE)*sizeof(float);
-    mmq_tma_ensure_smem(device, mul_mat_q_tma_q45_K<type, NWARPS, OCC, SINGLE_UNIT>, smem_bytes);
+    static std::atomic<int> max_smem[GGML_CUDA_MAX_DEVICES];
+    mmq_tma_ensure_smem(device, mul_mat_q_tma_q45_K<type, NWARPS, OCC, SINGLE_UNIT>, max_smem, smem_bytes);
 
     const int nsm = ggml_cuda_info().devices[device].nsm;
     const int max_tiles = (nrows_x / MMQ_TMA_TILE_ROWS) * npairs_max;
@@ -894,15 +895,8 @@ static void dispatch_mul_mat_q_tma_q45_K(
     } else if (nunits == 4) {
         launch_mul_mat_q_tma_q45_K<type, 4, 2, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
             ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
-    } else if (nunits == 3) {
-        launch_mul_mat_q_tma_q45_K<type, 3, 3, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
-            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
-    } else if (nunits == 2) {
-        launch_mul_mat_q_tma_q45_K<type, 2, 4, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
-            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
     } else {
-        launch_mul_mat_q_tma_q45_K<type, 4, 1, false>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
-            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+        GGML_ABORT("unexpected nunits %d for Q4_K/Q5_K TMA", nunits);
     }
 }
 
@@ -955,11 +949,15 @@ static bool mmq_tma_q45_shape_ok(const ggml_tensor * w, int & nunits, int & row_
     if (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K) {
         return false;
     }
-    if (w->ne[0] % QK_K != 0 || w->ne[0] < 2*QK_K) {
+    if (w->ne[0] % QK_K != 0) {
+        return false;
+    }
+    const int u = (int) (w->ne[0] / QK_K);
+    if (u != 4 && u != 6 && u != 9) {
         return false;
     }
     const int unit_bytes = w->type == GGML_TYPE_Q4_K ? MMQ_TMA_Q4K_UNIT_BYTES : MMQ_TMA_Q5K_UNIT_BYTES;
-    nunits    = (int) (w->ne[0] / QK_K);
+    nunits    = u;
     row_bytes = nunits * unit_bytes;
     return row_bytes / 8 <= MMQ_TMA_Q45_MAX_BOX_U64;
 }
@@ -1030,7 +1028,8 @@ bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     if (is_q3k) {
         constexpr size_t smem_bytes = (size_t) (2*MMQ_TMA_TILE_STRIDE) + 2*sizeof(uint64_t) +
             (size_t) (2*(MMQ_TMA_Q3K_NWARPS - 1)*4*WARP_SIZE)*sizeof(float);
-        mmq_tma_ensure_smem(ctx.device, mul_mat_q_tma_q3_K, smem_bytes);
+        static std::atomic<int> max_smem_q3k[GGML_CUDA_MAX_DEVICES];
+        mmq_tma_ensure_smem(ctx.device, mul_mat_q_tma_q3_K, max_smem_q3k, smem_bytes);
         const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
         const int max_tiles = (int) (src0->ne[1]/MMQ_TMA_TILE_ROWS) * npairs_max;
         const dim3 grid((unsigned) std::max(1, std::min(nsm, max_tiles)), 1, 1);
@@ -1089,7 +1088,8 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
 
     constexpr size_t smem_bytes = (size_t) (2*MMQ_TMA_TILE_STRIDE) + 2*sizeof(uint64_t) +
         (size_t) (2*(MMQ_TMA_Q3K_NWARPS - 1)*4*WARP_SIZE)*sizeof(float);
-    mmq_tma_ensure_smem(ctx.device, mul_mat_q_tma_q3_K_gate_up_situ, smem_bytes);
+    static std::atomic<int> max_smem_gu[GGML_CUDA_MAX_DEVICES];
+    mmq_tma_ensure_smem(ctx.device, mul_mat_q_tma_q3_K_gate_up_situ, max_smem_gu, smem_bytes);
 
     cudaStream_t stream = ctx.stream();
     const int64_t n_expert_used = ids->ne[0];

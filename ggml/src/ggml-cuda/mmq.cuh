@@ -500,7 +500,7 @@ static constexpr __device__ bool mmq_iq3_xxs_staged(const ggml_type type) {
 #endif // defined(BLACKWELL_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
 }
 
-// Blackwell cp.async staging for Q3_K/Q4_K/Q5_K (double-buffered x_staged and two y buffers).
+// Blackwell cp.async staging for Q3_K/Q4_K/Q5_K (single x_staged buffer and two y buffers).
 #define MMQ_Q3_K_STAGED_ROW 128
 #define MMQ_Q4_K_STAGED_ROW 144
 #define MMQ_Q5_K_STAGED_ROW 176
@@ -2006,8 +2006,8 @@ static void launch_mul_mat_q_one(
 
     if (force_tiling) {
         GGML_ASSERT((rows_innermost ? args.ntj : nti) <= 65535); // gridDim.y limit
-        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, true>), nbytes_shared);
-        mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, true><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, false>), nbytes_shared);
+        mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, false><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, dst, nullptr,
              args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
