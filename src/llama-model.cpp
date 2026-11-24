@@ -445,7 +445,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // split of its rows gives out 3/2/2/2, and every layer waits for the card with 3
     static const std::regex inkling2_experts("blk\\.\\d+\\.ffn_(gate_up|down)_exps\\.weight");
     const bool by_expert = ud->model->experts_split_by_expert() && std::regex_match(tensor_name, inkling2_experts);
-    static const std::regex experts("blk\\.\\d+\\.ffn_(up|gate|down)_exps\\.weight");
+    static const std::regex experts("blk\\.\\d+\\.ffn_(up|gate|gate_up|down)_exps\\.weight");
     if (by_expert || (ud->model->split_mode() == LLAMA_SPLIT_MODE_DATA && std::regex_match(tensor_name, experts))) {
         GGML_ASSERT(tensor->ne[2] >= (int64_t) ud->n_devices);
         ggml_backend_meta_split_state split = {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
