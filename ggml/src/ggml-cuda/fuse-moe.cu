@@ -1,8 +1,11 @@
 #include "fuse-moe.cuh"
+#include "mmq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <type_traits>
@@ -39,7 +42,7 @@ __device__ __forceinline__ int32_t moe_chain_local(int32_t expert, int32_t first
 
 template <int n_expert, int cpl, bool has_bias, bool tma_mode>
 __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain(
-        const float * cur, const float * router, const float * bias, float * logits,
+        const float * cur, const float * expert_cur, const float * router, const float * bias, float * logits,
         int32_t * ids, float * weights, int32_t * routes, block_q8_1 * q8, unsigned int * flag,
         int32_t * local_ids_out, const int n_embd, const int n_tokens, const int n_used,
         const int ids_stride, const moe_chain_args args) {
@@ -65,7 +68,7 @@ __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain
         for (int b = blockIdx.x*MOE_CHAIN_WARPS + warp; b < n_blk; b += stride) {
             const int   row = b/per_row;
             const int   col = (b%per_row)*QK8_1;
-            const float xi  = cur[(int64_t) row*n_embd + col + lane];
+            const float xi  = expert_cur[(int64_t) row*n_embd + col + lane];
 
             float amax = warp_reduce_max<QK8_1>(fabsf(xi));
             const float  d = amax/127.0f;
@@ -516,7 +519,7 @@ static int moe_chain_cpl(int n_tokens) {
 }
 
 void ggml_cuda_op_moe_router_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * router, const ggml_tensor * cur,
-        const ggml_tensor * bias, ggml_tensor * logits, ggml_tensor * ids, ggml_tensor * weights,
+        const ggml_tensor * expert_cur, const ggml_tensor * bias, ggml_tensor * logits, ggml_tensor * ids, ggml_tensor * weights,
         int32_t * routes, block_q8_1 * q8, unsigned int * flag, int32_t first, int32_t count,
         float clamp_val, float scale_val, bool norm_eps, int32_t * local_ids_out, bool tma_mode) {
     constexpr int n_expert = 384;
@@ -541,7 +544,7 @@ void ggml_cuda_op_moe_router_chain(ggml_backend_cuda_context & ctx, const ggml_t
     const auto launch_impl = [&](auto cpl_tag, auto bias_tag, auto tma_tag) {
         ggml_cuda_kernel_launch(
             moe_router_chain<n_expert, decltype(cpl_tag)::value, decltype(bias_tag)::value, decltype(tma_tag)::value>,
-            params, (const float *) cur->data, (const float *) router->data,
+            params, (const float *) cur->data, (const float *) expert_cur->data, (const float *) router->data,
             decltype(bias_tag)::value ? (const float *) bias->data : (const float *) nullptr,
             (float *) logits->data, (int32_t *) ids->data, (float *) weights->data,
             routes, q8, flag, local_ids_out, n_embd, n_tokens, n_used, ids_stride, args);
@@ -658,4 +661,223 @@ void ggml_cuda_op_moe_experts_weighted_sum(ggml_backend_cuda_context & ctx, cons
         case GGML_TYPE_Q5_K: launch(std::integral_constant<ggml_type, GGML_TYPE_Q5_K>{}); break;
         default: GGML_ABORT("moe_experts_weighted_sum has no launch for %s", ggml_type_name(w->type));
     }
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+namespace {
+constexpr int route_gate_experts = 384;
+constexpr int route_gate_slots = 8;
+
+// Prefix counts give each expert the same columns as the stock MMQ mapping.
+__global__ void moe_route_census(const int32_t * ids, const int rows, const int stride, const int experts,
+        int * ends, int * active, ggml_cuda_mm_id_tile_spec * tiles, const int ntiles) {
+    constexpr int threads = 512;
+    __shared__ int counts[threads];
+    __shared__ int warps[threads/WARP_SIZE];
+    __shared__ int active_warps[threads/WARP_SIZE];
+    const int i = threadIdx.x;
+    const int lane = i % WARP_SIZE;
+    const int warp = i / WARP_SIZE;
+    counts[i] = 0;
+    for (int j = i; j < ntiles; j += threads) {
+        tiles[j] = {};
+    }
+    __syncthreads();
+
+    for (int r = i; r < rows*route_gate_slots; r += threads) {
+        const int expert = ids[(r/route_gate_slots)*stride + r%route_gate_slots];
+        if (expert >= 0 && expert < experts) {
+            atomicAdd(&counts[expert], 1);
+        }
+    }
+    __syncthreads();
+
+    int sum = counts[i];
+    const unsigned occupied = __ballot_sync(0xffffffff, sum != 0);
+    for (int step = 1; step < WARP_SIZE; step *= 2) {
+        const int prior = __shfl_up_sync(0xffffffff, sum, step);
+        if (lane >= step) {
+            sum += prior;
+        }
+    }
+    if (lane == WARP_SIZE - 1) {
+        warps[warp] = sum;
+        active_warps[warp] = __popc(occupied);
+    }
+    __syncthreads();
+
+    if (i < experts) {
+        int rank = __popc(occupied & ((1u << lane) - 1));
+        for (int j = 0; j < warp; ++j) {
+            sum  += warps[j];
+            rank += active_warps[j];
+        }
+        ends[i] = sum;
+        if (counts[i] != 0) {
+            active[rank] = i;
+        }
+    }
+    if (i == 0) {
+        int count = 0;
+        for (int j = 0; j < threads/WARP_SIZE; ++j) {
+            count += active_warps[j];
+        }
+        active[experts] = count;
+    }
+}
+
+__device__ void moe_route_expert(const int32_t * ids, const int rows, const int stride, const int src_stride,
+        const bool broadcast, const int * ends, int32_t * from, int32_t * to, ggml_cuda_mm_id_tile_spec * tiles,
+        const int width, const int seams, const int expert) {
+    const int end = ends[expert];
+    const int start = expert == 0 ? 0 : ends[expert - 1];
+
+    const int lane = threadIdx.x;
+    int col = start;
+    for (int base = 0; base < rows*route_gate_slots && col < end; base += WARP_SIZE) {
+        const int route = base + lane;
+        const int token = route/route_gate_slots;
+        const int slot = route%route_gate_slots;
+        const bool hit = token < rows && ids[token*stride + slot] == expert;
+        const unsigned mask = __ballot_sync(0xffffffff, hit);
+        if (hit) {
+            const int packed = col + __popc(mask & ((1u << lane) - 1));
+            to[packed] = route;
+            if (broadcast) {
+                from[route] = packed;
+            } else {
+                from[packed] = token*src_stride + slot;
+            }
+        }
+        col += __popc(mask);
+    }
+
+    if (lane == 0) {
+        col = start;
+        int high = min(col + width, end);
+        while (high > ((col + width - 1)/width)*width) {
+            tiles[(col + width - 1)/width] = {expert, col, high, 0};
+            col = high;
+            high = min(col + width, end);
+        }
+        if (col != high) {
+            tiles[seams + expert] = {expert, col, high, 0};
+        }
+    }
+}
+__global__ void moe_route_tiles(const int32_t * ids, const int rows, const int stride, const int src_stride,
+        const bool broadcast, const int * ends, const int * active, const int experts, int32_t * from, int32_t * to,
+        ggml_cuda_mm_id_tile_spec * tiles, const int width, const int seams) {
+    const int occupied = active[experts];
+    for (int rank = blockIdx.x; rank < occupied; rank += gridDim.x) {
+        moe_route_expert(ids, rows, stride, src_stride, broadcast, ends, from, to, tiles, width, seams, active[rank]);
+    }
+}
+
+} // namespace
+#endif
+
+bool ggml_cuda_moe_route_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
+        const ggml_tensor * ids, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool enabled = ggml_env_switch("GGML_CUDA_MOE_ROUTE_GATE");
+    if (!enabled) {
+        return false;
+    }
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    const int64_t rows = ids->ne[1];
+    const int64_t experts = w->ne[2];
+    const int64_t expert_total = ggml_get_op_params_i32(dst, 2);
+    const bool gate_up = w->ne[0] == 4608 && w->ne[1] == 4608 && strstr(w->name, ".ffn_gate_up_exps.weight");
+    const bool down = w->ne[0] == 2304 && w->ne[1] == 4608 && strstr(w->name, ".ffn_down_exps.weight");
+    if (device.cc != GGML_CUDA_CC_BLACKWELL || (!gate_up && !down) ||
+            !w->buffer || ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+            (w->type != GGML_TYPE_Q3_K && w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K) ||
+            (expert_total ? expert_total : experts) != route_gate_experts || experts > route_gate_experts ||
+            rows < 2 || rows > 2048 || ids->ne[0] != route_gate_slots || ids->nb[0] != sizeof(int32_t) ||
+            ids->ne[2] != 1 || ids->ne[3] != 1 || x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(dst) ||
+            x->ne[2] != rows || (x->ne[1] != 1 && x->ne[1] != route_gate_slots) || w->ne[3] != 1 || x->ne[3] != 1) {
+        return false;
+    }
+
+    // Keep the stock tile width and seams so Stream-K keeps its reduction order.
+    int64_t cols = rows;
+    if (!ggml_cuda_mmq_moe_tiles_legacy()) {
+        static const bool legacy_spread = ggml_env_switch("GGML_CUDA_MMQ_KQUANT_SPREAD_LEGACY");
+        const int64_t override_cols = ggml_cuda_mmq_moe_ncols();
+        const int64_t spread = ggml_cuda_mmq_moe_spread_ncols(
+            w->type, device.cc, rows, route_gate_slots, route_gate_experts, legacy_spread);
+        cols = std::min({rows, int64_t(128), override_cols > 0 ? override_cols : spread});
+    }
+    int width = 0;
+    int nthreads = 0;
+    int best = INT_MAX;
+    for (int j = 8; j <= 128 && best > 1; j += 8) {
+        const auto config = ggml_cuda_mmq_get_config(w->type, j, ggml_cuda_mmq_needs_fallback(w->ne[1]), device.cc, GGML_PREC_Q8);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, device.cc) <= device.smpbo &&
+                (cols + config.J - 1)/config.J < best) {
+            best = (cols + config.J - 1)/config.J;
+            width = j;
+            nthreads = config.nthreads;
+        }
+    }
+    GGML_ASSERT(width > 0);
+
+    const int routes = rows*route_gate_slots;
+    const int seams = (routes + width - 1)/width;
+    const int ntiles = seams + experts;
+    const int64_t k_padded = GGML_PAD(w->ne[0], MATRIX_ROW_PADDING);
+    const size_t padding = GGML_PAD(width*sizeof(block_q8_1_mmq), nthreads*sizeof(int));
+    auto & pool = ctx.pool();
+    ggml_cuda_pool_alloc<int> ends(pool, experts);
+    ggml_cuda_pool_alloc<int> active(pool, experts + 1);
+    ggml_cuda_pool_alloc<int32_t> from(pool, routes);
+    ggml_cuda_pool_alloc<int32_t> to(pool, routes + width - 1);
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tiles(pool, ntiles);
+    ggml_cuda_pool_alloc<char> q8(pool, routes*k_padded*sizeof(block_q8_1_mmq)/QK8_1_MMQ + padding);
+    const auto stream = ctx.stream();
+    const auto * route_ids = (const int32_t *) ids->data;
+    const int stride = ids->nb[1]/sizeof(int32_t);
+    const bool broadcast = x->ne[1] == 1;
+    if (expert_total) {
+        CUDA_CHECK(cudaMemsetAsync(from.get(), broadcast ? 0xff : 0, routes*sizeof(int32_t), stream));
+    }
+    moe_route_census<<<1, 512, 0, stream>>>(route_ids, rows, stride, experts, ends.get(), active.get(), tiles.get(), ntiles);
+    moe_route_tiles<<<std::min<int>(experts, device.nsm), WARP_SIZE, 0, stream>>>(route_ids, rows, stride, x->nb[2]/x->nb[1],
+        broadcast, ends.get(), active.get(), experts, from.get(), to.get(), tiles.get(), width, seams);
+    CUDA_CHECK(cudaGetLastError());
+
+    const auto * src = (const float *) x->data;
+    if (broadcast) {
+        quantize_scatter_mmq_q8_1_cuda(src, from.get(), q8.get(), w->type, w->ne[0], x->nb[2]/sizeof(float),
+            k_padded, rows, routes, route_gate_slots, stream);
+    } else {
+        quantize_mmq_q8_1_cuda(src, from.get(), q8.get(), w->type, w->ne[0], x->nb[1]/sizeof(float),
+            x->nb[2]/sizeof(float), x->nb[3]/sizeof(float), k_padded, routes, 1, 1, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    const size_t weight_block = ggml_type_size(w->type);
+    const int64_t s12 = x->ne[1]*k_padded*sizeof(block_q8_1)/(QK8_1*sizeof(int));
+    mmq_args args = {
+        (const char *) w->data, w->type, (const int *) q8.get(), to.get(), tiles.get(), (float *) dst->data, nullptr,
+        w->ne[0], w->ne[1], routes, int64_t(w->nb[1]/weight_block), routes, int64_t(dst->nb[1]/sizeof(float)),
+        experts, 1, int64_t(w->nb[2]/weight_block), s12, int64_t(dst->nb[2]/sizeof(float)),
+        1, 1, int64_t(w->nb[3]/weight_block), rows*s12, int64_t(dst->nb[3]/sizeof(float)),
+        ntiles, width,
+    };
+    args.n_experts_total = expert_total;
+    args.route_name = w->name;
+    switch (w->type) {
+        case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K, GGML_PREC_Q8>(ctx, args, stream); break;
+        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8>(ctx, args, stream); break;
+        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K, GGML_PREC_Q8>(ctx, args, stream); break;
+        default: GGML_UNREACHABLE();
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(ctx, w, x, ids, dst);
+    return false;
+#endif
 }

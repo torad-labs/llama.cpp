@@ -754,6 +754,47 @@ set_tests_properties(test-backend-moe-prep-cpu PROPERTIES LABELS "main")
 if (GGML_CUDA)
     add_test(NAME test-inkling-moe-mul-mat-id-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID -p "n_mats=384,n_used=8,")
     add_test(NAME test-inkling-moe-block-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MOE)
+    llama_build(test-inkling-seam.cpp LINK ggml Threads::Threads)
+    add_test(NAME inkling-seam-ops-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
+        -p "n_mats=384,n_used=8,b=[01],m=4608,n=23,k=(4608|2304),")
+    add_test(NAME inkling-seam-broadcast-cuda0 COMMAND test-inkling-seam ${CMAKE_CURRENT_BINARY_DIR}/inkling-seam-broadcast.bin)
+    add_test(NAME inkling-seam-legacy-cuda0 COMMAND test-inkling-seam ${CMAKE_CURRENT_BINARY_DIR}/inkling-seam-legacy.bin)
+    add_test(NAME inkling-seam-exact-cuda0 COMMAND ${CMAKE_COMMAND} -E compare_files
+        ${CMAKE_CURRENT_BINARY_DIR}/inkling-seam-broadcast.bin ${CMAKE_CURRENT_BINARY_DIR}/inkling-seam-legacy.bin)
+    set_tests_properties(inkling-seam-broadcast-cuda0 PROPERTIES FIXTURES_SETUP seam_broadcast
+        ENVIRONMENT "GGML_CUDA_MMQ_FEW_ID_QUANT_LEGACY=0")
+    set_tests_properties(inkling-seam-legacy-cuda0 PROPERTIES FIXTURES_SETUP seam_legacy
+        ENVIRONMENT "GGML_CUDA_MMQ_FEW_ID_QUANT_LEGACY=1")
+    set_tests_properties(inkling-seam-exact-cuda0 PROPERTIES FIXTURES_REQUIRED "seam_broadcast;seam_legacy")
+    set_tests_properties(inkling-seam-ops-cuda0 inkling-seam-broadcast-cuda0 inkling-seam-legacy-cuda0
+        inkling-seam-exact-cuda0 PROPERTIES LABELS "main")
+    llama_build(test-inkling-router-bake.cpp llama-archs-gguf.cpp)
+    add_test(NAME inkling-router-bake-cuda0 COMMAND test-inkling-router-bake)
+    set_tests_properties(inkling-router-bake-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_DISABLE_GRAPHS=1")
+    llama_build(test-inkling-route-gate.cpp LINK ggml)
+    set(route_gate_env "GGML_CUDA_MMQ_FEW_LEGACY=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=8;GGML_CUDA_MMQ_TMA=0")
+    foreach(mode live graph)
+        if(mode STREQUAL live)
+            set(disable_graphs 1)
+        else()
+            set(disable_graphs 0)
+        endif()
+        foreach(arm dense gated)
+            if(arm STREQUAL dense)
+                set(route_gate_flag 0)
+            else()
+                set(route_gate_flag 1)
+            endif()
+            set(route_gate_test inkling-route-gate-${mode}-${arm})
+            add_test(NAME ${route_gate_test} COMMAND test-inkling-route-gate ${CMAKE_CURRENT_BINARY_DIR}/${route_gate_test}.bin)
+            set_tests_properties(${route_gate_test} PROPERTIES LABELS "main" FIXTURES_SETUP route_gate_${mode}_${arm}
+                ENVIRONMENT "${route_gate_env};GGML_CUDA_DISABLE_GRAPHS=${disable_graphs};GGML_CUDA_MOE_ROUTE_GATE=${route_gate_flag}")
+        endforeach()
+        add_test(NAME inkling-route-gate-${mode}-exact COMMAND ${CMAKE_COMMAND} -E compare_files
+            ${CMAKE_CURRENT_BINARY_DIR}/inkling-route-gate-${mode}-dense.bin ${CMAKE_CURRENT_BINARY_DIR}/inkling-route-gate-${mode}-gated.bin)
+        set_tests_properties(inkling-route-gate-${mode}-exact PROPERTIES LABELS "main"
+            FIXTURES_REQUIRED "route_gate_${mode}_dense;route_gate_${mode}_gated")
+    endforeach()
     add_test(NAME test-inkling-moe-routed-rows-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
         -p "n_mats=32,n_used=8,.*m=256,n=(17|23|32),k=512,")
     set_tests_properties(test-inkling-moe-routed-rows-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
@@ -864,6 +905,9 @@ if (GGML_CUDA)
         ENVIRONMENT "GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
     set_tests_properties(inkling-fuse-chain-exact PROPERTIES LABELS "main"
         DEPENDS "inkling-fuse-chain-ref-cuda0;inkling-fuse-chain-fused-cuda0")
+    add_test(NAME inkling-router-bake-fuse-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-bake-fused.bin --router-bake)
+    set_tests_properties(inkling-router-bake-fuse-cuda0 PROPERTIES LABELS "main"
+        ENVIRONMENT "LLAMA_INKLING2_ROUTER_BAKE=1;GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
     add_test(NAME inkling-fuse-chain-tma-ref-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-tma-ref.bin)
     add_test(NAME inkling-fuse-chain-tma-fused-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-tma-fused.bin)
     add_test(NAME inkling-fuse-chain-tma-exact COMMAND ${CMAKE_COMMAND} -E compare_files
