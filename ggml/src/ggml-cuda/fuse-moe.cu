@@ -42,7 +42,7 @@ __device__ __forceinline__ int32_t moe_chain_local(int32_t expert, int32_t first
 
 template <int n_expert, int cpl, bool has_bias, bool tma_mode>
 __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain(
-        const float * cur, const float * router, const float * bias, float * logits,
+        const float * cur, const float * expert_cur, const float * router, const float * bias, float * logits,
         int32_t * ids, float * weights, int32_t * routes, block_q8_1 * q8, unsigned int * flag,
         int32_t * local_ids_out, const int n_embd, const int n_tokens, const int n_used,
         const int ids_stride, const moe_chain_args args) {
@@ -68,7 +68,7 @@ __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain
         for (int b = blockIdx.x*MOE_CHAIN_WARPS + warp; b < n_blk; b += stride) {
             const int   row = b/per_row;
             const int   col = (b%per_row)*QK8_1;
-            const float xi  = cur[(int64_t) row*n_embd + col + lane];
+            const float xi  = expert_cur[(int64_t) row*n_embd + col + lane];
 
             float amax = warp_reduce_max<QK8_1>(fabsf(xi));
             const float  d = amax/127.0f;
@@ -519,7 +519,7 @@ static int moe_chain_cpl(int n_tokens) {
 }
 
 void ggml_cuda_op_moe_router_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * router, const ggml_tensor * cur,
-        const ggml_tensor * bias, ggml_tensor * logits, ggml_tensor * ids, ggml_tensor * weights,
+        const ggml_tensor * expert_cur, const ggml_tensor * bias, ggml_tensor * logits, ggml_tensor * ids, ggml_tensor * weights,
         int32_t * routes, block_q8_1 * q8, unsigned int * flag, int32_t first, int32_t count,
         float clamp_val, float scale_val, bool norm_eps, int32_t * local_ids_out, bool tma_mode) {
     constexpr int n_expert = 384;
@@ -544,7 +544,7 @@ void ggml_cuda_op_moe_router_chain(ggml_backend_cuda_context & ctx, const ggml_t
     const auto launch_impl = [&](auto cpl_tag, auto bias_tag, auto tma_tag) {
         ggml_cuda_kernel_launch(
             moe_router_chain<n_expert, decltype(cpl_tag)::value, decltype(bias_tag)::value, decltype(tma_tag)::value>,
-            params, (const float *) cur->data, (const float *) router->data,
+            params, (const float *) cur->data, (const float *) expert_cur->data, (const float *) router->data,
             decltype(bias_tag)::value ? (const float *) bias->data : (const float *) nullptr,
             (float *) logits->data, (int32_t *) ids->data, (float *) weights->data,
             routes, q8, flag, local_ids_out, n_embd, n_tokens, n_used, ids_stride, args);
@@ -781,13 +781,17 @@ bool ggml_cuda_moe_route_gate(ggml_backend_cuda_context & ctx, const ggml_tensor
         const ggml_tensor * ids, ggml_tensor * dst) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     static const bool enabled = ggml_env_switch("GGML_CUDA_MOE_ROUTE_GATE");
+    if (!enabled) {
+        return false;
+    }
     const auto & device = ggml_cuda_info().devices[ctx.device];
     const int64_t rows = ids->ne[1];
     const int64_t experts = w->ne[2];
     const int64_t expert_total = ggml_get_op_params_i32(dst, 2);
     const bool gate_up = w->ne[0] == 4608 && w->ne[1] == 4608 && strstr(w->name, ".ffn_gate_up_exps.weight");
     const bool down = w->ne[0] == 2304 && w->ne[1] == 4608 && strstr(w->name, ".ffn_down_exps.weight");
-    if (!enabled || device.cc != GGML_CUDA_CC_BLACKWELL || (!gate_up && !down) ||
+    if (device.cc != GGML_CUDA_CC_BLACKWELL || (!gate_up && !down) ||
+            !w->buffer || ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
             (w->type != GGML_TYPE_Q3_K && w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K) ||
             (expert_total ? expert_total : experts) != route_gate_experts || experts > route_gate_experts ||
             rows < 2 || rows > 2048 || ids->ne[0] != route_gate_slots || ids->nb[0] != sizeof(int32_t) ||

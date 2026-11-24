@@ -7,14 +7,15 @@
 // mmvq_sort_routes' sort and the q8_1 copies quantize_q8_1's arithmetic, so every output is bit-identical to the
 // launches the piece replaces. Off by default behind GGML_CUDA_MOE_FUSE.
 //
-// cur is the normed expert input [n_embd, n_tokens] (n_tokens rows of n_embd), router the F32 [n_embd, 384] gate_inp and
+// expert_cur is the normed expert input [n_embd, n_tokens] (n_tokens rows of n_embd), router the F32 [n_embd, 384] gate_inp and
 // bias the F32 [384] selection bias or nullptr. The chain writes the logits (the router product's graph tensor), the
 // ids and weights the top-k group would write, the routes sorted by the card's local experts, and the q8_1 copy of cur
 // the gate/up product reads. routes holds n_tokens*n_used ints, q8 n_tokens*GGML_PAD(n_embd, MATRIX_ROW_PADDING)/32
 // blocks and flag one unsigned that the launch leaves zero.
-// tma_mode skips q8_1 cur quantization and routes sorting; local_ids_out optionally writes [n_used, n_tokens] local ids.
+// cur may be a router-only projection of expert_cur.
+// tma_mode skips q8_1 expert_cur quantization and routes sorting; local_ids_out optionally writes [n_used, n_tokens] local ids.
 void ggml_cuda_op_moe_router_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * router, const ggml_tensor * cur,
-        const ggml_tensor * bias, ggml_tensor * logits, ggml_tensor * ids, ggml_tensor * weights,
+        const ggml_tensor * expert_cur, const ggml_tensor * bias, ggml_tensor * logits, ggml_tensor * ids, ggml_tensor * weights,
         int32_t * routes, block_q8_1 * q8, unsigned int * flag, int32_t first, int32_t count,
         float clamp_val, float scale_val, bool norm_eps, int32_t * local_ids_out = nullptr, bool tma_mode = false);
 

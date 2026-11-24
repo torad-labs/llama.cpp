@@ -119,32 +119,51 @@ bool llama_model_inkling2::load_tensors(llama_model_loader & ml) {
             continue;
         }
 
-        auto & baked = baked_routers[il];
+        const auto buft = src->buffer ? ggml_backend_buffer_get_type(src->buffer) : nullptr;
+        const auto dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        const bool repacked_cpu = buft && !ggml_backend_buft_is_host(buft) &&
+            (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!buft || src->extra || repacked_cpu || !ggml_is_contiguous(src)) {
+            LLAMA_LOG_WARN("%s: keeping the unbaked router %s (no readable F32 rows)\n", __func__, src->name);
+            continue;
+        }
+
+        router_bake baked;
         baked.ctx.reset(ggml_init({2*ggml_tensor_overhead(), nullptr, true}));
+        if (!baked.ctx) {
+            LLAMA_LOG_WARN("%s: keeping the unbaked router %s (no tensor context)\n", __func__, src->name);
+            continue;
+        }
         baked.weight = ggml_dup_tensor(baked.ctx.get(), src);
         baked.signs = ggml_new_tensor_1d(baked.ctx.get(), GGML_TYPE_F32, src->ne[0]);
         ggml_set_name(baked.weight, src->name);
         ggml_format_name(baked.signs, "blk.%d.ffn_gate_inp.scale", il);
-        const auto buft = ggml_backend_buffer_get_type(src->buffer);
         baked.buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(baked.ctx.get(), buft));
         if (!baked.buffer) {
-            throw std::runtime_error("inkling2: could not allocate baked router");
+            LLAMA_LOG_WARN("%s: keeping the unbaked router %s (no backend buffer)\n", __func__, src->name);
+            continue;
         }
         ggml_backend_buffer_set_usage(baked.buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
         // Paired block signs are orthogonal and preserve the product and its accumulation order.
         std::vector<float> signs(src->ne[0]);
-        std::vector<float> row(src->ne[0]);
+        const int64_t width = src->ne[0];
+        constexpr int64_t chunk_rows = 64;
+        std::vector<float> rows(width*std::min(chunk_rows, src->ne[1]));
         for (int64_t j = 0; j < src->ne[0]; ++j) {
             signs[j] = (j/16) % 2 ? -1.0f : 1.0f;
         }
         ggml_backend_tensor_set(baked.signs, signs.data(), 0, signs.size()*sizeof(float));
-        for (int64_t expert = 0; expert < src->ne[1]; ++expert) {
-            ggml_backend_tensor_get(src, row.data(), expert*src->nb[1], row.size()*sizeof(float));
-            for (size_t j = 0; j < row.size(); ++j) {
-                row[j] *= signs[j];
+        for (int64_t expert = 0; expert < src->ne[1]; expert += chunk_rows) {
+            const int64_t count = std::min(chunk_rows, src->ne[1] - expert);
+            const size_t bytes = count*src->nb[1];
+            ggml_backend_tensor_get(src, rows.data(), expert*src->nb[1], bytes);
+            for (int64_t r = 0; r < count; ++r) {
+                for (int64_t j = 0; j < width; ++j) {
+                    rows[r*width + j] *= signs[j];
+                }
             }
-            ggml_backend_tensor_set(baked.weight, row.data(), expert*baked.weight->nb[1], row.size()*sizeof(float));
+            ggml_backend_tensor_set(baked.weight, rows.data(), expert*baked.weight->nb[1], bytes);
         }
         if (const auto it = prec_policy.prec_acc.find(src); it != prec_policy.prec_acc.end()) {
             prec_policy.prec_acc.emplace(baked.weight, it->second);
@@ -152,6 +171,7 @@ bool llama_model_inkling2::load_tensors(llama_model_loader & ml) {
         if (const auto it = prec_policy.prec_src1.find(src); it != prec_policy.prec_src1.end()) {
             prec_policy.prec_src1.emplace(baked.weight, it->second);
         }
+        baked_routers[il] = std::move(baked);
     }
     return true;
 }

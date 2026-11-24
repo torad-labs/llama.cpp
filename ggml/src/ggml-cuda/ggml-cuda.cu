@@ -8216,7 +8216,16 @@ static int ggml_cuda_try_moe_chain(ggml_backend_cuda_context & ctx, const ggml_c
             break;
         }
     }
-    if (mm == nullptr) {
+    if (mm == nullptr || mm->src[1] == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * expert_cur = mm->src[1];
+    // The router can read a signed basis, but the experts must read the original rows.
+    if (expert_cur->data != cur->data &&
+            (cur->op != GGML_OP_MUL || cur->src[0] == nullptr || cur->src[0]->data != expert_cur->data ||
+             expert_cur->type != GGML_TYPE_F32 || !ggml_is_contiguous(expert_cur) ||
+             expert_cur->ne[0] != cur->ne[0] || ggml_nrows(expert_cur) != ggml_nrows(cur) ||
+             ggml_cuda_spans_overlap(expert_cur, ids) || ggml_cuda_spans_overlap(expert_cur, weights))) {
         return 0;
     }
     const int32_t first = ggml_get_op_params_i32(mm, 2) > 0 ? ggml_get_op_params_i32(mm, 1) : 0;
@@ -8236,12 +8245,12 @@ static int ggml_cuda_try_moe_chain(ggml_backend_cuda_context & ctx, const ggml_c
         scratch.n_tokens >= 2 && scratch.n_tokens <= MMVQ_MMID_CEILING;
     const bool skip_vec_prep = tma_chain_ok || scratch.n_tokens < 2;
 
-    ggml_cuda_op_moe_router_chain(ctx, router, cur, bias, node, ids, weights,
+    ggml_cuda_op_moe_router_chain(ctx, router, cur, expert_cur, bias, node, ids, weights,
         skip_vec_prep ? nullptr : scratch.routes,
         skip_vec_prep ? nullptr : (block_q8_1 *) scratch.q8_cur,
         scratch.flag, first, count, clamp_val, scale_val, norm_eps,
         scratch.n_tokens >= 2 ? scratch.local_ids : nullptr, skip_vec_prep);
-    scratch.q8_cur_src      = cur->data;
+    scratch.q8_cur_src      = expert_cur->data;
     scratch.routes_ids      = (const int32_t *) ids->data;
     scratch.local_ids_src   = (scratch.n_tokens >= 2 && scratch.local_ids != nullptr) ? (const int32_t *) ids->data : nullptr;
     scratch.down_local_ids  = nullptr;
