@@ -52,8 +52,8 @@
     {
       "id": "cuda-graph-concurrent-fork-join",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 11185,
-      "line_end": 11365,
+      "line": 11229,
+      "line_end": 11409,
       "symbol": "ggml_cuda_graph_evaluate_and_capture",
       "api": "ggml_cuda_arrival_signal / ggml_cuda_arrival_wait",
       "anchor": "SLOT_FORK",
@@ -65,8 +65,8 @@
     {
       "id": "cuda-l2-issuer-fork-join",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 4160,
-      "line_end": 4208,
+      "line": 4180,
+      "line_end": 4228,
       "symbol": "ggml_cuda_l2_side_fork / ggml_cuda_l2_issue_join",
       "api": "ggml_cuda_arrival_signal / ggml_cuda_arrival_wait",
       "anchor": "SLOT_L2_FORK",
@@ -102,7 +102,7 @@
     {
       "id": "cuda-backend-synchronize-impl",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 5792,
+      "line": 5816,
       "symbol": "ggml_backend_cuda_synchronize",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(cuda_ctx->stream())",
@@ -114,7 +114,7 @@
     {
       "id": "cuda-device-event-synchronize-impl",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 13462,
+      "line": 13506,
       "symbol": "ggml_backend_cuda_device_event_synchronize",
       "api": "cudaEventSynchronize",
       "anchor": "cudaEventSynchronize((cudaEvent_t)event->context)",
@@ -176,7 +176,7 @@
     {
       "id": "cuda-mapped-transfer",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 1486,
+      "line": 1506,
       "symbol": "ggml_cuda_mapped_transfer",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(stream)",
@@ -188,8 +188,8 @@
     {
       "id": "cuda-q8-transfer-sync",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 1616,
-      "line_end": 1649,
+      "line": 1636,
+      "line_end": 1669,
       "symbol": "ggml_cuda_q8_transfer",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(stream)",
@@ -321,7 +321,7 @@
     {
       "id": "cuda-q8-workspace-dtor",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 1400,
+      "line": 1420,
       "symbol": "~ggml_cuda_q8_transfer_workspace",
       "api": "cudaEventSynchronize",
       "anchor": "cudaEventSynchronize(ready)",
@@ -332,8 +332,8 @@
     {
       "id": "cuda-sync-buffer-iface",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 1700,
-      "line_end": 2001,
+      "line": 1720,
+      "line_end": 2021,
       "symbol": "ggml_backend_cuda_buffer_set/get/clear/memset",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(cudaStreamPerThread)",
@@ -344,7 +344,7 @@
     {
       "id": "cuda-dp-expert-stats-free",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 4829,
+      "line": 4849,
       "symbol": "ggml_cuda_dp_expert_stats_free",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(ctx.stream())",
@@ -355,8 +355,8 @@
     {
       "id": "cuda-mul-mat-id-host-fallback",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 5097,
-      "line_end": 5119,
+      "line": 5121,
+      "line_end": 5143,
       "symbol": "ggml_cuda_mul_mat_id",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(stream)",
@@ -390,7 +390,7 @@
     {
       "id": "batch-copy-stage-release",
       "file": "ggml/src/ggml-cuda/common.cuh",
-      "line": 2827,
+      "line": 2840,
       "symbol": "ggml_cuda_async_batch_stage::release",
       "api": "cudaEventSynchronize",
       "anchor": "cudaEventSynchronize(s.event)",
