@@ -8201,7 +8201,6 @@ static int ggml_cuda_try_moe_chain(ggml_backend_cuda_context & ctx, const ggml_c
             weights->nb[2] != (size_t) ids->ne[0]*sizeof(float) ||
             !ggml_can_fuse_subgraph(cgraph, start, group, ops.data(), out_nodes, 2) ||
             !ggml_cuda_should_use_topk_moe(cgraph->nodes[start], node, weights, ids) ||
-            ggml_cuda_spans_overlap(cur, ids) || ggml_cuda_spans_overlap(cur, weights) ||
             !ggml_cuda_check_fusion_memory_ranges(cgraph, start, group, out_nodes, 2, /*is_topk_moe=*/true)) {
         return 0;
     }
@@ -8224,9 +8223,21 @@ static int ggml_cuda_try_moe_chain(ggml_backend_cuda_context & ctx, const ggml_c
     if (expert_cur->data != cur->data &&
             (cur->op != GGML_OP_MUL || cur->src[0] == nullptr || cur->src[0]->data != expert_cur->data ||
              expert_cur->type != GGML_TYPE_F32 || !ggml_is_contiguous(expert_cur) ||
-             expert_cur->ne[0] != cur->ne[0] || ggml_nrows(expert_cur) != ggml_nrows(cur) ||
-             ggml_cuda_spans_overlap(expert_cur, ids) || ggml_cuda_spans_overlap(expert_cur, weights))) {
+             expert_cur->ne[0] != cur->ne[0] || ggml_nrows(expert_cur) != ggml_nrows(cur))) {
         return 0;
+    }
+    if (ggml_cuda_spans_overlap(expert_cur, ids) || ggml_cuda_spans_overlap(expert_cur, weights) ||
+            ggml_cuda_spans_overlap(expert_cur, node) || ggml_cuda_spans_overlap(cur, node)) {
+        return 0;
+    }
+    if (ggml_cuda_spans_overlap(cur, ids) || ggml_cuda_spans_overlap(cur, weights)) {
+        // All blocks read the projection before the last block writes the routes.
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, cur);
+        if (cur->data == expert_cur->data || (cur->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                pos >= cgraph->visited_hash_set.size || !ggml_bitset_get(cgraph->visited_hash_set.used, pos) ||
+                cgraph->use_counts[pos] != 1) {
+            return 0;
+        }
     }
     const int32_t first = ggml_get_op_params_i32(mm, 2) > 0 ? ggml_get_op_params_i32(mm, 1) : 0;
     const int32_t count = (int32_t) mm->src[0]->ne[2];
