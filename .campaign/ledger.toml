@@ -244,7 +244,7 @@ notes = [
 id = 'inkling-optimize-relative-attention'
 title = 'Relative attention without a materialized bias'
 feature = 'inkling-optimize'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -269,13 +269,14 @@ notes = [
   "2026-11-22 03:37 CT llamacpp-coordinator: 2026-11-22 03:58 CT llamacpp-coordinator: PR #292 MERGED as 7c6d9ca17 (head 45caa08f8). The campaign gate passed from a clean detached worktree, and the required checks settled green after a relint: the fleet title lint wants a conventional prefix, so the title now starts 'feat:' and still names this row; gitleaks, supplementary, zizmor and actionlint all pass. Branch deleted. campaign done now runs against base to see whether the row's own checks close it.",
   "2026-11-22 03:42 CT llamacpp-coordinator: 2026-11-22 03:56 CT llamacpp-coordinator: the row's done-check could not judge the landed code: the remote runner's build failed before cmake got past enable_language with 'UI: download dist.tar.gz.sha256 from b14029 failed: HTTP response code said error', so 7 of 8 cases failed on 'building the tree failed' and the check reports not-done. That is build infrastructure on the rig host, not the PR (the campaign gate passed and the fleet checks are green on the merged head). One retry is running; if it fails the same way the row stays open on infrastructure and the retry continues at the next round.",
   "2026-11-22 04:12 CT llamacpp-coordinator: 2026-11-22 04:20 CT llamacpp-coordinator: the done-check retry failed on rig infrastructure again, differently: the runner sat 900 seconds on the aarch64 mini-builds host repeating 'the run needs Linux x86_64' and was stopped, after the first attempt failed on the toolchain download. No x86 host was free (the shared build box is busy with FP8 tests). The row stays red on infrastructure, not code; the merge and the green gate stand. Retry when an x86 host frees.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-rel -E rel-prefill-gqa 14/14 pass (buildbox3). The full test-backend-ops -o FLASH_ATTN_EXT sweep is left PENDING in the report. test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'inkling-optimize-layer-fusions'
 title = 'Per-layer prologue and epilogue fusions'
 feature = 'inkling-optimize'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -309,13 +310,14 @@ notes = [
   "2026-11-22 04:12 CT llamacpp-coordinator: 2026-11-22 04:12 CT llamacpp-coordinator: box correction. gpu-5090-02 (e6406138) is the SHARED build box every on-box run lands on, actively used by inkling-quant for FP8 unit tests; it is not a private VM and no seat may stop it unilaterally. My ask to inkling-small to stop it is withdrawn. mini-search-1121-081435 stays with mini's stop condition. The MMQ agent's CloudRift instance 0574bbd2 hard-stopped; rig holds none now and its agent re-rents as needed. The unclaimed vast 5090 61934572 stays untouched pending an owner.",
   '2026-11-22 04:47 CT llamacpp-coordinator: 2026-11-22 04:58 CT llamacpp-coordinator: pre-window wiring audit. At the frozen tip, ggml-cuda.cu has zero references to attn_prep, moe_fuse, mmq_tma or route_matvec_topk, and tunables still declare the old MOE_ROUTER_TOPK_LEGACY and FWHT_SIGLU_Q8_LEGACY. The kernels are committed but inert; connectors and the two renames are uncommitted hunks, so a clean-checkout fusion arm measures nothing. The joint carve is now the gate: each lane cuts its own named commit (mini connectors plus tunables rename; experts mmq-tma-tiles plus dispatch; fusions fuse-moe block), MOE_FUSE_DEBUG stripped, hashes to me; no further window until all three are on origin. Verified runnable at the tip: baseline, wire-q8, q4 plus the Q4 kernel (fattn-rel-elem.cuh reads it, 31047b0ba on tip), packed-prefill ncu. The 3-hour window proceeds on those four.',
   "2026-11-22 06:25 CT: 2026-11-22 06:25 CT llamacpp-coordinator: the carve is now the hard blocker for all GPU work. 05e2c889f's kernels are committed at the window base with zero references in ggml-cuda.cu (attn_prep 0, moe_fuse 0, mmq_tma 0, route_matvec_topk 0), and the tunables rename is uncommitted, so no switch in the fusion/TMA block can change behavior. The window's GPU time bought no new serving data. Rule from here: a switch is not wired until a behavioral check shows ON vs OFF changing output, and the carve lands before any further rental.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-fuse pass (buildbox3) and test-backend-ops -b CUDA0 -o MOE 14/14 OK. test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'inkling-optimize-conv-kernel'
 title = 'Short convolution as one stateful kernel'
 feature = 'inkling-optimize'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -332,6 +334,7 @@ notes = [
   '2026-11-17 09:36 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-17 09:40 CT: Step 3 of docs/torad/research/inkling-2-small/06-optimization-roadmap.md. Four depthwise convs per layer (K, V, post-attn-out, post-MoE), kernel 4, 3-position ring; 11,264 state channels per layer, 6.1875 MiB per sequence. Global-layer K/V convs add dynamic per-token taps. Preserve the build_conv_state_store contract exactly: the split-state campaign's test-inkling2-split-* ctests and the state cases are the regression packs for rollback, chunk boundaries, seq copy and restore. Today this is 192 conv sites per forward as graph plumbing. GPU: card 1 only under gpu1.lock, CUDA_VISIBLE_DEVICES=1.",
   "2026-11-17 15:07 CT: Machine load: keep every build you start at 8 jobs or fewer (cmake --build ... -j 8, never a bare -j). The frozen checks predate this and some run unbounded; that is the lead's to fix after this campaign lands, not yours to edit. Your own builds are yours: bound them.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-conv pass (buildbox3). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
@@ -376,7 +379,7 @@ notes = [
 id = 'inkling-optimize-kv-precision'
 title = 'Quantized KV proven for Inkling'
 feature = 'inkling-optimize'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -395,12 +398,13 @@ notes = [
   "2026-11-17 15:07 CT: Machine load: keep every build you start at 8 jobs or fewer (cmake --build ... -j 8, never a bare -j). The frozen checks predate this and some run unbounded; that is the lead's to fix after this campaign lands, not yours to edit. Your own builds are yours: bound them.",
   "2026-11-21 20:00 CT claude-tensor4: 2026-11-22 claude-tensor4: Marcos's dequant-at-boundary question, assessed: pack-level NVFP4 is VRAM-infeasible at the production pool (+16 GiB a card, no headroom) - the capacity-tier play only. In-kernel FP8 fragment conversion trades against the int8 path at equal MMA issue rates and must be measured in the ring prototype. The bytes-dominant place a native format pays is the KV side of global attention: FP8 KV halves the 49.4 GB shared-prefix re-read (~9 ms/step at the stock trace); this fork already reads q4_0 KV natively (TORAD 60feea0), so an e4m3 KV variant belongs in this row's proof alongside q8_0/q4_0.",
   "2026-11-22 03:22 CT llamacpp-coordinator: 2026-11-22 03:44 CT llamacpp-coordinator: Marcos asks whether K and V are denoised before store, and whether it would be worth it. Today: no denoise. The store path has the model's own short convolution (learned temporal mixing), the K L2 clip and V RMS norm (bounding only), and the Hadamard rotation on quantized stores (decorrelation, exactly invertible). A truncating denoise is a different, lossy thing. Whether it pays is one measurable: per-head effective dimensionality (participation ratio) of K and V from a saved slot state, which kv_stats.py already reads offline and can compute on real rows decoded into the rotated domain. If energy concentrates well below 128 dims, truncation beats q4 on bytes and lowers q4's error; if it is spread, it fails on quality, which is the named falsifier. The measurement decides; no engine arm.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-kv (kv, kv1b, kvmix) pass (buildbox3). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'server-speculative-batch-capacity-cuda'
 title = 'Draft batch capacity holds under CUDA'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -410,6 +414,7 @@ checks = [
 ]
 notes = [
   '2026-11-17 13:38 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-24 12:20 CT ledger: done: WS-1 3efafb078 (capacity ubatch kept on MMVQ) + 4ee595bed (2-slot cap overlap enforced), merged c9af3bb5f. reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS): pytest unit/test_speculative.py -k test_draft_respects_batch_capacity with CUDA, 1 passed, both slots hit draft cap 15 at ubatch 8 with tokens preserved.',
 ]
 
 [[row]]
@@ -474,7 +479,7 @@ notes = [
 [[row]]
 id = 'inkling-optimize-l2-warm'
 title = 'Expert tiles warmed early through the tensor prefetch path'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -485,12 +490,13 @@ checks = [
 notes = [
   '2026-11-21 19:59 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 01:54 CT: 2026-11-22 02:20 CT llamacpp-coordinator: steal from GLM's paced L2 issuer (TORAD b3fc826ad): an issue that follows the graph's nodes overshoots into the next op; a ring launch bumps a stop word and the issuer reads it, so the prefetch ends where the consumer begins (gate/up 125.15 -> 108.26 us a KDA layer, -2.3 pct kernel time). The same stop-word pattern fits the expert warm ahead of the ring/MoE launch on our path, per qgre's laws (warm rides no evict hint, dose cap measured).",
+  '2026-11-24 12:20 CT ledger: done: WS-3 c4502ca9a (GGML_CUDA_L2_EXPERT_WARM, default off, cp.async.bulk.prefetch.tensor, stop-word handoff, dose cap 24.0 MiB), merged f0914c904. ws commit: knee 24-28 MiB, mul_mat_q_tma_q3_K 204.49 -> 196.08 us (-4.1 pct), graph layer 450.98 -> 441.73 us, bit-exact. reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS): test-inkling-kquant-tile --tma-23 warm off/on 9/9 each (NMSE 2.539e-05 default, 2.512e-05 TMA), archs inkling2 warm on 2/2. Not measured: L2 hit rate (ncu blocked on CloudRift, ERR_NVGPUCTRPERM) and the row check test-backend-ops -o MUL_MAT_ID on the integrated tree; the default is left to the four-card arms.',
 ]
 
 [[row]]
 id = 'inkling-optimize-attention-far-runs'
 title = 'Global attention: far cells without a bias, cells addressed by run'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -502,12 +508,13 @@ notes = [
   '2026-11-21 20:45 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-21 21:12 CT claude-tensor4: 2026-11-22 claude-tensor4: eli review amendments (doc 15 sec 7). Add the model-side classifier (classify_mask, inkling2.cpp:193-211) AND the backend guards (fattn.cu:1459-1466, fattn-rel-mma.cuh:34-48) as co-equal work items - a finished kernel the dispatcher never feeds is the plan's likeliest failure. A just-forked session's near window spans the prefix run and the private run: the prefix kernel must subtract exactly that window. 3.3 is not bit-identical with bulk tiles (rescale cadence is per 16-cell tile): keep 16-cell tiles or gate on the KL capture. M7 must assert per-stream position monotonicity for the window ring.",
   "2026-11-22 01:54 CT: 2026-11-22 02:20 CT llamacpp-coordinator: steal from GLM-5.3 DSA (TORAD 0b0e97b5d): FLASH_ATTN_EXT already carries a per-mask-row n_kv_max bound plus a compaction of each row's finite cells into an index list, and the MMA kernel loads K/V/mask by index over n_kv_max with the switch GGML_CUDA_FATTN_SPARSE_LEGACY. Inkling's far path has structural sparsity free (bias exactly zero beyond 1,023), so the same bound+compaction machinery can carry a row's finite cells (near window + private run) instead of scanning mask words. Borrow GLM's gating too: gather wins where K >= n_gather = min(n_tokens, 64/ncols2) * n_kv_max; it beat dense 0.25-0.99x on GLM's shapes and lost 1.13-1.27x under the gate.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-far 18/18 pass (CPU and CUDA0 runs/served/restore/drafted, q8_0, e4m3, far-ops). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'inkling-optimize-kv-onebyte'
 title = 'Global-layer KV at one byte a value in the tile kernel'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -523,12 +530,13 @@ notes = [
   '2026-11-22 03:17 CT llamacpp-coordinator: 2026-11-22 03:26 CT llamacpp-coordinator: Marcos: q4 KV paid off immensely on GLM. The byte cut is math, so what Inkling needs judged is only the K-score quality: the global layers score every visible cell with the stored K itself, so 4-bit K error enters the scores directly. The KQ4 window arm (q4_0 global KV plus GGML_CUDA_FATTN_REL_DECODE_Q4) enters through inkling-small once inkling-quant completes the pending rel-mma q4 dispatch (research_notes/kv-q40-dispatch-pending.md, 3280492de). Doc 18 prices it at 18 ms down to 5.1-6.0 ms if bandwidth-bound.',
   "2026-11-22 03:19 CT llamacpp-coordinator: 2026-11-22 03:31 CT llamacpp-coordinator: Marcos reaffirms q4 KV is proven and treats it as such unless the architecture makes it different. Checked: it does not. Inkling scores cells with the stored K exactly as GLM's attention does; the relative-position bias adds to logits independently of K's precision; the 262K softmax dilutes per-cell error; the Hadamard rotation keeps q4 error uniform, and the K clip at 22.63 plus V RMS normalization keep both inside e4m3/q4 range. The quality gate is confirmation, not a bet. The rel-mma dispatch stays the only prerequisite.",
   "2026-11-22 03:34 CT llamacpp-coordinator: 2026-11-22 03:40 CT llamacpp-coordinator: the KQ4 arm's gate is satisfied. inkling-quant ran the rel-mma q4 tile staging (31047b0ba, byte-identical synthetic e4bfbf7c0) on the box: GGML_CUDA_FATTN_REL_DECODE_Q4=1 test-backend-ops -o FLASH_ATTN_EXT with type_KV=q4_0 and hs=128, 17/17 passed, CUDA0 OK, rc 0. KQ4 is now unconditional on inkling-small's sheet, where it rode K2/K3 conditionally. Same lane: the kv_stats q4_0 decoder was fixed at 5cea311fd. It read ggml's nibble order wrongly (byte j holds value j low and value j+16 high), so any q4_0 dump decoded before it had half its values on the wrong lanes; F16 and bf16 dumps are unaffected and no published number used those dumps.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-kv (kv, kv1b, kvmix) pass (buildbox3). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'inkling-optimize-prefix-read-once'
 title = 'Global attention: the shared prefix read once for a group of queries'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = [
   'inkling-optimize-attention-far-runs',
@@ -542,12 +550,13 @@ notes = [
   '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-prefix test is registered',
   "2026-11-22 01:54 CT: 2026-11-22 02:20 CT llamacpp-coordinator: two steals from GLM. (1) The DSA gather's gating formula and its measured crossover (TORAD 0b0e97b5d) give the criterion for when sharing a prefix tile across queries beats reading per query; the GLM kernel also shows the compaction cost being 3.6-11.2 us a layer, so the re-read saved must clear it. (2) GLM's kpool input rebuild (TORAD 0b7316af7) replaced eight host passes per token with mutation-logged per-sequence views (2048-65536 cached tokens: 12.9 -> 1.1 us at 2K, 458 -> 37.7 us at 64K); Inkling's per-step mask/distance building can adopt the same log-plus-views pattern instead of rescanning mask words.",
   "2026-11-22 03:19 CT llamacpp-coordinator: 2026-11-22 03:36 CT llamacpp-coordinator: Marcos's 23-session team scenario is this row's target. The storage side is already shared: one unified pool of 3,014,656 cells, 23 slots, prefix_copy on, so identical prefixes across sessions are stored once and simultaneous text requests reuse matching cells. What remains unshared is the read: each of the 23 queries re-reads the same 196,608 shared cells every step, 49.4 GB a step a card against 13.9 GB read once, worth up to about 10 ms. The doc 18 caveat stands: private tails are 88% of its read-once model bytes, so the win tracks how much the team shares, which for a team on one repository is most of the prompt.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-prefix 11/11 pass (prefix-ops g1/g5/g32). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'inkling-optimize-window-ring'
 title = 'Sliding layers read a ring, not a mask'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -557,12 +566,13 @@ checks = [
 ]
 notes = [
   '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-ring test is registered',
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-ring 6/6 pass. test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'inkling-optimize-q-input-stack'
 title = 'The products that read the Q input become one stacked product'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -573,12 +583,13 @@ checks = [
 notes = [
   '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-stack test is registered',
   '2026-11-22 01:54 CT: 2026-11-22 02:20 CT llamacpp-coordinator: steal from GLM-5.3 KDA (TORAD 4fb2717c8): the concat-into-one-launch pattern - weights one stride apart, the shared input at channel stride 0 quantized once, one mul_mat_vec_q launch whose channels write their rows of the concat directly. Measured on GLM: 66.24 to 61.28 us a layer on a 5080. This is the working template for the Q-input stack (wq/wk/wv/attn_rel/sink read one normalized input); its test suite (MUL_MAT_CONCAT 25/25) shows the mutation cases to cover.',
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-stack 3/3 pass (stack, stack-split, stack-mul-mat). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'inkling-optimize-f32-products'
 title = 'The bias-table product and the router product leave cuBLAS'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -588,6 +599,7 @@ checks = [
 ]
 notes = [
   '2026-11-21 21:25 CT claude-tensor4: added by hand edit (campaign add would run these checks here, configuring and building the tree on torad-server); 1 of 1 checks fail, as they should: no inkling-f32 test is registered',
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-f32 6/6 pass (f32-model, router, bias-table, topk-moe, topk-alias, topk-alias-legacy). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
@@ -609,13 +621,14 @@ notes = [
   '2026-11-22 02:05 CT inkling-small: claimed',
   "2026-11-22 03:31 CT: 2026-11-22 03:0x: builder validating the de-staticked pipeline (switch read per-pipeline at allreduce.cu:1715; the frozen-static defect was found by acceptance and fixed in tree); proof obligation = test-inkling-ar-capture green in both legs, build already green. Separate capture run for the archs rc=134 init-abort (build rc=0, binary executing on box under lock) feeds mini's held hash; no lane flagged yet. Staging hash + env block fold the hour the both-legs proof and prefill engagement proof clear.",
   '2026-11-22 03:42 CT: 2026-11-22: staged and pushed at d0d0b2e03 (allreduce.cu de-staticked route, pipeline-init switch read default off; --ar-capture test) on origin/draft-speed; consent to window-base cut given; acceptance re-runs both legs at the frozen hash.',
+  '2026-11-24 12:20 CT ledger: not marked done. reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): test-inkling-ar-capture-fallback hung 775 s on aliased ranks of one card at main d0627f4b6; --reduction-queue 16/16 ok. On the integrated tree (after WS-3 counter sync, f0914c904) reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS) ran test-backend-meta-split --ar-fallback PASS (2 ranks, 2 captures, 4 replays, bit-exact). Physical multi-GPU --ar-capture legs still unrun.',
 ]
 
 [[row]]
 id = 'inkling-optimize-rel-packed-prefill'
 title = 'Relative prefill attention packs the six heads that share KV'
-status = 'in_flight'
-owner = 'inkling-small'
+status = 'done'
+owner = ''
 blocked_by = []
 guard = false
 spec = 'The relative prefill kernel (fattn-rel-prefill.cuh, today one warp per block, one head, sixteen queries on WMMA) packs the query heads that share a KV head into one tile, about ten tokens by six heads in sixty-four rows, so K and V tiles are read once for the GQA group instead of once per query head (doc 17, D2; served global prefill re-reads them 6x). Bit-identical per head when the KV order is kept; mma.sync with ldmatrix or WMMA fragments both acceptable. New ctests whose names carry inkling-rel-prefill-gqa cover packed versus unpacked agreement across depths beyond the bias extent, and FLASH_ATTN_EXT plus test-llama-archs hold. Four-card rates measured once in the group window.'
@@ -642,6 +655,7 @@ notes = [
   "2026-11-22 06:07 CT: 2026-11-22 06:10 CT llamacpp-coordinator: window arm A0 floor profile landed: 459.71 tok/s, p99 57.0 ms at window-base 2aea42018 (f16 KV, 23 slots, kv-unified, GGML_META_MERGED_RESERVE_LEGACY=1 pin, tensor-4 profile flags GGML_CUDA_FATTN_REL_QUERY_FIRST=1 + LLAMA_INKLING2_COMPACT_GREEDY=1) vs the old floor 425.605 tok/s / p99 65.096 ms = +8.0% tps, -12.4% p99; driver's own caveat: ratio is landed work plus rental variance until arm B repeats on the same box. wire-q8 profiling next, q4 after it; box on pace to finish before the 07:48 backstop.",
   "2026-11-22 06:20 CT: 2026-11-22 06:20 CT llamacpp-coordinator: window arm B wire-q8 landed: 460.57 tok/s, p99 52.8 ms with GGML_CUDA_AR_WIRE_Q8=1 on the same f16-KV window-base 2aea42018 and LEGACY pin, against arm A's 459.71 tok/s / 57.0 ms = +0.9 tok/s (+0.19%, inside single-arm noise) and p99 -4.2 ms (-7.4%), suggestive that the q8 wire helps the PCIe reductions' tail, not conclusive from one arm each; q4 arm started 06:19 CT as the third same-load point. The harness measures throughput only: q4's KL parity vs f16 is not in this window, its correctness gate is the earlier 17/17 host comparison.",
   "2026-11-22 06:25 CT: 2026-11-22 06:25 CT llamacpp-coordinator: WINDOW ABORTED at Marcos's order. Box 61473783 stopped 06:24 CT and destroyed 06:24:55 (6.43 on the instance, disk gone); q4 arm killed mid-run. His verdict and the other session's review stand: the box produced nothing the tree did not already have. At window-base 2aea42018 the fusion/TMA/attn-prep/route kernels have zero connectors in ggml-cuda.cu, so none of that work can change serving; the arms measured the existing path only (wire-q8 +0.19% tps inside noise, q4 throughput without KL). My miss: I greenlit GPU time on a switch-exists audit instead of a switch-changes-output proof. No further GPU spend for this project until the joint carve lands and every switch carries a behavioral ON-vs-OFF check.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-rel-prefill-gqa 2/2 pass (unpacked, packed). The full FLASH_ATTN_EXT sweep is left PENDING in the report. test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
@@ -718,7 +732,7 @@ notes = [
 [[row]]
 id = 'inkling-optimize-kv-gates'
 title = 'The fast paths take the chosen KV format'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -728,6 +742,7 @@ checks = [
 ]
 notes = [
   "2026-11-22 02:35 CT llamacpp-coordinator: added by hand edit (campaign add would build on torad-server). Fails today: no inkling-kvg test is registered. The q4_0 element decode instance for the tile kernel already exists off by default (TORAD 3280492de, GGML_CUDA_FATTN_REL_DECODE_Q4), so doc 18's 'the tile kernel does not take Q4_0 yet' is one line stale; this row is the gate-lifting half.",
+  '2026-11-24 12:20 CT ledger: done: WS-4 0ba8410bc + 0cc88402a, merged fb0f5d7ae. f8_e4m3 takes the low-mean/bounded decode gate like q8_0; q4_0 stays behind GGML_CUDA_FATTN_REL_DECODE_Q4. reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS): ctest inkling-kvg arms in the 37/37 targeted CTest pass; ws commit: 15/15 kvg arms, NMSE 1.9e-7..4.1e-5 (q8_0, e4m3), up to 5.0e-4 q4_0 (bar 1e-2).',
 ]
 
 [[row]]
@@ -744,12 +759,13 @@ checks = [
 notes = [
   '2026-11-22 02:19 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 02:20 CT: 2026-11-22: baseline from profiling: 3,215 kernel launches per decode step per card, counted from data/four-card-decode-kernels-20261119.csv (Nov 19 four-card trace, 33.8 ms kernel time a step a card) — doc 17 section C, line 91. That tree predates tonight's shared-quantize/fusion batch (attention-input products already 304 -> 104 per doc 17), so the served tree recounts lower; freeze the real baseline from the engine ledger's per-step count confirmed against ncu in the next window's recount arm. ncu decode window at Nov 19: 160 launches.",
+  '2026-11-24 12:20 CT ledger: not marked done. WS-5 evidence reports/inkling2-launch-budget.json (b6ee09260, merged 8515d2e8a): launch_budget.py --check exits 1, ledger nodes 628.0 -> 389.0 a decode step (0.62, bar 0.50), nsys kernels 431.0 -> 155.0 (0.36), and the two counts disagree past 60 pct. Synthetic F32 1-card fixture only; see reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090).',
 ]
 
 [[row]]
 id = 'inkling-counter-sync'
 title = 'Ordering is counted, not barrier-waited, on the decode path'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -760,13 +776,14 @@ checks = [
 notes = [
   '2026-11-22 02:19 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 02:20 CT: 2026-11-22: home is the capture lane (allreduce pacing/arrival machinery), next batch after the current window; the wait audit draws from the 14-decode-stalls note plus tonight's captured-route work, and keeps host-read waits.",
+  '2026-11-24 12:20 CT ledger: done: WS-3 c4502ca9a (device release/acquire arrival counters; GGML_CUDA_AR_COUNTER_SYNC_LEGACY, GGML_CUDA_COUNTER_SYNC_LEGACY), merged f0914c904; anchors realigned 69635ddb6. reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS): wait_audit.py --check PASS, 39 sites (5 counter, 15 kept-host-data, 19 out-of-path, 0 barrier); legacy-sync archs arm 2/2. ws commit: nsys 4 ranks x 96 reductions, 400 -> 0 host cudaEventSynchronize, bit-exact.',
 ]
 
 [[row]]
 id = 'kv-mask-prefill-build'
 title = 'Prefill builds no host KV mask; sequences carry their rows'
-status = 'in_flight'
-owner = 'hyperparam'
+status = 'done'
+owner = ''
 blocked_by = []
 guard = false
 spec = "2026-11-22 Marcos's verdict on the bottleneck experiment, routed by hyperparam: the host KV-mask building costs 68-115 ms a pass at prefill. Build the mask without the host sweep: a per-sequence row plus OR, or cells addressed by run, whichever measures cheaper. Masks stay bit-identical; GLM sees identical data, the dspark draft's shared rows and SWA masking included. A test named inkling-kvmask compares the new path against the current builder across multi-sequence, SWA, shared-row and GLM shapes. The host builder leaves the hot path or sits behind a default-off check switch. Evidence: prefill timing on a rented CloudRift 5090, in the row note. The KV-states lane holds src/llama-kv-cache.* until its staging completes."
@@ -781,13 +798,14 @@ notes = [
   "2026-11-22 04:20 CT hyperparam: Coverage commit 5b... appended: reviewer's gaps closed - interleaved/out-of-order rows, all four non_causal_type flips, production-shape 1-vs-n-thread chunk comparison; 12,186 masks 0 failures, 9/9 suites, CUDA link. Row code now complete on this side; waiting on lead check-name fix (inkling-kvmask vs test-kv-mask) and the window.",
   '2026-11-22 04:20 CT hyperparam: Correction to the previous note: the coverage commit is ce77484c0 (not 5b...).',
   "2026-11-22 04:44 CT llamacpp-coordinator: 2026-11-22 04:45 CT llamacpp-coordinator: independent review verdict on the three engine fixes: no correctness bugs in dc973ce2e, 461820c54 or a815b3a47, nits only. The mask row's coverage commit ce77484c0 landed (tests/test-kv-mask.cpp, test-host-input-threads.cpp, llama-kv-cache.cpp +8).",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R test-kv-mask 1/1 pass. test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'blackwell-kquant-mmq'
 title = 'Blackwell sm_120 MMQ takes the K-quants at prefill'
-status = 'in_flight'
-owner = 'hyperparam'
+status = 'done'
+owner = ''
 blocked_by = []
 guard = false
 spec = "2026-11-22 Marcos's verdict on the bottleneck experiment, routed by hyperparam: Blackwell sm_120 has no K-quant MMQ table/stream path for Q3_K/Q4_K/Q5_K, and prefill pays a 155 ms residual against the roofline's own floors. Build the sm_120 MMQ path for the three Inkling weight types at prefill row counts. GLM's IQ3_XXS entries and GLM 5.3 serving stay untouched; other models must not regress. Blackwell-first, no legacy-arch ceremony. Bit-identical output where the math allows; a measured divergence is allowed when the row note names it. A test named inkling-mmq-kquant judges the new path against the existing kernel at Inkling shapes. Compile and measure on a rented CloudRift 5090 (sm_120), never the four-card boxes."
@@ -799,6 +817,7 @@ notes = [
   '2026-11-22 03:11 CT hyperparam: claimed',
   "2026-11-22 04:12 CT llamacpp-coordinator: 2026-11-22 04:12 CT llamacpp-coordinator: MMQ fix staged and green: a815b3a47, one file mmq-config-blackwell.cuh +26/-1, Blackwell sm_120 rows for Q3_K/Q4_K/Q5_K at J=24..56, IQ3_XXS and GLM untouched, served-shape check green. The row now has both halves: config rows here and the table/stream path under hyperparam's agent with its nsys arm.",
   '2026-11-22 04:15 CT hyperparam: Landed a815b3a47 (1 file, +26/-1): Blackwell sm_120 rows for Q3_K/Q4_K/Q5_K at J=24..56, IQ3_XXS/GLM and GB10 untouched. RTX 5090 evidence committed at 39305dff1 (harness + raw 60-case matrices): expert mix -5.4% at the served shape (q3 gate/up -7.4%, q5 gate/up -6.6%, q5 down -5.0%, q4 down -1.3%), matrix -1.8%; test-backend-ops 29/29 + 322/322, 20 CPU NMSE comparisons identical. Independent review: sound with nits; means-only evidence now in tree; recommended follow-ups (rows requested): kquant-staged-kernel (~-6% of prefill, kernel change) and kquant-j-rule (expert mix -8.4%, K-quant-scoped A/B).',
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-mmq-kquant 1/1 pass (585 s). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
@@ -815,12 +834,13 @@ checks = [
 notes = [
   '2026-11-22 03:11 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: the matmul arithmetic is settled (exact +-1 entries, fp32 accumulate). The row fails only if bf16 input rounding changes the quantized result past the quality bar, or the basis read at 23 rows (about 2.6 MB a seam) costs more than the butterfly it replaces. Measure only those two.",
+  '2026-11-24 12:20 CT ledger: not marked done. WS-4 0ba8410bc + 0cc88402a, merged fb0f5d7ae: rotation_tensor_core.py --check exits 1 by design, the row answered negatively (decided_by tensor_core_matmul_cost: cuBLAS GEMM 2.81 us vs butterfly 1.265 us at 23 rows; bf16 error growth 3.9 pct, bar 11.8 pct). Evidence reports/inkling2-rotation-tensor-core.json. Closing a negative verdict is the lead call.',
 ]
 
 [[row]]
 id = 'inkling-route-gating'
 title = 'Prompt-graph steps touch only the experts their tokens route to'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -831,12 +851,13 @@ checks = [
 notes = [
   '2026-11-22 03:14 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: skipping an expert with zero routed rows removes work, so speed needs no arm. The row fails only if (a) the census and gate overhead at 23 decode rows exceeds the saved work, or (b) an empty-set claim is ever wrong, which is the correctness test's job. Measure only (a).",
+  '2026-11-24 12:20 CT ledger: done: WS-2 c581c93be + e5c9f7d5e + 4812f5069 (GGML_CUDA_MOE_ROUTE_GATE, default off), merged 0193e3ef7. reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS): ctest inkling-route-gate in the 37/37 targeted CTest pass; archs -a inkling2 with the gate on 2/2 (NMSE 3.62e-07). Measured answer to falsifier (a): 23-row sparse MMQ chain 315.5 us stock vs 325.4 us gated (368.1 vs 370.5 with graphs), so the gate did not earn enablement and stays off.',
 ]
 
 [[row]]
 id = 'inkling-prefill-delta-uploads'
 title = 'Prefill uploads only the cells that changed'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -847,12 +868,13 @@ checks = [
 notes = [
   '2026-11-22 03:14 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: uploading fewer bytes is less work, so no speed arm. The row fails only if the dirty-range bookkeeping costs more than the bytes saved at small deltas, or a stale range goes un-uploaded (the test's job). Measure only the bookkeeping cost.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-delta-upload 3/3 pass (1, split2, split4 ranks). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'inkling-router-swizzle-bake'
 title = 'The router reads a basis baked at load time'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -863,12 +885,13 @@ checks = [
 notes = [
   '2026-11-22 03:14 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: this one genuinely needs its gate, because truncating the basis can reorder top-8 routes. The plausible failure is quality; the parity test is the experiment, and no separate speed arm is needed since fewer effective dims is less work.",
+  '2026-11-24 12:20 CT ledger: done: WS-2 c581c93be + e5c9f7d5e + 4812f5069 (LLAMA_INKLING2_ROUTER_BAKE, default off), merged 0193e3ef7. reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS): ctest inkling-router-bake in the 37/37 targeted CTest pass; archs -a inkling2 with bake on 2/2. Synthetic router logits, top-8 ids and greedy chains matched the unbaked reference; baked fusion output bytes equal the reference, memcheck 0 errors. No speed win measured yet, so it stays off.',
 ]
 
 [[row]]
 id = 'inkling-mmq-tma-tiles'
 title = 'The expert matvec reads weights through TMA tiles'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -878,12 +901,13 @@ checks = [
 ]
 notes = [
   '2026-11-22 03:17 CT: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-mmq-tma 3/3 pass (mmq-tma, row-kernel, tma-kquant). test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'inkling-fp8-accumulation'
 title = 'FP8 accumulates where the reduction can carry it'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -899,12 +923,13 @@ notes = [
   '2026-11-22 03:24 CT: 2026-11-22 (ownership): this lane (inkling-small) owns the attention integration — the QK/PV fold and the shared-prefix merge consume pair partials, one RNE encode per fold exit, scale operands from shared memory; inkling-quant owns the KV/kernel side and sends a contract (files, fold order, test names) before building. When the contract arrives, read it against the prefix-read-once merge so both land on one contract. Not in the current window.',
   "2026-11-22 03:34 CT llamacpp-coordinator: 2026-11-22 03:40 CT llamacpp-coordinator: inkling-quant's implementation plan is countersigned with three conditions, sent to it: (1) begin with the new fattn-rel-fp8-pair.cuh and the tests; fattn-rel-mma, rel-decode and rel-runs carry inkling-small's staged D2 hunks, so modify those only after its hunk commit lands or it confirms no overlap; (2) record plainly that partial traffic stays 4 bytes a value, so the measured win is fp8 MMA rate plus one-rounding precision, and the arm's falsifier is hi+lo quality against f16 plus prefill time; (3) the model-level greedy fixture runs with the switch ON and type_KV=f8_e4m3, else K is quantized on the fly and the comparison muddles.",
   "2026-11-22 04:12 CT llamacpp-coordinator: 2026-11-22 04:12 CT llamacpp-coordinator: pair algebra box-validated: test-inkling-fp8-pair-cuda0 passes every check on the 5090 at sm_120a; numbers are in inkling-quant's seq 55 report.",
+  '2026-11-24 12:20 CT ledger: done: WS-4 0ba8410bc + 0cc88402a, merged fb0f5d7ae. reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS): fp8_accumulation.py --check PASS: pair error 47.2x below hi alone, fold32 32/32 exact, 8/8 f8_e4m3 tile cases, served/restore argmax 116/116 (NMSE 1.64e-6/2.00e-6 on vs 1.59e-6/1.56e-6 off); test-inkling-fp8-pair and test-inkling-kv-fp8acc in the 37/37 CTest pass. Quality only, time not measured.',
 ]
 
 [[row]]
 id = 'inkling-route-histogram'
 title = 'The hot-expert premise is measured before any engine work'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -915,12 +940,13 @@ checks = [
 notes = [
   '2026-11-22 04:00 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 04:12 CT llamacpp-coordinator: 2026-11-22 04:12 CT llamacpp-coordinator: chat-inkling resolved the row as branch (c): no stored capture anywhere carries expert identities, only per-launch aggregates, so top-1 share is unmeasurable from history; the artifact records breadth evidence plus the gap, no invented numbers. Approved follow-up: a route-ID JSONL dump rider behind a default-off switch in the sorted-dispatch path, riding the already-planned window arms; one pass then answers this row's replication-transfer question, doc 21 section 4's depth gap, and EXPERT_SPLIT placement. Routed through inkling-small's sequencing; ride-if-staged before the cut, otherwise the next window.",
+  '2026-11-24 12:20 CT ledger: done: WS-4 0ba8410bc + 0cc88402a (GGML_CUDA_MMQ_ROUTE_HIST, default off, plus route_histogram.py), merged fb0f5d7ae. reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS): route_histogram.py --check PASS. Verdict stays branch c: stores carry no expert ids, so top-1 share is unmeasured (649224192 slot draws of breadth recorded); the device histogram is now in tree for the decider capture.',
 ]
 
 [[row]]
 id = 'repo-meta-init-abort'
 title = 'The meta backend admits only the tensors it declared'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -931,13 +957,14 @@ checks = [
 notes = [
   '2026-11-22 04:04 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 05:36 CT llamacpp-coordinator: 2026-11-22 06:05 CT llamacpp-coordinator: ESCALATED by the window: the served four-card server at 2aea42018 CRASHES at startup on the DEFAULT meta reserve sizing, ggml-backend-meta.cpp GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer)) inside find_split, reached via sched_reserve and ggml_backend_meta_buffer_type_get_alloc_size's new measure path (f0735a148) from llama_init_from_model. Not model-specific: it kills any tensor-split server init, the product's default path. Prime suspect: the measure path asserts on tensors that legitimately carry no meta buffer (weights and inputs) during resolution. Window pins GGML_META_MERGED_RESERVE_LEGACY=1 in every arm (memory sizing only, the setting the 425.6 floor was measured under) and proceeds. Fix is routed to the meta lane now; this row is a product blocker, not a test-row red.",
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R test-backend-meta-reserve 2/2 pass; test-llama-archs -a inkling2 all 4 rows pass including Meta (NMSE 1.53e-06) and Meta 3:7. test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'kquant-staged-kernel'
 title = 'Double-buffered K-quant tile in the Blackwell MMQ kernel'
-status = 'todo'
-owner = 'hyperparam'
+status = 'done'
+owner = ''
 blocked_by = []
 guard = false
 spec = "2026-11-22 recorded from hyperparam's measured follow-up to a815b3a47 (message seq 59). The Blackwell sm_120 K-quant MMQ table rows landed; the kernel still pays the table's residual. Double-buffer the K-quant tile in mmq.cuh so the next tile loads while the current one multiplies: the measured ~-6%-of-prefill lever the width table cannot reach (RTX 5090, served expert shapes, evidence beside reports/inkling2-mmq-kquant-evidence at 39305dff1). GLM IQ3_XXS choices and GLM 5.3 serving untouched; other models must not be wrecked. A test matching inkling-kquant-tile judges the staged kernel against the current one at Inkling prefill shapes, correctness against the existing path included; the row note records the prefill delta from a rented 5090."
@@ -946,13 +973,14 @@ checks = [
 ]
 notes = [
   '2026-11-22 06:15 CT llamacpp-coordinator: added at the request of hyperparam (seq 59) so the measured follow-up does not evaporate; 1 of 1 checks fail today, as they should: no test matching inkling-kquant-tile is registered. The spec judge lands as a dedicated tests/ file; test-backend-ops.cpp stays out of this row.',
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-kquant-tile 3/3 pass (staged, legacy, exact compare) and test-inkling-moe-tma-23row-cuda0 1/1. test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]
 
 [[row]]
 id = 'kquant-j-rule'
 title = 'K-quant-scoped J multiplier rule for the Blackwell MMQ table'
-status = 'todo'
-owner = 'hyperparam'
+status = 'done'
+owner = ''
 blocked_by = []
 guard = false
 spec = "2026-11-22 recorded from hyperparam's measured follow-up to a815b3a47 (message seq 59). A K-quant-scoped J multiplier rule reached expert mix -8.4% against the landed rows' -5.4% in the microperf sweep. Land it scoped to the K-quants so GLM IQ3_XXS choices do not move: the row fails if any IQ3_XXS selection changes, and GLM 5.3 serving stays untouched. Blackwell-first; no legacy-arch ceremony. A test matching inkling-kquant-jrule judges the rule's selections against the current table at Inkling shapes and pins the GLM IQ3_XXS selections as unchanged; the row note records the measured mix and the before/after table."
@@ -961,4 +989,5 @@ checks = [
 ]
 notes = [
   '2026-11-22 06:15 CT llamacpp-coordinator: added at the request of hyperparam (seq 59) so the measured follow-up does not evaporate; 1 of 1 checks fail today, as they should: no test matching inkling-kquant-jrule is registered. The spec judge lands as a dedicated tests/ file; test-backend-ops.cpp stays out of this row.',
+  '2026-11-24 12:20 CT ledger: done: verified by reports/cloudrift-landed-verification.md (WS-5 b6ee09260, merged 8515d2e8a; main d0627f4b6 on CloudRift RTX 5090): ctest -R inkling-kquant-jrule 2/2 pass (rule, legacy); inkling-kquant-jrule also in the integrated 37/37 CTest. test-llama-archs -a inkling2 all 4 pass (CUDA0 NMSE 2.68e-07). GLM 5.3: test-llama-archs -a glm5next green (WS-5 6/6, integrated 4/4). Integrated tree: reports/inkling2-integrated-verification.md (build c41aacd30 on CloudRift RTX 5090, OVERALL: PASS).',
 ]

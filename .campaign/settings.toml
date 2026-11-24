@@ -1,0 +1,31 @@
+# campaign settings: how each role runs. Hand edits are fine; `campaign setup` rewrites this file.
+
+merge = "pr"
+
+[roles.coordinator]
+model = "claude-anthropic--claude-opus-5-5"
+effort = "xhigh"
+
+[roles.worker]
+model = "claude-codex--gpt-6.2-sol"
+effort = "xhigh"
+
+[roles.verifier]
+model = "claude-anthropic--claude-opus-5-5"
+effort = "xhigh"
+
+[roles.researcher]
+model = "claude-anthropic--claude-opus-5-5"
+effort = "high"
+
+[roles.planner]
+model = "claude-anthropic--claude-opus-5-5"
+effort = "xhigh"
+
+[remote]
+run = "on-box"
+
+[mlflow]
+enabled = true
+server = ""
+experiment = ""

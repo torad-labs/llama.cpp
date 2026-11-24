@@ -167,5 +167,156 @@ class TestBuildAndCheck(unittest.TestCase):
             self.assertEqual(rh.check(bad), 1)
 
 
+class TestHitHistograms(unittest.TestCase):
+    def store(self, tmp, hits_by_layer, ctxs=(0, 1)):
+        lines = []
+        for ctx in ctxs:   # tensor split: each context sees every expert and the same routing
+            lines += [l.replace('"ctx":0', '"ctx":%d' % ctx) for l in site_lines(sorted(hits_by_layer))]
+            for i, layer in enumerate(sorted(hits_by_layer)):
+                for site in (2 * i, 2 * i + 1):   # gate_up and down carry one routing
+                    lines.append('MMQ_ROUTE_HIST {"ctx":%d,"device":0,"site":%d,"launches":5,"bins":384,"hits":%s}'
+                                 % (ctx, site, json.dumps(hits_by_layer[layer])))
+            lines.append('MMQ_ROUTE {"ctx":%d,"seq":0,"eval":1,"site":0,"cols":96,"used":60,"tiles8":60,"tiles":60,"j":8}' % ctx)
+        path = os.path.join(tmp, "routes.jsonl")
+        with open(path, "w") as fh:
+            fh.write("".join(l + "\n" for l in lines))
+        return path
+
+    def test_uniform_routing_is_branch_b(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.json")
+            a = rh.build([self.store(tmp, {0: [8] * 384, 1: [8] * 384})], out)
+            self.assertEqual(rh.check(out), 0)
+        self.assertTrue(a["totals"]["expert_hit_histograms_present"])
+        self.assertEqual(a["verdict"]["branch"], "b")
+        self.assertAlmostEqual(a["verdict"]["measured_top1_share"], 8 / 384.0 * 8 / 8.0 * 1.0, places=6)
+        self.assertEqual(a["totals"]["hist_dropped"]["site_repeats"], 4)   # down sites, two contexts
+        self.assertEqual(a["totals"]["hist_dropped"]["device_repeats"], 2)  # the second context's copies
+        self.assertEqual(a["per_layer"][0]["expert_hits"]["slot_draws"], 8 * 384)
+        self.assertTrue(a["verdict"]["sample_noise_reaches_bar"])   # 8 hits an expert: noise alone reaches 1.5x
+
+    def test_hot_expert_is_branch_a(self):
+        hot = [8] * 384
+        hot[17] = 400
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.json")
+            a = rh.build([self.store(tmp, {0: [8] * 384, 3: hot})], out)
+            self.assertEqual(rh.check(out), 0)
+            self.assertEqual(a["verdict"]["branch"], "a")
+            self.assertEqual(a["verdict"]["hot_layers"], [3])
+            d = json.load(open(out))
+            d["per_layer"][3]["expert_hits"]["hits"][17] = 8   # the hot leader erased, shares left as they were
+            with open(out, "w") as fh:
+                json.dump(d, fh)
+            self.assertEqual(rh.check(out), 1)
+
+    def test_evidence_flag_is_the_artifact_path(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.json")
+            rh.build([self.store(tmp, {0: [8] * 384})], out)
+            r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "route_histogram.py"),
+                                "--check", "--evidence", out], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class TestModelShape(unittest.TestCase):
+    def write(self, tmp, lines, name="s.jsonl"):
+        path = os.path.join(tmp, name)
+        with open(path, "w") as fh:
+            fh.write("".join(l + "\n" for l in lines))
+        return path
+
+    def sites(self, experts, layers=(0,)):
+        return ['MMQ_ROUTE_SITE {"ctx":0,"device":0,"site":%d,"name":"blk.%d.ffn_gate_up_exps.weight",'
+                '"type":"q4_K","experts":%d,"experts_total":0,"paired":true}' % (i, l, experts)
+                for i, l in enumerate(layers)]
+
+    def test_top4_128_experts_end_to_end(self):
+        lines = self.sites(128) + [
+            'MMQ_ROUTE {"ctx":0,"seq":0,"eval":1,"site":0,"cols":44,"used":30,"tiles8":30,"tiles":30,"j":8}',
+            'MMQ_ROUTE_HIST {"ctx":0,"device":0,"site":0,"launches":1,"bins":128,"hits":%s}' % json.dumps([1] * 44 + [0] * 84)]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.json")
+            a = rh.build([self.write(tmp, lines)], out, top_k=4)
+            self.assertEqual(rh.check(out), 0)
+        self.assertEqual((a["model"]["n_experts"], a["model"]["top_k"]), (128, 4))
+        self.assertEqual(a["totals"]["bad_cols_records"], 0)
+        self.assertEqual(a["by_batch_size"][0]["tokens_per_launch"], 11)
+        self.assertAlmostEqual(a["pooled_breadth"]["decode"]["uniform_expected_at_mean_cols"],
+                               round(rh.uniform_expected_distinct(128, 4, 11), 6))
+
+    def test_experts_from_site_lines_without_histograms(self):
+        lines = self.sites(128) + [
+            'MMQ_ROUTE {"ctx":0,"seq":0,"eval":1,"site":0,"cols":44,"used":30,"tiles8":30,"tiles":30,"j":8}']
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.json")
+            a = rh.build([self.write(tmp, lines)], out, top_k=4)
+            self.assertEqual(rh.check(out), 0)
+        self.assertEqual(a["model"]["n_experts"], 128)
+
+    def test_truncated_histogram_is_an_error(self):
+        lines = self.sites(640) + [
+            'MMQ_ROUTE_HIST {"ctx":0,"device":0,"site":0,"launches":1,"bins":512,"hits":%s}' % json.dumps([1] * 512)]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as e:
+                rh.build([self.write(tmp, lines)], os.path.join(tmp, "a.json"))
+        self.assertIn("640 experts", str(e.exception))
+
+    def test_negative_histogram_is_an_error(self):
+        lines = self.sites(4) + ['MMQ_ROUTE_HIST {"ctx":0,"device":0,"site":0,"launches":1,"bins":4,"hits":[1,-1,0,0]}']
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                rh.build([self.write(tmp, lines)], os.path.join(tmp, "a.json"))
+
+    def test_prefill_only_store_through_main(self):
+        import subprocess
+        lines = self.sites(384) + [
+            'MMQ_ROUTE {"ctx":0,"seq":0,"eval":1,"site":0,"cols":4096,"used":380,"tiles8":512,"tiles":64,"j":64}']
+        with tempfile.TemporaryDirectory() as tmp:
+            store, out = self.write(tmp, lines), os.path.join(tmp, "a.json")
+            r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "route_histogram.py"), "--stores", store,
+                                "--evidence", out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNone(json.loads(r.stdout)["decode_ratio_to_uniform_mean"])
+            self.assertEqual(rh.check(out), 0)
+
+
+class TestCheckTeeth(unittest.TestCase):
+    def artifact(self, tmp):
+        hot = [8] * 384
+        hot[5] = 900
+        t = TestHitHistograms()
+        out = os.path.join(tmp, "a.json")
+        rh.build([t.store(tmp, {0: [8] * 384, 2: hot})], out)
+        return out
+
+    def tamper(self, tmp, fn):
+        out = self.artifact(tmp)
+        d = json.load(open(out))
+        fn(d)
+        with open(out, "w") as fh:
+            json.dump(d, fh)
+        return rh.check(out)
+
+    def test_fresh_artifact_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(rh.check(self.artifact(tmp)), 0)
+
+    def test_each_verdict_field_is_recomputed(self):
+        edits = [
+            lambda d: d["verdict"].__setitem__("sample_noise_reaches_bar", not d["verdict"]["sample_noise_reaches_bar"]),
+            lambda d: d["verdict"].__setitem__("hot_layers", []),
+            lambda d: d["verdict"].__setitem__("label", "near_uniform_no_hot_expert"),
+            lambda d: d["verdict"].__setitem__("replication_bar_top1_share", 0.5),
+            lambda d: d["per_layer"][0]["expert_hits"].__setitem__("uniform_noise_top1_share", 1.0),
+            lambda d: d["per_layer"][0]["expert_hits"].__setitem__("hits", []),
+            lambda d: d["per_layer"][0]["expert_hits"]["hits"].__setitem__(0, -8),
+        ]
+        for i, fn in enumerate(edits):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.assertEqual(self.tamper(tmp, fn), 1, "edit %d slipped through" % i)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -951,16 +951,103 @@ static constexpr size_t GGML_CUDA_AR_CE_LAND = GGML_CUDA_AR_CE_DT_ADD + GGML_CUD
 static constexpr size_t GGML_CUDA_AR_CE_TOK_COUNT =
     GGML_CUDA_AR_CE_LAND + GGML_CUDA_MAX_DEVICES * GGML_CUDA_MAX_DEVICES;
 
-// Every counter below has exactly one device writing it, so publication is a
-// volatile store rather than an atomic: mapped pinned memory does not take
-// device atomics everywhere over PCIe. The fence orders each bump after the
-// stores of the copy or add that released it.
+// System-scope release store and acquire load for mapped pinned rendezvous counters over PCIe.
+static __device__ __forceinline__ void ggml_cuda_ar_sys_inc_release(uint32_t * ctr) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    const uint32_t next = *(const volatile uint32_t *) ctr + 1u;
+    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(ctr), "r"(next) : "memory");
+#else
+    __threadfence_system();
+    *(volatile uint32_t *) ctr = *(const volatile uint32_t *) ctr + 1u;
+    __threadfence_system();
+#endif
+}
+
+static __device__ __forceinline__ uint32_t ggml_cuda_ar_sys_load_acquire(const volatile uint32_t * ctr) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    uint32_t val;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(ctr) : "memory");
+    return val;
+#else
+    const uint32_t val = *ctr;
+    __threadfence_system();
+    return val;
+#endif
+}
+
+// GPU-scope release atomicAdd and acquire load for device-memory arrival counters on a single GPU.
+static __device__ __forceinline__ void ggml_cuda_ar_gpu_inc_release(uint32_t * ctr) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    asm volatile("red.release.gpu.global.add.u32 [%0], 1;" :: "l"(ctr) : "memory");
+#else
+    __threadfence();
+    atomicAdd(ctr, 1u);
+#endif
+}
+
+static __device__ __forceinline__ uint32_t ggml_cuda_ar_gpu_load_acquire(const uint32_t * ctr) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    uint32_t val;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(val) : "l"(ctr) : "memory");
+    return val;
+#else
+    const uint32_t val = *(const volatile uint32_t *) ctr;
+    __threadfence();
+    return val;
+#endif
+}
+
+__global__ static void ggml_cuda_ar_pace_signal_gpu(uint32_t * ctr) {
+    if (threadIdx.x == 0) {
+        ggml_cuda_ar_gpu_inc_release(ctr);
+    }
+}
+
+__global__ static void ggml_cuda_ar_pace_wait_gpu(const uint32_t * base, int n_devices, uint32_t target) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    for (int r = 0; r < n_devices; ++r) {
+        const uint32_t * ctr = base + (size_t) r * GGML_CUDA_AR_CE_STRIDE;
+        while ((int32_t) (ggml_cuda_ar_gpu_load_acquire(ctr) - target) < 0) {
+#ifdef GGML_USE_HIP
+            __builtin_amdgcn_s_sleep(4);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(64);
+#endif
+        }
+    }
+}
+
+__global__ static void ggml_cuda_ar_pace_signal_sys(uint32_t * ctr) {
+    if (threadIdx.x == 0) {
+        ggml_cuda_ar_sys_inc_release(ctr);
+    }
+}
+
+__global__ static void ggml_cuda_ar_pace_wait_sys(const volatile uint32_t * base, int n_devices, uint32_t target) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    for (int r = 0; r < n_devices; ++r) {
+        const volatile uint32_t * ctr = base + (size_t) r * GGML_CUDA_AR_CE_STRIDE;
+        while ((int32_t) (ggml_cuda_ar_sys_load_acquire(ctr) - target) < 0) {
+#ifdef GGML_USE_HIP
+            __builtin_amdgcn_s_sleep(4);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#endif
+        }
+    }
+}
+
+// Every counter below has exactly one device writing it, so system-scope release/acquire
+// orders each bump after the stores of the copy or add that released it without needing
+// host-native PCIe atomics.
 
 __global__ static void ggml_cuda_ar_ce_bump(uint32_t * ctr) {
     if (threadIdx.x == 0) {
-        __threadfence_system();
-        *(volatile uint32_t *) ctr = *(volatile uint32_t *) ctr + 1u;
-        __threadfence_system();
+        ggml_cuda_ar_sys_inc_release(ctr);
     }
 }
 
@@ -970,8 +1057,13 @@ __global__ static void ggml_cuda_ar_ce_wait_geq(volatile uint32_t * waited, cons
     if (threadIdx.x != 0) {
         return;
     }
-    while ((int32_t) (*waited - *against) < 0) {
+    const uint32_t target = ggml_cuda_ar_sys_load_acquire(against);
+    while ((int32_t) (ggml_cuda_ar_sys_load_acquire(waited) - target) < 0) {
+#ifdef GGML_USE_HIP
+        __builtin_amdgcn_s_sleep(4);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
         __nanosleep(100);
+#endif
     }
 }
 
@@ -980,37 +1072,38 @@ __global__ static void ggml_cuda_ar_ce_wait_new(const volatile uint32_t * sent, 
     if (threadIdx.x != 0) {
         return;
     }
-    while ((int32_t) (*sent - *read) <= 0) {
+    const uint32_t prev = ggml_cuda_ar_sys_load_acquire(read);
+    while ((int32_t) (ggml_cuda_ar_sys_load_acquire(sent) - prev) <= 0) {
+#ifdef GGML_USE_HIP
+        __builtin_amdgcn_s_sleep(4);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
         __nanosleep(100);
+#endif
     }
 }
 
 // every rank of self's row but itself took one more share in
 __global__ static void ggml_cuda_ar_ce_read_all(uint32_t * read_base, int self, int n_devices) {
     if (threadIdx.x == 0) {
-        __threadfence_system();
         for (int k = 0; k < n_devices; ++k) {
             if (k != self) {
                 uint32_t * at = read_base + (size_t) (self * GGML_CUDA_MAX_DEVICES + k) * GGML_CUDA_AR_CE_STRIDE;
-                *(volatile uint32_t *) at = *(volatile uint32_t *) at + 1u;
+                ggml_cuda_ar_sys_inc_release(at);
             }
         }
-        __threadfence_system();
     }
 }
 
 // card-to-card shares from src landed in every peer's scratch
 static __global__ void ggml_cuda_ar_ce_publish_d2d(uint32_t * land_base, uint32_t * dt_wrote, int src, int n_devices) {
     if (threadIdx.x == 0) {
-        __threadfence_system();
         for (int dest = 0; dest < n_devices; ++dest) {
             if (dest != src) {
                 uint32_t * land = land_base + (size_t) (dest * GGML_CUDA_MAX_DEVICES + src) * GGML_CUDA_AR_CE_STRIDE;
-                *(volatile uint32_t *) land = *(volatile uint32_t *) land + 1u;
+                ggml_cuda_ar_sys_inc_release(land);
             }
         }
-        *(volatile uint32_t *) dt_wrote = *(volatile uint32_t *) dt_wrote + 1u;
-        __threadfence_system();
+        ggml_cuda_ar_sys_inc_release(dt_wrote);
     }
 }
 
@@ -1140,7 +1233,13 @@ struct ggml_cuda_ar_pipeline {
     uint64_t n_split;         // reductions that went to owners and were gathered from them (GGML_CUDA_AR_SPLIT_REDUCE)
     uint64_t n_wire_q8;       // reductions to every rank that crossed in 8-bit blocks (wire_q8)
     uint64_t call_count;
-    bool     slot_no_sync;     // GGML_CUDA_AR_SLOT_NO_SYNC: the host does not wait for the copy-engine call two back to end
+    bool     slot_no_sync;        // GGML_CUDA_AR_SLOT_NO_SYNC: no two-back pacing at all
+    bool     counter_sync_legacy; // GGML_CUDA_AR_COUNTER_SYNC_LEGACY: host cudaEventSynchronize pacing
+    bool     pace_same_gpu;       // all ranks share one physical GPU: device-memory pacing counters
+    ggml_cuda_ar_host_mapping pace_tokens; // mapped pinned pacing counters across physical GPUs
+    uint32_t * pace_dev;          // device-memory pacing counters when pace_same_gpu
+    uint32_t * pace_ptr;          // active pacing counter array (n_devices * GGML_CUDA_AR_CE_STRIDE)
+    uint64_t pace_call_count;     // live copy-engine calls that signal pace_ptr
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -1241,15 +1340,48 @@ struct ggml_cuda_ar_pipeline {
 // route's owned rows under GGML_CUDA_AR_HOST_OWNER_STREAM_ORDERED), and so does
 // the captured copy-engine route (graph_captured): a capture cannot block its
 // host, and reuse pacing lives in mapped counters and graph edges instead.
-static int ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p, bool stream_ordered = false, bool graph_captured = false) {
+static void ggml_cuda_ar_pace_signal(const ggml_cuda_ar_pipeline * p, int rank, cudaStream_t stream) {
+    uint32_t * ctr = p->pace_ptr + (size_t) rank * GGML_CUDA_AR_CE_STRIDE;
+    if (p->pace_same_gpu) {
+        ggml_cuda_ar_pace_signal_gpu<<<1, 32, 0, stream>>>(ctr);
+    } else {
+        ggml_cuda_ar_pace_signal_sys<<<1, 32, 0, stream>>>(ctr);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_ar_pace_wait(const ggml_cuda_ar_pipeline * p, uint32_t target, cudaStream_t stream) {
+    if (p->pace_same_gpu) {
+        ggml_cuda_ar_pace_wait_gpu<<<1, 32, 0, stream>>>(p->pace_ptr, p->n_devices, target);
+    } else {
+        ggml_cuda_ar_pace_wait_sys<<<1, 32, 0, stream>>>(p->pace_ptr, p->n_devices, target);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static int ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p, bool stream_ordered = false, bool graph_captured = false,
+                                     uint32_t * pace_wait_target = nullptr) {
+    if (pace_wait_target != nullptr) {
+        *pace_wait_target = 0;
+    }
     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
     p->call_count++;
 
-    if (pool_lapped && !stream_ordered && !graph_captured && !p->slot_no_sync) {
-        for (int i = 0; i < p->n_devices; ++i) {
-            ggml_cuda_set_device(p->devices[i]);
-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+    if (!graph_captured && !p->slot_no_sync) {
+        if (p->counter_sync_legacy) {
+            if (pool_lapped && !stream_ordered) {
+                for (int i = 0; i < p->n_devices; ++i) {
+                    ggml_cuda_set_device(p->devices[i]);
+                    CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+                }
+            }
+        } else if (p->pace_ptr != nullptr) {
+            // Device-side two-back arrival counter pacing: host never blocks.
+            const uint64_t pk = p->pace_call_count++;
+            if (!stream_ordered && pk >= GGML_CUDA_AR_POOL_SIZE && pace_wait_target != nullptr) {
+                *pace_wait_target = (uint32_t) (pk - GGML_CUDA_AR_POOL_SIZE + 1);
+            }
         }
     }
 
@@ -1608,8 +1740,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                       __func__, p->copy_chunk_bytes, GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
         p->copy_chunk_bytes = GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN;
     }
-    p->copy_tail_legacy = ggml_env_switch("GGML_CUDA_AR_COPY_TAIL_LEGACY");
-    p->slot_no_sync = ggml_env_switch("GGML_CUDA_AR_SLOT_NO_SYNC");
+    p->copy_tail_legacy    = ggml_env_switch("GGML_CUDA_AR_COPY_TAIL_LEGACY");
+    p->slot_no_sync        = ggml_env_switch("GGML_CUDA_AR_SLOT_NO_SYNC");
+    p->counter_sync_legacy = ggml_env_switch("GGML_CUDA_AR_COUNTER_SYNC_LEGACY");
     // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
@@ -1817,6 +1950,39 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // Device-side two-back pacing arrival counters for live copy-engine reductions.
+    // Same physical GPU uses device memory (GPU-scope atomicAdd/acquire); multi-GPU uses mapped pinned memory.
+    if (!p->counter_sync_legacy && !p->slot_no_sync) {
+        bool same_gpu = true;
+        const int phys0 = ggml_cuda_info().devices[p->devices[0]].physical_device;
+        for (size_t i = 1; i < n_devices; ++i) {
+            if (ggml_cuda_info().devices[p->devices[i]].physical_device != phys0) {
+                same_gpu = false;
+                break;
+            }
+        }
+        p->pace_same_gpu = same_gpu;
+        const size_t pace_bytes = (size_t) n_devices * GGML_CUDA_AR_CE_STRIDE * sizeof(uint32_t);
+        if (same_gpu) {
+            ggml_cuda_set_device(p->devices[0]);
+            if (cudaMalloc(reinterpret_cast<void **>(&p->pace_dev), pace_bytes) != cudaSuccess ||
+                    cudaMemset(p->pace_dev, 0, pace_bytes) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: alloc for device pacing counters failed (%zu bytes)\n", __func__, pace_bytes);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+            p->pace_ptr = p->pace_dev;
+        } else {
+            if (p->pace_tokens.alloc(pace_bytes) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: alloc for mapped pacing counters failed (%zu bytes)\n", __func__, pace_bytes);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+            std::memset(p->pace_tokens.host, 0, pace_bytes);
+            p->pace_ptr = reinterpret_cast<uint32_t *>(p->pace_tokens.dev);
+        }
+    }
+
     // Captured copy-engine rendezvous tokens: one mapped pinned block, zeroed
     // so the first share on every pair reads as unpublished and unread.
     //
@@ -1970,6 +2136,13 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     for (size_t i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         ggml_cuda_ar_peer_free(p, (int) i, p->ce_wire[i]);
     }
+    if (p->pace_dev) {
+        ggml_cuda_set_device(p->devices[0]);
+        cudaFree(p->pace_dev);
+        p->pace_dev = nullptr;
+    }
+    p->pace_tokens.free();
+    p->pace_ptr = nullptr;
     p->ce_tokens.free();
     p->arrival.free();
     delete p;
@@ -1988,7 +2161,8 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // peer's blocks lie a whole copy_bytes apart in dev_tmp[i], in rank order.
 template <typename T_src, typename T_dst, bool owned_rows = false>
 static void ggml_cuda_ar_copy_add(
-        ggml_cuda_ar_pipeline * p, int i, int slot, cudaStream_t stream, const T_src * own, T_dst * dst_buf, int64_t ne) {
+        ggml_cuda_ar_pipeline * p, int i, int slot, cudaStream_t stream, const T_src * own, T_dst * dst_buf, int64_t ne,
+        bool signal_pace = true) {
     if constexpr (std::is_same_v<T_src, ggml_cuda_ar_q8_block>) {
         ggml_cuda_ar_reduce_q8(dst_buf, own, p->dev_tmp[i].as<const char>(), p->copy_bytes, ne, i, p->n_devices, stream);
     } else {
@@ -2011,6 +2185,9 @@ static void ggml_cuda_ar_copy_add(
 
     CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], stream));
     CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+    if (signal_pace && !p->counter_sync_legacy && !p->slot_no_sync && p->pace_ptr != nullptr) {
+        ggml_cuda_ar_pace_signal(p, i, stream);
+    }
 }
 
 // The copy-engine reduction card to card (p->copy_peer): each device copies its
@@ -2028,7 +2205,8 @@ static bool ggml_cuda_ar_allreduce_copy_peer(
         const bool              compute[GGML_CUDA_MAX_DEVICES],
         int64_t                 ne,
         size_t                  nbytes) {
-    const int slot = ggml_cuda_ar_acquire_slot(p);
+    uint32_t pace_target = 0;
+    const int slot = ggml_cuda_ar_acquire_slot(p, false, false, &pace_target);
 
     ggml_backend_cuda_context * cuda_ctx[2] = {};
 
@@ -2042,6 +2220,9 @@ static bool ggml_cuda_ar_allreduce_copy_peer(
         GGML_ASSERT(cuda_ctx[i]->device == p->devices[i]);
 
         ggml_cuda_ar_wait_for_compute(p, cuda_ctx[i], i, slot);
+        if (pace_target > 0) {
+            ggml_cuda_ar_pace_wait(p, pace_target, p->streams[i]);
+        }
         if (p->ce_tok) {
             // guard peer dev_tmp with counters so replay->live steps do not wait on stale events
             ggml_cuda_ar_ce_wait_geq<<<1, 32, 0, p->streams[i]>>>(
@@ -2102,7 +2283,8 @@ static bool ggml_cuda_ar_allreduce_copy_n(
     const bool stream_ordered = owned_rows && p->host_owner_stream_ordered;
     // All waits for this event generation are enqueued before the next call records it again.
     // The previous receives release host_large; the previous add releases dev_tmp below.
-    const int slot = ggml_cuda_ar_acquire_slot(p, stream_ordered);
+    uint32_t pace_target = 0;
+    const int slot = ggml_cuda_ar_acquire_slot(p, stream_ordered, false, &pace_target);
     // owned rows go in one piece: each rank takes its quarter of every row, which a byte range of the rows does not hold
     const size_t chunk_bytes = owned_rows ? nbytes : ggml_cuda_ar_chunk_bytes(p, nbytes);
     const size_t chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
@@ -2129,6 +2311,9 @@ static bool ggml_cuda_ar_allreduce_copy_n(
         contexts[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
         GGML_ASSERT(contexts[i]->device == p->devices[i]);
         ggml_cuda_ar_wait_for_compute(p, contexts[i], i, slot);
+        if (pace_target > 0) {
+            ggml_cuda_ar_pace_wait(p, pace_target, p->streams[i]);
+        }
         for (int peer = 0; peer < p->n_devices; ++peer) {
             if (peer == i) { continue; }
             if (p->ce_tok) {
@@ -2288,7 +2473,8 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
     const size_t chunk_bytes = ggml_cuda_ar_chunk_bytes(p, nbytes);
     GGML_ASSERT(chunk_bytes > 0);
 
-    const int slot = ggml_cuda_ar_acquire_slot(p);
+    uint32_t pace_target = 0;
+    const int slot = ggml_cuda_ar_acquire_slot(p, false, false, &pace_target);
     const size_t copy_chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
     GGML_ASSERT(copy_chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
 
@@ -2301,6 +2487,9 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         GGML_ASSERT(cuda_ctx[i]->device == p->devices[i]);
 
         ggml_cuda_ar_wait_for_compute(p, cuda_ctx[i], i, slot);
+        if (pace_target > 0) {
+            ggml_cuda_ar_pace_wait(p, pace_target, p->streams[i]);
+        }
 
         // Wait for peer's H2D from our host_large[i] to finish before overwriting it.
         if (p->ce_tok) {
@@ -2609,7 +2798,7 @@ static bool ggml_cuda_ar_allreduce_copy_captured(
                 CUDA_CHECK(cudaGetLastError());
             }
         }
-        ggml_cuda_ar_copy_add<T_src, T_dst, owned_rows>(p, i, slot, stream, src_buf[i], dst_buf[i], ne);
+        ggml_cuda_ar_copy_add<T_src, T_dst, owned_rows>(p, i, slot, stream, src_buf[i], dst_buf[i], ne, /*signal_pace=*/false);
         if (p->copy_peer) {
             // my adds released the scratch my peers write me at: they may overwrite it next round
             ggml_cuda_ar_ce_read_all<<<1, 32, 0, stream>>>(

@@ -19,7 +19,7 @@
 
 // GGML_CUDA_MMQ_TMA=1 opts in; the kernel declines outside Blackwell sm_120 and the few-row MMQ's own gate.
 bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                          const ggml_tensor * ids, ggml_tensor * dst);
+                          const ggml_tensor * ids, ggml_tensor * dst, bool ids_ready = false);
 
 // Fused Q3_K gate/up + SITU via two TMA boxes per 16-row tile (shared y fragments, evict_first).
 bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,

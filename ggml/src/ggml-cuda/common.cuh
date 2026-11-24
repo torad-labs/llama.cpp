@@ -1942,7 +1942,12 @@ struct ggml_cuda_route_stats {
 // width, not the experts) and the experts of all ranks where each rank holds some of them (the data split), so that a
 // launch's columns are the sum over the ranks. Made before a graph evaluation, never inside a capture, like the
 // counters above. A diagnostic: it adds launches to every evaluation and every routed MMQ, so its legs give no rate.
+// GGML_CUDA_MMQ_ROUTE_HIST (default off, needs the log on): the same one-block launch also adds each expert's columns
+// into a per-site hit histogram on the device, over every launch and replay, written as one MMQ_ROUTE_HIST line a site.
 struct ggml_cuda_mmq_route_log {
+    static constexpr int hist_sites = 512; // sites past these get no histogram
+    static constexpr int hist_bins  = 512; // experts past these are not counted; a row ends with its launch count
+
     struct record {
         uint32_t site;   // index into sites
         uint32_t eval;   // the context's graph evaluation the launch ran in
@@ -1963,6 +1968,7 @@ struct ggml_cuda_mmq_route_log {
     };
     unsigned int *    head     = nullptr; // on the device: [0] the records its launches tried to append, [1] evaluations begun
     record *          records  = nullptr; // on the device
+    unsigned long long * hist  = nullptr; // on the device: hist_sites rows of hist_bins hits and one launch count
     uint32_t          capacity = 0;
     int               ctx      = -1;      // the context's number in the process
     std::vector<site> sites;
@@ -1977,6 +1983,11 @@ struct ggml_cuda_mmq_route_log {
             CUDA_CHECK(cudaMalloc(&head, 2*sizeof(*head)));
             CUDA_CHECK(cudaMemset(head, 0, 2*sizeof(*head)));
             CUDA_CHECK(cudaMalloc(&records, n*sizeof(*records)));
+            if (ggml_env_switch("GGML_CUDA_MMQ_ROUTE_HIST")) {
+                const size_t bytes = (size_t) hist_sites*(hist_bins + 1)*sizeof(*hist);
+                CUDA_CHECK(cudaMalloc(&hist, bytes));
+                CUDA_CHECK(cudaMemset(hist, 0, bytes));
+            }
             capacity = n;
             ctx      = n_ctx.fetch_add(1);
         }
@@ -2013,6 +2024,46 @@ struct ggml_cuda_l2_issue_stop {
             CUDA_CHECK(cudaFree(ptr));
             ptr = nullptr;
         }
+    }
+};
+
+// Device-side arrival counters for ordering-only stream handoffs (fork/join, side-stream L2 warm).
+// Each slot sits on its own 64-byte cache line (16 uint32_t stride). Allocated before graph evaluation.
+struct ggml_cuda_arrival_counters {
+    static constexpr int stride_u32 = 16;
+    static constexpr int n_slots    = 4;
+    enum slot_id {
+        SLOT_FORK    = 0,
+        SLOT_JOIN    = 1,
+        SLOT_L2_FORK = 2,
+        SLOT_L2_JOIN = 3,
+    };
+
+    uint32_t * ptr = nullptr;
+    uint32_t   seq[n_slots] = {};
+
+    void ensure() {
+        if (ptr == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ptr, (size_t) n_slots * stride_u32 * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemset(ptr, 0, (size_t) n_slots * stride_u32 * sizeof(uint32_t)));
+            for (int i = 0; i < n_slots; ++i) {
+                seq[i] = 0;
+            }
+        }
+    }
+
+    void release() {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+            ptr = nullptr;
+        }
+        for (int i = 0; i < n_slots; ++i) {
+            seq[i] = 0;
+        }
+    }
+
+    uint32_t * slot(slot_id id) const {
+        return ptr != nullptr ? ptr + (size_t) id * stride_u32 : nullptr;
     }
 };
 
@@ -2742,7 +2793,9 @@ struct ggml_backend_cuda_context {
     cudaEvent_t l2_issue_fork = nullptr; // the paced L2 issuer's fork from the evaluation's stream, and its join back
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
+    bool        l2_issue_counter = false; // the open issuer forked through device arrival counters
     ggml_cuda_l2_issue_stop l2_issue_stop;
+    ggml_cuda_arrival_counters arrival_counters;
     bool        l2_persisting = false;   // a launch was given a persisting L2 window (ggml_cuda_l2_persist_window)
     const ggml_cgraph * l2_graph_next = nullptr; // the graph after the next computed, while it computes (ggml_backend_graph_next)
     const ggml_cgraph * ar_hc_graph = nullptr;

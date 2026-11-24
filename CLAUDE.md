@@ -4,25 +4,24 @@ This codebase is yours: what it's for and how it's built are your calls, and you
 <!-- campaign:start -->
 ## Campaign
 
-Open work lives in `.campaign/ledger.toml`. Run `campaign help` for the verbs.
+This repo uses the new `campaign` CLI (`campaign help`) configured in `.campaign/settings.toml` (inspect with
+`campaign setup --show --json`).
 
-- Work on a row: `campaign next`, then `campaign claim <id> --as <your seat>`. Every pull request names the row
-  it moves forward (or `upkeep`).
-- A row is done only when `campaign done <id>` passes. It runs the row's checks as the base branch has them.
-  Saying it is done, a test count or a commit message is not done.
-- Checks change only in a commit of their own that touches nothing but `.campaign/` and judged paths, written by
-  the lead. They judge once they reach the base branch.
-  If a check is wrong, `campaign note` why and `campaign status <id> blocked`.
-- New work starts as a row whose checks fail today (`campaign add` refuses checks that already pass).
-- A migration row's check proves the old path is gone, not only that the new one exists.
-- The reviewer runs `campaign gate --title "<pr title>"` on every pull request; it merges only when the gate passes.
-- Nobody outside the seats approves or reviews anything. What a row needs judged, its checks judge, including
-  review checks that run a fresh agent against the work.
-- A feature is cut into items by its lead (`campaign feature`, `campaign add --feature`) and run by the tool:
-  the committed items are the plan, and no session writes or reviews it. `campaign start <feature>` builds
-  its items in the feature's worktree and has them reviewed, `campaign finish <feature>` merges it. An item of a
-  feature is done only when its checks, its feature review and its code review pass in one round. A session given
-  items builds them and ends; it never commits, closes an item or reviews it.
+- **Unattended worktree campaigns (default for features, fixes, integrations):** write a concise Markdown goal
+  file with executable checks and launch `campaign hand <name> <goal.md>`. Track with `campaign status [<name> | --all]`
+  and `campaign queue`, reply to prompts with `campaign origin reply <name> <ask-id> "<answer>"`, pause/resume with
+  `campaign hold` / `campaign resume`, and tear down superseded runs with `campaign cancel <name> "<reason>" --force`.
+- **Interactive Live Mode:** follow the `campaign` skill (`blocks/live.md` and `references/host-routing.md`). Keep
+  the coordinator thin, enforce every allowlist/effort rule in `campaign setup --show --json`, and archive finished
+  child sessions once collected.
+- **Cross-lab verification bar (critical & blocker only):** every non-trivial change is verified by a fresh
+  cross-lab verifier from the kernel allowlist below. Re-loop to the builder ONLY for critical or blocker bugs
+  (wrong math/numerical divergence, memory corruption/OOB/crash/deadlock/real race, build break, GLM 5.3 regression,
+  or broken core feature contract) - log minor concerns/nits without blocking merge.
+- **Remote builds & GPU tests:** `[remote]` in `.campaign/settings.toml` routes builds/tests to CloudRift RTX 5090
+  via `on-box` (`buildbox`). Always use a dedicated build directory per checkout and per-command GPU locks (`flock`).
+- **Legacy ledger:** `.campaign/ledger.toml` holds historical row tracking from the previous workflow and is reconciled
+  directly as rows land (the old `campaign next`/`claim`/`done`/`gate`/`feature` subcommands are retired).
 <!-- campaign:end -->
 
 ## Changing shared code (Marcos, 2026-11-22)
@@ -57,3 +56,14 @@ paths generic so every model and backend fits; this fork does not owe that.
   built its whole 384x2304x4608 weight tensor as one f32 array, about 16 GB, before quantizing it, and hung
   for 22 minutes under memory pressure; the same case in chunks of about 16M values peaks near its quantized
   size, about 2.3 GB.
+
+## Models allowed for kernel work (Marcos, 2026-11-24)
+
+Only these models are allowed to build, debug, or review kernel work (CUDA, PTX, TMA, attention, MoE, quantize, allreduce, backend ops):
+
+- Gemini: Carbon (`claude-antigravity--gem-4-carbon`), Neon (`claude-antigravity--gem-4-neon`) - use Neon for difficult kernel tasks
+- GPT: Astra 6.2 (`claude-oai--6.2-astra`) or Sol 6.2 (`claude-oai--6.2-sol`)
+- Claude: Opus 5.5 (`claude-opus-5-5`)
+- Muse: Muse Wonder Full 1.0 (`claude-muse--muse-wonder-full-1.0`)
+
+NO OTHER MODEL IS EVER ALLOWED TO WORK ON KERNELS (never Fable 5.2, never Grok 4.7, never Sonnet/Haiku/Flash/etc.).

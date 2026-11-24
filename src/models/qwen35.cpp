@@ -311,7 +311,10 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
         int           layer) {
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
 
-    // silu(gate) * normalized as one GLU op instead of a unary and a mul
+    // silu(gate) * normalized as one GLU op when gate is contiguous; merged wqkv_z views are strided
+    if (!ggml_is_contiguous_1(gate)) {
+        return ggml_mul(ctx0, normalized, ggml_silu(ctx0, gate));
+    }
     return ggml_swiglu_split(ctx0, gate, normalized);
 }
 

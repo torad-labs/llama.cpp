@@ -34,6 +34,7 @@ struct model_weights {
     ggml_context *        ctx     = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
     ggml_tensor *         router  = nullptr;
+    ggml_tensor *         router_signs = nullptr;
     ggml_tensor *         bias    = nullptr;
     ggml_tensor *         gate_up = nullptr;
     ggml_tensor *         down    = nullptr;
@@ -111,7 +112,7 @@ static constexpr int32_t k_candidates[13] = {
     0, 31, 32, 33, 47, 64, 95, 110, 126, 127, 128, 220, 383
 };
 
-static bool init_weights(model_weights & W, ggml_backend_t dev_backend, int n_threads) {
+static bool init_weights(model_weights & W, ggml_backend_t dev_backend, int n_threads, bool bake) {
     ggml_init_params params = { 16 * ggml_tensor_overhead(), nullptr, true };
     W.ctx     = ggml_init(params);
     W.router  = ggml_new_tensor_2d(W.ctx, GGML_TYPE_F32, n_embd, n_expert);
@@ -119,6 +120,9 @@ static bool init_weights(model_weights & W, ggml_backend_t dev_backend, int n_th
     W.gate_up = ggml_new_tensor_3d(W.ctx, GGML_TYPE_Q3_K, n_embd, 2*n_ff, n_local);
     W.down    = ggml_new_tensor_3d(W.ctx, GGML_TYPE_Q4_K, n_ff, n_embd, n_local);
     W.down_q5 = ggml_new_tensor_3d(W.ctx, GGML_TYPE_Q5_K, n_ff, n_embd, n_local);
+    if (bake) {
+        W.router_signs = ggml_new_tensor_1d(W.ctx, GGML_TYPE_F32, n_embd);
+    }
 
     W.buf = ggml_backend_alloc_ctx_tensors(W.ctx, dev_backend);
     if (W.buf == nullptr) {
@@ -135,7 +139,21 @@ static bool init_weights(model_weights & W, ggml_backend_t dev_backend, int n_th
         W.h_bias[e] = 0.005f * (float) c;
     }
 
-    ggml_backend_tensor_set(W.router, W.h_router.data(), 0, W.h_router.size()*sizeof(float));
+    if (bake) {
+        std::vector<float> signs(n_embd), row(n_embd);
+        for (int64_t j = 0; j < n_embd; ++j) {
+            signs[j] = (j/16) % 2 ? -1.0f : 1.0f;
+        }
+        ggml_backend_tensor_set(W.router_signs, signs.data(), 0, n_embd*sizeof(float));
+        for (int64_t expert = 0; expert < n_expert; ++expert) {
+            for (int64_t j = 0; j < n_embd; ++j) {
+                row[j] = W.h_router[expert*n_embd + j]*signs[j];
+            }
+            ggml_backend_tensor_set(W.router, row.data(), expert*n_embd*sizeof(float), n_embd*sizeof(float));
+        }
+    } else {
+        ggml_backend_tensor_set(W.router, W.h_router.data(), 0, W.h_router.size()*sizeof(float));
+    }
     ggml_backend_tensor_set(W.bias,   W.h_bias.data(),   0, W.h_bias.size()*sizeof(float));
     quantize_rows(W.gate_up, 99,  n_threads);
     quantize_rows(W.down,    123, n_threads);
@@ -179,7 +197,8 @@ static layer build(const model_weights & W, int64_t n_tokens, bool computed_cur,
     ggml_set_input(L.cur_in);
     L.cur = computed_cur ? ggml_rms_norm(ctx, L.cur_in, 1e-5f) : L.cur_in;
 
-    L.logits = ggml_mul_mat(ctx, W.router, L.cur);
+    auto * router_cur = W.router_signs ? ggml_mul(ctx, L.cur, W.router_signs) : L.cur;
+    L.logits = ggml_mul_mat(ctx, W.router, router_cur);
     L.probs  = ggml_sigmoid(ctx, L.logits);
     ggml_tensor * selection = ggml_add(ctx, L.probs, W.bias);
     L.ids = ggml_argsort_top_k(ctx, selection, n_used);
@@ -416,8 +435,9 @@ static float cpu_weighted_sum_elem(const model_weights & W, const std::vector<fl
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 2) {
-        printf("usage: %s <out.bin>\n", argv[0]);
+    const bool bake = argc == 3 && strcmp(argv[2], "--router-bake") == 0;
+    if (argc != 2 && !bake) {
+        printf("usage: %s <out.bin> [--router-bake]\n", argv[0]);
         return 1;
     }
     ggml_backend_t dev_backend = nullptr;
@@ -428,6 +448,10 @@ int main(int argc, char ** argv) {
         }
     }
     if (!dev_backend) {
+        if (bake) {
+            fprintf(stderr, "CUDA device required for baked router fusion\n");
+            return 1;
+        }
         FILE * f = fopen(argv[1], "wb");
         if (f) { fclose(f); }
         printf("SKIP: no GPU device\n");
@@ -445,7 +469,7 @@ int main(int argc, char ** argv) {
 
     const int n_threads = std::min<int>(16, std::max<int>(1, (int) std::thread::hardware_concurrency()));
     model_weights W;
-    if (!init_weights(W, dev_backend, n_threads)) {
+    if (!init_weights(W, dev_backend, n_threads, bake)) {
         printf("FAIL: no buffer for model weights\n");
         return 1;
     }

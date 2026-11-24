@@ -17303,6 +17303,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, true,  2304, n, 4608));
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, false, 4608, n, 2304));
     }
+    // Inkling 2's full gate/up and down expert products at 23 rows.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true,  4608, 23, 4608));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, 23, 2304));
     // the Q3_K_M pack's products as four cards split them (gate and up packed in 1,024 rows, down to 512), the shapes whose
     // routes GGML_CUDA_MMVQ_EXPERT_SORT_23 sorts: at the fewest tokens the sort takes, the 23 it serves and the most
     for (int n : { 1, 23, 32 }) {
@@ -17399,6 +17402,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 1025, 10, false, 64, 33, 256, 0, true));
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
+    }
+
+    // repeated expert ids on the K-quant few-row row-split path (k=512 = 2 units)
+    for (ggml_type ta : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 32, 8, b, 256, 23, 512, 0, true));
+        }
     }
 
     for (ggml_type type_a : all_types) {

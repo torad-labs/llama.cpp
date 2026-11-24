@@ -390,6 +390,41 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
                     "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;LLAMA_INKLING2_MEAN_MASK_DECODE=1;LLAMA_INKLING2_MEAN_POOL_MIN=8192")
             endforeach()
         endforeach()
+        # doc 18 section 3.2 (campaign row inkling-optimize-kv-gates): each fast path on a q8_0, q4_0 or f8_e4m3 global
+        # cache against F16 on the same path, and on a GPU the attention kernel the path names on the quantized cache.
+        # f8_e4m3 runs without GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE where the path does not need it, so its by-element
+        # decode is what takes the low-mean and drafted steps; q4_0 rides GGML_CUDA_FATTN_REL_DECODE_Q4
+        if (NOT inkling_path_device STREQUAL "CPU")
+            foreach(inkling_kv q8_0 q4_0 e4m3)
+                set(inkling_kvg_type "")
+                if (inkling_kv STREQUAL "q4_0")
+                    set(inkling_kvg_type "GGML_CUDA_FATTN_REL_DECODE_Q4=1")
+                endif()
+                set(inkling_kvg_runs "GGML_CUDA_FATTN_REL_QUERY_FIRST=1;GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1")
+                if (inkling_kv STREQUAL "q4_0")
+                    set(inkling_kvg_runs "GGML_CUDA_FATTN_REL_QUERY_FIRST=1;GGML_CUDA_FATTN_REL_DECODE_Q4=1")
+                endif()
+                foreach(inkling_kvg mean:served group:drafted short:unified runs:runs bucket:bucket)
+                    string(REPLACE ":" ";" inkling_kvg_pair ${inkling_kvg})
+                    list(GET inkling_kvg_pair 0 inkling_kvg_path)
+                    list(GET inkling_kvg_pair 1 inkling_kvg_case)
+                    set(inkling_kvg_test test-inkling-kvg-${inkling_kvg_path}-${inkling_kv})
+                    llama_test(test-llama-archs NAME ${inkling_kvg_test}
+                        ARGS --inkling-path kvg-${inkling_kvg_path}-${inkling_kv}/${inkling_kvg_case}
+                             --inkling-path-device ${inkling_path_device} -s 1234)
+                    if (inkling_kvg_path STREQUAL "mean")
+                        set(inkling_kvg_env "LLAMA_INKLING2_MEAN_MASK_DECODE=1;LLAMA_INKLING2_MEAN_POOL_MIN=8192;${inkling_kvg_type}")
+                    elseif (inkling_kvg_path STREQUAL "runs")
+                        set(inkling_kvg_env "${inkling_kvg_runs}")
+                    elseif (inkling_kvg_path STREQUAL "bucket")
+                        set(inkling_kvg_env "LLAMA_INKLING2_BUCKET_PREFILL_KV=1")
+                    else()
+                        set(inkling_kvg_env "${inkling_kvg_type}")
+                    endif()
+                    set_tests_properties(${inkling_kvg_test} PROPERTIES LABELS "main" ENVIRONMENT "${inkling_kvg_env}")
+                endforeach()
+            endforeach()
+        endif()
         # section 3.5 skeleton (doc 18-global-kv-off-f16.md): the mixed recency store's dual pools route stores by
         # recency and its dense read merge serves every cell from exactly one source - all-hot and all-cold fixtures
         # equal their single pool bit for bit, evictions fall back to cold exactly
@@ -754,6 +789,47 @@ set_tests_properties(test-backend-moe-prep-cpu PROPERTIES LABELS "main")
 if (GGML_CUDA)
     add_test(NAME test-inkling-moe-mul-mat-id-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID -p "n_mats=384,n_used=8,")
     add_test(NAME test-inkling-moe-block-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MOE)
+    llama_build(test-inkling-seam.cpp LINK ggml Threads::Threads)
+    add_test(NAME inkling-seam-ops-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
+        -p "n_mats=384,n_used=8,b=[01],m=4608,n=23,k=(4608|2304),")
+    add_test(NAME inkling-seam-broadcast-cuda0 COMMAND test-inkling-seam ${CMAKE_CURRENT_BINARY_DIR}/inkling-seam-broadcast.bin)
+    add_test(NAME inkling-seam-legacy-cuda0 COMMAND test-inkling-seam ${CMAKE_CURRENT_BINARY_DIR}/inkling-seam-legacy.bin)
+    add_test(NAME inkling-seam-exact-cuda0 COMMAND ${CMAKE_COMMAND} -E compare_files
+        ${CMAKE_CURRENT_BINARY_DIR}/inkling-seam-broadcast.bin ${CMAKE_CURRENT_BINARY_DIR}/inkling-seam-legacy.bin)
+    set_tests_properties(inkling-seam-broadcast-cuda0 PROPERTIES FIXTURES_SETUP seam_broadcast
+        ENVIRONMENT "GGML_CUDA_MMQ_FEW_ID_QUANT_LEGACY=0")
+    set_tests_properties(inkling-seam-legacy-cuda0 PROPERTIES FIXTURES_SETUP seam_legacy
+        ENVIRONMENT "GGML_CUDA_MMQ_FEW_ID_QUANT_LEGACY=1")
+    set_tests_properties(inkling-seam-exact-cuda0 PROPERTIES FIXTURES_REQUIRED "seam_broadcast;seam_legacy")
+    set_tests_properties(inkling-seam-ops-cuda0 inkling-seam-broadcast-cuda0 inkling-seam-legacy-cuda0
+        inkling-seam-exact-cuda0 PROPERTIES LABELS "main")
+    llama_build(test-inkling-router-bake.cpp llama-archs-gguf.cpp)
+    add_test(NAME inkling-router-bake-cuda0 COMMAND test-inkling-router-bake)
+    set_tests_properties(inkling-router-bake-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_DISABLE_GRAPHS=1")
+    llama_build(test-inkling-route-gate.cpp LINK ggml)
+    set(route_gate_env "GGML_CUDA_MMQ_FEW_LEGACY=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=8;GGML_CUDA_MMQ_TMA=0")
+    foreach(mode live graph)
+        if(mode STREQUAL live)
+            set(disable_graphs 1)
+        else()
+            set(disable_graphs 0)
+        endif()
+        foreach(arm dense gated)
+            if(arm STREQUAL dense)
+                set(route_gate_flag 0)
+            else()
+                set(route_gate_flag 1)
+            endif()
+            set(route_gate_test inkling-route-gate-${mode}-${arm})
+            add_test(NAME ${route_gate_test} COMMAND test-inkling-route-gate ${CMAKE_CURRENT_BINARY_DIR}/${route_gate_test}.bin)
+            set_tests_properties(${route_gate_test} PROPERTIES LABELS "main" FIXTURES_SETUP route_gate_${mode}_${arm}
+                ENVIRONMENT "${route_gate_env};GGML_CUDA_DISABLE_GRAPHS=${disable_graphs};GGML_CUDA_MOE_ROUTE_GATE=${route_gate_flag}")
+        endforeach()
+        add_test(NAME inkling-route-gate-${mode}-exact COMMAND ${CMAKE_COMMAND} -E compare_files
+            ${CMAKE_CURRENT_BINARY_DIR}/inkling-route-gate-${mode}-dense.bin ${CMAKE_CURRENT_BINARY_DIR}/inkling-route-gate-${mode}-gated.bin)
+        set_tests_properties(inkling-route-gate-${mode}-exact PROPERTIES LABELS "main"
+            FIXTURES_REQUIRED "route_gate_${mode}_dense;route_gate_${mode}_gated")
+    endforeach()
     add_test(NAME test-inkling-moe-routed-rows-cuda0 COMMAND test-backend-ops test -b CUDA0 -o MUL_MAT_ID
         -p "n_mats=32,n_used=8,.*m=256,n=(17|23|32),k=512,")
     set_tests_properties(test-inkling-moe-routed-rows-cuda0 PROPERTIES LABELS "main" ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=32")
@@ -853,8 +929,6 @@ if (GGML_CUDA)
     # against a double-precision CPU port (router logits, ids, weights, sampled SITU and one weighted-sum output) and sees
     # the tensors a fused launch leaves unwritten keep their sentinel. The expert-row limit is the served 23 so that the
     # reference arm runs the row kernels the fused launches copy.
-    # guarded: test-inkling-moe-fuse.cpp is not in this commit (fusions lane still uncommitted)
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-inkling-moe-fuse.cpp)
     llama_build(test-inkling-moe-fuse.cpp LINK ggml Threads::Threads)
     add_test(NAME inkling-fuse-chain-ref-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-ref.bin)
     add_test(NAME inkling-fuse-chain-fused-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-fused.bin)
@@ -866,6 +940,9 @@ if (GGML_CUDA)
         ENVIRONMENT "GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
     set_tests_properties(inkling-fuse-chain-exact PROPERTIES LABELS "main"
         DEPENDS "inkling-fuse-chain-ref-cuda0;inkling-fuse-chain-fused-cuda0")
+    add_test(NAME inkling-router-bake-fuse-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-bake-fused.bin --router-bake)
+    set_tests_properties(inkling-router-bake-fuse-cuda0 PROPERTIES LABELS "main"
+        ENVIRONMENT "LLAMA_INKLING2_ROUTER_BAKE=1;GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
     add_test(NAME inkling-fuse-chain-tma-ref-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-tma-ref.bin)
     add_test(NAME inkling-fuse-chain-tma-fused-cuda0 COMMAND test-inkling-moe-fuse ${CMAKE_CURRENT_BINARY_DIR}/inkling-fuse-tma-fused.bin)
     add_test(NAME inkling-fuse-chain-tma-exact COMMAND ${CMAKE_COMMAND} -E compare_files
@@ -876,17 +953,14 @@ if (GGML_CUDA)
         ENVIRONMENT "GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MMQ_TMA=1;GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_F32_FEW=1")
     set_tests_properties(inkling-fuse-chain-tma-exact PROPERTIES LABELS "main"
         DEPENDS "inkling-fuse-chain-tma-ref-cuda0;inkling-fuse-chain-tma-fused-cuda0")
-    endif()
     # [fp8] the e4m3 hi+lo pair algebra and the block-scaled folds of GGML_CUDA_FATTN_FP8_ACCUM, on the device
     # (campaign row inkling-fp8-accumulation; the primitives live in ggml/src/ggml-cuda/fattn-rel-fp8-pair.cuh):
     # the RNE code held against CUDA's own fp8 conversion, the block encode's one ceil scale a warp, a
     # single-lane fold bit-exact, the 32- and 256-partial folds against double sums, and the one-hot per-term
     # fold; the binary skips (77) on a device below compute capability 12.0
     find_package(CUDAToolkit REQUIRED)
-    # guarded: test-inkling-fp8-pair.cpp is not in this commit
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-inkling-fp8-pair.cpp)
     set_source_files_properties(test-inkling-fp8-pair.cpp PROPERTIES LANGUAGE CUDA)
-    llama_build(test-inkling-fp8-pair.cpp)
+    llama_build(test-inkling-fp8-pair.cpp LINK ggml-base CUDA::cublas CUDA::cuda_driver)
     target_include_directories(test-inkling-fp8-pair PRIVATE ${CUDAToolkit_INCLUDE_DIRS}
         ${PROJECT_SOURCE_DIR}/ggml/src)
     # the block-scaled QMMA (kind::mxf8f6f4, ue8m0 scales) is an sm_120a feature: ptxas refuses it on
@@ -896,7 +970,6 @@ if (GGML_CUDA)
     target_compile_options(test-inkling-fp8-pair PRIVATE -lineinfo)
     llama_test(test-inkling-fp8-pair NAME test-inkling-fp8-pair-cuda0)
     set_tests_properties(test-inkling-fp8-pair-cuda0 PROPERTIES LABELS "main" SKIP_RETURN_CODE 77)
-    endif()
     # [fp8] the relative decode with the accumulator's pair planes: every partial writer (tile, one-cell and
     # runs kernels) stores two-term slots and the merge folds them on the block-scaled MMA; e4m3 K/V rides the
     # tile kernel so the KV type and the accumulator meet on one path, every relative case against the host
@@ -932,7 +1005,7 @@ if (GGML_CUDA)
         ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_MMQ_TMA=1")
     # Blackwell K-quant-scoped J rule (kquant-j-rule): pins GLM IQ3_XXS selections unchanged and verifies live sm_120 dispatch
     set_source_files_properties(test-inkling-kquant-jrule.cpp PROPERTIES LANGUAGE CUDA)
-    llama_build(test-inkling-kquant-jrule.cpp LINK ggml)
+    llama_build(test-inkling-kquant-jrule.cpp LINK ggml CUDA::cublas CUDA::cuda_driver)
     target_include_directories(test-inkling-kquant-jrule PRIVATE ${CUDAToolkit_INCLUDE_DIRS}
         ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
     add_test(NAME test-inkling-kquant-jrule-cuda0 COMMAND test-inkling-kquant-jrule ${CMAKE_CURRENT_BINARY_DIR}/inkling-kquant-jrule.jsonl)
@@ -992,6 +1065,7 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
         find_package(CUDAToolkit REQUIRED)
         set_source_files_properties(test-cuda-graph-cap.cpp PROPERTIES LANGUAGE CUDA)
         target_include_directories(test-cuda-graph-cap PRIVATE ${CUDAToolkit_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR}/ggml/src)
+        target_link_libraries(test-cuda-graph-cap PRIVATE CUDA::cublas CUDA::cuda_driver)
     endif()
     if (GGML_CUDA_GRAPHS)
         target_compile_definitions(test-cuda-graph-cap PRIVATE GGML_CUDA_USE_GRAPHS)
