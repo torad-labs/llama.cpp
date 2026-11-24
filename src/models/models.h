@@ -2613,6 +2613,16 @@ struct llama_model_inkling2 : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
+    bool load_tensors(llama_model_loader & ml) override;
+
+    struct router_bake {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        ggml_tensor * weight = nullptr;
+        ggml_tensor * signs = nullptr;
+    };
+    std::vector<router_bake> baked_routers;
+
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
 

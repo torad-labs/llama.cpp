@@ -4800,7 +4800,9 @@ static void ggml_cuda_mul_mat_id_partition(ggml_backend_cuda_context & ctx, cons
     } else if (paired) {
         ggml_cuda_mul_mat_q_id_pair(ctx, src0, paired->src[0], src1, &mapped, dst, paired);
     } else if (ggml_is_quantized(src0->type)) {
-        ggml_cuda_mul_mat_q(ctx, src0, src1, &mapped, dst);
+        if (!ggml_cuda_moe_route_gate(ctx, src0, src1, &mapped, dst)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, &mapped, dst);
+        }
     } else if (ggml_cuda_should_use_mmf(src0, src1, cc, ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, src1->ne[2], /*mul_mat_id=*/true)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, &mapped, dst);
     } else {
@@ -4862,7 +4864,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            if (!ggml_cuda_moe_route_gate(ctx, src0, src1, ids, dst)) {
+                ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            }
             return;
         }
 

@@ -32,3 +32,7 @@ void ggml_cuda_op_moe_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_t
 void ggml_cuda_op_moe_experts_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
         const ggml_tensor * ids, const ggml_tensor * weights, const block_q8_1 * q8, ggml_tensor * dst,
         int32_t first, int32_t count);
+
+// Inkling prompt MMQ: count routes once, then build tiles for the occupied experts.
+bool ggml_cuda_moe_route_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
+        const ggml_tensor * ids, ggml_tensor * dst);

@@ -17303,6 +17303,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, true,  2304, n, 4608));
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, false, 4608, n, 2304));
     }
+    // Inkling 2's full gate/up and down expert products at 23 rows.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true,  4608, 23, 4608));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, 23, 2304));
     // the Q3_K_M pack's products as four cards split them (gate and up packed in 1,024 rows, down to 512), the shapes whose
     // routes GGML_CUDA_MMVQ_EXPERT_SORT_23 sorts: at the fewest tokens the sort takes, the 23 it serves and the most
     for (int n : { 1, 23, 32 }) {

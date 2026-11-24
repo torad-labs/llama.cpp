@@ -1,5 +1,6 @@
 #include "models.h"
 #include "inkling2-attention.h"
+#include "ggml-alloc.h"
 #include "../llama-memory-hybrid-iswa.h"
 
 #include <algorithm>
@@ -101,6 +102,58 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     hparams.n_sconv_hidden = hidden_channels;
 
     type = LLM_TYPE_UNKNOWN;
+}
+
+bool llama_model_inkling2::load_tensors(llama_model_loader & ml) {
+    if (!llama_model_base::load_tensors(ml)) {
+        return false;
+    }
+    if (!ggml_env_switch("LLAMA_INKLING2_ROUTER_BAKE") || ml.no_alloc) {
+        return true;
+    }
+
+    baked_routers.resize(n_layer_phys());
+    for (int il = 0; il < n_layer_phys(); ++il) {
+        const auto * src = layers[il].ffn_gate_inp;
+        if (!src || src->type != GGML_TYPE_F32 || hdmd.rot.count(src)) {
+            continue;
+        }
+
+        auto & baked = baked_routers[il];
+        baked.ctx.reset(ggml_init({2*ggml_tensor_overhead(), nullptr, true}));
+        baked.weight = ggml_dup_tensor(baked.ctx.get(), src);
+        baked.signs = ggml_new_tensor_1d(baked.ctx.get(), GGML_TYPE_F32, src->ne[0]);
+        ggml_set_name(baked.weight, src->name);
+        ggml_format_name(baked.signs, "blk.%d.ffn_gate_inp.scale", il);
+        const auto buft = ggml_backend_buffer_get_type(src->buffer);
+        baked.buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(baked.ctx.get(), buft));
+        if (!baked.buffer) {
+            throw std::runtime_error("inkling2: could not allocate baked router");
+        }
+        ggml_backend_buffer_set_usage(baked.buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        // Paired block signs are orthogonal and preserve the product and its accumulation order.
+        std::vector<float> signs(src->ne[0]);
+        std::vector<float> row(src->ne[0]);
+        for (int64_t j = 0; j < src->ne[0]; ++j) {
+            signs[j] = (j/16) % 2 ? -1.0f : 1.0f;
+        }
+        ggml_backend_tensor_set(baked.signs, signs.data(), 0, signs.size()*sizeof(float));
+        for (int64_t expert = 0; expert < src->ne[1]; ++expert) {
+            ggml_backend_tensor_get(src, row.data(), expert*src->nb[1], row.size()*sizeof(float));
+            for (size_t j = 0; j < row.size(); ++j) {
+                row[j] *= signs[j];
+            }
+            ggml_backend_tensor_set(baked.weight, row.data(), expert*baked.weight->nb[1], row.size()*sizeof(float));
+        }
+        if (const auto it = prec_policy.prec_acc.find(src); it != prec_policy.prec_acc.end()) {
+            prec_policy.prec_acc.emplace(baked.weight, it->second);
+        }
+        if (const auto it = prec_policy.prec_src1.find(src); it != prec_policy.prec_src1.end()) {
+            prec_policy.prec_src1.emplace(baked.weight, it->second);
+        }
+    }
+    return true;
 }
 
 void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
@@ -960,9 +1013,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // others' sums, one collective with the scatter's slice bounds).
     const bool seq_rows = cparams.n_seq_devices > 1;
     auto * moe_in = seq_rows ? ggml_backend_meta_gather(ctx0, cur) : cur;
+    ggml_tensor * router_logits = nullptr;
+    const auto & baked_routers = static_cast<const llama_model_inkling2 &>(model).baked_routers;
+    if (!baked_routers.empty() && baked_routers[ip].weight && (!loras || loras->empty())) {
+        const auto & router = baked_routers[ip];
+        auto * projected = ggml_mul(ctx0, moe_in, router.signs);
+        cb(projected, "ffn_moe_router_basis", il);
+        router_logits = build_lora_mm(router.weight, projected);
+        if (hparams.expert_router_f32) {
+            ggml_prec_set_acc(router_logits, GGML_PREC_F32);
+        }
+        cb(router_logits, "ffn_moe_logits", il);
+    }
     cur = build_moe_ffn(moe_in, l.ffn_gate_inp, nullptr, nullptr, l.ffn_down_exps, l.ffn_exp_probs_b,
             hparams.n_expert, hparams.n_expert_used(il), LLM_FFN_SITU, true, hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, nullptr, l.ffn_gate_up_exps,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, router_logits, l.ffn_gate_up_exps,
             l.ffn_up_exps_s, l.ffn_gate_exps_s, l.ffn_down_exps_s);
     if (seq_rows) {
         const auto counts = ubatch.device_rows(cparams.n_seq_devices);
