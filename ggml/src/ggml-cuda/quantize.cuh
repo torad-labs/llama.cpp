@@ -48,7 +48,8 @@ static constexpr int MMQ_FEW_PAIR_INTS = 2 + MMQ_FEW_NCOLS;
 
 void quantize_mmq_few_id_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, int * pairs, mmq_q8_1_ds_layout ds_layout, int64_t ne00, int64_t s11, int64_t s12,
-        int64_t ne11, int64_t n_experts, int64_t n_expert_used, int64_t n_tokens, int64_t si1, int64_t npairs_max, cudaStream_t stream);
+        int64_t ne11, int64_t n_experts, int64_t n_expert_used, int64_t n_tokens, int64_t si1, int64_t npairs_max, cudaStream_t stream,
+        int * npairs_out = nullptr);
 
 void quantize_mmq_fp4_cuda(const float *   x,
                              const int32_t * ids,

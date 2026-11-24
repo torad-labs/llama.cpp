@@ -1226,6 +1226,229 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
+// Stage one K-quant block per row into shared memory with 16-byte cp.async copies.
+// Q3_K skips piece 7 when the block fits in 7 pieces (off < 4), keeping loads inside pad16(end).
+template <ggml_type type, int J, bool fallback, bool has_fusion> static __device__ __forceinline__ void ggml_cuda_mmq_stage_x_kquant(
+        const char * __restrict__ x, const char * __restrict__ x_gate, char * __restrict__ x_staged,
+        const int kbx0, const int i_max, const int stride) {
+    static_assert(mmq_is_staged_kquant_type(type), "only Q3_K/Q4_K/Q5_K use kquant staging");
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads   = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8);
+    constexpr int I          = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+    constexpr int staged_row = mmq_kquant_staged_row(type);
+    constexpr int pieces     = staged_row / 16;
+    static_assert(staged_row % 16 == 0, "staged row size must be a multiple of 16 bytes");
+
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+
+#pragma unroll
+    for (int c0 = 0; c0 < I*pieces; c0 += nthreads) {
+        const int c = c0 + tid;
+        if (c0 + nthreads > I*pieces && c >= I*pieces) {
+            break;
+        }
+
+        const int i     = c / pieces;
+        const int piece = c % pieces;
+
+        if (fallback && i > i_max) {
+            continue;
+        }
+
+        if constexpr (type == GGML_TYPE_Q3_K) {
+            GGML_UNUSED(x_gate);
+            const char * block = (const char *) ((const block_q3_K *) x + kbx0 + i*stride);
+            const int    off   = int(uintptr_t(block) & 15);
+            if (16*piece >= off + int(sizeof(block_q3_K))) {
+                continue;
+            }
+            const char * line = block - off;
+            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(x_staged + i*staged_row + 16*piece), line + 16*piece);
+        } else if constexpr (type == GGML_TYPE_Q4_K) {
+            const char * block = (const char *) ggml_cuda_mmq_x_row<block_q4_K, has_fusion>(x, x_gate, kbx0, i, stride);
+            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(x_staged + i*staged_row + 16*piece), block + 16*piece);
+        } else {
+            const char * block = (const char *) ggml_cuda_mmq_x_row<block_q5_K, has_fusion>(x, x_gate, kbx0, i, stride);
+            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(x_staged + i*staged_row + 16*piece), block + 16*piece);
+        }
+    }
+}
+
+// Dequantize staged Q3_K/Q4_K/Q5_K blocks from shared memory into the MMA tile layout.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_kquant_staged(
+        const char * __restrict__ x, const char * __restrict__ x_staged, int * __restrict__ x_tile,
+        const int kbx0, const int i_max, const int stride) {
+    static_assert(mmq_is_staged_kquant_type(type), "only Q3_K/Q4_K/Q5_K use kquant staging");
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback, GGML_PREC_Q8);
+
+    if constexpr (type == GGML_TYPE_Q3_K) {
+        GGML_UNUSED(x);
+        int   * x_qs = (int   *)  x_tile;
+        float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+
+        constexpr int threads_per_row = MMQ_ITER_K / (4 * QR3_K);
+        constexpr int nrows = warp_size / threads_per_row;
+        const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+            int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+            if (fallback) {
+                i = min(i, i_max);
+            }
+
+            // Host checks 16-byte alignment of x, so block offset mod 16 depends only on the block index.
+            const uint32_t     off = (uint32_t(kbx0 + i*stride) * uint32_t(sizeof(block_q3_K))) & 15u;
+            const block_q3_K * bxi = (const block_q3_K *) (x_staged + i*MMQ_Q3_K_STAGED_ROW + off);
+
+            const int x_ql_0 = get_int_b2(bxi->qs,    kqsx);
+            const int x_qh_0 = get_int_b2(bxi->hmask, kqsx % (QI3_K/2)) >> (4 * (kqsx / (QI3_K/2)));
+
+#pragma unroll
+            for (int l = 0; l < QR3_K; ++l) {
+                const int k = (kqsx/8)*32 + l*8 + kqsx % 8;
+
+                const int x_ql_k =  (x_ql_0 >> (2*l))       & 0x03030303;
+                const int x_qh_k = ((x_qh_0 >>    l)  << 2) & 0x04040404;
+
+                x_qs[i*sram_stride + k] = __vsub4(x_ql_k | x_qh_k, 0x04040404);
+            }
+        }
+
+        constexpr int rows_per_warp = warp_size / 4;
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
+            int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/4;
+            if (fallback) {
+                i = min(i, i_max);
+            }
+
+            const uint32_t     off = (uint32_t(kbx0 + i*stride) * uint32_t(sizeof(block_q3_K))) & 15u;
+            const block_q3_K * bxi = (const block_q3_K *) (x_staged + i*MMQ_Q3_K_STAGED_ROW + off);
+
+            const int ksc = threadIdx.x % 4;
+            const int sc  = unpack_scales_q3_K(bxi->scales, ksc);
+            const int8_t * sc8 = (const int8_t *) &sc;
+            const float d = bxi->d;
+
+#pragma unroll
+            for (int l = 0; l < int(sizeof(int)); ++l) {
+                x_df[i*sram_stride + sizeof(int)*ksc + l] = d*sc8[l];
+            }
+        }
+    } else if constexpr (type == GGML_TYPE_Q4_K) {
+        GGML_UNUSED_VARS(x, kbx0, stride);
+        int   * x_qs = (int   *)  x_tile;
+        half2 * x_dm = (half2 *) (x_qs + 2*MMQ_TILE_NE_K);
+
+        constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_K);
+        constexpr int nrows = warp_size / threads_per_row;
+        const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+            int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+            if (fallback) {
+                i = min(i, i_max);
+            }
+
+            const block_q4_K * bxi = (const block_q4_K *) (x_staged + i*MMQ_Q4_K_STAGED_ROW);
+            const int qs0 = get_int_b4(bxi->qs, txi);
+
+            x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 0] = (qs0 >> 0) & 0x0F0F0F0F;
+            x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 8] = (qs0 >> 4) & 0x0F0F0F0F;
+        }
+
+        constexpr int rows_per_warp = warp_size / 2;
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
+            int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
+            if (fallback) {
+                i = min(i, i_max);
+            }
+
+            const block_q4_K * bxi = (const block_q4_K *) (x_staged + i*MMQ_Q4_K_STAGED_ROW);
+            const int * scales = (const int *) bxi->scales;
+            const int ksc = threadIdx.x % 2;
+
+            const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
+            const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
+
+            const uint8_t * sc8 = (const uint8_t *) &sc32;
+            const uint8_t *  m8 = (const uint8_t *)  &m32;
+
+            const half2 dm = bxi->dm * make_half2(1.0f, -1.0f);
+
+#pragma unroll
+            for (int l = 0; l < int(sizeof(int)); ++l) {
+                x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+            }
+        }
+    } else {
+        GGML_UNUSED_VARS(x, kbx0, stride);
+        int   * x_qs = (int   *)  x_tile;
+        half2 * x_dm = (half2 *) (x_qs + MMQ_TILE_NE_K*2);
+
+        constexpr int threads_per_row = MMQ_ITER_K / (4 * QR5_K);
+        constexpr int nrows = warp_size / threads_per_row;
+        const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+            int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+            if (fallback) {
+                i = min(i, i_max);
+            }
+
+            const block_q5_K * bxi = (const block_q5_K *) (x_staged + i*MMQ_Q5_K_STAGED_ROW);
+            const int ky = QR5_K*txi;
+
+            const int ql  = get_int_b4(bxi->qs, txi);
+            const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+            const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+            const int qh  = get_int_b4(bxi->qh, txi % (QI5_K/4));
+            const int qh0 = ((qh >> (2 * (txi / (QI5_K/4)) + 0)) << 4) & 0x10101010;
+            const int qh1 = ((qh >> (2 * (txi / (QI5_K/4)) + 1)) << 4) & 0x10101010;
+
+            const int kq0 = ky - ky % (QI5_K/2) + txi % (QI5_K/4) + 0;
+            const int kq1 = ky - ky % (QI5_K/2) + txi % (QI5_K/4) + QI5_K/4;
+
+            x_qs[i*sram_stride + kq0] = ql0 | qh0;
+            x_qs[i*sram_stride + kq1] = ql1 | qh1;
+        }
+
+        constexpr int rows_per_warp = warp_size / 2;
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
+            int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
+            if (fallback) {
+                i = min(i, i_max);
+            }
+
+            const block_q5_K * bxi = (const block_q5_K *) (x_staged + i*MMQ_Q5_K_STAGED_ROW);
+            const int * scales = (const int *) bxi->scales;
+            const int ksc = threadIdx.x % 2;
+
+            const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
+            const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
+
+            const uint8_t * sc8 = (const uint8_t *) &sc32;
+            const uint8_t *  m8 = (const uint8_t *)  &m32;
+
+            const half2 dm = bxi->dm * make_half2(1.0f, -1.0f);
+
+#pragma unroll
+            for (int l = 0; l < int(sizeof(int)); ++l) {
+                x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+            }
+        }
+    }
+}
+
 template <ggml_type type, int J, bool fallback, bool has_fusion> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q6_K(
         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

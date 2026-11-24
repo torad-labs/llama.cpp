@@ -4738,7 +4738,7 @@ static void ggml_cuda_mul_mat_id_partition(ggml_backend_cuda_context & ctx, cons
     const bool vector_ok = ggml_is_quantized(src0->type) && mm->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc);
     static const bool mmq_tma_enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
     const bool try_tma = !fusion && !paired && mmq_tma_enabled &&
-        (src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K) &&
+        (src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) &&
         mm->ne[2] >= 2 && mm->ne[2] <= 32;
     const bool use_mmq_few = !fusion && !paired && !try_tma && ggml_cuda_should_use_mmq_few(src0, src1, ids, cc);
     const bool vector = !try_tma && !use_mmq_few && vector_ok;
@@ -8286,7 +8286,7 @@ static int ggml_cuda_try_moe_gate_up_situ(ggml_backend_cuda_context & ctx, const
         ggml_node_get_use_count(cgraph, i + 3) == 1 &&
         next_mm != nullptr && next_mm->op == GGML_OP_MUL_MAT_ID &&
         next_mm->type == GGML_TYPE_F32 && ggml_is_contiguous(next_mm) &&
-        next_mm->src[0] != nullptr && next_mm->src[0]->type == GGML_TYPE_Q4_K &&
+        next_mm->src[0] != nullptr && (next_mm->src[0]->type == GGML_TYPE_Q4_K || next_mm->src[0]->type == GGML_TYPE_Q5_K) &&
         next_mm->src[0]->ne[0] == 2304 && next_mm->src[0]->ne[1] == 4608 &&
         next_mm->src[0]->ne[2] == count && next_mm->src[0]->ne[3] == 1 &&
         ggml_is_contiguous(next_mm->src[0]) && ((uintptr_t) next_mm->src[0]->data % 16) == 0 &&
@@ -8368,7 +8368,8 @@ static int ggml_cuda_try_moe_experts_weighted_sum(ggml_backend_cuda_context & ct
     // only where the launch it replaces is mul_mat_vec_q_moe itself (or Blackwell TMA when GGML_CUDA_MMQ_TMA=1)
     static const bool mmq_tma = ggml_env_switch("GGML_CUDA_MMQ_TMA");
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    const bool tma_ok = mmq_tma && cc == GGML_CUDA_CC_BLACKWELL && w->type == GGML_TYPE_Q4_K &&
+    const bool tma_ok = mmq_tma && cc == GGML_CUDA_CC_BLACKWELL &&
+        (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_K) &&
         n_tokens >= 2 && n_tokens <= MMVQ_MMID_CEILING;
     const bool vector_ref = n_tokens >= 2 &&
         (ggml_get_op_params_i32(node, 2) > 0 ? n_tokens <= get_mmvq_mmid_max_batch(w->type, cc) :

@@ -27,7 +27,7 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
                                     float beta, float lb, const int32_t * precomputed_local_ids = nullptr,
                                     bool zero_non_owned = true);
 
-// Fused Q4_K down + deterministic slot-order weighted sum via TMA boxes (evict_first).
+// Fused Q4_K/Q5_K down + deterministic slot-order weighted sum via TMA boxes (evict_first).
 bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
                                          const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor * dst,
                                          int32_t first, int32_t count,

@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 using namespace ggml_cuda_mma;
@@ -23,32 +24,27 @@ using namespace ggml_cuda_mma;
 // A Q3_K row of 4,608 values is 18 blocks of 110 bytes = 1,980 bytes. Four adjacent rows are 7,920 = 9 * 880 bytes,
 // so the weight buffer viewed as a rank-2 map of UINT64 chunks (110 elements = 880 bytes a chunk, 16-byte stride)
 // has whole 16-row tiles as boxes of 36 chunks, and shared memory receives the tile's rows in order.
-static constexpr int MMQ_TMA_ROW_BYTES  = 1980;
-static constexpr int MMQ_TMA_UNIT_BYTES = 110; // one 256-value unit of a Q3_K row
-static constexpr int MMQ_TMA_CHUNK      = 880;
-static constexpr int MMQ_TMA_TILE_ROWS  = 16;
-static constexpr int MMQ_TMA_BOX        = MMQ_TMA_TILE_ROWS*MMQ_TMA_ROW_BYTES/MMQ_TMA_CHUNK; // 36
-static constexpr int MMQ_TMA_TILE_BYTES = MMQ_TMA_BOX*MMQ_TMA_CHUNK;                         // 31,680
-static constexpr int MMQ_TMA_TILE_STRIDE = ((MMQ_TMA_TILE_BYTES + 127)/128)*128;              // 31,744 (128B TMA align)
-static constexpr int MMQ_TMA_UNITS      = 18; // 256-value units of the row
-static constexpr int MMQ_TMA_NWARPS     = 4;
-// Q4_K down row of 2,304 values: 9 blocks of 144 bytes = 1,296 bytes (natively 16-byte aligned).
-static constexpr int MMQ_TMA_Q4K_UNITS      = 9;
+static constexpr int MMQ_TMA_ROW_BYTES      = 1980;
+static constexpr int MMQ_TMA_UNIT_BYTES     = 110; // one 256-value unit of a Q3_K row
+static constexpr int MMQ_TMA_CHUNK          = 880;
+static constexpr int MMQ_TMA_TILE_ROWS      = 16;
+static constexpr int MMQ_TMA_BOX            = MMQ_TMA_TILE_ROWS*MMQ_TMA_ROW_BYTES/MMQ_TMA_CHUNK; // 36
+static constexpr int MMQ_TMA_TILE_BYTES     = MMQ_TMA_BOX*MMQ_TMA_CHUNK;                         // 31,680
+static constexpr int MMQ_TMA_TILE_STRIDE    = ((MMQ_TMA_TILE_BYTES + 127)/128)*128;              // 31,744 (128B TMA align)
+static constexpr int MMQ_TMA_UNITS          = 18; // 256-value units of the Q3_K row
+static constexpr int MMQ_TMA_Q3K_NWARPS     = 9;  // 18 / 9 = 2 units per warp (balanced, >2 warps/SMSP)
 static constexpr int MMQ_TMA_Q4K_UNIT_BYTES = 144;
-static constexpr int MMQ_TMA_Q4K_ROW_BYTES  = MMQ_TMA_Q4K_UNITS*MMQ_TMA_Q4K_UNIT_BYTES; // 1,296
-static constexpr int MMQ_TMA_Q4K_TILE_BYTES = MMQ_TMA_TILE_ROWS*MMQ_TMA_Q4K_ROW_BYTES;  // 20,736
+static constexpr int MMQ_TMA_Q5K_UNIT_BYTES = 176;
+static constexpr int MMQ_TMA_Q45_MAX_BOX_U64 = 256; // hardware TMA rank-2 inner box limit in UINT64 elements
 static constexpr int MMQ_TMA_MAX_TOKENS     = 32;
-static constexpr size_t MMQ_TMA_GATE_UP_REDUCE_FLOATS = (MMQ_TMA_NWARPS - 1)*4*WARP_SIZE;
-static constexpr size_t MMQ_TMA_GATE_UP_SMEM_BYTES =
-    MMQ_TMA_TILE_STRIDE + MMQ_TMA_TILE_BYTES + sizeof(uint64_t) + 2*MMQ_TMA_GATE_UP_REDUCE_FLOATS*sizeof(float);
+
 static_assert(MMQ_TMA_CHUNK % 16 == 0, "a chunk starts on a TMA stride boundary");
 static_assert(MMQ_TMA_CHUNK/8 <= 256, "a TMA box is at most 256 8-byte elements wide");
 static_assert(MMQ_TMA_BOX <= 256, "a TMA box is at most 256 elements in every dimension");
 static_assert(MMQ_TMA_TILE_ROWS % 4 == 0, "whole 4-row chunks");
 static_assert(MMQ_TMA_TILE_STRIDE % 128 == 0, "second TMA tile starts 128-byte aligned");
-static_assert((MMQ_TMA_TILE_STRIDE + MMQ_TMA_TILE_BYTES) % alignof(uint64_t) == 0, "mbarrier starts 8-byte aligned");
-static_assert(MMQ_TMA_Q4K_ROW_BYTES % 16 == 0, "Q4_K row starts on a TMA stride boundary");
-static_assert(MMQ_TMA_Q4K_ROW_BYTES/8 <= 256, "Q4_K TMA box fits in 256 UINT64 elements");
+static_assert(MMQ_TMA_Q4K_UNIT_BYTES % 16 == 0, "Q4_K unit is 16-byte aligned");
+static_assert(MMQ_TMA_Q5K_UNIT_BYTES % 16 == 0, "Q5_K unit is 16-byte aligned");
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
 static __device__ __forceinline__ uint32_t mmq_tma_smem(const void * p) {
@@ -78,7 +74,6 @@ static __device__ __forceinline__ void mmq_tma_mbar_wait(uint64_t * bar, uint32_
     } while (!done);
 }
 
-// One box of the map (110 x 36 elements) into this block's own shared memory, counted on bar.
 static __device__ __forceinline__ void mmq_tma_load(void * dst, const CUtensorMap * map, const int x, const int y,
                                                     uint64_t * bar, const uint64_t policy) {
     asm volatile(
@@ -88,7 +83,7 @@ static __device__ __forceinline__ void mmq_tma_load(void * dst, const CUtensorMa
         : "memory");
 }
 
-// The weight stream is read once a step: evict_first, as the fork's other TMA weight loads.
+// Weight stream is read once a step: evict_first, matching the fork's other TMA weight loads.
 static __device__ __forceinline__ uint64_t mmq_tma_evict_first() {
     uint64_t policy;
     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
@@ -124,7 +119,7 @@ static __device__ __forceinline__ float2 mmq_tma_get_d(const mmq_tma_y_frag & yf
     return make_float2(d[2*(s % 2) + 0], d[2*(s % 2) + 1]);
 }
 
-// Q4_K uses MMQ_Q8_1_DS_LAYOUT_DS4 (half2 {d, sum} per sub-block).
+// Q4_K and Q5_K use MMQ_Q8_1_DS_LAYOUT_DS4 (half2 {d, sum} per sub-block).
 static __device__ __forceinline__ float2 mmq_tma_get_d_ds4(const mmq_tma_y_frag & yf, const int s) {
     const half2 * ds = (const half2 *) &yf.ds[s/2];
     return make_float2(__low2float(ds[2*(s % 2) + 0]), __low2float(ds[2*(s % 2) + 1]));
@@ -193,7 +188,6 @@ static __device__ __forceinline__ int mmq_tma_unpack_scales_q3_K(const uint8_t *
 }
 
 // One unit of 256 values of the 16 rows of a warp: x[0] and x[1] are the rows g and g+8 of lane (g, t).
-// This is ggml_cuda_mul_mat_q_few's mmq_few_vec_dot_q3_K for one column group, so the sums are the same sums.
 static __device__ __forceinline__ void mmq_tma_vec_dot_q3_K(const char * const (&x)[2], const mmq_tma_y_frag & yf, float (&sum)[4]) {
     const int t = threadIdx.x % 4;
 
@@ -239,22 +233,29 @@ static __device__ __forceinline__ void mmq_tma_vec_dot_q3_K(const char * const (
     mmq_tma_add_scaled(sum, d, sum_d);
 }
 
-// One 256-value unit of 16 Q4_K rows, matching mmq_few_vec_dot_q45_K<GGML_TYPE_Q4_K, 1>.
-static __device__ __forceinline__ void mmq_tma_vec_dot_q4_K(const char * const (&x)[2], const mmq_tma_y_frag & yf, float (&sum)[4]) {
+// One 256-value unit of 16 Q4_K or Q5_K rows, matching mmq_few_vec_dot_q45_K<type, 1>.
+template <ggml_type type>
+static __device__ __forceinline__ void mmq_tma_vec_dot_q45_K(const char * const (&x)[2], const mmq_tma_y_frag & yf, float (&sum)[4]) {
+    using block_t = std::conditional_t<type == GGML_TYPE_Q4_K, block_q4_K, block_q5_K>;
     const int t = threadIdx.x % 4;
 
     int   qs[2][4][2];
+    [[maybe_unused]] int qh[2][2];
     int   sc[2][2];
     int   mn[2][2];
     float d[2];
     float dmin[2];
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
-        const block_q4_K * bx = (const block_q4_K *) x[r];
+        const block_t * bx = (const block_t *) x[r];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             qs[r][j][0] = get_int_b4(bx->qs + 32*j,      t);
             qs[r][j][1] = get_int_b4(bx->qs + 32*j + 16, t);
+        }
+        if constexpr (type == GGML_TYPE_Q5_K) {
+            qh[r][0] = get_int_b4(bx->qh,      t);
+            qh[r][1] = get_int_b4(bx->qh + 16, t);
         }
         const int4 hdr = *(const int4 *) bx;
         const int scales[3] = {hdr.y, hdr.z, hdr.w};
@@ -279,6 +280,10 @@ static __device__ __forceinline__ void mmq_tma_vec_dot_q4_K(const char * const (
         for (int r = 0; r < 2; ++r) {
             lo[r] = (qs[r][j][0] >> shift) & 0x0F0F0F0F;
             hi[r] = (qs[r][j][1] >> shift) & 0x0F0F0F0F;
+            if constexpr (type == GGML_TYPE_Q5_K) {
+                lo[r] |= ((qh[r][0] >> s) & 0x01010101) << 4;
+                hi[r] |= ((qh[r][1] >> s) & 0x01010101) << 4;
+            }
         }
         const int   ls[2] = {(sc[0][s/4] >> (8*(s % 4))) & 0xFF, (sc[1][s/4] >> (8*(s % 4))) & 0xFF};
         const float m0    = (mn[0][s/4] >> (8*(s % 4))) & 0xFF;
@@ -301,129 +306,164 @@ static __device__ __forceinline__ void mmq_tma_vec_dot_q4_K(const char * const (
     }
 }
 
-// MUL_MAT_ID, one column group of one expert's 16-row tile a block, the four warps splitting the row's K units as
-// ggml_cuda_mul_mat_q_few's few-row kernel does. The tile arrives in shared memory in one TMA box of 36 chunks and
-// the dot reads it from there, so the products and their order are that kernel's.
-static __global__ __launch_bounds__(MMQ_TMA_NWARPS*WARP_SIZE, 1)
+// Persistent 2-slot double-buffered Q3_K TMA kernel (9 balanced warps x 2 units = 18 units).
+static __global__ __launch_bounds__(MMQ_TMA_Q3K_NWARPS*WARP_SIZE, 1)
 void mul_mat_q_tma_q3_K(const __grid_constant__ CUtensorMap map, const int4 * y, float * dst,
                         const int nrows_x, const int64_t expert_chunks, const int ncols_dst,
-                        const int stride_col_dst, const int64_t stride_channel_dst, const int * pairs) {
+                        const int stride_col_dst, const int64_t stride_channel_dst,
+                        const int * pairs, const int * npairs_ptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
-    __shared__ __align__(128) char s_weight[MMQ_TMA_TILE_BYTES];
-    __shared__ uint64_t bar;
-    // the other three warps' four sums a lane, as the few-row kernel's reduce lays them out
-    __shared__ float buf_sum[(MMQ_TMA_NWARPS - 1)*4*WARP_SIZE];
+    constexpr int NWARPS = MMQ_TMA_Q3K_NWARPS;
+    constexpr int REDUCE_FLOATS = (NWARPS - 1)*4*WARP_SIZE;
+
+    extern __shared__ __align__(128) char s_dyn[];
+    char *     s_buf0   = s_dyn;
+    char *     s_buf1   = s_dyn + MMQ_TMA_TILE_STRIDE;
+    uint64_t * bar      = reinterpret_cast<uint64_t *>(s_dyn + 2*MMQ_TMA_TILE_STRIDE);
+    float *    buf_sum0 = reinterpret_cast<float *>(bar + 2);
+    float *    buf_sum1 = buf_sum0 + REDUCE_FLOATS;
 
     const int warp = threadIdx.y;
     const int lane = threadIdx.x;
     const int tid  = warp*WARP_SIZE + lane;
 
-    ggml_cuda_pdl_sync(); // the pairs come from the quantize before this kernel
+    ggml_cuda_pdl_sync();
 
-    const int * pair = pairs + blockIdx.y*MMQ_FEW_PAIR_INTS;
-    const int ncols = pair[1];
-    if (ncols == 0) {
+    const int npairs      = *npairs_ptr;
+    const int n_row_tiles = nrows_x / MMQ_TMA_TILE_ROWS;
+    const int total_tiles = npairs * n_row_tiles;
+    const int t_begin     = (int) ((int64_t(total_tiles) * blockIdx.x) / gridDim.x);
+    const int t_end       = (int) ((int64_t(total_tiles) * (blockIdx.x + 1)) / gridDim.x);
+    if (t_begin >= t_end) {
+        ggml_cuda_pdl_lc();
         return;
     }
-    const int row0 = blockIdx.x*MMQ_TMA_TILE_ROWS;
 
+    const uint64_t policy = mmq_tma_evict_first();
     if (tid == 0) {
-        mmq_tma_mbar_init(&bar);
+        mmq_tma_mbar_init(&bar[0]);
+        mmq_tma_mbar_init(&bar[1]);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
+
     if (tid == 0) {
-        mmq_tma_mbar_expect(&bar, MMQ_TMA_TILE_BYTES);
-        const int chunk = (int) (int64_t(pair[0])*expert_chunks + int64_t(blockIdx.x)*MMQ_TMA_BOX);
-        mmq_tma_load(s_weight, &map, 0, chunk, &bar, mmq_tma_evict_first());
+        const int p0  = t_begin / n_row_tiles;
+        const int rt0 = t_begin % n_row_tiles;
+        const int e0  = pairs[p0*MMQ_FEW_PAIR_INTS];
+        mmq_tma_mbar_expect(&bar[0], MMQ_TMA_TILE_BYTES);
+        const int chunk0 = (int) (int64_t(e0)*expert_chunks + int64_t(rt0)*MMQ_TMA_BOX);
+        mmq_tma_load(s_buf0, &map, 0, chunk0, &bar[0], policy);
     }
-
-    float sum[4] = {0.0f};
-
-    // the warp's K units, as the few-row kernel's K split: two units a step, eight apart
-    const int iu_begin = 2*warp;
-
-    // this block's pair holds one column group's units consecutively, as ggml_cuda_mul_mat_q_few reads them
-    const int4 * y_pair = y + int64_t(blockIdx.y)*MMQ_TMA_UNITS*MMQ_FEW_Q8_1_INT4;
-
-    // the first y fragment while the TMA runs; the weight tile is constant, so this overlaps it
-    mmq_tma_y_frag yf;
-    mmq_tma_load_y(yf, y_pair + iu_begin*MMQ_FEW_Q8_1_INT4);
-
-    mmq_tma_mbar_wait(&bar, 0);
     __syncthreads();
 
-    for (int step = 0; iu_begin + 2*MMQ_TMA_NWARPS*step < MMQ_TMA_UNITS; ++step) {
-#pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            const int iu = iu_begin + 2*MMQ_TMA_NWARPS*step + k;
-            if (iu >= MMQ_TMA_UNITS) {
-                break;
-            }
-            if (step > 0 || k > 0) {
-                mmq_tma_load_y(yf, y_pair + iu*MMQ_FEW_Q8_1_INT4);
-            }
-            const char * const xr[2] = {
-                s_weight + (lane/4 + 0)*MMQ_TMA_ROW_BYTES + iu*MMQ_TMA_UNIT_BYTES,
-                s_weight + (lane/4 + 8)*MMQ_TMA_ROW_BYTES + iu*MMQ_TMA_UNIT_BYTES,
-            };
-            mmq_tma_vec_dot_q3_K(xr, yf, sum);
+    uint32_t par0 = 0;
+    uint32_t par1 = 0;
+    int cur = 0;
+    int cached_p = -1;
+    mmq_tma_y_frag yf0, yf1;
+    for (int t = t_begin; t < t_end; ++t) {
+        if (tid == 0 && t + 1 < t_end) {
+            const int pn  = (t + 1) / n_row_tiles;
+            const int rtn = (t + 1) % n_row_tiles;
+            const int en  = pairs[pn*MMQ_FEW_PAIR_INTS];
+            const int chunk_n = (int) (int64_t(en)*expert_chunks + int64_t(rtn)*MMQ_TMA_BOX);
+            uint64_t * bar_nxt = cur == 0 ? &bar[1] : &bar[0];
+            char *     s_nxt   = cur == 0 ? s_buf1 : s_buf0;
+            mmq_tma_mbar_expect(bar_nxt, MMQ_TMA_TILE_BYTES);
+            mmq_tma_load(s_nxt, &map, 0, chunk_n, bar_nxt, policy);
         }
+
+        const int p    = t / n_row_tiles;
+        const int rt   = t % n_row_tiles;
+        const int row0 = rt*MMQ_TMA_TILE_ROWS;
+        const int * pair = pairs + p*MMQ_FEW_PAIR_INTS;
+        if (p != cached_p) {
+            const int4 * y_pair = y + int64_t(p)*MMQ_TMA_UNITS*MMQ_FEW_Q8_1_INT4;
+            mmq_tma_load_y(yf0, y_pair + warp*MMQ_FEW_Q8_1_INT4);
+            mmq_tma_load_y(yf1, y_pair + (warp + NWARPS)*MMQ_FEW_Q8_1_INT4);
+            cached_p = p;
+        }
+
+        if (cur == 0) {
+            mmq_tma_mbar_wait(&bar[0], par0);
+            par0 ^= 1;
+        } else {
+            mmq_tma_mbar_wait(&bar[1], par1);
+            par1 ^= 1;
+        }
+
+        float sum[4] = {0.0f};
+        const char * s_cur = cur == 0 ? s_buf0 : s_buf1;
+        {
+            const char * const xr0[2] = {
+                s_cur + (lane/4 + 0)*MMQ_TMA_ROW_BYTES + warp*MMQ_TMA_UNIT_BYTES,
+                s_cur + (lane/4 + 8)*MMQ_TMA_ROW_BYTES + warp*MMQ_TMA_UNIT_BYTES,
+            };
+            mmq_tma_vec_dot_q3_K(xr0, yf0, sum);
+            const char * const xr1[2] = {
+                s_cur + (lane/4 + 0)*MMQ_TMA_ROW_BYTES + (warp + NWARPS)*MMQ_TMA_UNIT_BYTES,
+                s_cur + (lane/4 + 8)*MMQ_TMA_ROW_BYTES + (warp + NWARPS)*MMQ_TMA_UNIT_BYTES,
+            };
+            mmq_tma_vec_dot_q3_K(xr1, yf1, sum);
+        }
+
+        float * buf_sum = cur == 0 ? buf_sum0 : buf_sum1;
+        if (warp > 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                buf_sum[((warp - 1)*4 + i)*WARP_SIZE + lane] = sum[i];
+            }
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+#pragma unroll
+            for (int w = 0; w < NWARPS - 1; ++w) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    sum[i] += buf_sum[(w*4 + i)*WARP_SIZE + lane];
+                }
+            }
+            const int ncols = pair[1];
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int i = row0 + tile<16, 8, int>::get_i(l);
+                const int j = tile<16, 8, int>::get_j(l);
+                if (i < nrows_x && j < ncols) {
+                    const int e = pair[2 + j];
+                    dst[int64_t(e / ncols_dst)*stride_channel_dst + int64_t(e % ncols_dst)*stride_col_dst + i] = sum[l];
+                }
+            }
+        }
+        cur ^= 1;
     }
 
     ggml_cuda_pdl_lc();
-
-    // the four warps' partial sums, warp 0 adds them in warp order (as the few-row kernel)
-    float * sum_flat = sum;
-    __syncthreads();
-    if (warp > 0) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            buf_sum[((warp - 1)*4 + i)*WARP_SIZE + lane] = sum_flat[i];
-        }
-    }
-    __syncthreads();
-    if (warp == 0) {
-#pragma unroll
-        for (int w = 0; w < MMQ_TMA_NWARPS - 1; ++w) {
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                sum_flat[i] += buf_sum[(w*4 + i)*WARP_SIZE + lane];
-            }
-        }
-    } else {
-        return;
-    }
-
-#pragma unroll
-    for (int l = 0; l < 4; ++l) {
-        const int i = row0 + tile<16, 8, int>::get_i(l);
-        const int j = tile<16, 8, int>::get_j(l);
-        if (i < nrows_x && j < ncols) {
-            const int e = pair[2 + j]; // token*n_expert_used + slot
-            dst[int64_t(e / ncols_dst)*stride_channel_dst + int64_t(e % ncols_dst)*stride_col_dst + i] = sum[l];
-        }
-    }
 #else
-    GGML_UNUSED_VARS(map, y, dst, nrows_x, expert_chunks, ncols_dst, stride_col_dst, stride_channel_dst, pairs);
+    GGML_UNUSED_VARS(map, y, dst, nrows_x, expert_chunks, ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr);
     NO_DEVICE_CODE;
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
 }
 
-// Fused Q3_K gate/up + SITU: two 16-row TMA boxes in dynamic SMEM sharing one y_pair stream.
-static __global__ __launch_bounds__(MMQ_TMA_NWARPS*WARP_SIZE, 1)
+// Persistent 2-slot alternating gate/up Q3_K + SITU kernel: overlaps every up TMA load with gate compute
+// and every next-tile gate TMA load with up compute + SITU writeback. Bit-identical to mul_mat_q_tma_q3_K + SITU.
+static __global__ __launch_bounds__(MMQ_TMA_Q3K_NWARPS*WARP_SIZE, 1)
 void mul_mat_q_tma_q3_K_gate_up_situ(
         const __grid_constant__ CUtensorMap map, const int4 * y, float * dst,
         const int n_ff, const int64_t expert_chunks, const int64_t half_chunks,
         const int ncols_dst, const int stride_col_dst, const int64_t stride_channel_dst,
-        const int * pairs, const float beta, const float lb) {
+        const int * pairs, const int * npairs_ptr, const float beta, const float lb) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
+    constexpr int NWARPS = MMQ_TMA_Q3K_NWARPS;
+    constexpr int REDUCE_FLOATS = (NWARPS - 1)*4*WARP_SIZE;
+
     extern __shared__ __align__(128) char s_dyn[];
     char *     s_gate   = s_dyn;
     char *     s_up     = s_dyn + MMQ_TMA_TILE_STRIDE;
-    uint64_t * bar      = reinterpret_cast<uint64_t *>(s_dyn + MMQ_TMA_TILE_STRIDE + MMQ_TMA_TILE_BYTES);
-    float *    buf_gate = reinterpret_cast<float *>(bar + 1);
-    float *    buf_up   = buf_gate + MMQ_TMA_GATE_UP_REDUCE_FLOATS;
+    uint64_t * bar      = reinterpret_cast<uint64_t *>(s_dyn + 2*MMQ_TMA_TILE_STRIDE);
+    float *    buf_gate = reinterpret_cast<float *>(bar + 2);
+    float *    buf_up   = buf_gate + REDUCE_FLOATS;
 
     const int warp = threadIdx.y;
     const int lane = threadIdx.x;
@@ -431,107 +471,163 @@ void mul_mat_q_tma_q3_K_gate_up_situ(
 
     ggml_cuda_pdl_sync();
 
-    const int * pair = pairs + blockIdx.y*MMQ_FEW_PAIR_INTS;
-    const int ncols = pair[1];
-    if (ncols == 0) {
+    const int npairs      = *npairs_ptr;
+    const int n_row_tiles = n_ff / MMQ_TMA_TILE_ROWS;
+    const int total_tiles = npairs * n_row_tiles;
+    const int t_begin     = (int) ((int64_t(total_tiles) * blockIdx.x) / gridDim.x);
+    const int t_end       = (int) ((int64_t(total_tiles) * (blockIdx.x + 1)) / gridDim.x);
+    if (t_begin >= t_end) {
+        ggml_cuda_pdl_lc();
         return;
     }
-    const int row0 = blockIdx.x*MMQ_TMA_TILE_ROWS;
 
+    const uint64_t policy = mmq_tma_evict_first();
     if (tid == 0) {
-        mmq_tma_mbar_init(bar);
+        mmq_tma_mbar_init(&bar[0]);
+        mmq_tma_mbar_init(&bar[1]);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
+
     if (tid == 0) {
-        mmq_tma_mbar_expect(bar, 2*MMQ_TMA_TILE_BYTES);
-        const uint64_t policy = mmq_tma_evict_first();
-        const int chunk_gate = (int) (int64_t(pair[0])*expert_chunks + int64_t(blockIdx.x)*MMQ_TMA_BOX);
-        const int chunk_up   = (int) (int64_t(pair[0])*expert_chunks + half_chunks + int64_t(blockIdx.x)*MMQ_TMA_BOX);
-        mmq_tma_load(s_gate, &map, 0, chunk_gate, bar, policy);
-        mmq_tma_load(s_up,   &map, 0, chunk_up,   bar, policy);
+        const int p0  = t_begin / n_row_tiles;
+        const int rt0 = t_begin % n_row_tiles;
+        const int e0  = pairs[p0*MMQ_FEW_PAIR_INTS];
+        mmq_tma_mbar_expect(&bar[0], MMQ_TMA_TILE_BYTES);
+        const int chunk_g0 = (int) (int64_t(e0)*expert_chunks + int64_t(rt0)*MMQ_TMA_BOX);
+        mmq_tma_load(s_gate, &map, 0, chunk_g0, &bar[0], policy);
     }
-
-    float sum_g[4] = {0.0f};
-    float sum_u[4] = {0.0f};
-    const int iu_begin = 2*warp;
-    const int4 * y_pair = y + int64_t(blockIdx.y)*MMQ_TMA_UNITS*MMQ_FEW_Q8_1_INT4;
-
-    mmq_tma_y_frag yf;
-    mmq_tma_load_y(yf, y_pair + iu_begin*MMQ_FEW_Q8_1_INT4);
-
-    mmq_tma_mbar_wait(bar, 0);
     __syncthreads();
 
-    for (int step = 0; iu_begin + 2*MMQ_TMA_NWARPS*step < MMQ_TMA_UNITS; ++step) {
+    uint32_t p0 = 0;
+    uint32_t p1 = 0;
+    int cached_p = -1;
+    mmq_tma_y_frag yf0, yf1;
+    for (int t = t_begin; t < t_end; ++t) {
+        const int p    = t / n_row_tiles;
+        const int rt   = t % n_row_tiles;
+        const int row0 = rt*MMQ_TMA_TILE_ROWS;
+        const int * pair = pairs + p*MMQ_FEW_PAIR_INTS;
+
+        // Issue up(t) into s_up while computing gate(t) from s_gate.
+        if (tid == 0) {
+            const int e = pair[0];
+            mmq_tma_mbar_expect(&bar[1], MMQ_TMA_TILE_BYTES);
+            const int chunk_u = (int) (int64_t(e)*expert_chunks + half_chunks + int64_t(rt)*MMQ_TMA_BOX);
+            mmq_tma_load(s_up, &map, 0, chunk_u, &bar[1], policy);
+        }
+
+        if (p != cached_p) {
+            const int4 * y_pair = y + int64_t(p)*MMQ_TMA_UNITS*MMQ_FEW_Q8_1_INT4;
+            mmq_tma_load_y(yf0, y_pair + warp*MMQ_FEW_Q8_1_INT4);
+            mmq_tma_load_y(yf1, y_pair + (warp + NWARPS)*MMQ_FEW_Q8_1_INT4);
+            cached_p = p;
+        }
+
+        mmq_tma_mbar_wait(&bar[0], p0);
+        p0 ^= 1;
+
+        float sum_g[4] = {0.0f};
+        {
+            const char * const xg0[2] = {
+                s_gate + (lane/4 + 0)*MMQ_TMA_ROW_BYTES + warp*MMQ_TMA_UNIT_BYTES,
+                s_gate + (lane/4 + 8)*MMQ_TMA_ROW_BYTES + warp*MMQ_TMA_UNIT_BYTES,
+            };
+            mmq_tma_vec_dot_q3_K(xg0, yf0, sum_g);
+            const char * const xg1[2] = {
+                s_gate + (lane/4 + 0)*MMQ_TMA_ROW_BYTES + (warp + NWARPS)*MMQ_TMA_UNIT_BYTES,
+                s_gate + (lane/4 + 8)*MMQ_TMA_ROW_BYTES + (warp + NWARPS)*MMQ_TMA_UNIT_BYTES,
+            };
+            mmq_tma_vec_dot_q3_K(xg1, yf1, sum_g);
+        }
+        // Release s_gate and ensure prior iter's warp-0 reduction finished reading buf_gate/buf_up.
+        __syncthreads();
+
+        if (tid == 0 && t + 1 < t_end) {
+            const int pn  = (t + 1) / n_row_tiles;
+            const int rtn = (t + 1) % n_row_tiles;
+            const int en  = pairs[pn*MMQ_FEW_PAIR_INTS];
+            mmq_tma_mbar_expect(&bar[0], MMQ_TMA_TILE_BYTES);
+            const int chunk_gn = (int) (int64_t(en)*expert_chunks + int64_t(rtn)*MMQ_TMA_BOX);
+            mmq_tma_load(s_gate, &map, 0, chunk_gn, &bar[0], policy);
+        }
+
+        mmq_tma_mbar_wait(&bar[1], p1);
+        p1 ^= 1;
+
+        float sum_u[4] = {0.0f};
+        {
+            const char * const xu0[2] = {
+                s_up + (lane/4 + 0)*MMQ_TMA_ROW_BYTES + warp*MMQ_TMA_UNIT_BYTES,
+                s_up + (lane/4 + 8)*MMQ_TMA_ROW_BYTES + warp*MMQ_TMA_UNIT_BYTES,
+            };
+            mmq_tma_vec_dot_q3_K(xu0, yf0, sum_u);
+            const char * const xu1[2] = {
+                s_up + (lane/4 + 0)*MMQ_TMA_ROW_BYTES + (warp + NWARPS)*MMQ_TMA_UNIT_BYTES,
+                s_up + (lane/4 + 8)*MMQ_TMA_ROW_BYTES + (warp + NWARPS)*MMQ_TMA_UNIT_BYTES,
+            };
+            mmq_tma_vec_dot_q3_K(xu1, yf1, sum_u);
+        }
+
+        if (warp > 0) {
 #pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            const int iu = iu_begin + 2*MMQ_TMA_NWARPS*step + k;
-            if (iu >= MMQ_TMA_UNITS) {
-                break;
+            for (int i = 0; i < 4; ++i) {
+                buf_gate[((warp - 1)*4 + i)*WARP_SIZE + lane] = sum_g[i];
+                buf_up[((warp - 1)*4 + i)*WARP_SIZE + lane]   = sum_u[i];
             }
-            if (step > 0 || k > 0) {
-                mmq_tma_load_y(yf, y_pair + iu*MMQ_FEW_Q8_1_INT4);
+        }
+        // Release s_up for next iter's up(t+1) TMA and publish buf_gate/buf_up to warp 0.
+        __syncthreads();
+
+        if (warp == 0) {
+#pragma unroll
+            for (int w = 0; w < NWARPS - 1; ++w) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    sum_g[i] += buf_gate[(w*4 + i)*WARP_SIZE + lane];
+                    sum_u[i] += buf_up[(w*4 + i)*WARP_SIZE + lane];
+                }
             }
-            const int off0 = (lane/4 + 0)*MMQ_TMA_ROW_BYTES + iu*MMQ_TMA_UNIT_BYTES;
-            const int off8 = (lane/4 + 8)*MMQ_TMA_ROW_BYTES + iu*MMQ_TMA_UNIT_BYTES;
-            const char * const xg[2] = { s_gate + off0, s_gate + off8 };
-            const char * const xu[2] = { s_up   + off0, s_up   + off8 };
-            mmq_tma_vec_dot_q3_K(xg, yf, sum_g);
-            mmq_tma_vec_dot_q3_K(xu, yf, sum_u);
+            const int ncols = pair[1];
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int i = row0 + tile<16, 8, int>::get_i(l);
+                const int j = tile<16, 8, int>::get_j(l);
+                if (i < n_ff && j < ncols) {
+                    const int e = pair[2 + j];
+                    const float r = ggml_cuda_op_situ_single(sum_g[l], sum_u[l], beta, lb);
+                    dst[int64_t(e / ncols_dst)*stride_channel_dst + int64_t(e % ncols_dst)*stride_col_dst + i] = r;
+                }
+            }
         }
     }
 
     ggml_cuda_pdl_lc();
-
-    __syncthreads();
-    if (warp > 0) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            buf_gate[((warp - 1)*4 + i)*WARP_SIZE + lane] = sum_g[i];
-            buf_up[((warp - 1)*4 + i)*WARP_SIZE + lane]   = sum_u[i];
-        }
-    }
-    __syncthreads();
-    if (warp == 0) {
-#pragma unroll
-        for (int w = 0; w < MMQ_TMA_NWARPS - 1; ++w) {
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                sum_g[i] += buf_gate[(w*4 + i)*WARP_SIZE + lane];
-                sum_u[i] += buf_up[(w*4 + i)*WARP_SIZE + lane];
-            }
-        }
-    } else {
-        return;
-    }
-
-#pragma unroll
-    for (int l = 0; l < 4; ++l) {
-        const int i = row0 + tile<16, 8, int>::get_i(l);
-        const int j = tile<16, 8, int>::get_j(l);
-        if (i < n_ff && j < ncols) {
-            const int e = pair[2 + j];
-            const float r = ggml_cuda_op_situ_single(sum_g[l], sum_u[l], beta, lb);
-            dst[int64_t(e / ncols_dst)*stride_channel_dst + int64_t(e % ncols_dst)*stride_col_dst + i] = r;
-        }
-    }
 #else
     GGML_UNUSED_VARS(map, y, dst, n_ff, expert_chunks, half_chunks, ncols_dst, stride_col_dst, stride_channel_dst,
-        pairs, beta, lb);
+        pairs, npairs_ptr, beta, lb);
     NO_DEVICE_CODE;
 #endif
 }
 
-// Q4_K MUL_MAT_ID (k = 2304): 16-row TMA box of 20,736 bytes with evict_first.
-static __global__ __launch_bounds__(MMQ_TMA_NWARPS*WARP_SIZE, 2)
-void mul_mat_q_tma_q4_K(const __grid_constant__ CUtensorMap map, const int4 * y, float * dst,
-                        const int nrows_x, const int64_t expert_rows, const int ncols_dst,
-                        const int stride_col_dst, const int64_t stride_channel_dst, const int * pairs) {
+// Persistent 2-slot double-buffered Q4_K / Q5_K TMA kernel for any 16-byte-aligned K = nunits * 256.
+template <ggml_type type, int NWARPS, int OCC, bool SINGLE_UNIT>
+static __global__ __launch_bounds__(NWARPS*WARP_SIZE, OCC)
+void mul_mat_q_tma_q45_K(const __grid_constant__ CUtensorMap map, const int4 * y, float * dst,
+                         const int nrows_x, const int64_t expert_rows, const int nunits,
+                         const int row_bytes, const int tile_bytes, const int tile_stride,
+                         const int ncols_dst, const int stride_col_dst, const int64_t stride_channel_dst,
+                         const int * pairs, const int * npairs_ptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
-    __shared__ __align__(128) char s_weight[MMQ_TMA_Q4K_TILE_BYTES];
-    __shared__ uint64_t bar;
-    __shared__ float buf_sum[(MMQ_TMA_NWARPS - 1)*4*WARP_SIZE];
+    constexpr int UNIT_BYTES    = type == GGML_TYPE_Q4_K ? MMQ_TMA_Q4K_UNIT_BYTES : MMQ_TMA_Q5K_UNIT_BYTES;
+    constexpr int REDUCE_FLOATS = (NWARPS - 1)*4*WARP_SIZE;
+
+    extern __shared__ __align__(128) char s_dyn[];
+    char *     s_buf0   = s_dyn;
+    char *     s_buf1   = s_dyn + tile_stride;
+    uint64_t * bar      = reinterpret_cast<uint64_t *>(s_dyn + 2*tile_stride);
+    float *    buf_sum0 = reinterpret_cast<float *>(bar + 2);
+    float *    buf_sum1 = buf_sum0 + REDUCE_FLOATS;
 
     const int warp = threadIdx.y;
     const int lane = threadIdx.x;
@@ -539,85 +635,133 @@ void mul_mat_q_tma_q4_K(const __grid_constant__ CUtensorMap map, const int4 * y,
 
     ggml_cuda_pdl_sync();
 
-    const int * pair = pairs + blockIdx.y*MMQ_FEW_PAIR_INTS;
-    const int ncols = pair[1];
-    if (ncols == 0) {
+    const int npairs      = *npairs_ptr;
+    const int n_row_tiles = nrows_x / MMQ_TMA_TILE_ROWS;
+    const int total_tiles = npairs * n_row_tiles;
+    const int t_begin     = (int) ((int64_t(total_tiles) * blockIdx.x) / gridDim.x);
+    const int t_end       = (int) ((int64_t(total_tiles) * (blockIdx.x + 1)) / gridDim.x);
+    if (t_begin >= t_end) {
+        ggml_cuda_pdl_lc();
         return;
     }
-    const int row0 = blockIdx.x*MMQ_TMA_TILE_ROWS;
 
+    const uint64_t policy = mmq_tma_evict_first();
     if (tid == 0) {
-        mmq_tma_mbar_init(&bar);
+        mmq_tma_mbar_init(&bar[0]);
+        mmq_tma_mbar_init(&bar[1]);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
+
     if (tid == 0) {
-        mmq_tma_mbar_expect(&bar, MMQ_TMA_Q4K_TILE_BYTES);
-        const int y_row = (int) (int64_t(pair[0])*expert_rows + int64_t(row0));
-        mmq_tma_load(s_weight, &map, 0, y_row, &bar, mmq_tma_evict_first());
+        const int p0  = t_begin / n_row_tiles;
+        const int rt0 = t_begin % n_row_tiles;
+        const int e0  = pairs[p0*MMQ_FEW_PAIR_INTS];
+        mmq_tma_mbar_expect(&bar[0], (uint32_t) tile_bytes);
+        const int y_row0 = (int) (int64_t(e0)*expert_rows + int64_t(rt0)*MMQ_TMA_TILE_ROWS);
+        mmq_tma_load(s_buf0, &map, 0, y_row0, &bar[0], policy);
     }
-
-    float sum[4] = {0.0f};
-    const int iu_begin = 2*warp;
-    const int4 * y_pair = y + int64_t(blockIdx.y)*MMQ_TMA_Q4K_UNITS*MMQ_FEW_Q8_1_INT4;
-
-    mmq_tma_y_frag yf;
-    mmq_tma_load_y(yf, y_pair + iu_begin*MMQ_FEW_Q8_1_INT4);
-
-    mmq_tma_mbar_wait(&bar, 0);
     __syncthreads();
 
-    for (int step = 0; iu_begin + 2*MMQ_TMA_NWARPS*step < MMQ_TMA_Q4K_UNITS; ++step) {
-#pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            const int iu = iu_begin + 2*MMQ_TMA_NWARPS*step + k;
-            if (iu >= MMQ_TMA_Q4K_UNITS) {
-                break;
-            }
-            if (step > 0 || k > 0) {
-                mmq_tma_load_y(yf, y_pair + iu*MMQ_FEW_Q8_1_INT4);
-            }
-            const char * const xr[2] = {
-                s_weight + (lane/4 + 0)*MMQ_TMA_Q4K_ROW_BYTES + iu*MMQ_TMA_Q4K_UNIT_BYTES,
-                s_weight + (lane/4 + 8)*MMQ_TMA_Q4K_ROW_BYTES + iu*MMQ_TMA_Q4K_UNIT_BYTES,
-            };
-            mmq_tma_vec_dot_q4_K(xr, yf, sum);
+    uint32_t par0 = 0;
+    uint32_t par1 = 0;
+    int cur = 0;
+    int cached_p = -1;
+    mmq_tma_y_frag yf;
+
+    for (int t = t_begin; t < t_end; ++t) {
+        if (tid == 0 && t + 1 < t_end) {
+            const int pn  = (t + 1) / n_row_tiles;
+            const int rtn = (t + 1) % n_row_tiles;
+            const int en  = pairs[pn*MMQ_FEW_PAIR_INTS];
+            const int y_rown = (int) (int64_t(en)*expert_rows + int64_t(rtn)*MMQ_TMA_TILE_ROWS);
+            uint64_t * bar_nxt = cur == 0 ? &bar[1] : &bar[0];
+            char *     s_nxt   = cur == 0 ? s_buf1 : s_buf0;
+            mmq_tma_mbar_expect(bar_nxt, (uint32_t) tile_bytes);
+            mmq_tma_load(s_nxt, &map, 0, y_rown, bar_nxt, policy);
         }
+
+        const int p    = t / n_row_tiles;
+        const int rt   = t % n_row_tiles;
+        const int row0 = rt*MMQ_TMA_TILE_ROWS;
+        const int * pair = pairs + p*MMQ_FEW_PAIR_INTS;
+        const int4 * y_pair = y + int64_t(p)*nunits*MMQ_FEW_Q8_1_INT4;
+
+        if constexpr (SINGLE_UNIT) {
+            if (p != cached_p && warp < nunits) {
+                mmq_tma_load_y(yf, y_pair + warp*MMQ_FEW_Q8_1_INT4);
+                cached_p = p;
+            }
+        } else if (warp < nunits) {
+            mmq_tma_load_y(yf, y_pair + warp*MMQ_FEW_Q8_1_INT4);
+        }
+
+        if (cur == 0) {
+            mmq_tma_mbar_wait(&bar[0], par0);
+            par0 ^= 1;
+        } else {
+            mmq_tma_mbar_wait(&bar[1], par1);
+            par1 ^= 1;
+        }
+
+        float sum[4] = {0.0f};
+        const char * s_cur = cur == 0 ? s_buf0 : s_buf1;
+        if constexpr (SINGLE_UNIT) {
+            if (warp < nunits) {
+                const char * const xr[2] = {
+                    s_cur + (lane/4 + 0)*row_bytes + warp*UNIT_BYTES,
+                    s_cur + (lane/4 + 8)*row_bytes + warp*UNIT_BYTES,
+                };
+                mmq_tma_vec_dot_q45_K<type>(xr, yf, sum);
+            }
+        } else {
+            for (int iu = warp; iu < nunits; iu += NWARPS) {
+                if (iu != warp) {
+                    mmq_tma_load_y(yf, y_pair + iu*MMQ_FEW_Q8_1_INT4);
+                }
+                const char * const xr[2] = {
+                    s_cur + (lane/4 + 0)*row_bytes + iu*UNIT_BYTES,
+                    s_cur + (lane/4 + 8)*row_bytes + iu*UNIT_BYTES,
+                };
+                mmq_tma_vec_dot_q45_K<type>(xr, yf, sum);
+            }
+        }
+
+        float * buf_sum = cur == 0 ? buf_sum0 : buf_sum1;
+        if (warp > 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                buf_sum[((warp - 1)*4 + i)*WARP_SIZE + lane] = sum[i];
+            }
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+#pragma unroll
+            for (int w = 0; w < NWARPS - 1; ++w) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    sum[i] += buf_sum[(w*4 + i)*WARP_SIZE + lane];
+                }
+            }
+            const int ncols = pair[1];
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int i = row0 + tile<16, 8, int>::get_i(l);
+                const int j = tile<16, 8, int>::get_j(l);
+                if (i < nrows_x && j < ncols) {
+                    const int e = pair[2 + j];
+                    dst[int64_t(e / ncols_dst)*stride_channel_dst + int64_t(e % ncols_dst)*stride_col_dst + i] = sum[l];
+                }
+            }
+        }
+        cur ^= 1;
     }
 
     ggml_cuda_pdl_lc();
-
-    __syncthreads();
-    if (warp > 0) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            buf_sum[((warp - 1)*4 + i)*WARP_SIZE + lane] = sum[i];
-        }
-    }
-    __syncthreads();
-    if (warp == 0) {
-#pragma unroll
-        for (int w = 0; w < MMQ_TMA_NWARPS - 1; ++w) {
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                sum[i] += buf_sum[(w*4 + i)*WARP_SIZE + lane];
-            }
-        }
-    } else {
-        return;
-    }
-
-#pragma unroll
-    for (int l = 0; l < 4; ++l) {
-        const int i = row0 + tile<16, 8, int>::get_i(l);
-        const int j = tile<16, 8, int>::get_j(l);
-        if (i < nrows_x && j < ncols) {
-            const int e = pair[2 + j];
-            dst[int64_t(e / ncols_dst)*stride_channel_dst + int64_t(e % ncols_dst)*stride_col_dst + i] = sum[l];
-        }
-    }
 #else
-    GGML_UNUSED_VARS(map, y, dst, nrows_x, expert_rows, ncols_dst, stride_col_dst, stride_channel_dst, pairs);
+    GGML_UNUSED_VARS(map, y, dst, nrows_x, expert_rows, nunits, row_bytes, tile_bytes, tile_stride,
+        ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr);
     NO_DEVICE_CODE;
 #endif
 }
@@ -691,6 +835,77 @@ static __global__ void mmq_tma_weighted_sum_kernel(
     *reinterpret_cast<float4 *>(dst + int64_t(token)*dst_col_stride + col4) = make_float4(a0, a1, a2, a3);
 }
 
+// Opt in to >48 KiB dynamic SMEM per kernel and device, safe inside CUDA graph capture.
+template <typename KernelFn>
+static void mmq_tma_ensure_smem(const int device, KernelFn kernel_fn, const size_t smem_bytes) {
+    if (smem_bytes <= 48*1024) {
+        return;
+    }
+    static std::atomic<int> max_smem[GGML_CUDA_MAX_DEVICES];
+    const int need = (int) smem_bytes;
+    int prev = max_smem[device].load(std::memory_order_acquire);
+    if (need <= prev) {
+        return;
+    }
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+    CUDA_CHECK(cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, need));
+    CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+    while (need > prev && !max_smem[device].compare_exchange_weak(prev, need, std::memory_order_release)) {
+    }
+}
+
+template <ggml_type type, int NWARPS, int OCC, bool SINGLE_UNIT>
+static void launch_mul_mat_q_tma_q45_K(
+        const int device, const CUtensorMap & map, const int4 * y, float * dst,
+        const int nrows_x, const int64_t expert_rows, const int nunits, const int row_bytes,
+        const int ncols_dst, const int stride_col_dst, const int64_t stride_channel_dst,
+        const int * pairs, const int * npairs_ptr, const int npairs_max, cudaStream_t stream) {
+    const int tile_bytes  = MMQ_TMA_TILE_ROWS * row_bytes;
+    const int tile_stride = ((tile_bytes + 127) / 128) * 128;
+    const size_t smem_bytes = (size_t) (2*tile_stride) + 2*sizeof(uint64_t) +
+        (size_t) (2*(NWARPS - 1)*4*WARP_SIZE)*sizeof(float);
+    mmq_tma_ensure_smem(device, mul_mat_q_tma_q45_K<type, NWARPS, OCC, SINGLE_UNIT>, smem_bytes);
+
+    const int nsm = ggml_cuda_info().devices[device].nsm;
+    const int max_tiles = (nrows_x / MMQ_TMA_TILE_ROWS) * npairs_max;
+    const int grid_x = std::max(1, std::min(nsm * OCC, max_tiles));
+    const dim3 grid((unsigned) grid_x, 1, 1);
+    const dim3 block(WARP_SIZE, NWARPS, 1);
+    const ggml_cuda_kernel_launch_params params(grid, block, smem_bytes, stream);
+    ggml_cuda_kernel_launch(mul_mat_q_tma_q45_K<type, NWARPS, OCC, SINGLE_UNIT>, params,
+        map, y, dst, nrows_x, expert_rows, nunits, row_bytes, tile_bytes, tile_stride,
+        ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr);
+}
+
+template <ggml_type type>
+static void dispatch_mul_mat_q_tma_q45_K(
+        const int device, const CUtensorMap & map, const int4 * y, float * dst,
+        const int nrows_x, const int64_t expert_rows, const int nunits, const int row_bytes,
+        const int ncols_dst, const int stride_col_dst, const int64_t stride_channel_dst,
+        const int * pairs, const int * npairs_ptr, const int npairs_max, cudaStream_t stream) {
+    if (nunits == 9) {
+        // 9 warps x 1 unit/warp: 0% warp imbalance, y cached in regs across row tiles of each pair.
+        launch_mul_mat_q_tma_q45_K<type, 9, 1, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
+            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+    } else if (nunits == 6) {
+        launch_mul_mat_q_tma_q45_K<type, 6, 2, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
+            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+    } else if (nunits == 4) {
+        launch_mul_mat_q_tma_q45_K<type, 4, 2, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
+            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+    } else if (nunits == 3) {
+        launch_mul_mat_q_tma_q45_K<type, 3, 3, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
+            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+    } else if (nunits == 2) {
+        launch_mul_mat_q_tma_q45_K<type, 2, 4, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
+            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+    } else {
+        launch_mul_mat_q_tma_q45_K<type, 4, 1, false>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
+            ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, stream);
+    }
+}
+
 // The tensor map of one weight buffer, encoded once and kept: the weights never move under it.
 static const CUtensorMap * mmq_tma_map_of(const int device, const void * base, const int chunk_bytes,
                                           const int box_rows, const int64_t chunks) {
@@ -736,6 +951,19 @@ static bool mmq_tma_arch_ok(const int device) {
     return cc == GGML_CUDA_CC_BLACKWELL && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_BLACKWELL;
 }
 
+static bool mmq_tma_q45_shape_ok(const ggml_tensor * w, int & nunits, int & row_bytes) {
+    if (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K) {
+        return false;
+    }
+    if (w->ne[0] % QK_K != 0 || w->ne[0] < 2*QK_K) {
+        return false;
+    }
+    const int unit_bytes = w->type == GGML_TYPE_Q4_K ? MMQ_TMA_Q4K_UNIT_BYTES : MMQ_TMA_Q5K_UNIT_BYTES;
+    nunits    = (int) (w->ne[0] / QK_K);
+    row_bytes = nunits * unit_bytes;
+    return row_bytes / 8 <= MMQ_TMA_Q45_MAX_BOX_U64;
+}
+
 bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                           const ggml_tensor * ids, ggml_tensor * dst) {
     static const bool enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
@@ -743,12 +971,14 @@ bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         return false;
     }
     const bool is_q3k = src0->type == GGML_TYPE_Q3_K && src0->ne[0] == MMQ_TMA_UNITS*QK_K;
-    const bool is_q4k = src0->type == GGML_TYPE_Q4_K && src0->ne[0] == MMQ_TMA_Q4K_UNITS*QK_K;
-    if ((!is_q3k && !is_q4k) || src0->ne[1] % MMQ_TMA_TILE_ROWS != 0 || src0->ne[2] < 2 || src0->ne[3] != 1) {
+    int q45_nunits = 0;
+    int q45_row_bytes = 0;
+    const bool is_q45 = !is_q3k && mmq_tma_q45_shape_ok(src0, q45_nunits, q45_row_bytes);
+    if ((!is_q3k && !is_q45) || src0->ne[1] % MMQ_TMA_TILE_ROWS != 0 || src0->ne[2] < 2 || src0->ne[3] != 1) {
         return false;
     }
-    const int chunk_bytes = is_q3k ? MMQ_TMA_CHUNK : MMQ_TMA_Q4K_ROW_BYTES;
-    const int row_bytes   = is_q3k ? MMQ_TMA_ROW_BYTES : MMQ_TMA_Q4K_ROW_BYTES;
+    const int chunk_bytes = is_q3k ? MMQ_TMA_CHUNK : q45_row_bytes;
+    const int row_bytes   = is_q3k ? MMQ_TMA_ROW_BYTES : q45_row_bytes;
     if (src0->nb[0] != ggml_type_size(src0->type) || src0->nb[1] != (size_t) row_bytes ||
             src0->nb[2] % chunk_bytes != 0 || !ggml_is_contiguous(src0) ||
             (uintptr_t) src0->data % 16 != 0) {
@@ -786,27 +1016,39 @@ bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const int64_t nused         = std::min<int64_t>(src0->ne[2], nentries);
     const int npairs_max = (int) std::min<int64_t>(nused + (nentries - nused)/MMQ_FEW_NCOLS,
         src0->ne[2]*((n_tokens + MMQ_FEW_NCOLS - 1)/MMQ_FEW_NCOLS));
-    const int nunits = is_q3k ? MMQ_TMA_UNITS : MMQ_TMA_Q4K_UNITS;
+    const int nunits = is_q3k ? MMQ_TMA_UNITS : q45_nunits;
 
     ggml_cuda_pool_alloc<int>  pairs(ctx.pool());
     ggml_cuda_pool_alloc<int4> src1_q(ctx.pool());
-    pairs.alloc((size_t) npairs_max*MMQ_FEW_PAIR_INTS);
+    pairs.alloc((size_t) npairs_max*MMQ_FEW_PAIR_INTS + 1);
+    int * npairs_ptr = pairs.get() + (size_t) npairs_max*MMQ_FEW_PAIR_INTS;
     src1_q.alloc((size_t) npairs_max*nunits*MMQ_FEW_Q8_1_INT4);
     quantize_mmq_few_id_q8_1_cuda((const float *) src1->data, (const int32_t *) ids->data, src1_q.get(), pairs.get(),
         is_q3k ? MMQ_Q8_1_DS_LAYOUT_D4 : MMQ_Q8_1_DS_LAYOUT_DS4, ne10, src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float),
-        src1->ne[1], src0->ne[2], n_expert_used, n_tokens, ids->nb[1]/sizeof(int32_t), npairs_max, stream);
+        src1->ne[1], src0->ne[2], n_expert_used, n_tokens, ids->nb[1]/sizeof(int32_t), npairs_max, stream, npairs_ptr);
 
-    const dim3 grid(src0->ne[1]/MMQ_TMA_TILE_ROWS, npairs_max, 1);
-    const dim3 block(WARP_SIZE, MMQ_TMA_NWARPS, 1);
-    const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
     if (is_q3k) {
+        constexpr size_t smem_bytes = (size_t) (2*MMQ_TMA_TILE_STRIDE) + 2*sizeof(uint64_t) +
+            (size_t) (2*(MMQ_TMA_Q3K_NWARPS - 1)*4*WARP_SIZE)*sizeof(float);
+        mmq_tma_ensure_smem(ctx.device, mul_mat_q_tma_q3_K, smem_bytes);
+        const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        const int max_tiles = (int) (src0->ne[1]/MMQ_TMA_TILE_ROWS) * npairs_max;
+        const dim3 grid((unsigned) std::max(1, std::min(nsm, max_tiles)), 1, 1);
+        const dim3 block(WARP_SIZE, MMQ_TMA_Q3K_NWARPS, 1);
+        const ggml_cuda_kernel_launch_params params(grid, block, smem_bytes, stream);
         ggml_cuda_kernel_launch(mul_mat_q_tma_q3_K, params, *map, (const int4 *) src1_q.get(), (float *) dst->data,
             (int) src0->ne[1], (int64_t) (src0->nb[2]/MMQ_TMA_CHUNK), (int) dst->ne[1],
-            (int) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)), pairs.get());
+            (int) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)), pairs.get(), npairs_ptr);
+    } else if (src0->type == GGML_TYPE_Q4_K) {
+        dispatch_mul_mat_q_tma_q45_K<GGML_TYPE_Q4_K>(ctx.device, *map, (const int4 *) src1_q.get(), (float *) dst->data,
+            (int) src0->ne[1], (int64_t) (src0->nb[2]/q45_row_bytes), q45_nunits, q45_row_bytes,
+            (int) dst->ne[1], (int) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)),
+            pairs.get(), npairs_ptr, npairs_max, stream);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_q_tma_q4_K, params, *map, (const int4 *) src1_q.get(), (float *) dst->data,
-            (int) src0->ne[1], (int64_t) (src0->nb[2]/MMQ_TMA_Q4K_ROW_BYTES), (int) dst->ne[1],
-            (int) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)), pairs.get());
+        dispatch_mul_mat_q_tma_q45_K<GGML_TYPE_Q5_K>(ctx.device, *map, (const int4 *) src1_q.get(), (float *) dst->data,
+            (int) src0->ne[1], (int64_t) (src0->nb[2]/q45_row_bytes), q45_nunits, q45_row_bytes,
+            (int) dst->ne[1], (int) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)),
+            pairs.get(), npairs_ptr, npairs_max, stream);
     }
     return true;
 }
@@ -845,16 +1087,9 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
         return false;
     }
 
-    constexpr size_t smem_bytes = MMQ_TMA_GATE_UP_SMEM_BYTES;
-    static std::atomic<bool> smem_set[GGML_CUDA_MAX_DEVICES];
-    if (!smem_set[ctx.device].load(std::memory_order_acquire)) {
-        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
-        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-        CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_tma_q3_K_gate_up_situ,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_bytes));
-        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-        smem_set[ctx.device].store(true, std::memory_order_release);
-    }
+    constexpr size_t smem_bytes = (size_t) (2*MMQ_TMA_TILE_STRIDE) + 2*sizeof(uint64_t) +
+        (size_t) (2*(MMQ_TMA_Q3K_NWARPS - 1)*4*WARP_SIZE)*sizeof(float);
+    mmq_tma_ensure_smem(ctx.device, mul_mat_q_tma_q3_K_gate_up_situ, smem_bytes);
 
     cudaStream_t stream = ctx.stream();
     const int64_t n_expert_used = ids->ne[0];
@@ -877,12 +1112,13 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
     const int64_t nused = std::min<int64_t>(count, nentries);
     const int npairs_max = (int) std::min<int64_t>(nused + (nentries - nused)/MMQ_FEW_NCOLS,
         count*((n_tokens + MMQ_FEW_NCOLS - 1)/MMQ_FEW_NCOLS));
-    ggml_cuda_pool_alloc<int>  pairs(ctx.pool(), (size_t) npairs_max*MMQ_FEW_PAIR_INTS);
+    ggml_cuda_pool_alloc<int>  pairs(ctx.pool(), (size_t) npairs_max*MMQ_FEW_PAIR_INTS + 1);
+    int * npairs_ptr = pairs.get() + (size_t) npairs_max*MMQ_FEW_PAIR_INTS;
     ggml_cuda_pool_alloc<int4> src1_q(ctx.pool(), (size_t) npairs_max*MMQ_TMA_UNITS*MMQ_FEW_Q8_1_INT4);
     // Quantize x before zeroing non-owned glu rows so glu may alias x.
     quantize_mmq_few_id_q8_1_cuda((const float *) x->data, local_ids, src1_q.get(), pairs.get(),
         MMQ_Q8_1_DS_LAYOUT_D4, x->ne[0], x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
-        x->ne[1], count, n_expert_used, n_tokens, n_expert_used, npairs_max, stream);
+        x->ne[1], count, n_expert_used, n_tokens, n_expert_used, npairs_max, stream, npairs_ptr);
 
     if (zero_non_owned) {
         const int row_blocks = (int) ((n_ff + 255)/256);
@@ -892,13 +1128,15 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
             local_ids, (float *) glu->data, (int) nentries, (int) n_ff, row_blocks);
     }
 
-    const dim3 grid((unsigned) (n_ff/MMQ_TMA_TILE_ROWS), (unsigned) npairs_max, 1);
-    const dim3 block(WARP_SIZE, MMQ_TMA_NWARPS, 1);
+    const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    const int max_tiles = (int) (n_ff/MMQ_TMA_TILE_ROWS) * npairs_max;
+    const dim3 grid((unsigned) std::max(1, std::min(nsm, max_tiles)), 1, 1);
+    const dim3 block(WARP_SIZE, MMQ_TMA_Q3K_NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(grid, block, smem_bytes, stream);
     ggml_cuda_kernel_launch(mul_mat_q_tma_q3_K_gate_up_situ, params, *map, (const int4 *) src1_q.get(), (float *) glu->data,
         (int) n_ff, (int64_t) (w->nb[2]/MMQ_TMA_CHUNK), (int64_t) (n_ff*MMQ_TMA_ROW_BYTES/MMQ_TMA_CHUNK),
         (int) glu->ne[1], (int) (glu->nb[1]/sizeof(float)), (int64_t) (glu->nb[2]/sizeof(float)),
-        pairs.get(), beta, lb);
+        pairs.get(), npairs_ptr, beta, lb);
     return true;
 }
 
@@ -907,15 +1145,19 @@ bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const 
                                          int32_t first, int32_t count,
                                          const int32_t * precomputed_local_ids) {
     static const bool enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
-    if (!enabled || !w || !x || !ids || !weights || !dst || w->type != GGML_TYPE_Q4_K) {
+    if (!enabled || !w || !x || !ids || !weights || !dst) {
         return false;
     }
-    if (w->ne[0] != MMQ_TMA_Q4K_UNITS*QK_K || w->ne[1] % MMQ_TMA_TILE_ROWS != 0 || w->ne[2] != count ||
-            w->ne[2] < 2 || w->ne[3] != 1) {
+    int nunits = 0;
+    int row_bytes = 0;
+    if (!mmq_tma_q45_shape_ok(w, nunits, row_bytes)) {
         return false;
     }
-    if (w->nb[0] != ggml_type_size(w->type) || w->nb[1] != MMQ_TMA_Q4K_ROW_BYTES ||
-            w->nb[2] % MMQ_TMA_Q4K_ROW_BYTES != 0 || !ggml_is_contiguous(w) || (uintptr_t) w->data % 16 != 0) {
+    if (w->ne[1] % MMQ_TMA_TILE_ROWS != 0 || w->ne[2] != count || w->ne[2] < 2 || w->ne[3] != 1) {
+        return false;
+    }
+    if (w->nb[0] != ggml_type_size(w->type) || w->nb[1] != (size_t) row_bytes ||
+            w->nb[2] % row_bytes != 0 || !ggml_is_contiguous(w) || (uintptr_t) w->data % 16 != 0) {
         return false;
     }
     if (x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
@@ -931,8 +1173,8 @@ bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const 
         return false;
     }
 
-    const int64_t chunks = (int64_t) w->ne[2]*w->nb[2]/MMQ_TMA_Q4K_ROW_BYTES;
-    const CUtensorMap * map = mmq_tma_map_of(ctx.device, w->data, MMQ_TMA_Q4K_ROW_BYTES, MMQ_TMA_TILE_ROWS, chunks);
+    const int64_t chunks = (int64_t) w->ne[2]*w->nb[2]/row_bytes;
+    const CUtensorMap * map = mmq_tma_map_of(ctx.device, w->data, row_bytes, MMQ_TMA_TILE_ROWS, chunks);
     if (map == nullptr) {
         return false;
     }
@@ -959,20 +1201,26 @@ bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const 
     const int64_t nused = std::min<int64_t>(count, nentries);
     const int npairs_max = (int) std::min<int64_t>(nused + (nentries - nused)/MMQ_FEW_NCOLS,
         count*((n_tokens + MMQ_FEW_NCOLS - 1)/MMQ_FEW_NCOLS));
-    ggml_cuda_pool_alloc<int>   pairs(ctx.pool(), (size_t) npairs_max*MMQ_FEW_PAIR_INTS);
-    ggml_cuda_pool_alloc<int4>  src1_q(ctx.pool(), (size_t) npairs_max*MMQ_TMA_Q4K_UNITS*MMQ_FEW_Q8_1_INT4);
+    ggml_cuda_pool_alloc<int>   pairs(ctx.pool(), (size_t) npairs_max*MMQ_FEW_PAIR_INTS + 1);
+    int * npairs_ptr = pairs.get() + (size_t) npairs_max*MMQ_FEW_PAIR_INTS;
+    ggml_cuda_pool_alloc<int4>  src1_q(ctx.pool(), (size_t) npairs_max*nunits*MMQ_FEW_Q8_1_INT4);
     ggml_cuda_pool_alloc<float> tmp_down(ctx.pool(), (size_t) nentries*n_embd);
 
     quantize_mmq_few_id_q8_1_cuda((const float *) x->data, local_ids, src1_q.get(), pairs.get(),
         MMQ_Q8_1_DS_LAYOUT_DS4, x->ne[0], x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
-        x->ne[1], count, n_expert_used, n_tokens, n_expert_used, npairs_max, stream);
+        x->ne[1], count, n_expert_used, n_tokens, n_expert_used, npairs_max, stream, npairs_ptr);
 
-    const dim3 grid((unsigned) (n_embd/MMQ_TMA_TILE_ROWS), (unsigned) npairs_max, 1);
-    const dim3 block(WARP_SIZE, MMQ_TMA_NWARPS, 1);
-    const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
-    ggml_cuda_kernel_launch(mul_mat_q_tma_q4_K, params, *map, (const int4 *) src1_q.get(), tmp_down.get(),
-        (int) n_embd, (int64_t) (w->nb[2]/MMQ_TMA_Q4K_ROW_BYTES), (int) n_expert_used,
-        (int) n_embd, (int64_t) (n_expert_used*n_embd), pairs.get());
+    if (w->type == GGML_TYPE_Q4_K) {
+        dispatch_mul_mat_q_tma_q45_K<GGML_TYPE_Q4_K>(ctx.device, *map, (const int4 *) src1_q.get(), tmp_down.get(),
+            (int) n_embd, (int64_t) (w->nb[2]/row_bytes), nunits, row_bytes,
+            (int) n_expert_used, (int) n_embd, (int64_t) (n_expert_used*n_embd),
+            pairs.get(), npairs_ptr, npairs_max, stream);
+    } else {
+        dispatch_mul_mat_q_tma_q45_K<GGML_TYPE_Q5_K>(ctx.device, *map, (const int4 *) src1_q.get(), tmp_down.get(),
+            (int) n_embd, (int64_t) (w->nb[2]/row_bytes), nunits, row_bytes,
+            (int) n_expert_used, (int) n_embd, (int64_t) (n_expert_used*n_embd),
+            pairs.get(), npairs_ptr, npairs_max, stream);
+    }
 
     const dim3 sum_grid((unsigned) ((n_embd/4 + 255)/256), (unsigned) n_tokens, 1);
     const ggml_cuda_kernel_launch_params sum_params(sum_grid, dim3(256, 1, 1), 0, stream);
