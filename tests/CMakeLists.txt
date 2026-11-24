@@ -960,7 +960,7 @@ if (GGML_CUDA)
     # fold; the binary skips (77) on a device below compute capability 12.0
     find_package(CUDAToolkit REQUIRED)
     set_source_files_properties(test-inkling-fp8-pair.cpp PROPERTIES LANGUAGE CUDA)
-    llama_build(test-inkling-fp8-pair.cpp)
+    llama_build(test-inkling-fp8-pair.cpp LINK ggml-base CUDA::cublas CUDA::cuda_driver)
     target_include_directories(test-inkling-fp8-pair PRIVATE ${CUDAToolkit_INCLUDE_DIRS}
         ${PROJECT_SOURCE_DIR}/ggml/src)
     # the block-scaled QMMA (kind::mxf8f6f4, ue8m0 scales) is an sm_120a feature: ptxas refuses it on
