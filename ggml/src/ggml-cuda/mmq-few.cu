@@ -1147,8 +1147,8 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
         const int64_t n_tokens      = ids->ne[1];
         const int64_t nentries      = n_tokens*n_expert_used;
         const int64_t nused         = std::min(ne02, nentries);
-        // an expert with c > 0 entries (at most one per token) has ceil(c/MMQ_FEW_NCOLS) pairs
-        npairs_max = (int) std::min(nused + (nentries - nused)/MMQ_FEW_NCOLS, ne02*((n_tokens + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS));
+        // an expert with c > 0 entries has ceil(c/MMQ_FEW_NCOLS) pairs
+        npairs_max = (int) (nused + (nentries - nused)/MMQ_FEW_NCOLS);
 
         pairs.alloc(int64_t(npairs_max)*MMQ_FEW_PAIR_INTS);
         src1_q.alloc(int64_t(npairs_max)*nunits*MMQ_FEW_Q8_1_INT4);
@@ -1278,7 +1278,7 @@ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * 
         }
     }
     // MUL_MAT_ID: the pairs are built in shared memory
-    if (ids && (2*src0->ne[2] + 1)*sizeof(int) > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
+    if (ids && (2*src0->ne[2] + 2)*sizeof(int) > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
         return false;
     }
     // the row must hold a whole number of ring stages of the launched kernel

@@ -1012,8 +1012,7 @@ bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const int64_t n_tokens      = ids->ne[1];
     const int64_t nentries      = n_tokens*n_expert_used;
     const int64_t nused         = std::min<int64_t>(src0->ne[2], nentries);
-    const int npairs_max = (int) std::min<int64_t>(nused + (nentries - nused)/MMQ_FEW_NCOLS,
-        src0->ne[2]*((n_tokens + MMQ_FEW_NCOLS - 1)/MMQ_FEW_NCOLS));
+    const int npairs_max = (int) (nused + (nentries - nused)/MMQ_FEW_NCOLS);
     const int nunits = is_q3k ? MMQ_TMA_UNITS : q45_nunits;
 
     ggml_cuda_pool_alloc<int>  pairs(ctx.pool());
@@ -1110,8 +1109,7 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
     }
 
     const int64_t nused = std::min<int64_t>(count, nentries);
-    const int npairs_max = (int) std::min<int64_t>(nused + (nentries - nused)/MMQ_FEW_NCOLS,
-        count*((n_tokens + MMQ_FEW_NCOLS - 1)/MMQ_FEW_NCOLS));
+    const int npairs_max = (int) (nused + (nentries - nused)/MMQ_FEW_NCOLS);
     ggml_cuda_pool_alloc<int>  pairs(ctx.pool(), (size_t) npairs_max*MMQ_FEW_PAIR_INTS + 1);
     int * npairs_ptr = pairs.get() + (size_t) npairs_max*MMQ_FEW_PAIR_INTS;
     ggml_cuda_pool_alloc<int4> src1_q(ctx.pool(), (size_t) npairs_max*MMQ_TMA_UNITS*MMQ_FEW_Q8_1_INT4);
@@ -1199,8 +1197,7 @@ bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const 
     }
 
     const int64_t nused = std::min<int64_t>(count, nentries);
-    const int npairs_max = (int) std::min<int64_t>(nused + (nentries - nused)/MMQ_FEW_NCOLS,
-        count*((n_tokens + MMQ_FEW_NCOLS - 1)/MMQ_FEW_NCOLS));
+    const int npairs_max = (int) (nused + (nentries - nused)/MMQ_FEW_NCOLS);
     ggml_cuda_pool_alloc<int>   pairs(ctx.pool(), (size_t) npairs_max*MMQ_FEW_PAIR_INTS + 1);
     int * npairs_ptr = pairs.get() + (size_t) npairs_max*MMQ_FEW_PAIR_INTS;
     ggml_cuda_pool_alloc<int4>  src1_q(ctx.pool(), (size_t) npairs_max*nunits*MMQ_FEW_Q8_1_INT4);
