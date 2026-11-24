@@ -6799,7 +6799,8 @@ private:
     };
 
     std::vector<cpu_sample_result> sample_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
-        const int n_threads_max = std::min(params_base.cpuparams.n_threads, sample_threads_max());
+        const int cpu_threads = std::max(params_base.cpuparams.n_threads, params_base.cpuparams_batch.n_threads);
+        const int n_threads_max = std::min(cpu_threads, sample_threads_max());
         if (n_threads_max < 2 || n_batch_tokens < 2 || !pull_k.empty() ||
                 llama_vocab_n_tokens(vocab) < 128*1024) {
             return {};
@@ -6817,11 +6818,17 @@ private:
                 continue;
             }
             const auto & sampling = slot.task->params.sampling;
-            if (sampling.top_k > 0 || sampling.temp <= 0.0f || sampling.n_probs > 0 ||
-                    !common_sampler_backend_passive(slot.smpl.get())) {
+            if (sampling.n_probs > 0) {
+                continue;
+            }
+            const bool passive = common_sampler_backend_passive(slot.smpl.get());
+            if (passive && (sampling.top_k > 0 || sampling.temp <= 0.0f)) {
                 continue;
             }
             const auto row = llama_get_sampling_row_ith(ctx_tgt, slot.i_batch - off);
+            if (!passive && row.sampled_logits != nullptr) {
+                continue;
+            }
             if (row.logits && row.token == LLAMA_TOKEN_NULL) {
                 jobs.push_back({slot.id, slot.smpl.get(), row});
             }
@@ -6870,7 +6877,8 @@ private:
     // whole vocabulary on the CPU, and slot after slot they were a quarter of a round at 23 sessions (74 ms of 305 on
     // four cards, 2026-11-19). A slot left out here verifies in post_decode as before.
     std::vector<spec_verify_result> verify_cpu_batch(int32_t off, int32_t n_batch_tokens, uint64_t trace_id) {
-        const int n_threads = std::min(params_base.cpuparams.n_threads, sample_threads_max());
+        const int cpu_threads = std::max(params_base.cpuparams.n_threads, params_base.cpuparams_batch.n_threads);
+        const int n_threads = std::min(cpu_threads, sample_threads_max());
         if (n_threads < 2 || !spec || !pull_k.empty() || llama_vocab_n_tokens(vocab) < 128*1024 ||
                 !common_speculative_get_synth_probs(spec.get()).empty()) {
             return {};
@@ -6883,10 +6891,10 @@ private:
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty() || slot.spec_i_batch.empty() ||
                     slot.spec_i_batch.front() < off || slot.spec_i_batch.front() >= off + n_batch_tokens ||
-                    slot.backend_sampler || slot.cand_rows || slot.task->params.sampling.n_probs > 0 ||
-                    !common_sampler_backend_passive(slot.smpl.get())) {
+                    slot.backend_sampler || slot.cand_rows || slot.task->params.sampling.n_probs > 0) {
                 continue;
             }
+            const bool passive = common_sampler_backend_passive(slot.smpl.get());
             // a replay is verified in post_decode, and a draft that came with its distribution by rejection here.
             // LLAMA_SPEC_REJECT_SERIAL_LEGACY=1: by rejection in post_decode, slot after slot
             static const bool reject_serial = ggml_env_switch("LLAMA_SPEC_REJECT_SERIAL_LEGACY");
@@ -6901,7 +6909,7 @@ private:
             seq.draft_q     = reject ? &slot.spec_draft_q : nullptr;
             for (const auto idx : slot.spec_i_batch) {
                 const auto row = llama_get_sampling_row_ith(ctx_tgt, idx - off);
-                if (!row.logits || row.token != LLAMA_TOKEN_NULL) {
+                if (!row.logits || row.token != LLAMA_TOKEN_NULL || (!passive && row.sampled_logits != nullptr)) {
                     break;
                 }
                 seq.rows.push_back(row);

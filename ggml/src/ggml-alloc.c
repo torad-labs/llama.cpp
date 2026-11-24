@@ -1290,7 +1290,7 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
-static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+static bool ggml_gallocr_needs_realloc_inner(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     // a reserve that could not allocate a buffer wrote its plan and left no buffer: a graph the plan fits (the same
     // one, tried again once memory was given back) would be placed in none
     for (int i = 0; i < galloc->n_buffers; i++) {
@@ -1387,6 +1387,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     }
 
     return false;
+}
+
+static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    // Keep one measure epoch across the graph check so meta split states stay cached across node size queries.
+    const uint64_t prev_epoch = g_gallocr_measure_epoch;
+    g_gallocr_measure_epoch = __atomic_add_fetch(&g_gallocr_next_epoch, 1, __ATOMIC_RELAXED);
+    const bool res = ggml_gallocr_needs_realloc_inner(galloc, graph);
+    g_gallocr_measure_epoch = prev_epoch;
+    return res;
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {

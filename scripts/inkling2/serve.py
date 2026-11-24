@@ -51,14 +51,15 @@ MAX_SLOTS = 256  # the engine's sequence limit (LLAMA_MAX_SEQ)
 PROFILES = {
     "tensor-4": {"pack": f"{SOURCE}-Q3_K_M-imatrix.gguf", "mmproj": "mmproj-F16.gguf",
                  "context": 3014656, "slot_context": CODING_SLOT_CONTEXT, "kv": "f16", "swa_kv": "q8_0",
-                 "cache_ram": 262144, "keep_graphs": 32,
+                 "cache_ram": 262144, "keep_graphs": 32, "keep_prompt_graphs": True, "prompt_shapes": 32,
                  "checkpoint_every": 32768, "checkpoint_rows": 2, "checkpoint_ram": 16384,
                  "expert_row_limit": 23, "bucket_prefill_kv": True,
                  "stable_prefill": False, "sort_expert_rows": True,
                  "prefix_copy": True, "mean_mask_decode": True, "reduction_route": "host", "host_owner_rows": False,
                  "query_first_decode": True, "compact_greedy": True,
                  "kv_runs": True, "packed_prefill": True, "f32_few": True, "moe_fuse": True,
-                 "mmq_tma": True, "l2_persist": True, "ar_copy_capture": True},
+                 "mmq_tma": True, "l2_persist": True, "l2_expert_warm": True,
+                 "router_bake": True, "moe_route_gate": True, "ar_copy_capture": True},
 }
 
 
@@ -86,6 +87,8 @@ def arguments(argv=None):
                              "greedy proposes the draft's first choice and verifies by matching (default: probabilistic)")
     parser.add_argument("--draft-device", choices=["CUDA0", "CUDA1", "CUDA2", "CUDA3"], default="CUDA3",
                         help="Device for the draft model (default: CUDA3)")
+    parser.add_argument("--dspark-trim-block", action=argparse.BooleanOptionalAction, default=True,
+                        help="Trim DSpark draft blocks to n_max + 1 rows when drafting (default: enabled)")
     parser.add_argument("--mmproj", type=Path, help="A local vision projector in place of the packs' F16 one")
     parser.add_argument("--text-only", action="store_true", help="Load no vision projector")
     parser.add_argument("--server", type=Path, default=ROOT / "build/bin/llama-server",
@@ -156,10 +159,18 @@ def arguments(argv=None):
                         help="Enable SM120 TMA tile MMQ kernel for K-quant projections (tensor-4 default: on)")
     parser.add_argument("--l2-persist", action=argparse.BooleanOptionalAction,
                         help="Pin hot Inkling 2 conv-state rings in persisting L2 on large-L2 cards (tensor-4 default: on)")
+    parser.add_argument("--l2-expert-warm", action=argparse.BooleanOptionalAction,
+                        help="Warm routed expert weight tiles into L2 after router selection (tensor-4 default: on)")
+    parser.add_argument("--router-bake", action=argparse.BooleanOptionalAction,
+                        help="Bake paired block signs into Inkling 2 F32 router weights (tensor-4 default: on)")
+    parser.add_argument("--moe-route-gate", action=argparse.BooleanOptionalAction,
+                        help="Count prompt routes once and skip empty experts on Blackwell MMQ tiles (tensor-4 default: on)")
     parser.add_argument("--ar-copy-capture", action=argparse.BooleanOptionalAction,
                         help="Enable copy-engine whole-step CUDA graph capture with device-side pacing on host route (tensor-4 default: on)")
-    parser.add_argument("--prompt-shapes", type=int, choices=[1, 2, 4, 8, 16, 32], metavar="ROWS",
-                        help="Read prompts apart from decode replies in reusable power-of-two ubatches")
+    parser.add_argument("--keep-prompt-graphs", action=argparse.BooleanOptionalAction,
+                        help="Retain repeated prompt-shaped graphs in shared buffers when keep-graphs > 0 (tensor-4 default: on)")
+    parser.add_argument("--prompt-shapes", type=int, choices=[0, 1, 2, 4, 8, 16, 32], metavar="ROWS",
+                        help="Read prompts apart from decode replies in reusable power-of-two ubatches (tensor-4: 32, 0 disables)")
     parser.add_argument("--prompt-shape-rows", type=int, choices=[64, 128, 256, 512, 1024, 2048], metavar="ROWS",
                         help="Largest power-of-two prompt ubatch with --prompt-shapes (default: 256)")
     for direction in ("save", "restore"):
@@ -197,13 +208,17 @@ def arguments(argv=None):
     profile = PROFILES[args.profile]
     for key, fallback in (("cache_ram", 32768), ("prefix_copy", False), ("mean_mask_decode", False), ("reduction_route", "host"),
                           ("checkpoint_every", None), ("checkpoint_rows", 0), ("checkpoint_ram", 0),
-                          ("keep_graphs", 0), ("expert_row_limit", None), ("bucket_prefill_kv", False),
+                          ("keep_graphs", 0), ("keep_prompt_graphs", False), ("prompt_shapes", None),
+                          ("expert_row_limit", None), ("bucket_prefill_kv", False),
                           ("stable_prefill", False), ("sort_expert_rows", False), ("query_first_decode", False),
                           ("compact_greedy", False), ("kv_runs", False), ("packed_prefill", False),
                           ("f32_few", False), ("moe_fuse", False), ("mmq_tma", False),
-                          ("l2_persist", False), ("ar_copy_capture", False)):
+                          ("l2_persist", False), ("l2_expert_warm", False),
+                          ("router_bake", False), ("moe_route_gate", False), ("ar_copy_capture", False)):
         if getattr(args, key) is None:
             setattr(args, key, profile.get(key, fallback))
+    if args.prompt_shapes == 0:
+        args.prompt_shapes = None
     if args.expert_row_limit == "auto":
         args.expert_row_limit = None
     if args.host_owner_rows is None:
@@ -230,8 +245,8 @@ def make_plan(args):
     kv = args.kv_cache or ("q8_0" if draft_layout else profile["kv"])
     swa_kv = args.swa_kv_cache if args.swa_kv_cache is not None else profile.get("swa_kv")
     slots = args.slots if args.slots is not None else SLOTS
-    # Quantized target KV leaves room for the full pool alongside the DSpark draft on CUDA3.
-    default_context = (DRAFT_CONTEXT if kv == "f16" else profile["context"]) if draft_layout else profile["context"]
+    # Use the reduced draft pool whenever draft layout is active so CUDA3 keeps headroom for CUDA graphs alongside DSpark.
+    default_context = DRAFT_CONTEXT if draft_layout else profile["context"]
     context = args.context if args.context is not None else default_context
     slot_context = args.slot_context if args.slot_context is not None else profile.get("slot_context", SLOT_CONTEXT)
     if not 1 <= args.port <= 65535:
@@ -368,15 +383,28 @@ def make_plan(args):
         env["GGML_CUDA_MMQ_TMA"] = "1"
     if args.l2_persist:
         env["GGML_CUDA_INKLING2_L2_PERSIST"] = "1"
+    if args.l2_expert_warm:
+        env["GGML_CUDA_L2_EXPERT_WARM"] = "1"
+    if args.router_bake:
+        env["LLAMA_INKLING2_ROUTER_BAKE"] = "1"
+    if args.moe_route_gate:
+        env["GGML_CUDA_MOE_ROUTE_GATE"] = "1"
+    if draft is not None and args.dspark_trim_block:
+        env["LLAMA_DSPARK_TRIM_BLOCK"] = "1"
+    elif not args.dspark_trim_block:
+        env.pop("LLAMA_DSPARK_TRIM_BLOCK", None)
     if kv == "q8_0" or swa_kv == "q8_0":
         env["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"] = "1"
     if kv == "q4_0" or swa_kv == "q4_0":
         env["GGML_CUDA_FATTN_REL_DECODE_Q4"] = "1"
     if args.keep_graphs > 0:
+        prompt_headroom = 12 if args.keep_prompt_graphs else 4
         env.update({"LLAMA_GRAPH_SLOTS": str(args.keep_graphs),
-                    "GGML_META_CAPTURE_GRAPHS": str(args.keep_graphs + 4 + args.checkpoint_rows),
+                    "GGML_META_CAPTURE_GRAPHS": str(args.keep_graphs + prompt_headroom + args.checkpoint_rows),
                     "LLAMA_RS_FIXED_ROWS": "1", "LLAMA_GRAPH_ANY_SEQS": "1",
                     "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000"})
+        if args.keep_prompt_graphs:
+            env["LLAMA_GRAPH_PROMPT_KEPT"] = "1"
     if args.checkpoint_rows > 0:
         env["LLAMA_RS_STAGE_ROWS"] = str(args.checkpoint_rows)
     if args.checkpoint_ram > 0:

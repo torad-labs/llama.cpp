@@ -1380,6 +1380,21 @@ void llama_context::sched_reserve() {
         }
     }
 
+    if (llama_model_is_inkling_draft(model) && n_seqs > 1 && !model.no_alloc()) {
+        // Single-sequence prompt feed on DSpark can exceed the equal-sequence reservation.
+        auto * gf = graph_reserve(n_tokens, 1, n_outputs_pp, mctx.get());
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute single-seq draft buffers");
+        }
+    }
+
+    std::vector<size_t> pp_buf_size(backend_ptrs.size(), 0);
+    if (!model.no_alloc()) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            pp_buf_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        }
+    }
+
     // reserve with tg (token generation) graph to get the number of splits and nodes
     if (cparams.training) {
         // no tg graph for training
@@ -1411,10 +1426,17 @@ void llama_context::sched_reserve() {
             }
         }
         nextn_mode = LLM_GRAPH_NEXTN_NONE;
-        if (llama_model_is_inkling_draft(model) && graph_slot_mtp_seq_tokens > 0) {
-            // DSpark feed (embd) and full-block draft shapes share the already-reserved main buffers.
+        if (llama_model_is_inkling_draft(model)) {
+            // DSpark feed (embd) and full-block draft shapes share the reserved main buffers, plus float embd input margin.
+            const size_t embd_margin = (size_t) n_tokens * model.hparams.n_embd_inp_enc() * sizeof(float) + 65536;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                slot_buf_size[i] = std::max(slot_buf_size[i], ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
+                slot_buf_size[i] = std::max(slot_buf_size[i], pp_buf_size[i] + embd_margin);
+            }
+        } else if (graph_shared && (graph_prompt_kept || graph_slot_mtp_seq_tokens > 0)) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (ggml_backend_sched_buffer_is_shared(sched.get(), backend_ptrs[i]) || pp_buf_size[i] > 0) {
+                    slot_buf_size[i] = std::max(slot_buf_size[i], pp_buf_size[i]);
+                }
             }
         }
     }
