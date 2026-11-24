@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "row": "inkling-launch-budget",
+  "build": "d0627f4b6",
+  "profile": "tensor-4",
+  "steps": {
+    "baseline": 32,
+    "result": 32
+  },
+  "per_device": {
+    "baseline": [
+      628.0
+    ],
+    "result": [
+      389.0
+    ]
+  },
+  "baseline_per_step": 628.0,
+  "result_per_step": 389.0,
+  "ncu": {
+    "baseline_launches": 13792,
+    "result_launches": 4960,
+    "command": "nsys profile -t cuda -s none --cpuctxsw=none --cuda-graph-trace=node llama-batched-bench ... -npl 23 -npp 32 -ntg {8,40}; kernel instances (nsys stats cuda_gpu_kern_sum) of -ntg 40 minus -ntg 8 = 32 decode steps; ncu itself refused: ERR_NVGPUCTRPERM on the rented 5090"
+  },
+  "sources": {
+    "baseline": [
+      "/tmp/wsv/lb1/baseline-n8.json",
+      "/tmp/wsv/lb1/baseline-n40.json"
+    ],
+    "result": [
+      "/tmp/wsv/lb1/result-n8.json",
+      "/tmp/wsv/lb1/result-n40.json"
+    ]
+  },
+  "measured_at": "2026-11-24T14:54:38+00:00",
+  "provenance": {
+    "judged": "FAIL: ledger result 389.0 > baseline/2 (314.0); this file records the measurement, it does not close the row",
+    "box": "CloudRift buildbox, 1x RTX 5090 (sm_120), build dir /home/riftuser/build-ws-verify-120a, tree 94cbb8c8 (main d0627f4b6)",
+    "model": "synthetic inkling2 fixture: test-llama-archs -a inkling2 -s 1 -d 0.1 -o (3 layers, 2 experts, n_embd 512, all F32 weights, vocab 130); NOT Inkling 2 Small, not Q3_K_M, not 4 cards",
+    "workload": "llama-batched-bench -m inkling2-moe.gguf -ngl 99 -fa on -c 2048 -b 2048 -ub 2048 -kvu -ctk f16 -ctv f16 -ctks q8_0 -ctvs q8_0 -npp 32 -npl 23 --output-format jsonl -ntg 8 and -ntg 40; the snapshot pair differs by 32 decode steps of 23 rows",
+    "baseline_arm": "unfused reference per the WS-5 brief, not the row spec's \"today's tensor-4\": GGML_CUDA_DISABLE_FUSION=1 LLAMA_INKLING2_FUSE_LEGACY=1 LLAMA_INKLING2_CONV_LEGACY=1 LLAMA_INKLING2_MOE_MERGED_LEGACY=1 GGML_CUDA_MMQ_FEW_GROUP_LEGACY=1 GGML_CUDA_MMVQ_GROUP_LEGACY=1 GGML_CUDA_PQ2_MMA_GROUP_LEGACY=1 GGML_CUDA_TOPK_MOE_WIDE_LEGACY=1 GGML_CUDA_TOPK_SOFTCAP_FUSE_LEGACY=1 GGML_CUDA_ROUTE_MATVEC_TOPK_LEGACY=1 GGML_CUDA_MOE_WSUM_LEGACY=1 GGML_CUDA_GLU_LIMIT_FUSE_LEGACY=1 GGML_CUDA_ATTN_PREP_Q_LEGACY=1 GGML_CUDA_ATTN_PREP_KV_LEGACY=1 GGML_CUDA_ATTN_PREP_REL_LEGACY=1 GGML_CUDA_ATTN_PREP_KV_SET_ROWS_LEGACY=1 GGML_CUDA_ATTN_PREP_STATE_STORE_LEGACY=1 GGML_CUDA_ATTN_RES_MIX_LEGACY=1 GGML_CUDA_RMS_NORM_GATE_LEGACY=1 GGML_CUDA_NORM_FWHT_LEGACY=1 GGML_CUDA_SHORT_CONV_ADD_LEGACY=1 GGML_CUDA_MMVQ_FUSION_MULTICOL_LEGACY=1 GGML_CUDA_MMVQ_FUSION_SRC1_LEGACY=1 GGML_CUDA_MMVQ_MOE_QUANTIZE_LEGACY=1 GGML_CUDA_UNARY_MUL_VIEW_LEGACY=1",
+    "result_arm": "tensor-4 single-card env from scripts/inkling2/serve.py --dry-run: LLAMA_INKLING2_BUCKET_PREFILL_KV=1 GGML_CUDA_MMVQ_EXPERT_SORT_23=1 LLAMA_INKLING2_MEAN_MASK_DECODE=1 GGML_CUDA_FATTN_REL_QUERY_FIRST=1 LLAMA_INKLING2_COMPACT_GREEDY=1 LLAMA_INKLING2_KV_RUNS=1 GGML_CUDA_FATTN_REL_RUNS_SHARED=1 GGML_CUDA_FATTN_REL_PACKED_PREFILL=1 GGML_CUDA_F32_FEW=1 GGML_CUDA_MOE_FUSE=1 GGML_CUDA_MMQ_TMA=1 GGML_CUDA_INKLING2_L2_PERSIST=1 GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1 GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23",
+    "both_arms": "LLAMA_GRAPH_SLOTS=32 GGML_META_CAPTURE_GRAPHS=38 LLAMA_RS_FIXED_ROWS=1 LLAMA_GRAPH_ANY_SEQS=1 GGML_CUDA_GRAPH_NODES=262144 GGML_CUDA_GRAPH_IDLE_MS=600000 LLAMA_RS_STAGE_ROWS=2 LLAMA_KV_SEQ_CELLS=294912 LLAMA_TOK_EMBD_GPU=1",
+    "metric_note": "cuda.eval.nodes adds cgraph->n_nodes per evaluation (ggml-cuda.cu:11576), counted before CUDA-backend fusion and including view/reshape nodes, so backend fusions (MOE_FUSE, MMQ_FEW group, rms_norm fusions, F32_FEW) do not reduce it",
+    "kernels_per_step_nsys": {
+      "baseline": 431.0,
+      "result": 155.0,
+      "ratio": 0.36
+    },
+    "ledger_nodes_per_step": {
+      "baseline": 628.0,
+      "result": 389.0,
+      "ratio": 0.62
+    },
+    "snapshots_captured_at": "buildbox:/home/riftuser/lb-out/{baseline,result}-n{8,40}.json, copied locally for the build step"
+  }
+}
