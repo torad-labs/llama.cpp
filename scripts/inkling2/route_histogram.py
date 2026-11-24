@@ -8,7 +8,7 @@ stays fenced.
 
 What exists on disk (found 2026-11-22): five stores of `MMQ_ROUTE_*` lines written by
 the engine hook `GGML_CUDA_MMQ_ROUTE_LOG=N` during the 2026-11-18 tp4 four-card window
-(producer: ggml_cuda_mmq_route_log::record — site/eval/cols/used/tiles8/tiles/j only).
+(producer: ggml_cuda_mmq_route_log::record - site/eval/cols/used/tiles8/tiles/j only).
 Each record carries the launch's routed columns (`cols` = tokens x top_k slots) and how
 many DISTINCT experts hold at least one column (`used`). NO expert identities exist in
 any store, so the falsifier's exact top-1 share cannot be measured from these bytes;
@@ -16,9 +16,15 @@ what they measure for real is breadth concentration per layer vs the uniform
 expectation E[distinct] = n_experts * (1 - (1 - top_k/n_experts)^B), B = cols/top_k,
 exact under uniform within-token-distinct routing over independent tokens.
 
+Expert identities: a store written with GGML_CUDA_MMQ_ROUTE_HIST=1 beside the log also carries one
+MMQ_ROUTE_HIST line per (context, site) with the site's per-expert hit counts over the whole run. Then
+build fills per-layer hit counts, top-1/top-8 shares and HHI, and the verdict is branch (a) (a hot expert
+at or above 1.5x the uniform share exists in some layer) or (b) (none does).
+
 Modes:
-  build (default)   parse --stores, aggregate, write --out JSON artifact.
-  --check [PATH]    validate the artifact's internal consistency only (no stores):
+  build (default)   parse --stores, aggregate, write --out (alias --evidence) JSON artifact.
+  --check [PATH]    validate the artifact's internal consistency only (no stores); PATH, else
+                    --evidence / --out:
                     totals equal rows*slots*topk relations, phase shares sum to 1,
                     stored uniform expectations re-derive from model params, verdict
                     agrees with what it claims was measurable.
@@ -26,7 +32,7 @@ Modes:
 The five default stores live outside this repo on the local rig research tree; pass
 --stores explicitly when they move. Records repeat once per device context with
 identical values and once per weight product of the same routing; dedup keeps one
-launch event per (store, eval, layer) — first occurrence wins — and counts the rest as
+launch event per (store, eval, layer) - first occurrence wins - and counts the rest as
 product repeats.
 """
 import argparse
@@ -92,10 +98,13 @@ class StoreCounts(object):
         self.bad_cols = 0
         self.unknown_sites = 0
         self.end_notes = []          # MMQ_ROUTE_END lines: ring capacity ran/kept facts
+        self.hist_records = 0        # MMQ_ROUTE_HIST lines read
+        self.hists = []              # (ctx, layer or None, experts_total, launches, hits); not in as_dict
 
     def as_dict(self):
         d = dict(self.__dict__)
         d["end_notes"] = list(d["end_notes"])
+        del d["hists"]
         return d
 
 
@@ -104,11 +113,22 @@ def parse_store(path):
     Dedupe: first record per (eval, layer); later ones count as repeats only."""
     counts = StoreCounts()
     sites = {}      # site index -> layer (from MMQ_ROUTE_SITE lines of THIS file)
+    ctx_sites = {}  # (ctx, site) -> (layer, experts_total), for the histograms
+    raw_hists = []
     seen = set()    # packed (eval, layer)
     launches = []
     with open(path, "r", errors="replace") as fh:
         for line in fh:
             counts.lines += 1
+            if line.startswith("MMQ_ROUTE_HIST "):
+                try:
+                    j = json.loads(line[len("MMQ_ROUTE_HIST "):])
+                except ValueError:
+                    continue
+                counts.hist_records += 1
+                raw_hists.append((int(j.get("ctx", -1)), int(j["site"]), int(j.get("launches", 0)),
+                                  [int(v) for v in j["hits"]]))
+                continue
             if line.startswith("MMQ_ROUTE_SITE ") or line.startswith("MMQ_ROUTE_END"):
                 if line.startswith("MMQ_ROUTE_SITE "):
                     try:
@@ -116,6 +136,7 @@ def parse_store(path):
                     except ValueError:
                         continue
                     layer = parse_site_layer(str(j.get("name", "")))
+                    ctx_sites[(int(j.get("ctx", -1)), int(j["site"]))] = (layer, int(j.get("experts_total", 0)))
                     if layer is not None:
                         sites[int(j["site"])] = layer
                 else:
@@ -149,7 +170,60 @@ def parse_store(path):
                 continue
             counts.launches += 1
             launches.append((layer, phase_of(cols), cols, used))
+    for (ctx, site, n_launch, hits) in raw_hists:
+        layer, experts_total = ctx_sites.get((ctx, site), (None, 0))
+        counts.hists.append((ctx, layer, experts_total, n_launch, hits))
     return launches, counts
+
+
+def layer_hit_stats(hits, top_k):
+    """Shares per token from one layer's hit vector: an expert's share is the fraction of tokens routed to it."""
+    slots = sum(hits)
+    tokens = slots / float(top_k)
+    order = sorted(hits, reverse=True)
+    return {
+        "n_experts": len(hits),
+        "slot_draws": slots,
+        "tokens": round(tokens, 6),
+        "hits": list(hits),
+        "experts_hit": sum(1 for h in hits if h > 0),
+        "top1_share": round(order[0] / tokens, 9) if slots else None,
+        "top8_shares": [round(h / tokens, 9) for h in order[:8]] if slots else None,
+        "uniform_share": round(float(top_k) / len(hits), 9),
+        # the top-1 share uniform routing gives by chance at this sample size (normal tail of the hottest of n)
+        "uniform_noise_top1_share": round(top_k * (slots / float(len(hits)) + math.sqrt(slots / float(len(hits)) *
+                                          2.0 * math.log(len(hits)))) / slots, 9) if slots else None,
+        "hhi": round(sum((h / float(slots)) ** 2 for h in hits), 9) if slots else None,
+    }
+
+
+def merge_hists(hist_entries, counts_out):
+    """Per layer, one site a context (gate_up and down carry one routing), then contexts: a vector equal to
+    one already taken is a device copy of the same routing (tensor split), a different one adds."""
+    per_ctx = {}
+    for (store_i, ctx, layer, experts_total, _n, hits) in hist_entries:
+        if layer is None or not (0 <= layer < ROUTED_LAYERS):
+            counts_out["unknown_site"] += 1
+            continue
+        if experts_total:
+            counts_out["sliced_experts"] += 1   # local expert ids under the data split: no global map
+            continue
+        key = (store_i, ctx, layer)
+        if key in per_ctx:
+            counts_out["site_repeats"] += 1
+            continue
+        per_ctx[key] = hits
+    layers = {}
+    for (_store_i, _ctx, layer), hits in sorted(per_ctx.items()):
+        entry = layers.setdefault(layer, {"sum": None, "taken": []})
+        if any(hits == t for t in entry["taken"]):
+            counts_out["device_repeats"] += 1
+            continue
+        if entry["sum"] is not None and len(entry["sum"]) != len(hits):
+            raise SystemExit("layer %d: histograms of %d and %d experts" % (layer, len(entry["sum"]), len(hits)))
+        entry["taken"].append(hits)
+        entry["sum"] = list(hits) if entry["sum"] is None else [a + b for a, b in zip(entry["sum"], hits)]
+    return {layer: e["sum"] for layer, e in layers.items()}
 
 
 def stats(values):
@@ -197,13 +271,12 @@ def by_cols_table(by_cols_ratios):
     return table
 
 
-def build(stores, out_path):
+def build(stores, out_path, top_k=TOP_K):
     per_layer_launches = {}   # layer -> phase -> list of used
     cols_hist = {"decode": {}, "prefill": {}}
     all_used = {"decode": [], "prefill": []}      # pooled across layers (breadth rollup)
     by_cols_ratios = {}       # cols -> {phase: [used/E_uniform]} for the by-batch table
     store_meta = []
-    unknown_hits_stores = 0
 
     slot_draws_total = 0
     launches_total = 0
@@ -213,7 +286,7 @@ def build(stores, out_path):
     bad_cols_total = 0
     unknown_sites_total = 0
 
-    expert_hit_histograms_present = False  # a future richer record format would set this
+    hist_entries = []
 
     for path in stores:
         if not os.path.exists(path):
@@ -237,6 +310,8 @@ def build(stores, out_path):
                                    - counts.bad_cols)
         bad_cols_total += counts.bad_cols
         unknown_sites_total += counts.unknown_sites
+        for (ctx, layer, experts_total, n_launch, hits) in counts.hists:
+            hist_entries.append((len(store_meta) - 1, ctx, layer, experts_total, n_launch, hits))
 
         for (layer, phase, cols, used) in launches:
             per_layer_launches.setdefault(layer, {"decode": [], "prefill": []})[phase].append(
@@ -257,6 +332,14 @@ def build(stores, out_path):
             if e_uniform > 0:
                 out.append(used / e_uniform)
         return out
+
+    hist_counts = {"unknown_site": 0, "sliced_experts": 0, "site_repeats": 0, "device_repeats": 0}
+    layer_hits = merge_hists(hist_entries, hist_counts)
+    n_hist_experts = {len(h) for h in layer_hits.values()}
+    if len(n_hist_experts) > 1:
+        raise SystemExit("histograms disagree on the expert count: %s" % sorted(n_hist_experts))
+    n_experts = n_hist_experts.pop() if n_hist_experts else N_EXPERTS
+    hist_present = any(sum(h) > 0 for h in layer_hits.values())
 
     layers_out = []
     layer_share_sum = 0.0
@@ -289,11 +372,16 @@ def build(stores, out_path):
                 "per_expert_hit_counts": None,
                 "top_k_shares": None,
                 "hhi": None,
-                "absent_because": "stored MMQ_ROUTE records are per-launch aggregates "
+                "absent_because": ("MMQ_ROUTE_HIST histograms sum over every launch of a site, both "
+                                   "phases together: see expert_hits")
+                                  if hist_present else
+                                  "stored MMQ_ROUTE records are per-launch aggregates "
                                   "(cols/used); no expert identities exist on disk",
             }
             row[phase] = block
         row["all"] = {"records": total_here}
+        hits = layer_hits.get(layer)
+        row["expert_hits"] = layer_hit_stats(hits, top_k) if hits and sum(hits) else None
         layers_out.append(row)
 
     pooled = {}
@@ -317,19 +405,27 @@ def build(stores, out_path):
                 if all_used[phase] else None,
         }
 
-    artifact = {
-        "schema_version": 1,
-        "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "generator": "scripts/inkling2/route_histogram.py",
-        "provenance_note": "CPU-side aggregation over stored MMQ_ROUTE serving traces "
-                           "(GGML_CUDA_MMQ_ROUTE_LOG) recorded during the 2026-11-18 tp4 "
-                           "four-card Inkling-2-Small-Q3_K_M windows. No GPU window was run.",
-        "model": {"name": "Inkling-2-Small-Q3_K_M", "n_experts": N_EXPERTS,
-                  "top_k": TOP_K, "routed_layers": ROUTED_LAYERS},
-        "phase_boundary_cols": PHASE_BOUNDARY,
-        "uniform_mean_share_per_expert": round(float(TOP_K) / N_EXPERTS, 9),
-        "falsifier_threshold_x_uniform": 1.5,
-        "verdict": {
+    bar = round(1.5 * float(top_k) / n_experts, 9)
+    if hist_present:
+        top1 = max(r["expert_hits"]["top1_share"] for r in layers_out if r["expert_hits"])
+        hot_layers = [r["layer"] for r in layers_out if r["expert_hits"] and r["expert_hits"]["top1_share"] >= bar]
+        verdict = {
+            "measured_top1_share": top1,
+            "branch": "a" if hot_layers else "b",
+            "label": "hot_expert_present" if hot_layers else "near_uniform_no_hot_expert",
+            "hot_layers": hot_layers,
+            "replication_bar_top1_share": bar,
+            # a capture this small reaches the bar by chance: read branch (a) as unproven until it is larger
+            "sample_noise_reaches_bar": any(r["expert_hits"]["uniform_noise_top1_share"] >= bar
+                                            for r in layers_out if r["expert_hits"]),
+            "reason": ("the hottest expert of the hottest layer takes %.6f of that layer's tokens, against the bar "
+                       "of 1.5x the uniform share (%.6f): %s"
+                       % (top1, bar, "the GLM hot-expert replication may transfer; layers %s are hot" % hot_layers
+                          if hot_layers else "no hot leader exists, so GLM's hot-expert replication does not "
+                          "transfer and no engine work follows")),
+        }
+    else:
+        verdict = {
             # branch (a)/(b) need per-expert shares; disk stores cannot produce them
             "measured_top1_share": None,
             "branch": "c",
@@ -340,7 +436,21 @@ def build(stores, out_path):
                 "the uniform mean (0.03125) cannot be evaluated from bytes on disk. "
                 "Measured breadth evidence IS recorded here per layer and phase.",
             "decider_capture": DECIDER_CAPTURE,
-        },
+        }
+
+    artifact = {
+        "schema_version": 1,
+        "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "generator": "scripts/inkling2/route_histogram.py",
+        "provenance_note": "CPU-side aggregation over stored MMQ_ROUTE serving traces "
+                           "(GGML_CUDA_MMQ_ROUTE_LOG) recorded during the 2026-11-18 tp4 "
+                           "four-card Inkling-2-Small-Q3_K_M windows. No GPU window was run.",
+        "model": {"name": "Inkling-2-Small-Q3_K_M", "n_experts": n_experts,
+                  "top_k": top_k, "routed_layers": ROUTED_LAYERS},
+        "phase_boundary_cols": PHASE_BOUNDARY,
+        "uniform_mean_share_per_expert": round(float(top_k) / n_experts, 9),
+        "falsifier_threshold_x_uniform": 1.5,
+        "verdict": verdict,
         "totals": {
             "launches": launches_total,
             "slot_draws": slot_draws_total,          # sum over launches of cols (= tokens*top_k)
@@ -351,7 +461,9 @@ def build(stores, out_path):
             "device_repeats_or_other_nonfirst": device_repeat_total,
             "bad_cols_records": bad_cols_total,
             "unknown_site_records": unknown_sites_total,
-            "expert_hit_histograms_present": expert_hit_histograms_present or unknown_hits_stores > 0,
+            "expert_hit_histograms_present": hist_present,
+            "hist_records": sum(s.get("hist_records", 0) for s in store_meta),
+            "hist_dropped": hist_counts,
         },
         "stores": store_meta,
         "phase_launch_share": {
@@ -434,7 +546,7 @@ def check(path):
         problems.append("sum(per_layer records)=%d != totals.launches=%d"
                         % (layer_records, totals["launches"]))
     share_sum = sum(row["launch_share_of_all"] for row in d["per_layer"])
-    if abs(share_sum - 1.0) > 1e-6:
+    if totals["launches"] and abs(share_sum - 1.0) > 1e-6:
         problems.append("per-layer launch shares sum to %.9f, expected 1" % share_sum)
 
     # phase shares close to 1 (shares are a distribution over two phases)
@@ -471,17 +583,32 @@ def check(path):
 
     # verdict consistency with what the artifact claims measurable
     v = d["verdict"]
+    bar = round(1.5 * float(top_k) / n_experts, 9)
     if totals["expert_hit_histograms_present"]:
-        if v["measured_top1_share"] is None:
-            problems.append("hit histograms present but measured_top1_share is null")
+        top1s = []
+        for row in d["per_layer"]:
+            eh = row.get("expert_hits")
+            if not eh:
+                continue
+            again = layer_hit_stats(eh["hits"], top_k)
+            for k in ("slot_draws", "top1_share", "top8_shares", "hhi", "n_experts"):
+                if again[k] != eh[k]:
+                    problems.append("layer %d: expert_hits %s does not follow from its hits" % (row["layer"], k))
+            if eh["n_experts"] != n_experts:
+                problems.append("layer %d: %d experts, model says %d" % (row["layer"], eh["n_experts"], n_experts))
+            top1s.append(again["top1_share"])
+        if not top1s:
+            problems.append("hit histograms present but no layer carries expert_hits")
+        elif v["measured_top1_share"] != max(top1s):
+            problems.append("measured_top1_share %r is not the hottest layer's %r" % (v["measured_top1_share"], max(top1s)))
+        elif v["branch"] != ("a" if max(top1s) >= bar else "b"):
+            problems.append("verdict branch %r does not follow from top-1 share %r against bar %r"
+                            % (v["branch"], max(top1s), bar))
     else:
         if v["measured_top1_share"] is not None:
             problems.append("no hit histograms on disk but a top-1 share was claimed")
         if v["branch"] != "c":
             problems.append("without expert ids only branch c may fire, got %r" % v["branch"])
-    bar = round(1.5 * float(top_k) / n_experts, 9)
-    if v["measured_top1_share"] is not None and v["measured_top1_share"] >= bar:
-        problems.append("top-1 share above the replication bar but verdict still says transfer")
 
     for problem in problems:
         print("CHECK FAIL: " + problem, file=sys.stderr)
@@ -493,17 +620,19 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--stores", nargs="*", default=DEFAULT_STORES,
                    help="MMQ_ROUTE_* stores to aggregate (default: the five tp4 windows)")
-    p.add_argument("--out", default=DEFAULT_OUT, help="artifact path to write or check")
+    p.add_argument("--out", "--evidence", dest="out", default=DEFAULT_OUT,
+                   help="artifact path to write or check")
     p.add_argument("--check", nargs="?", default=False, const=True, metavar="PATH",
                    help="validate the artifact's internal consistency and exit; PATH "
-                        "defaults to --out when given bare as --check")
+                        "defaults to --evidence / --out when given bare as --check")
+    p.add_argument("--top-k", type=int, default=TOP_K, help="routed experts a token (Inkling 2 Small: 8)")
     args = p.parse_args()
 
     if args.check is True:
         sys.exit(check(args.out))
     if args.check:
         sys.exit(check(args.check))
-    artifact = build(args.stores, args.out)
+    artifact = build(args.stores, args.out, args.top_k)
     pooled = artifact["pooled_breadth"]
     dec = pooled["decode"]
     print(json.dumps({

@@ -26,6 +26,12 @@
 //          once for a group of rows
 //   far-q8_0, far-e4m3   the same on a q8_0 or f8_e4m3 global cache, the sliding layers' F16, against the mask path on
 //          the same caches (the tests set GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE)
+//   kvg-<path>-<type>   doc 18 section 3.2: each fast path on a q8_0, q4_0 or f8_e4m3 global cache, the sliding layers'
+//          F16, against the F16 cache on the same path, on the served attention of one card of four. The paths: mean
+//          (low-mean decode, served), group (query groups of drafted rows, drafted), short (the short-rows kernel,
+//          unified), runs (the decode by runs, query-first under GGML_CUDA_FATTN_REL_QUERY_FIRST, runs) and bucket
+//          (bucketed prefill graph reuse, bucket). On a device the attention kernel each path names must run on the
+//          quantized cache (ggml_cuda_fattn's debug note); q4_0 is held to its rounding bar as the kv-q4_0 cases are
 //
 // A q4_0 cache cannot meet the fixture's tolerance against F16: its rounding alone moves these logits by an NMSE of
 // 3.3e-3 (prompt) to 4.0e-3 (unified), as measured on Nov 17, 2026, where q8_0's moves them by 6.2e-6 to 1.3e-5, the
@@ -50,6 +56,8 @@
 //             steps of a token a sequence, one sequence cleared and read again alone, and more steps
 //   long      one sequence of 6,000 cells and three of 800 in one unified cache, then steps of 1 and 4 rows, and of
 //             a token and 2 drafts a sequence
+//   bucket    one sequence of 33,280 tokens in calls of 2,000 rows in a pool of 49,152 cells: the last calls read more
+//             than 32,768 cells, where bucketed prefill pads them to LLAMA_INKLING2_BUCKET_CELLS
 //
 // --inkling-window <device> is a check of another kind in this file for its helpers: sessions that share one cache give
 // each session the logits it has alone (test_inkling_window).
@@ -72,6 +80,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -94,6 +103,7 @@ struct feature {
     double vs_legacy = tolerance; // the bar against the legacy path
     double vs_host = 0.0;         // when set, the bar against the same path on the CPU, run on a device
     std::function<void(gguf_context *)> fixture = nullptr; // a change to the fixture model
+    std::vector<std::string> kernels = {}; // on a device, the CUDA attention kernels the optimized path must take
 };
 
 // an attention node by the types of the cache it reads
@@ -206,8 +216,60 @@ std::function<void(llama_context_params &, bool)> kv1b_types(ggml_type global) {
     };
 }
 
+// an attention node on a cache that is not F16, named by the fast path its shape asks for (the kvg features)
+std::function<std::string(const ggml_tensor *)> kvg_kind(const std::string & path) {
+    return [path](const ggml_tensor * t) -> std::string {
+        if (t->op != GGML_OP_FLASH_ATTN_EXT || t->src[1]->type == GGML_TYPE_F16) {
+            return "";
+        }
+        const int64_t rows = t->src[0]->ne[1], cells = t->src[1]->ne[1];
+        const int32_t live = ggml_flash_attn_ext_get_n_kv_max(t);
+        if (path == "mean") {
+            return ggml_flash_attn_ext_has_low_mean_mask(t) ? "low-mean decode" : "";
+        }
+        if (path == "group") {
+            return t->src[3] && t->src[3]->type == GGML_TYPE_I16 && live > 0 &&
+                ggml_flash_attn_ext_get_query_group(t) > 1 ? "drafted query groups" : "";
+        }
+        if (path == "short") {
+            return t->src[9] && rows <= 32 && (cells <= 256 || (live > 0 && live <= 32)) ? "short rows" : "";
+        }
+        if (path == "runs") {
+            return runs_kind(t);
+        }
+        return rows >= 256 && cells >= 32768 && cells % 8192 == 0 ? "bucketed prefill" : ""; // bucket
+    };
+}
+
+// the kvg features: the global cache in type against F16 on the same path, the sliding layers' F16, packed masks
+void add_kvg(std::map<std::string, feature> & all) {
+    const std::pair<const char *, ggml_type> types[] = {
+        {"q8_0", GGML_TYPE_Q8_0}, {"q4_0", GGML_TYPE_Q4_0}, {"e4m3", GGML_TYPE_F8_E4M3}};
+    const std::pair<const char *, const char *> paths[] = {
+        {"mean", "low-mean decode"}, {"group", "drafted query groups"}, {"short", "short rows"},
+        {"runs", "attention by runs"}, {"bucket", "bucketed prefill"}};
+    for (const auto & [tname, type] : types) {
+        for (const auto & [path, kind] : paths) {
+            const std::string p = path;
+            const ggml_type t = type;
+            feature f{nullptr, {kind}, kvg_kind(p), [p, t](llama_context_params & params, bool legacy) {
+                kv1b_types(t)(params, legacy);
+                params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+                if (p == "runs") {
+                    kv_runs_on(params, false);
+                }
+            }, t == GGML_TYPE_Q4_0 ? q4_0_rounding : tolerance, 0.0, served_heads};
+            if (p != "bucket") {
+                f.kernels = {std::string("kernel ") + (p == "short" ? "REL_SHORT" : "REL_DECODE") + " on K " +
+                    ggml_type_name(t)};
+            }
+            all[std::string("kvg-") + path + "-" + tname] = f;
+        }
+    }
+}
+
 const std::map<std::string, feature> & features() {
-    static const std::map<std::string, feature> all = {
+    static const std::map<std::string, feature> all = [] { std::map<std::string, feature> all = {
         {"rel", {"LLAMA_INKLING2_REL_POS_LEGACY", {"attention with the bias"}, [](const ggml_tensor * t) {
             return t->op == GGML_OP_FLASH_ATTN_EXT && t->src[6] && t->src[9] ? "attention with the bias" : "";
         }}},
@@ -262,12 +324,15 @@ const std::map<std::string, feature> & features() {
         {"kv-mixed-near", {nullptr, {"hot F16 mixed KV"}, kv_mixed_kind, kv_mixed_on("2048", false), tolerance, tolerance}},
         {"kv-mixed", {nullptr, {"hot F16 mixed KV"}, kv_mixed_kind, kv_mixed_on("1024", true), q4_0_rounding, q4_0_on_host, served_heads}},
     };
+    add_kvg(all);
+    return all; }();
     return all;
 }
 
 struct shape {
     uint32_t n_seq_max = 1;
     bool unified = true;
+    uint32_t n_ctx = 0; // cells, else 2048 a sequence
 };
 
 // the nodes a context ran, as the scheduler hands them to the eval callback
@@ -292,7 +357,7 @@ bool observe(ggml_tensor * t, bool ask, void * user_data) {
 
 llama_context_ptr make_context(llama_model * model, const shape & s, nodes_seen & seen, bool legacy) {
     llama_context_params params = llama_context_default_params();
-    params.n_ctx = 2048*s.n_seq_max;
+    params.n_ctx = s.n_ctx ? s.n_ctx : 2048*s.n_seq_max;
     params.n_batch = 2048;
     params.n_ubatch = 512;
     params.n_seq_max = s.n_seq_max;
@@ -503,6 +568,13 @@ std::map<std::string, std::pair<shape, path_case>> cases(size_t seed) {
             step({0, 1, 2, 3}, 3, 100 + 10*i);
         }
     }};
+    ret["bucket"] = {{1, true, 49152}, [=](llama_context * ctx, std::vector<float> & out) {
+        const auto prompt = span(tokens(33280, 80), 0, 0);
+        for (size_t i0 = 0; i0 < prompt.size(); i0 += 2000) {
+            const size_t n = std::min<size_t>(2000, prompt.size() - i0);
+            decode(ctx, {prompt.begin() + i0, prompt.begin() + i0 + n}, out, std::vector<size_t>{n - 1});
+        }
+    }};
     ret["unified"] = {{3, true}, together};
     ret["streams"] = {{3, false}, together};
     ret["churn"] = {{3, true}, [=](llama_context * ctx, std::vector<float> & out) {
@@ -550,10 +622,28 @@ int test_inkling_path(const std::string & path, size_t seed, ggml_backend_dev_t 
         auto ctx = make_context(model.get(), it->second.first, seen_legacy, true);
         it->second.second(ctx.get(), expected);
     }
+    // the CUDA backend notes the first launch of each attention kernel on each K type at debug level
+    struct kernel_log {
+        ggml_log_callback callback;
+        void * user_data;
+        std::mutex mutex;
+        std::vector<std::string> lines;
+    } klog;
+    llama_log_get(&klog.callback, &klog.user_data);
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        auto * kl = static_cast<kernel_log *>(user_data);
+        if (strstr(text, "ggml_cuda_fattn: kernel ")) {
+            std::lock_guard<std::mutex> lock(kl->mutex);
+            kl->lines.emplace_back(text);
+        } else if (level != GGML_LOG_LEVEL_DEBUG && kl->callback) {
+            kl->callback(level, text, kl->user_data);
+        }
+    }, &klog);
     {
         auto ctx = make_context(model.get(), it->second.first, seen_new, false);
         it->second.second(ctx.get(), actual);
     }
+    llama_log_set(klog.callback, klog.user_data);
     const bool against_host = f.vs_host > 0.0 && !on_host;
     if (against_host) {
         llama_model_ptr host_model = load(true);
@@ -578,9 +668,31 @@ int test_inkling_path(const std::string & path, size_t seed, ggml_backend_dev_t 
         }
     }
     fprintf(stderr, "inkling2 %s: %d of them off the device\n", path.c_str(), seen_new.off_device);
+    for (const auto & line : klog.lines) {
+        fprintf(stderr, "inkling2 %s: %s", path.c_str(), line.c_str());
+    }
+    if (!on_host) {
+        for (const auto & k : f.kernels) {
+            const bool took = std::any_of(klog.lines.begin(), klog.lines.end(),
+                    [&](const std::string & line) { return line.find(k) != std::string::npos; });
+            fprintf(stderr, "inkling2 %s: %s %s\n", path.c_str(), k.c_str(), took ? "ran" : "did NOT run");
+            ran = ran && took;
+        }
+    }
     const bool same = expected.size() == actual.size() && !expected.empty();
     const double d = same ? nmse(expected, actual) : INFINITY;
     fprintf(stderr, "inkling2 %s: %zu logits, NMSE %g (at most %g)\n", path.c_str(), expected.size(), d, f.vs_legacy);
+    if (same) {
+        // the token greedy decoding picks at each output row, against the path replaced
+        const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const size_t n_rows = expected.size()/n_vocab;
+        size_t agree = 0;
+        for (size_t r = 0; r < n_rows; ++r) {
+            const auto e0 = expected.begin() + r*n_vocab, a0 = actual.begin() + r*n_vocab;
+            agree += std::max_element(e0, e0 + n_vocab) - e0 == std::max_element(a0, a0 + n_vocab) - a0;
+        }
+        fprintf(stderr, "inkling2 %s: argmax agrees on %zu of %zu rows\n", path.c_str(), agree, n_rows);
+    }
     bool ok = ran && d <= f.vs_legacy;
     if (against_host) {
         const double dh = host.size() == actual.size() ? nmse(host, actual) : INFINITY;

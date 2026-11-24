@@ -167,5 +167,58 @@ class TestBuildAndCheck(unittest.TestCase):
             self.assertEqual(rh.check(bad), 1)
 
 
+class TestHitHistograms(unittest.TestCase):
+    def store(self, tmp, hits_by_layer, ctxs=(0, 1)):
+        lines = []
+        for ctx in ctxs:   # tensor split: each context sees every expert and the same routing
+            lines += [l.replace('"ctx":0', '"ctx":%d' % ctx) for l in site_lines(sorted(hits_by_layer))]
+            for i, layer in enumerate(sorted(hits_by_layer)):
+                for site in (2 * i, 2 * i + 1):   # gate_up and down carry one routing
+                    lines.append('MMQ_ROUTE_HIST {"ctx":%d,"device":0,"site":%d,"launches":5,"bins":384,"hits":%s}'
+                                 % (ctx, site, json.dumps(hits_by_layer[layer])))
+            lines.append('MMQ_ROUTE {"ctx":%d,"seq":0,"eval":1,"site":0,"cols":96,"used":60,"tiles8":60,"tiles":60,"j":8}' % ctx)
+        path = os.path.join(tmp, "routes.jsonl")
+        with open(path, "w") as fh:
+            fh.write("".join(l + "\n" for l in lines))
+        return path
+
+    def test_uniform_routing_is_branch_b(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.json")
+            a = rh.build([self.store(tmp, {0: [8] * 384, 1: [8] * 384})], out)
+            self.assertEqual(rh.check(out), 0)
+        self.assertTrue(a["totals"]["expert_hit_histograms_present"])
+        self.assertEqual(a["verdict"]["branch"], "b")
+        self.assertAlmostEqual(a["verdict"]["measured_top1_share"], 8 / 384.0 * 8 / 8.0 * 1.0, places=6)
+        self.assertEqual(a["totals"]["hist_dropped"]["site_repeats"], 4)   # down sites, two contexts
+        self.assertEqual(a["totals"]["hist_dropped"]["device_repeats"], 2)  # the second context's copies
+        self.assertEqual(a["per_layer"][0]["expert_hits"]["slot_draws"], 8 * 384)
+        self.assertTrue(a["verdict"]["sample_noise_reaches_bar"])   # 8 hits an expert: noise alone reaches 1.5x
+
+    def test_hot_expert_is_branch_a(self):
+        hot = [8] * 384
+        hot[17] = 400
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.json")
+            a = rh.build([self.store(tmp, {0: [8] * 384, 3: hot})], out)
+            self.assertEqual(rh.check(out), 0)
+            self.assertEqual(a["verdict"]["branch"], "a")
+            self.assertEqual(a["verdict"]["hot_layers"], [3])
+            d = json.load(open(out))
+            d["per_layer"][3]["expert_hits"]["hits"][17] = 8   # the hot leader erased, shares left as they were
+            with open(out, "w") as fh:
+                json.dump(d, fh)
+            self.assertEqual(rh.check(out), 1)
+
+    def test_evidence_flag_is_the_artifact_path(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.json")
+            rh.build([self.store(tmp, {0: [8] * 384})], out)
+            r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "route_histogram.py"),
+                                "--check", "--evidence", out], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

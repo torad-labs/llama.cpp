@@ -11,6 +11,8 @@
 #include "fattn-rel-rows.cuh"
 #include "ggml-attn-mask.h"
 
+#include <atomic>
+
 // ggml_flash_attn_ext_add_rel_pos: a bias of its own a Q head, which the kernels add as they load the mask
 static bool ggml_cuda_fattn_rel_pos(const ggml_tensor * dst) {
     return dst->op == GGML_OP_FLASH_ATTN_EXT && dst->src[6] != nullptr;
@@ -1391,9 +1393,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const auto * v = dst->src[2];
     const int n_live = ggml_flash_attn_ext_get_n_kv_max(dst);
     const bool sparse_rows = n_live > 0 && int64_t(n_live)*8 <= k->ne[1];
-    // The model picks the steps that are low-mean (LLAMA_INKLING2_DECODE_POOL_READS): 1 to 32 rows of F16 or Q8_0 K/V, and
-    // F8_E4M3 under GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE (the type test below), any of which may read the whole pool, and
-    // which read fewer cells together than the dense kernels would.
+    // The model picks the steps that are low-mean (LLAMA_INKLING2_DECODE_POOL_READS): 1 to 32 rows of F16, Q8_0 or F8_E4M3
+    // K/V (F8_E4M3 reads by element, or on the tile kernel under GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE), any of which may
+    // read the whole pool, and which read fewer cells together than the dense kernels would.
     const bool sparse_mean = ggml_flash_attn_ext_has_low_mean_mask(dst) && q->ne[2] == 6*k->ne[2];
     float softcap;
     memcpy(&softcap, dst->op_params + 2, sizeof(softcap));
@@ -1421,8 +1423,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (k->ne[1] >= 8192 || (fattn_rel_runs_hinted(dst) && k->ne[1] >= 256)) && k->ne[1] <= INT32_MAX && k->ne[1]%32 == 0 &&
             q->ne[3] == 1 && q->ne[1] <= 32*fattn_rel_decode_group(dst) && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
             q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == k->nb[0] &&
-            k->type == v->type && (k->type == GGML_TYPE_Q8_0 || fattn_rel_mma_type(k->type) ||
-                fattn_rel_elem_q4(k->type)) && softcap == 0.0f) {
+            k->type == v->type && (k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_F8_E4M3 ||
+                fattn_rel_mma_type(k->type) || fattn_rel_elem_q4(k->type)) && softcap == 0.0f) {
         return BEST_FATTN_KERNEL_REL_DECODE;
     }
     // Inkling 2 Mini's decode rows on a q4_0 or q8_0 cache: only their cells' reads and streams balanced to fill the
@@ -1508,9 +1510,34 @@ static size_t ggml_cuda_flash_attn_ext_device_alloc_size(int device, const ggml_
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// The first launch of each kernel on each K type, at debug level: the inkling-kvg tests read which kernel a cache type takes.
+static void ggml_cuda_fattn_note_kernel(const best_fattn_kernel kernel, const ggml_type type) {
+    static std::atomic<uint8_t> seen[GGML_TYPE_COUNT];
+    int bit;
+    const char * name;
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_TILE:        bit = 0; name = "TILE";        break;
+        case BEST_FATTN_KERNEL_VEC:         bit = 1; name = "VEC";         break;
+        case BEST_FATTN_KERNEL_MMA_F16:     bit = 2; name = "MMA_F16";     break;
+        case BEST_FATTN_KERNEL_REL_DECODE:  bit = 3; name = "REL_DECODE";  break;
+        case BEST_FATTN_KERNEL_REL_SHORT:   bit = 4; name = "REL_SHORT";   break;
+        case BEST_FATTN_KERNEL_REL_PREFILL: bit = 5; name = "REL_PREFILL"; break;
+        case BEST_FATTN_KERNEL_REL_ROWS:    bit = 6; name = "REL_ROWS";    break;
+        default: return;
+    }
+    const uint8_t mask = uint8_t(1u << bit);
+    if ((int) type < 0 || (int) type >= GGML_TYPE_COUNT || (seen[type].load(std::memory_order_relaxed) & mask) ||
+            (seen[type].fetch_or(mask, std::memory_order_relaxed) & mask)) {
+        return;
+    }
+    GGML_LOG_DEBUG("ggml_cuda_fattn: kernel %s on K %s\n", name, ggml_type_name(type));
+}
+
 static void ggml_cuda_flash_attn_ext_device(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    ggml_cuda_fattn_note_kernel(kernel, dst->src[1]->type);
+    switch (kernel) {
         case BEST_FATTN_KERNEL_REL_PREFILL:
             ggml_cuda_flash_attn_ext_rel_prefill(ctx, dst);
             break;
