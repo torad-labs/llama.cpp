@@ -1,6 +1,5 @@
 import math
 import pytest
-from concurrent.futures import ThreadPoolExecutor
 from utils import *
 import inkling_fixture as fx
 
@@ -68,7 +67,7 @@ def test_with_and_without_draft():
     assert res.body["tokens"] == tokens_no_draft
 
 
-def test_draft_respects_batch_capacity():
+def test_draft_respects_batch_capacity(tmp_path):
     global server
     server.model_hf_repo = None
     server.model_hf_file = None
@@ -87,36 +86,49 @@ def test_draft_respects_batch_capacity():
     # upstream v1.0.0, 1 after). The host's flash attention computes every column the same way
     server.fa = "on"
 
-    def complete(slot):
-        result = server.make_request("POST", "/completion", data={
-            "prompt": ["Once upon a time", "A little girl found a"][slot],
-            "id_slot": slot,
-            "temperature": 0.0,
-            "n_predict": 96,
-            "ignore_eos": True,
-            "cache_prompt": False,
-            "return_tokens": True,
-            "n_probs": 2,
-        })
-        assert result.status_code == 200
-        return result.body
+    prompts = ["Once upon a time", "A little girl found a"]
+    base_req = {
+        "temperature": 0.0,
+        "n_predict": 96,
+        "ignore_eos": True,
+        "cache_prompt": False,
+        "return_tokens": True,
+        "n_probs": 2,
+    }
 
     draft_model = server.model_draft
     server.model_draft = None
     server.spec_type = None
     server.start()
-    plain = [complete(slot) for slot in range(2)]
+    plain = []
+    for slot, prompt in enumerate(prompts):
+        result = server.make_request("POST", "/completion", data={**base_req, "prompt": prompt, "id_slot": slot})
+        assert result.status_code == 200
+        plain.append(result.body)
     server.stop()
 
+    log_path = tmp_path / "drafted.log"
     server.model_draft = draft_model
     server.spec_type = "draft-simple"
+    server.debug = True
+    server.log_path = str(log_path)
     server.start()
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        drafted = list(pool.map(complete, range(2)))
-    for expected, actual in zip(plain, drafted):
+    # One multi-prompt request enqueues both slots together so continuous batching shares n_batch=32 across them.
+    result = server.make_request("POST", "/completion", data={**base_req, "prompt": prompts})
+    assert result.status_code == 200
+    drafted = result.body
+    server.stop()
+
+    assert len(drafted) == len(prompts)
+    log_text = log_path.read_text(errors="replace")
+    shared_cap = server.n_batch // server.n_slots - 1
+    for slot, (expected, actual) in enumerate(zip(plain, drafted)):
         assert actual["timings"]["draft_n"] > 0
         assert actual["tokens"] == expected["tokens"]
         assert len(actual["completion_probabilities"]) == len(actual["tokens"])
+        assert re.search(rf"id\s+{slot}\s+\|.*max possible draft:\s+{shared_cap}\b", log_text), (
+            f"slot {slot} did not hit shared draft cap {shared_cap}"
+        )
 
 
 def test_draft_acceptance_floor():

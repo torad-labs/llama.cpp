@@ -775,10 +775,9 @@ static __global__ void quantize_mmq_few_id_q8_1(
         const int ne11, const int n_experts, const int n_expert_used, const int64_t si1, const int npairs_max, int * npairs_out) {
     // per expert: bit t set if token t uses it (or entry count if a token repeats an expert) and first pair; then total pairs
     extern __shared__ unsigned int data_mmq_few_id[];
-    unsigned int * tokens  = data_mmq_few_id;
-    int          * pair0   = (int *) (tokens + n_experts);
-    int          & npairs  = pair0[n_experts];
-    int          & has_dup = pair0[n_experts + 1];
+    unsigned int * tokens = data_mmq_few_id;
+    int          * pair0  = (int *) (tokens + n_experts);
+    int          & npairs = pair0[n_experts];
 
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
@@ -791,24 +790,21 @@ static __global__ void quantize_mmq_few_id_q8_1(
         return e >= 0 && e < n_experts ? e : -1; // other ids skip the slot
     };
 
-    if (threadIdx.x == 0) {
-        has_dup = 0;
-    }
     for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
         tokens[e] = 0;
     }
     __syncthreads();
+    int local_dup = 0;
     for (int i = threadIdx.x; i < nentries; i += blockDim.x) {
         const int e = expert_of(i);
         if (e >= 0) {
             const unsigned int bit = 1u << (i / n_expert_used);
             if (atomicOr(&tokens[e], bit) & bit) {
-                has_dup = 1;
+                local_dup = 1;
             }
         }
     }
-    __syncthreads();
-    const bool dup = has_dup != 0;
+    const bool dup = __syncthreads_or(local_dup) != 0;
     if (dup) {
         for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
             tokens[e] = 0;
@@ -926,9 +922,8 @@ static __global__ void quantize_mmq_few_id_bcast_q8_1(
     int          * pair0       = (int *) (tokens + n_experts);
     int          & npairs      = pair0[n_experts];
     int          & n_active    = pair0[n_experts + 1];
-    int          & has_dup     = pair0[n_experts + 2];
-    unsigned int & active_mask = ((unsigned int *) pair0)[n_experts + 3];
-    uint8_t      * active_list = (uint8_t *) (pair0 + n_experts + 4);
+    unsigned int & active_mask = ((unsigned int *) pair0)[n_experts + 2];
+    uint8_t      * active_list = (uint8_t *) (pair0 + n_experts + 3);
 
     ggml_cuda_pdl_lc();
     const float   * GGML_CUDA_RESTRICT x     = x_ptr;
@@ -946,13 +941,13 @@ static __global__ void quantize_mmq_few_id_bcast_q8_1(
     };
 
     if (threadIdx.x == 0) {
-        has_dup     = 0;
         active_mask = 0;
     }
     for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
         tokens[e] = 0;
     }
     __syncthreads();
+    int local_dup = 0;
     unsigned int local_mask = 0;
     for (int i = threadIdx.x; i < nentries; i += blockDim.x) {
         const int e = expert_of(i);
@@ -960,15 +955,14 @@ static __global__ void quantize_mmq_few_id_bcast_q8_1(
             const unsigned int bit = 1u << (i / n_expert_used);
             local_mask |= bit;
             if (atomicOr(&tokens[e], bit) & bit) {
-                has_dup = 1;
+                local_dup = 1;
             }
         }
     }
     if (local_mask != 0) {
         atomicOr(&active_mask, local_mask);
     }
-    __syncthreads();
-    const bool dup = has_dup != 0;
+    const bool dup = __syncthreads_or(local_dup) != 0;
     if (dup) {
         for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
             tokens[e] = 0;
@@ -1141,7 +1135,7 @@ void quantize_mmq_few_id_q8_1_cuda(
 
     static const bool quant_legacy = ggml_env_switch("GGML_CUDA_MMQ_FEW_ID_QUANT_LEGACY");
     const size_t smpb         = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
-    const size_t nbytes_bcast = (size_t) n_tokens*288 + (size_t) (2*n_experts + 12)*sizeof(int);
+    const size_t nbytes_bcast = (size_t) n_tokens*288 + (size_t) (2*n_experts + 11)*sizeof(int);
     if (ne11 == 1 && !quant_legacy && n_tokens > 0 && ne00 > 0 && n_expert_used > 0 && nbytes_bcast <= smpb) {
         const int64_t nunits = ne00 / QK_K;
         const dim3 num_blocks(1, nunits, 1);
@@ -1163,7 +1157,7 @@ void quantize_mmq_few_id_q8_1_cuda(
     }
 
     const int64_t block_num_y   = (ne00 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
-    const size_t  nbytes_shared = (2*n_experts + 2)*sizeof(int);
+    const size_t  nbytes_shared = (2*n_experts + 1)*sizeof(int);
     GGML_ASSERT(nbytes_shared <= smpb);
     const dim3 num_blocks(n_tokens*n_expert_used, block_num_y, 1);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);

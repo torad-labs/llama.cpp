@@ -1278,7 +1278,7 @@ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * 
         }
     }
     // MUL_MAT_ID: the pairs are built in shared memory
-    if (ids && (2*src0->ne[2] + 2)*sizeof(int) > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
+    if (ids && (2*src0->ne[2] + 1)*sizeof(int) > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
         return false;
     }
     // the row must hold a whole number of ring stages of the launched kernel
