@@ -26,8 +26,10 @@ TENSOR4_ENV = {**ENV, "LLAMA_KV_SEQ_CELLS": "294912", "LLAMA_SLOT_PREFIX_COPY": 
                "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE": "1",
                "GGML_CUDA_FATTN_REL_PACKED_PREFILL": "1", "GGML_CUDA_F32_FEW": "1", "GGML_CUDA_MOE_FUSE": "1",
                "GGML_CUDA_MMQ_TMA": "1", "GGML_CUDA_INKLING2_L2_PERSIST": "1",
+               "GGML_CUDA_L2_EXPERT_WARM": "1", "LLAMA_INKLING2_ROUTER_BAKE": "1", "GGML_CUDA_MOE_ROUTE_GATE": "1",
                "GGML_CUDA_AR_COPY_ENGINE_CAPTURE": "1",
-               "LLAMA_GRAPH_SLOTS": "32", "GGML_META_CAPTURE_GRAPHS": "38",
+               "LLAMA_GRAPH_SLOTS": "32", "GGML_META_CAPTURE_GRAPHS": "46",
+               "LLAMA_GRAPH_PROMPT_KEPT": "1", "LLAMA_PROMPT_SHAPES": "1",
                "LLAMA_RS_FIXED_ROWS": "1", "LLAMA_GRAPH_ANY_SEQS": "1",
                "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000",
                "LLAMA_RS_STAGE_ROWS": "2", "LLAMA_CHECKPOINT_RAM_MIB": "16384"}
@@ -60,14 +62,16 @@ class ProfilePlanTest(unittest.TestCase):
             self.assertNotIn("--spec-type", plain)
             draft.touch()
             self.assertEqual(plain, plan("--packs", root)[0])
-            auto, _ = plan("--packs", root, "--draft")
+            auto, auto_env = plan("--packs", root, "--draft")
             for flag, value in {
                 "--spec-type": "draft-dspark", "--spec-draft-model": str(draft),
                 "--spec-draft-n-max": "3", "--spec-draft-sampling": "probabilistic",
                 "--spec-draft-device": "CUDA3", "--spec-draft-type-k": "q8_0",
-                "--cache-type-k": "q8_0", "--cache-type-k-swa": "q8_0", "-c": "3014656", "-ub": "256",
+                "--cache-type-k": "q8_0", "--cache-type-k-swa": "q8_0", "-c": "1572864", "-ub": "256",
             }.items():
                 self.assertEqual(auto[auto.index(flag) + 1], value)
+            self.assertEqual(auto_env["LLAMA_DSPARK_TRIM_BLOCK"], "1")
+            self.assertNotIn("LLAMA_DSPARK_TRIM_BLOCK", plan("--packs", root, "--draft", "--no-dspark-trim-block")[1])
             greedy, _ = plan("--packs", root, "--draft", "--draft-sampling", "greedy")
             self.assertEqual(greedy[greedy.index("--spec-draft-sampling") + 1], "greedy")
             override, _ = plan("--packs", root, "--draft", "--ubatch-size", "512")
@@ -106,6 +110,7 @@ class ProfilePlanTest(unittest.TestCase):
                           "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE",
                           "GGML_CUDA_FATTN_REL_PACKED_PREFILL", "GGML_CUDA_F32_FEW", "GGML_CUDA_MOE_FUSE",
                           "GGML_CUDA_MMQ_TMA", "GGML_CUDA_INKLING2_L2_PERSIST",
+                          "GGML_CUDA_L2_EXPERT_WARM", "GGML_CUDA_MOE_ROUTE_GATE",
                           "GGML_CUDA_GRAPH_NODES", "GGML_CUDA_GRAPH_IDLE_MS"})
         _, q8 = plan(*profile, "--reduction-wire", "q8")
         self.assertEqual(q8["GGML_CUDA_AR_WIRE_Q8"], "1")
@@ -118,7 +123,8 @@ class ProfilePlanTest(unittest.TestCase):
         argv, env = plan("--profile", "tensor-4", "--no-host-owner-rows", "--no-prefix-copy", "--no-mean-mask-decode", "--no-bucket-prefill-kv", "--no-stable-prefill", "--no-sort-expert-rows",
                          "--no-query-first-decode", "--no-compact-greedy",
                          "--no-kv-runs", "--no-packed-prefill", "--no-f32-few", "--no-moe-fuse", "--no-mmq-tma",
-                         "--no-l2-persist", "--no-ar-copy-capture",
+                         "--no-l2-persist", "--no-l2-expert-warm", "--no-router-bake", "--no-moe-route-gate", "--no-ar-copy-capture",
+                         "--no-keep-prompt-graphs", "--prompt-shapes", "0",
                          "--swa-kv-cache", "f16",
                          "--keep-graphs", "0", "--checkpoint-rows", "0", "--checkpoint-ram", "0",
                          "--cache-ram", "0", "--context", "1048576", "--slots", "8", "--slot-context", "131072",
@@ -228,7 +234,10 @@ class OptionTest(unittest.TestCase):
         env = plan("--keep-graphs", "32")[1]
         self.assertEqual(env, plan("--kept-graphs", "32")[1])
         self.assertEqual(env["LLAMA_GRAPH_SLOTS"], "32")
-        self.assertEqual(env["GGML_META_CAPTURE_GRAPHS"], "38")
+        self.assertEqual(env["GGML_META_CAPTURE_GRAPHS"], "46")
+        self.assertEqual(env["LLAMA_GRAPH_PROMPT_KEPT"], "1")
+        self.assertEqual(plan("--keep-graphs", "32", "--no-keep-prompt-graphs")[1]["GGML_META_CAPTURE_GRAPHS"], "38")
+        self.assertNotIn("LLAMA_GRAPH_PROMPT_KEPT", plan("--keep-graphs", "32", "--no-keep-prompt-graphs")[1])
         self.assertEqual(env["GGML_CUDA_GRAPH_NODES"], "262144")
         self.assertEqual(env["GGML_CUDA_GRAPH_IDLE_MS"], "600000")
         self.assertEqual(env["LLAMA_RS_FIXED_ROWS"], "1")
@@ -244,7 +253,7 @@ class OptionTest(unittest.TestCase):
         self.assertEqual(env["LLAMA_PROMPT_SHAPE_SMALL"], "8")
         self.assertEqual(env["LLAMA_PROMPT_SHAPE_ROWS"], "256")
         with self.assertRaises(ValueError):
-            plan("--prompt-shape-rows", "256")
+            plan("--prompt-shapes", "0", "--prompt-shape-rows", "256")
         self.assertEqual(plan("--kv-cache", "q8_0")[1]["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"], "1")
         self.assertEqual(plan("--kv-cache", "q4_0")[1]["GGML_CUDA_FATTN_REL_DECODE_Q4"], "1")
 

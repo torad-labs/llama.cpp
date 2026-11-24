@@ -3773,16 +3773,29 @@ static cudaAccessPolicyWindow ggml_cuda_l2_persist_window(ggml_backend_cuda_cont
     while (root->view_src) { root = root->view_src; }
     const auto arena = ggml_recurrent_arena_of(root);
     const auto arena_window = ggml_recurrent_arena_window_of(state, dev.l2_window_bytes);
-    char * const base = arena.magic ? (char *) arena_window.base : (char *) ggml_backend_buffer_get_base(buf);
+    char * const buf_base = (char *) ggml_backend_buffer_get_base(buf);
+    const size_t buf_size = ggml_backend_buffer_get_size(buf);
+    char * base = arena.magic ? (char *) arena_window.base : buf_base;
     // Only the current plane persists. Prefix snapshots keep their ordinary
     // cache policy; a rollback reads them correctly and writes current state.
-    const size_t bytes = arena.magic ? arena_window.bytes :
-                                      std::min(ggml_backend_buffer_get_size(buf), dev.l2_window_bytes);
-    const size_t active_bytes = arena.magic ? arena_window.active_bytes : bytes;
+    size_t bytes = arena.magic ? arena_window.bytes : std::min(buf_size, dev.l2_window_bytes);
+    size_t active_bytes = arena.magic ? arena_window.active_bytes : bytes;
+    if (!arena.magic && buf_size > dev.l2_window_bytes && (const char *) state->data >= buf_base) {
+        // Window this layer's recurrent tensor individually when the combined state buffer exceeds l2_window_bytes.
+        const uintptr_t p0 = (uintptr_t) state->data & ~(uintptr_t) 255;
+        const uintptr_t p1 = std::min<uintptr_t>(
+                ((uintptr_t) state->data + ggml_nbytes(state) + 255) & ~(uintptr_t) 255,
+                (uintptr_t) buf_base + buf_size);
+        if (p1 > p0 && p1 - p0 <= dev.l2_window_bytes) {
+            base         = (char *) p0;
+            bytes        = p1 - p0;
+            active_bytes = buf_size;
+        }
+    }
     if (bytes == 0 || bytes > dev.l2_window_bytes || (!arena.magic &&
         ((const char *) state->data < base || (const char *) state->data + ggml_nbytes(state) > base + bytes))) {
         return none("a layer's recurrent states lie past the largest window, " + std::to_string(dev.l2_window_bytes / 1024) +
-                    " KiB from the base of their " + std::to_string(ggml_backend_buffer_get_size(buf) / 1024) + " KiB buffer");
+                    " KiB from the base of their " + std::to_string(buf_size / 1024) + " KiB buffer");
     }
 
     std::atomic<size_t> & set_aside = ggml_cuda_l2_set_aside[ctx.device];

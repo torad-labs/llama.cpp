@@ -52,8 +52,8 @@
     {
       "id": "cuda-graph-concurrent-fork-join",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 11229,
-      "line_end": 11409,
+      "line": 11242,
+      "line_end": 11422,
       "symbol": "ggml_cuda_graph_evaluate_and_capture",
       "api": "ggml_cuda_arrival_signal / ggml_cuda_arrival_wait",
       "anchor": "SLOT_FORK",
@@ -65,8 +65,8 @@
     {
       "id": "cuda-l2-issuer-fork-join",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 4180,
-      "line_end": 4228,
+      "line": 4193,
+      "line_end": 4241,
       "symbol": "ggml_cuda_l2_side_fork / ggml_cuda_l2_issue_join",
       "api": "ggml_cuda_arrival_signal / ggml_cuda_arrival_wait",
       "anchor": "SLOT_L2_FORK",
@@ -90,7 +90,7 @@
     {
       "id": "context-synchronize-outputs",
       "file": "src/llama-context.cpp",
-      "line": 1627,
+      "line": 1649,
       "symbol": "llama_context::synchronize / llama_context::synchronize_outputs",
       "api": "ggml_backend_sched_synchronize",
       "anchor": "ggml_backend_sched_synchronize(sched.get())",
@@ -102,7 +102,7 @@
     {
       "id": "cuda-backend-synchronize-impl",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 5816,
+      "line": 5829,
       "symbol": "ggml_backend_cuda_synchronize",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(cuda_ctx->stream())",
@@ -114,7 +114,7 @@
     {
       "id": "cuda-device-event-synchronize-impl",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 13506,
+      "line": 13519,
       "symbol": "ggml_backend_cuda_device_event_synchronize",
       "api": "cudaEventSynchronize",
       "anchor": "cudaEventSynchronize((cudaEvent_t)event->context)",
@@ -225,8 +225,8 @@
     {
       "id": "context-nextn-host-rows",
       "file": "src/llama-context.cpp",
-      "line": 2570,
-      "line_end": 2587,
+      "line": 2592,
+      "line_end": 2609,
       "symbol": "llama_context::get_h_nextn_rows / set_h_nextn_rows",
       "api": "ggml_backend_event_synchronize",
       "anchor": "ggml_backend_event_synchronize(ev_h_nextn_written.get())",
@@ -344,7 +344,7 @@
     {
       "id": "cuda-dp-expert-stats-free",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 4849,
+      "line": 4862,
       "symbol": "ggml_cuda_dp_expert_stats_free",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(ctx.stream())",
@@ -355,8 +355,8 @@
     {
       "id": "cuda-mul-mat-id-host-fallback",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 5121,
-      "line_end": 5143,
+      "line": 5134,
+      "line_end": 5156,
       "symbol": "ggml_cuda_mul_mat_id",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(stream)",
@@ -412,7 +412,7 @@
     {
       "id": "context-pipeline-parallel-guard",
       "file": "src/llama-context.cpp",
-      "line": 2936,
+      "line": 2958,
       "symbol": "llama_context::process_ubatch",
       "api": "ggml_backend_sched_synchronize",
       "anchor": "ggml_backend_sched_synchronize(sched_gf)",
@@ -423,8 +423,8 @@
     {
       "id": "context-graph-slot-evict-fallback",
       "file": "src/llama-context.cpp",
-      "line": 3074,
-      "line_end": 3161,
+      "line": 3096,
+      "line_end": 3183,
       "symbol": "llama_context::process_ubatch",
       "api": "ggml_backend_synchronize",
       "anchor": "ggml_backend_synchronize(backend)",
@@ -435,8 +435,8 @@
     {
       "id": "context-draft-inject-handoff",
       "file": "src/llama-context.cpp",
-      "line": 3784,
-      "line_end": 3801,
+      "line": 3806,
+      "line_end": 3823,
       "symbol": "llama_context::decode",
       "api": "ggml_backend_event_synchronize",
       "anchor": "ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get())",
@@ -447,7 +447,7 @@
     {
       "id": "context-nextn-copy-no-event-fallback",
       "file": "src/llama-context.cpp",
-      "line": 4980,
+      "line": 5002,
       "symbol": "llama_context::nextn_keep_rows",
       "api": "ggml_backend_synchronize",
       "anchor": "ggml_backend_synchronize(copy_backend)",
@@ -458,7 +458,7 @@
     {
       "id": "context-moe-ids-prefetch-callback",
       "file": "src/llama-context.cpp",
-      "line": 5156,
+      "line": 5178,
       "symbol": "llama_context::moe_prefetch_cb",
       "api": "ggml_backend_synchronize",
       "anchor": "ggml_backend_synchronize(backend)",
