@@ -76,7 +76,8 @@ def test_draft_respects_batch_capacity():
     server.n_slots = 2
     server.n_ctx = 2048
     server.n_batch = 32
-    server.n_ubatch = 32
+    # Keep ubatch within CUDA MMVQ_MAX_BATCH_SIZE (8) so batched verification and plain 1-token decoding use the same matmul kernel; n_batch=32 still trims the 48-token draft across both slots.
+    server.n_ubatch = 8
     server.spec_draft_n_min = 1
     server.spec_draft_n_max = 48
     server.server_continuous_batching = True
