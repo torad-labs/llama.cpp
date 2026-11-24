@@ -706,13 +706,13 @@ static __device__ __forceinline__ void quantize_mmq_few_sub(const float4 xi, int
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
     amax = warp_reduce_max<8>(amax);
 
-    const float d_inv = 127.0f / amax;
+    const float d_inv = amax == 0.0f ? 0.0f : 127.0f / amax;
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
-    d = 1.0f / d_inv;
+    d = amax == 0.0f ? 0.0f : 1.0f / d_inv;
 
     // as in quantize_mmq_q8_1: the sum of the quantized values; the int warp_reduce_sum reduces the whole warp on Ampere+
     sum = 0.0f;
@@ -773,7 +773,7 @@ template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_few_id_q8_1(
         const float * x_ptr, const int32_t * ids, void * vy_ptr, int * pairs, const int64_t ne00, const int64_t s11, const int64_t s12,
         const int ne11, const int n_experts, const int n_expert_used, const int64_t si1, const int npairs_max, int * npairs_out) {
-    // per expert: bit t set if token t uses it and the index of its first pair; then the total number of pairs
+    // per expert: bit t set if token t uses it (or entry count if a token repeats an expert) and first pair; then total pairs
     extern __shared__ unsigned int data_mmq_few_id[];
     unsigned int * tokens = data_mmq_few_id;
     int          * pair0  = (int *) (tokens + n_experts);
@@ -794,25 +794,45 @@ static __global__ void quantize_mmq_few_id_q8_1(
         tokens[e] = 0;
     }
     __syncthreads();
+    int local_dup = 0;
     for (int i = threadIdx.x; i < nentries; i += blockDim.x) {
         const int e = expert_of(i);
         if (e >= 0) {
-            atomicOr(&tokens[e], 1u << (i / n_expert_used));
+            const unsigned int bit = 1u << (i / n_expert_used);
+            if (atomicOr(&tokens[e], bit) & bit) {
+                local_dup = 1;
+            }
         }
     }
-    __syncthreads();
+    const bool dup = __syncthreads_or(local_dup) != 0;
+    if (dup) {
+        for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+            tokens[e] = 0;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < nentries; i += blockDim.x) {
+            const int e = expert_of(i);
+            if (e >= 0) {
+                atomicAdd(&tokens[e], 1u);
+            }
+        }
+        __syncthreads();
+    }
+    auto count_of = [&](const int e) {
+        return dup ? (int) tokens[e] : __popc(tokens[e]);
+    };
     if (threadIdx.x < WARP_SIZE) {
         const int per_lane = (n_experts + WARP_SIZE - 1) / WARP_SIZE;
         const int e0       = min(int(threadIdx.x)*per_lane, n_experts);
         const int e1       = min(e0 + per_lane, n_experts);
         int n = 0;
         for (int e = e0; e < e1; ++e) {
-            n += (__popc(tokens[e]) + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS;
+            n += (count_of(e) + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS;
         }
         int p = warp_prefix_inclusive_sum<int>(n) - n;
         for (int e = e0; e < e1; ++e) {
             pair0[e] = p;
-            p += (__popc(tokens[e]) + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS;
+            p += (count_of(e) + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS;
         }
         if (threadIdx.x == WARP_SIZE - 1) {
             npairs = p;
@@ -821,7 +841,16 @@ static __global__ void quantize_mmq_few_id_q8_1(
     __syncthreads();
 
     auto rank = [&](const int i, const int e) {
-        return __popc(tokens[e] & ((1u << (i / n_expert_used)) - 1u));
+        if (!dup) {
+            return __popc(tokens[e] & ((1u << (i / n_expert_used)) - 1u));
+        }
+        int r = 0;
+        for (int j = 0; j < i; ++j) {
+            if (expert_of(j) == e) {
+                ++r;
+            }
+        }
+        return r;
     };
 
     if (blockIdx.x == 0 && blockIdx.y == 0) {
@@ -835,7 +864,7 @@ static __global__ void quantize_mmq_few_id_q8_1(
             pair[2 + r % MMQ_FEW_NCOLS] = i;
             if (r % MMQ_FEW_NCOLS == 0) {
                 pair[0] = e;
-                pair[1] = min(__popc(tokens[e]) - r, MMQ_FEW_NCOLS);
+                pair[1] = min(count_of(e) - r, MMQ_FEW_NCOLS);
             }
         }
         for (int p = npairs + threadIdx.x; p < npairs_max; p += blockDim.x) {
@@ -858,6 +887,21 @@ static __global__ void quantize_mmq_few_id_q8_1(
     const int r = rank(blockIdx.x, e);
     int4 * yg = vy + (int64_t(pair0[e] + r/MMQ_FEW_NCOLS)*(ne00/QK_K) + i0/QK_K)*MMQ_FEW_Q8_1_INT4;
     quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, r % MMQ_FEW_NCOLS);
+
+    const int c   = count_of(e);
+    const int rem = c % MMQ_FEW_NCOLS;
+    if (r == c - 1 && rem != 0) {
+        const int iu = i0 % QK_K;
+        const int s  = iu / QK8_1;
+        const int k  = iu % QK8_1;
+        for (int g = rem; g < MMQ_FEW_NCOLS; ++g) {
+            ((int *) (yg + (s/2)*WARP_SIZE + 4*g + (k % 16)/4))[2*(s % 2) + k/16] = 0;
+            if (k == 0) {
+                int4 * ds = yg + 4*WARP_SIZE + 4*(g/2) + s/2;
+                ((int *) ds)[2*(s % 2) + g % 2] = 0;
+            }
+        }
+    }
 }
 
 // Broadcast ne11 == 1 path: one 256-thread block per 256-value unit quantizes each active token once in shared memory,
@@ -878,7 +922,8 @@ static __global__ void quantize_mmq_few_id_bcast_q8_1(
     int          * pair0       = (int *) (tokens + n_experts);
     int          & npairs      = pair0[n_experts];
     int          & n_active    = pair0[n_experts + 1];
-    uint8_t      * active_list = (uint8_t *) (pair0 + n_experts + 2);
+    unsigned int & active_mask = ((unsigned int *) pair0)[n_experts + 2];
+    uint8_t      * active_list = (uint8_t *) (pair0 + n_experts + 3);
 
     ggml_cuda_pdl_lc();
     const float   * GGML_CUDA_RESTRICT x     = x_ptr;
@@ -895,37 +940,59 @@ static __global__ void quantize_mmq_few_id_bcast_q8_1(
         return e >= 0 && e < n_experts ? e : -1;
     };
 
+    if (threadIdx.x == 0) {
+        active_mask = 0;
+    }
     for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
         tokens[e] = 0;
     }
     __syncthreads();
+    int local_dup = 0;
+    unsigned int local_mask = 0;
     for (int i = threadIdx.x; i < nentries; i += blockDim.x) {
         const int e = expert_of(i);
         if (e >= 0) {
-            atomicOr(&tokens[e], 1u << (i / n_expert_used));
+            const unsigned int bit = 1u << (i / n_expert_used);
+            local_mask |= bit;
+            if (atomicOr(&tokens[e], bit) & bit) {
+                local_dup = 1;
+            }
         }
     }
-    __syncthreads();
+    if (local_mask != 0) {
+        atomicOr(&active_mask, local_mask);
+    }
+    const bool dup = __syncthreads_or(local_dup) != 0;
+    if (dup) {
+        for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+            tokens[e] = 0;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < nentries; i += blockDim.x) {
+            const int e = expert_of(i);
+            if (e >= 0) {
+                atomicAdd(&tokens[e], 1u);
+            }
+        }
+        __syncthreads();
+    }
+    auto count_of = [&](const int e) {
+        return dup ? (int) tokens[e] : __popc(tokens[e]);
+    };
     if (threadIdx.x < WARP_SIZE) {
         const int per_lane = (n_experts + WARP_SIZE - 1) / WARP_SIZE;
         const int e0       = min(int(threadIdx.x)*per_lane, n_experts);
         const int e1       = min(e0 + per_lane, n_experts);
-        int          n    = 0;
-        unsigned int mask = 0;
+        int n = 0;
         for (int e = e0; e < e1; ++e) {
-            const unsigned int te = tokens[e];
-            mask |= te;
-            n += (__popc(te) + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS;
+            n += (count_of(e) + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS;
         }
         int p = warp_prefix_inclusive_sum<int>(n) - n;
         for (int e = e0; e < e1; ++e) {
             pair0[e] = p;
-            p += (__popc(tokens[e]) + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS;
+            p += (count_of(e) + MMQ_FEW_NCOLS - 1) / MMQ_FEW_NCOLS;
         }
-#pragma unroll
-        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            mask |= ggml_cuda_shfl_xor(mask, offset, WARP_SIZE);
-        }
+        const unsigned int mask = active_mask;
         if ((mask >> threadIdx.x) & 1u) {
             active_list[__popc(mask & ((1u << threadIdx.x) - 1u))] = (uint8_t) threadIdx.x;
         }
@@ -937,7 +1004,16 @@ static __global__ void quantize_mmq_few_id_bcast_q8_1(
     __syncthreads();
 
     auto rank = [&](const int i, const int e) {
-        return __popc(tokens[e] & ((1u << (i / n_expert_used)) - 1u));
+        if (!dup) {
+            return __popc(tokens[e] & ((1u << (i / n_expert_used)) - 1u));
+        }
+        int r = 0;
+        for (int j = 0; j < i; ++j) {
+            if (expert_of(j) == e) {
+                ++r;
+            }
+        }
+        return r;
     };
 
     if (iu == 0) {
@@ -951,7 +1027,7 @@ static __global__ void quantize_mmq_few_id_bcast_q8_1(
             pair[2 + r % MMQ_FEW_NCOLS] = i;
             if (r % MMQ_FEW_NCOLS == 0) {
                 pair[0] = e;
-                pair[1] = min(__popc(tokens[e]) - r, MMQ_FEW_NCOLS);
+                pair[1] = min(count_of(e) - r, MMQ_FEW_NCOLS);
             }
         }
         for (int p = npairs + threadIdx.x; p < npairs_max; p += blockDim.x) {
@@ -1009,6 +1085,22 @@ static __global__ void quantize_mmq_few_id_bcast_q8_1(
             ((ds_t *) ds)[2*(lane16 % 2) + g % 2] = tok_ds[t*8 + lane16];
         }
     }
+    const int4 zero4 = make_int4(0, 0, 0, 0);
+    for (int e = grp16; e < n_experts; e += 16) {
+        const int c   = count_of(e);
+        const int rem = c % MMQ_FEW_NCOLS;
+        if (rem == 0) {
+            continue;
+        }
+        int4 * yg = vy + (int64_t(pair0[e] + c / MMQ_FEW_NCOLS)*nunits + iu)*MMQ_FEW_Q8_1_INT4;
+        for (int g = rem; g < MMQ_FEW_NCOLS; ++g) {
+            yg[j*WARP_SIZE + 4*g + t_mma] = zero4;
+            if (lane16 < 8) {
+                int4 * ds = yg + 4*WARP_SIZE + 4*(g/2) + lane16/2;
+                ((int *) ds)[2*(lane16 % 2) + g % 2] = 0;
+            }
+        }
+    }
 }
 
 void quantize_mmq_few_q8_1_cuda(
@@ -1043,7 +1135,7 @@ void quantize_mmq_few_id_q8_1_cuda(
 
     static const bool quant_legacy = ggml_env_switch("GGML_CUDA_MMQ_FEW_ID_QUANT_LEGACY");
     const size_t smpb         = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
-    const size_t nbytes_bcast = (size_t) n_tokens*288 + (size_t) (2*n_experts + 10)*sizeof(int);
+    const size_t nbytes_bcast = (size_t) n_tokens*288 + (size_t) (2*n_experts + 11)*sizeof(int);
     if (ne11 == 1 && !quant_legacy && n_tokens > 0 && ne00 > 0 && n_expert_used > 0 && nbytes_bcast <= smpb) {
         const int64_t nunits = ne00 / QK_K;
         const dim3 num_blocks(1, nunits, 1);
