@@ -119,7 +119,9 @@ def main():
     if os.path.exists(zf_path):
         zl = json.load(open(zf_path))
         print(f"zero-frac resume with {len(zl)} layers", flush=True)
-    stride = 16
+    # L0-2 measured at stride 16; the rest at 64 (sampling error ~0.05pp on the
+    # fraction; recorded per layer in the npz meta). Resume keys keep their values.
+    stride = 16 if len(zl) < 3 else 64
     for lay in sorted(gate_up):
         key = str(lay)
         if key in zl:

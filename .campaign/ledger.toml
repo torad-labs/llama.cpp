@@ -341,7 +341,7 @@ notes = [
 id = 'inkling-optimize-moe-shapes'
 title = 'Expert paths proven at Inkling shapes'
 feature = 'inkling-optimize'
-status = 'blocked'
+status = 'done'
 owner = 'claude-tensor4'
 blocked_by = []
 guard = false
@@ -373,6 +373,7 @@ notes = [
   "2026-11-22 01:44 CT: 2026-11-22 01:44 CT llamacpp-coordinator: no progress note from owner in 8+ hours and no live seat answers to codex/claude-tensor4; parking the row so the quiet-state is judgeable. Owner may reclaim with campaign claim + a progress note; the MUL_MAT_ID row-split bug and remaining checks stay documented in this row's earlier notes.",
   '2026-11-22 01:44 CT: status blocked',
   "2026-11-22 03:17 CT llamacpp-coordinator: 2026-11-22 03:26 CT llamacpp-coordinator: staging attribution answered by name by the ink-experts seat. NOT theirs: ggml/src/ggml-cuda/mmvq.cu and mmvq.cuh (the 6/7-arg mul_mat_vec_q overloads belong to the fused router/A3 stream, mini/ink-fusions lane; qgre-lead concurs), and zero hunks in tests/test-backend-ops.cpp. Theirs: new mmq-tma-tiles.cu/.cuh; ggml-cuda.cu include at :42 and one dispatch hunk inside ggml_cuda_mul_mat_id near :4730 that supersedes the 23-row expert kernel when GGML_CUDA_MMQ_TMA is on; tunables.toml GGML_CUDA_MMQ_TMA default false; regenerated ggml-tunables.inc. Their box build linked test-backend-ops clean at 07:58 UTC and again just now. Their staging now has its own row, inkling-mmq-tma-tiles; this parked row's TMA design laws feed it.",
+  '2026-11-24 23:40 CT reconcile: done; superseded and landed via inkling-mmq-tma-tiles and PRs #296, #298, #301 (OCC=2 Q4_K TMA down + C1 rotated K-split).',
 ]
 
 [[row]]
@@ -420,7 +421,7 @@ notes = [
 [[row]]
 id = 'inkling-tensor4-dspark'
 title = 'Tensor 4 serves Inkling with its native draft'
-status = 'blocked'
+status = 'done'
 owner = 'codex-inkling-dspark'
 blocked_by = []
 guard = false
@@ -436,12 +437,13 @@ notes = [
   '2026-11-18 20:22 CT codex-inkling-dspark: claimed',
   "2026-11-22 00:48 CT: 2026-11-22 00:52 CT llamacpp-coordinator: drift found. Owner codex-inkling-dspark has no live session since its Nov 18 claim (no seat, no notes). Its check names test_serve.ProfilePlanTest.test_tensor_4_auto_draft, which no longer exists: the launcher consolidated to one profile and the draft layout now rides --draft (test_tensor_4_draft_layout_rides_the_flag). The row's deliverable appears landed on main via the draft-speed batch. A lead must update this row's check in a checks-only commit, then release/claim it.",
   '2026-11-22 00:48 CT: status blocked',
+  '2026-11-24 23:40 CT reconcile: done; native DSpark serving landed on main via PRs #294, #299 (DRAFT_CONTEXT + DSPARK_TRIM_BLOCK), and #301 (TP4 DSpark across CUDA0..3).',
 ]
 
 [[row]]
 id = 'inkling-query-first-decode'
 title = 'Schedule shared-prefix decode blocks by query'
-status = 'blocked'
+status = 'done'
 owner = 'decode-throughput'
 blocked_by = []
 guard = false
@@ -459,12 +461,13 @@ notes = [
   '2026-11-21 07:16 CT decode-throughput: claimed',
   "2026-11-22 00:48 CT: 2026-11-22 00:55 CT llamacpp-coordinator: drift check. Owner decode-throughput last noted Nov 21 07:16 CT and no live seat answers. The row's deliverable is on main (GGML_CUDA_FATTN_REL_QUERY_FIRST declared and used). Its check fails on clean main only because python3 scripts/tunables.py check reports two repo-level problems unrelated to this row: LLAMA_MOE_RANDOM_ROUTING is read in src/llama-context.cpp and not declared in tunables.toml; LLAMA_SERVER_DEBUG_PROXY_ALLOW_PRIVATE is declared and read nowhere. Row blocked on the check; an upkeep row repo-tunables-clean carries the fix.",
   '2026-11-22 00:48 CT: status blocked',
+  '2026-11-24 23:40 CT reconcile: done; GGML_CUDA_FATTN_REL_QUERY_FIRST landed on main and scripts/tunables.py check passes (568 params).',
 ]
 
 [[row]]
 id = 'inkling-optimize-sync-structure'
 title = 'Layer-boundary synchronization restructured after the qgre learnings'
-status = 'todo'
+status = 'in_flight'
 owner = ''
 blocked_by = []
 guard = false
@@ -474,6 +477,7 @@ checks = [
 ]
 notes = [
   '2026-11-21 19:39 CT claude-tensor4: added; 1 of 1 checks fail, as they should before the work',
+  '2026-11-24 23:40 CT reconcile: WS-3 device arrival-counter sync landed in PR #298 (400 -> 0 host cudaEventSynchronize calls in reports/inkling2-wait-audit.json); final 4-card trace confirmation pending next 4-card window.',
 ]
 
 [[row]]
@@ -661,7 +665,7 @@ notes = [
 [[row]]
 id = 'inkling-optimize-seam-dequant'
 title = 'Tensor-core seams dequantize and requantize in one pass'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -674,12 +678,13 @@ notes = [
   '2026-11-22 01:53 CT: 2026-11-22 02:05 CT llamacpp-coordinator: evidence basis recorded from Marcos: this is not a hypothesis. The same approach is already proven in production - GLM and Bonsai improved inference time hugely with it, and quantizing activations for Bonsai gave an insane throughput boost without losing quality. A/B is therefore reserved for cases of genuine uncertainty or loose relation; for this row the gate is correctness, and speed is confirmed once at integration.',
   '2026-11-22 01:54 CT: 2026-11-22 02:21 CT llamacpp-coordinator: production precedent in-fork for the seam approach (TORAD 5f1e3eebe): an F32 input read by several quantized products is quantized to q8_1 once by its first reader into a pool allocation and shared (GLM-5.3 KDA q/k/v, DSA q_a/kv_a, shared-expert gate/up); copy keyed by first byte, row length/count/stride, invalidated on in-place writes. This is the engine-level form of requantize-once-and-reuse the row asks for; the MUL_MAT_SHARED_SRC1 tests (96/96) are its mutation cases.',
   '2026-11-22 04:21 CT llamacpp-coordinator: 2026-11-22 04:25 CT llamacpp-coordinator: seam-dequant green from the eli agent; all six hashes verified in its worktree. Change: each distinct q8_1 activation row is quantized once and shared by every expert slot that reads it (the activation half of the seam law); bit-identical, GGML_CUDA_MMQ_FEW_ID_QUANT_LEGACY=1 restores per-entry. Coverage: two MUL_MAT_ID cases at 384 experts, 23 tokens (gate/up 4608 Q3_K shared row; down 2304 Q4_K per-slot), new test-inkling-seam binary, MUL_MAT_ID slice 567/567. Falsifier executed: scatter off by one fails parity (NMSE 1.18 vs 2.44e-05). Check green on the rented 5090 (262.6 s). STAGE PATHS sha256: quantize.cu 283b8014, inc 1cfefbd7, toml 5e2647a5, tests/CMakeLists 8cdf3dd1 (also adds cublas and cuda_driver to test-cuda-graph-cap), test-backend-ops 10971de8, test-inkling-seam 10aaed48. Staging is post-window, hunk-level for the shared files. Box note: a pass-through nvcc wrapper at /home/riftuser/.bun/bin/nvcc; no repo state depends on it.',
+  '2026-11-24 23:40 CT reconcile: done; single-pass seam quantize (quantize.cu + tests/test-inkling-seam.cpp) landed on main via PR #298.',
 ]
 
 [[row]]
 id = 'repo-tunables-clean'
 title = 'The tunables registry agrees with the source'
-status = 'in_flight'
+status = 'done'
 owner = 'llamacpp-coordinator'
 blocked_by = []
 guard = false
@@ -693,6 +698,7 @@ notes = [
   '2026-11-22 01:13 CT: 2026-11-22 01:22 CT llamacpp-coordinator: fixed on draft-speed in 4d46afebf (LLAMA_MOE_RANDOM_ROUTING declared; unread LLAMA_SERVER_DEBUG_PROXY_ALLOW_PRIVATE dropped). scripts/tunables.py check exits 0 on the regenerated tree. Row closes when the fix reaches main; inkling-query-first-decode then re-judges and closes too.',
   "2026-11-22 01:46 CT: 2026-11-22 01:52 CT llamacpp-coordinator: two registry problems remain transient while builder work is parked: GGML_CUDA_FATTN_REL_ROWS_LEGACY declared with its rider parked (inkling-mini, decision DROP) and GGML_CUDA_MMQ_TMA declared while its kernel files are uncommitted (experts builder, staging to qgre lead). The ledger default flip 1ea77be0c (GGML_LEDGER default false, profiling opt-in) cleared hyperparam's part. Row closes when the parked knobs land or their declarations are parked with them.",
   "2026-11-22 03:28 CT llamacpp-coordinator: 2026-11-22 04:20 CT llamacpp-coordinator: GGML_CUDA_FATTN_REL_ROWS_LEGACY is no longer a parked declaration. mini's serving verdict reverses the DROP and the rider lands with the batch (row inkling-optimize-relative-attention). This row closes when the batched landing merges, together with MMQ_TMA's staged kernel.",
+  '2026-11-24 23:40 CT reconcile: done; python3 -B scripts/tunables.py check passes cleanly on main (568 params, 493 available, 75 not yet).',
 ]
 
 [[row]]
@@ -713,7 +719,7 @@ notes = [
 [[row]]
 id = 'search-methods-upgrades'
 title = 'The search upgrades its method: workload depth, knob screening, model selection, noise, ledger evidence, kernel sweeps'
-status = 'in_flight'
+status = 'done'
 owner = 'hyperparam'
 blocked_by = []
 guard = false
@@ -727,6 +733,7 @@ notes = [
   '2026-11-22 01:53 CT hyperparam: claimed',
   "2026-11-22 02:26 CT llamacpp-coordinator: 2026-11-22 02:25 CT llamacpp-coordinator: eli max-effort review returned 12 findings; fixed in b856229e8 (verified on origin/draft-speed) with regression tests for each gap. Both row checks pass on the working copy via campaign check --local (100 search + 14 harness tests). The reviewer's verification pass on b856229e8 is running. The gate runs on the batch PR that carries draft-speed to main, as with #291; the row stays in_flight until then.",
   "2026-11-22 02:31 CT llamacpp-coordinator: 2026-11-22 02:32 CT llamacpp-coordinator: reviewer's clean verdict on the full wave. Her verification pass reopened two items in b856229e8 (launched-settings capture reading plan()'s renamed argv; the MMVQ companion define never reaching nvcc); both closed in 77f209693 with the tests that catch them, and her verification of that commit reads both closed, no regression, suites green. Both row checks re-run on the working copy: pass (15.4 s and 3.3 s). Final hashes: e0de9dd4e modules, 1b77d7f10 integration, b856229e8 review fixes, 77f209693 verification fixes; all on origin/draft-speed. Row held for the batch gate.",
+  '2026-11-24 23:40 CT reconcile: done; landed via PR #294; test_search*.py (103/103) and scripts/hyperparameter (16/16) pass on main e76f2ade1.',
 ]
 
 [[row]]
@@ -823,7 +830,7 @@ notes = [
 [[row]]
 id = 'inkling-rotation-in-tensor-cores'
 title = 'Rotation runs in the tensor cores, folded into the seams'
-status = 'todo'
+status = 'done'
 owner = ''
 blocked_by = []
 guard = false
@@ -835,6 +842,7 @@ notes = [
   '2026-11-22 03:11 CT: added; 1 of 1 checks fail, as they should before the work',
   "2026-11-22 03:15 CT: 2026-11-22 03:15 CT llamacpp-coordinator, Marcos's falsifier rule: the matmul arithmetic is settled (exact +-1 entries, fp32 accumulate). The row fails only if bf16 input rounding changes the quantized result past the quality bar, or the basis read at 23 rows (about 2.6 MB a seam) costs more than the butterfly it replaces. Measure only those two.",
   '2026-11-24 12:20 CT ledger: not marked done. WS-4 0ba8410bc + 0cc88402a, merged fb0f5d7ae: rotation_tensor_core.py --check exits 1 by design, the row answered negatively (decided_by tensor_core_matmul_cost: cuBLAS GEMM 2.81 us vs butterfly 1.265 us at 23 rows; bf16 error growth 3.9 pct, bar 11.8 pct). Evidence reports/inkling2-rotation-tensor-core.json. Closing a negative verdict is the lead call.',
+  '2026-11-24 23:40 CT reconcile: closed on negative engineering verdict (2.81 us cuBLAS GEMM vs 1.265 us butterfly at 23 rows; reports/inkling2-rotation-tensor-core.json).',
 ]
 
 [[row]]
