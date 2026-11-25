@@ -41,8 +41,10 @@ paths generic so every model and backend fits; this fork does not owe that.
 
 ## Boxes and GPUs (Marcos, 2026-11-22)
 
-- All builds, tests and dev runs go to the rented CloudRift box(s) with the RTX 5090s (`on-box`, ssh host
-  `buildbox`). Rent another 5090 if the work needs one. Nothing new runs on this machine's local cards.
+- Plain `on-box` (ssh host `buildbox`) is the 64-core Vast RTX 5060 Ti build and correctness box (`sm_120a`).
+  RTX 5090 throughput and L2 measurements go to CloudRift via `ON_MAC_HOST=gpubox on-box` (or
+  `ON_MAC_HOST=qgre-rift5090 on-box`). Rent another 5090 if the work needs one. Nothing new runs on this
+  machine's local cards.
 - The four-card RTX PRO 6000 Inkling box tests a batch of changes after they are made: one test and profile
   window per batch on that box, then stop the box, and every seat iterates against its recorded numbers from
   the 5090s. Profile once per window; do not re-profile piecemeal.

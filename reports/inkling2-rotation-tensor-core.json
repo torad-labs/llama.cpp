@@ -5985,7 +5985,7 @@
     "cost_pass": false
   },
   "run": {
-    "invocation": "ON_MAC_HOST=buildbox3 on-box flock /tmp/buildbox3-gpu.lock python3 scripts/inkling2/rotation_tensor_core.py --measure",
+    "invocation": "ON_MAC_HOST=gpubox on-box flock /tmp/gpubox-gpu.lock python3 scripts/inkling2/rotation_tensor_core.py --measure",
     "local_git_head": "0ba8410bc849b36b598414ad7a87304598c4e6f2",
     "finished_at": "2026-11-24T14:59:15Z"
   }

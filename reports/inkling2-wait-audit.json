@@ -479,7 +479,7 @@
     }
   ],
   "verification": {
-    "hardware": "CloudRift RTX 5090 (sm_120a, buildbox3 + buildbox)",
+    "hardware": "CloudRift RTX 5090 (sm_120a, gpubox + buildbox)",
     "nsys_allreduce_96calls_4ranks": {
       "legacy_host_cudaEventSynchronize_calls": 400,
       "counter_sync_cudaEventSynchronize_calls": 0,
@@ -493,7 +493,7 @@
       "python3 -B -m unittest scripts/inkling2/test_wait_audit.py -> 11/11 OK",
       "python3 scripts/tunables.py check -> 559 params OK; test-tunables -> 441 listed, 375 checked OK",
       "test-backend-meta-allreduce-copy (default, --logical 4, GGML_CUDA_AR_SPLIT_REDUCE=1, GGML_CUDA_AR_COUNTER_SYNC_LEGACY=1) -> PASS (0/8396800 diff)",
-      "test-backend-meta-split (default on buildbox3 Release, --reduction-queue 96 reductions bit-exact, --ar-fallback) -> PASS; --ar-capture SKIP(77) on 1 physical GPU",
+      "test-backend-meta-split (default on gpubox Release, --reduction-queue 96 reductions bit-exact, --ar-fallback) -> PASS; --ar-capture SKIP(77) on 1 physical GPU",
       "test-backend-meta-capture -> PASS (14/14 captures)",
       "test-llama-archs -a inkling2 -s 1234 (default, WARM=1, WARM=1 DISABLE_GRAPHS=1 GRAPH_OPT=1, WARM=1 TMA=1 MOE_FUSE=1 F32_FEW=1) -> PASS",
       "test-llama-archs --inkling-split decode --inkling-split-device CUDA0,CUDA0 -s 1234 (default & WARM=1) -> PASS (NMSE 1.71722e-06)",
