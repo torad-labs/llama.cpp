@@ -6,15 +6,15 @@
   "summary": {
     "counter": 5,
     "kept-host-data": 15,
-    "out-of-path": 19,
+    "out-of-path": 18,
     "barrier": 0
   },
   "sites": [
     {
       "id": "ar-acquire-slot-pacing",
       "file": "ggml/src/ggml-cuda/allreduce.cu",
-      "line": 1363,
-      "line_end": 1388,
+      "line": 1362,
+      "line_end": 1387,
       "symbol": "ggml_cuda_ar_acquire_slot",
       "api": "cudaEventSynchronize",
       "anchor": "ggml_cuda_ar_acquire_slot",
@@ -26,8 +26,8 @@
     {
       "id": "ar-copy-captured-rendezvous",
       "file": "ggml/src/ggml-cuda/allreduce.cu",
-      "line": 1049,
-      "line_end": 1105,
+      "line": 1048,
+      "line_end": 1104,
       "symbol": "ggml_cuda_ar_ce_bump / ggml_cuda_ar_ce_wait_geq / ggml_cuda_ar_ce_wait_new",
       "api": "st.release.sys.global.u32 / ld.acquire.sys.global.u32",
       "anchor": "ggml_cuda_ar_ce_bump",
@@ -52,8 +52,8 @@
     {
       "id": "cuda-graph-concurrent-fork-join",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 11242,
-      "line_end": 11422,
+      "line": 11249,
+      "line_end": 11429,
       "symbol": "ggml_cuda_graph_evaluate_and_capture",
       "api": "ggml_cuda_arrival_signal / ggml_cuda_arrival_wait",
       "anchor": "SLOT_FORK",
@@ -65,8 +65,8 @@
     {
       "id": "cuda-l2-issuer-fork-join",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 4193,
-      "line_end": 4241,
+      "line": 4198,
+      "line_end": 4246,
       "symbol": "ggml_cuda_l2_side_fork / ggml_cuda_l2_issue_join",
       "api": "ggml_cuda_arrival_signal / ggml_cuda_arrival_wait",
       "anchor": "SLOT_L2_FORK",
@@ -102,7 +102,7 @@
     {
       "id": "cuda-backend-synchronize-impl",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 5829,
+      "line": 5830,
       "symbol": "ggml_backend_cuda_synchronize",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(cuda_ctx->stream())",
@@ -114,7 +114,7 @@
     {
       "id": "cuda-device-event-synchronize-impl",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 13519,
+      "line": 13521,
       "symbol": "ggml_backend_cuda_device_event_synchronize",
       "api": "cudaEventSynchronize",
       "anchor": "cudaEventSynchronize((cudaEvent_t)event->context)",
@@ -126,7 +126,7 @@
     {
       "id": "meta-backend-synchronize-impl",
       "file": "ggml/src/ggml-backend-meta.cpp",
-      "line": 4357,
+      "line": 4538,
       "symbol": "ggml_backend_meta_synchronize",
       "api": "ggml_backend_synchronize",
       "anchor": "ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i))",
@@ -138,7 +138,7 @@
     {
       "id": "meta-device-event-synchronize-impl",
       "file": "ggml/src/ggml-backend-meta.cpp",
-      "line": 349,
+      "line": 378,
       "symbol": "ggml_backend_meta_device_event_synchronize",
       "api": "ggml_backend_event_synchronize",
       "anchor": "ggml_backend_event_synchronize(simple_event)",
@@ -201,7 +201,7 @@
     {
       "id": "meta-set-tensor-async-fallback",
       "file": "ggml/src/ggml-backend-meta.cpp",
-      "line": 4124,
+      "line": 4298,
       "symbol": "ggml_backend_meta_set_tensor_async",
       "api": "ggml_backend_synchronize",
       "anchor": "ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, j))",
@@ -213,7 +213,7 @@
     {
       "id": "meta-get-tensor-async-fallback",
       "file": "ggml/src/ggml-backend-meta.cpp",
-      "line": 4293,
+      "line": 4474,
       "symbol": "ggml_backend_meta_get_tensor_async",
       "api": "ggml_backend_synchronize",
       "anchor": "ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, j))",
@@ -225,8 +225,8 @@
     {
       "id": "context-nextn-host-rows",
       "file": "src/llama-context.cpp",
-      "line": 2592,
-      "line_end": 2609,
+      "line": 2613,
+      "line_end": 2630,
       "symbol": "llama_context::get_h_nextn_rows / set_h_nextn_rows",
       "api": "ggml_backend_event_synchronize",
       "anchor": "ggml_backend_event_synchronize(ev_h_nextn_written.get())",
@@ -263,7 +263,7 @@
     {
       "id": "ar-peer-free-teardown",
       "file": "ggml/src/ggml-cuda/allreduce.cu",
-      "line": 1549,
+      "line": 1548,
       "symbol": "ggml_cuda_ar_peer_free",
       "api": "cudaDeviceSynchronize",
       "anchor": "cudaDeviceSynchronize()",
@@ -274,8 +274,8 @@
     {
       "id": "ar-p2p-init-probe",
       "file": "ggml/src/ggml-cuda/allreduce.cu",
-      "line": 1670,
-      "line_end": 1695,
+      "line": 1669,
+      "line_end": 1694,
       "symbol": "ggml_cuda_ar_p2p_init",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(p->streams[i])",
@@ -286,8 +286,8 @@
     {
       "id": "ar-pipeline-free-drain",
       "file": "ggml/src/ggml-cuda/allreduce.cu",
-      "line": 2080,
-      "line_end": 2089,
+      "line": 2079,
+      "line_end": 2088,
       "symbol": "ggml_cuda_ar_pipeline_free",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(p->streams[i])",
@@ -355,8 +355,8 @@
     {
       "id": "cuda-mul-mat-id-host-fallback",
       "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "line": 5134,
-      "line_end": 5156,
+      "line": 5135,
+      "line_end": 5157,
       "symbol": "ggml_cuda_mul_mat_id",
       "api": "cudaStreamSynchronize",
       "anchor": "cudaStreamSynchronize(stream)",
@@ -412,7 +412,7 @@
     {
       "id": "context-pipeline-parallel-guard",
       "file": "src/llama-context.cpp",
-      "line": 2958,
+      "line": 3002,
       "symbol": "llama_context::process_ubatch",
       "api": "ggml_backend_sched_synchronize",
       "anchor": "ggml_backend_sched_synchronize(sched_gf)",
@@ -423,8 +423,8 @@
     {
       "id": "context-graph-slot-evict-fallback",
       "file": "src/llama-context.cpp",
-      "line": 3096,
-      "line_end": 3183,
+      "line": 3147,
+      "line_end": 3234,
       "symbol": "llama_context::process_ubatch",
       "api": "ggml_backend_synchronize",
       "anchor": "ggml_backend_synchronize(backend)",
@@ -435,8 +435,8 @@
     {
       "id": "context-draft-inject-handoff",
       "file": "src/llama-context.cpp",
-      "line": 3806,
-      "line_end": 3823,
+      "line": 3867,
+      "line_end": 3884,
       "symbol": "llama_context::decode",
       "api": "ggml_backend_event_synchronize",
       "anchor": "ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get())",
@@ -447,7 +447,7 @@
     {
       "id": "context-nextn-copy-no-event-fallback",
       "file": "src/llama-context.cpp",
-      "line": 5002,
+      "line": 5079,
       "symbol": "llama_context::nextn_keep_rows",
       "api": "ggml_backend_synchronize",
       "anchor": "ggml_backend_synchronize(copy_backend)",
@@ -458,24 +458,13 @@
     {
       "id": "context-moe-ids-prefetch-callback",
       "file": "src/llama-context.cpp",
-      "line": 5178,
+      "line": 5255,
       "symbol": "llama_context::moe_prefetch_cb",
       "api": "ggml_backend_synchronize",
       "anchor": "ggml_backend_synchronize(backend)",
       "hot_decode_path": false,
       "disposition": "out-of-path",
       "reason": "Host-RAM MoE expert cache callback; inactive when all experts are GPU-resident (tensor-4)."
-    },
-    {
-      "id": "model-load-sync",
-      "file": "src/llama-model.cpp",
-      "line": 2632,
-      "symbol": "llama_model::load_tensors",
-      "api": "ggml_backend_synchronize",
-      "anchor": "ggml_backend_synchronize(backend.get())",
-      "hot_decode_path": false,
-      "disposition": "out-of-path",
-      "reason": "One-time synchronization during model weight loading."
     }
   ],
   "verification": {

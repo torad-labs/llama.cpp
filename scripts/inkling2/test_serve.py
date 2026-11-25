@@ -32,8 +32,7 @@ TENSOR4_ENV = {**ENV, "LLAMA_KV_SEQ_CELLS": "294912", "LLAMA_SLOT_PREFIX_COPY": 
                "LLAMA_GRAPH_PROMPT_KEPT": "1", "LLAMA_PROMPT_SHAPES": "1",
                "LLAMA_RS_FIXED_ROWS": "1", "LLAMA_GRAPH_ANY_SEQS": "1",
                "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000",
-               "LLAMA_RS_STAGE_ROWS": "2", "LLAMA_CHECKPOINT_RAM_MIB": "16384",
-               "LLAMA_PROMPT_SHAPES": "1", "LLAMA_PROMPT_SHAPE_SMALL": "8"}
+               "LLAMA_RS_STAGE_ROWS": "2", "LLAMA_CHECKPOINT_RAM_MIB": "16384"}
 
 
 def pinned(pack, kv, context, cache_ram="32768", projector=MMPROJ, swa_kv="q8_0"):
