@@ -465,6 +465,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     }
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
+    static const std::regex pattern_dspark_kv_ctx   ("blk\\.\\d*\\.attn_(k|v)_ctx\\.weight");
+    const bool dspark = llama_model_is_inkling_draft(*ud->model);
+    const bool dspark_kv_ctx = dspark && std::regex_match(tensor_name, pattern_dspark_kv_ctx);
     static const std::regex pattern_v_exps_weight   ("blk\\.\\d*\\.attn_v_exps.weight"); // K2 Horizon MoVA
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
     static const std::regex pattern_qkv_gate_weight ("blk\\.\\d*\\.attn_qkv_gate.weight");
@@ -773,7 +776,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // standard attention
-        if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
+        if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight) || dspark_kv_ctx) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
         // routed value experts {n_embd, n_embd_v_gqa, n_expert} produce V, so they split like attn_v
@@ -847,6 +850,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL, "ffn_down_exps.weight");
         }
 
+        // DSpark's load-time product follows the LM head's vocabulary spans.
+        if (dspark && tensor_name == "dspark_head_out.weight") {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "output.weight");
+        }
+        if (dspark && tensor_name == "dspark_head_out.bias") {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "output.weight");
+        }
         // output
         if (std::regex_match(tensor_name, pattern_output_weight) || tensor_name == "output_draft.weight") {
             if (is_dsv4) {
@@ -1179,7 +1189,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_v_exps_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
-                std::regex_match(tensor_name, pattern_kv_cache)) {
+                std::regex_match(tensor_name, pattern_kv_cache) || dspark_kv_ctx) {
                 GGML_ASSERT(segments.size() == 1);
                 const bool is_v = tensor_name.find("attn_v") != std::string::npos || tensor_name.find("cache_v") != std::string::npos;
                 return {is_v ? granularity_v : granularity_kv};
@@ -2604,8 +2614,13 @@ void llama_model_base::load_tensors_dspark_head() {
     }
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_buft_is_host(buft)) {
-        return; // a head the CPU holds keeps its product a step
+    const bool meta = dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+    if (dev == nullptr || (!meta && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) || ggml_backend_buft_is_host(buft)) {
+        return;
+    }
+    if (meta && (ggml_backend_buffer_get_type(draft->dspark_hidden_out->buffer) != buft ||
+                 ggml_backend_buffer_get_type(draft->dspark_hidden_out_b->buffer) != buft)) {
+        return;
     }
     const int64_t rank = draft->dspark_markov_rank, n_embd = output->ne[0], n_vocab = output->ne[1];
     GGML_ASSERT(draft->dspark_hidden_out->ne[0] == rank && draft->dspark_hidden_out->ne[1] == n_embd);
@@ -2618,41 +2633,70 @@ void llama_model_base::load_tensors_dspark_head() {
     ggml_set_name(head_out,   "dspark_head_out.weight");
     ggml_set_name(head_out_b, "dspark_head_out.bias");
     ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
-    ggml_backend_ptr backend { ggml_backend_dev_init(dev, nullptr) };
-    if (!buffer || !backend) {
+    if (!buffer) {
         LLAMA_LOG_WARN("%s: no room for the DSpark head's product on %s: every step multiplies by the head\n", __func__,
                 ggml_backend_buft_name(buft));
         return;
     }
     ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // the head's rows a pass, so its rows' F32 product stays a few hundred MB on the card
-    const int64_t rows_pass = 16384;
-    for (int64_t v0 = 0; v0 < n_vocab; v0 += rows_pass) {
-        const int64_t nv = std::min(rows_pass, n_vocab - v0);
-        ggml_init_params gparams = { 48*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
-        ggml_context_ptr gctx { ggml_init(gparams) };
-        ggml_context * g = gctx.get();
-        ggml_tensor * w  = ggml_cont(g, ggml_transpose(g, ggml_cast(g, draft->dspark_hidden_out, GGML_TYPE_F32))); // [n_embd, rank]
-        ggml_tensor * b  = ggml_reshape_2d(g, ggml_cast(g, draft->dspark_hidden_out_b, GGML_TYPE_F32), n_embd, 1); // [n_embd, 1]
-        ggml_tensor * rows = ggml_view_2d(g, output, n_embd, nv, output->nb[1], v0*output->nb[1]);
-        ggml_tensor * prod_w = ggml_mul_mat(g, rows, w);                                                           // [nv, rank]
-        ggml_tensor * prod_b = ggml_mul_mat(g, rows, b);                                                           // [nv, 1]
-        ggml_prec_set_acc(prod_w, GGML_PREC_F32);
-        ggml_prec_set_acc(prod_b, GGML_PREC_F32);
-        ggml_tensor * dst_w = ggml_view_2d(g, head_out, rank, nv, head_out->nb[1], v0*head_out->nb[1]);
-        ggml_tensor * dst_b = ggml_view_1d(g, head_out_b, nv, v0*head_out_b->nb[0]);
-        ggml_tensor * out_w = ggml_cpy(g, ggml_cont(g, ggml_transpose(g, prod_w)), dst_w);
-        ggml_tensor * out_b = ggml_cpy(g, ggml_reshape_1d(g, prod_b, nv), dst_b);
-        ggml_cgraph * gf = ggml_new_graph(g);
-        ggml_build_forward_expand(gf, out_w);
-        ggml_build_forward_expand(gf, out_b);
-        ggml_gallocr_ptr galloc { ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())) };
-        if (!ggml_gallocr_alloc_graph(galloc.get(), gf) || ggml_backend_graph_compute(backend.get(), gf) != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("DSpark: the head's product with the Markov correction failed");
+    const auto shards = [](ggml_tensor * tensor) {
+        std::vector<ggml_tensor *> parts;
+        if (!ggml_backend_meta_tensor_ranges(tensor, 0, ggml_nbytes(tensor), false,
+                [](ggml_tensor * part, size_t offset, size_t size, size_t, void * data) {
+                    GGML_ASSERT(offset == 0 && size == ggml_nbytes(part));
+                    static_cast<std::vector<ggml_tensor *> *>(data)->push_back(part);
+                }, &parts)) {
+            throw std::runtime_error("DSpark: the head requires contiguous vocabulary shards");
+        }
+        return parts;
+    };
+    const auto heads = shards(output);
+    const auto products = shards(head_out);
+    const auto biases = shards(head_out_b);
+    const auto hidden = shards(draft->dspark_hidden_out);
+    const auto hidden_b = shards(draft->dspark_hidden_out_b);
+    GGML_ASSERT(heads.size() == products.size() && heads.size() == biases.size() &&
+                heads.size() == hidden.size() && heads.size() == hidden_b.size());
+    for (size_t j = 0; j < heads.size(); ++j) {
+        auto * head = heads[j];
+        auto * dst = products[j];
+        auto * db = biases[j];
+        const auto child = [](const ggml_tensor * t) {
+            return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        };
+        GGML_ASSERT(child(head) == child(dst) && child(head) == child(db) &&
+                    child(head) == child(hidden[j]) && child(head) == child(hidden_b[j]));
+        GGML_ASSERT(head->ne[1] == dst->ne[1] && head->ne[1] == db->ne[0]);
+        ggml_backend_ptr backend { ggml_backend_dev_init(child(head), nullptr) };
+        if (!backend) {
+            return;
+        }
+        // Limit the F32 product to one chunk on one rank.
+        const int64_t rows_pass = 16384;
+        for (int64_t v0 = 0; v0 < head->ne[1]; v0 += rows_pass) {
+            const int64_t nv = std::min(rows_pass, head->ne[1] - v0);
+            ggml_init_params gparams = { 48*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
+            ggml_context_ptr gctx { ggml_init(gparams) };
+            ggml_context * g = gctx.get();
+            ggml_tensor * w = ggml_cont(g, ggml_transpose(g, ggml_cast(g, hidden[j], GGML_TYPE_F32)));
+            ggml_tensor * b = ggml_reshape_2d(g, ggml_cast(g, hidden_b[j], GGML_TYPE_F32), n_embd, 1);
+            ggml_tensor * rows = ggml_view_2d(g, head, n_embd, nv, head->nb[1], v0*head->nb[1]);
+            ggml_tensor * prod_w = ggml_mul_mat(g, rows, w);
+            ggml_tensor * prod_b = ggml_mul_mat(g, rows, b);
+            ggml_prec_set_acc(prod_w, GGML_PREC_F32);
+            ggml_prec_set_acc(prod_b, GGML_PREC_F32);
+            ggml_tensor * dst_w = ggml_view_2d(g, dst, rank, nv, dst->nb[1], v0*dst->nb[1]);
+            ggml_tensor * dst_b = ggml_view_1d(g, db, nv, v0*db->nb[0]);
+            ggml_cgraph * gf = ggml_new_graph(g);
+            ggml_build_forward_expand(gf, ggml_cpy(g, ggml_cont(g, ggml_transpose(g, prod_w)), dst_w));
+            ggml_build_forward_expand(gf, ggml_cpy(g, ggml_reshape_1d(g, prod_b, nv), dst_b));
+            ggml_gallocr_ptr galloc { ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())) };
+            if (!ggml_gallocr_alloc_graph(galloc.get(), gf) || ggml_backend_graph_compute(backend.get(), gf) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("DSpark: the head's product with the Markov correction failed");
+            }
         }
     }
-    ggml_backend_synchronize(backend.get());
     LLAMA_LOG_INFO("%s: %12s DSpark head product = %8.2f MiB\n", __func__, ggml_backend_buft_name(buft),
             ggml_backend_buffer_get_size(buffer.get())/1024.0/1024.0);
     draft->dspark_head_out   = head_out;

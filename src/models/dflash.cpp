@@ -169,6 +169,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         if ((tok_embd || tok_norm || output) && !(tok_embd && tok_norm && output)) {
             throw std::runtime_error("Inkling2 DSpark needs all three target vocabulary tensors or none");
         }
+        if (split_mode() == LLAMA_SPLIT_MODE_TENSOR && !output) {
+            throw std::runtime_error("Inkling2 DSpark tensor split requires an own-head GGUF");
+        }
         output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
         dspark_mask_embd = create_tensor(tn(LLM_TENSOR_DSPARK_MASK_EMBD, "weight"), {n_embd}, 0);
         dspark_fuse = create_tensor(tn(LLM_TENSOR_DSPARK_FUSE, "weight"), {(int64_t) target_layer_ids.size(), n_layer + 1}, 0);
@@ -679,6 +682,10 @@ llama_model_dflash::graph_dflash::graph_dflash(const llm_graph_params & params) 
     build_logits(cur);
 }
 
+static ggml_tensor * inkling2_vocab_weight(ggml_context * ctx, ggml_tensor * weight, int64_t vocab) {
+    return ggml_view_2d(ctx, weight, weight->ne[0], vocab, weight->nb[1], 0);
+}
+
 static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model_dflash & model, ggml_tensor * output,
         ggml_tensor * output_s, ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden,
         ggml_tensor * base, ggml_tensor * context) {
@@ -694,15 +701,19 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
     auto * candidate = ggml_tanh(ctx0, chunk(1));
     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
     auto * latent = ggml_tanh(ctx0, chunk(2));
+    const bool tp = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+    const int64_t vocab = model.hparams.n_vocab_unpadded;
     ggml_tensor * bias;
     if (model.dspark_head_out && model.dspark_head_out_b && output == model.output && g.loras->empty()) {
-        // head x (W x latent + b) as (head x W) x latent + (head x b), made at load (load_tensors_dspark_head)
-        bias = ggml_mul_mat(ctx0, model.dspark_head_out, latent);
-        ggml_prec_set_acc(bias, model.dspark_head_out->type == GGML_TYPE_BF16 ? GGML_PREC_BF16 : GGML_PREC_F32);
-        bias = ggml_add(ctx0, bias, model.dspark_head_out_b);
+        auto * w = tp ? inkling2_vocab_weight(ctx0, model.dspark_head_out, vocab) : model.dspark_head_out;
+        auto * b = tp ? ggml_view_1d(ctx0, model.dspark_head_out_b, vocab, 0) : model.dspark_head_out_b;
+        bias = ggml_mul_mat(ctx0, w, latent);
+        ggml_prec_set_acc(bias, w->type == GGML_TYPE_BF16 ? GGML_PREC_BF16 : GGML_PREC_F32);
+        bias = ggml_add(ctx0, bias, b);
     } else {
         auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-        bias = g.build_lora_mm(output, correction, output_s);
+        auto * w = tp ? inkling2_vocab_weight(ctx0, output, vocab) : output;
+        bias = g.build_lora_mm(w, correction, output_s);
         ggml_prec_set_acc(bias, output->type == GGML_TYPE_BF16 ? GGML_PREC_BF16 : GGML_PREC_F32);
     }
     if (bias->ne[0] != base->ne[0]) {
@@ -718,7 +729,7 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
 // first, the column's first maximum. The host draws the same way from the same k candidates (common/speculative.cpp,
 // dspark_draw), so the token a step conditions on is the token the host proposes.
 static ggml_tensor * build_inkling2_draw(ggml_context * ctx0, ggml_tensor * logits, ggml_tensor * first,
-        ggml_tensor * uniform, ggml_tensor * inv_temp, int64_t k) {
+        ggml_tensor * uniform, ggml_tensor * inv_temp, int64_t k, ggml_tensor ** record) {
     const int64_t vocab = logits->ne[0];
     const int64_t nb = logits->ne[1];
     auto * top = ggml_top_k(ctx0, logits, k);
@@ -727,14 +738,21 @@ static ggml_tensor * build_inkling2_draw(ggml_context * ctx0, ggml_tensor * logi
     auto * vals = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, vocab, nb), ggml_reshape_2d(ctx0, ids, k, nb));
     auto * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, ggml_reshape_2d(ctx0, vals, k, nb), inv_temp));
     auto * cdf = ggml_cumsum(ctx0, probs);
-    // the uniform is scaled to the sum the round-off leaves, so the token drawn always has a probability above 0
     auto * total = ggml_cont(ctx0, ggml_view_2d(ctx0, cdf, 1, nb, cdf->nb[1], (k - 1)*cdf->nb[0]));
-    auto * above = ggml_step(ctx0, ggml_sub(ctx0, cdf, ggml_mul(ctx0, uniform, total)));
+    if (record) {
+        cdf = ggml_div(ctx0, cdf, total);
+    }
+    auto * above = ggml_step(ctx0, ggml_sub(ctx0, cdf, record ? uniform : ggml_mul(ctx0, uniform, total)));
     auto * pick = ggml_scale_bias(ctx0, ggml_clamp(ctx0, ggml_sum_rows(ctx0, above), 1.0f, (float) k), -1.0f, (float) k);
     auto * drawn = ggml_get_rows(ctx0, ggml_cast(ctx0, ids, GGML_TYPE_F32), ggml_cast(ctx0, pick, GGML_TYPE_I32));
     drawn = ggml_reshape_2d(ctx0, drawn, 1, nb);
     auto * first_f = ggml_reshape_2d(ctx0, ggml_cast(ctx0, first, GGML_TYPE_F32), 1, nb);
     auto * token = ggml_add(ctx0, first_f, ggml_mul(ctx0, ggml_step(ctx0, inv_temp), ggml_sub(ctx0, drawn, first_f)));
+    if (record) {
+        auto * ids_f = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ids, k, nb), GGML_TYPE_F32);
+        *record = ggml_concat(ctx0, ggml_concat(ctx0, token, ids_f, 0),
+                ggml_concat(ctx0, cdf, ggml_reshape_2d(ctx0, vals, k, nb), 0), 0);
+    }
     return ggml_reshape_1d(ctx0, ggml_cast(ctx0, token, GGML_TYPE_I32), nb);
 }
 
@@ -871,60 +889,87 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         cur = ggml_view_3d(ctx0, cur, n_embd, head_rows, nb, cur->nb[1], block*cur->nb[1], 0);
         cur = ggml_cont_2d(ctx0, cur, n_embd, head_rows*nb);
     }
-    auto * base = build_lora_mm(output, cur, output_s);
+    const bool tp = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+    const int64_t vocab = hparams.n_vocab_unpadded;
+    auto * base = build_lora_mm(tp ? inkling2_vocab_weight(ctx0, output, vocab) : output, cur, output_s);
     ggml_prec_set_acc(base, output->type == GGML_TYPE_BF16 ? GGML_PREC_BF16 : GGML_PREC_F32);
     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
     const auto column = [&](ggml_tensor * t, int64_t i, int64_t stride) {
         return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, stride*t->nb[1], i*t->nb[1]));
     };
-    const int64_t vocab = hparams.n_vocab_unpadded;
     const auto unpad = [&](ggml_tensor * t) {
         auto * v = ggml_view_2d(ctx0, t, vocab, nb, t->nb[1], 0);
         return ggml_is_contiguous(v) ? v : ggml_cont(ctx0, v);
     };
-    std::vector<ggml_tensor *> logit_cols;
-    logit_cols.reserve(head_rows);
-    {
-        auto * c0 = ggml_view_2d(ctx0, base, vocab, nb, head_rows*base->nb[1], 0);
-        logit_cols.push_back(ggml_reshape_3d(ctx0, ggml_is_contiguous(c0) ? c0 : ggml_cont(ctx0, c0), vocab, 1, nb));
-    }
+    auto * base_blocks = tp ? ggml_reshape_3d(ctx0, base, vocab, head_rows, nb) : nullptr;
+    const auto base_col = [&](int64_t i) {
+        if (!tp) {
+            return column(base, i, head_rows);
+        }
+        // Keep the full sharded axis and both block strides.
+        auto * col = ggml_view_3d(ctx0, base_blocks, vocab, 1, nb, base_blocks->nb[1], base_blocks->nb[2], i*base_blocks->nb[1]);
+        return ggml_cont_2d(ctx0, col, vocab, nb);
+    };
+    auto * c0 = tp ? base_col(0) : ggml_view_2d(ctx0, base, vocab, nb, head_rows*base->nb[1], 0);
+    std::vector<ggml_tensor *> logit_cols = {
+        ggml_reshape_3d(ctx0, ggml_is_contiguous(c0) ? c0 : ggml_cont(ctx0, c0), vocab, 1, nb)
+    };
     auto * context = column(f_rnn, 0, block);
     const int64_t n_draw = std::min<int64_t>(cparams.n_out_candidates, vocab);
+    const int64_t draw_width = 1 + 3*n_draw;
+    const bool record_draws = tp && n_draw > 1 && head_rows > 2;
+    std::vector<ggml_tensor *> draw_cols;
+    auto * no_draw = record_draws ?
+        ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, draw_width, 1, nb), -1.0f) : nullptr;
+    if (record_draws) {
+        draw_cols.push_back(no_draw);
+    }
     auto * prev = ids;
     for (int64_t i = 1; i < head_rows; ++i) {
         auto * col = build_inkling2_head(*this, draft, output, output_s, prev, state,
-                column(cur, i, head_rows), column(base, i, head_rows), context);
-        auto * valid = unpad(col);
+                column(cur, i, head_rows), base_col(i), context);
+        auto * valid = tp ? col : unpad(col);
         logit_cols.push_back(ggml_reshape_3d(ctx0, valid, vocab, 1, nb));
         if (i + 1 == head_rows) {
+            if (record_draws) {
+                draw_cols.push_back(no_draw);
+            }
             break;
         }
-        // top_k(1) selects the first maximum deterministically across backends.
-        prev = ggml_reshape_1d(ctx0, ggml_top_k(ctx0, valid, 1), nb);
-        // the host reads k > 1 candidates a row when it samples the draft: a block row past the anchor carries its
-        // step's uniform and the sequence's inverse temperature in the first two values of its state
+        // Only feedback within the block needs the full vocabulary on device.
+        auto * feedback = tp ? ggml_backend_meta_gather(ctx0, valid) : valid;
+        prev = ggml_reshape_1d(ctx0, ggml_top_k(ctx0, feedback, 1), nb);
         if (n_draw > 1) {
             const auto draw_in = [&](int64_t j) {
                 return ggml_cont(ctx0, ggml_view_2d(ctx0, f_rnn, 1, nb, block*f_rnn->nb[1], i*f_rnn->nb[1] + j*f_rnn->nb[0]));
             };
-            prev = build_inkling2_draw(ctx0, valid, prev, draw_in(0), draw_in(1), n_draw);
-        }
-    }
-    // balanced tree concat along dim 1 yields contiguous [vocab, head_rows, nb] without permute or trailing copy
-    while (logit_cols.size() > 1) {
-        std::vector<ggml_tensor *> next_cols;
-        next_cols.reserve((logit_cols.size() + 1) / 2);
-        for (size_t k = 0; k < logit_cols.size(); k += 2) {
-            if (k + 1 < logit_cols.size()) {
-                next_cols.push_back(ggml_concat(ctx0, logit_cols[k], logit_cols[k + 1], 1));
-            } else {
-                next_cols.push_back(logit_cols[k]);
+            ggml_tensor * record = nullptr;
+            prev = build_inkling2_draw(ctx0, feedback, prev, draw_in(0), draw_in(1), n_draw, record_draws ? &record : nullptr);
+            if (record) {
+                draw_cols.push_back(ggml_reshape_3d(ctx0, record, draw_width, 1, nb));
             }
         }
-        logit_cols = std::move(next_cols);
     }
-    auto * logits = ggml_reshape_2d(ctx0, logit_cols[0], vocab, head_rows*nb);
-    res->t_logits = n_outputs == head_rows*nb ? logits : ggml_get_rows(ctx0, logits, build_inp_out_ids());
+
+    auto * out_ids = n_outputs == head_rows*nb ? nullptr : build_inp_out_ids();
+    const auto pack = [&](std::vector<ggml_tensor *> & cols, int64_t width) {
+        GGML_ASSERT(cols.size() == (size_t) head_rows);
+        while (cols.size() > 1) {
+            size_t n = 0;
+            for (size_t k = 0; k < cols.size(); k += 2) {
+                cols[n++] = k + 1 < cols.size() ? ggml_concat(ctx0, cols[k], cols[k + 1], 1) : cols[k];
+            }
+            cols.resize(n);
+        }
+        auto * rows = ggml_reshape_2d(ctx0, cols[0], width, head_rows*nb);
+        return out_ids ? ggml_get_rows(ctx0, rows, out_ids) : rows;
+    };
+    res->t_logits = pack(logit_cols, vocab);
+    if (record_draws) {
+        res->t_draft_draw = pack(draw_cols, draw_width);
+        cb(res->t_draft_draw, "dspark_draw", -1);
+        ggml_build_forward_expand(gf, res->t_draft_draw);
+    }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {

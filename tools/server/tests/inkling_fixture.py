@@ -142,16 +142,16 @@ def read_gguf(path: str) -> tuple[dict, dict]:
     return kv, tensors
 
 
-def write_dspark_draft(path: str, target: str, seed: int = 4558) -> None:
+def write_dspark_draft(path: str, target: str, seed: int = 4558, *, tp4: bool = False) -> None:
     """An Inkling DSpark draft for the inkling2 target, laid out as the drafter kit's rehearsal fixture: two layers,
-    four heads 32 wide, a Markov head of rank 8 and a block of 8, with the target's tokenizer, embeddings and LM head.
-    Its weights are random, so it agrees with the target no more than chance does."""
+    a Markov head of rank 8 and a block of 8, with the target's tokenizer, embeddings and LM head.
+    The TP4 fixture has at least one complete KV group and 32 FFN channels per rank."""
     kv_t, t_t = read_gguf(target)
     width = read_u32(target, "inkling2.embedding_length")
     layers = read_u32(target, "inkling2.block_count")
     padded = read_u32(target, "inkling2.vocab_size")
     vocab = read_u32(target, "inkling2.vocab_size_unpadded")
-    heads, kv_heads, dim, ff, rank = 4, 2, 32, 64, 8
+    heads, kv_heads, dim, ff, rank = (8, 4, 64, 128, 8) if tp4 else (4, 2, 32, 64, 8)
     kv = {
         "general.architecture": "dflash", "dflash.context_length": 512, "dflash.embedding_length": width,
         "dflash.feed_forward_length": ff, "dflash.block_count": 2, "dflash.attention.head_count": heads,

@@ -510,12 +510,13 @@ private:
     // output rows as their largest logits (llama_set_output_candidates): a decode reads the records
     // ggml_top_k_candidates packed for a row, and the row's first reader cuts them to the k largest
     struct candidates_info {
-        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_DRAFT_RECORDS, ROW_GREEDY_RECORDS, ROW_SAMPLE_RECORDS, ROW_CUT, ROW_CUT_SAMPLE };
+        enum : uint8_t { ROW_WHOLE, ROW_RECORDS, ROW_DRAFT_RECORDS, ROW_GREEDY_RECORDS, ROW_SAMPLE_RECORDS, ROW_DSPARK_DRAW, ROW_CUT, ROW_CUT_SAMPLE };
         enum seq_mode : uint8_t { SEQ_TOP_K, SEQ_GREEDY, SEQ_TEMP_SAMPLE };
 
         buffer_view<int64_t>     records = {nullptr, 0}; // [n_outputs][n_record]
         buffer_view<float>       logits  = {nullptr, 0}; // [n_outputs][k], the largest first
         buffer_view<llama_token> ids     = {nullptr, 0}; // [n_outputs][k]
+        buffer_view<float> draft_draw = {nullptr, 0}; // [n_outputs][1 + 3*k]
 
         std::vector<uint32_t> count; // candidates of a cut row
         std::vector<uint8_t>  state; // of each output row

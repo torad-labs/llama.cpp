@@ -27,6 +27,7 @@ void batch_add(llama_batch & batch, llama_token id, llama_pos pos, const std::ve
 
 // --inkling-split <case>: the case of Inkling 2 run on the ranks of devs under -sm tensor and on the first alone
 int test_inkling_split(const std::string & name, size_t seed, const std::vector<ggml_backend_dev_t> & devs);
+int test_inkling_dspark(const std::string & draft, size_t seed, const std::vector<ggml_backend_dev_t> & devs);
 
 // --inkling-data <devs>: Inkling 2 under -sm data (sequence-parallel rows, experts a device) against one device
 int test_inkling_data(size_t seed, const std::vector<ggml_backend_dev_t> & devs);

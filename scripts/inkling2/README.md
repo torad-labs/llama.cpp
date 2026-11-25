@@ -46,7 +46,7 @@ python3 scripts/glm53/dflash_own_head.py \
     --out "$PACKS/Inkling-2-Small-abliterated-e4853745-DSpark-BF16-own-head.gguf"
 ```
 
-Pass `--draft` to load the paired DSpark draft. The flag also applies the draft layout: a 1,572,864-token shared pool, Q8_0 global KV, F16 sliding KV and a 256-token physical microbatch (the full Tensor 4 pool ran out of memory with the paired draft on four RTX PRO 6000 GPUs). The draft runs on `CUDA3` with Q8_0 KV and proposes up to three tokens; the server verifies each proposal with the target's sampling settings. `tensor-4` without the flag is the qualified serving configuration.
+Pass `--draft` to load the paired DSpark draft. The flag also applies the draft layout: Q8_0 global KV, Q8_0 sliding KV and a 256-token physical microbatch. By default the draft is split across `CUDA0,CUDA1,CUDA2,CUDA3` and the target keeps the full 3,014,656-token pool. `--draft-device` takes `all`, a comma list of distinct cards, or one card; a draft parked on one card shrinks the pool to 2,097,152 tokens with Q8_0 KV or 1,310,720 with F16 KV, because the draft's own KV grows with the pool and the full pool beside the whole draft filled CUDA3 (97,258 of 97,887 MiB) and evicted CUDA graphs. `--context` overrides either. The draft uses Q8_0 KV and proposes up to three tokens; the server verifies each proposal with the target's sampling settings. `--draft-layout` applies the same layout and pool without a draft, as the matched control. `tensor-4` without the flag is the qualified serving configuration.
 
 `--draft-depth` and `--draft-device` select other configurations. Use `--draft-model` when supplying a different target path. `--no-draft` is the plain serving control.
 

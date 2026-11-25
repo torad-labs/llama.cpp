@@ -1181,6 +1181,7 @@ public:
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_cand        = nullptr; // each output row's largest logits (build_candidates)
+    ggml_tensor * t_draft_draw  = nullptr; // DSpark feedback: token, candidate IDs, CDF, and logits
     ggml_tensor * t_logits_draft = nullptr; // packed vocabulary, before gather/scatter; candidate records use hot ordinals
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;

@@ -4581,6 +4581,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.devices = parse_device_list(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-split-mode"}, "{layer,tensor}",
+        "split mode for a separate draft model (default: inherited, except tensor and dp use layer for the draft). "
+        "Tensor requires an own-head Inkling 2 DSpark GGUF and a list of at least two devices.",
+        [](common_params & params, const std::string & value) {
+            if (value == "layer") {
+                params.speculative.draft.split_mode = LLAMA_SPLIT_MODE_LAYER;
+            } else if (value == "tensor") {
+                params.speculative.draft.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            } else {
+                throw std::invalid_argument("invalid draft split mode, must be layer or tensor");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SPLIT_MODE"));
     GGML_ASSERT(params.speculative.draft.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"--spec-draft-ngl", "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",

@@ -1539,9 +1539,15 @@ public:
 // token (build_inkling2_draw, src/models/dflash.cpp): in token id order at inverse temperature inv_temp, the first whose
 // cumulative probability is above u. q gets the distribution the token was drawn from, for rejection sampling.
 static llama_token dspark_draw(const llama_sampling_row & row, float inv_temp, float u, std::vector<llama_token_data> & q) {
-    GGML_ASSERT(row.candidates && row.sampled_logits && row.n_candidates > 0 && "a sampled DSpark draft reads candidate rows");
-
     q.clear();
+    if (row.token != LLAMA_TOKEN_NULL && row.sampled_probs) {
+        GGML_ASSERT(row.candidates && row.n_candidates == row.n_sampled_probs);
+        for (uint32_t k = 0; k < row.n_candidates; ++k) {
+            q.push_back({row.candidates[k], row.sampled_logits[k], row.sampled_probs[k]});
+        }
+        return row.token;
+    }
+    GGML_ASSERT(row.candidates && row.sampled_logits && row.n_candidates > 0 && "a sampled DSpark draft reads candidate rows");
     for (uint32_t k = 0; k < row.n_candidates; ++k) {
         q.push_back({ row.candidates[k], row.sampled_logits[k], 0.0f });
     }
@@ -4182,19 +4188,18 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
-        // -sm tensor and -sm dp describe how the target spans the cards. A draft model of its own is a small separate
-        // model, and none of the draft architectures has split-state rules: loaded with the target's mode, a DFlash
-        // draft aborts in its first decode (GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0))
-        if (result.split_mode == LLAMA_SPLIT_MODE_TENSOR || result.split_mode == LLAMA_SPLIT_MODE_DATA) {
-            result.split_mode = LLAMA_SPLIT_MODE_LAYER;
-        }
-
-        // a draft pinned to a single device doesn't need the meta wrapper an inherited -sm tensor would give it
-        // (the device list is null-terminated, so a single device means size 2)
-        const size_t n_devs = std::count_if(params_spec.devices.begin(), params_spec.devices.end(),
-                [](ggml_backend_dev_t d) { return d != nullptr; });
-        if (n_devs == 1) {
-            result.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        if (params_spec.split_mode) {
+            result.split_mode = *params_spec.split_mode;
+            if (result.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                // Target proportions describe its rank order, not the draft's.
+                std::fill_n(result.tensor_split, llama_max_devices(), 0.0f);
+            }
+        } else {
+            const size_t n_devs = std::count_if(params_spec.devices.begin(), params_spec.devices.end(),
+                    [](ggml_backend_dev_t d) { return d != nullptr; });
+            if (n_devs == 1 || result.split_mode == LLAMA_SPLIT_MODE_TENSOR || result.split_mode == LLAMA_SPLIT_MODE_DATA) {
+                result.split_mode = LLAMA_SPLIT_MODE_LAYER;
+            }
         }
 
         if (params_spec.cpuparams.n_threads > 0) {
@@ -4325,6 +4330,13 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    const bool draft_tp = params.speculative.draft.split_mode == LLAMA_SPLIT_MODE_TENSOR;
+    if (draft_tp && (!has_draft || std::count_if(params.devices.begin(), params.devices.end(),
+            [](ggml_backend_dev_t dev) { return dev != nullptr; }) < 2)) {
+        LOG_ERR("%s: --spec-draft-split-mode tensor requires a separate draft and at least two listed devices\n", __func__);
+        return;
+    }
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
@@ -4339,7 +4351,13 @@ common_speculative_init_result::common_speculative_init_result(
         pimpl->model.reset(model_dft);
 
         char inkling_rank[32] = {};
-        if (llama_model_meta_val_str(model_dft, "dflash.dspark.markov_rank", inkling_rank, sizeof(inkling_rank)) >= 0) {
+        const bool inkling = llama_model_meta_val_str(model_dft, "dflash.dspark.markov_rank", inkling_rank, sizeof(inkling_rank)) >= 0;
+        if (draft_tp && (!inkling || llama_model_dflash_variant(model_dft) != LLAMA_DFLASH_VARIANT_DSPARK)) {
+            LOG_ERR("%s: --spec-draft-split-mode tensor is implemented only for Inkling 2 DSpark\n", __func__);
+            pimpl->model.reset();
+            return;
+        }
+        if (inkling) {
             const uint32_t n_seq = std::max(1, params.n_parallel);
             const uint32_t block_rows = 8u*n_seq;
             const uint32_t output_rows = std::clamp(params.speculative.draft.n_max, 1, 7) + 1;

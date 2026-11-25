@@ -2230,6 +2230,26 @@ bool llama_context::get_candidates_ith(int32_t idx, llama_sampling_row & row) {
     float *       logits_row = cand.logits.data + j*cand.k;
     llama_token * ids_row    = cand.ids.data    + j*cand.k;
 
+    if (cand.state[j] == candidates_info::ROW_DSPARK_DRAW) {
+        const float * draw = cand.draft_draw.data + j*(1 + 3*cand.k);
+        if (draw[0] >= 0.0f) {
+            // The CDF is the one the graph used to select this token.
+            const float * cdf = draw + 1 + cand.k;
+            for (uint32_t k = 0; k < cand.k; ++k) {
+                ids_row[k] = (llama_token) draw[1 + k];
+                logits_row[k] = cdf[k] - (k == 0 ? 0.0f : cdf[k - 1]);
+            }
+            row.token = (llama_token) draw[0];
+            row.candidates = ids_row;
+            row.sampled_probs = logits_row;
+            row.sampled_logits = cdf + cand.k;
+            row.n_candidates = row.n_sampled_probs = row.n_sampled_logits = cand.k;
+            return true;
+        }
+        // The final proposal has no feedback consumer; it is drawn on the host.
+        cand.state[j] = candidates_info::ROW_RECORDS;
+    }
+
     if (cand.state[j] == candidates_info::ROW_RECORDS || cand.state[j] == candidates_info::ROW_DRAFT_RECORDS ||
             cand.state[j] == candidates_info::ROW_GREEDY_RECORDS || cand.state[j] == candidates_info::ROW_SAMPLE_RECORDS) {
         const bool draft  = cand.state[j] == candidates_info::ROW_DRAFT_RECORDS;
@@ -2422,6 +2442,7 @@ ggml_backend_event_t llama_context::layer_inp_read_event(ggml_backend_dev_t dev)
             ggml_backend_t simple = ggml_backend_meta_simple_backend(layer_inp_backend, j);
             if (ggml_backend_get_device(simple) == dev) {
                 layer_inp_read_backend = simple;
+                break;
             }
         }
     }
@@ -3797,12 +3818,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (inject_src) {
         // the device of the rows we read: the buffer's, or of a split target the copy on ours
         const ggml_tensor * src = layer_inp_src();
-        ggml_backend_dev_t  dev = src ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer)) : nullptr;
-        inject_backend = inject_src->ev_layer_inp_written && dev ? backend_from_dev(dev) : nullptr;
-        inject_read    = inject_backend ? inject_src->layer_inp_read_event(dev) : nullptr;
-        if (inject_read) {
-            // wait on the host: a device-side wait would stall our queue for the whole target batch,
-            // which trips the Metal command buffer timeout on long prompts
+        if (src && inject_src->ev_layer_inp_written) {
+            const auto buft = ggml_backend_buffer_get_type(src->buffer);
+            for (const auto & backend : backends) {
+                if (ggml_backend_supports_buft(backend.get(), buft)) {
+                    inject_backend = backend.get();
+                    break;
+                }
+            }
+            if (inject_backend) {
+                inject_read = inject_src->layer_inp_read_event(ggml_backend_buft_get_device(buft));
+            }
+        }
+        if (inject_read && ggml_backend_is_meta(inject_backend)) {
+            ggml_backend_event_wait(inject_backend, inject_src->ev_layer_inp_written.get());
+        } else if (inject_read) {
+            // A device wait can trip the Metal command buffer timeout on long prompts.
             ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
         } else {
             inject_src->synchronize();
@@ -3927,6 +3958,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 cand.state[row++] = !as_cand ? candidates_info::ROW_WHOLE :
                     is_sample ? candidates_info::ROW_SAMPLE_RECORDS :
                     is_greedy ? candidates_info::ROW_GREEDY_RECORDS :
+                    res->t_draft_draw ? candidates_info::ROW_DSPARK_DRAW :
                     res->t_logits_draft ? candidates_info::ROW_DRAFT_RECORDS : candidates_info::ROW_RECORDS;
                 rows_whole |= !as_cand;
             }
@@ -3934,6 +3966,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             ggml_backend_t backend_cand = ggml_backend_sched_get_tensor_backend(sched_res, t_cand);
             GGML_ASSERT(backend_cand != nullptr);
             ggml_backend_tensor_get_async(backend_cand, t_cand, cand.records.data + (size_t) n_outputs_prev*cand.n_record, 0, ggml_nbytes(t_cand));
+            if (auto * draw = res->t_draft_draw) {
+                const size_t stride = 1 + 3*cand.k;
+                GGML_ASSERT(cand.draft_draw.has_data() && draw->ne[0] == (int64_t) stride && draw->ne[1] == n_outputs);
+                auto * backend_draw = ggml_backend_sched_get_tensor_backend(sched_res, draw);
+                ggml_backend_tensor_get_async(backend_draw, draw, cand.draft_draw.data + n_outputs_prev*stride, 0, ggml_nbytes(draw));
+            }
         }
 
         // extract logits
@@ -4288,8 +4326,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // rows read as candidates: a row's records, and the k they are cut to
     const size_t cand_k      = (size_t) std::max(0, cparams.n_out_candidates);
     const size_t cand_record = cand_k * (size_t) cparams.n_logits_parts;
+    const size_t draft_draw_stride = cand_k > 1 && cparams.logits_gather && llama_model_is_inkling_draft(model) ? 1 + 3*cand_k : 0;
     const size_t cand_bytes  = cand_k == 0 ? 0 :
-        sizeof(int64_t) + (cand_record*sizeof(int64_t) + cand_k*(sizeof(float) + sizeof(llama_token))) * n_outputs_max;
+        sizeof(int64_t) + (cand_record*sizeof(int64_t) + (cand_k + draft_draw_stride)*sizeof(float) + cand_k*sizeof(llama_token)) * n_outputs_max;
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  = cand_bytes +
@@ -4407,6 +4446,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         cand.ids = {(llama_token *) (base + offset), cand_k*n_outputs_max};
         offset += cand.ids.size * sizeof(llama_token);
 
+        cand.draft_draw = draft_draw_stride ? buffer_view<float>{(float *) (base + offset), draft_draw_stride*n_outputs_max} : buffer_view<float>{nullptr, 0};
+        offset += cand.draft_draw.size * sizeof(float);
+
         cand.k        = (uint32_t) cand_k;
         cand.n_record = (uint32_t) cand_record;
         cand.count.assign(n_outputs_max, 0);
@@ -4415,6 +4457,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         cand.records = {nullptr, 0};
         cand.logits  = {nullptr, 0};
         cand.ids     = {nullptr, 0};
+        cand.draft_draw = {nullptr, 0};
         cand.k        = 0;
         cand.n_record = 0;
         cand.count.clear();
@@ -4512,6 +4555,10 @@ void llama_context::output_reorder() {
             std::swap_ranges(cand.records.data + i0*cand.n_record, cand.records.data + (i0 + 1)*cand.n_record, cand.records.data + i1*cand.n_record);
             std::swap_ranges(cand.logits.data + i0*cand.k, cand.logits.data + (i0 + 1)*cand.k, cand.logits.data + i1*cand.k);
             std::swap_ranges(cand.ids.data + i0*cand.k, cand.ids.data + (i0 + 1)*cand.k, cand.ids.data + i1*cand.k);
+            if (cand.draft_draw.has_data()) {
+                const size_t width = 1 + 3*cand.k;
+                std::swap_ranges(cand.draft_draw.data + i0*width, cand.draft_draw.data + (i0 + 1)*width, cand.draft_draw.data + i1*width);
+            }
             std::swap(cand.count[i0], cand.count[i1]);
             std::swap(cand.state[i0], cand.state[i1]);
         }

@@ -1973,6 +1973,7 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
     t_cand        = nullptr;
+    t_draft_draw  = nullptr;
     t_logits_draft = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
@@ -2041,6 +2042,9 @@ void llm_graph_result::inputs_lost() {
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
+    }
+    if (t_draft_draw != nullptr) {
+        ggml_set_output(t_draft_draw);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);

@@ -331,6 +331,8 @@ static void usage(char ** argv) {
     LOG("  --inkling-split <case>   Compare Inkling 2 under -sm tensor with one device: prefill, decode, chunks, seq-cp,\n");
     LOG("                           state, rollback, graph-churn or layer-inp\n");
     LOG("  --inkling-split-device <devs>  The ranks of that split, one per name (default: CUDA0,CUDA0)\n");
+    LOG("  --inkling-dspark <gguf>  Compare DSpark draft TP4 with one device using the Inkling fixture draft\n");
+    LOG("                           Use GGML_CUDA_AR_BF16_THRESHOLD=0 to compare without BF16 wire rounding\n");
     LOG("  --inkling-data <devs>    Compare Inkling 2 under -sm data (sequence-parallel rows) with one device, on <devs>\n");
     LOG("  --inkling-path <f>/<case>  Compare an optimized path of Inkling 2 with the path it replaced: rel, fuse, conv,\n");
     LOG("                           kv-q8_0, kv-q4_0 or kv-split, in prompt, decode, unified or streams\n");
@@ -4429,6 +4431,7 @@ int main(int argc, char ** argv) {
     std::string dp_device, prefill_device, shared_device;
     std::string tensor_device; // --glm-tensor-device CUDA0,CUDA1,CUDA0,CUDA1: one rank per name, repeats allowed
     std::string inkling_split, inkling_device; // --inkling-split <case> on --inkling-split-device's ranks, as above
+    std::string inkling_dspark; // --inkling-dspark <gguf>: draft fixture on --inkling-split-device
     std::string inkling_data; // --inkling-data <devs>: Inkling 2 under -sm data against one device
     std::string inkling_path, inkling_path_device; // --inkling-path <feature>/<case> on --inkling-path-device
     std::string inkling_window; // --inkling-window <device>
@@ -4472,6 +4475,11 @@ int main(int argc, char ** argv) {
             const bool device = strcmp(argv[i], "--inkling-split-device") == 0;
             if (i + 1 == argc) return 1;
             (device ? inkling_device : inkling_split) = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--inkling-dspark") == 0) {
+            if (i + 1 == argc) return 1;
+            inkling_dspark = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--inkling-data") == 0) {
@@ -4647,15 +4655,16 @@ int main(int argc, char ** argv) {
             }
             return test_inkling_data(seed, ranks);
         }
-        if (!inkling_split.empty()) {
+        if (!inkling_split.empty() || !inkling_dspark.empty()) {
             ggml_backend_load_all();
             std::vector<ggml_backend_dev_t> ranks;
-            for (const auto & name : string_split<std::string>(inkling_device.empty() ? "CUDA0,CUDA0" : inkling_device, ',')) {
+            const auto * defaults = inkling_dspark.empty() ? "CUDA0,CUDA0" : "CUDA0,CUDA1,CUDA2,CUDA3";
+            for (const auto & name : string_split<std::string>(inkling_device.empty() ? defaults : inkling_device, ',')) {
                 const auto device = ggml_backend_dev_by_name(name.c_str());
                 if (!device) throw std::runtime_error("Inkling split device is unavailable: " + name);
                 ranks.push_back(device);
             }
-            return test_inkling_split(inkling_split, seed, ranks);
+            return inkling_dspark.empty() ? test_inkling_split(inkling_split, seed, ranks) : test_inkling_dspark(inkling_dspark, seed, ranks);
         }
         if (!inkling_path.empty()) {
             ggml_backend_load_all();

@@ -1,5 +1,7 @@
 import math
 import pytest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from utils import *
 import inkling_fixture as fx
 
@@ -583,6 +585,79 @@ def test_inkling_dspark_sampled_drafts_of_different_lengths(inkling_pair):
         drafted, _, _ = spec_counts(s)
         assert drafted > 0
         assert spec_reject_rows(s) > 0
+    finally:
+        s.stop()
+
+
+@pytest.mark.skipif(os.environ.get("INKLING_DSPARK_TP4") != "1", reason="requires four logical CUDA devices")
+def test_inkling_dspark_tp4_rollback_and_restore(tmp_path, monkeypatch):
+    target = fx.write_model(str(tmp_path))
+    draft = str(tmp_path / "draft.gguf")
+    fx.write_dspark_draft(draft, target, tp4=True)
+    for name, value in {
+        "LLAMA_ARG_DEVICE": "CUDA0,CUDA1,CUDA2,CUDA3",
+        "LLAMA_ARG_SPLIT_MODE": "tensor",
+        "LLAMA_TOK_EMBD_GPU": "1",
+        "LLAMA_ARG_FIT": "off",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    def config():
+        s = create_inkling_server((target, draft), "greedy")
+        s.n_slots = 23
+        s.n_ctx = 23 * 256
+        s.n_batch = s.n_ubatch = 256
+        s.fa = "on"
+        s.kv_unified = True
+        s.server_continuous_batching = True
+        return s
+
+    def complete(s, seq, *, slot=None):
+        res = s.make_request("POST", "/completion", data={
+            "prompt": INKLING_PROMPT * 4 + [31 + seq],
+            "id_slot": seq if slot is None else slot,
+            "temperature": 0.0,
+            "n_predict": 12 + seq % 4,
+            "ignore_eos": True,
+            "cache_prompt": True,
+            "return_tokens": True,
+        })
+        assert res.status_code == 200
+        return res.body["tokens"]
+
+    plain = config()
+    plain.model_draft = plain.spec_type = None
+    plain.start()
+    try:
+        expected = [complete(plain, i) for i in range(23)]
+    finally:
+        plain.stop()
+
+    monkeypatch.setenv("LLAMA_ARG_SPEC_DRAFT_SPLIT_MODE", "tensor")
+    s = config()
+    s.spec_synth_rates = [0.0] * 3
+    s.server_slots = True
+    s.slot_save_path = str(tmp_path)
+    s.start()
+    try:
+        for n in range(1, 24):
+            ready = Barrier(n)
+
+            def send(seq):
+                ready.wait()
+                return complete(s, seq)
+
+            with ThreadPoolExecutor(max_workers=n) as pool:
+                assert list(pool.map(send, range(n))) == expected[:n]
+
+        path = {"filename": "dspark-state.bin"}
+        saved = s.make_request("POST", "/slots/0?action=save", data=path)
+        assert saved.status_code == 200 and saved.body["n_saved"] > 0
+        restored = s.make_request("POST", "/slots/22?action=restore", data=path)
+        assert restored.status_code == 200 and restored.body["n_restored"] == saved.body["n_saved"]
+        assert complete(s, 0, slot=22) == expected[0]
+        drafted, accepted, _ = spec_counts(s)
+        assert drafted > 0 and accepted == 0
     finally:
         s.stop()
 

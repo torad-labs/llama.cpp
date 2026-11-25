@@ -30,9 +30,12 @@ SLOTS = 23
 SLOT_CONTEXT = 262144
 CODING_SLOT_CONTEXT = 294912  # Shared by prompt, reasoning, tool history and generated text.
 BATCH_SIZE = 2048
-DRAFT_CONTEXT = 1572864
 DRAFT_UBATCH_SIZE = 256
 MAX_SLOTS = 256  # the engine's sequence limit (LLAMA_MAX_SEQ)
+DEVICES = ("CUDA0", "CUDA1", "CUDA2", "CUDA3")
+# Pool for a draft parked whole on one card, by target KV type. It keeps about 6 GiB free on that card beside
+# the draft weights and its n_ctx-sized KV, estimated from the full pool's 97,258 of 97,887 MiB on CUDA3.
+SINGLE_DEVICE_DRAFT_CONTEXT = {"q8_0": 2097152, "f16": 1310720}
 # The one serving configuration for the ablated model on four RTX PRO 6000 cards. Every variant tested
 # against it lost or was an experiment, and their settings are recorded here so nothing is re-derived:
 #   stock decode order (all switches off): 289.6/290.7 tok/s in the 2026-11-21 six-arm window, 292.0 in the
@@ -67,6 +70,14 @@ def expert_row_limit(value):
     return value if value == "auto" else int(value)
 
 
+def draft_devices(value):
+    """all, or distinct names from CUDA0..CUDA3 joined by commas; returned as the engine's comma list."""
+    names = list(DEVICES) if value == "all" else value.split(",")
+    if not all(name in DEVICES for name in names) or len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError(f"{value!r} is not all or distinct names from {', '.join(DEVICES)}")
+    return ",".join(names)
+
+
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=sorted(PROFILES), default="tensor-4",
@@ -76,7 +87,8 @@ def arguments(argv=None):
     parser.add_argument("--model", type=Path, help="A local GGUF in place of the profile's pack")
     parser.add_argument("--draft", action=argparse.BooleanOptionalAction,
                         help="Use the paired native DSpark draft (default off; the flag also applies the draft "
-                             "layout: context 1572864, ubatch 256, q8_0 target KV)")
+                             "layout: ubatch 256, q8_0 target KV, the full pool when the draft is split across cards "
+                             "and a smaller one when it sits on one card)")
     parser.add_argument("--draft-layout", action=argparse.BooleanOptionalAction,
                         help="Apply the draft layout without a draft: the matched control of a draft A/B")
     parser.add_argument("--draft-model", type=Path, help="An explicit Inkling DSpark GGUF with its own vocabulary tensors")
@@ -85,8 +97,9 @@ def arguments(argv=None):
     parser.add_argument("--draft-sampling", choices=["probabilistic", "greedy"], default="probabilistic",
                         help="probabilistic samples the draft at the request's temperature and verifies by rejection; "
                              "greedy proposes the draft's first choice and verifies by matching (default: probabilistic)")
-    parser.add_argument("--draft-device", choices=["CUDA0", "CUDA1", "CUDA2", "CUDA3"], default="CUDA3",
-                        help="Device for the draft model (default: CUDA3)")
+    parser.add_argument("--draft-device", type=draft_devices, default=",".join(DEVICES),
+                        help="Devices for the draft model: all, a comma list of CUDA0..CUDA3, or one card, which "
+                             "shrinks the pool to leave it headroom (default: CUDA0,CUDA1,CUDA2,CUDA3)")
     parser.add_argument("--dspark-trim-block", action=argparse.BooleanOptionalAction, default=True,
                         help="Trim DSpark draft blocks to n_max + 1 rows when drafting (default: enabled)")
     parser.add_argument("--mmproj", type=Path, help="A local vision projector in place of the packs' F16 one")
@@ -253,8 +266,10 @@ def make_plan(args):
     kv = args.kv_cache or ("q8_0" if draft_layout else profile["kv"])
     swa_kv = args.swa_kv_cache if args.swa_kv_cache is not None else profile.get("swa_kv")
     slots = args.slots if args.slots is not None else SLOTS
-    # Use the reduced draft pool whenever draft layout is active so CUDA3 keeps headroom for CUDA graphs alongside DSpark.
-    default_context = DRAFT_CONTEXT if draft_layout else profile["context"]
+    # A draft split across cards keeps the full pool; one parked on a single card needs room beside it there.
+    # f8_e4m3 and q4_0 are no larger than q8_0, so the q8_0 entry fits them too.
+    one_card = draft_layout and "," not in args.draft_device
+    default_context = SINGLE_DEVICE_DRAFT_CONTEXT.get(kv, SINGLE_DEVICE_DRAFT_CONTEXT["q8_0"]) if one_card else profile["context"]
     context = args.context if args.context is not None else default_context
     slot_context = args.slot_context if args.slot_context is not None else profile.get("slot_context", SLOT_CONTEXT)
     if not 1 <= args.port <= 65535:
@@ -330,6 +345,8 @@ def make_plan(args):
                  "--spec-draft-device", args.draft_device, "--spec-draft-ngl", "99",
                  "--spec-draft-ubatch", str(DRAFT_UBATCH_SIZE),
                  "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+        if "," in args.draft_device:
+            argv += ["--spec-draft-split-mode", "tensor"]
     env = {
         **args.tuned_env,
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
