@@ -151,7 +151,8 @@ llama_kv_cache::llama_kv_cache(
     // 10 of 110 steps captured every graph again). It reads densely at every length, so it pads as a dense pool does.
     // Its DSpark draft's pool too: 23 sessions crossed 256 cells every ~5 drafted rounds, each crossing a round that ran
     // the draft's graphs uncaptured, one that captured them and one that destroyed them (four RTX PRO 6000, Nov 20, 2026)
-    if ((hparams.indexer_kpool > 0 || model.arch == LLM_ARCH_INKLING2 || llama_model_is_inkling_draft(model)) && n_stream < n_seq_max) {
+    if ((hparams.indexer_kpool > 0 || model.arch == LLM_ARCH_INKLING2 || llama_model_is_inkling_draft(model) ||
+            model.arch == LLM_ARCH_DFLASH) && n_stream < n_seq_max) {
         const char * legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
 
         if (!legacy || atoi(legacy) != 1) {

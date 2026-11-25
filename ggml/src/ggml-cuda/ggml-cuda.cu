@@ -4636,8 +4636,8 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
         return false;
     }
 
-    // The fused kernel needs one block per tile (no stream-k split), so only fuse if the tiling is efficient.
-    return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, nchannels, device);
+    // Fused MMQ runs one block per tile, with no Stream-K split.
+    return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, x_up->ne[0], nchannels, device);
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4662,7 +4662,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool force_mmf = ggml_get_op_params_i32(dst, 1) == GGML_HINT_MUL_MAT_FORCE_MMF;
 
     // F32 weights at few columns or a short K, where cuBLAS runs below the bytes' time (GGML_CUDA_F32_FEW)
-    if (!force_mmf && ggml_cuda_mul_mat_f32_few(ctx, src0, src1, dst)) {
+    if (ggml_cuda_mul_mat_f32_few(ctx, src0, src1, dst)) {
         return;
     }
 

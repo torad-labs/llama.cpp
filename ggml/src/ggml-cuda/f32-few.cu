@@ -8,6 +8,7 @@
 // the warps, run in a fixed order, so the result does not depend on timing.
 #define F32_COLS_WARPS  12
 #define F32_COLS_KLANES 8
+#define F32_COLS_TILE   32
 #define F32_COLS_MAX    32
 
 template <int rows, int cpl> // rows of a block, columns of a lane (a warp has 4 column groups)
@@ -22,6 +23,8 @@ static __global__ __launch_bounds__(F32_COLS_WARPS*WARP_SIZE, 1) void f32_cols(
     const int kl   = lane%F32_COLS_KLANES;
     const int cg   = lane/F32_COLS_KLANES;
     const int64_t row0 = int64_t(blockIdx.x)*rows;
+    const int     col0 = int(blockIdx.y)*ncol;
+    const int     ncols_tile = min(ncol, ncols - col0);
 
     // rows and columns past the end read the last one and are not written
     const float * ar[rows];
@@ -32,7 +35,7 @@ static __global__ __launch_bounds__(F32_COLS_WARPS*WARP_SIZE, 1) void f32_cols(
     const float * xc[cpl];
 #pragma unroll
     for (int j = 0; j < cpl; ++j) {
-        xc[j] = x + min(int64_t(cg*cpl + j), int64_t(ncols - 1))*s11;
+        xc[j] = x + min(int64_t(col0 + cg*cpl + j), int64_t(ncols - 1))*s11;
     }
 
     float acc[rows][cpl] = {};
@@ -77,13 +80,13 @@ static __global__ __launch_bounds__(F32_COLS_WARPS*WARP_SIZE, 1) void f32_cols(
     for (int o = threadIdx.x; o < rows*ncol; o += blockDim.x) {
         const int r = o%rows;
         const int c = o/rows;
-        if (row0 + r < nrows && c < ncols) {
+        if (row0 + r < nrows && c < ncols_tile) {
             float sum = 0.0f;
 #pragma unroll
             for (int w = 0; w < F32_COLS_WARPS; ++w) {
                 sum += partial[w][r][c];
             }
-            dst[c*ldc + row0 + r] = sum;
+            dst[(col0 + c)*ldc + row0 + r] = sum;
         }
     }
 }
@@ -91,7 +94,8 @@ static __global__ __launch_bounds__(F32_COLS_WARPS*WARP_SIZE, 1) void f32_cols(
 template <int rows, int cpl>
 static void launch_f32_cols(cudaStream_t stream, const float * a, const float * x, float * dst, const int64_t k,
         const int64_t nrows, const int ncols, const int64_t s01, const int64_t s11, const int64_t ldc) {
-    const dim3 grid((nrows + rows - 1)/rows);
+    constexpr int ncol = 4*cpl;
+    const dim3 grid((nrows + rows - 1)/rows, (ncols + ncol - 1)/ncol);
     f32_cols<rows, cpl><<<grid, F32_COLS_WARPS*WARP_SIZE, 0, stream>>>(a, x, dst, k, nrows, ncols, s01, s11, ldc);
 }
 
@@ -196,11 +200,21 @@ bool ggml_cuda_mul_mat_f32_few(ggml_backend_cuda_context & ctx, const ggml_tenso
         return true;
     }
 
-    if (ne12 == 1 && ne11 <= F32_COLS_MAX) {
-        // the router: weights [K, rows] against up to 32 columns
-        const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    const auto & dev = ggml_cuda_info().devices[ctx.device];
+    int ncols_limit = F32_COLS_MAX;
+    if (dev.cc == GGML_CUDA_CC_BLACKWELL) {
+        // The 4096-wide projections stop winning past 16 output rows in a three-tile decode.
+        if (ne00 == 4096) {
+            ncols_limit = ne01 <= 16 ? 69 : ne01 <= 32 ? F32_COLS_MAX : 16;
+        } else if (ne00 == 128 && ne01 >= 2048) {
+            ncols_limit = 16;
+        }
+    }
+    if (ne12 == 1 && ne11 <= ncols_limit) {
+        const int nsm = dev.nsm;
         const int64_t ldc = nb1/sizeof(float);
-        const int rows = ne01 <= nsm ? 1 : ne01 <= 2*nsm ? 2 : ne01 <= 3*nsm ? 3 : 4;
+        const int ncol_tiles = (int) ((ne11 + F32_COLS_TILE - 1) / F32_COLS_TILE);
+        const int rows = ne01 * ncol_tiles <= nsm ? 1 : ne01 * ncol_tiles <= 2*nsm ? 2 : ne01 * ncol_tiles <= 3*nsm ? 3 : 4;
         const float * a = (const float *) src0->data;
         const float * x = (const float *) src1->data;
         float * d = (float *) dst->data;

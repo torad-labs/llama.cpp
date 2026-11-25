@@ -347,8 +347,10 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     // here, after the convolution, g_a beside f_a (two mat-vecs of one input, which ggml-cuda runs as one launch) and
     // g_b before the recurrence, so that nothing after the recurrence waits on them
     ggml_build_forward_expand(gf, qk);
-    ggml_tensor * f_a  = kda_mul_mat(layer.ssm_f_a, inp);
-    ggml_tensor * gate = kda_mul_mat(layer.ssm_g_b, kda_mul_mat(layer.ssm_g_a, inp));
+    ggml_tensor * f_a      = kda_mul_mat(layer.ssm_f_a, inp);
+    ggml_tensor * g_a      = kda_mul_mat(layer.ssm_g_a, inp);
+    ggml_tensor * beta_raw = ggml_reshape_4d(ctx0, kda_mul_mat(layer.ssm_beta, inp), 1, n_head, n_seq_tokens, n_seqs);
+    ggml_tensor * gate     = kda_mul_mat(layer.ssm_g_b, g_a);
     ggml_build_forward_expand(gf, f_a);
     ggml_build_forward_expand(gf, gate);
 
@@ -362,7 +364,6 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     g = ggml_reshape_4d(ctx0, g, head_dim, n_head, n_seq_tokens, n_seqs);
     cb(g, "kda_gate", il);
 
-    ggml_tensor * beta_raw = ggml_reshape_4d(ctx0, kda_mul_mat(layer.ssm_beta, inp), 1, n_head, n_seq_tokens, n_seqs);
     ggml_tensor * beta = ggml_sigmoid(ctx0, beta_raw);
     cb(beta, "kda_beta", il);
 
@@ -481,6 +482,11 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
                 cb(t, name, il);
             });
 
+    // no query (the MTP head's KV-only pass): the keys are stored and pooled, nothing is scored
+    if (qr == nullptr) {
+        return nullptr;
+    }
+
     if (inp_kp->draft_top_k) {
         return inp_kp->draft_top_k;
     }
@@ -497,13 +503,34 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         return pool_k;
     };
 
+    // Under -sm tensor with multiple concurrent streams on a shared pool, shard the indexer and top-k across ranks by
+    // stream and all-gather only the compact pool selection (I32), cutting kbuf reads and scoring by n_devices.
+    static const bool stream_split_legacy = ggml_env_switch("LLAMA_GLM5_INDEXER_STREAM_SPLIT_LEGACY");
+    static const bool gather_legacy = ggml_env_switch("LLAMA_INDEXER_GATHER_LEGACY");
+    const size_t n_meta_devices = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? model.get_split_state_ud.n_devices : 0;
+    const bool shard_streams = !stream_split_legacy && cparams.fused_lid && !gather_legacy &&
+            cparams.n_seq_devices == 1 && inp_kp->shared && n_meta_devices > 1 && n_stream >= (int64_t) n_meta_devices;
+    std::vector<int64_t> stream_counts;
+    if (shard_streams) {
+        stream_counts.resize(n_meta_devices);
+        for (size_t d = 0; d < n_meta_devices; ++d) {
+            stream_counts[d] = n_stream / (int64_t) n_meta_devices + ((int64_t) d < n_stream % (int64_t) n_meta_devices ? 1 : 0);
+        }
+    }
+
     // no rope: n_rot() is 0 for the whole text tower
-    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
+    ggml_tensor * qr_in = shard_streams ?
+            ggml_backend_meta_scatter(ctx0, ggml_reshape_3d(ctx0, qr, qr->ne[0], n_tps, n_stream), 2, stream_counts.data(), n_meta_devices) :
+            qr;
+    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr_in);
     iq = ggml_reshape_4d(ctx0, iq, d_idx, n_ihead, n_tps, n_stream);
     cb(iq, "indexer_q", il);
 
     // sign-unconstrained head weights; PREC_F32 is load-bearing, bf16 swaps near-tied pools
-    ggml_tensor * w = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
+    ggml_tensor * cur_in = shard_streams ?
+            ggml_backend_meta_scatter(ctx0, ggml_reshape_3d(ctx0, cur, cur->ne[0], n_tps, n_stream), 2, stream_counts.data(), n_meta_devices) :
+            cur;
+    ggml_tensor * w = ggml_mul_mat(ctx0, layer.indexer_proj, cur_in);
     ggml_prec_set_acc(w, GGML_PREC_F32);
     w = ggml_reshape_4d(ctx0, w, n_ihead, n_tps, 1, n_stream);
     w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(d_idx*n_ihead)));
@@ -512,15 +539,19 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * pool_score = nullptr;
 
     if (cparams.fused_lid) {
-        static const bool gather_legacy = ggml_env_switch("LLAMA_INDEXER_GATHER_LEGACY");
-
         if (!gather_legacy) {
             // the pooled keys read where the cache holds them, pool p at cell pool_reps[p], scored in f32 like the
             // gathered rows (ggml_lightning_indexer_rows): no copy of every pool's key each token
             ggml_tensor * pooled = ggml_view_4d(ctx0, kbuf, d_idx, 1, n_kv, kbuf->ne[3],
                     kbuf->nb[1], kbuf->nb[2], kbuf->nb[3], 2*kbuf->nb[1]);
+            ggml_tensor * pool_reps = shard_streams ?
+                    ggml_backend_meta_scatter(ctx0, inp_kp->pool_reps, 1, stream_counts.data(), n_meta_devices) :
+                    inp_kp->pool_reps;
+            ggml_tensor * pool_bias = shard_streams ?
+                    ggml_backend_meta_scatter(ctx0, inp_kp->pool_bias_f16, 3, stream_counts.data(), n_meta_devices) :
+                    inp_kp->pool_bias_f16;
 
-            pool_score = ggml_lightning_indexer_rows(ctx0, iq, pooled, inp_kp->pool_reps, w, inp_kp->pool_bias_f16);
+            pool_score = ggml_lightning_indexer_rows(ctx0, iq, pooled, pool_reps, w, pool_bias);
 
             // LLAMA_INDEXER_Q8_QUERY=1, lossy and off unless set: over a q8_0 cache (-ctki q8_0) the query is rounded
             // to 8-bit blocks and scored on int8 tensor cores where the backend has them
@@ -528,7 +559,10 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
             if (q8_query && pooled->type == GGML_TYPE_Q8_0) {
                 ggml_lightning_indexer_set_q8_query(pool_score);
                 if (inp_kp->resident_rows) {
-                    ggml_lightning_indexer_set_kpool_padding(pool_score, inp_kp->resident_rows);
+                    ggml_tensor * res_rows = shard_streams ?
+                            ggml_backend_meta_scatter(ctx0, inp_kp->resident_rows, 2, stream_counts.data(), n_meta_devices) :
+                            inp_kp->resident_rows;
+                    ggml_lightning_indexer_set_kpool_padding(pool_score, res_rows);
                 }
             }
         } else {
@@ -565,9 +599,15 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
 
     // fewer than select_k live pools (finite scores) fill the top-k with dump pools (-FLT_MAX), never with a dead pool
     // (-inf), whose cells may be another slot's: each dump pool's cells are its own, past n_kv (llm_graph_input_kpool)
-    pool_score = ggml_concat(ctx0, pool_score, inp_kp->pool_dump, 0);
+    ggml_tensor * pool_dump = shard_streams ?
+            ggml_backend_meta_scatter(ctx0, inp_kp->pool_dump, 2, stream_counts.data(), n_meta_devices) :
+            inp_kp->pool_dump;
+    pool_score = ggml_concat(ctx0, pool_score, pool_dump, 0);
 
     ggml_tensor * sel = ggml_cont(ctx0, ggml_top_k(ctx0, pool_score, (int) select_k));
+    if (shard_streams) {
+        sel = ggml_backend_meta_gather(ctx0, sel);
+    }
     cb(sel, "indexer_top_k_pools", il);
 
     ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*n_tps, n_stream);
@@ -892,7 +932,12 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llm_graph_params & params)
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // Catch-up and prompt batches with no outputs (and masked h_nextn) only fill the latent KV and indexer caches.
+    // LLAMA_MTP_KV_ONLY_LEGACY=1 keeps the full DSA + MoE FFN + LM head pass. Read at each build, so a test can compare both.
+    const bool kv_only = n_outputs == 0 && cparams.embeddings_nextn_masked && !ggml_env_switch("LLAMA_MTP_KV_ONLY_LEGACY");
+
+    // an input no node reads is not allocated, and its set_input would write a null buffer
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
     llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k();
 
@@ -928,6 +973,35 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llm_graph_params & params)
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
+
+    if (kv_only) {
+        if (inp_kp) {
+            // pooled as the full pass pools them, so the next scoring step does not re-pool the whole sequence
+            build_indexer(layer, inp_kp, cur, nullptr, indexer_scoring, il);
+            if (inp_kp->pool_cells) {
+                // set_input writes these host inputs, and the bank patches it emits apply through pool_cells
+                ggml_build_forward_expand(gf, inp_kp->pool_cells);
+                if (inp_kp->draft_top_k) {
+                    ggml_build_forward_expand(gf, inp_kp->draft_top_k);
+                }
+                for (ggml_tensor * t : { inp_kp->pool_bias, inp_kp->pool_dump, inp_kp->pool_reps, inp_kp->mask_cells,
+                                         inp_kp->mask_rows, inp_kp->sel_mask, inp_kp->cand_mask }) {
+                    if (t && t->op == GGML_OP_NONE) {
+                        ggml_build_forward_expand(gf, t);
+                    }
+                }
+            }
+        }
+        ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+        kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+        cb(kv, "dsa_kv_a_norm", il);
+        ggml_tensor * k = ggml_reshape_3d(ctx0, kv, hparams.n_lora_kv, 1, n_tokens);
+        cb(k, "dsa_kv_latent", il);
+        auto * inp_attn = inp_mem->get_attn();
+        ggml_build_forward_expand(gf, k);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, k, inp_attn->get_k_idxs(), il));
+        return;
+    }
 
     cur = build_layer_attn(model, inp_mem, inp_kp, indexer_scoring, cur, il);
 

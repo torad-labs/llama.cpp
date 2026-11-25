@@ -524,13 +524,13 @@ static __host__ bool mmq_kquant_staged(const ggml_type type, const int cc) {
     return mmq_is_staged_kquant_type(type) && blackwell_mma_available(cc) && !ggml_cuda_mmq_kquant_staged_legacy();
 }
 
-// MoE tile width column target: Blackwell Q3_K/Q4_K/Q5_K uses 1.5-sigma spread; other types (including IQ3_XXS) keep 3-sigma.
+// Blackwell staged K-quants use 1.5-sigma spread; other types keep 3-sigma.
 static inline __host__ int64_t ggml_cuda_mmq_moe_spread_ncols(
         const ggml_type type, const int cc, const int64_t ne12, const int64_t n_expert_used,
         const int64_t n_experts, const bool kquant_spread_legacy) {
-    const bool kquant_bw = !kquant_spread_legacy && cc == GGML_CUDA_CC_BLACKWELL && mmq_is_staged_kquant_type(type);
+    const bool tight_bw = !kquant_spread_legacy && cc == GGML_CUDA_CC_BLACKWELL && mmq_is_staged_kquant_type(type);
     const double mean  = double(ne12 * n_expert_used) / double(n_experts);
-    const double sigma = kquant_bw ? 1.5 : 3.0;
+    const double sigma = tight_bw ? 1.5 : 3.0;
     return int64_t(std::ceil(mean + sigma * std::sqrt(mean)));
 }
 
@@ -2302,4 +2302,5 @@ void ggml_cuda_mul_mat_q_fused_two(
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
 // prec_requested: the src1 precision requested by the fused MUL_MATs.
-bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, ggml_prec prec_requested, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);
+bool ggml_cuda_mmq_fusion_is_efficient(
+    ggml_type type, ggml_prec prec_requested, int64_t nrows_x, int64_t ncols, int64_t k, int64_t nchannels, int device);

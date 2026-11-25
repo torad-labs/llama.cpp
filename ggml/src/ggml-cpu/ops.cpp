@@ -8582,21 +8582,22 @@ void ggml_compute_forward_upscale(
 
 // ggml_compute_forward_pad
 
-template<bool circular_t>
-static void ggml_compute_forward_pad_f32(
+// T is float or int32_t: a pad copies elements and fills zero bits, so any 4-byte type pads the same way
+template<typename T, bool circular_t>
+static void ggml_compute_forward_pad_x32(
     const ggml_compute_params * params,
           ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
 
-    assert(dst->nb[0] == sizeof(float));
+    assert(dst->nb[0] == sizeof(T));
 
     const int ith = params->ith;
     const int nth = params->nth;
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
-    float * dst_ptr = (float *) dst->data;
+    T * dst_ptr = (T *) dst->data;
     const int32_t lp0 = ggml_get_op_params_i32(dst, 0);
     const int32_t rp0 = ggml_get_op_params_i32(dst, 1);
     const int32_t lp1 = ggml_get_op_params_i32(dst, 2);
@@ -8607,14 +8608,14 @@ static void ggml_compute_forward_pad_f32(
     const int32_t rp3 = ggml_get_op_params_i32(dst, 7);
 
     const int64_t nrows = ne1 * ne2 * ne3;
-    const bool src_row_contig = src0->nb[0] == sizeof(float);
+    const bool src_row_contig = src0->nb[0] == sizeof(T);
 
     for (int64_t row = ith; row < nrows; row += nth) {
         const int64_t i1 = row % ne1;
         const int64_t i2 = (row / ne1) % ne2;
         const int64_t i3 = row / (ne1 * ne2);
 
-        float * dst_row = dst_ptr + row * ne0;
+        T * dst_row = dst_ptr + row * ne0;
 
         if constexpr (circular_t) {
             // circular padding wraps around on a torus
@@ -8624,29 +8625,29 @@ static void ggml_compute_forward_pad_f32(
 
             for (int64_t i0 = 0; i0 < ne0; ++i0) {
                 const int64_t src_i0 = ggml_wrap_around(i0 - lp0, ne00);
-                dst_row[i0] = *(const float *)((const char *) src0->data + src_i3*nb03 + src_i2*nb02 + src_i1*nb01 + src_i0*nb00);
+                dst_row[i0] = *(const T *)((const char *) src0->data + src_i3*nb03 + src_i2*nb02 + src_i1*nb01 + src_i0*nb00);
             }
         } else {
             const bool interior = (i1 >= lp1 && i1 < ne1 - rp1)
                                && (i2 >= lp2 && i2 < ne2 - rp2)
                                && (i3 >= lp3 && i3 < ne3 - rp3);
             if (!interior) {
-                memset(dst_row, 0, ne0 * sizeof(float));
+                memset(dst_row, 0, ne0 * sizeof(T));
                 continue;
             }
 
             const char * src_row = (const char *) src0->data + (i3 - lp3)*nb03 + (i2 - lp2)*nb02 + (i1 - lp1)*nb01;
 
             if (src_row_contig && lp0 >= 0 && rp0 >= 0) {
-                memset(dst_row, 0, lp0 * sizeof(float));
-                memcpy(dst_row + lp0, src_row, ne00 * sizeof(float));
-                memset(dst_row + lp0 + ne00, 0, rp0 * sizeof(float));
+                memset(dst_row, 0, lp0 * sizeof(T));
+                memcpy(dst_row + lp0, src_row, ne00 * sizeof(T));
+                memset(dst_row + lp0 + ne00, 0, rp0 * sizeof(T));
             } else {
                 for (int64_t i0 = 0; i0 < ne0; ++i0) {
                     if (i0 >= lp0 && i0 < ne0 - rp0) {
-                        dst_row[i0] = *(const float *)(src_row + (i0 - lp0)*nb00);
+                        dst_row[i0] = *(const T *)(src_row + (i0 - lp0)*nb00);
                     } else {
-                        dst_row[i0] = 0.0f;
+                        dst_row[i0] = T(0);
                     }
                 }
             }
@@ -8664,9 +8665,17 @@ void ggml_compute_forward_pad(
         case GGML_TYPE_F32:
             {
                 if (circular) {
-                    ggml_compute_forward_pad_f32<true>(params, dst);
+                    ggml_compute_forward_pad_x32<float, true>(params, dst);
                 } else {
-                    ggml_compute_forward_pad_f32<false>(params, dst);
+                    ggml_compute_forward_pad_x32<float, false>(params, dst);
+                }
+            } break;
+        case GGML_TYPE_I32:
+            {
+                if (circular) {
+                    ggml_compute_forward_pad_x32<int32_t, true>(params, dst);
+                } else {
+                    ggml_compute_forward_pad_x32<int32_t, false>(params, dst);
                 }
             } break;
         default:

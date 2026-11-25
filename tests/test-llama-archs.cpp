@@ -1260,6 +1260,131 @@ static bool test_glm_mtp_index(const size_t seed, const std::vector<ggml_backend
     return step(-1, 47, true);
 }
 
+// The MTP head's KV-only pass (n_outputs == 0, masked h_nextn): a batch with no outputs stores the latent K and the
+// indexer key, gate and pooled key, and skips DSA attention, the MoE FFN and the LM head. Two MTP contexts, one under
+// LLAMA_MTP_KV_ONLY_LEGACY=1, decode the same no-output batches (prompts of three sequences across the dense span and
+// past it, a catch-up of 1-3 rows each, a rollback): every sequence's saved state (latent KV, indexer cache) is the same
+// bytes, and the next decode with outputs gives the same logits bit for bit. The KV-only graph holds no FFN and no head.
+static bool test_glm_mtp_kv_only(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int n_embd  = llama_model_n_embd(model);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int n_seq   = 3;
+
+    struct seen_nodes { int ffn = 0; int head = 0; };
+    const auto make = [&](bool legacy, seen_nodes * seen) {
+        set_env("LLAMA_MTP_KV_ONLY_LEGACY", legacy ? "1" : nullptr);
+        llama_context_params params = llama_context_default_params();
+        params.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx      = 512*n_seq;
+        params.n_batch    = params.n_ubatch = 256;
+        params.n_seq_max  = n_seq;
+        params.kv_unified = true;
+        params.n_threads  = params.n_threads_batch = 4;
+        params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            if (!ask) return false;
+            auto * s = static_cast<seen_nodes *>(data);
+            const std::string name = t->name;
+            if (name.find("mtp_ffn_out") == 0) ++s->ffn;
+            if (name.find("result_output") == 0 || name.find("mtp_draft_logits") == 0) ++s->head;
+            return false;
+        };
+        params.cb_eval_user_data = seen;
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        if (ctx) llama_set_embeddings_nextn(ctx.get(), true, true);
+        return ctx;
+    };
+    seen_nodes seen_kv, seen_full;
+    llama_context_ptr kv_only = make(false, &seen_kv);
+    llama_context_ptr full    = make(true,  &seen_full);
+    set_env("LLAMA_MTP_KV_ONLY_LEGACY", nullptr);
+    if (!kv_only || !full) throw std::runtime_error("MTP KV-only: failed to create a context");
+
+    std::mt19937 rng(seed + 7);
+    std::normal_distribution<float> normal(0.0f, 0.1f);
+    std::vector<llama_pos> n_past(n_seq, 0);
+    // one batch, no outputs unless asked, the sequences' rows consecutive; the same batch to both contexts
+    const auto decode = [&](const std::vector<std::pair<llama_seq_id, int>> & rows, bool output) {
+        int n = 0;
+        for (const auto & r : rows) n += r.second;
+        llama_batch batch = llama_batch_init(n, 0, 1);
+        std::vector<float> hidden((size_t) n*n_embd);
+        for (auto & v : hidden) v = normal(rng);
+        for (const auto & r : rows) {
+            const auto toks = get_tokens(r.second, n_vocab, rng());
+            for (int i = 0; i < r.second; ++i) {
+                batch_add(batch, toks[i], n_past[r.first]++, {r.first}, output);
+            }
+        }
+        batch.embd = hidden.data();
+        seen_kv = seen_full = {};
+        set_env("LLAMA_MTP_KV_ONLY_LEGACY", nullptr);
+        const int rc_kv   = llama_decode(kv_only.get(), batch);
+        set_env("LLAMA_MTP_KV_ONLY_LEGACY", "1");
+        const int rc_full = llama_decode(full.get(), batch);
+        set_env("LLAMA_MTP_KV_ONLY_LEGACY", nullptr);
+        std::vector<float> out_kv, out_full;
+        for (int i = 0; output && rc_kv == 0 && rc_full == 0 && i < n; ++i) {
+            const float * a = llama_get_logits_ith(kv_only.get(), i);
+            const float * b = llama_get_logits_ith(full.get(), i);
+            out_kv.insert(out_kv.end(), a, a + n_vocab);
+            out_full.insert(out_full.end(), b, b + n_vocab);
+        }
+        batch.embd = nullptr;
+        llama_batch_free(batch);
+        if (rc_kv != 0 || rc_full != 0) throw std::runtime_error("MTP KV-only: decode failed");
+        if (!output && (seen_kv.ffn != 0 || seen_kv.head != 0 || seen_full.ffn == 0)) {
+            LOG_ERR("MTP KV-only: a no-output batch ran %d FFN and %d head nodes (want 0), the legacy one %d FFN (want > 0)\n",
+                    seen_kv.ffn, seen_kv.head, seen_full.ffn);
+            return false;
+        }
+        return out_kv == out_full;
+    };
+    const auto same_cells = [&](const char * what) {
+        for (llama_seq_id s = 0; s < n_seq; ++s) {
+            const auto read = [s](llama_context * ctx) {
+                std::vector<uint8_t> out(llama_state_seq_get_size(ctx, s));
+                out.resize(llama_state_seq_get_data(ctx, out.data(), out.size(), s));
+                return out;
+            };
+            const auto a = read(kv_only.get()), b = read(full.get());
+            if (a.empty() || a != b) {
+                size_t i = 0;
+                while (i < std::min(a.size(), b.size()) && a[i] == b[i]) ++i;
+                LOG_ERR("MTP KV-only: %s: seq %d state %zu and %zu bytes, first difference at %zu\n", what, s, a.size(), b.size(), i);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // prompts: one inside the dense span, two past it, read together and then alone
+    if (!decode({{0, 6}, {1, 40}, {2, 90}}, false) || !same_cells("three prompts")) return false;
+    if (!decode({{1, 70}}, false) || !same_cells("a longer prompt alone")) return false;
+    // catch-up rounds of 1 to 3 rows each, with a rollback of one sequence between them
+    for (int round = 0; round < 12; ++round) {
+        std::vector<std::pair<llama_seq_id, int>> rows;
+        for (llama_seq_id s = 0; s < n_seq; ++s) rows.emplace_back(s, 1 + (int) (rng() % 3));
+        if (!decode(rows, false) || !same_cells("a catch-up")) return false;
+        if (round % 4 == 3) {
+            const llama_seq_id s = round % n_seq;
+            n_past[s] -= 2;
+            for (auto * ctx : { kv_only.get(), full.get() }) {
+                if (!llama_memory_seq_rm(llama_get_memory(ctx), s, n_past[s], -1)) return false;
+            }
+        }
+    }
+    // a draft step with outputs reads what the KV-only passes stored
+    if (!decode({{0, 1}, {1, 1}, {2, 1}}, true)) {
+        LOG_ERR("MTP KV-only: the logits after the KV-only passes differ from LLAMA_MTP_KV_ONLY_LEGACY=1's\n");
+        return false;
+    }
+    return same_cells("after a draft step");
+}
+
 // With a budget covering every live pool, reusing the selection must compute the
 // same logits as scoring it afresh. Distinct histories and reordered batch rows
 // exercise the graph-to-sequence mapping, in both KV layouts.
@@ -4027,6 +4152,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_mtp_index_sequences(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL MTP sequences\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_mtp_kv_only(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            test_ok = false;
+                            status_nmse = "\033[1;31mFAIL MTP KV-only\033[0m";
                         }
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_reserve_holds_reads(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             test_ok = false;

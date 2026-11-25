@@ -383,6 +383,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 if (has_state) {
                     return false;
                 }
+                // no state to roll back: the cell keeps the sequence, at the last position left. Cleared, it made the
+                // hybrid memory's seq_pos_max -1 while the attention cache still held positions below p0
+                if (cell.seq_id.size() == 1) {
+                    cell.pos = p0 - 1;
+                    return true;
+                }
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {

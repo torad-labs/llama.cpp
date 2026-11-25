@@ -129,12 +129,67 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_type type, const ggml_pr
     return GGML_PREC_Q4;
 }
 
-// Tile width in ne11 (dense) / ne12 (MoE) direction with the fewest tiles that fits into shared memory, 0 if there is none.
+static bool ggml_cuda_mmq_q8_sm_tiling(const ggml_type type, const int cc) {
+    static const bool legacy = ggml_env_switch("GGML_CUDA_MMQ_Q8_SM_TILING_LEGACY");
+    return !legacy && type == GGML_TYPE_Q8_0 && cc == GGML_CUDA_CC_BLACKWELL && blackwell_mma_available(cc);
+}
+
+static bool ggml_cuda_mmq_q8_fuse_tile(
+        const int64_t nrows, const int64_t ncols, const int64_t k, const int64_t nchannels, const int nsm) {
+    // J=16, I/2=32: keep at least a third of the SMs working without a Stream-K split.
+    return nrows == 512 && k == 4096 && nchannels == 1 && ncols > 32 && ncols <= 80 &&
+        ((ncols + 15) / 16) * (nrows / 32) * 3 >= nsm;
+}
+
+// Pick the width with the fewest column tiles unless small Blackwell Q8_0 products benefit from more parallel tiles.
 static int ggml_cuda_mmq_get_J_best(
         const ggml_type type, const int64_t ncols, const bool fallback, const int cc, const size_t smpbo, const ggml_prec prec_src1,
-        int * nthreads_best = nullptr) {
+        int * nthreads_best = nullptr, const int64_t nrows_x = 0, const int64_t k = 0, const int64_t nchannels = 1,
+        const int nsm = 0, const bool has_fusion = false) {
     int J_best        = 0;
-    int ntiles_J_best = INT_MAX;
+    int64_t ntiles_J_best = INT64_MAX;
+
+    if (ggml_cuda_mmq_q8_sm_tiling(type, cc) && !fallback && nrows_x > 0 && k > 0 && nsm > 0 && ncols > 32 && ncols <= 80) {
+        if (has_fusion) {
+            const auto cfg = ggml_cuda_mmq_get_config(type, 16, fallback, cc, prec_src1);
+            if (ggml_cuda_mmq_q8_fuse_tile(nrows_x, ncols, k, nchannels, nsm) && mmq_get_nbytes_shared(cfg, cc) <= smpbo) {
+                if (nthreads_best) {
+                    *nthreads_best = cfg.nthreads;
+                }
+                return cfg.J;
+            }
+        } else {
+            const auto wide = ggml_cuda_mmq_get_config(type, 80, fallback, cc, prec_src1);
+            const int64_t rows = (nrows_x + wide.I - 1) / wide.I * nchannels;
+            const int64_t steps = (k + wide.K_vram - 1) / wide.K_vram;
+            // When the wide tile already has enough K work, do not read the weights again for extra column tiles.
+            if (steps < 8 || 2 * rows * steps < 5 * nsm) {
+                int64_t best_work = INT64_MAX;
+                for (const int J : {16, 24, 32, 40, 48, 64, 80}) {
+                    const auto cfg = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+                    if (mmq_get_nbytes_shared(cfg, cc) > smpbo) {
+                        continue;
+                    }
+                    const int64_t tiles = rows * ((ncols + J - 1) / J);
+                    const int64_t waves = (tiles + nsm - 1) / nsm;
+                    // Match the split in launch_mul_mat_q_one and minimize the longest SM's padded work.
+                    const int64_t work = J * (100 * tiles / (nsm * waves) >= 90 ?
+                            waves * steps : (tiles * steps + nsm - 1) / nsm);
+                    if (work < best_work || (work == best_work && tiles < ntiles_J_best)) {
+                        J_best = J;
+                        best_work = work;
+                        ntiles_J_best = tiles;
+                        if (nthreads_best) {
+                            *nthreads_best = cfg.nthreads;
+                        }
+                    }
+                }
+                if (J_best != 0) {
+                    return J_best;
+                }
+            }
+        }
+    }
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
@@ -282,7 +337,10 @@ static void ggml_cuda_mul_mat_q_impl(
             }
         }
 
-        J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
+        const int nsm = ggml_cuda_info().devices[id].nsm;
+        J_best = ggml_cuda_mmq_get_J_best(
+            src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best,
+            ids ? 0 : ne01, ne00, ids ? 1 : ne12 * ne13, nsm, fusion && fusion->gate != nullptr);
     }
     GGML_ASSERT(J_best > 0);
 
@@ -810,7 +868,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 }
 
 bool ggml_cuda_mmq_fusion_is_efficient(
-        const ggml_type type, const ggml_prec prec_requested, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int device) {
+        const ggml_type type, const ggml_prec prec_requested, const int64_t nrows_x, const int64_t ncols, const int64_t k,
+        const int64_t nchannels, const int device) {
     const int    cc    = ggml_cuda_info().devices[device].cc;
     const int    nsm   = ggml_cuda_info().devices[device].nsm;
     const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
@@ -818,9 +877,12 @@ bool ggml_cuda_mmq_fusion_is_efficient(
     // Same tile width as ggml_cuda_mul_mat_q; the fused kernel has no fallback and writes I/2 output rows per tile.
     const bool      fallback  = false;
     const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(type, prec_requested, cc);
-    const int       J_best    = ggml_cuda_mmq_get_J_best(type, ncols, fallback, cc, smpbo, prec_src1);
+    const int       J_best    = ggml_cuda_mmq_get_J_best(type, ncols, fallback, cc, smpbo, prec_src1, nullptr, nrows_x, k, nchannels, nsm, true);
     if (J_best == 0) {
         return false;
+    }
+    if (J_best == 16 && ggml_cuda_mmq_q8_sm_tiling(type, cc) && ggml_cuda_mmq_q8_fuse_tile(nrows_x, ncols, k, nchannels, nsm)) {
+        return true;
     }
     const int64_t nrows_tile = ggml_cuda_mmq_get_config(type, J_best, fallback, cc, prec_src1).I / 2;
     const int64_t ntiles     = (ncols + J_best - 1)/J_best * ((nrows_x + nrows_tile - 1)/nrows_tile) * nchannels;

@@ -5654,7 +5654,11 @@ private:
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                const llama_pos rm_from = (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                        common_speculative_keep_draft_step0(spec.get(), slot.id, ckpt.pos_max + 1))
+                    ? ckpt.pos_max + 2
+                    : ckpt.pos_max + 1;
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, rm_from, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }
@@ -7303,6 +7307,17 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+
+        if (spec) {
+            bool ok = true;
+            queue_tasks.yield_to_queue([&]() {
+                ok = common_speculative_flush(spec.get());
+            });
+            if (!ok) {
+                SRV_ERR("%s", "failed to flush deferred speculative catch-up\n");
+                throw std::runtime_error("failed to flush deferred speculative catch-up");
+            }
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model

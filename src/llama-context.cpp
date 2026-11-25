@@ -5010,10 +5010,10 @@ bool llama_context::nextn_bind(llama_context & head, int32_t n_keep) {
     return true;
 }
 
-bool llama_context::nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int32_t n) {
+bool llama_context::nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int32_t n, int32_t dst_offset) {
     if (!nextn_store || !nextn_is_target) { return false; }
     auto & st = *nextn_store;
-    if (seq < 0 || seq >= st.n_host || n < 1 || n > st.n_keep || !st.n_rows) { return false; }
+    if (seq < 0 || seq >= st.n_host || n < 1 || dst_offset < 0 || dst_offset + n > st.n_keep || !st.n_rows) { return false; }
     for (int32_t i = 0; i < n; ++i) {
         if (rows[i] < 0 || rows[i] >= st.n_rows ||
                 (st.n_devices > 1 && st.owners[st.half*st.n_batch + rows[i]] != uint32_t(seq)%st.n_devices)) {
@@ -5061,7 +5061,7 @@ bool llama_context::nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int3
         int32_t end = i + 1;
         while (end < n && st.row(st.half, rows[end]) == st.row(st.half, rows[end - 1]) + 1) { ++end; }
         auto * src = ggml_view_1d(copy_ctx, st.t, st.n_embd*(end - i), st.row(st.half, rows[i])*row);
-        auto * dst = ggml_view_1d(copy_ctx, st.t, st.n_embd*(end - i), st.kept(st.ref(seq, i))*row);
+        auto * dst = ggml_view_1d(copy_ctx, st.t, st.n_embd*(end - i), st.kept(st.ref(seq, dst_offset + i))*row);
         if (ggml_backend_view_init(src) != GGML_STATUS_SUCCESS || ggml_backend_view_init(dst) != GGML_STATUS_SUCCESS) {
             return false;
         }
@@ -7020,7 +7020,7 @@ bool llama_context::set_mtp_graph_reuse(int32_t n_max) {
     // Allow retained graph slots for multi-token verify shapes on GLM5NEXT MTP and Inkling DSpark.
     const bool allow = (model.arch == LLM_ARCH_GLM5NEXT && model.hparams.n_layer_nextn == 1) ||
                        (model.arch == LLM_ARCH_INKLING2 && model.hparams.n_layer_nextn == 0 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ||
-                       llama_model_is_inkling_draft(model);
+                       llama_model_is_inkling_draft(model) || model.arch == LLM_ARCH_DFLASH;
     if (!allow || n_max < 0) { return false; }
     const uint32_t seq_tokens = n_max == 0 ? 0 : std::min<uint64_t>(uint64_t(n_max) + 1, cparams.n_ubatch);
     if (seq_tokens != graph_slot_mtp_seq_tokens) {
@@ -7058,7 +7058,11 @@ bool llama_set_nextn_source(llama_context * ctx_dft, llama_context * ctx_tgt, in
 }
 
 bool llama_nextn_keep_rows(llama_context * ctx, llama_seq_id seq, const int32_t * rows, int32_t n) {
-    return ctx->nextn_keep_rows(seq, rows, n);
+    return ctx->nextn_keep_rows(seq, rows, n, 0);
+}
+
+bool llama_nextn_keep_rows_at(llama_context * ctx, llama_seq_id seq, const int32_t * rows, int32_t n, int32_t dst_offset) {
+    return ctx->nextn_keep_rows(seq, rows, n, dst_offset);
 }
 
 int32_t llama_nextn_kept_row(const llama_context * ctx, llama_seq_id seq, int32_t row) {
