@@ -24,7 +24,7 @@ TENSOR4_ENV = {**ENV, "LLAMA_KV_SEQ_CELLS": "294912", "LLAMA_SLOT_PREFIX_COPY": 
                "LLAMA_INKLING2_BUCKET_PREFILL_KV": "1", "GGML_CUDA_MMVQ_EXPERT_SORT_23": "1",
                "GGML_CUDA_FATTN_REL_QUERY_FIRST": "1", "LLAMA_INKLING2_COMPACT_GREEDY": "1",
                "LLAMA_INKLING2_KV_RUNS": "1", "GGML_CUDA_FATTN_REL_RUNS_SHARED": "1",
-               "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE": "1",
+               "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE": "1", "LLAMA_INKLING2_KV_MIXED": "1",
                "GGML_CUDA_FATTN_REL_PACKED_PREFILL": "1", "GGML_CUDA_F32_FEW": "1", "GGML_CUDA_MOE_FUSE": "1",
                "GGML_CUDA_MMQ_TMA": "1", "GGML_CUDA_INKLING2_L2_PERSIST": "1",
                "GGML_CUDA_L2_EXPERT_WARM": "1", "LLAMA_INKLING2_ROUTER_BAKE": "1", "GGML_CUDA_MOE_ROUTE_GATE": "1",
@@ -69,9 +69,10 @@ class ProfilePlanTest(unittest.TestCase):
                 "--spec-draft-n-max": "3", "--spec-draft-sampling": "probabilistic",
                 "--spec-draft-device": "CUDA0,CUDA1,CUDA2,CUDA3", "--spec-draft-type-k": "q8_0",
                 "--spec-draft-split-mode": "tensor",
-                "--cache-type-k": "q8_0", "--cache-type-k-swa": "q8_0", "-c": "3014656", "-ub": "256",
+                "--cache-type-k": "f8_e4m3", "--cache-type-k-swa": "q8_0", "-c": "3014656", "-ub": "256",
             }.items():
                 self.assertEqual(auto[auto.index(flag) + 1], value)
+            self.assertEqual(auto_env["LLAMA_INKLING2_KV_MIXED"], "1")
             self.assertEqual(auto_env["LLAMA_DSPARK_TRIM_BLOCK"], "1")
             self.assertNotIn("LLAMA_DSPARK_TRIM_BLOCK", plan("--packs", root, "--draft", "--no-dspark-trim-block")[1])
             greedy, _ = plan("--packs", root, "--draft", "--draft-sampling", "greedy")
@@ -125,7 +126,7 @@ class ProfilePlanTest(unittest.TestCase):
 
     def test_tensor_4_defaults_to_the_qualified_q3_pack_and_pool(self):
         argv, env = plan()
-        self.assertEqual(argv, pinned("Inkling-2-Small-abliterated-e4853745-Q3_K_M-imatrix", "f16", "3014656",
+        self.assertEqual(argv, pinned("Inkling-2-Small-abliterated-e4853745-Q3_K_M-imatrix", "f8_e4m3", "3014656",
                                       cache_ram="262144", projector=str(PACKS / "mmproj-F16.gguf")) + ["--checkpoint-every", "32768"])
         self.assertEqual(env, TENSOR4_ENV)
         self.assertEqual((argv, env), plan("--profile", "tensor-4"))
@@ -161,7 +162,7 @@ class ProfilePlanTest(unittest.TestCase):
                          "--no-kv-runs", "--no-packed-prefill", "--no-f32-few", "--no-moe-fuse", "--no-mmq-tma",
                          "--no-l2-persist", "--no-l2-expert-warm", "--no-router-bake", "--no-moe-route-gate", "--no-ar-copy-capture",
                          "--no-keep-prompt-graphs", "--prompt-shapes", "0",
-                         "--swa-kv-cache", "f16",
+                         "--kv-cache", "f16", "--no-kv-mixed", "--swa-kv-cache", "f16",
                          "--keep-graphs", "0", "--checkpoint-rows", "0", "--checkpoint-ram", "0", "--no-prompt-shapes",
                          "--cache-ram", "0", "--context", "1048576", "--slots", "8", "--slot-context", "131072",
                          "--expert-row-limit", "auto", "--expert-layout", "auto", "--checkpoint-every", "0")
@@ -297,13 +298,17 @@ class OptionTest(unittest.TestCase):
         self.assertEqual(plan("--kv-cache", "q4_0")[1]["GGML_CUDA_FATTN_REL_DECODE_Q4"], "1")
 
     def test_one_byte_and_mixed_kv(self):
-        argv, env = plan("--kv-cache", "f8_e4m3", "--swa-kv-cache", "f16")
+        argv, env = plan("--kv-cache", "f8_e4m3", "--no-kv-mixed", "--swa-kv-cache", "f16")
         self.assertEqual(argv[argv.index("--cache-type-k") + 1], "f8_e4m3")
         self.assertEqual(argv[argv.index("--cache-type-v") + 1], "f8_e4m3")
         self.assertEqual(env["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"], "1")
         self.assertNotIn("LLAMA_INKLING2_KV_MIXED", env)
-        self.assertNotIn("LLAMA_INKLING2_KV_MIXED", plan()[1])
-        self.assertNotIn("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE", plan("--swa-kv-cache", "f16")[1])
+        self.assertEqual(plan()[1]["LLAMA_INKLING2_KV_MIXED"], "1")
+        f16_argv, f16_env = plan("--kv-cache", "f16", "--swa-kv-cache", "f16")
+        self.assertNotIn("LLAMA_INKLING2_KV_MIXED", f16_env)
+        self.assertNotIn("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE", f16_env)
+        self.assertEqual(f16_argv[f16_argv.index("-c") + 1], "2752512")
+        self.assertEqual(plan("--kv-cache", "f16", "--no-keep-prompt-graphs")[0][f16_argv.index("-c") + 1], "3014656")
         for cold in ("q8_0", "f8_e4m3"):
             env = plan("--kv-cache", cold, "--kv-mixed", "--swa-kv-cache", "f16")[1]
             self.assertEqual(env["LLAMA_INKLING2_KV_MIXED"], "1")
@@ -312,7 +317,7 @@ class OptionTest(unittest.TestCase):
         env = plan("--kv-cache", "q4_0", "--kv-mixed", "--kv-mixed-hot", "2048")[1]
         self.assertEqual(env["LLAMA_INKLING2_KV_MIXED_HOT"], "2048")
         self.assertEqual(env["GGML_CUDA_FATTN_REL_DECODE_Q4"], "1")
-        for bad in (["--kv-mixed"], ["--kv-cache", "f16", "--kv-mixed"], ["--kv-cache", "q8_0", "--kv-mixed-hot", "2048"],
+        for bad in (["--kv-cache", "f16", "--kv-mixed"], ["--kv-cache", "q8_0", "--no-kv-mixed", "--kv-mixed-hot", "2048"],
                     ["--kv-cache", "q8_0", "--kv-mixed", "--kv-mixed-hot", "32"]):
             with self.assertRaises(ValueError):
                 plan(*bad)

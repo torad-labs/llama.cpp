@@ -53,7 +53,7 @@ SINGLE_DEVICE_DRAFT_CONTEXT = {"q8_0": 2097152, "f16": 1310720}
 #     tensor-4-quality  {SOURCE}-Q4_K_M-imatrix.gguf, f16 KV, context 2*SLOT_CONTEXT - a two-session quality box.
 PROFILES = {
     "tensor-4": {"pack": f"{SOURCE}-Q3_K_M-imatrix.gguf", "mmproj": "mmproj-F16.gguf",
-                 "context": 3014656, "slot_context": CODING_SLOT_CONTEXT, "kv": "f16", "swa_kv": "q8_0",
+                 "context": 3014656, "slot_context": CODING_SLOT_CONTEXT, "kv": "f8_e4m3", "kv_mixed": True, "swa_kv": "q8_0",
                  "cache_ram": 262144, "keep_graphs": 32, "keep_prompt_graphs": True, "prompt_shapes": 32,
                  "checkpoint_every": 32768, "checkpoint_rows": 2, "checkpoint_ram": 16384,
                  "expert_row_limit": 23, "expert_layout": "rotated", "bucket_prefill_kv": True,
@@ -245,9 +245,12 @@ def arguments(argv=None):
                           ("f32_few", False), ("moe_fuse", False), ("mmq_tma", False),
                           ("l2_persist", False), ("l2_expert_warm", False),
                           ("router_bake", False), ("moe_route_gate", False),
-                          ("ar_copy_capture", False), ("kv_mixed", False)):
+                          ("ar_copy_capture", False)):
         if getattr(args, key) is None:
             setattr(args, key, profile.get(key, fallback))
+    args.kv_mixed_explicit = args.kv_mixed is not None
+    if args.kv_mixed is None:
+        args.kv_mixed = profile.get("kv_mixed", False) and (args.kv_cache is None or args.kv_cache in ("q8_0", "f8_e4m3", "q4_0"))
     if args.prompt_shapes == 0:
         args.prompt_shapes = None
     if args.expert_row_limit == "auto":
@@ -273,13 +276,20 @@ def make_plan(args):
             raise ValueError("a draft for a different target requires --draft-model")
         draft = args.packs / DRAFT
     draft_layout = draft is not None or args.draft_layout
-    kv = args.kv_cache or ("q8_0" if draft_layout else profile["kv"])
+    kv = args.kv_cache or (profile["kv"] if draft_layout and profile["kv"] in ("q8_0", "f8_e4m3", "q4_0") else ("q8_0" if draft_layout else profile["kv"]))
     swa_kv = args.swa_kv_cache if args.swa_kv_cache is not None else profile.get("swa_kv")
     slots = args.slots if args.slots is not None else SLOTS
     # A draft split across cards keeps the full pool; one parked on a single card needs room beside it there.
     # f8_e4m3 and q4_0 are no larger than q8_0, so the q8_0 entry fits them too.
+    # Explicit F16 with keep_prompt_graphs exceeded CUDA0 VRAM at 3,014,656 cells (61 MiB free, 34x/step no_memory on
+    # Nov 25 4x RTX PRO 6000 S), so default F16 context trims 256K cells (~2 GiB/card) when --context is omitted.
     one_card = draft_layout and "," not in args.draft_device
-    default_context = SINGLE_DEVICE_DRAFT_CONTEXT.get(kv, SINGLE_DEVICE_DRAFT_CONTEXT["q8_0"]) if one_card else profile["context"]
+    if one_card:
+        default_context = SINGLE_DEVICE_DRAFT_CONTEXT.get(kv, SINGLE_DEVICE_DRAFT_CONTEXT["q8_0"])
+    elif kv == "f16" and args.keep_prompt_graphs:
+        default_context = 2752512
+    else:
+        default_context = profile["context"]
     context = args.context if args.context is not None else default_context
     slot_context = args.slot_context if args.slot_context is not None else profile.get("slot_context", SLOT_CONTEXT)
     if not 1 <= args.port <= 65535:
