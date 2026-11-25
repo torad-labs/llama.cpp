@@ -7,6 +7,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-context.h"
 
 #include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
@@ -342,6 +343,7 @@ static void usage(char ** argv) {
     LOG("  --inkling-stack <devs>   Compare Inkling 2's Q-input products as one launch with one launch each, on <devs> (two: -sm tensor)\n");
     LOG("  --inkling-delta-upload <devs>  Verify Inkling 2 delta uploads and batched small H2D inputs bit-for-bit on <devs>\n");
     LOG("  --inkling-delta-bench <devs>   Benchmark Inkling 2 delta uploads vs legacy full writes on <devs>\n");
+    LOG("  --time-inkling-alloc <dev> <repeats>   Time 48-layer graph allocation on four logical ranks\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -437,6 +439,94 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         throw std::runtime_error("failed to create llama context");
     }
     return std::make_pair(std::move(model), std::move(lctx));
+}
+
+static int time_inkling_alloc(ggml_backend_dev_t device, size_t seed, int repeats) {
+    constexpr int layers = 48;
+    constexpr int rows = 23;
+    auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true, false, layers);
+    kv_writer(LLM_ARCH_INKLING2, gguf.get()).add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+    const float stdev = arch_stdev(LLM_ARCH_INKLING2, seed, 0.01f);
+    auto model = get_model(gguf.get(), nullptr, seed, stdev, std::vector<ggml_backend_dev_t>(4, device), LLAMA_SPLIT_MODE_TENSOR);
+    auto params = llama_context_default_params();
+    params.n_ctx = 256*rows;
+    params.n_batch = 256;
+    params.n_ubatch = rows;
+    params.n_seq_max = rows;
+    params.n_threads = params.n_threads_batch = 3;
+    params.kv_unified = true;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+    GGML_ASSERT(ctx);
+
+    auto memory = ctx->get_memory()->init_full();
+    llama_batch_allocr batch(model->hparams.n_pos_per_embd(), model->n_seq_devices());
+    auto ubatch = batch.ubatch_reserve(1, rows);
+    for (int i = 0; i < rows; ++i) {
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i] = &ubatch.seq_id_unq[i];
+        ubatch.output[i] = true;
+    }
+    llama_adapter_cvec cvec;
+    llama_adapter_loras loras;
+    llm_graph_result result(32768);
+    llm_graph_params graph_params = {};
+    graph_params.model = model.get();
+    graph_params.cparams = ctx->get_cparams();
+    graph_params.ubatch = ubatch;
+    graph_params.gtype = LLM_GRAPH_TYPE_DEFAULT;
+    graph_params.sched = ctx->get_sched();
+    graph_params.backend_cpu = ggml_backend_sched_get_backend(graph_params.sched,
+            ggml_backend_sched_get_n_backends(graph_params.sched) - 1);
+    graph_params.cvec = &cvec;
+    graph_params.loras = &loras;
+    graph_params.mctx = memory.get();
+    graph_params.n_outputs = rows;
+    graph_params.res = &result;
+
+    ggml_backend_buffer_type_t bufts[] = {
+        ggml_backend_dev_buffer_type(model->devices.front().dev),
+        ggml_backend_cpu_buffer_type(),
+    };
+    ggml_gallocr_ptr alloc(ggml_gallocr_new_n(bufts, 2));
+
+    const auto build = [&]() {
+        result.reset();
+        auto * graph = model->build_graph(graph_params);
+        auto * last = ggml_new_tensor_1d(result.get_ctx(), GGML_TYPE_F32, 1);
+        ggml_build_forward_expand(graph, last);
+        GGML_ASSERT(graph->leafs[graph->n_leafs - 1] == last);
+        return graph;
+    };
+    auto * graph = build();
+    std::vector<int> nodes(graph->n_nodes, 0), leaves(graph->n_leafs, 0);
+    leaves.back() = 1;
+    GGML_ASSERT(ggml_gallocr_reserve_n(alloc.get(), graph, nodes.data(), leaves.data()));
+    printf("Inkling 2: %d layers, 4 logical ranks, %d rows, %d nodes, %d leaves\n",
+            layers, rows, graph->n_nodes, graph->n_leafs);
+
+    double needs = 0, reserve = 0, place = 0;
+    for (int i = 0; i < repeats; ++i) {
+        graph = build();
+        GGML_ASSERT((int) nodes.size() == graph->n_nodes && (int) leaves.size() == graph->n_leafs);
+        // Change only the last leaf's lifetime so alloc_graph checks the full plan but cannot place it.
+        ggml_set_input(graph->leafs[graph->n_leafs - 1]);
+        const auto start = ggml_time_us();
+        GGML_ASSERT(!ggml_gallocr_alloc_graph(alloc.get(), graph));
+        needs += ggml_time_us() - start;
+        graph->leafs[graph->n_leafs - 1]->flags &= ~GGML_TENSOR_FLAG_INPUT;
+
+        const auto reserve_start = ggml_time_us();
+        GGML_ASSERT(ggml_gallocr_reserve_n(alloc.get(), graph, nodes.data(), leaves.data()));
+        reserve += ggml_time_us() - reserve_start;
+        const auto place_start = ggml_time_us();
+        GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), graph));
+        place += ggml_time_us() - place_start;
+    }
+    const double scale = 1.0/(1000*repeats);
+    printf("Mean of %d (ms): needs_realloc %.3f, reserve %.3f, sum %.3f, alloc_graph %.3f\n",
+            repeats, needs*scale, reserve*scale, (needs + reserve)*scale, place*scale);
+    return 0;
 }
 
 static std::vector<float> get_logits(
@@ -4415,6 +4505,14 @@ int main(int argc, char ** argv) {
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
     llama_backend_init();
+
+    if (argc == 4 && strcmp(argv[1], "--time-inkling-alloc") == 0) {
+        ggml_backend_load_all();
+        const auto device = ggml_backend_dev_by_name(argv[2]);
+        const int repeats = atoi(argv[3]);
+        GGML_ASSERT(device && repeats > 0);
+        return time_inkling_alloc(device, 1234, repeats);
+    }
 
     std::random_device rd;
 

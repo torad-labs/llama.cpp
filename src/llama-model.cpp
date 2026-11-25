@@ -36,10 +36,10 @@
 #include <functional>
 #include <map>
 #include <numeric>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -432,10 +432,51 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+static bool meta_name_is_one_of(std::string_view name, std::initializer_list<std::string_view> options) {
+    return std::find(options.begin(), options.end(), name) != options.end();
+}
+
+static bool meta_name_ends_with(std::string_view name, std::string_view suffix) {
+    return name.size() >= suffix.size() && name.substr(name.size() - suffix.size()) == suffix;
+}
+
+static size_t meta_name_digit_count(std::string_view name) {
+    return std::min(name.find_first_not_of("0123456789"), name.size());
+}
+
+// Some of the original split rules allow any separator before weight or bias.
+static std::string_view meta_name_stem(std::string_view name, std::string_view suffix) {
+    if (name.size() <= suffix.size() || !meta_name_ends_with(name, suffix)) {
+        return {};
+    }
+    const size_t sep = name.size() - suffix.size() - 1;
+    return name[sep] != '\r' && name[sep] != '\n' ? name.substr(0, sep) : std::string_view{};
+}
+
+static bool meta_name_is_scale(std::string_view name) {
+    const size_t dot = name.find('.');
+    return dot != 0 && dot != std::string_view::npos &&
+        name.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") == dot &&
+        meta_name_is_one_of(name.substr(dot + 1), {"scale", "input_scale", "k_scale", "v_scale"});
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    const std::string_view tensor_name = tensor->name;
+    const bool is_block = tensor_name.substr(0, 4) == "blk.";
+    const bool is_cache = tensor_name.substr(0, 6) == "cache_";
+    const size_t layer_end = is_block ? 4 + meta_name_digit_count(tensor_name.substr(4)) : 0;
+    const auto block = is_block && layer_end < tensor_name.size() && tensor_name[layer_end] == '.'
+        ? tensor_name.substr(layer_end + 1) : std::string_view{};
+    const bool has_layer = layer_end > 4;
+    const auto weight = meta_name_stem(block, "weight");
+    const auto bias = meta_name_stem(block, "bias");
+    const size_t cache_sep = tensor_name.rfind("_l");
+    const auto cache_digits = cache_sep != std::string_view::npos ? tensor_name.substr(cache_sep + 2) : std::string_view{};
+    const auto cache_stem = cache_sep != std::string_view::npos && meta_name_digit_count(cache_digits) == cache_digits.size()
+        ? tensor_name.substr(0, cache_sep) : std::string_view{};
+    const size_t n_cache_digits = cache_digits.size();
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
     const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
@@ -443,11 +484,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     // Each card holds a quarter of Inkling 2's experts whole: their hidden width of 2,304 is 9 K-quant blocks, which a
     // split of its rows gives out 3/2/2/2, and every layer waits for the card with 3
-    static const std::regex inkling2_experts("blk\\.\\d+\\.ffn_(gate_up|down)_exps\\.weight");
+    const bool inkling2_experts = has_layer && meta_name_is_one_of(block, {"ffn_gate_up_exps.weight", "ffn_down_exps.weight"});
     const bool by_expert = (tensor->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS) ||
-        (ud->model->experts_split_by_expert() && std::regex_match(tensor_name, inkling2_experts));
-    static const std::regex experts("blk\\.\\d+\\.ffn_(up|gate|gate_up|down)_exps\\.weight");
-    if (by_expert || (ud->model->split_mode() == LLAMA_SPLIT_MODE_DATA && std::regex_match(tensor_name, experts))) {
+        (ud->model->experts_split_by_expert() && inkling2_experts);
+    const bool experts = has_layer && meta_name_is_one_of(block, {"ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_gate_up_exps.weight", "ffn_down_exps.weight"});
+    if (by_expert || (ud->model->split_mode() == LLAMA_SPLIT_MODE_DATA && experts)) {
         GGML_ASSERT(tensor->ne[2] >= (int64_t) ud->n_devices);
         ggml_backend_meta_split_state split = {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
         for (size_t rank = 0; rank < ud->n_devices; ++rank) {
@@ -458,51 +499,50 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (ud->model->split_mode() == LLAMA_SPLIT_MODE_DATA) {
         // Caches must supply explicit ownership before allocation; never silently mirror them. The K/V rotation
         // matrices (llama_kv_cache::init_rotation) carry the caches' prefix and are constants: every rank holds one whole
-        static const std::regex cache_rot("cache_.*(k|v)_rot_l\\d+");
-        GGML_ASSERT(std::regex_match(tensor_name, cache_rot) ||
-                (tensor_name.rfind("cache_", 0) != 0 && tensor_name != "mtp_h_store"));
+        const bool cache_rot = n_cache_digits && cache_stem.substr(0, 6) == "cache_" && (meta_name_ends_with(cache_stem, "k_rot") || meta_name_ends_with(cache_stem, "v_rot")) && cache_stem.find_first_of("\r\n") == std::string_view::npos;
+        GGML_ASSERT(cache_rot ||
+                (!is_cache && tensor_name != "mtp_h_store"));
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
     }
-    static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
-    static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
-    static const std::regex pattern_dspark_kv_ctx   ("blk\\.\\d*\\.attn_(k|v)_ctx\\.weight");
+    const bool pattern_q_weight = weight == "attn_q";
+    const bool pattern_kv_weight = meta_name_is_one_of(weight, {"attn_k", "attn_v"});
     const bool dspark = llama_model_is_inkling_draft(*ud->model);
-    const bool dspark_kv_ctx = dspark && std::regex_match(tensor_name, pattern_dspark_kv_ctx);
-    static const std::regex pattern_v_exps_weight   ("blk\\.\\d*\\.attn_v_exps.weight"); // K2 Horizon MoVA
-    static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
-    static const std::regex pattern_qkv_gate_weight ("blk\\.\\d*\\.attn_qkv_gate.weight");
-    static const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
-    static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
-    static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
-    static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
-    static const std::regex pattern_kv_cache        ("cache_(k|v|hot_kv)_l\\d*");
-    static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
-    static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
-    static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
-    static const std::regex pattern_attn_gate_bias  ("blk\\.\\d*\\.attn_gate\\.bias");
-    static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
-    static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
-    static const std::regex pattern_attn_out_a_weight("blk\\.\\d*\\.attn_output_a\\.weight");
-    static const std::regex pattern_attn_out_b_weight("blk\\.\\d*\\.attn_output_b\\.weight");
-    static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
-    static const std::regex pattern_attn_kv_b_weight("blk\\.\\d*\\.attn_(k|v)_b\\.weight");
-    static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+    const bool dspark_kv_ctx = dspark && meta_name_is_one_of(block, {"attn_k_ctx.weight", "attn_v_ctx.weight"});
+    const bool pattern_v_exps_weight = weight == "attn_v_exps"; // K2 Horizon MoVA
+    const bool pattern_qkv_weight = weight == "attn_qkv";
+    const bool pattern_qkv_gate_weight = weight == "attn_qkv_gate";
+    const bool pattern_q_bias = block == "attn_q.bias";
+    const bool pattern_kv_bias = meta_name_is_one_of(block, {"attn_k.bias", "attn_v.bias"});
+    const bool pattern_qkv_bias = bias == "attn_qkv";
+    const bool pattern_qk_norm = meta_name_is_one_of(block, {"attn_q_norm.weight", "attn_k_norm.weight"});
+    const bool pattern_kv_cache = meta_name_is_one_of(cache_stem, {"cache_k", "cache_v", "cache_hot_kv"});
+    const bool pattern_idx_cache = meta_name_is_one_of(cache_stem, {"cache_idx_k", "cache_idx_v"});
+    const bool pattern_dsv4_state = meta_name_is_one_of(cache_stem, {"dsv4_csa_state_kv", "dsv4_csa_state_score", "dsv4_hca_state_kv", "dsv4_hca_state_score", "dsv4_lid_state_kv", "dsv4_lid_state_score"});
+    const bool pattern_attn_sinks = weight == "attn_sinks";
+    const bool pattern_attn_gate_bias = block == "attn_gate.bias";
+    const bool pattern_attn_out_weight = weight == "attn_output";
+    const bool pattern_attn_out_bias = bias == "attn_output";
+    const bool pattern_attn_out_a_weight = block == "attn_output_a.weight";
+    const bool pattern_attn_out_b_weight = block == "attn_output_b.weight";
+    const bool pattern_attn_q_b_weight = block == "attn_q_b.weight";
+    const bool pattern_attn_kv_b_weight = meta_name_is_one_of(block, {"attn_k_b.weight", "attn_v_b.weight"});
+    const bool pattern_attn_gate_weight = weight == "attn_gate";
 
     // glm5next low-rank attention, KDA state and indexer tensors
-    static const std::regex pattern_glm_q_a         ("blk\\.\\d*\\.attn_q_a\\.weight");
-    static const std::regex pattern_glm_q_a_norm    ("blk\\.\\d*\\.attn_q_a_norm\\.weight");
-    static const std::regex pattern_glm_kv_a_mqa    ("blk\\.\\d*\\.attn_kv_a_mqa\\.weight");
-    static const std::regex pattern_glm_kv_a_norm   ("blk\\.\\d*\\.attn_kv_a_norm\\.weight");
-    static const std::regex pattern_glm_k_b         ("blk\\.\\d*\\.attn_k_b\\.weight");
-    static const std::regex pattern_glm_v_b         ("blk\\.\\d*\\.attn_v_b\\.weight");
-    static const std::regex pattern_glm_ssm_a_proj  ("blk\\.\\d*\\.ssm_(f_a|g_a|norm)\\.weight");
-    static const std::regex pattern_glm_ssm_b_proj  ("blk\\.\\d*\\.ssm_(f_b|g_b)\\.weight");
-    static const std::regex pattern_glm_ssm_conv    ("blk\\.\\d*\\.ssm_conv1d_[qkv]\\.weight");
-    static const std::regex pattern_glm_ssm_qkv_conv("blk\\.\\d*\\.ssm_conv1d_qkv\\.weight");
-    static const std::regex pattern_glm_indexer     ("blk\\.\\d*\\.indexer.*\\.(weight|bias)");
+    const bool pattern_glm_q_a = block == "attn_q_a.weight";
+    const bool pattern_glm_q_a_norm = block == "attn_q_a_norm.weight";
+    const bool pattern_glm_kv_a_mqa = block == "attn_kv_a_mqa.weight";
+    const bool pattern_glm_kv_a_norm = block == "attn_kv_a_norm.weight";
+    const bool pattern_glm_k_b = block == "attn_k_b.weight";
+    const bool pattern_glm_v_b = block == "attn_v_b.weight";
+    const bool pattern_glm_ssm_a_proj = meta_name_is_one_of(block, {"ssm_f_a.weight", "ssm_g_a.weight", "ssm_norm.weight"});
+    const bool pattern_glm_ssm_b_proj = meta_name_is_one_of(block, {"ssm_f_b.weight", "ssm_g_b.weight"});
+    const bool pattern_glm_ssm_conv = meta_name_is_one_of(block, {"ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"});
+    const bool pattern_glm_ssm_qkv_conv = block == "ssm_conv1d_qkv.weight";
+    const bool pattern_glm_indexer = block.substr(0, 7) == "indexer" && (meta_name_ends_with(block, ".weight") || meta_name_ends_with(block, ".bias")) && block.find_first_of("\r\n") == std::string_view::npos;
 
-    if (is_glm5next && std::regex_match(tensor_name, pattern_glm_ssm_qkv_conv)) {
-        const auto prefix = tensor_name.substr(0, tensor_name.find('.', 4) + 1);
+    if (is_glm5next && pattern_glm_ssm_qkv_conv) {
+        const std::string prefix(tensor_name.substr(0, layer_end + 1));
         const auto * q = ud->model->get_tensor((prefix + "ssm_conv1d_q.weight").c_str());
         GGML_ASSERT(q);
         auto split = llama_meta_device_get_split_state(q, userdata);
@@ -513,35 +553,34 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     }
 
     // inkling2: the tensors with no standard analog (llama_model_inkling2::load_arch_tensors)
-    static const std::regex pattern_ink_rel         ("blk\\.\\d*\\.attn_rel\\.weight");
-    static const std::regex pattern_ink_head        ("blk\\.\\d*\\.attn_(q_clip|rel_clip|sink_proj)\\.weight");
-    static const std::regex pattern_ink_kv_conv     ("blk\\.\\d*\\.attn_(k|v)_conv\\.weight");
-    static const std::regex pattern_ink_kv_conv_proj("blk\\.\\d*\\.attn_(k|v)_conv_proj\\.weight");
-    static const std::regex pattern_ink_hidden_conv ("blk\\.\\d*\\.(attn|ffn)_post_conv\\.weight");
-    static const std::regex pattern_ink_mirrored    ("blk\\.\\d*\\.(attn_rel_bias|attn_norm|attn_(q|k|v)_inp_norm|attn_res_query|"
-            "ffn_res_query|ffn_norm|ffn_gate_inp)\\.weight|blk\\.\\d*\\.exp_probs_b\\.bias|"
-            "(token_embd|token_embd_norm|output_norm|output_res_query)\\.weight|"
-            // the scales the loader adds for every architecture: one value a tensor, or one an expert
-            "blk\\.\\d*\\.[a-z_]+\\.(scale|input_scale|k_scale|v_scale)");
-    static const std::regex pattern_ink_standard    ("blk\\.\\d*\\.(attn_(q|k|v|output|gate)|ffn_gate_up_exps|ffn_down_exps)\\.weight|"
-            "output\\.weight");
-    static const std::regex pattern_r_cache         ("cache_r_l\\d*");
+    const bool pattern_ink_rel = block == "attn_rel.weight";
+    const bool pattern_ink_head = meta_name_is_one_of(block, {"attn_q_clip.weight", "attn_rel_clip.weight", "attn_sink_proj.weight"});
+    const bool pattern_ink_kv_conv = meta_name_is_one_of(block, {"attn_k_conv.weight", "attn_v_conv.weight"});
+    const bool pattern_ink_kv_conv_proj = meta_name_is_one_of(block, {"attn_k_conv_proj.weight", "attn_v_conv_proj.weight"});
+    const bool pattern_ink_hidden_conv = meta_name_is_one_of(block, {"attn_post_conv.weight", "ffn_post_conv.weight"});
+    const bool pattern_ink_mirrored = meta_name_is_one_of(block, {"attn_rel_bias.weight", "attn_norm.weight", "attn_q_inp_norm.weight", "attn_k_inp_norm.weight",
+            "attn_v_inp_norm.weight", "attn_res_query.weight", "ffn_res_query.weight", "ffn_norm.weight", "ffn_gate_inp.weight", "exp_probs_b.bias"}) ||
+        meta_name_is_one_of(tensor_name, {"token_embd.weight", "token_embd_norm.weight", "output_norm.weight", "output_res_query.weight"}) ||
+        meta_name_is_scale(block);
+    const bool pattern_ink_standard = meta_name_is_one_of(block, {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_gate.weight",
+            "ffn_gate_up_exps.weight", "ffn_down_exps.weight"}) || tensor_name == "output.weight";
+    const bool pattern_r_cache = cache_stem == "cache_r";
 
     const bool is_inkling2 = ud->model->arch == LLM_ARCH_INKLING2;
     // the hidden streams' state is the S state (hparams.n_sconv_hidden): it and their kernels are whole on every device,
     // which convolves each hidden stream after one all-reduce of it
     const bool inkling2_hidden_apart = is_inkling2 && hparams.n_sconv_hidden > 0;
-    if (inkling2_hidden_apart && std::regex_match(tensor_name, pattern_ink_hidden_conv)) {
+    if (inkling2_hidden_apart && pattern_ink_hidden_conv) {
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
     }
-    if (is_inkling2 && (std::regex_match(tensor_name, pattern_ink_hidden_conv) || std::regex_match(tensor_name, pattern_r_cache))) {
+    if (is_inkling2 && (pattern_ink_hidden_conv || pattern_r_cache)) {
         // Each layer's convolution state holds the last positions of its streams one after the other: K, V, and, with
         // LLAMA_INKLING2_HIDDEN_CONV_LEGACY, the two hidden streams (the attention output and the experts' sum, after
         // their reductions). K and V split by the layer's KV heads, as attn_k does. The legacy hidden streams split by
         // channel in the same ratio, n_embd/n_head_kv channels a KV head: the graph's views and stores into the state
         // scale their offsets by one ratio for all four, and the hidden kernels split as the state they read.
-        const bool cache = tensor_name.rfind("cache_", 0) == 0;
-        const uint32_t il = std::stoul(cache ? tensor_name.substr(tensor_name.find("_l", 6) + 2) : tensor_name.substr(4));
+        const bool cache = is_cache;
+        const uint32_t il = std::stoul(std::string(cache ? tensor_name.substr(tensor_name.find("_l", 6) + 2) : tensor_name.substr(4)));
         const ggml_tensor * k = ud->model->get_tensor(("blk." + std::to_string(il) + ".attn_k.weight").c_str());
         GGML_ASSERT(k != nullptr);
         const ggml_backend_meta_split_state heads = llama_meta_device_get_split_state(k, userdata);
@@ -564,33 +603,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return split;
     }
 
-    static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
-    static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
-    static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
-    static const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
-    static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
-    static const std::regex pattern_ssm_beta_alpha_cat("blk\\.\\d*\\.ssm_beta_alpha.weight");
-    static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
-    static const std::regex pattern_s_cache         ("cache_s_l\\d*");
-    static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
-    static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
-    static const std::regex pattern_kda_conv1d      ("blk\\.\\d*\\.ssm_conv1d_(q|k|v)\\.weight");
-    static const std::regex pattern_kda_gate_b      ("blk\\.\\d*\\.ssm_(f|g)_b\\.weight");
+    const bool pattern_ssm_dt = bias == "ssm_dt";
+    const bool pattern_ssm_a = block == "ssm_a";
+    const bool pattern_ssm_alpha = weight == "ssm_alpha";
+    const bool pattern_ssm_beta = weight == "ssm_beta";
+    const bool pattern_ssm_beta_alpha = weight == "ssm_ba";
+    const bool pattern_ssm_beta_alpha_cat = weight == "ssm_beta_alpha";
+    const bool pattern_ple_r_cache = cache_stem == "cache_ple_r";
+    const bool pattern_s_cache = cache_stem == "cache_s";
+    const bool pattern_ssm_conv1d = weight == "ssm_conv1d";
+    const bool pattern_ssm_out_weight = weight == "ssm_out";
+    const bool pattern_kda_conv1d = pattern_glm_ssm_conv;
+    const bool pattern_kda_gate_b = pattern_glm_ssm_b_proj;
 
-    static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
-    static const std::regex pattern_ffn_up_bias       ("blk\\.\\d*\\.ffn_up(_exps)?.bias");
-    static const std::regex pattern_ffn_gate_weight   ("blk\\.\\d*\\.ffn_gate(_exps)?.weight");
-    static const std::regex pattern_ffn_gate_bias     ("blk\\.\\d*\\.ffn_gate(_exps)?.bias");
-    static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
-    static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
-    static const std::regex pattern_ffn_down_bias         ("blk\\.\\d*\\.ffn_down.bias");
-    static const std::regex pattern_ffn_down_exps_bias    ("blk\\.\\d*\\.ffn_down_exps.bias");
-    static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
-    static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
-    static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
+    const bool pattern_ffn_up_weight = meta_name_is_one_of(weight, {"ffn_up", "ffn_up_exps"});
+    const bool pattern_ffn_up_bias = meta_name_is_one_of(bias, {"ffn_up", "ffn_up_exps"});
+    const bool pattern_ffn_gate_weight = meta_name_is_one_of(weight, {"ffn_gate", "ffn_gate_exps"});
+    const bool pattern_ffn_gate_bias = meta_name_is_one_of(bias, {"ffn_gate", "ffn_gate_exps"});
+    const bool pattern_ffn_gate_up_weight = meta_name_is_one_of(weight, {"ffn_gate_up", "ffn_gate_up_exps"});
+    const bool pattern_ffn_down_weight = meta_name_is_one_of(weight, {"ffn_down", "ffn_down_exps"});
+    const bool pattern_ffn_down_bias = bias == "ffn_down";
+    const bool pattern_ffn_down_exps_bias = bias == "ffn_down_exps";
+    const bool pattern_ffn_up_shexp_weight = weight == "ffn_up_shexp";
+    const bool pattern_ffn_gate_shexp_weight = weight == "ffn_gate_shexp";
+    const bool pattern_ffn_down_shexp_weight = weight == "ffn_down_shexp";
 
-    static const std::regex pattern_output_weight("output\\.weight");
-    static const std::regex pattern_output_bias  ("output\\.bias");
+    const bool pattern_output_weight = tensor_name == "output.weight";
+    const bool pattern_output_bias = tensor_name == "output.bias";
 
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
@@ -618,18 +657,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         uint32_t il;
         std::string prefix;
         size_t rotation;
-        if (tensor_name.substr(0, 4) == "blk.") {
+        if (is_block) {
             const size_t length_prefix = tensor_name.find('.', 4);
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
-            il = std::stoull(tensor_name.substr(4, length_prefix));
+            il = std::stoull(std::string(tensor_name.substr(4, length_prefix)));
             const bool is_attn = tensor_name.compare(prefix.size(), 5, "attn_") == 0;
             // attention heads must be on the same device as the KV of the source layer
             rotation = get_il_eff(is_attn ? hparams.kv_source(il) : il) % ud->n_devices;
-        } else if (tensor_name.substr(0, 6) == "cache_") {
+        } else if (is_cache) {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
-            il = std::stoull(tensor_name.substr(layer_index_start + 2));
+            il = std::stoull(std::string(tensor_name.substr(layer_index_start + 2)));
             prefix = "blk." + std::to_string(il) + ".";
             rotation = get_il_eff(il) % ud->n_devices;
         } else {
@@ -653,72 +692,72 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 tensor_name == "kv_resident_kv_runs") {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
-        if (is_inkling2 && std::regex_match(tensor_name, pattern_s_cache)) {
+        if (is_inkling2 && pattern_s_cache) {
             // the recurrent memory's S state: the hidden streams' convolution state whole on every device, or empty
             GGML_ASSERT(ggml_nelements(tensor) == 0 || inkling2_hidden_apart);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
-        if (is_inkling2 && tensor_name.rfind("cache_", 0) != 0 && !std::regex_match(tensor_name, pattern_ink_standard)) {
+        if (is_inkling2 && !is_cache && !pattern_ink_standard) {
             // Every inkling2 weight has its decision here or takes the standard table's (pattern_ink_standard: q, k, v,
             // the output projection and gate, the experts and the output head); the K and V caches take the table's
             // split by KV heads. The relative projection, the per-head clip scales and the sink projection have one
             // value or vector a query head and follow the query heads, the K and V kernels and their dynamic taps
             // follow the KV heads. The relative bias table is shared by all heads, and the norms, the depth-mixing
             // queries and the router read the whole hidden state.
-            if (std::regex_match(tensor_name, pattern_ink_rel) || std::regex_match(tensor_name, pattern_ink_head) ||
-                    std::regex_match(tensor_name, pattern_ink_kv_conv) || std::regex_match(tensor_name, pattern_ink_kv_conv_proj)) {
+            if (pattern_ink_rel || pattern_ink_head ||
+                    pattern_ink_kv_conv || pattern_ink_kv_conv_proj) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
             }
-            if (std::regex_match(tensor_name, pattern_ink_mirrored)) {
+            if (pattern_ink_mirrored) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
-            GGML_ABORT("inkling2: no tensor split decision for %s", tensor_name.c_str());
+            GGML_ABORT("inkling2: no tensor split decision for %s", tensor->name);
         }
         if (ud->model->arch == LLM_ARCH_HRM_TEXT || ud->model->arch == LLM_ARCH_METIS16) {
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
         if (is_dsv4) {
-            if (std::regex_match(tensor_name, pattern_kv_cache) ||
-                    std::regex_match(tensor_name, pattern_dsv4_state)) {
+            if (pattern_kv_cache ||
+                    pattern_dsv4_state) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
-            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+            if (pattern_attn_sinks) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output_a.weight");
             }
-            if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+            if (pattern_attn_q_b_weight) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_a.weight");
             }
-            if (std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
+            if (pattern_attn_out_a_weight) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
             }
-            if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
+            if (pattern_attn_out_b_weight) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
         }
         if (is_glm5_next) {
             // split the KDA and MLA heads, the MLA latent cache and the indexer stay mirrored
-            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+            if (pattern_kv_cache) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
-            if (std::regex_match(tensor_name, pattern_attn_q_b_weight) || std::regex_match(tensor_name, pattern_kda_gate_b) ||
-                    std::regex_match(tensor_name, pattern_ssm_beta)) {
+            if (pattern_attn_q_b_weight || pattern_kda_gate_b ||
+                    pattern_ssm_beta) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
             }
-            if (std::regex_match(tensor_name, pattern_attn_kv_b_weight) || std::regex_match(tensor_name, pattern_kda_conv1d)) {
+            if (pattern_attn_kv_b_weight || pattern_kda_conv1d) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
             }
-            if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
-                    std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+            if (pattern_ssm_dt || pattern_ssm_a ||
+                    pattern_r_cache || pattern_s_cache) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
             }
         }
         if (is_dsv4 || is_glm5_next) {
-            if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
-                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+            if (pattern_ffn_up_shexp_weight ||
+                    pattern_ffn_gate_shexp_weight) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
             }
-            if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+            if (pattern_ffn_down_shexp_weight) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
             }
         }
@@ -729,124 +768,124 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // expert adds. What every head reads stays mirrored: the low-rank projections into the heads (q_a,
             // kv_a_mqa, f_a, g_a) and their norms, the per-head norm's weight, the DSA latent cache that every head
             // attends to (absorbed MLA is MQA), and the indexer, which picks the same keys for every head.
-            if (std::regex_match(tensor_name, pattern_glm_q_a) || std::regex_match(tensor_name, pattern_glm_q_a_norm) ||
-                    std::regex_match(tensor_name, pattern_glm_kv_a_mqa) || std::regex_match(tensor_name, pattern_glm_kv_a_norm) ||
-                    std::regex_match(tensor_name, pattern_glm_ssm_a_proj) || std::regex_match(tensor_name, pattern_glm_indexer) ||
-                    std::regex_match(tensor_name, pattern_kv_cache)) {
+            if (pattern_glm_q_a || pattern_glm_q_a_norm ||
+                    pattern_glm_kv_a_mqa || pattern_glm_kv_a_norm ||
+                    pattern_glm_ssm_a_proj || pattern_glm_indexer ||
+                    pattern_kv_cache) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             // KDA: q, k and v by their rows, their short convs and the per-head gate, decay and beta by head
-            if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight) ||
-                    std::regex_match(tensor_name, pattern_glm_ssm_b_proj) || std::regex_match(tensor_name, pattern_ssm_beta)) {
+            if (pattern_q_weight || pattern_kv_weight ||
+                    pattern_glm_ssm_b_proj || pattern_ssm_beta) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
             }
-            if (std::regex_match(tensor_name, pattern_glm_ssm_conv)) {
+            if (pattern_glm_ssm_conv) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight"); // [d_conv, 1, channels]
             }
-            if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
-                    std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+            if (pattern_ssm_dt || pattern_ssm_a ||
+                    pattern_r_cache || pattern_s_cache) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
             }
             // DSA: q_b by its rows and the absorbed k_b and v_b by head; the output projection of both layer kinds
             // splits by its columns below, as standard attention's does
-            if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+            if (pattern_attn_q_b_weight) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
             }
-            if (std::regex_match(tensor_name, pattern_glm_k_b) || std::regex_match(tensor_name, pattern_glm_v_b)) {
+            if (pattern_glm_k_b || pattern_glm_v_b) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight"); // [.., .., n_head]
             }
             // Shared experts split the way DeepSeek4's do.
-            if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
-                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+            if (pattern_ffn_up_shexp_weight ||
+                    pattern_ffn_gate_shexp_weight) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
             }
-            if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+            if (pattern_ffn_down_shexp_weight) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
             }
         }
 
         // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
-        if (std::regex_match(tensor_name, pattern_idx_cache)) {
+        if (pattern_idx_cache) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
         // the PLE table is model-level and its conv is mirrored, so every device runs the whole conv and needs the whole history
-        if (std::regex_match(tensor_name, pattern_ple_r_cache)) {
+        if (pattern_ple_r_cache) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
         // standard attention
-        if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight) || dspark_kv_ctx) {
+        if (pattern_q_weight || pattern_kv_weight || dspark_kv_ctx) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
         // routed value experts {n_embd, n_embd_v_gqa, n_expert} produce V, so they split like attn_v
-        if (std::regex_match(tensor_name, pattern_v_exps_weight)) {
+        if (pattern_v_exps_weight) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
-        if (std::regex_match(tensor_name, pattern_q_bias) || std::regex_match(tensor_name, pattern_kv_bias)) {
+        if (pattern_q_bias || pattern_kv_bias) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_gate_weight)) {
+        if (pattern_qkv_weight || pattern_qkv_gate_weight) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
-        if ( std::regex_match(tensor_name, pattern_qkv_bias)) {
+        if (pattern_qkv_bias) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_qk_norm)) {
+        if (pattern_qk_norm) {
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
-        if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks) ||
-                std::regex_match(tensor_name, pattern_attn_gate_bias)) {
+        if (pattern_kv_cache || pattern_attn_sinks ||
+                pattern_attn_gate_bias) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
-        if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+        if (pattern_attn_out_weight) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
-        if (std::regex_match(tensor_name, pattern_attn_out_bias)) {
+        if (pattern_attn_out_bias) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
-        if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
+        if (pattern_attn_gate_weight) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
+        if (pattern_ssm_dt || pattern_ssm_a) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta) ||
-                std::regex_match(tensor_name, pattern_ssm_beta_alpha) || std::regex_match(tensor_name, pattern_ssm_beta_alpha_cat)) {
+        if (pattern_ssm_alpha || pattern_ssm_beta ||
+                pattern_ssm_beta_alpha || pattern_ssm_beta_alpha_cat) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+        if (pattern_r_cache || pattern_s_cache) {
             if (ud->model->arch == LLM_ARCH_LFM2 || ud->model->arch == LLM_ARCH_LFM2MOE || ud->model->arch == LLM_ARCH_LFM3) {
                 // the LFM2 shortconv block runs fully mirrored, so its conv state must be mirrored too
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED, "");
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {
+        if (pattern_ssm_conv1d) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+        if (pattern_ssm_out_weight) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
 
         // FFN
-        if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
+        if (pattern_ffn_up_weight || pattern_ffn_gate_weight) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ffn_up_bias) || std::regex_match(tensor_name, pattern_ffn_gate_bias)) {
+        if (pattern_ffn_up_bias || pattern_ffn_gate_bias) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+        if (pattern_ffn_gate_up_weight) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+        if (pattern_ffn_down_weight) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ffn_down_bias)) {
+        if (pattern_ffn_down_bias) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
-        if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+        if (pattern_ffn_down_exps_bias) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL, "ffn_down_exps.weight");
         }
 
@@ -858,13 +897,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "output.weight");
         }
         // output
-        if (std::regex_match(tensor_name, pattern_output_weight) || tensor_name == "output_draft.weight") {
+        if (pattern_output_weight || tensor_name == "output_draft.weight") {
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
-        if (std::regex_match(tensor_name, pattern_output_bias)) {
+        if (pattern_output_bias) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
             GGML_ASSERT(output_weight != nullptr);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
@@ -876,13 +915,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     // if a model has fused tensors they need to be separated into "segments", see the comments on ggml_backend_meta_split_state struct
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
-        if (is_glm5next && std::regex_match(tensor_name, pattern_r_cache)) {
+        if (is_glm5next && pattern_r_cache) {
             // the conv states of q, k and v one after the other, each split by head
             const int64_t d_inner = int64_t(hparams.n_embd_head_kda) * hparams.n_head(il);
             GGML_ASSERT(tensor->ne[axis] == 3*(hparams.ssm_d_conv - 1)*d_inner);
             return {{(hparams.ssm_d_conv - 1)*d_inner, 3}};
         }
-        if (is_glm5_next && std::regex_match(tensor_name, pattern_r_cache)) {
+        if (is_glm5_next && pattern_r_cache) {
             // the conv state holds the q, k and v windows one after the other
             const int64_t conv_state_size = (hparams.ssm_d_conv - 1) * hparams.n_head(il) * hparams.n_embd_head_kda;
             GGML_ASSERT(tensor->ne[axis] == 3*conv_state_size);
@@ -894,7 +933,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 ud->model->arch == LLM_ARCH_QWEN4EXP || ud->model->arch == LLM_ARCH_ZONOS3) {
 
             // fused full attention layers with Q gate tensors that need n_embd doubled:
-            if (!hparams.is_recr(il) && (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias))) {
+            if (!hparams.is_recr(il) && (pattern_qkv_weight || pattern_qkv_bias)) {
                 const int64_t n_embd      = hparams.n_head(il) * hparams.n_embd_head_k(il) * 2;
                 const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
                 GGML_ASSERT(hparams.n_embd_k_gqa(il) == n_embd_gqa);
@@ -913,44 +952,44 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             //   - Qwen 3 Next: [k0_v0, k0_v1, k1_v2, k1_v3] (this is the default split pattern)
             //   - Qwen 3.5:    [k0_v0, k1_v1, k0_v2, k1_v3] (needs segmenting of V on the scale of K to get the correct pattern)
             if (ud->model->arch == LLM_ARCH_QWEN3NEXT) {
-                if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_ssm_conv1d)) {
+                if (pattern_qkv_weight || pattern_ssm_conv1d) {
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2}, {value_dim, 1}};
                 }
-                if (std::regex_match(tensor_name, pattern_r_cache)) {
+                if (pattern_r_cache) {
                     return {{key_dim * (hparams.ssm_d_conv - 1), 2}, {value_dim * (hparams.ssm_d_conv - 1), 1}};
                 }
             } else {
                 const int64_t head_ratio = n_v_heads / n_k_heads;
-                if (std::regex_match(tensor_name, pattern_qkv_gate_weight)) {
+                if (pattern_qkv_gate_weight) {
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + 2*value_dim);
                     return {{key_dim, 2 + 2*head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_ssm_beta_alpha_cat)) {
+                if (pattern_ssm_beta_alpha_cat) {
                     GGML_ASSERT(tensor->ne[axis] == 2*n_v_heads);
                     return {{n_k_heads, 2*head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_ssm_conv1d)) {
+                if (pattern_qkv_weight || pattern_ssm_conv1d) {
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2 + head_ratio}};
                 }
-                if ((hparams.is_recr(il) && std::regex_match(tensor_name, pattern_attn_gate_weight)) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                if ((hparams.is_recr(il) && pattern_attn_gate_weight) || pattern_ssm_out_weight) {
                     return {{key_dim, head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
-                        std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
+                if (pattern_ssm_dt || pattern_ssm_a ||
+                        pattern_ssm_alpha || pattern_ssm_beta) {
                     return {{n_k_heads, head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_r_cache)) {
+                if (pattern_r_cache) {
                     return {{key_dim * (hparams.ssm_d_conv - 1), 2 + head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_s_cache)) {
+                if (pattern_s_cache) {
                     return {{n_k_heads * head_v_dim * head_v_dim, head_ratio}};
                 }
             }
 
             // the FFN is the same for Qwen 3 Next and Qwen 3.5:
-            if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+            if (pattern_ffn_gate_up_weight) {
                 const int64_t n_ff_exp = hparams.n_ff_exp(il);
                 GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
                 return {{n_ff_exp, 2}};
@@ -958,7 +997,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {{tensor->ne[axis], 1}};
         }
 
-        if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
+        if (pattern_qkv_weight || pattern_qkv_bias) {
             const int64_t n_embd_q = hparams.n_head(il) * hparams.n_embd_head_k(il);
             const int64_t n_embd_k = hparams.n_embd_k_gqa(il);
             const int64_t n_embd_v = hparams.n_embd_v_gqa(il);
@@ -970,7 +1009,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // segments so each device gets whole heads of both
             return {{n_embd_q, 1}, {n_embd_k, 1}, {n_embd_v, 1}};
         }
-        if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias)) {
+        if (pattern_ffn_up_weight || pattern_ffn_up_bias) {
             const int64_t n_ff = hparams.n_ff(il);
             // some models such as Phi 3 have fused up + gate tensors named "up" tensors, which need to be segmented
             if (tensor->ne[axis] == 2*n_ff) {
@@ -978,7 +1017,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             return {{tensor->ne[axis], 1}};
         }
-        if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+        if (pattern_ffn_gate_up_weight) {
             const int64_t n_ff_exp = hparams.n_ff_exp(il);
             GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
             return {{n_ff_exp, 2}};
@@ -1009,18 +1048,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (hparams.is_recr(il)) {
                 const int64_t head_dim = hparams.n_embd_head_kda;
                 const int64_t channels = std::lcm(blck_size_perf, head_dim);
-                if (std::regex_match(tensor_name, pattern_ssm_a) || std::regex_match(tensor_name, pattern_ssm_beta)) {
+                if (pattern_ssm_a || pattern_ssm_beta) {
                     return std::vector<int64_t>(segments.size(), channels / head_dim);
                 }
-                if (std::regex_match(tensor_name, pattern_r_cache)) {
+                if (pattern_r_cache) {
                     return std::vector<int64_t>(segments.size(), channels * (hparams.ssm_d_conv - 1));
                 }
-                if (std::regex_match(tensor_name, pattern_s_cache)) {
+                if (pattern_s_cache) {
                     return std::vector<int64_t>(segments.size(), channels * head_dim);
                 }
-                if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight) ||
-                        std::regex_match(tensor_name, pattern_attn_out_weight) || std::regex_match(tensor_name, pattern_glm_ssm_b_proj) ||
-                        std::regex_match(tensor_name, pattern_glm_ssm_conv) || std::regex_match(tensor_name, pattern_ssm_dt)) {
+                if (pattern_q_weight || pattern_kv_weight ||
+                        pattern_attn_out_weight || pattern_glm_ssm_b_proj ||
+                        pattern_glm_ssm_conv || pattern_ssm_dt) {
                     return std::vector<int64_t>(segments.size(), channels);
                 }
             } else {
@@ -1029,15 +1068,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const int64_t head_k = hparams.n_embd_head_k_mla();
                 const int64_t head_v = hparams.n_embd_head_v_mla();
                 const int64_t n_head_unit = std::lcm(std::lcm(blck_size_perf, head_k) / head_k, std::lcm(blck_size_perf, head_v) / head_v);
-                if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                if (pattern_attn_q_b_weight) {
                     GGML_ASSERT(segments.size() == 1);
                     return {n_head_unit * head_k};
                 }
-                if (std::regex_match(tensor_name, pattern_glm_k_b) || std::regex_match(tensor_name, pattern_glm_v_b)) {
+                if (pattern_glm_k_b || pattern_glm_v_b) {
                     GGML_ASSERT(segments.size() == 1);
                     return {n_head_unit};
                 }
-                if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                if (pattern_attn_out_weight) {
                     GGML_ASSERT(segments.size() == 1);
                     return {n_head_unit * head_v};
                 }
@@ -1049,31 +1088,31 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t head_dim        = hparams.n_embd_head_kda;
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
-            if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight) ||
-                    std::regex_match(tensor_name, pattern_kda_conv1d) || std::regex_match(tensor_name, pattern_kda_gate_b) ||
-                    std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_attn_out_weight)) {
+            if (pattern_q_weight || pattern_kv_weight ||
+                    pattern_kda_conv1d || pattern_kda_gate_b ||
+                    pattern_ssm_dt || pattern_attn_out_weight) {
                 return {granularity_qkv};
             }
-            if (std::regex_match(tensor_name, pattern_ssm_a) || std::regex_match(tensor_name, pattern_ssm_beta)) {
+            if (pattern_ssm_a || pattern_ssm_beta) {
                 return {granularity_qkv / head_dim};
             }
-            if (std::regex_match(tensor_name, pattern_r_cache)) {
+            if (pattern_r_cache) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * (hparams.ssm_d_conv - 1));
             }
-            if (std::regex_match(tensor_name, pattern_s_cache)) {
+            if (pattern_s_cache) {
                 return {granularity_qkv * head_dim};
             }
         } else if (is_glm5_next) {
             // MLA, each device holds whole heads
             // an even number of heads per device, the HIP tile FA kernel for D=512 needs an even GQA ratio
             const int64_t granularity_head = std::lcm(std::lcm(hparams.n_embd_head_v_mla(), blck_size) / hparams.n_embd_head_v_mla(), int64_t(2));
-            if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+            if (pattern_attn_q_b_weight) {
                 return {granularity_head * hparams.n_embd_head_k_mla()};
             }
-            if (std::regex_match(tensor_name, pattern_attn_kv_b_weight)) {
+            if (pattern_attn_kv_b_weight) {
                 return {granularity_head};
             }
-            if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+            if (pattern_attn_out_weight) {
                 return {granularity_head * hparams.n_embd_head_v_mla()};
             }
         } else if (hparams.is_recr(il)) {
@@ -1081,23 +1120,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t head_dim        = hparams.ssm_d_state;
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
-            if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
-                    std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight) ||
-                    std::regex_match(tensor_name, pattern_qkv_gate_weight)) {
+            if (pattern_qkv_weight || pattern_attn_gate_weight ||
+                    pattern_ssm_conv1d || pattern_ssm_out_weight ||
+                    pattern_qkv_gate_weight) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv);
             }
-            if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
-                    std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta) ||
-                    std::regex_match(tensor_name, pattern_ssm_beta_alpha_cat)) {
+            if (pattern_ssm_dt || pattern_ssm_a ||
+                    pattern_ssm_alpha || pattern_ssm_beta ||
+                    pattern_ssm_beta_alpha_cat) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv / head_dim);
             }
-            if (std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
+            if (pattern_ssm_beta_alpha) {
                 return std::vector<int64_t>(segments.size(), 2 * (granularity_qkv / head_dim));
             }
-            if (std::regex_match(tensor_name, pattern_r_cache)) {
+            if (pattern_r_cache) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * (hparams.ssm_d_conv - 1));
             }
-            if (std::regex_match(tensor_name, pattern_s_cache)) {
+            if (pattern_s_cache) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
             }
         } else {
@@ -1116,24 +1155,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (is_inkling2) {
                 GGML_ASSERT(segments.size() == 1);
                 const int64_t granularity_kv_heads = granularity_head / n_gqa;
-                if (std::regex_match(tensor_name, pattern_ink_rel)) {
+                if (pattern_ink_rel) {
                     return {granularity_head * hparams.n_relative};
                 }
-                if (std::regex_match(tensor_name, pattern_ink_head)) {
+                if (pattern_ink_head) {
                     return {granularity_head};
                 }
-                if (std::regex_match(tensor_name, pattern_ink_kv_conv)) {
+                if (pattern_ink_kv_conv) {
                     return {granularity_kv_heads * hparams.n_embd_head_k(il)};
                 }
-                if (std::regex_match(tensor_name, pattern_ink_kv_conv_proj)) {
+                if (pattern_ink_kv_conv_proj) {
                     return {granularity_kv_heads * hparams.n_shortconv_l_cache};
                 }
             }
-            if (std::regex_match(tensor_name, pattern_attn_gate_bias)) {
+            if (pattern_attn_gate_bias) {
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_head};
             }
-            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+            if (pattern_attn_sinks) {
                 GGML_ASSERT(segments.size() == 1);
                 if (is_dsv4) {
                     return {hparams.n_head(il) / hparams.dsv4_o_group_count};
@@ -1142,24 +1181,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             if (is_dsv4) {
-                if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                if (pattern_attn_q_b_weight) {
                     GGML_ASSERT(segments.size() == 1);
                     // the grouped output projection requires each device to hold whole groups of heads
                     const int64_t n_head_group = hparams.n_head(il) / hparams.dsv4_o_group_count;
                     return {n_head_group * hparams.n_embd_head_k(il)};
                 }
-                if (std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
+                if (pattern_attn_out_a_weight) {
                     GGML_ASSERT(segments.size() == 1);
                     return {1};
                 }
-                if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
+                if (pattern_attn_out_b_weight) {
                     GGML_ASSERT(segments.size() == 1);
                     // the boundaries must align with wo_a's per-group split, so quant blocks must not straddle groups
                     GGML_ASSERT(hparams.dsv4_o_lora_rank % blck_size == 0);
                     return {hparams.dsv4_o_lora_rank};
                 }
             }
-            if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
+            if (pattern_q_weight || pattern_q_bias) {
                 GGML_ASSERT(segments.size() == 1);
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
                 // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
@@ -1169,11 +1208,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
                 return {granularity_q};
             }
-            if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+            if (pattern_attn_out_weight) {
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_head * hparams.n_embd_head_v(il)};
             }
-            if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
+            if (pattern_attn_gate_weight) {
                 GGML_ASSERT(segments.size() == 1);
                 if (tensor->ne[1] == hparams.n_head(il)) {
                     return {granularity_head};
@@ -1186,15 +1225,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // align V tensors to whole V heads at the same head-index scale as Q and K so all
             // three stay in lockstep per device
             const int64_t granularity_v  = (granularity_kv / hparams.n_embd_head_k(il)) * hparams.n_embd_head_v(il);
-            if (std::regex_match(tensor_name, pattern_kv_weight) ||
-                std::regex_match(tensor_name, pattern_v_exps_weight) ||
-                std::regex_match(tensor_name, pattern_kv_bias) ||
-                std::regex_match(tensor_name, pattern_kv_cache) || dspark_kv_ctx) {
+            if (pattern_kv_weight ||
+                pattern_v_exps_weight ||
+                pattern_kv_bias ||
+                pattern_kv_cache || dspark_kv_ctx) {
                 GGML_ASSERT(segments.size() == 1);
                 const bool is_v = tensor_name.find("attn_v") != std::string::npos || tensor_name.find("cache_v") != std::string::npos;
                 return {is_v ? granularity_v : granularity_kv};
             }
-            if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
+            if (pattern_qkv_weight || pattern_qkv_bias) {
                 // fused full attention layers need Q gate tensors handled like above:
                 // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_CLEF || ud->model->arch == LLM_ARCH_CLOVER_MOE ||
@@ -1211,13 +1250,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
-        if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias) ||
-                std::regex_match(tensor_name, pattern_ffn_gate_weight) || std::regex_match(tensor_name, pattern_ffn_gate_bias) ||
-                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
-                std::regex_match(tensor_name, pattern_ffn_down_weight) ||
-                std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
-                std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
-                std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+        if (pattern_ffn_up_weight || pattern_ffn_up_bias ||
+                pattern_ffn_gate_weight || pattern_ffn_gate_bias ||
+                pattern_ffn_gate_up_weight ||
+                pattern_ffn_down_weight ||
+                pattern_ffn_up_shexp_weight ||
+                pattern_ffn_gate_shexp_weight ||
+                pattern_ffn_down_shexp_weight) {
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
             // where 128 leaves the devices uneven, a finer granularity of whole blocks of 32 or more that splits the
@@ -1233,7 +1272,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         if (ud->model->arch == LLM_ARCH_STEP35 || ud->model->arch == LLM_ARCH_LAGUNA) {
             GGML_ASSERT(segments.size() == 1);
-            if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
+            if (pattern_attn_gate_weight) {
                 return {hparams.n_head(il) / hparams.n_head_kv(il)};
             }
         }

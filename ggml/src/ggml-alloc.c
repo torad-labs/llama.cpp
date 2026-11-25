@@ -579,6 +579,7 @@ struct hash_node {
     struct buffer_address addr;
     bool allocated;
     int pos; // where the planned graph holds the tensor (ggml_gallocr_pos)
+    size_t size;
 };
 
 struct tensor_alloc {
@@ -824,8 +825,8 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
     struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
 
-    size_t parent_size = ggml_backend_buft_get_alloc_size(galloc->bufts[p_hn->buffer_id], parent);
-    size_t node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
+    size_t parent_size = p_hn->size;
+    size_t node_size = hn->size = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
 
     GGML_ASSERT(parent_size >= node_size);
 
@@ -905,9 +906,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         // allocate tensor from the buffer
         struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
         ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
-        size_t size = ggml_backend_buft_get_alloc_size(buft, node);
+        hn->size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
-        hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        hn->addr = ggml_dyn_tallocr_alloc(alloc, hn->size, node);
     }
 }
 
@@ -921,8 +922,7 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
     int buffer_id = hn->buffer_id;
     struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
-    ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
-    size_t size = ggml_backend_buft_get_alloc_size(buft, node);
+    size_t size = hn->size;
 
     AT_PRINTF("%s: freeing %s at {chunk=%d, offset=%zu} (%zu bytes) - n_free_blocks = %d\n",
         __func__, node->name, hn->addr.chunk, hn->addr.offset, size, alloc->chunks[hn->addr.chunk]->n_free_blocks);
@@ -1048,9 +1048,18 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 static __thread uint64_t g_gallocr_measure_epoch = 0;
 static uint64_t g_gallocr_next_epoch = 0;
 
-uint64_t ggml_gallocr_measure_epoch(void);
 uint64_t ggml_gallocr_measure_epoch(void) {
     return g_gallocr_measure_epoch;
+}
+
+uint64_t ggml_gallocr_measure_begin(void) {
+    const uint64_t prev = g_gallocr_measure_epoch;
+    g_gallocr_measure_epoch = __atomic_add_fetch(&g_gallocr_next_epoch, 1, __ATOMIC_RELAXED);
+    return prev;
+}
+
+void ggml_gallocr_measure_end(uint64_t prev) {
+    g_gallocr_measure_epoch = prev;
 }
 
 static bool ggml_gallocr_reserve_n_inner(
@@ -1110,7 +1119,7 @@ static bool ggml_gallocr_reserve_n_inner(
             struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
             node_alloc->dst.buffer_id = hn->buffer_id;
             node_alloc->dst.addr = hn->addr;
-            node_alloc->dst.size_max  = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
+            node_alloc->dst.size_max  = hn->size;
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
@@ -1123,7 +1132,7 @@ static bool ggml_gallocr_reserve_n_inner(
                 struct hash_node * hn = ggml_gallocr_hash_get(galloc, src);
                 node_alloc->src[j].buffer_id = hn->buffer_id;
                 node_alloc->src[j].addr = hn->addr;
-                node_alloc->src[j].size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], src);
+                node_alloc->src[j].size_max = hn->size;
             }
         }
     }
@@ -1145,7 +1154,7 @@ static bool ggml_gallocr_reserve_n_inner(
         } else {
             galloc->leaf_allocs[i].leaf.buffer_id = hn->buffer_id;
             galloc->leaf_allocs[i].leaf.addr = hn->addr;
-            galloc->leaf_allocs[i].leaf.size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], leaf);
+            galloc->leaf_allocs[i].leaf.size_max = hn->size;
         }
     }
 
@@ -1219,10 +1228,9 @@ static bool ggml_gallocr_reserve_n_inner(
 
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
-    const uint64_t prev = g_gallocr_measure_epoch;
-    g_gallocr_measure_epoch = __atomic_add_fetch(&g_gallocr_next_epoch, 1, __ATOMIC_RELAXED);
+    const uint64_t prev = ggml_gallocr_measure_begin();
     const bool ok = ggml_gallocr_reserve_n_inner(galloc, graph, node_buffer_ids, leaf_buffer_ids, no_alloc);
-    g_gallocr_measure_epoch = prev;
+    ggml_gallocr_measure_end(prev);
     return ok;
 }
 
@@ -1247,7 +1255,6 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
 
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
     int buffer_id = tensor_alloc->buffer_id;
-    assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
 
     if (tensor->view_src != NULL) {
         if (tensor->buffer == NULL) {
@@ -1263,7 +1270,6 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
         // was placed. Such a tensor comes here again as the source of a later node.
         if (tensor->data == NULL && tensor->buffer == NULL) {
             assert(tensor_alloc->addr.offset != SIZE_MAX);
-            assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
             ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
         } else {
             if (tensor->buffer == NULL) {
@@ -1344,7 +1350,8 @@ static bool ggml_gallocr_needs_realloc_inner(ggml_gallocr_t galloc, struct ggml_
 #endif
                 return true;
             }
-            if (src == NULL) {
+            // Sources in the graph are checked at their own node or leaf position.
+            if (src == NULL || node_alloc->src_pos[j] > GGML_GALLOCR_POS_OUT_END) {
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
@@ -1391,10 +1398,9 @@ static bool ggml_gallocr_needs_realloc_inner(ggml_gallocr_t galloc, struct ggml_
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     // Keep one measure epoch across the graph check so meta split states stay cached across node size queries.
-    const uint64_t prev_epoch = g_gallocr_measure_epoch;
-    g_gallocr_measure_epoch = __atomic_add_fetch(&g_gallocr_next_epoch, 1, __ATOMIC_RELAXED);
+    const uint64_t prev_epoch = ggml_gallocr_measure_begin();
     const bool res = ggml_gallocr_needs_realloc_inner(galloc, graph);
-    g_gallocr_measure_epoch = prev_epoch;
+    ggml_gallocr_measure_end(prev_epoch);
     return res;
 }
 
