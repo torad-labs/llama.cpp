@@ -56,7 +56,7 @@ PROFILES = {
                  "context": 3014656, "slot_context": CODING_SLOT_CONTEXT, "kv": "f16", "swa_kv": "q8_0",
                  "cache_ram": 262144, "keep_graphs": 32, "keep_prompt_graphs": True, "prompt_shapes": 32,
                  "checkpoint_every": 32768, "checkpoint_rows": 2, "checkpoint_ram": 16384,
-                 "expert_row_limit": 23, "bucket_prefill_kv": True,
+                 "expert_row_limit": 23, "expert_layout": "rotated", "bucket_prefill_kv": True,
                  "stable_prefill": False, "sort_expert_rows": True,
                  "prefix_copy": True, "mean_mask_decode": True, "reduction_route": "host", "host_owner_rows": False,
                  "query_first_decode": True, "compact_greedy": True,
@@ -153,6 +153,13 @@ def arguments(argv=None):
     parser.add_argument("--expert-row-limit", type=expert_row_limit, metavar="N|auto",
                         help="Try the SM120 Q3_K/Q4_K/Q5_K routed matrix-vector kernel up to N rows (8..32); "
                              "auto uses the engine's dispatch (tensor-4: 23, otherwise auto)")
+    parser.add_argument("--expert-layout", choices=["auto", "contiguous", "rotated"],
+                        help="Four-card MoE expert split layout: rotated (two-bank C1 K-split), contiguous (whole "
+                             "experts), or auto (engine default; tensor-4 default: rotated)")
+    parser.add_argument("--ledger", action="store_true",
+                        help="Enable the engine profiling ledger (GGML_LEDGER=1; default off)")
+    parser.add_argument("--ledger-file", type=Path, metavar="PATH",
+                        help="Write the engine profiling ledger snapshot to PATH on exit (implies --ledger)")
     parser.add_argument("--cache-ram", type=int, metavar="MIB",
                         help="RAM budget for displaced sessions and their checkpoints, in MiB. Idle sessions stay "
                              "resident until a slot is reused or KV is needed (tensor-4: 262144, otherwise 32768; -1 removes the byte "
@@ -232,7 +239,7 @@ def arguments(argv=None):
     for key, fallback in (("cache_ram", 32768), ("prefix_copy", False), ("mean_mask_decode", False), ("reduction_route", "host"),
                           ("checkpoint_every", None), ("checkpoint_rows", 0), ("checkpoint_ram", 0),
                           ("keep_graphs", 0), ("keep_prompt_graphs", False), ("prompt_shapes", None),
-                          ("expert_row_limit", None), ("bucket_prefill_kv", False),
+                          ("expert_row_limit", None), ("expert_layout", "auto"), ("bucket_prefill_kv", False),
                           ("stable_prefill", False), ("sort_expert_rows", False), ("query_first_decode", False),
                           ("compact_greedy", False), ("kv_runs", False), ("packed_prefill", False),
                           ("f32_few", False), ("moe_fuse", False), ("mmq_tma", False),
@@ -455,6 +462,14 @@ def make_plan(args):
             env["LLAMA_PROMPT_SHAPE_ROWS"] = str(args.prompt_shape_rows)
     if args.expert_row_limit is not None:
         env["GGML_CUDA_MMVQ_KQUANT_MMID_MAX"] = str(args.expert_row_limit)
+    if args.expert_layout != "auto":
+        env["LLAMA_INKLING2_EXPERT_LAYOUT"] = args.expert_layout
+    else:
+        env.pop("LLAMA_INKLING2_EXPERT_LAYOUT", None)
+    if args.ledger or args.ledger_file is not None:
+        env["GGML_LEDGER"] = "1"
+        if args.ledger_file is not None:
+            env["GGML_LEDGER_FILE"] = str(args.ledger_file.expanduser().resolve())
     if args.reduction_route in ("host", "host-sliced"):
         env.update({"GGML_CUDA_ALLREDUCE": "internal", "GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0",
                     "GGML_CUDA_AR_COPY_THRESHOLD": "1", "GGML_CUDA_AR_COPY_PEER": "0"})
