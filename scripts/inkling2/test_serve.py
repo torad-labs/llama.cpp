@@ -20,7 +20,8 @@ ENV = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3", "LL
        "LLAMA_STATE_SAVE_ASYNC": "1", "LLAMA_STATE_RESTORE_ASYNC": "1",
        "LD_LIBRARY_PATH": str(serve.ROOT / "build/bin"), **HOST_ROUTE}
 TENSOR4_ENV = {**ENV, "LLAMA_KV_SEQ_CELLS": "294912", "LLAMA_SLOT_PREFIX_COPY": "1", "LLAMA_INKLING2_MEAN_MASK_DECODE": "1",
-               "GGML_CUDA_MMVQ_KQUANT_MMID_MAX": "23", "LLAMA_INKLING2_BUCKET_PREFILL_KV": "1", "GGML_CUDA_MMVQ_EXPERT_SORT_23": "1",
+               "GGML_CUDA_MMVQ_KQUANT_MMID_MAX": "23", "LLAMA_INKLING2_EXPERT_LAYOUT": "rotated",
+               "LLAMA_INKLING2_BUCKET_PREFILL_KV": "1", "GGML_CUDA_MMVQ_EXPERT_SORT_23": "1",
                "GGML_CUDA_FATTN_REL_QUERY_FIRST": "1", "LLAMA_INKLING2_COMPACT_GREEDY": "1",
                "LLAMA_INKLING2_KV_RUNS": "1", "GGML_CUDA_FATTN_REL_RUNS_SHARED": "1",
                "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE": "1",
@@ -163,7 +164,7 @@ class ProfilePlanTest(unittest.TestCase):
                          "--swa-kv-cache", "f16",
                          "--keep-graphs", "0", "--checkpoint-rows", "0", "--checkpoint-ram", "0", "--no-prompt-shapes",
                          "--cache-ram", "0", "--context", "1048576", "--slots", "8", "--slot-context", "131072",
-                         "--expert-row-limit", "auto", "--checkpoint-every", "0")
+                         "--expert-row-limit", "auto", "--expert-layout", "auto", "--checkpoint-every", "0")
         for flag, expected in [("--cache-ram", "0"), ("-c", "1048576"), ("-np", "8"), ("--checkpoint-every", "0")]:
             self.assertEqual(argv[argv.index(flag)+1], expected)
         self.assertEqual(env, {**HOST_ROUTE, "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
@@ -350,6 +351,17 @@ class OptionTest(unittest.TestCase):
         for count in ("7", "33"):
             with self.assertRaises(ValueError):
                 plan("--expert-row-limit", count)
+
+    def test_expert_layout_and_ledger_options(self):
+        self.assertEqual(plan()[1]["LLAMA_INKLING2_EXPERT_LAYOUT"], "rotated")
+        self.assertEqual(plan("--expert-layout", "contiguous")[1]["LLAMA_INKLING2_EXPERT_LAYOUT"], "contiguous")
+        self.assertNotIn("LLAMA_INKLING2_EXPERT_LAYOUT", plan("--expert-layout", "auto")[1])
+        self.assertNotIn("GGML_LEDGER", plan()[1])
+        self.assertEqual(plan("--ledger")[1]["GGML_LEDGER"], "1")
+        self.assertNotIn("GGML_LEDGER_FILE", plan("--ledger")[1])
+        lf_env = plan("--ledger-file", "/tmp/inkling-ledger.json")[1]
+        self.assertEqual(lf_env["GGML_LEDGER"], "1")
+        self.assertEqual(lf_env["GGML_LEDGER_FILE"], "/tmp/inkling-ledger.json")
 
     def test_slot_exchange_controls(self):
         argv, env = plan("--cache-ram", "262144", "--save-async", "--restore-async", "--ctx-checkpoints", "8", "--checkpoint-every", "8192")
