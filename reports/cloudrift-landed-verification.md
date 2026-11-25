@@ -33,10 +33,10 @@ includes waiting on the shared GPU lock.
 
 | # | Ledger row | Command | Exit | Result |
 |---|---|---|---|---|
-| 1 | inkling-optimize-relative-attention | `ctest -R inkling-rel -E rel-prefill-gqa` | 0 | 14/14 passed (buildbox3 run, 778 s); buildbox rerun: PENDING_01 |
-| 2 | inkling-optimize-layer-fusions | `ctest -R inkling-fuse` | 0 | passed on buildbox3 (1544 s; per-test log lost with the box); buildbox rerun: PENDING_02 |
-| 3 | inkling-optimize-conv-kernel | `ctest -R inkling-conv` | 0 | passed on buildbox3 (14 s); buildbox rerun: PENDING_03 |
-| 4 | inkling-optimize-kv-precision, inkling-optimize-kv-onebyte (kv, kv1b, kvmix) | `ctest -R inkling-kv` | 0 | passed on buildbox3 (174 s); buildbox rerun: PENDING_04 |
+| 1 | inkling-optimize-relative-attention | `ctest -R inkling-rel -E rel-prefill-gqa` | 0 | 14/14 passed (gpubox run, 778 s); buildbox rerun: PENDING_01 |
+| 2 | inkling-optimize-layer-fusions | `ctest -R inkling-fuse` | 0 | passed on gpubox (1544 s; per-test log lost with the box); buildbox rerun: PENDING_02 |
+| 3 | inkling-optimize-conv-kernel | `ctest -R inkling-conv` | 0 | passed on gpubox (14 s); buildbox rerun: PENDING_03 |
+| 4 | inkling-optimize-kv-precision, inkling-optimize-kv-onebyte (kv, kv1b, kvmix) | `ctest -R inkling-kv` | 0 | passed on gpubox (174 s); buildbox rerun: PENDING_04 |
 | 5 | inkling-optimize-attention-far-runs | `ctest -R inkling-far` | 0 | 18/18 passed (CPU and CUDA0 runs/served/restore/drafted, q8_0, e4m3, far-ops, far-ops-query-first), 207 s |
 | 6 | inkling-optimize-prefix-read-once | `ctest -R inkling-prefix` | 0 | 11/11 passed (CUDA0 cases, prefix-ops g1/g5/g32), 92 s |
 | 7 | inkling-optimize-window-ring | `ctest -R inkling-ring` | 0 | 6/6 passed, 40 s |
@@ -119,7 +119,7 @@ Setup:
   The row's own reduction work has not landed, so that baseline equals the result arm here.
 
 Measured (`GGML_LEDGER=1 GGML_LEDGER_FILE=...`, snapshots in `buildbox:/home/riftuser/lb-out`). The ledger
-numbers are the same on buildbox3 and buildbox:
+numbers are the same on gpubox and buildbox:
 
 | | steps (n8 / n40) | `cuda.eval.nodes[0]` sum (n8 / n40) | nodes per decode step | nsys kernels (n8 / n40) | kernels per decode step |
 |---|---|---|---|---|---|
@@ -165,7 +165,7 @@ does: the four-card window, or a K-quant fixture at served shapes.
   `checks/inkling-moe-23row-f27242` (tree `87b36e23`, not main), and two other seats' ninja runs were writing
   it at once. I built main into `/home/riftuser/build-ws-verify-120a`. The lead then moved every seat to its
   own dir with box-wide `flock` locks.
-- Boxes: the first buildbox build hit an nvcc OOM-kill at load average 138, so I moved to buildbox3. That box
+- Boxes: the first buildbox build hit an nvcc OOM-kill at load average 138, so I moved to gpubox. That box
   went down mid-run (ssh refused at about 11:15 CT) after rows 1-4 had passed, and came back re-provisioned
   without my build, so everything else ran on buildbox after a clean rebuild there. Rows 1-4 are rerun on
   buildbox at the end of the matrix.
