@@ -444,7 +444,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // Each card holds a quarter of Inkling 2's experts whole: their hidden width of 2,304 is 9 K-quant blocks, which a
     // split of its rows gives out 3/2/2/2, and every layer waits for the card with 3
     static const std::regex inkling2_experts("blk\\.\\d+\\.ffn_(gate_up|down)_exps\\.weight");
-    const bool by_expert = ud->model->experts_split_by_expert() && std::regex_match(tensor_name, inkling2_experts);
+    const bool by_expert = (tensor->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS) ||
+        (ud->model->experts_split_by_expert() && std::regex_match(tensor_name, inkling2_experts));
     static const std::regex experts("blk\\.\\d+\\.ffn_(up|gate|gate_up|down)_exps\\.weight");
     if (by_expert || (ud->model->split_mode() == LLAMA_SPLIT_MODE_DATA && std::regex_match(tensor_name, experts))) {
         GGML_ASSERT(tensor->ne[2] >= (int64_t) ud->n_devices);
@@ -2298,6 +2299,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // every down tensor exists now, and no buffer has asked for a split yet
     experts_by_expert = decide_experts_split_by_expert() ? 1 : 0;
+
+    if (arch == LLM_ARCH_INKLING2 && split_mode == LLAMA_SPLIT_MODE_TENSOR && get_split_state_ud.n_devices == 4 &&
+            (!tensor_split || std::all_of(tensor_split, tensor_split + 4, [&](float x) { return x == tensor_split[0]; }))) {
+        const char * layout = ggml_env_str("LLAMA_INKLING2_EXPERT_LAYOUT");
+        if (layout && strcmp(layout, "contiguous") == 0) {
+            experts_by_expert = 1;
+        } else if (layout && strcmp(layout, "rotated") == 0) {
+            const auto ctx = ml.ctx_map.find({ggml_backend_dev_buffer_type(devices.front().dev), false});
+            if (ctx != ml.ctx_map.end()) {
+                for (auto & l : layers) {
+                    auto * gate = l.ffn_gate_up_exps;
+                    auto * down = l.ffn_down_exps;
+                    if (gate && down && gate->type == GGML_TYPE_Q3_K && gate->ne[1] == 4608 && down->ne[0] == 2304 &&
+                            (down->type == GGML_TYPE_Q4_K || down->type == GGML_TYPE_Q5_K) && down->ne[2] % 4 == 0 &&
+                            ggml_get_tensor(ctx->second.get(), gate->name) == gate && ggml_get_tensor(ctx->second.get(), down->name) == down) {
+                        gate->flags |= GGML_TENSOR_FLAG_META_EXPERT_BANKS;
+                        down->flags |= GGML_TENSOR_FLAG_META_EXPERT_BANKS;
+                    }
+                }
+            }
+        }
+    }
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);

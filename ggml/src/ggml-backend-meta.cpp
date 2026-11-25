@@ -78,6 +78,35 @@ ggml_tensor * ggml_backend_meta_reduce(ggml_context * ctx, ggml_tensor * tensor)
     return result;
 }
 
+static bool meta_expert_banks(const ggml_tensor * t) {
+    return (t->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS) != 0;
+}
+
+static bool meta_expert_bonus(const ggml_tensor * t) {
+    return t->op == GGML_OP_VIEW && meta_expert_banks(t) && t->view_offs != 0;
+}
+
+static int meta_expert_width_axis(const ggml_tensor * weight) {
+    return weight->type == GGML_TYPE_Q3_K ? 1 : 0;
+}
+
+ggml_tensor * ggml_backend_meta_expert_bank(ggml_context * ctx, ggml_tensor * weight, bool bonus) {
+    GGML_ASSERT(meta_expert_banks(weight) && weight->op == GGML_OP_NONE);
+    int64_t ne[] = {weight->ne[0], weight->ne[1], weight->ne[2]};
+    ne[meta_expert_width_axis(weight)] = ne[meta_expert_width_axis(weight)]/9*(bonus ? 1 : 8);
+    const size_t nb1 = ggml_row_size(weight->type, ne[0]);
+    const size_t bytes = nb1*ne[1]*ne[2];
+    auto * view = ggml_view_3d(ctx, weight, ne[0], ne[1], ne[2], nb1, nb1*ne[1], bonus ? ggml_nbytes(weight) - bytes : 0);
+    view->flags |= GGML_TENSOR_FLAG_META_EXPERT_BANKS;
+    ggml_format_name(view, "%s.%s", weight->name, bonus ? "bonus" : "base");
+    return view;
+}
+
+void ggml_backend_meta_local_mat_id(ggml_tensor * mat) {
+    GGML_ASSERT(mat->op == GGML_OP_MUL_MAT_ID && meta_expert_banks(mat->src[0]) && !meta_expert_bonus(mat->src[0]));
+    mat->flags |= GGML_TENSOR_FLAG_META;
+}
+
 void ggml_backend_meta_set_stream_view(ggml_tensor * view, const int64_t * counts, const int64_t * first, size_t n_devices) {
     GGML_ASSERT(view->op == GGML_OP_VIEW && view->src[0] == view->view_src && view->view_offs == 0);
     GGML_ASSERT(ggml_is_contiguous(view->src[0]) && view->src[0]->ne[3] == 1);
@@ -1426,6 +1455,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            if (tensor->op == GGML_OP_MUL_MAT_ID && (tensor->flags & GGML_TENSOR_FLAG_META)) {
+                return {GGML_BACKEND_SPLIT_AXIS_LOCAL, {0}, {1}, 1};
+            }
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
@@ -1852,6 +1884,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
             return ret;
         }
 
+        if (tensor->op == GGML_OP_VIEW && meta_expert_banks(tensor)) {
+            GGML_ASSERT(n_bufs == 4 && tensor->view_src && meta_expert_banks(tensor->view_src));
+            const bool bonus = meta_expert_bonus(tensor);
+            const int axis = bonus ? 2 : meta_expert_width_axis(tensor);
+            const unsigned repeat = !bonus && axis == 1 ? 2 : 1;
+            ggml_backend_meta_split_state bank = {ggml_backend_meta_split_axis(axis), {0}, {repeat}, 1};
+            std::fill_n(bank.ne, n_bufs, tensor->ne[axis]/(n_bufs*repeat));
+            return bank;
+        }
         if (tensor->op == GGML_OP_VIEW && tensor->view_src != nullptr && !ggml_backend_meta_has_stream_view(tensor->src[0])) {
             ggml_backend_meta_view_layout layout;
             const auto * root = ggml_backend_meta_view_base(tensor);
@@ -2508,7 +2549,8 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
     int64_t scatter_offset = 0;
     int64_t expert_offset = 0;
     ggml_backend_meta_view_layout view_layout;
-    const bool sliced_view = tensor->op == GGML_OP_VIEW && !stream_view && !local_view && tensor->view_src != nullptr &&
+    const bool expert_bank = tensor->op == GGML_OP_VIEW && meta_expert_banks(tensor);
+    const bool sliced_view = tensor->op == GGML_OP_VIEW && !expert_bank && !stream_view && !local_view && tensor->view_src != nullptr &&
         ggml_backend_meta_slice_view(tensor, ggml_backend_meta_get_split_state(ggml_backend_meta_view_base(tensor), true), n_simple_bufs,
             ggml_backend_meta_owns_rows(ggml_backend_meta_view_base(tensor)), view_layout);
 
@@ -2560,7 +2602,10 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
         t_ij->view_offs = tensor->view_offs;
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
             t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
-            if (stream_view) {
+            if (expert_bank) {
+                t_ij->view_offs = tensor->view_offs/n_simple_bufs;
+                t_ij->flags &= ~GGML_TENSOR_FLAG_META_EXPERT_BANKS;
+            } else if (stream_view) {
                 t_ij->view_offs = (uint32_t(tensor->op_params[j]) >> 16)*tensor->src[0]->nb[2];
                 memset(t_ij->op_params, 0, sizeof(t_ij->op_params));
                 memcpy(t_ij->op_params, &t_ij->view_offs, sizeof(t_ij->view_offs));
@@ -2651,7 +2696,10 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
             }
         }
 
-        if (tensor->op == GGML_OP_MUL_MAT_ID && split_dim == GGML_BACKEND_SPLIT_AXIS_LOCAL) {
+        if (tensor->op == GGML_OP_MUL_MAT_ID && meta_expert_bonus(tensor->src[0])) {
+            ggml_mul_mat_id_set_strided_expert_range(t_ij, (int32_t) j, (int32_t) tensor->src[0]->ne[2], (int32_t) n_simple_bufs);
+        } else if (tensor->op == GGML_OP_MUL_MAT_ID && split_dim == GGML_BACKEND_SPLIT_AXIS_LOCAL &&
+                !(tensor->flags & GGML_TENSOR_FLAG_META)) {
             ggml_mul_mat_id_set_expert_range(t_ij, expert_offset, tensor->src[0]->ne[2]);
             expert_offset += t_ij->src[0]->ne[2];
             if (simple_buf) {
@@ -2709,12 +2757,67 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+// Translate canonical rows to the two packed banks without staging whole experts.
+template <typename copy_t>
+static void meta_expert_bank_ranges(const ggml_tensor * t, size_t offset, size_t size, const copy_t & copy) {
+    const size_t end = offset + size;
+    const size_t plane = t->nb[2];
+    const size_t pitch = t->nb[1];
+    const size_t base = ggml_nbytes(t)/9*2;
+    auto strip = [&](size_t rank, size_t src, size_t dst, size_t width, size_t rows) {
+        if (end <= src || offset >= src + (rows - 1)*pitch + width) {
+            return;
+        }
+        auto edge = [&](size_t i) {
+            const size_t s = src + i*pitch;
+            const size_t lo = std::max(s, offset), hi = std::min(s + width, end);
+            if (lo < hi) {
+                copy(rank, dst + i*width + lo - s, lo - offset, hi - lo, 1, width, pitch);
+            }
+        };
+        if (rows == 1) {
+            edge(0);
+            return;
+        }
+        size_t first = offset <= src ? 0 : (offset - src)/pitch;
+        size_t last = std::min(rows, (end - src + pitch - 1)/pitch);
+        if (first < last && offset > src + first*pitch) {
+            edge(first++);
+        }
+        if (first < last && end < src + (last - 1)*pitch + width) {
+            edge(--last);
+        }
+        if (first < last) {
+            copy(rank, dst + first*width, src + first*pitch - offset, width, last - first, width, pitch);
+        }
+    };
+    for (size_t e = offset/plane; e*plane < end; ++e) {
+        const size_t owner = e % 4, slot = e/4;
+        if (meta_expert_width_axis(t) == 0) {
+            const size_t unit = pitch/9;
+            const size_t rows = t->ne[1];
+            for (size_t rank = 0; rank < 4; ++rank) {
+                strip(rank, e*plane + 2*rank*unit, e*rows*2*unit, 2*unit, rows);
+            }
+            strip(owner, e*plane + 8*unit, base + slot*rows*unit, unit, rows);
+        } else {
+            const size_t unit = 256*pitch;
+            for (size_t half = 0; half < 2; ++half) {
+                for (size_t rank = 0; rank < 4; ++rank) {
+                    strip(rank, e*plane + (half*9 + 2*rank)*unit, (e*4 + half*2)*unit, 2*unit, 1);
+                }
+                strip(owner, e*plane + (half*9 + 8)*unit, base + (slot*2 + half)*unit, unit, 1);
+            }
+        }
+    }
+}
+
 // Split outer axes are contiguous byte intervals. Checkpoint transfers may start
 // or end inside an interval, including inside a quantized block's stored bytes.
 template <typename copy_t>
 static bool ggml_backend_meta_outer_ranges(const ggml_tensor * tensor, const ggml_backend_meta_split_state & split,
         size_t n_devices, size_t offset, size_t size, const copy_t & copy) {
-    if (split.axis < 0 || split.axis >= GGML_MAX_DIMS) { return false; }
+    if (split.axis < 0 || split.axis >= GGML_MAX_DIMS || (meta_expert_banks(tensor) && tensor->op == GGML_OP_NONE)) { return false; }
     for (int axis = split.axis + 1; axis < GGML_MAX_DIMS; ++axis) { if (tensor->ne[axis] != 1) { return false; } }
     GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
     if (!ggml_is_contiguous(tensor)) {
@@ -2758,6 +2861,12 @@ static bool ggml_backend_meta_outer_ranges(const ggml_tensor * tensor, const ggm
 static void ggml_backend_meta_buffer_memset_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    if (meta_expert_banks(tensor) && tensor->op == GGML_OP_NONE) {
+        meta_expert_bank_ranges(tensor, offset, size, [&](size_t rank, size_t local, size_t, size_t bytes, size_t rows, size_t, size_t) {
+            ggml_backend_tensor_memset(ggml_backend_meta_buffer_simple_tensor(tensor, rank), value, local, rows*bytes);
+        });
+        return;
+    }
     const ggml_backend_meta_split_state split_state =
             ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     if (ggml_backend_meta_outer_ranges(tensor, split_state, n_bufs, offset, size,
@@ -2863,6 +2972,13 @@ static void ggml_backend_meta_buffer_memset_tensor(
 }
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (meta_expert_banks(tensor) && tensor->op == GGML_OP_NONE) {
+        meta_expert_bank_ranges(tensor, offset, size, [&](size_t rank, size_t local, size_t src, size_t bytes, size_t rows, size_t dst_pitch, size_t src_pitch) {
+            ggml_backend_tensor_set_2d(ggml_backend_meta_buffer_simple_tensor(tensor, rank),
+                (const char *) data + src, local, bytes, rows, dst_pitch, src_pitch);
+        });
+        return;
+    }
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     if (ggml_backend_meta_outer_ranges(tensor, split_state, n_bufs, offset, size,
@@ -3051,6 +3167,13 @@ static bool ggml_backend_meta_get_dense(const ggml_tensor * tensor, const ggml_b
 }
 
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (meta_expert_banks(tensor) && tensor->op == GGML_OP_NONE) {
+        meta_expert_bank_ranges(tensor, offset, size, [&](size_t rank, size_t local, size_t src, size_t bytes, size_t rows, size_t dst_pitch, size_t src_pitch) {
+            ggml_backend_tensor_get_2d(ggml_backend_meta_buffer_simple_tensor(tensor, rank),
+                (char *) data + src, local, bytes, rows, dst_pitch, src_pitch);
+        });
+        return;
+    }
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     if (ggml_backend_meta_outer_ranges(tensor, split_state, n_bufs, offset, size,
@@ -3157,6 +3280,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 }
 
 static bool ggml_backend_meta_matching_copy(const ggml_tensor * src, const ggml_tensor * dst) {
+    if (meta_expert_banks(src) != meta_expert_banks(dst)) { return false; }
     if (!ggml_backend_buffer_is_meta(src->buffer) || !ggml_backend_buffer_is_meta(dst->buffer) ||
             ggml_backend_buffer_get_type(src->buffer) != ggml_backend_buffer_get_type(dst->buffer) ||
             !ggml_are_same_layout(src, dst) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
@@ -4101,6 +4225,13 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (meta_expert_banks(tensor) && tensor->op == GGML_OP_NONE) {
+        meta_expert_bank_ranges(tensor, offset, size, [&](size_t rank, size_t local, size_t src, size_t bytes, size_t rows, size_t dst_pitch, size_t src_pitch) {
+            ggml_backend_tensor_set_2d_async(ggml_backend_meta_simple_backend(backend, rank), ggml_backend_meta_buffer_simple_tensor(tensor, rank),
+                (const char *) data + src, local, bytes, rows, dst_pitch, src_pitch);
+        });
+        return;
+    }
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
 
@@ -4256,6 +4387,13 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 }
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (meta_expert_banks(tensor) && tensor->op == GGML_OP_NONE) {
+        meta_expert_bank_ranges(tensor, offset, size, [&](size_t rank, size_t local, size_t src, size_t bytes, size_t rows, size_t dst_pitch, size_t src_pitch) {
+            ggml_backend_tensor_get_2d_async(ggml_backend_meta_simple_backend(backend, rank), ggml_backend_meta_buffer_simple_tensor(tensor, rank),
+                (char *) data + src, local, bytes, rows, dst_pitch, src_pitch);
+        });
+        return;
+    }
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 

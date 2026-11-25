@@ -285,6 +285,23 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
         }
     }
 
+    if (ggml_is_quantized(tensor->type) && !ggml_quantize_requires_imatrix(tensor->type)) {
+        const int64_t width = tensor->ne[0];
+        const int64_t chunk = std::max<int64_t>(1, (1 << 20)/width);
+        const size_t row_bytes = ggml_row_size(tensor->type, width);
+        std::vector<float> src;
+        std::vector<uint8_t> dst;
+        for (int64_t r = 0; r < ggml_nrows(tensor); r += chunk) {
+            const int64_t rows = std::min(chunk, ggml_nrows(tensor) - r);
+            src.resize(rows*width);
+            dst.resize(rows*row_bytes);
+            const std::string name = std::string(tensor->name) + ":" + std::to_string(r);
+            fill(src, name.c_str(), params);
+            ggml_quantize_chunk(tensor->type, src.data(), dst.data(), 0, rows, width, nullptr);
+            ggml_backend_tensor_set(tensor, dst.data(), r*row_bytes, dst.size());
+        }
+        return;
+    }
     std::vector<float> tmp(ggml_nelements(tensor));
     fill(tmp, tensor->name, params);
 
@@ -296,11 +313,6 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
             tmp16[i] = ggml_fp32_to_fp16(tmp[i]);
         }
         ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
-    } else if (ggml_is_quantized(tensor->type) && !ggml_quantize_requires_imatrix(tensor->type)) {
-        // a fixture that declares a weight's type in its metadata (test_inkling_stack)
-        std::vector<uint8_t> q(ggml_nbytes(tensor));
-        ggml_quantize_chunk(tensor->type, tmp.data(), q.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
-        ggml_backend_tensor_set(tensor, q.data(), 0, q.size());
     } else {
         GGML_ABORT("fatal error");
     }
@@ -4735,7 +4747,14 @@ int main(int argc, char ** argv) {
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
         }
-        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        const int status = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        if (status == 0 && arch == LLM_ARCH_INKLING2 && target_backend && strcmp(target_backend, "CUDA0") == 0) {
+            auto * dev = ggml_backend_dev_by_name(target_backend);
+            if (dev) {
+                return test_inkling_split("expert-banks", seed, {dev, dev, dev, dev});
+            }
+        }
+        return status;
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

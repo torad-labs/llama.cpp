@@ -1013,6 +1013,11 @@ if (GGML_CUDA)
     llama_test(test-inkling-kquant-tile NAME test-inkling-moe-tma-23row-cuda0 ARGS --tma-23)
     set_tests_properties(test-inkling-moe-tma-23row-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
         ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_MMQ_TMA=1")
+    # one card's banks of the rotated expert split (gate/up N 1024 and 512, down K 512 and 256) at 23 and 512 rows, and
+    # the fused TMA gate/up + SITU and down + weighted sum on the bonus bank's strided expert range
+    llama_test(test-inkling-kquant-tile NAME test-inkling-moe-tma-rotated-cuda0 ARGS --rotated)
+    set_tests_properties(test-inkling-moe-tma-rotated-cuda0 PROPERTIES LABELS "main" TIMEOUT 3600
+        ENVIRONMENT "GGML_CUDA_MMVQ_KQUANT_MMID_MAX=23;GGML_CUDA_MMQ_TMA=1")
     # Blackwell K-quant-scoped J rule (kquant-j-rule): pins GLM IQ3_XXS selections unchanged and verifies live sm_120 dispatch
     set_source_files_properties(test-inkling-kquant-jrule.cpp PROPERTIES LANGUAGE CUDA)
     llama_build(test-inkling-kquant-jrule.cpp LINK ggml CUDA::cublas CUDA::cuda_driver)

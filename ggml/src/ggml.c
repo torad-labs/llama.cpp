@@ -3496,6 +3496,18 @@ void ggml_mul_mat_id_set_expert_range(struct ggml_tensor * a, int32_t first, int
     GGML_ASSERT(first >= 0 && total > 0 && a->src[0]->ne[2] <= (int64_t) total - first);
     ggml_set_op_params_i32(a, 1, first);
     ggml_set_op_params_i32(a, 2, total);
+    ggml_set_op_params_i32(a, 4, 0);
+}
+
+void ggml_mul_mat_id_set_strided_expert_range(struct ggml_tensor * a, int32_t first, int32_t total, int32_t stride) {
+    ggml_mul_mat_id_set_expert_range(a, first, total);
+    GGML_ASSERT(stride > 1 && first + stride*(a->src[0]->ne[2] - 1) < total);
+    ggml_set_op_params_i32(a, 4, stride);
+}
+
+int32_t ggml_mul_mat_id_expert_stride(const struct ggml_tensor * a) {
+    const int32_t stride = ggml_get_op_params_i32(a, 4);
+    return stride == 0 ? 1 : stride;
 }
 
 // ggml_out_prod

@@ -519,6 +519,7 @@ extern "C" {
                                              // that stores no sequence's new state to a row another sequence is read
                                              // from: a backend may read each sequence's row where it computes that
                                              // sequence, beside the stores of the others
+        GGML_TENSOR_FLAG_META_EXPERT_BANKS = 128,
     };
 
     enum ggml_tri_type {
@@ -1365,6 +1366,8 @@ extern "C" {
     // as contains experts [first, first + as->ne[2]); ids remain global. Other expert lanes produce zero.
     // Backends must advertise ggml_backend_supports_expert_partition before executing this form.
     GGML_API void ggml_mul_mat_id_set_expert_range(struct ggml_tensor * a, int32_t first, int32_t total);
+    GGML_API void ggml_mul_mat_id_set_strided_expert_range(struct ggml_tensor * a, int32_t first, int32_t total, int32_t stride);
+    GGML_API int32_t ggml_mul_mat_id_expert_stride(const struct ggml_tensor * a);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

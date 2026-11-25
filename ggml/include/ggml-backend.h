@@ -504,6 +504,11 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_backend_meta_gather(struct ggml_context * ctx, struct ggml_tensor * tensor);
     GGML_API struct ggml_tensor * ggml_backend_meta_reduce(struct ggml_context * ctx, struct ggml_tensor * tensor);
 
+    // Four equal K shards of the base; the last block belongs to expert % 4.
+    GGML_API struct ggml_tensor * ggml_backend_meta_expert_bank(
+            struct ggml_context * ctx, struct ggml_tensor * weight, bool bonus);
+    GGML_API void ggml_backend_meta_local_mat_id(struct ggml_tensor * mat);
+
     // Owner-local cache indices. Cache rows and request rows may have different per-device counts.
     // Indices must address the owning device's cache slice; callers validate and translate them before upload.
     // These nodes require the meta backend and cannot fall back to an unsplit backend.

@@ -4876,13 +4876,14 @@ static void ggml_cuda_dp_expert_stats_free(ggml_backend_cuda_context & ctx) {
 
 static __global__ void ggml_cuda_local_expert_ids(const int32_t * ids, int32_t * local,
         float * dst, int64_t n, int64_t rows, int64_t row_blocks, int n_used, int64_t stride,
-        int first, int count, int missing, unsigned long long * hits,
+        int first, int count, int expert_stride, int missing, unsigned long long * hits,
         float * paired_dst = nullptr, unsigned long long * paired_hits = nullptr) {
     const int64_t i = dst ? blockIdx.x / row_blocks : int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (i >= n) { return; }
     const int64_t row = dst ? (blockIdx.x % row_blocks)*blockDim.x + threadIdx.x : 0;
-    const int expert = ids[(i/n_used)*stride + i % n_used] - first;
-    const bool owned = expert >= 0 && expert < count;
+    const int delta = ids[(i/n_used)*stride + i % n_used] - first;
+    const int expert = expert_stride == 1 ? delta : delta / expert_stride;
+    const bool owned = delta >= 0 && expert < count && (expert_stride == 1 || expert * expert_stride == delta);
     if (row == 0) {
         local[i] = owned ? expert : missing;
         if (hits && owned) { atomicAdd(hits + expert, 1ULL); }
@@ -4994,7 +4995,7 @@ static void ggml_cuda_mul_mat_id_partition(ggml_backend_cuda_context & ctx, cons
     ggml_cuda_local_expert_ids<<<clear_in_kernel ? n*row_blocks : (n + 255)/256, 256, 0, ctx.stream()>>>(
         (const int32_t *) ids->data, local_ids.get(), clear_in_kernel ? (float *) dst->data : nullptr, n, rows, row_blocks,
         ids->ne[0], ids->nb[1]/sizeof(int32_t),
-        ggml_get_op_params_i32(mm, 1), src0->ne[2], vector_ok ? -1 : src0->ne[2], hits,
+        ggml_get_op_params_i32(mm, 1), src0->ne[2], ggml_mul_mat_id_expert_stride(mm), vector_ok ? -1 : src0->ne[2], hits,
         clear_in_kernel && paired ? (float *) paired->data : nullptr, paired ? ggml_cuda_dp_expert_counters(ctx, paired) : nullptr);
     CUDA_CHECK(cudaGetLastError());
     if (overlap) {

@@ -14,6 +14,9 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <random>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -187,7 +190,8 @@ static void cpu_rms_norm(const std::vector<float> & x, int64_t n_tokens, float e
     }
 }
 
-static layer build(const model_weights & W, int64_t n_tokens, bool computed_cur, bool use_q5_down = false) {
+static layer build(const model_weights & W, int64_t n_tokens, bool computed_cur, bool use_q5_down = false,
+        int rank = -1, ggml_tensor * gate_bonus = nullptr, ggml_tensor * down_bonus = nullptr) {
     layer L;
     ggml_init_params params = { 512*ggml_tensor_overhead() + 8*ggml_graph_overhead(), nullptr, true };
     L.ctx = ggml_init(params);
@@ -208,18 +212,23 @@ static layer build(const model_weights & W, int64_t n_tokens, bool computed_cur,
     w = ggml_reshape_3d(ctx, ggml_div(ctx, w, sum), 1, n_used, n_tokens);
     L.weights = ggml_scale(ctx, w, 8.0f);
 
-    L.gate_up = ggml_mul_mat_id(ctx, W.gate_up, ggml_reshape_3d(ctx, L.cur, n_embd, 1, n_tokens), L.ids);
-    L.gate_v  = ggml_view_3d(ctx, L.gate_up, n_ff, L.gate_up->ne[1], L.gate_up->ne[2],
+    auto * input = ggml_reshape_3d(ctx, L.cur, n_embd, 1, n_tokens);
+    L.gate_up = ggml_mul_mat_id(ctx, W.gate_up, input, L.ids);
+    const int64_t width = W.gate_up->ne[1]/2;
+    L.gate_v  = ggml_view_3d(ctx, L.gate_up, width, L.gate_up->ne[1], L.gate_up->ne[2],
                              L.gate_up->nb[1], L.gate_up->nb[2], 0);
-    L.up_v    = ggml_view_3d(ctx, L.gate_up, n_ff, L.gate_up->ne[1], L.gate_up->ne[2],
-                             L.gate_up->nb[1], L.gate_up->nb[2], n_ff*L.gate_up->nb[0]);
+    L.up_v    = ggml_view_3d(ctx, L.gate_up, width, L.gate_up->ne[1], L.gate_up->ne[2],
+                             L.gate_up->nb[1], L.gate_up->nb[2], width*L.gate_up->nb[0]);
     L.glu     = ggml_situ_split(ctx, L.gate_v, L.up_v, situ_beta, situ_lb);
 
     L.down = ggml_mul_mat_id(ctx, use_q5_down ? W.down_q5 : W.down, L.glu, L.ids);
     L.wmul = ggml_mul(ctx, L.down, L.weights);
 
-    ggml_mul_mat_id_set_expert_range(L.gate_up, (int32_t) first, (int32_t) n_expert);
-    ggml_mul_mat_id_set_expert_range(L.down,    (int32_t) first, (int32_t) n_expert);
+    if (!gate_bonus) {
+        const int start = rank < 0 ? first : rank*n_local;
+        ggml_mul_mat_id_set_expert_range(L.gate_up, start, n_expert);
+        ggml_mul_mat_id_set_expert_range(L.down, start, n_expert);
+    }
 
     L.gf = ggml_new_graph(ctx);
     if (!computed_cur) {
@@ -242,7 +251,30 @@ static layer build(const model_weights & W, int64_t n_tokens, bool computed_cur,
             ggml_build_forward_expand(L.gf, L.out);
         }
     }
-    if (computed_cur) {
+    if (gate_bonus) {
+        ggml_build_forward_expand(L.gf, L.out);
+        auto * pair = ggml_mul_mat_id(ctx, gate_bonus, input, L.ids);
+        const int64_t w = gate_bonus->ne[1]/2;
+        auto * g = ggml_view_3d(ctx, pair, w, n_used, n_tokens, pair->nb[1], pair->nb[2], 0);
+        auto * u = ggml_view_3d(ctx, pair, w, n_used, n_tokens, pair->nb[1], pair->nb[2], w*pair->nb[0]);
+        auto * d = ggml_mul_mat_id(ctx, down_bonus, ggml_situ_split(ctx, g, u, situ_beta, situ_lb), L.ids);
+        ggml_mul_mat_id_set_strided_expert_range(pair, rank, n_expert, 4);
+        ggml_mul_mat_id_set_strided_expert_range(d, rank, n_expert, 4);
+        auto * weighted = ggml_mul(ctx, d, L.weights);
+        ggml_build_forward_expand(L.gf, weighted);
+        ggml_tensor * slots[n_used];
+        for (int64_t i = 0; i < n_used; ++i) {
+            slots[i] = ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], i*weighted->nb[1]);
+            ggml_build_forward_expand(L.gf, slots[i]);
+        }
+        auto * sum = slots[0];
+        for (int64_t i = 1; i < n_used; ++i) {
+            sum = ggml_add(ctx, sum, slots[i]);
+            ggml_build_forward_expand(L.gf, sum);
+        }
+        L.out = ggml_add(ctx, L.out, sum);
+    }
+    if (computed_cur || gate_bonus) {
         ggml_set_output(L.out);
         ggml_build_forward_expand(L.gf, L.out);
     }
@@ -434,18 +466,171 @@ static float cpu_weighted_sum_elem(const model_weights & W, const std::vector<fl
     return acc;
 }
 
+static void bench_weight(ggml_tensor * t) {
+    constexpr size_t period = 31;
+    const int64_t k = t->ne[0];
+    const size_t bytes = t->nb[1];
+    std::vector<float> src(period*k);
+    uint32_t seed = 8121;
+    for (auto & v : src) {
+        v = noise(seed)*0.025f;
+    }
+    std::vector<char> sample(period*bytes);
+    ggml_quantize_chunk(t->type, src.data(), sample.data(), 0, period, k, nullptr);
+    std::vector<char> chunk(period*64*bytes);
+    for (size_t i = 0; i < 64; ++i) {
+        memcpy(chunk.data() + i*sample.size(), sample.data(), sample.size());
+    }
+    for (size_t off = 0; off < ggml_nbytes(t); off += chunk.size()) {
+        ggml_backend_tensor_set(t, chunk.data(), off, std::min(chunk.size(), ggml_nbytes(t) - off));
+    }
+}
+
+static std::vector<int> bench_routes(int rows, bool clustered, std::mt19937 & rng) {
+    std::vector<int> ids;
+    ids.reserve(rows*n_used);
+    std::array<std::vector<int>, 2> pools;
+    const int phase = rng() % 2;
+    const int quota[4] = {17, 13, 10, 8};
+    for (int e = 0; e < n_expert; ++e) {
+        const int rank = e/n_local, slot = e%n_local;
+        const int common = (3*quota[rank] + 4)/5;
+        const bool hot = clustered && (slot < common ||
+            (slot >= common + phase*(quota[rank] - common) && slot < quota[rank] + phase*(quota[rank] - common)));
+        pools[hot].push_back(e);
+    }
+    std::bernoulli_distribution seven(0.571217);
+    for (int t = 0; t < rows; ++t) {
+        const int n_hot = clustered ? 6 + seven(rng) : 0;
+        for (int hot : {1, 0}) {
+            auto & pool = pools[hot];
+            const int n = hot ? n_hot : n_used - n_hot;
+            for (int i = 0; i < n; ++i) {
+                const int j = std::uniform_int_distribution<int>(i, int(pool.size()) - 1)(rng);
+                std::swap(pool[i], pool[j]);
+                ids.push_back(pool[i]);
+            }
+        }
+    }
+    return ids;
+}
+
+static int bench_shards(ggml_backend_t cuda) {
+    constexpr int trials = 64;
+    struct scenario {
+        int rows;
+        bool clustered;
+        std::vector<std::vector<int>> ids;
+        double times[2][4][trials] = {};
+    };
+    scenario work[] = {{23, false, {}}, {23, true, {}}, {512, false, {}}, {512, true, {}}};
+    std::mt19937 rng(294);
+    for (auto & s : work) {
+        for (int i = 0; i < trials; ++i) {
+            s.ids.push_back(bench_routes(s.rows, s.clustered, rng));
+        }
+    }
+    for (int rotated = 0; rotated < 2; ++rotated) {
+        ggml_context * ctx = ggml_init({12*ggml_tensor_overhead(), nullptr, true});
+        model_weights w;
+        w.router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_expert);
+        w.bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        const int width = rotated ? 512 : n_ff;
+        const int experts = rotated ? n_expert : n_local;
+        w.gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_K, n_embd, 2*width, experts);
+        w.down = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, width, n_embd, experts);
+        auto * bg = rotated ? ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_K, n_embd, 512, n_local) : nullptr;
+        auto * bd = rotated ? ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, 256, n_embd, n_local) : nullptr;
+        auto * buf = ggml_backend_alloc_ctx_tensors(ctx, cuda);
+        GGML_ASSERT(buf);
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> router(n_expert*n_embd), bias(n_expert);
+        for (int e = 0; e < n_expert; ++e) {
+            router[e*n_embd + e] = 1.0f;
+        }
+        ggml_backend_tensor_set(w.router, router.data(), 0, ggml_nbytes(w.router));
+        ggml_backend_tensor_set(w.bias, bias.data(), 0, ggml_nbytes(w.bias));
+        for (auto * t : {w.gate_up, w.down, bg, bd}) {
+            if (t) {
+                bench_weight(t);
+            }
+        }
+        // Reuse the synthetic weight arena; each rank runs alone on CUDA0.
+        for (auto & s : work) {
+            std::vector<float> input;
+            fill_cur(s.rows, input);
+            for (int rank = 0; rank < 4; ++rank) {
+                layer l = build(w, s.rows, true, false, rank, bg, bd);
+                auto * galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cuda));
+                GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, l.gf));
+                for (int trial = -3; trial < trials; ++trial) {
+                    const auto & routes = s.ids[std::max(trial, 0)];
+                    for (int r = 0; r < s.rows; ++r) {
+                        std::fill_n(input.data() + r*n_embd, n_expert, -2.0f);
+                        for (int i = 0; i < n_used; ++i) {
+                            input[r*n_embd + routes[r*n_used + i]] = 3.0f - 0.1f*i;
+                        }
+                    }
+                    ggml_backend_tensor_set(l.cur_in, input.data(), 0, ggml_nbytes(l.cur_in));
+                    const auto start = std::chrono::steady_clock::now();
+                    GGML_ASSERT(ggml_backend_graph_compute(cuda, l.gf) == GGML_STATUS_SUCCESS);
+                    const auto stop = std::chrono::steady_clock::now();
+                    if (trial >= 0) {
+                        s.times[rotated][rank][trial] = std::chrono::duration<double, std::micro>(stop - start).count();
+                    }
+                }
+                ggml_gallocr_free(galloc);
+                ggml_free(l.ctx);
+            }
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+    printf("layout rows routes draws mean_max_us mean_rank_us rank0_us rank1_us rank2_us rank3_us\n");
+    for (const auto & s : work) {
+        for (int rotated = 0; rotated < 2; ++rotated) {
+            double max_sum = 0, avg_sum = 0, rank_sum[4] = {};
+            for (int i = 0; i < trials; ++i) {
+                double max_us = 0;
+                for (int r = 0; r < 4; ++r) {
+                    const double t = s.times[rotated][r][i];
+                    max_us = std::max(max_us, t);
+                    rank_sum[r] += t;
+                    avg_sum += t/4;
+                }
+                max_sum += max_us;
+            }
+            printf("%s %d %s %d %.3f %.3f %.3f %.3f %.3f %.3f\n", rotated ? "rotated" : "contiguous", s.rows,
+                s.clustered ? "clustered" : "uniform", trials, max_sum/trials, avg_sum/trials,
+                rank_sum[0]/trials, rank_sum[1]/trials, rank_sum[2]/trials, rank_sum[3]/trials);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    const bool bench = argc >= 2 && strcmp(argv[1], "--bench-shards") == 0;
     const bool bake = argc == 3 && strcmp(argv[2], "--router-bake") == 0;
-    if (argc != 2 && !bake) {
-        printf("usage: %s <out.bin> [--router-bake]\n", argv[0]);
+    if (argc < 2 || (!bench && argc != 2 && !bake)) {
+        printf("usage: %s <out.bin> [--router-bake] | --bench-shards\n", argv[0]);
         return 1;
     }
     ggml_backend_t dev_backend = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            dev_backend = ggml_backend_dev_init(ggml_backend_dev_get(i), nullptr);
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && (!bench || strcmp(ggml_backend_dev_name(dev), "CUDA0") == 0)) {
+            dev_backend = ggml_backend_dev_init(dev, nullptr);
             break;
         }
+    }
+    if (bench) {
+        if (!dev_backend) {
+            fprintf(stderr, "No CUDA0 backend for shard benchmark\n");
+            return 1;
+        }
+        const int status = bench_shards(dev_backend);
+        ggml_backend_free(dev_backend);
+        return status;
     }
     if (!dev_backend) {
         if (bake) {

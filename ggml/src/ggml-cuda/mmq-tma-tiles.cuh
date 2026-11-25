@@ -15,20 +15,25 @@
 // expert, the four warps splitting K of the expert's 16-row tile, the same int8 MMA fragments, y quantization and
 // write-back as ggml_cuda_mul_mat_q_few, so its results are bit-identical to that kernel's.
 
-#include "common.cuh"
+#include "ggml.h"
+
+struct ggml_backend_cuda_context;
 
 // GGML_CUDA_MMQ_TMA=1 opts in; the kernel declines outside Blackwell sm_120 and the few-row MMQ's own gate.
 bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                           const ggml_tensor * ids, ggml_tensor * dst, bool ids_ready = false);
 
+// Expert ranges of the two fused entry points: global expert first + expert_stride*l is w's local expert l, l < count,
+// and every other id is not owned. precomputed_local_ids, if given, must hold that same map of ids.
+
 // Fused Q3_K gate/up + SITU via two TMA boxes per 16-row tile (shared y fragments, evict_first).
 bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
                                     const ggml_tensor * ids, ggml_tensor * glu, int32_t first, int32_t count,
                                     float beta, float lb, const int32_t * precomputed_local_ids = nullptr,
-                                    bool zero_non_owned = true);
+                                    bool zero_non_owned = true, int32_t expert_stride = 1);
 
 // Fused Q4_K/Q5_K down + deterministic slot-order weighted sum via TMA boxes (evict_first).
 bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
                                          const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor * dst,
                                          int32_t first, int32_t count,
-                                         const int32_t * precomputed_local_ids = nullptr);
+                                         const int32_t * precomputed_local_ids = nullptr, int32_t expert_stride = 1);

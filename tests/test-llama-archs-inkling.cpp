@@ -23,6 +23,7 @@
 
 #include "llama-archs-gguf.h"
 #include "../src/llama-context.h"
+#include "../src/llama-model.h"
 #include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
@@ -44,6 +45,7 @@ struct record {
     std::vector<std::vector<float>> states; // the serialized convolution state of each sequence, by step
     std::vector<std::vector<float>> memory; // all the sequence keeps, at the same steps: KV cells and the state
     std::vector<std::vector<float>> layer_rows; // the layer input rows of the device buffer, a copy a rank, by step
+    std::vector<float> moe;
 };
 
 struct context_shape {
@@ -52,7 +54,7 @@ struct context_shape {
     uint32_t n_rs_seq  = 0;
 };
 
-llama_context_ptr make_context(llama_model * model, const context_shape & shape) {
+llama_context_ptr make_context(llama_model * model, const context_shape & shape, record * trace = nullptr) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx = 256*shape.n_seq_max;
     params.n_batch = 256;
@@ -63,6 +65,19 @@ llama_context_ptr make_context(llama_model * model, const context_shape & shape)
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; // -sm tensor requires it, and both contexts compute alike
     params.type_k = params.type_v = GGML_TYPE_F32; // the cells compare word by word as the state does
     params.n_threads = params.n_threads_batch = 4;
+    if (trace) {
+        params.cb_eval_user_data = trace;
+        params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            if (ask) {
+                return strncmp(t->name, "ffn_moe_post_conv", sizeof("ffn_moe_post_conv") - 1) == 0;
+            }
+            auto & values = static_cast<record *>(data)->moe;
+            const size_t pos = values.size();
+            values.resize(pos + ggml_nelements(t));
+            ggml_backend_tensor_get(t, values.data() + pos, 0, ggml_nbytes(t));
+            return true;
+        };
+    }
     llama_context_ptr ctx(llama_init_from_model(model, params));
     if (!ctx) {
         throw std::runtime_error("inkling2: the context was not created");
@@ -361,14 +376,43 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
         return compact_greedy(seed, devs) ? 0 : 1;
     }
     const auto all = cases(seed, devs);
-    const auto it = all.find(name);
+    const bool banks = name == "expert-banks";
+    const auto it = all.find(banks ? "decode" : name);
     if (it == all.end()) {
         fprintf(stderr, "inkling2 split: no case %s\n", name.c_str());
         return 1;
     }
     auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+    if (banks) {
+        if (devs.size() != 4) {
+            throw std::runtime_error("expert banks need four ranks");
+        }
+        kv_writer write(LLM_ARCH_INKLING2, gguf.get());
+        write.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+        write.add_kv(LLM_KV_EXPERT_USED_COUNT, uint32_t(4));
+        write.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, uint32_t(2304));
+        ggml_context_ptr meta(ggml_init({6*ggml_tensor_overhead(), nullptr, true}));
+        for (int i = 0; i < 3; ++i) {
+            auto * gu = ggml_new_tensor_3d(meta.get(), GGML_TYPE_Q3_K, 512, 4608, 8);
+            auto * dn = ggml_new_tensor_3d(meta.get(), i == 0 ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K, 2304, 512, 8);
+            ggml_format_name(gu, "blk.%d.ffn_gate_up_exps.weight", i);
+            ggml_format_name(dn, "blk.%d.ffn_down_exps.weight", i);
+            gguf_add_tensor(gguf.get(), gu);
+            gguf_add_tensor(gguf.get(), dn);
+        }
+    }
     llama_model_ptr one = get_model(gguf.get(), nullptr, seed, 0.0f, {devs.front()}, LLAMA_SPLIT_MODE_LAYER);
     llama_model_ptr split = get_model(gguf.get(), nullptr, seed, 0.0f, devs, LLAMA_SPLIT_MODE_TENSOR);
+    if (banks) {
+        const char * layout = getenv("LLAMA_INKLING2_EXPERT_LAYOUT");
+        const bool rotated = layout && strcmp(layout, "rotated") == 0;
+        for (const auto & l : split->layers) {
+            if (bool(l.ffn_down_exps->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS) != rotated ||
+                bool(l.ffn_gate_up_exps->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS) != rotated) {
+                return 1;
+            }
+        }
+    }
     const bool graph_churn = name == "graph-churn";
     if (name == "state") {
         set_env("LLAMA_RS_STAGE_ROWS", "2");
@@ -380,7 +424,7 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
     }
     record expected, actual;
     {
-        auto ctx = make_context(one.get(), it->second.shape);
+        auto ctx = make_context(one.get(), it->second.shape, banks ? &expected : nullptr);
         it->second.run(ctx.get(), expected);
     }
     {
@@ -388,7 +432,7 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
             set_env("LLAMA_RS_FIXED_ROWS", "1");
             set_env("LLAMA_GRAPH_ANY_SEQS", "1");
         }
-        auto ctx = make_context(split.get(), it->second.shape);
+        auto ctx = make_context(split.get(), it->second.shape, banks ? &actual : nullptr);
         it->second.run(ctx.get(), actual);
     }
     bool ok = expected.logits.size() == actual.logits.size() && !expected.logits.empty() &&
@@ -397,6 +441,19 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
         fprintf(stderr, "inkling2 split %s: %d of 23 changed session pairs reused a graph (baseline %d)\n",
                 name.c_str(), actual.reused, expected.reused);
         ok = ok && actual.reused == 22 && expected.reused == 0;
+    }
+    if (banks && ok) {
+        const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(one.get()));
+        size_t differing = 0;
+        for (size_t pos = 0; pos < expected.logits.size(); pos += vocab) {
+            const float * a = expected.logits.data() + pos;
+            const float * b = actual.logits.data() + pos;
+            differing += std::max_element(a, a + vocab) - a != std::max_element(b, b + vocab) - b;
+        }
+        const double moe_nmse = expected.moe.empty() || expected.moe.size() != actual.moe.size() ?
+            INFINITY : nmse(expected.moe, actual.moe);
+        fprintf(stderr, "Meta 4-rank expert banks: %zu differing top tokens, MoE NMSE %g\n", differing, moe_nmse);
+        ok = differing == 0 && moe_nmse <= 1e-3;
     }
     const double logits_nmse = ok ? nmse(expected.logits, actual.logits) : INFINITY;
     ok = ok && logits_nmse <= tolerance;
@@ -420,6 +477,25 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
         ok = ok && largest(expected.layer_rows[i]) > 1e-6f && d <= tolerance;
         fprintf(stderr, "inkling2 split %s: layer input rows %zu (rank %zu), %zu values, NMSE %g\n", name.c_str(),
                 i/devs.size(), i%devs.size(), expected.layer_rows[i].size(), d);
+    }
+    if (banks && ok && (split->layers[0].ffn_down_exps->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS)) {
+        // Exchange the first and last K blocks only in down, leaving both gate/up halves unchanged.
+        auto * down = split->layers[0].ffn_down_exps;
+        std::vector<uint8_t> plane(down->nb[2]);
+        for (int64_t e = 0; e < down->ne[2]; ++e) {
+            ggml_backend_tensor_get(down, plane.data(), e*plane.size(), plane.size());
+            for (int64_t r = 0; r < down->ne[1]; ++r) {
+                auto * row = plane.data() + r*down->nb[1];
+                std::swap_ranges(row, row + down->nb[0], row + 8*down->nb[0]);
+            }
+            ggml_backend_tensor_set(down, plane.data(), e*plane.size(), plane.size());
+        }
+        record wrong;
+        auto ctx = make_context(split.get(), it->second.shape, &wrong);
+        it->second.run(ctx.get(), wrong);
+        const double bad_nmse = expected.moe.size() == wrong.moe.size() ? nmse(expected.moe, wrong.moe) : 0.0;
+        fprintf(stderr, "Meta 4-rank mispaired K blocks: MoE NMSE %g\n", bad_nmse);
+        ok = std::isfinite(bad_nmse) && bad_nmse > 1e-3;
     }
     fprintf(stderr, "%s inkling2 split %s\n", ok ? "OK" : "FAIL", name.c_str());
     return ok ? 0 : 1;
