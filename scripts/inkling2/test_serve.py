@@ -32,7 +32,8 @@ TENSOR4_ENV = {**ENV, "LLAMA_KV_SEQ_CELLS": "294912", "LLAMA_SLOT_PREFIX_COPY": 
                "LLAMA_GRAPH_PROMPT_KEPT": "1", "LLAMA_PROMPT_SHAPES": "1",
                "LLAMA_RS_FIXED_ROWS": "1", "LLAMA_GRAPH_ANY_SEQS": "1",
                "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000",
-               "LLAMA_RS_STAGE_ROWS": "2", "LLAMA_CHECKPOINT_RAM_MIB": "16384"}
+               "LLAMA_RS_STAGE_ROWS": "2", "LLAMA_CHECKPOINT_RAM_MIB": "16384",
+               "LLAMA_PROMPT_SHAPES": "1", "LLAMA_PROMPT_SHAPE_SMALL": "8"}
 
 
 def pinned(pack, kv, context, cache_ram="32768", projector=MMPROJ, swa_kv="q8_0"):
@@ -161,7 +162,7 @@ class ProfilePlanTest(unittest.TestCase):
                          "--no-l2-persist", "--no-l2-expert-warm", "--no-router-bake", "--no-moe-route-gate", "--no-ar-copy-capture",
                          "--no-keep-prompt-graphs", "--prompt-shapes", "0",
                          "--swa-kv-cache", "f16",
-                         "--keep-graphs", "0", "--checkpoint-rows", "0", "--checkpoint-ram", "0",
+                         "--keep-graphs", "0", "--checkpoint-rows", "0", "--checkpoint-ram", "0", "--no-prompt-shapes",
                          "--cache-ram", "0", "--context", "1048576", "--slots", "8", "--slot-context", "131072",
                          "--expert-row-limit", "auto", "--checkpoint-every", "0")
         for flag, expected in [("--cache-ram", "0"), ("-c", "1048576"), ("-np", "8"), ("--checkpoint-every", "0")]:
@@ -287,8 +288,11 @@ class OptionTest(unittest.TestCase):
         self.assertEqual(env["LLAMA_PROMPT_SHAPES"], "1")
         self.assertEqual(env["LLAMA_PROMPT_SHAPE_SMALL"], "8")
         self.assertEqual(env["LLAMA_PROMPT_SHAPE_ROWS"], "256")
+        self.assertEqual(plan("--prompt-shape-rows", "512")[1]["LLAMA_PROMPT_SHAPE_ROWS"], "512")
         with self.assertRaises(ValueError):
             plan("--prompt-shapes", "0", "--prompt-shape-rows", "256")
+        with self.assertRaises(ValueError):
+            plan("--no-prompt-shapes", "--prompt-shape-rows", "256")
         self.assertEqual(plan("--kv-cache", "q8_0")[1]["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"], "1")
         self.assertEqual(plan("--kv-cache", "q4_0")[1]["GGML_CUDA_FATTN_REL_DECODE_Q4"], "1")
 
@@ -312,6 +316,30 @@ class OptionTest(unittest.TestCase):
                     ["--kv-cache", "q8_0", "--kv-mixed", "--kv-mixed-hot", "32"]):
             with self.assertRaises(ValueError):
                 plan(*bad)
+
+    def test_prompt_shapes_default_on_and_both_overrides(self):
+        default = plan()[1]
+        self.assertEqual(default["LLAMA_PROMPT_SHAPES"], "1")
+        self.assertNotIn("LLAMA_PROMPT_SHAPE_SMALL", default)
+        self.assertNotIn("LLAMA_PROMPT_SHAPE_ROWS", default)
+        self.assertEqual(plan("--prompt-shapes", "32")[1], default)
+        self.assertEqual(plan("--prompt-shapes", "8")[1]["LLAMA_PROMPT_SHAPE_SMALL"], "8")
+        self.assertEqual(plan("--prompt-shapes", "4")[1]["LLAMA_PROMPT_SHAPE_SMALL"], "4")
+        off = plan("--no-prompt-shapes")[1]
+        for key in ("LLAMA_PROMPT_SHAPES", "LLAMA_PROMPT_SHAPE_SMALL", "LLAMA_PROMPT_SHAPE_ROWS"):
+            self.assertNotIn(key, off)
+        self.assertEqual(off, {k: v for k, v in default.items() if not k.startswith("LLAMA_PROMPT_SHAPE")})
+        # the last of the two on the command line wins
+        self.assertEqual(plan("--no-prompt-shapes", "--prompt-shapes", "16")[1]["LLAMA_PROMPT_SHAPE_SMALL"], "16")
+        self.assertNotIn("LLAMA_PROMPT_SHAPES", plan("--prompt-shapes", "16", "--no-prompt-shapes")[1])
+        with tempfile.TemporaryDirectory() as root:
+            tuned = Path(root) / "tuned.json"
+            tuned.write_text(json.dumps({"tensor-4": {"--prompt-shapes": "8"}}))
+            self.assertEqual(plan("--tuned", str(tuned))[1]["LLAMA_PROMPT_SHAPE_SMALL"], "8")
+            self.assertNotIn("LLAMA_PROMPT_SHAPES", plan("--tuned", str(tuned), "--no-prompt-shapes")[1])
+            tuned.write_text(json.dumps({"tensor-4": {"--prompt-shapes": "off"}}))
+            self.assertNotIn("LLAMA_PROMPT_SHAPES", plan("--tuned", str(tuned))[1])
+            self.assertEqual(plan("--tuned", str(tuned), "--prompt-shapes", "32")[1], default)
 
     def test_expert_row_limit_only_overrides_sm120_kquants(self):
         for count in ("8", "23", "32"):

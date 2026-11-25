@@ -2942,18 +2942,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool use_slots = !graph_reuse_disable &&
         (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape || prompt_shape || prompt_kept || draft_shape) && sampling_can_retain();
 
-    bool reuse = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+    // Only a kept graph of the ubatch's shape is asked. Asking every slot counted each one of another shape as a
+    // rejection (graph.kept.reject), about half the slots for every reuse: 15.45 a step on four RTX PRO 6000 with 32
+    // kept graphs (Nov 24, 2026), where 23% of steps built a graph. A build is counted once, by cause, in graph.kept.miss
+    bool reuse   = false;
+    bool refused = false;            // a kept graph of this shape turned it down
+    size_t slot_refused = SIZE_MAX;  // the slot that holds it
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->same_shape(ubatch, gparams.n_outputs)) {
+        reuse   = res->can_reuse(gparams);
+        refused = !reuse;
+    }
     for (size_t i = 0; !reuse && use_slots && i < graph_slots.size(); ++i) {
         auto & slot = graph_slots[i];
+        if (!slot.res->same_shape(ubatch, gparams.n_outputs)) {
+            continue;
+        }
         auto gparams_slot = graph_params(slot.res.get(), ubatch, mctx, gtype, slot.sched.get());
         if (slot.res->can_reuse(gparams_slot)) {
             res      = slot.res.get();
             sched_gf = slot.sched.get();
             t_used   = &slot.t_used;
             reuse    = true;
+        } else {
+            refused      = true;
+            slot_refused = i;
         }
     }
     t_search.stop();
+    if (!reuse && !graph_reuse_disable) {
+        static const int slot_miss[3] = {
+            ggml_ledger_slot_of("graph.kept.miss", "refused"), // a kept graph of the shape whose inputs moved (n_kv, mask kind)
+            ggml_ledger_slot_of("graph.kept.miss", "no_shape"), // a shape the slots take, and none holds
+            ggml_ledger_slot_of("graph.kept.miss", "main"),     // a shape the slots do not take: the main scheduler's one graph
+        };
+        ggml_ledger_add(slot_miss[refused ? 0 : use_slots ? 1 : 2], ubatch.n_tokens);
+    }
 
     auto * gf = res->get_gf();
 
@@ -3031,8 +3054,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             part(us_measure);
         }
+        // A kept graph of this shape that turned it down (its inputs moved: the padded cache length, the mask kind) is
+        // built over: the slot used least recently was, and the stale graph held a slot of its own until it was the
+        // least recent, so each of a step's shapes put out another kept shape when the cache passed a pad. On the
+        // Inkling 2 fixture, 23 sessions x 10 turns with prompt shapes: 76 of 326 builds put out a kept shape.
+        // LLAMA_GRAPH_SLOT_LRU_LEGACY=1: the slot used least recently
+        static const bool slot_lru_legacy = ggml_env_switch("LLAMA_GRAPH_SLOT_LRU_LEGACY");
+        const bool rebuild_refused = take_slot && slot_refused != SIZE_MAX && !slot_lru_legacy;
         bool devices_low = take_slot && graph_devices_low();
-        if (take_slot) {
+        if (take_slot && !rebuild_refused) {
             if (graph_slots.size() < graph_slots_max && !devices_low) {
                 llama_decode_phase_timer t(LLAMA_DECODE_PHASE_GRAPH_NEW);
                 graph_slots.push_back({
@@ -3052,7 +3082,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
         if (take_slot && !graph_slots.empty()) {
-            auto & slot = *std::min_element(graph_slots.begin(), graph_slots.end(),
+            auto & slot = rebuild_refused ? graph_slots[slot_refused] : *std::min_element(graph_slots.begin(), graph_slots.end(),
                     [](const graph_slot & a, const graph_slot & b) { return a.t_used < b.t_used; });
             res      = slot.res.get();
             sched_gf = slot.sched.get();

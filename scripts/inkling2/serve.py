@@ -190,7 +190,10 @@ def arguments(argv=None):
     parser.add_argument("--keep-prompt-graphs", action=argparse.BooleanOptionalAction,
                         help="Retain repeated prompt-shaped graphs in shared buffers when keep-graphs > 0 (tensor-4 default: on)")
     parser.add_argument("--prompt-shapes", type=int, choices=[0, 1, 2, 4, 8, 16, 32], metavar="ROWS",
-                        help="Read prompts apart from decode replies in reusable power-of-two ubatches (tensor-4: 32, 0 disables)")
+                        help="Read prompts apart from decode replies in reusable power-of-two ubatches, whole up to ROWS rows "
+                             "(tensor-4 default: 32; 0 or --no-prompt-shapes turns it off)")
+    parser.add_argument("--no-prompt-shapes", dest="prompt_shapes", action="store_const", const=0,
+                        help="Read prompts beside replies in ubatches of any length")
     parser.add_argument("--prompt-shape-rows", type=int, choices=[64, 128, 256, 512, 1024, 2048], metavar="ROWS",
                         help="Largest power-of-two prompt ubatch with --prompt-shapes (default: 256)")
     for direction in ("save", "restore"):
@@ -287,7 +290,7 @@ def make_plan(args):
         raise ValueError("checkpoint-rows must be 0..64")
     if args.checkpoint_ram < 0 or args.checkpoint_ram > 1048576:
         raise ValueError("checkpoint-ram must be 0..1048576")
-    if args.prompt_shape_rows is not None and args.prompt_shapes is None:
+    if args.prompt_shape_rows is not None and not args.prompt_shapes:
         raise ValueError("prompt-shape-rows requires --prompt-shapes")
     if args.expert_row_limit is not None and not 8 <= args.expert_row_limit <= 32:
         raise ValueError("expert-row-limit must be 8..32")
@@ -444,7 +447,7 @@ def make_plan(args):
         env["LLAMA_RS_STAGE_ROWS"] = str(args.checkpoint_rows)
     if args.checkpoint_ram > 0:
         env["LLAMA_CHECKPOINT_RAM_MIB"] = str(args.checkpoint_ram)
-    if args.prompt_shapes is not None:
+    if args.prompt_shapes:
         env["LLAMA_PROMPT_SHAPES"] = "1"
         if args.prompt_shapes != 32:
             env["LLAMA_PROMPT_SHAPE_SMALL"] = str(args.prompt_shapes)

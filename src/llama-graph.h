@@ -1164,6 +1164,10 @@ public:
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
 
+    // the ubatch shape and output count this graph was built for: a kept graph of another shape cannot be reused, and
+    // is not asked (can_reuse would turn it down at its first check)
+    bool same_shape(const llama_ubatch & ubatch, uint32_t n_outputs) const;
+
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void add_fused_node(llm_graph_fused_node result);

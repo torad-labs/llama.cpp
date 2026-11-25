@@ -2150,6 +2150,12 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+bool llm_graph_result::same_shape(const llama_ubatch & ubatch, uint32_t n_outputs) const {
+    const auto & built = params.ubatch;
+    return built.n_tokens == ubatch.n_tokens && built.n_seq_tokens == ubatch.n_seq_tokens && built.n_seqs == ubatch.n_seqs &&
+        built.n_seqs_unq == ubatch.n_seqs_unq && built.equal_seqs() == ubatch.equal_seqs() && params.n_outputs == n_outputs;
+}
+
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
     inputs.emplace_back(std::move(input));
     return inputs.back().get();

@@ -419,6 +419,7 @@ param = [
   { name = "LLAMA_GRAMMAR_TRIGGER_LITERAL_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_GRAPH_BUFFER_SHARED_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_GRAPH_RESULT_ZERO_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
+  { name = "LLAMA_GRAPH_SLOT_LRU_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama", output = "same", about = "a shape whose kept graph turned it down is built in the slot used least recently, not over its own stale graph" },
   { name = "LLAMA_KQ_MASK_SCAN_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_KQ_MASK_SEQ_BITS_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
   { name = "LLAMA_KV_CELL_CAPACITY_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "llama" },
