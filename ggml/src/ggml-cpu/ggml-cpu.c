@@ -1683,10 +1683,12 @@ static void ggml_compute_forward_mul_mat_id(
                 if (total > 0 && i02 != -1) { // -1 skips the row, as below
                     GGML_ASSERT(i02 >= 0 && i02 < total);
                     i02 -= ggml_get_op_params_i32(dst, 1);
-                    if (i02 < 0 || i02 >= n_as) {
+                    const int32_t stride = ggml_mul_mat_id_expert_stride(dst);
+                    if (i02 < 0 || i02 % stride != 0 || i02 / stride >= n_as) {
                         memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
                         continue;
                     }
+                    i02 /= stride;
                 }
 
                 assert(i02 == -1 || (i02 >= 0 && i02 < n_as));

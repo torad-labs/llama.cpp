@@ -99,6 +99,7 @@ def render(diff, out=sys.stdout):
     table("Decode phases on the host, microseconds", [n for n in group("decode.") if "rows" not in n and "seqs" not in n])
     table("Step shapes: rows and sequences", [n for n in group("decode.") if "rows" in n or "seqs" in n])
     table("Kept graphs turned down, by reason (rows of the step refused)", group("graph.kept.reject"))
+    table("Graphs built where none kept was reused, by cause (rows of the step)", group("graph.kept.miss"))
     table("Between devices, microseconds on the host", [n for n in group("meta.") if n.endswith("_us")])
     table("Between devices, events", [n for n in group("meta.") if not n.endswith("_us")])
     table("Graph evaluations a device, microseconds on the host", [n for n in group("cuda.eval.") if n.split("[")[0].endswith("_us")])
@@ -121,7 +122,7 @@ def render(diff, out=sys.stdout):
         for name, slot in sorted(gauges):
             print(f"  {name:60} {slot['g']:10} {slot['max']:10}", file=out)
 
-    shown = ("stage.", "decode.", "graph.kept.reject", "meta.", "cuda.eval.", "cuda.graph.", "cuda.outer.", "cuda.span_us")
+    shown = ("stage.", "decode.", "graph.kept.reject", "graph.kept.miss", "meta.", "cuda.eval.", "cuda.graph.", "cuda.outer.", "cuda.span_us")
     table("Everything else", [name for name in slots if not name.startswith(shown)])
 
 

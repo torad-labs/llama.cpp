@@ -13,16 +13,16 @@
 #include <mutex>
 #include <tuple>
 
-// Relative decode over the runs of cells the model gives (ggml_flash_attn_ext_set_kv_runs) in place of a mask scan. A
-// warp copies the K and V rows of 16 cells into a tile with cp.async while it multiplies the tile before on the tensor
-// cores, as fattn_rel_mma_rows does (a q8_0 or f8_e4m3 cache is loaded into registers instead and converted to f16 as
-// it is staged, fattn_rel_elem). A cell 1024 positions or more before its query has no bias: a tile with no near
-// cell reads no position and no table. With GGML_CUDA_FATTN_REL_RUNS_SHARED a block reads each tile of the shared list
-// once for a group of rows (fattn_rel_runs_shared) and each row's warps read only its other runs.
+// Relative decode by cell runs instead of a mask scan. Private warps stage K/V panels of their own tiles;
+// shared and drafted rows reuse a staged tile across warps. Only tiles with near cells look up relative bias.
 
 constexpr int fattn_rel_runs_cells  = 16; // cells a tile
 constexpr int fattn_rel_runs_stages = 2;  // tiles a block holds: one is read while the next one is copied
 constexpr int fattn_rel_runs_row_i4 = 17; // a staged row: 128 halves and 16 bytes of padding against bank conflicts
+
+constexpr int fattn_rel_runs_private_warps  = 4;
+constexpr int fattn_rel_runs_private_stages = 3;
+constexpr int fattn_rel_runs_panel_i4 = 5; // 32 halves and 16 bytes of padding
 
 // The cache types the tiles are read from: f16, copied as it is, and with GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE q8_0 and
 // f8_e4m3, and q4_0 under its own switch (fattn_rel_elem_q4), converted to f16 as a tile is staged (fattn_rel_elem), as
@@ -130,87 +130,126 @@ struct fattn_rel_runs_cursor {
     }
 };
 
-// A lane's half of a K row and of a V row on their way to a stage. f16 rows go by cp.async and leave nothing here. Rows of
-// another type are loaded into registers, and fattn_rel_runs_finish writes them to the stage as f16 once the warp has
-// done the work it does while they load.
-template <ggml_type type>
-struct fattn_rel_runs_pending {
-    typename fattn_rel_elem<type>::raw k, v;
-    int4 * k_dst = nullptr;
-    int4 * v_dst = nullptr;
+struct fattn_rel_runs_panel_cells {
+    int row[fattn_rel_runs_cells]; // cold cell index, or bitwise complement of hot slot
+    int pos[fattn_rel_runs_cells];
 };
 
-template <ggml_type type>
-static __device__ __forceinline__ void fattn_rel_runs_finish(fattn_rel_runs_pending<type> & pending) {
-    if constexpr (type != GGML_TYPE_F16) {
-        if (pending.k_dst) {
-            const int half_row = threadIdx.x/fattn_rel_runs_cells;
-            fattn_rel_elem<type>::store(pending.k, half_row, pending.k_dst);
-            fattn_rel_elem<type>::store(pending.v, half_row, pending.v_dst);
-            pending.k_dst = nullptr;
+static __device__ __forceinline__ void fattn_rel_runs_panel_resolve(
+        fattn_rel_runs_cursor & cur, const int at, const int end, const int32_t * hot_map, fattn_rel_runs_panel_cells & meta) {
+    const int lane = threadIdx.x;
+    if (lane < fattn_rel_runs_cells) {
+        int64_t cell = cur.run.x;
+        int pos = INT_MIN;
+        if (lane < end - at) {
+            cur.move(at + lane);
+            const int offset = at + lane - cur.run.z;
+            cell = cur.run.x + int64_t(offset)*(cur.run.w & 0x7fffffff);
+            pos = cur.run.y + offset;
         }
-    } else {
-        GGML_UNUSED(pending);
+        const int slot = hot_map ? hot_map[cell] : -1;
+        meta.row[lane] = slot >= 0 ? ~slot : int(cell);
+        meta.pos[lane] = pos;
+    }
+    __syncwarp();
+}
+
+template <ggml_type type>
+static __device__ __forceinline__ void fattn_rel_runs_panel_copy(
+        int4 * dst, const fattn_rel_runs_panel_cells & meta, const int b, const bool is_v,
+        const char * src, const size_t stride, const char * hot_kv, const size_t hot_row) {
+    if constexpr (type == GGML_TYPE_F8_E4M3) {
+        if (!hot_kv) {
+            const int cell = threadIdx.x/2, j = threadIdx.x%2;
+            const unsigned int addr = ggml_cuda_cvta_generic_to_shared(dst + cell*fattn_rel_runs_panel_i4);
+            cp_async_cg_16<0>(addr + 64 - 16*j, src + int64_t(meta.row[cell])*stride + 32*b + 16*j);
+            return;
+        }
+    }
+    constexpr int vectors = type == GGML_TYPE_Q8_0 ? 5 : 4;
+#pragma unroll
+    for (int i = 0; i < (vectors*fattn_rel_runs_cells + WARP_SIZE - 1)/WARP_SIZE; ++i) {
+        const int item = threadIdx.x + i*WARP_SIZE;
+        if (item >= vectors*fattn_rel_runs_cells) {
+            continue;
+        }
+        const int cell = item/vectors, j = item%vectors;
+        const int row = meta.row[cell];
+        const char * ptr = row >= 0 ? src + int64_t(row)*stride : hot_kv + (2*int64_t(~row) + is_v)*hot_row;
+        const unsigned int addr = ggml_cuda_cvta_generic_to_shared(dst + cell*fattn_rel_runs_panel_i4);
+        if (type == GGML_TYPE_F16 || row < 0) {
+            if (j < 4) {
+                cp_async_cg_16<0>(addr + 16*j, ptr + 64*b + 16*j);
+            }
+        } else if constexpr (type == GGML_TYPE_Q8_0) {
+            cp_async_ca_8(addr + 40 + 8*j, ptr + 32*b + 8*j);
+        } else if constexpr (type == GGML_TYPE_Q4_0) {
+            if (j < 3) {
+                cp_async_ca_8(addr + 56 + 8*j, ptr + 16*b + 8*j);
+            }
+        } else if (j < 2) {
+            // Expand each FP8 half over only its own raw bytes.
+            cp_async_cg_16<0>(addr + 64 - 16*j, ptr + 32*b + 16*j);
+        }
     }
 }
 
-// The lanes of a warp copy the K and V rows of the 16 cells of the list from at into a stage, half a row a lane, with the
-// position of each cell, INT_MIN past end (such a slot copies a cell of the run again, and has no weight). In the shared
-// list the last field of a run is the sequences whose rows read it, which the stage keeps too.
-template <ggml_type type, bool shared_list>
-static __device__ __forceinline__ void fattn_rel_runs_stage(
-        fattn_rel_runs_cursor & cur, const int at, const int end, const char * k, const char * v,
-        const size_t k_row, const size_t v_row, int4 * staged_k, int4 * staged_v, int * staged_pos, uint32_t * staged_rows,
-        fattn_rel_runs_pending<type> & pending,
-        const char * hot_kv, const size_t hot_row, const int32_t * hot_map) {
-    constexpr int row_i4 = fattn_rel_runs_row_i4;
-    const int lane = threadIdx.x;
-    const int slot = lane%fattn_rel_runs_cells, half_row = lane/fattn_rel_runs_cells;
-    const int at_slot = at + slot;
-    if (at_slot < end) {
-        cur.move(at_slot);
-    }
-    int64_t cell = cur.run.x;
-    int pos = INT_MIN;
-    if (at_slot < end) {
-        const int offset = at_slot - cur.run.z;
-        cell += shared_list ? int64_t(offset) : int64_t(offset)*(cur.run.w & 0x7fffffff);
-        pos = cur.run.y + offset;
-    }
-    const int32_t hslot = hot_map ? hot_map[cell] : -1;
-    const char * k_src = hslot >= 0 ? hot_kv + (2*int64_t(hslot) + 0)*hot_row : k + cell*k_row;
-    const char * v_src = hslot >= 0 ? hot_kv + (2*int64_t(hslot) + 1)*hot_row : v + cell*v_row;
-    int4 * k_dst = staged_k + slot*row_i4 + 8*half_row;
-    int4 * v_dst = staged_v + slot*row_i4 + 8*half_row;
+template <ggml_type type>
+static __device__ __forceinline__ void fattn_rel_runs_panel_expand(
+        int4 * panel, const fattn_rel_runs_panel_cells & meta, const int b, const char * packed = nullptr) {
     if constexpr (type == GGML_TYPE_F16) {
-        const unsigned int k_dst_s = ggml_cuda_cvta_generic_to_shared(k_dst);
-        const unsigned int v_dst_s = ggml_cuda_cvta_generic_to_shared(v_dst);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            cp_async_cg_16<0>(k_dst_s + 16*j, k_src + 128*half_row + 16*j);
-            cp_async_cg_16<0>(v_dst_s + 16*j, v_src + 128*half_row + 16*j);
-        }
-        GGML_UNUSED(pending);
-    } else if (hslot >= 0) {
-        const unsigned int k_dst_s = ggml_cuda_cvta_generic_to_shared(k_dst);
-        const unsigned int v_dst_s = ggml_cuda_cvta_generic_to_shared(v_dst);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            cp_async_cg_16<0>(k_dst_s + 16*j, k_src + 128*half_row + 16*j);
-            cp_async_cg_16<0>(v_dst_s + 16*j, v_src + 128*half_row + 16*j);
-        }
-        pending.k_dst = nullptr;
+        GGML_UNUSED_VARS(panel, meta, b);
     } else {
-        pending.k = fattn_rel_elem<type>::load(k_src, half_row);
-        pending.v = fattn_rel_elem<type>::load(v_src, half_row);
-        pending.k_dst = k_dst;
-        pending.v_dst = v_dst;
-    }
-    if (half_row == 0) {
-        staged_pos[slot] = pos;
-        if constexpr (shared_list) {
-            staged_rows[slot] = at_slot < end ? uint32_t(cur.run.w) : 0;
+        const int cell = threadIdx.x/2, half_row = threadIdx.x%2;
+        int4 * dst = panel + cell*fattn_rel_runs_panel_i4;
+        const bool cold = meta.row[cell] >= 0;
+        int4 lo = {}, hi = {};
+        if (cold) {
+            if constexpr (type == GGML_TYPE_F8_E4M3) {
+                const int4 r = packed ? ((const int4 *) packed)[cell*8 + 2*b + half_row] : dst[4 - half_row];
+                lo = make_int4(fattn_rel_elem<type>::pair(r.x), fattn_rel_elem<type>::pair(uint32_t(r.x) >> 16),
+                               fattn_rel_elem<type>::pair(r.y), fattn_rel_elem<type>::pair(uint32_t(r.y) >> 16));
+                hi = make_int4(fattn_rel_elem<type>::pair(r.z), fattn_rel_elem<type>::pair(uint32_t(r.z) >> 16),
+                               fattn_rel_elem<type>::pair(r.w), fattn_rel_elem<type>::pair(uint32_t(r.w) >> 16));
+            } else {
+                constexpr bool q8 = type == GGML_TYPE_Q8_0;
+                const char * bytes = (const char *) dst + (q8 ? 40 : 56);
+                if constexpr (q8) {
+                    if (packed) {
+                        bytes = packed + 136*cell + 32*b;
+                    }
+                }
+                const uint32_t * raw = (const uint32_t *) bytes;
+                // The aligned copy starts 2*b bytes before the half scale.
+                const half2 d = __half2half2(__ushort_as_half(uint16_t(raw[b/2] >> (16*(b%2)))));
+                const int off = 2*b + 2 + (q8 ? 16*half_row : 0);
+                const half2 bias = q8 ? make_half2(1152.0f, 1152.0f) : make_half2(1032.0f, 1032.0f);
+                half2 values[8];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int w = off/4 + j;
+                    uint32_t qs = off%4 ? __byte_perm(raw[w], raw[w + 1], 0x5432) : raw[w];
+                    qs = q8 ? qs ^ 0x80808080u : (qs >> (4*half_row)) & 0x0f0f0f0fu;
+                    const uint32_t x = __byte_perm(qs, 0x64646464u, 0x4140);
+                    const uint32_t y = __byte_perm(qs, 0x64646464u, 0x4342);
+                    values[2*j + 0] = __hmul2(__hsub2(*((const half2 *) &x), bias), d);
+                    values[2*j + 1] = __hmul2(__hsub2(*((const half2 *) &y), bias), d);
+                }
+                ggml_cuda_memcpy_1<16>(&lo, values);
+                ggml_cuda_memcpy_1<16>(&hi, values + 4);
+            }
         }
+        if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) {
+            // Both halves must load overlapping raw bytes before writing.
+            if (!packed) {
+                __syncwarp();
+            }
+        }
+        if (cold) {
+            dst[2*half_row + 0] = lo;
+            dst[2*half_row + 1] = hi;
+        }
+        __syncwarp();
     }
 }
 
@@ -317,19 +356,16 @@ static __device__ __forceinline__ void fattn_rel_runs_dequant_coop(
     }
 }
 
-// The logits of a staged tile against the Q heads in B, then one online softmax step into O. Lane holds heads j0, j0 + 1
-// of cells lane/4 and 8 + lane/4. A head takes the bias of a cell only in a tile that has a near cell for some head of the
-// warp; a far cell adds no bias, or the rounded sink shift where the sinks are shifted, as the mask kernels add it.
-template <bool use_log2, bool swa_mask = false>
-static __device__ __forceinline__ void fattn_rel_runs_tile(
-        const ggml_cuda_mma::tile<8, 8, half2> * Q_B, const int4 * staged_k, const int4 * staged_v, const int * staged_pos,
-        const int n, const int * pos_q, const int pos_q_min, const bool * use_head, const uint32_t * row_bits,
-        const uint32_t * staged_rows, const float * const * bias_row, const float * sink, const float * far,
-        const bool shift, const int n_dist, float * maximum, float * denominator, ggml_cuda_mma::tile<16, 8, float> * O) {
 #ifdef AMPERE_MMA_AVAILABLE
+// Lane holds two Q heads of cells lane/4 and 8 + lane/4. Only a tile with a near cell reads the bias table.
+template <bool use_log2, bool swa_mask>
+static __device__ __forceinline__ ggml_cuda_mma::tile<8, 8, half2> fattn_rel_runs_weights(
+        ggml_cuda_mma::tile<16, 8, float> S, const int * staged_pos, const int n, const int * pos_q, const int pos_q_min,
+        const bool * use_head, const uint32_t * row_bits, const uint32_t * staged_rows, const float * const * bias_row,
+        const float * sink, const float * far, const bool shift, const int n_dist,
+        float * maximum, float * denominator, ggml_cuda_mma::tile<16, 8, float> * O) {
     using namespace ggml_cuda_mma;
     constexpr float LOG2E = 1.4426950408889634f;
-    constexpr int row_i4 = fattn_rel_runs_row_i4;
     const int lane = threadIdx.x;
     const int slots[2] = {lane/4, 8 + lane/4};
     bool use[4];
@@ -371,14 +407,6 @@ static __device__ __forceinline__ void fattn_rel_runs_tile(
         }
     }
 
-    // S.x[l] is the logit of cell slot (l/2)*8 + lane/4 for head j0 + l%2.
-    tile<16, 8, float> S;
-#pragma unroll
-    for (int c = 0; c < 8; ++c) {
-        tile<16, 8, half2> K_A;
-        load_ldmatrix(K_A, (const half2 *) staged_k + 8*c, 4*row_i4);
-        mma(S, K_A, Q_B[c]);
-    }
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
         S.x[l] = use[l] ? S.x[l] + bias[l] : -FLT_MAX;
@@ -412,7 +440,28 @@ static __device__ __forceinline__ void fattn_rel_runs_tile(
             }
         }
     }
-    const tile<8, 8, half2> W_B = get_transposed(W);
+    return get_transposed(W);
+}
+#endif // AMPERE_MMA_AVAILABLE
+
+template <bool use_log2, bool swa_mask = false>
+static __device__ __forceinline__ void fattn_rel_runs_tile(
+        const ggml_cuda_mma::tile<8, 8, half2> * Q_B, const int4 * staged_k, const int4 * staged_v, const int * staged_pos,
+        const int n, const int * pos_q, const int pos_q_min, const bool * use_head, const uint32_t * row_bits,
+        const uint32_t * staged_rows, const float * const * bias_row, const float * sink, const float * far,
+        const bool shift, const int n_dist, float * maximum, float * denominator, ggml_cuda_mma::tile<16, 8, float> * O) {
+#ifdef AMPERE_MMA_AVAILABLE
+    using namespace ggml_cuda_mma;
+    constexpr int row_i4 = fattn_rel_runs_row_i4;
+    tile<16, 8, float> S;
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        tile<16, 8, half2> K_A;
+        load_ldmatrix(K_A, (const half2 *) staged_k + 8*c, 4*row_i4);
+        mma(S, K_A, Q_B[c]);
+    }
+    const tile<8, 8, half2> W_B = fattn_rel_runs_weights<use_log2, swa_mask>(S, staged_pos, n, pos_q, pos_q_min,
+            use_head, row_bits, staged_rows, bias_row, sink, far, shift, n_dist, maximum, denominator, O);
 #pragma unroll
     for (int c = 0; c < 8; ++c) {
         tile<16, 8, half2> V_A;
@@ -493,9 +542,9 @@ static __device__ __forceinline__ void fattn_rel_runs_store_direct(
     }
 }
 
-// One warp a part of a row's runs and a KV head, multiplying all the query heads of the KV head at once. After the shared
-// pass it starts at the row's first run the shared list does not hold.
+// Split a part's private tiles across warps, then store one partial for the CTA.
 template <ggml_type type, bool query_first, bool use_log2, bool swa_mask, bool direct>
+__launch_bounds__(fattn_rel_runs_private_warps*WARP_SIZE, 4)
 static __global__ void fattn_rel_runs_rows(
         const char * __restrict__ q, const char * __restrict__ k, const char * __restrict__ v, const int4 * __restrict__ runs,
         const float * __restrict__ table, const int32_t * __restrict__ q_pos, const float * __restrict__ sinks, const bool shift,
@@ -506,23 +555,40 @@ static __global__ void fattn_rel_runs_rows(
 #if defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
     using namespace ggml_cuda_mma;
     constexpr float LOG2E = 1.4426950408889634f;
+    constexpr float LN2 = 0.6931471805599453f;
     const float q_scale = use_log2 ? scale*LOG2E : scale;
-    constexpr int cells = fattn_rel_runs_cells, stages = fattn_rel_runs_stages, row_i4 = fattn_rel_runs_row_i4;
-    const int lane = threadIdx.x;
+    constexpr int cells = fattn_rel_runs_cells, stages = fattn_rel_runs_private_stages;
+    constexpr int warps = fattn_rel_runs_private_warps, row_i4 = fattn_rel_runs_panel_i4;
+    const int lane = threadIdx.x, warp = threadIdx.y;
     const int part = query_first ? blockIdx.z : blockIdx.x;
     const int n_parts = query_first ? gridDim.z : gridDim.x;
     const int kv_head = blockIdx.y, query = query_first ? blockIdx.x : blockIdx.z;
     const int head0 = kv_head*gqa, n_heads = gridDim.y*gqa;
     const int64_t row0 = int64_t(query)*n_heads + head0;
-    __shared__ int4 staged_k[stages][cells*row_i4], staged_v[stages][cells*row_i4];
-    __shared__ int staged_pos[stages][cells];
+    constexpr bool one_byte = type == GGML_TYPE_F8_E4M3 || type == GGML_TYPE_Q8_0;
+    constexpr int raw_words = type == GGML_TYPE_Q8_0 ? 17 : 16;
+    __shared__ union {
+        struct {
+            int4 panel[warps][stages][cells*row_i4];
+            fattn_rel_runs_panel_cells meta[warps][2];
+        } stage;
+        struct {
+            float o[warps][8][128];
+            float m[warps][8];
+            float d[warps][8];
+        } fold;
+        struct {
+            alignas(16) int2 raw[one_byte ? warps : 1][2][cells*raw_words];
+            int4 panel[warps][cells*row_i4];
+            fattn_rel_runs_panel_cells meta[warps][2];
+        } packed;
+    } scratch;
     k += kv_head*k_head;
     v += kv_head*v_head;
     if (hot_kv) {
         hot_kv += kv_head*hot_head;
     }
 
-    // Q is the B operand: 8 heads by 16 values a tile, zero for the heads this KV head does not have.
     tile<8, 8, half2> Q_B[8];
     {
         const int j = lane/4;
@@ -562,42 +628,226 @@ static __global__ void fattn_rel_runs_rows(
     cur.list = runs + int64_t(query)*n_entries;
     const int4 head = cur.list[0];
     const int first = after_shared ? head.z : 0;
-    const int n_tiles = (head.y - first + cells - 1)/cells;
+    const int n_tiles = (int64_t(head.y) - first + cells - 1)/cells;
     const int per_part = (n_tiles + n_parts - 1)/n_parts;
-    const int begin = first + part*per_part*cells;
-    const int end = min(head.y, begin + per_part*cells);
+    const int part_begin = min(n_tiles, part*per_part);
+    const int part_end = min(n_tiles, part_begin + per_part);
+    const int per_warp = (part_end - part_begin + warps - 1)/warps;
+    const int begin = part_begin + warp*per_warp;
+    const int end = min(part_end, begin + per_warp);
 
-    if (begin < end) {
-        fattn_rel_runs_pending<type> pending;
-        cur.seek(begin, head.x);
+    // Copy cold operands as a group; only expand one 32-value panel at a time.
+    if (one_byte && !hot_kv && begin < end) {
+        auto & raw = scratch.packed.raw[warp];
+        auto & panel = scratch.packed.panel[warp];
+        auto & meta = scratch.packed.meta[warp];
+        const int stop = end == n_tiles ? head.y : first + end*cells;
+        const auto copy_operand = [&](int2 * dst, const fattn_rel_runs_panel_cells & m, const char * src, size_t stride) {
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                // Copy the 128-byte body in two-row stripes; the last word follows separately.
 #pragma unroll
-        for (int t = 0; t + 1 < stages; ++t) {
-            if (begin + t*cells < end) {
-                fattn_rel_runs_stage<type, false>(cur, begin + t*cells, end, k, v, k_row, v_row, staged_k[t], staged_v[t],
-                        staged_pos[t], nullptr, pending, hot_kv, hot_row, hot_map);
-                fattn_rel_runs_finish(pending);
+                for (int j = 0; j < cells/2; ++j) {
+                    const int cell = 2*j + lane/16, seg = lane%16;
+                    cp_async_ca_8(ggml_cuda_cvta_generic_to_shared(dst + 17*cell + seg),
+                            src + int64_t(m.row[cell])*stride + 8*seg);
+                }
+                if (lane < cells) {
+                    cp_async_ca_8(ggml_cuda_cvta_generic_to_shared(dst + 17*lane + 16),
+                            src + int64_t(m.row[lane])*stride + 128);
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < cells*8/WARP_SIZE; ++j) {
+                    const int i = j*WARP_SIZE + lane;
+                    cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared((int4 *) dst + i),
+                            src + int64_t(m.row[i/8])*stride + 16*(i%8));
+                }
             }
+        };
+        if (lane < cells) {
+            cur.seek(first + begin*cells, head.x);
+        }
+        fattn_rel_runs_panel_resolve(cur, first + begin*cells, stop, nullptr, meta[0]);
+        copy_operand(raw[0], meta[0], k, k_row);
+        cp_async_commit_group();
+        int current = 0;
+        for (int i = begin; i < end; ++i) {
+            cp_async_wait_group<0>();
+            __syncwarp();
+            copy_operand(raw[1], meta[current], v, v_row);
+            cp_async_commit_group();
+            tile<16, 8, float> S;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                fattn_rel_runs_panel_expand<type>(panel, meta[current], b, (const char *) raw[0]);
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    tile<16, 8, half2> K_A;
+                    load_ldmatrix(K_A, (const half2 *) panel + 8*c, 4*row_i4);
+                    mma(S, K_A, Q_B[2*b + c]);
+                }
+                __syncwarp();
+            }
+            const int at = first + i*cells;
+            if (i + 1 < end) {
+                fattn_rel_runs_panel_resolve(cur, at + cells, stop, nullptr, meta[current ^ 1]);
+                copy_operand(raw[0], meta[current ^ 1], k, k_row);
+            }
+            cp_async_commit_group();
+            const auto W_B = fattn_rel_runs_weights<use_log2, swa_mask>(S, meta[current].pos, min(cells, stop - at),
+                    pos_q, q_pos_row, valid, nullptr, nullptr, bias_row, sink, far, shift, n_dist, maximum, denominator, O);
+            cp_async_wait_group<1>();
+            __syncwarp();
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                fattn_rel_runs_panel_expand<type>(panel, meta[current], b, (const char *) raw[1]);
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    tile<16, 8, half2> V_A;
+                    load_ldmatrix_trans(V_A, (const half2 *) panel + 8*c, 4*row_i4);
+                    mma(O[2*b + c], V_A, W_B);
+                }
+                __syncwarp();
+            }
+            current ^= 1;
+        }
+        cp_async_wait_all();
+    } else if (begin < end) {
+        auto & panel = scratch.stage.panel[warp];
+        auto & meta = scratch.stage.meta[warp];
+        const int stop = end == n_tiles ? head.y : first + end*cells;
+        if (lane < cells) {
+            cur.seek(first + begin*cells, head.x);
+        }
+        fattn_rel_runs_panel_resolve(cur, first + begin*cells, stop, hot_map, meta[0]);
+
+        int stage = 0, current = 0;
+        constexpr int ahead = stages - 1;
+#pragma unroll
+        for (int b = 0; b < ahead; ++b) {
+            fattn_rel_runs_panel_copy<type>(panel[b], meta[0], b, false, k, k_row, hot_kv, hot_row);
             cp_async_commit_group();
         }
-        for (int at = begin, s = 0; at < end; at += cells, s = (s + 1)%stages) {
-            cp_async_wait_group<stages - 2>();
-            __syncwarp();
-            // the next tile goes to the stage the warp read last
-            if (at + (stages - 1)*cells < end) {
-                const int t = (s + stages - 1)%stages;
-                fattn_rel_runs_stage<type, false>(cur, at + (stages - 1)*cells, end, k, v, k_row, v_row,
-                        staged_k[t], staged_v[t], staged_pos[t], nullptr, pending, hot_kv, hot_row, hot_map);
+
+        for (int i = begin; i < end; ++i) {
+            tile<16, 8, float> S;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                cp_async_wait_group<stages - 2>();
+                __syncwarp();
+                const int next = (stage + ahead)%stages;
+                const bool is_v = b + ahead >= 4;
+                fattn_rel_runs_panel_copy<type>(panel[next], meta[current], (b + ahead)%4, is_v,
+                        is_v ? v : k, is_v ? v_row : k_row, hot_kv, hot_row);
+                cp_async_commit_group();
+
+                fattn_rel_runs_panel_expand<type>(panel[stage], meta[current], b);
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    tile<16, 8, half2> K_A;
+                    load_ldmatrix(K_A, (const half2 *) panel[stage] + 8*c, 4*row_i4);
+                    mma(S, K_A, Q_B[2*b + c]);
+                }
+                stage = (stage + 1)%stages;
             }
-            cp_async_commit_group();
-            fattn_rel_runs_tile<use_log2, swa_mask>(Q_B, staged_k[s], staged_v[s], staged_pos[s], min(cells, end - at), pos_q, q_pos_row, valid, nullptr,
-                    nullptr, bias_row, sink, far, shift, n_dist, maximum, denominator, O);
-            fattn_rel_runs_finish(pending);
+            const int at = first + i*cells;
+            const auto W_B = fattn_rel_runs_weights<use_log2, swa_mask>(S, meta[current].pos, min(cells, stop - at),
+                    pos_q, q_pos_row, valid, nullptr, nullptr, bias_row, sink, far, shift, n_dist, maximum, denominator, O);
+            const bool more = i + 1 < end;
+            if (more) {
+                fattn_rel_runs_panel_resolve(cur, at + cells, stop, hot_map, meta[current ^ 1]);
+            }
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                cp_async_wait_group<stages - 2>();
+                __syncwarp();
+                const int next = (stage + ahead)%stages;
+                if (b + ahead < 4) {
+                    fattn_rel_runs_panel_copy<type>(panel[next], meta[current], b + ahead, true, v, v_row, hot_kv, hot_row);
+                } else if (more) {
+                    fattn_rel_runs_panel_copy<type>(panel[next], meta[current ^ 1], b + ahead - 4, false, k, k_row, hot_kv, hot_row);
+                }
+                cp_async_commit_group();
+
+                fattn_rel_runs_panel_expand<type>(panel[stage], meta[current], b);
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    tile<16, 8, half2> V_A;
+                    load_ldmatrix_trans(V_A, (const half2 *) panel[stage] + 8*c, 4*row_i4);
+                    mma(O[2*b + c], V_A, W_B);
+                }
+                stage = (stage + 1)%stages;
+            }
+            current ^= 1;
+        }
+        cp_async_wait_all();
+    }
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+#pragma unroll
+        for (int offset = 16; offset >= 4; offset >>= 1) {
+            denominator[p] += __shfl_xor_sync(0xffffffff, denominator[p], offset, WARP_SIZE);
         }
     }
-    if constexpr (direct) {
-        fattn_rel_runs_store_direct<use_log2>(maximum, denominator, O, valid, row, sink, shift, out);
-    } else {
-        fattn_rel_runs_store<use_log2>(maximum, denominator, O, valid, row, out, n_slots, slot0 + part, fp8);
+
+    // The staging storage is dead. Keep the fold in the tile's log base until writing the partial.
+    __syncthreads();
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int h = j0 + p;
+        if (lane < 4) {
+            scratch.fold.m[warp][h] = maximum[p];
+            scratch.fold.d[warp][h] = denominator[p];
+        }
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            scratch.fold.o[warp][h][16*c + lane/4] = O[c].x[p];
+            scratch.fold.o[warp][h][16*c + 8 + lane/4] = O[c].x[p + 2];
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0 && lane < gqa) {
+        float m = -FLT_MAX;
+#pragma unroll
+        for (int w = 0; w < warps; ++w) {
+            m = fmaxf(m, scratch.fold.m[w][lane]);
+        }
+        float d = 0.0f;
+#pragma unroll
+        for (int w = 0; w < warps; ++w) {
+            const float dw = scratch.fold.d[w][lane];
+            const float md = scratch.fold.m[w][lane] - m;
+            const float weight = dw > 0.0f ? (use_log2 ? exp2f(md) : expf(md)) : 0.0f;
+            d += weight*dw;
+            scratch.fold.m[w][lane] = weight;
+        }
+        const float max_e = use_log2 && m > -1e30f ? m*LN2 : m;
+        if constexpr (direct) {
+            const float sink_e = shift ? 0.0f : sinks[row0 + lane];
+            const float m_all = fmaxf(max_e, sink_e);
+            const float w = d > 0.0f ? expf(max_e - m_all) : 0.0f;
+            scratch.fold.d[0][lane] = w/(expf(sink_e - m_all) + w*d);
+        } else {
+            float * dst = out + ((row0 + lane)*n_slots + slot0 + part)*130;
+            dst[0] = max_e;
+            dst[1] = fattn_rel_partial_word(d, fp8);
+        }
+    }
+    __syncthreads();
+
+    const int dim = warp*WARP_SIZE + lane;
+    for (int h = 0; h < gqa; ++h) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int w = 0; w < warps; ++w) {
+            acc += scratch.fold.m[w][h]*scratch.fold.o[w][h][dim];
+        }
+        if constexpr (direct) {
+            out[(row0 + h)*128 + dim] = acc*scratch.fold.d[0][h];
+        } else {
+            out[((row0 + h)*n_slots + slot0 + part)*130 + 2 + dim] = fattn_rel_partial_word(acc, fp8);
+        }
     }
 #else
     GGML_UNUSED_VARS(q, k, v, runs, table, q_pos, sinks, shift, out, scale, n_entries, table_stride, n_dist, gqa, slot0, n_slots,
@@ -1120,7 +1370,7 @@ static int fattn_rel_runs_occupancy_blocks(const int device, const void * kernel
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-// GGML_CUDA_FATTN_REL_RUNS_PARTS: warps a row's cells are split across for each KV head, capped to SM occupancy unless overridden.
+// GGML_CUDA_FATTN_REL_RUNS_PARTS: CTAs per row and KV head, capped to SM occupancy unless overridden.
 static int fattn_rel_runs_parts(const int device, const ggml_tensor * dst) {
     const int q_group = fattn_rel_decode_group(dst);
     if (ggml_flash_attn_ext_is_swa_runs(dst)) {
@@ -1146,7 +1396,7 @@ static int fattn_rel_runs_parts(const int device, const ggml_tensor * dst) {
         static const bool log2_legacy = ggml_env_switch("GGML_CUDA_FATTN_REL_LOG2_LEGACY");
         const bool use_log2 = !log2_legacy;
         const int gqa = (int) (q->ne[2]/k->ne[2]);
-        const int block_threads = q_group > 1 ? WARP_SIZE*std::max(2, (q_group*gqa + 7)/8) : WARP_SIZE;
+        const int block_threads = WARP_SIZE*(q_group > 1 ? std::max(2, (q_group*gqa + 7)/8) : fattn_rel_runs_private_warps);
         auto pick_kernel = [&](auto type_tag) -> const void * {
             constexpr ggml_type T = decltype(type_tag)::value;
             if (q_group > 1) {
@@ -1336,7 +1586,8 @@ static void ggml_cuda_fattn_rel_runs_type(ggml_backend_cuda_context & ctx, ggml_
                                : fattn_rel_runs_rows<type, false, true,  swa_c, dir_c>)
                 : (query_first ? fattn_rel_runs_rows<type, true,  false, swa_c, dir_c>
                                : fattn_rel_runs_rows<type, false, false, swa_c, dir_c>);
-            kernel<<<query_first ? dim3(n_rows, n_kv_heads, parts) : dim3(parts, n_kv_heads, n_rows), WARP_SIZE, 0, ctx.stream()>>>(
+            const dim3 block(WARP_SIZE, fattn_rel_runs_private_warps);
+            kernel<<<query_first ? dim3(n_rows, n_kv_heads, parts) : dim3(parts, n_kv_heads, n_rows), block, 0, ctx.stream()>>>(
                     (const char *) q->data, (const char *) k->data, (const char *) v->data, runs_d, table, q_pos, sinks, shift, row_out,
                     scale, n_entries, table_stride, n_dist, gqa, shared_parts, n_slots, shared_parts > 0,
                     q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2], fp8,

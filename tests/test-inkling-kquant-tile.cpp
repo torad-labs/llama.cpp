@@ -2,12 +2,19 @@
 // Default mode runs Q3_K/Q4_K/Q5_K MMQ across Inkling prefill widths, fallback rows, dense Stream-K, and fused GLU,
 // checking CPU NMSE < 5e-4 and dumping output bytes for bit-exact staged-vs-legacy comparison.
 // --tma-23 mode checks 23-row Q3_K/Q4_K/Q5_K TMA decode across 0/3/8 repeated experts and 1024/1536/4608 shards.
+// --rotated mode checks one card's banks of the rotated expert split (gate/up N=1024 and 512, down K=512 and 256) at
+// 23 and 512 rows, and the fused TMA gate/up + SITU and down + weighted sum with a strided bonus expert range.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
+
+#ifdef GGML_USE_CUDA
+#include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-cuda/mmq-tma-tiles.cuh"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -475,9 +482,299 @@ static int run_tma_23_suite(ggml_backend_t cuda, ggml_backend_t cpu, int n_threa
     return failures;
 }
 
+// One card c of the rotated expert split (LLAMA_INKLING2_EXPERT_LAYOUT=rotated): the base banks hold all 384 experts
+// at K [512c, 512c + 512) of the down and N 1024 of gate/up, the bonus banks the 96 experts e % 4 == c at K 256 of the
+// down and N 512 of gate/up as local experts (e - c)/4. Each against the CPU on the same bytes.
+static constexpr int ROT_TOTAL = 384;
+static constexpr int ROT_CARDS = 4;
+static constexpr int ROT_CARD  = 1;
+
+static void rot_routes(std::vector<int32_t> & ids, int64_t n_tok, int64_t n_used, uint32_t seed) {
+    ids.resize(n_used*n_tok);
+    uint32_t st = seed | 1u;
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t u = 0; u < n_used; ++u) {
+            int32_t cand = 0;
+            bool dup = true;
+            while (dup) {
+                noise_from(st);
+                cand = (int32_t) (st % ROT_TOTAL);
+                dup = false;
+                for (int64_t p = 0; p < u; ++p) {
+                    dup = dup || ids[t*n_used + p] == cand;
+                }
+            }
+            ids[t*n_used + u] = cand;
+        }
+    }
+}
+
+struct rot_case {
+    ggml_type    type;
+    int64_t      k;
+    int64_t      m;
+    bool         bonus;
+    bool         bcast;
+    const char * label;
+};
+
+static bool run_rot_case(ggml_backend_t cuda, ggml_backend_t cpu, const rot_case & c, int64_t n_tok, int n_threads,
+                         uint32_t seed, int64_t & owned, int iters) {
+    constexpr int64_t n_used = 8;
+    const int64_t n_local = c.bonus ? ROT_TOTAL/ROT_CARDS : ROT_TOTAL;
+    ggml_init_params params  = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params gparams = { ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx[2]  = { ggml_init(params),  ggml_init(params) };
+    ggml_context * gctx[2] = { ggml_init(gparams), ggml_init(gparams) };
+    ggml_tensor * as[2], * ids_t[2], * b[2], * out[2];
+    ggml_cgraph * gf[2];
+    for (int i = 0; i < 2; ++i) {
+        as[i]    = ggml_new_tensor_3d(ctx[i], c.type, c.k, c.m, n_local);
+        ids_t[i] = ggml_new_tensor_2d(ctx[i], GGML_TYPE_I32, n_used, n_tok);
+        b[i]     = ggml_new_tensor_3d(ctx[i], GGML_TYPE_F32, c.k, c.bcast ? 1 : n_used, n_tok);
+        out[i]   = ggml_mul_mat_id(ctx[i], as[i], b[i], ids_t[i]);
+        if (c.bonus) {
+            ggml_mul_mat_id_set_expert_range(out[i], 0, ROT_TOTAL); // ids [0, 96) owned, the rest zero rows
+        }
+        gf[i] = ggml_new_graph(gctx[i]);
+        ggml_build_forward_expand(gf[i], out[i]);
+    }
+    ggml_backend_buffer_t buf_g = ggml_backend_alloc_ctx_tensors(ctx[0], cuda);
+    ggml_backend_buffer_t buf_c = ggml_backend_alloc_ctx_tensors(ctx[1], cpu);
+    bool ok = buf_g != nullptr && buf_c != nullptr;
+    double err = 1.0;
+    if (ok) {
+        quantize_weight_pair(as[0], as[1], c.type, c.k, seed, n_threads);
+        fill_f32_pair(b[0], b[1], seed ^ 0x2468ace1u);
+        std::vector<int32_t> ids;
+        rot_routes(ids, n_tok, n_used, seed ^ 0x0badf00du);
+        owned = 0;
+        for (int32_t & e : ids) {
+            const bool own = !c.bonus || e % ROT_CARDS == ROT_CARD;
+            owned += own;
+            if (c.bonus) {
+                e = own ? (e - ROT_CARD)/ROT_CARDS : (int32_t) (n_local + e % (ROT_TOTAL - n_local));
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            ggml_backend_tensor_set(ids_t[i], ids.data(), 0, ids.size()*sizeof(int32_t));
+        }
+        std::vector<char> sentinel(ggml_nbytes(out[0]), (char) 0xA5);
+        ggml_backend_tensor_set(out[0], sentinel.data(), 0, sentinel.size());
+        ok = ggml_backend_graph_compute(cuda, gf[0]) == GGML_STATUS_SUCCESS &&
+             ggml_backend_graph_compute(cpu,  gf[1]) == GGML_STATUS_SUCCESS;
+        if (ok) {
+            std::vector<float> gpu(ggml_nelements(out[0])), ref(ggml_nelements(out[1]));
+            ggml_backend_tensor_get(out[0], gpu.data(), 0, gpu.size()*sizeof(float));
+            ggml_backend_tensor_get(out[1], ref.data(), 0, ref.size()*sizeof(float));
+            err = compute_nmse(ref, gpu);
+            ok = err < 5e-4;
+        }
+    }
+    double us = 0.0; // the op's wall time a call: its launches and one synchronize
+    if (ok && iters > 0) {
+        for (int i = 0; i < 3; ++i) {
+            ggml_backend_graph_compute(cuda, gf[0]);
+        }
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < iters; ++i) {
+            ggml_backend_graph_compute(cuda, gf[0]);
+        }
+        us = (double) (ggml_time_us() - t0)/iters;
+    }
+    printf("%-36s n=%-4lld owned %4lld/%-4lld nmse %.3e  op %8.1f us  %s\n", c.label, (long long) n_tok,
+        (long long) owned, (long long) (n_used*n_tok), err, us, ok ? "ok" : "FAIL");
+    if (buf_g) { ggml_backend_buffer_free(buf_g); }
+    if (buf_c) { ggml_backend_buffer_free(buf_c); }
+    for (int i = 0; i < 2; ++i) {
+        ggml_free(gctx[i]);
+        ggml_free(ctx[i]);
+    }
+    return ok;
+}
+
+#ifdef GGML_USE_CUDA
+// The fused TMA entry points on the card's bonus banks (96 local experts, global e = 1 + 4l), called directly with
+// global ids and stride 4. 87.5% of the routed slots are other cards' experts, many of them in [1, 97), which a
+// contiguous range would take as owned: their gate/up rows must be zero and their down slots must not enter the sum.
+// The CPU reference runs on ids remapped here (l or -1), so the expected map does not come from the code under test.
+static bool run_rot_fused(ggml_backend_t cuda, ggml_backend_t cpu, int n_threads) {
+    const char * tma = getenv("GGML_CUDA_MMQ_TMA");
+    if (tma == nullptr || strcmp(tma, "1") != 0) {
+        printf("rotated fused bonus: skipped, GGML_CUDA_MMQ_TMA is not 1\n");
+        return true;
+    }
+    constexpr int64_t n_tok = 23, n_used = 8, n_local = ROT_TOTAL/ROT_CARDS, k = 4608, n_ff = 256, n_embd = 4608;
+    constexpr float beta = 4.0f, lb = 25.0f;
+    ggml_init_params params  = { 16*ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params gparams = { ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx_g = ggml_init(params);
+    ggml_context * ctx_c = ggml_init(params);
+    ggml_context * gctx  = ggml_init(gparams);
+    ggml_tensor * gu_g  = ggml_new_tensor_3d(ctx_g, GGML_TYPE_Q3_K, k, 2*n_ff, n_local);
+    ggml_tensor * dn_g  = ggml_new_tensor_3d(ctx_g, GGML_TYPE_Q4_K, n_ff, n_embd, n_local);
+    ggml_tensor * x_g   = ggml_new_tensor_3d(ctx_g, GGML_TYPE_F32, k, 1, n_tok);
+    ggml_tensor * ids_g = ggml_new_tensor_2d(ctx_g, GGML_TYPE_I32, n_used, n_tok);
+    ggml_tensor * glu_g = ggml_new_tensor_3d(ctx_g, GGML_TYPE_F32, n_ff, n_used, n_tok);
+    ggml_tensor * w_g   = ggml_new_tensor_3d(ctx_g, GGML_TYPE_F32, 1, n_used, n_tok);
+    ggml_tensor * out_g = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, n_embd, n_tok);
+
+    // CPU: the gate/up product, SITU over its halves, and the down product on the GPU's GLU output
+    ggml_tensor * gu_c  = ggml_new_tensor_3d(ctx_c, GGML_TYPE_Q3_K, k, 2*n_ff, n_local);
+    ggml_tensor * dn_c  = ggml_new_tensor_3d(ctx_c, GGML_TYPE_Q4_K, n_ff, n_embd, n_local);
+    ggml_tensor * x_c   = ggml_new_tensor_3d(ctx_c, GGML_TYPE_F32, k, 1, n_tok);
+    ggml_tensor * ids_c = ggml_new_tensor_2d(ctx_c, GGML_TYPE_I32, n_used, n_tok);
+    ggml_tensor * h_c   = ggml_new_tensor_3d(ctx_c, GGML_TYPE_F32, n_ff, n_used, n_tok);
+    ggml_tensor * pair  = ggml_mul_mat_id(ctx_c, gu_c, x_c, ids_c);
+    ggml_tensor * glu_c = ggml_situ_split(ctx_c,
+        ggml_view_3d(ctx_c, pair, n_ff, n_used, n_tok, pair->nb[1], pair->nb[2], 0),
+        ggml_view_3d(ctx_c, pair, n_ff, n_used, n_tok, pair->nb[1], pair->nb[2], n_ff*sizeof(float)), beta, lb);
+    ggml_tensor * dn_out = ggml_mul_mat_id(ctx_c, dn_c, h_c, ids_c);
+    ggml_cgraph * gf = ggml_new_graph(gctx);
+    ggml_build_forward_expand(gf, glu_c);
+    ggml_build_forward_expand(gf, dn_out);
+
+    ggml_backend_buffer_t buf_g = ggml_backend_alloc_ctx_tensors(ctx_g, cuda);
+    ggml_backend_buffer_t buf_c = ggml_backend_alloc_ctx_tensors(ctx_c, cpu);
+    bool ok = buf_g != nullptr && buf_c != nullptr;
+    if (ok) {
+        quantize_weight_pair(gu_g, gu_c, GGML_TYPE_Q3_K, k, 0x0b0e5001u, n_threads);
+        quantize_weight_pair(dn_g, dn_c, GGML_TYPE_Q4_K, n_ff, 0x0b0e5002u, n_threads);
+        fill_f32_pair(x_g, x_c, 0x0b0e5003u);
+        // per token 1 slot on an owned expert (two of them shared by every token), the other 7 on other cards
+        std::vector<int32_t> ids(n_used*n_tok);
+        std::vector<float>   wts(n_used*n_tok);
+        uint32_t st = 0x0b0e5004u;
+        for (int64_t t = 0; t < n_tok; ++t) {
+            for (int64_t u = 0; u < n_used; ++u) {
+                noise_from(st);
+                int32_t e;
+                if (u == t % n_used) {
+                    const int32_t l = t < 12 ? (t % 2 ? 95 : 0) : (int32_t) (st % n_local);
+                    e = ROT_CARD + ROT_CARDS*l;
+                } else {
+                    e = (int32_t) (st % ROT_TOTAL);
+                    if (e % ROT_CARDS == ROT_CARD) {
+                        e = (e + 1) % ROT_TOTAL;
+                    }
+                }
+                ids[t*n_used + u] = e;
+                wts[t*n_used + u] = 0.25f + 0.5f*(float) (st % 1000)/1000.0f;
+            }
+        }
+        std::vector<int32_t> lids(ids.size());
+        int64_t n_trap = 0; // non-owned ids a contiguous range [1, 97) would take as owned
+        for (size_t s = 0; s < ids.size(); ++s) {
+            const bool own = ids[s] % ROT_CARDS == ROT_CARD;
+            lids[s] = own ? (ids[s] - ROT_CARD)/ROT_CARDS : -1;
+            n_trap += !own && ids[s] >= ROT_CARD && ids[s] < ROT_CARD + n_local;
+        }
+        ggml_backend_tensor_set(ids_g, ids.data(), 0, ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ids_c, lids.data(), 0, lids.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(w_g, wts.data(), 0, wts.size()*sizeof(float));
+        std::vector<char> sentinel(ggml_nbytes(glu_g), (char) 0xA5);
+        ggml_backend_tensor_set(glu_g, sentinel.data(), 0, sentinel.size());
+
+        ggml_backend_cuda_context & cctx = *(ggml_backend_cuda_context *) cuda->context;
+        ok = ggml_cuda_mmq_tma_gate_up_situ(cctx, gu_g, x_g, ids_g, glu_g, ROT_CARD, (int32_t) n_local, beta, lb,
+            nullptr, true, ROT_CARDS);
+        ok = ok && ggml_cuda_mmq_tma_down_weighted_sum(cctx, dn_g, glu_g, ids_g, w_g, out_g, ROT_CARD, (int32_t) n_local,
+            nullptr, ROT_CARDS);
+        ggml_backend_synchronize(cuda);
+        if (!ok) {
+            printf("rotated fused: TMA entry point declined the bonus bank  FAIL\n");
+        } else {
+            std::vector<float> glu(ggml_nelements(glu_g)), out(ggml_nelements(out_g));
+            ggml_backend_tensor_get(glu_g, glu.data(), 0, glu.size()*sizeof(float));
+            ggml_backend_tensor_get(out_g, out.data(), 0, out.size()*sizeof(float));
+            ggml_backend_tensor_set(h_c, glu.data(), 0, glu.size()*sizeof(float));
+            ok = ggml_backend_graph_compute(cpu, gf) == GGML_STATUS_SUCCESS;
+            std::vector<float> glu_ref(ggml_nelements(glu_c)), dn(ggml_nelements(dn_out));
+            ggml_backend_tensor_get(glu_c, glu_ref.data(), 0, glu_ref.size()*sizeof(float));
+            ggml_backend_tensor_get(dn_out, dn.data(), 0, dn.size()*sizeof(float));
+            int64_t n_owned = 0, bad_zero = 0;
+            for (int64_t s = 0; s < n_used*n_tok; ++s) {
+                const bool own = ids[s] % ROT_CARDS == ROT_CARD;
+                n_owned += own;
+                for (int64_t j = 0; j < n_ff && !own; ++j) {
+                    bad_zero += glu[s*n_ff + j] != 0.0f;
+                }
+            }
+            std::vector<float> out_ref(n_embd*n_tok, 0.0f);
+            for (int64_t t = 0; t < n_tok; ++t) {
+                for (int64_t u = 0; u < n_used; ++u) {
+                    const int64_t s = t*n_used + u;
+                    if (ids[s] % ROT_CARDS == ROT_CARD) {
+                        for (int64_t j = 0; j < n_embd; ++j) {
+                            out_ref[t*n_embd + j] += wts[s]*dn[s*n_embd + j];
+                        }
+                    }
+                }
+            }
+            const double err_glu = compute_nmse(glu_ref, glu);
+            const double err_out = compute_nmse(out_ref, out);
+
+            // control: the same call with a contiguous range must take trap ids as owned, or the check above proves nothing
+            int64_t ctl_nonzero = 0;
+            ok = ok && n_trap > 0 && ggml_cuda_mmq_tma_gate_up_situ(cctx, gu_g, x_g, ids_g, glu_g, ROT_CARD,
+                (int32_t) n_local, beta, lb, nullptr, true, 1);
+            ggml_backend_synchronize(cuda);
+            ggml_backend_tensor_get(glu_g, glu.data(), 0, glu.size()*sizeof(float));
+            for (int64_t s = 0; s < n_used*n_tok; ++s) {
+                for (int64_t j = 0; j < n_ff && ids[s] % ROT_CARDS != ROT_CARD; ++j) {
+                    ctl_nonzero += glu[s*n_ff + j] != 0.0f;
+                }
+            }
+            ok = ok && bad_zero == 0 && err_glu < 5e-4 && err_out < 5e-4 && ctl_nonzero > 0;
+            printf("rotated fused bonus (stride 4): owned %lld/%lld, trap ids %lld, non-owned glu nonzero %lld, "
+                "glu nmse %.3e, down+sum nmse %.3e, stride-1 control nonzero %lld  %s\n", (long long) n_owned,
+                (long long) (n_used*n_tok), (long long) n_trap, (long long) bad_zero, err_glu, err_out,
+                (long long) ctl_nonzero, ok ? "ok" : "FAIL");
+        }
+    }
+    if (buf_g) { ggml_backend_buffer_free(buf_g); }
+    if (buf_c) { ggml_backend_buffer_free(buf_c); }
+    ggml_free(gctx);
+    ggml_free(ctx_g);
+    ggml_free(ctx_c);
+    return ok;
+}
+#endif
+
+static int run_rotated_suite(ggml_backend_t cuda, ggml_backend_t cpu, int n_threads, int iters, const char * only) {
+    const rot_case cases[] = {
+        { GGML_TYPE_Q3_K, 4608, 1024, false, true,  "rot gate_up base q3_K N=1024"  },
+        { GGML_TYPE_Q3_K, 4608,  512, true,  true,  "rot gate_up bonus q3_K N=512"  },
+        { GGML_TYPE_Q4_K,  512, 4608, false, false, "rot down base q4_K K=512"      },
+        { GGML_TYPE_Q5_K,  512, 4608, false, false, "rot down base q5_K K=512"      },
+        { GGML_TYPE_Q4_K,  256, 4608, true,  false, "rot down bonus q4_K K=256"     },
+        { GGML_TYPE_Q5_K,  256, 4608, true,  false, "rot down bonus q5_K K=256"     },
+    };
+    int failures = 0;
+    uint32_t seed = 0x707a7ed1u;
+    for (const rot_case & c : cases) {
+        for (int64_t n_tok : { 23, 512 }) {
+            int64_t owned = 0;
+            seed += 31u;
+            char name[96];
+            snprintf(name, sizeof(name), "%s n=%lld", c.label, (long long) n_tok);
+            if (only == nullptr || strstr(name, only) != nullptr) {
+                failures += !run_rot_case(cuda, cpu, c, n_tok, n_threads, seed, owned, iters);
+            }
+        }
+    }
+#ifdef GGML_USE_CUDA
+    if (only == nullptr || strstr("fused", only) != nullptr) {
+        failures += !run_rot_fused(cuda, cpu, n_threads);
+    }
+#endif
+    return failures;
+}
+
 int main(int argc, char ** argv) {
-    const bool tma_23 = argc > 1 && strcmp(argv[1], "--tma-23") == 0;
-    const char * dump_path = (!tma_23 && argc > 1) ? argv[1] : nullptr;
+    const bool tma_23  = argc > 1 && strcmp(argv[1], "--tma-23") == 0;
+    const bool rotated = argc > 1 && strcmp(argv[1], "--rotated") == 0;
+    const char * dump_path = (!tma_23 && !rotated && argc > 1) ? argv[1] : nullptr;
 
     ggml_backend_t cuda = ggml_backend_cuda_init(0);
     if (cuda == nullptr) {
@@ -493,8 +790,12 @@ int main(int argc, char ** argv) {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(cpu, n_threads);
 
-    if (tma_23) {
-        const int failures = run_tma_23_suite(cuda, cpu, n_threads);
+    if (tma_23 || rotated) {
+        // --rotated [iters [filter]]: time each case over iters calls; run only cases whose "label n=rows" holds filter
+        const int    iters = rotated && argc > 2 ? atoi(argv[2]) : 0;
+        const char * only  = rotated && argc > 3 ? argv[3] : nullptr;
+        const int failures = tma_23 ? run_tma_23_suite(cuda, cpu, n_threads) :
+            run_rotated_suite(cuda, cpu, n_threads, iters, only);
         ggml_backend_free(cpu);
         ggml_backend_free(cuda);
         return failures == 0 ? 0 : 1;

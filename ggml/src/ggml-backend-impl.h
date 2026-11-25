@@ -106,6 +106,11 @@ extern "C" {
     // Backend (meta)
     //
 
+    // One epoch for a read-only pass sizing a set of tensors.
+    uint64_t ggml_gallocr_measure_epoch(void);
+    uint64_t ggml_gallocr_measure_begin(void);
+    void     ggml_gallocr_measure_end(uint64_t prev);
+
     GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);

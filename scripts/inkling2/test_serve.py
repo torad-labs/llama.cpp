@@ -66,8 +66,9 @@ class ProfilePlanTest(unittest.TestCase):
             for flag, value in {
                 "--spec-type": "draft-dspark", "--spec-draft-model": str(draft),
                 "--spec-draft-n-max": "3", "--spec-draft-sampling": "probabilistic",
-                "--spec-draft-device": "CUDA3", "--spec-draft-type-k": "q8_0",
-                "--cache-type-k": "q8_0", "--cache-type-k-swa": "q8_0", "-c": "1572864", "-ub": "256",
+                "--spec-draft-device": "CUDA0,CUDA1,CUDA2,CUDA3", "--spec-draft-type-k": "q8_0",
+                "--spec-draft-split-mode": "tensor",
+                "--cache-type-k": "q8_0", "--cache-type-k-swa": "q8_0", "-c": "3014656", "-ub": "256",
             }.items():
                 self.assertEqual(auto[auto.index(flag) + 1], value)
             self.assertEqual(auto_env["LLAMA_DSPARK_TRIM_BLOCK"], "1")
@@ -86,6 +87,40 @@ class ProfilePlanTest(unittest.TestCase):
                 plan(*custom, "--draft")
             with self.assertRaises(ValueError):
                 plan("--no-draft", "--draft-model", str(draft))
+
+    def test_draft_device_takes_all_a_list_or_one_card(self):
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / serve.DRAFT).touch()
+            def draft(*options):
+                argv, _ = plan("--packs", root, "--draft", *options)
+                return argv, argv[argv.index("--spec-draft-device") + 1], argv[argv.index("-c") + 1]
+            default = draft()
+            self.assertEqual(default[1:], ("CUDA0,CUDA1,CUDA2,CUDA3", "3014656"))
+            self.assertEqual(draft("--draft-device", "all"), default)
+            multi = draft("--draft-device", "CUDA3,CUDA1")
+            self.assertEqual(multi[1:], ("CUDA3,CUDA1", "3014656"))
+            self.assertEqual(multi[0][multi[0].index("--spec-draft-split-mode") + 1], "tensor")
+            single = draft("--draft-device", "CUDA3")
+            self.assertEqual(single[1:], ("CUDA3", "2097152"))
+            self.assertNotIn("--spec-draft-split-mode", single[0])
+            self.assertEqual(draft("--draft-device", "CUDA3", "--kv-cache", "f16")[1:], ("CUDA3", "1310720"))
+            self.assertEqual(draft("--draft-device", "CUDA3", "--kv-cache", "q4_0")[2], "2097152")
+            self.assertEqual(draft("--context", "1048576")[2], "1048576")
+            self.assertEqual(draft("--draft-device", "CUDA3", "--context", "2500000")[2], "2500000")
+
+    def test_draft_device_refuses_unknown_repeated_or_empty_names(self):
+        for value in ("CUDA4", "CUDA0,CUDA0", "", "CUDA0,", "ALL"):
+            with self.subTest(value=value), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                serve.arguments(["--draft-device", value])
+
+    def test_draft_layout_control_takes_the_pool_of_its_draft(self):
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / serve.DRAFT).touch()
+            for devices in ((), ("--draft-device", "CUDA3"), ("--draft-device", "CUDA3", "--kv-cache", "f16")):
+                with self.subTest(devices=devices):
+                    drafted, _ = plan("--packs", root, "--draft", *devices)
+                    control, _ = plan("--packs", root, "--draft-layout", "--no-draft", *devices)
+                    self.assertEqual(control, drafted[:drafted.index("--spec-type")])
 
     def test_tensor_4_defaults_to_the_qualified_q3_pack_and_pool(self):
         argv, env = plan()
@@ -126,7 +161,7 @@ class ProfilePlanTest(unittest.TestCase):
                          "--no-l2-persist", "--no-l2-expert-warm", "--no-router-bake", "--no-moe-route-gate", "--no-ar-copy-capture",
                          "--no-keep-prompt-graphs", "--prompt-shapes", "0",
                          "--swa-kv-cache", "f16",
-                         "--keep-graphs", "0", "--checkpoint-rows", "0", "--checkpoint-ram", "0",
+                         "--keep-graphs", "0", "--checkpoint-rows", "0", "--checkpoint-ram", "0", "--no-prompt-shapes",
                          "--cache-ram", "0", "--context", "1048576", "--slots", "8", "--slot-context", "131072",
                          "--expert-row-limit", "auto", "--checkpoint-every", "0")
         for flag, expected in [("--cache-ram", "0"), ("-c", "1048576"), ("-np", "8"), ("--checkpoint-every", "0")]:
@@ -252,10 +287,58 @@ class OptionTest(unittest.TestCase):
         self.assertEqual(env["LLAMA_PROMPT_SHAPES"], "1")
         self.assertEqual(env["LLAMA_PROMPT_SHAPE_SMALL"], "8")
         self.assertEqual(env["LLAMA_PROMPT_SHAPE_ROWS"], "256")
+        self.assertEqual(plan("--prompt-shape-rows", "512")[1]["LLAMA_PROMPT_SHAPE_ROWS"], "512")
         with self.assertRaises(ValueError):
             plan("--prompt-shapes", "0", "--prompt-shape-rows", "256")
+        with self.assertRaises(ValueError):
+            plan("--no-prompt-shapes", "--prompt-shape-rows", "256")
         self.assertEqual(plan("--kv-cache", "q8_0")[1]["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"], "1")
         self.assertEqual(plan("--kv-cache", "q4_0")[1]["GGML_CUDA_FATTN_REL_DECODE_Q4"], "1")
+
+    def test_one_byte_and_mixed_kv(self):
+        argv, env = plan("--kv-cache", "f8_e4m3", "--swa-kv-cache", "f16")
+        self.assertEqual(argv[argv.index("--cache-type-k") + 1], "f8_e4m3")
+        self.assertEqual(argv[argv.index("--cache-type-v") + 1], "f8_e4m3")
+        self.assertEqual(env["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"], "1")
+        self.assertNotIn("LLAMA_INKLING2_KV_MIXED", env)
+        self.assertNotIn("LLAMA_INKLING2_KV_MIXED", plan()[1])
+        self.assertNotIn("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE", plan("--swa-kv-cache", "f16")[1])
+        for cold in ("q8_0", "f8_e4m3"):
+            env = plan("--kv-cache", cold, "--kv-mixed", "--swa-kv-cache", "f16")[1]
+            self.assertEqual(env["LLAMA_INKLING2_KV_MIXED"], "1")
+            self.assertEqual(env["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"], "1")
+            self.assertNotIn("LLAMA_INKLING2_KV_MIXED_HOT", env)
+        env = plan("--kv-cache", "q4_0", "--kv-mixed", "--kv-mixed-hot", "2048")[1]
+        self.assertEqual(env["LLAMA_INKLING2_KV_MIXED_HOT"], "2048")
+        self.assertEqual(env["GGML_CUDA_FATTN_REL_DECODE_Q4"], "1")
+        for bad in (["--kv-mixed"], ["--kv-cache", "f16", "--kv-mixed"], ["--kv-cache", "q8_0", "--kv-mixed-hot", "2048"],
+                    ["--kv-cache", "q8_0", "--kv-mixed", "--kv-mixed-hot", "32"]):
+            with self.assertRaises(ValueError):
+                plan(*bad)
+
+    def test_prompt_shapes_default_on_and_both_overrides(self):
+        default = plan()[1]
+        self.assertEqual(default["LLAMA_PROMPT_SHAPES"], "1")
+        self.assertNotIn("LLAMA_PROMPT_SHAPE_SMALL", default)
+        self.assertNotIn("LLAMA_PROMPT_SHAPE_ROWS", default)
+        self.assertEqual(plan("--prompt-shapes", "32")[1], default)
+        self.assertEqual(plan("--prompt-shapes", "8")[1]["LLAMA_PROMPT_SHAPE_SMALL"], "8")
+        self.assertEqual(plan("--prompt-shapes", "4")[1]["LLAMA_PROMPT_SHAPE_SMALL"], "4")
+        off = plan("--no-prompt-shapes")[1]
+        for key in ("LLAMA_PROMPT_SHAPES", "LLAMA_PROMPT_SHAPE_SMALL", "LLAMA_PROMPT_SHAPE_ROWS"):
+            self.assertNotIn(key, off)
+        self.assertEqual(off, {k: v for k, v in default.items() if not k.startswith("LLAMA_PROMPT_SHAPE")})
+        # the last of the two on the command line wins
+        self.assertEqual(plan("--no-prompt-shapes", "--prompt-shapes", "16")[1]["LLAMA_PROMPT_SHAPE_SMALL"], "16")
+        self.assertNotIn("LLAMA_PROMPT_SHAPES", plan("--prompt-shapes", "16", "--no-prompt-shapes")[1])
+        with tempfile.TemporaryDirectory() as root:
+            tuned = Path(root) / "tuned.json"
+            tuned.write_text(json.dumps({"tensor-4": {"--prompt-shapes": "8"}}))
+            self.assertEqual(plan("--tuned", str(tuned))[1]["LLAMA_PROMPT_SHAPE_SMALL"], "8")
+            self.assertNotIn("LLAMA_PROMPT_SHAPES", plan("--tuned", str(tuned), "--no-prompt-shapes")[1])
+            tuned.write_text(json.dumps({"tensor-4": {"--prompt-shapes": "off"}}))
+            self.assertNotIn("LLAMA_PROMPT_SHAPES", plan("--tuned", str(tuned))[1])
+            self.assertEqual(plan("--tuned", str(tuned), "--prompt-shapes", "32")[1], default)
 
     def test_expert_row_limit_only_overrides_sm120_kquants(self):
         for count in ("8", "23", "32"):
@@ -314,6 +397,16 @@ class DryRunTest(unittest.TestCase):
         out = self.dry_run(env=clean)
         self.assertEqual(out, {"argv": plan()[0], "env": TENSOR4_ENV, "removed": []})
         self.assertEqual(out, self.dry_run(env=clean))
+
+    def test_dry_run_keeps_its_contract_with_a_draft_device_list(self):
+        clean = {"PATH": os.environ.get("PATH", "")}
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / serve.DRAFT).touch()
+            options = ["--packs", root, "--draft", "--draft-device", "all", "--tuned", os.devnull]
+            out = self.dry_run(*options, env=clean)
+        self.assertEqual(set(out), {"argv", "env", "removed"})
+        self.assertEqual(out["argv"][out["argv"].index("--spec-draft-device") + 1], "CUDA0,CUDA1,CUDA2,CUDA3")
+        self.assertEqual(out["argv"][out["argv"].index("-c") + 1], "3014656")
 
     def test_qualifier_dry_run_uses_tensor_4_and_honors_opt_outs(self):
         options = ["--profile", "tensor-4", "--no-prefix-copy", "--no-mean-mask-decode", "--no-host-owner-rows", "--no-bucket-prefill-kv", "--stable-prefill",

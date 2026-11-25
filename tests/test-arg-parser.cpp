@@ -421,6 +421,15 @@ static void test(void) {
         assert(common_base_params_to_speculative(rows).split_mode == LLAMA_SPLIT_MODE_ROW);
     }
 
+    {
+        common_params target;
+        argv = {"binary_name", "--split-mode", "layer", "--spec-draft-split-mode", "tensor"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), target, LLAMA_EXAMPLE_SERVER));
+        target.speculative.draft.mparams.path = "draft.gguf";
+        assert(common_base_params_to_speculative(target).split_mode == LLAMA_SPLIT_MODE_TENSOR);
+        assert(target.split_mode == LLAMA_SPLIT_MODE_LAYER);
+    }
+
     // the draft's indexer cache takes the type -ctki names, as the target's does; without -ctki both stay f16
     {
         common_params named;

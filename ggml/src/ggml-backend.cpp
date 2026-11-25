@@ -64,6 +64,8 @@ static ggml_backend_buft_alloc_buffer_n_plan_t ggml_backend_buft_alloc_buffer_n_
     size_t cur_buf_size = 0;
     int    first        = 0;
 
+    const bool meta = ggml_backend_buft_is_meta(buft);
+    const uint64_t prev = meta ? ggml_gallocr_measure_begin() : 0;
     for (int i = 0; i < n_tensors; i++) {
         size_t this_size = 0;
         struct ggml_tensor * t = tensors[i];
@@ -81,6 +83,9 @@ static ggml_backend_buft_alloc_buffer_n_plan_t ggml_backend_buft_alloc_buffer_n_
         }
     }
 
+    if (meta) {
+        ggml_gallocr_measure_end(prev);
+    }
     if (cur_buf_size > 0) {
         plan.push_back({ cur_buf_size, first, n_tensors });
     }
@@ -196,7 +201,7 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
     // get_alloc_size is optional, defaults to ggml_nbytes
     if (buft->iface.get_alloc_size) {
         size_t size = buft->iface.get_alloc_size(buft, tensor);
-        assert(size >= ggml_nbytes(tensor));
+        assert(size >= ggml_nbytes(tensor) || ggml_backend_buft_is_meta(buft));
 
         // [TAG_ALLOC_SIZE_EXPAND]
         // if you hit this assert, update ggml_backend_op_alloc_size_may_expand() accordingly

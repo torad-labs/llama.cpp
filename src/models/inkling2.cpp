@@ -1053,11 +1053,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const auto counts = ubatch.device_rows(cparams.n_seq_devices);
         cur = ggml_backend_meta_reduce(ctx0, cur);
         cur = ggml_backend_meta_scatter(ctx0, cur, 1, counts.data(), counts.size());
-    } else if (model.experts_split_by_expert()) {
-        // each card's sum holds only its own experts: summed across the cards as the split rows' sums are
+    } else if (model.experts_split_by_expert() || (l.ffn_down_exps->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS)) {
+        // Each card's local expert contributions are summed after the slot sum.
         cur = ggml_backend_meta_reduce(ctx0, cur);
     }
     cur = convolve_hidden(cur, l.ffn_post_conv, hidden, hidden_offset + n_embd, hwindows, il);
+    cb(cur, "ffn_moe_post_conv", il);
     cur = ggml_add(ctx0, residual, cur);
     if (!(state_only && !cparams.embeddings_layer_inp[n_layer] && il == n_layer - 1)) {
         // Expand conv+add before store so short_conv_window and short_conv_add both fuse.

@@ -1973,6 +1973,7 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
     t_cand        = nullptr;
+    t_draft_draw  = nullptr;
     t_logits_draft = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
@@ -2041,6 +2042,9 @@ void llm_graph_result::inputs_lost() {
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
+    }
+    if (t_draft_draw != nullptr) {
+        ggml_set_output(t_draft_draw);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
@@ -2144,6 +2148,12 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     }
 
     return res;
+}
+
+bool llm_graph_result::same_shape(const llama_ubatch & ubatch, uint32_t n_outputs) const {
+    const auto & built = params.ubatch;
+    return built.n_tokens == ubatch.n_tokens && built.n_seq_tokens == ubatch.n_seq_tokens && built.n_seqs == ubatch.n_seqs &&
+        built.n_seqs_unq == ubatch.n_seqs_unq && built.equal_seqs() == ubatch.equal_seqs() && params.n_outputs == n_outputs;
 }
 
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
@@ -3231,6 +3241,74 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    const auto situ = [&](ggml_tensor * gate, ggml_tensor * up) {
+        const float beta = hparams.situ_beta;
+        const float lb = hparams.situ_linear_beta;
+        ggml_tensor * out;
+        if (cparams.fused_inkling2) {
+            out = ggml_situ_split(ctx0, gate, up, beta, lb);
+            res->add_fused_node({LLM_FUSED_OP_INKLING2_LAYER, out, il});
+        } else {
+            auto * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, gate, 1.0f/beta)), beta);
+            act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, gate));
+            if (lb > 0.0f) {
+                up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
+            }
+            out = ggml_mul(ctx0, act, up);
+        }
+        cb(out, "ffn_moe_situ", il);
+        return out;
+    };
+
+    const auto sum_slots = [&](ggml_tensor * experts) {
+        ggml_build_forward_expand(gf, experts);
+        ggml_tensor * slots[LLAMA_MAX_EXPERTS] = {};
+        const uint32_t n_slots = hparams.n_expert_used(il);
+        GGML_ASSERT(n_slots > 0);
+        for (uint32_t i = 0; i < n_slots; ++i) {
+            slots[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+            ggml_build_forward_expand(gf, slots[i]);
+        }
+        auto * sum = slots[0];
+        for (uint32_t i = 1; i < n_slots; ++i) {
+            sum = ggml_add(ctx0, sum, slots[i]);
+            ggml_build_forward_expand(gf, sum);
+        }
+        return n_slots == 1 ? ggml_cont(ctx0, sum) : sum;
+    };
+
+    if (gate_up_exps && (gate_up_exps->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS)) {
+        GGML_ASSERT(type_op == LLM_FFN_SITU && !weight_before_ffn && !gate_up_exps_b && !down_exps_b && !post_exp_norm);
+        if (!loras->empty()) {
+            throw std::runtime_error("rotated Inkling expert banks do not support LoRA");
+        }
+        const auto bank = [&](bool bonus) {
+            auto * gu = ggml_backend_meta_expert_bank(ctx0, gate_up_exps, bonus);
+            auto * dn = ggml_backend_meta_expert_bank(ctx0, down_exps, bonus);
+            auto * pair = build_lora_mm_id(gu, cur, selected_experts, up_exps_s, nullptr, false);
+            const int64_t width = pair->ne[0]/2;
+            auto * gate = ggml_view_3d(ctx0, pair, width, pair->ne[1], pair->ne[2], pair->nb[1], pair->nb[2], 0);
+            auto * up = ggml_view_3d(ctx0, pair, width, pair->ne[1], pair->ne[2], pair->nb[1], pair->nb[2], width*pair->nb[0]);
+            auto * projected = ggml_mul_mat_id(ctx0, dn, situ(gate, up), selected_experts);
+            prec_policy.apply(projected);
+            if (!bonus) {
+                ggml_backend_meta_local_mat_id(projected);
+            }
+            ggml_tensor * out = projected;
+            if (down_exps_s) {
+                auto * scale = ggml_reshape_3d(ctx0, down_exps_s, 1, n_expert, 1);
+                scale = ggml_repeat_4d(ctx0, scale, 1, n_expert, n_tokens, 1);
+                out = ggml_mul(ctx0, out, ggml_get_rows(ctx0, scale, selected_experts));
+            }
+            return sum_slots(ggml_mul(ctx0, out, weights));
+        };
+        auto * base = bank(false);
+        auto * bonus = bank(true);
+        auto * out = ggml_add(ctx0, base, bonus);
+        cb(out, "ffn_moe_out", il);
+        return out;
+    }
+
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
     auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
@@ -3349,24 +3427,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 } break;
             case LLM_FFN_SITU:
                 {
-                    // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
                     GGML_ASSERT(has_gate);
-                    const float beta = hparams.situ_beta;
-                    const float lb   = hparams.situ_linear_beta;
-
-                    // Inkling 2 runs it as one GLU op (cparams.fused_inkling2)
-                    if (cparams.fused_inkling2) {
-                        cur = ggml_situ_split(ctx0, cur, up, beta, lb);
-                        res->add_fused_node({LLM_FUSED_OP_INKLING2_LAYER, cur, il});
-                    } else {
-                        ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                        act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                        if (lb > 0.0f) {
-                            up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                        }
-                        cur = ggml_mul(ctx0, act, up);
-                    }
-                    cb(cur, "ffn_moe_situ", il);
+                    cur = situ(cur, up);
                 } break;
             case LLM_FFN_GELU:
                 if (has_gate) {
@@ -3455,37 +3517,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_weighted", il);
     }
 
-    ggml_build_forward_expand(gf, experts);
-
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
-
-    assert(n_expert_used > 0);
-
-    // order the views before the adds
-    // Use per-layer n_expert_used to bound the graph even during warmup (avoids
-    // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
-    // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
-    for (uint32_t i = 0; i < n_expert_used_il; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
-
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
-
-    // aggregate experts
-    ggml_tensor * moe_out = cur_experts[0];
-
-    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
-
-        ggml_build_forward_expand(gf, moe_out);
-    }
-
-    if (n_expert_used_il == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx0, moe_out);
-    }
-
+    auto * moe_out = sum_slots(experts);
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;

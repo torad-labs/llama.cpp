@@ -22,7 +22,9 @@
 #include "test-llama-archs.h"
 
 #include "llama-archs-gguf.h"
+#include "speculative.h"
 #include "../src/llama-context.h"
+#include "../src/llama-model.h"
 #include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
@@ -44,6 +46,7 @@ struct record {
     std::vector<std::vector<float>> states; // the serialized convolution state of each sequence, by step
     std::vector<std::vector<float>> memory; // all the sequence keeps, at the same steps: KV cells and the state
     std::vector<std::vector<float>> layer_rows; // the layer input rows of the device buffer, a copy a rank, by step
+    std::vector<float> moe;
 };
 
 struct context_shape {
@@ -52,7 +55,7 @@ struct context_shape {
     uint32_t n_rs_seq  = 0;
 };
 
-llama_context_ptr make_context(llama_model * model, const context_shape & shape) {
+llama_context_ptr make_context(llama_model * model, const context_shape & shape, record * trace = nullptr) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx = 256*shape.n_seq_max;
     params.n_batch = 256;
@@ -63,6 +66,19 @@ llama_context_ptr make_context(llama_model * model, const context_shape & shape)
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; // -sm tensor requires it, and both contexts compute alike
     params.type_k = params.type_v = GGML_TYPE_F32; // the cells compare word by word as the state does
     params.n_threads = params.n_threads_batch = 4;
+    if (trace) {
+        params.cb_eval_user_data = trace;
+        params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            if (ask) {
+                return strncmp(t->name, "ffn_moe_post_conv", sizeof("ffn_moe_post_conv") - 1) == 0;
+            }
+            auto & values = static_cast<record *>(data)->moe;
+            const size_t pos = values.size();
+            values.resize(pos + ggml_nelements(t));
+            ggml_backend_tensor_get(t, values.data() + pos, 0, ggml_nbytes(t));
+            return true;
+        };
+    }
     llama_context_ptr ctx(llama_init_from_model(model, params));
     if (!ctx) {
         throw std::runtime_error("inkling2: the context was not created");
@@ -361,14 +377,43 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
         return compact_greedy(seed, devs) ? 0 : 1;
     }
     const auto all = cases(seed, devs);
-    const auto it = all.find(name);
+    const bool banks = name == "expert-banks";
+    const auto it = all.find(banks ? "decode" : name);
     if (it == all.end()) {
         fprintf(stderr, "inkling2 split: no case %s\n", name.c_str());
         return 1;
     }
     auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+    if (banks) {
+        if (devs.size() != 4) {
+            throw std::runtime_error("expert banks need four ranks");
+        }
+        kv_writer write(LLM_ARCH_INKLING2, gguf.get());
+        write.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+        write.add_kv(LLM_KV_EXPERT_USED_COUNT, uint32_t(4));
+        write.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, uint32_t(2304));
+        ggml_context_ptr meta(ggml_init({6*ggml_tensor_overhead(), nullptr, true}));
+        for (int i = 0; i < 3; ++i) {
+            auto * gu = ggml_new_tensor_3d(meta.get(), GGML_TYPE_Q3_K, 512, 4608, 8);
+            auto * dn = ggml_new_tensor_3d(meta.get(), i == 0 ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K, 2304, 512, 8);
+            ggml_format_name(gu, "blk.%d.ffn_gate_up_exps.weight", i);
+            ggml_format_name(dn, "blk.%d.ffn_down_exps.weight", i);
+            gguf_add_tensor(gguf.get(), gu);
+            gguf_add_tensor(gguf.get(), dn);
+        }
+    }
     llama_model_ptr one = get_model(gguf.get(), nullptr, seed, 0.0f, {devs.front()}, LLAMA_SPLIT_MODE_LAYER);
     llama_model_ptr split = get_model(gguf.get(), nullptr, seed, 0.0f, devs, LLAMA_SPLIT_MODE_TENSOR);
+    if (banks) {
+        const char * layout = getenv("LLAMA_INKLING2_EXPERT_LAYOUT");
+        const bool rotated = layout && strcmp(layout, "rotated") == 0;
+        for (const auto & l : split->layers) {
+            if (bool(l.ffn_down_exps->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS) != rotated ||
+                bool(l.ffn_gate_up_exps->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS) != rotated) {
+                return 1;
+            }
+        }
+    }
     const bool graph_churn = name == "graph-churn";
     if (name == "state") {
         set_env("LLAMA_RS_STAGE_ROWS", "2");
@@ -380,7 +425,7 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
     }
     record expected, actual;
     {
-        auto ctx = make_context(one.get(), it->second.shape);
+        auto ctx = make_context(one.get(), it->second.shape, banks ? &expected : nullptr);
         it->second.run(ctx.get(), expected);
     }
     {
@@ -388,7 +433,7 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
             set_env("LLAMA_RS_FIXED_ROWS", "1");
             set_env("LLAMA_GRAPH_ANY_SEQS", "1");
         }
-        auto ctx = make_context(split.get(), it->second.shape);
+        auto ctx = make_context(split.get(), it->second.shape, banks ? &actual : nullptr);
         it->second.run(ctx.get(), actual);
     }
     bool ok = expected.logits.size() == actual.logits.size() && !expected.logits.empty() &&
@@ -398,10 +443,33 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
                 name.c_str(), actual.reused, expected.reused);
         ok = ok && actual.reused == 22 && expected.reused == 0;
     }
+    if (banks && ok) {
+        const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(one.get()));
+        size_t differing = 0;
+        for (size_t pos = 0; pos < expected.logits.size(); pos += vocab) {
+            const float * a = expected.logits.data() + pos;
+            const float * b = actual.logits.data() + pos;
+            differing += std::max_element(a, a + vocab) - a != std::max_element(b, b + vocab) - b;
+        }
+        const double moe_nmse = expected.moe.empty() || expected.moe.size() != actual.moe.size() ?
+            INFINITY : nmse(expected.moe, actual.moe);
+        fprintf(stderr, "Meta 4-rank expert banks: %zu differing top tokens, MoE NMSE %g\n", differing, moe_nmse);
+        ok = differing == 0 && moe_nmse <= 1e-3;
+    }
     const double logits_nmse = ok ? nmse(expected.logits, actual.logits) : INFINITY;
-    ok = ok && logits_nmse <= tolerance;
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(one.get()));
+    size_t differ = 0;
+    for (size_t offset = 0; ok && offset < expected.logits.size(); offset += vocab) {
+        const auto * a = expected.logits.data() + offset;
+        const auto * b = actual.logits.data() + offset;
+        differ += std::max_element(a, a + vocab) - a != std::max_element(b, b + vocab) - b;
+    }
     fprintf(stderr, "inkling2 split %s, %zu ranks: %zu logits, NMSE %g (at most %g)\n", name.c_str(), devs.size(),
             expected.logits.size(), logits_nmse, tolerance);
+    if (ok) {
+        fprintf(stderr, "inkling2 split %s: %zu differing top tokens\n", name.c_str(), differ);
+    }
+    ok = ok && logits_nmse <= tolerance;
     for (size_t i = 0; i < expected.states.size() && i < actual.states.size(); ++i) {
         // a state of zeros would agree with any other: the one-rank state must hold the convolution's history
         const double d = state_nmse(expected.states[i], actual.states[i]);
@@ -421,7 +489,183 @@ int test_inkling_split(const std::string & name, size_t seed, const std::vector<
         fprintf(stderr, "inkling2 split %s: layer input rows %zu (rank %zu), %zu values, NMSE %g\n", name.c_str(),
                 i/devs.size(), i%devs.size(), expected.layer_rows[i].size(), d);
     }
+    if (banks && ok && (split->layers[0].ffn_down_exps->flags & GGML_TENSOR_FLAG_META_EXPERT_BANKS)) {
+        // Exchange the first and last K blocks only in down, leaving both gate/up halves unchanged.
+        auto * down = split->layers[0].ffn_down_exps;
+        std::vector<uint8_t> plane(down->nb[2]);
+        for (int64_t e = 0; e < down->ne[2]; ++e) {
+            ggml_backend_tensor_get(down, plane.data(), e*plane.size(), plane.size());
+            for (int64_t r = 0; r < down->ne[1]; ++r) {
+                auto * row = plane.data() + r*down->nb[1];
+                std::swap_ranges(row, row + down->nb[0], row + 8*down->nb[0]);
+            }
+            ggml_backend_tensor_set(down, plane.data(), e*plane.size(), plane.size());
+        }
+        record wrong;
+        auto ctx = make_context(split.get(), it->second.shape, &wrong);
+        it->second.run(ctx.get(), wrong);
+        const double bad_nmse = expected.moe.size() == wrong.moe.size() ? nmse(expected.moe, wrong.moe) : 0.0;
+        fprintf(stderr, "Meta 4-rank mispaired K blocks: MoE NMSE %g\n", bad_nmse);
+        ok = std::isfinite(bad_nmse) && bad_nmse > 1e-3;
+    }
     fprintf(stderr, "%s inkling2 split %s\n", ok ? "OK" : "FAIL", name.c_str());
+    return ok ? 0 : 1;
+}
+
+int test_inkling_dspark(const std::string & draft, size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+    if (devs.size() != 4) {
+        throw std::runtime_error("Inkling DSpark test requires four ranks");
+    }
+    set_env("LLAMA_TOK_EMBD_GPU", "1");
+    auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+    auto target = get_model(gguf.get(), nullptr, seed, 0.0f, devs, LLAMA_SPLIT_MODE_TENSOR);
+    constexpr int n_seq = 2, depth = 3, rounds = 6;
+    struct draft_result {
+        llama_tokens ids;
+        std::vector<llama_token_data> q;
+        std::vector<float> ring;
+    };
+    const auto run = [&](bool split, bool probabilistic) {
+        set_env("LLAMA_DFLASH_DEV", split ? "1" : "0");
+        auto ctx_tgt = make_context(target.get(), {256, n_seq, depth});
+
+        common_params params;
+        params.n_parallel = n_seq;
+        params.n_batch = params.n_ubatch = 256;
+        params.kv_unified = true;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.cpuparams.n_threads = params.cpuparams_batch.n_threads = 4;
+        params.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK};
+        auto & opts = params.speculative.draft;
+        opts.mparams.path = draft;
+        opts.devices = split ? devs : std::vector<ggml_backend_dev_t>{devs.front()};
+        opts.devices.push_back(nullptr);
+        opts.n_gpu_layers = 99;
+        opts.n_min = 1;
+        opts.n_max = depth;
+        opts.probabilistic = probabilistic;
+        if (split) {
+            opts.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+        }
+        auto draft_params = common_base_params_to_speculative(params);
+        auto init = common_speculative_init_from_params(draft_params, target.get(), ctx_tgt.get());
+        if (!init->context()) {
+            throw std::runtime_error("Inkling DSpark test could not create the draft context");
+        }
+        opts.ctx_tgt = ctx_tgt.get();
+        opts.ctx_dft = init->context();
+        common_speculative_ptr spec(common_speculative_init(params.speculative, n_seq));
+        if (!spec || bool(ctx_tgt->get_layer_inp_dev()) != split || llama_supports_embd_row(opts.ctx_dft) != split) {
+            throw std::runtime_error("Inkling DSpark test did not select the requested feed path");
+        }
+        std::vector<draft_result> results;
+        std::array<llama_tokens, n_seq> prompt;
+        common_batch batch(ctx_tgt.get());
+        int pos = 0;
+        for (int round = 0; round < rounds; ++round) {
+            const int feed = round == 0 ? 16 : depth;
+            batch.clear();
+            for (int seq = 0; seq < n_seq; ++seq) {
+                for (int i = 0; i < feed; ++i) {
+                    const llama_token id = 5 + (pos + i + seq * 11) % 112;
+                    batch.add(id, pos + i, seq, false);
+                    prompt[seq].push_back(id);
+                }
+            }
+            if (llama_process(ctx_tgt.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) || !common_speculative_process(spec.get(), batch)) {
+                throw std::runtime_error("Inkling DSpark test could not feed target rows");
+            }
+            pos += feed;
+            std::array<draft_result, n_seq> step;
+            std::array<std::vector<std::vector<llama_token_data>>, n_seq> q;
+            for (int seq = 0; seq < n_seq; ++seq) {
+                auto & dp = common_speculative_get_draft_params(spec.get(), seq);
+                dp = {};
+                dp.drafting = true;
+                dp.pos0 = pos;
+                dp.id_last = 17 + seq;
+                dp.prompt = &prompt[seq];
+                dp.result = &step[seq].ids;
+                dp.result_q = probabilistic ? &q[seq] : nullptr;
+                dp.seed = (uint32_t) seed;
+                dp.temp = 0.7f;
+            }
+            common_speculative_draft(spec.get());
+            for (int seq = 0; seq < n_seq; ++seq) {
+                if (step[seq].ids.size() != depth || (probabilistic && q[seq].size() != depth)) {
+                    throw std::runtime_error("Inkling DSpark test did not draft every row");
+                }
+                for (size_t i = 0; i < q[seq].size(); ++i) {
+                    const auto & row = q[seq][i];
+                    const auto sampled = std::find_if(row.begin(), row.end(), [&](const auto & e) { return e.id == step[seq].ids[i]; });
+                    if (sampled == row.end() || !(sampled->p > 0.0f)) {
+                        throw std::runtime_error("Inkling DSpark drew a token outside its proposal distribution");
+                    }
+                    float mass = 0.0f;
+                    for (const auto & e : row) {
+                        mass += e.p;
+                    }
+                    if (!(std::abs(mass - 1.0f) <= 1e-6f)) {
+                        throw std::runtime_error("Inkling DSpark proposal distribution does not sum to one");
+                    }
+                    step[seq].q.insert(step[seq].q.end(), row.begin(), row.end());
+                }
+                if (!llama_memory_seq_rm(llama_get_memory(opts.ctx_dft), seq, pos, -1)) {
+                    throw std::runtime_error("Inkling DSpark test could not remove draft rows");
+                }
+                std::vector<uint8_t> state;
+                if (!common_speculative_get_state(spec.get(), seq, state) || state.size() <= 9*sizeof(llama_pos)) {
+                    throw std::runtime_error("Inkling DSpark test could not save the anchor ring");
+                }
+                common_speculative_set_state(spec.get(), seq, state);
+                step[seq].ring.resize((state.size() - 9*sizeof(llama_pos))/sizeof(float));
+                memcpy(step[seq].ring.data(), state.data() + 9*sizeof(llama_pos), step[seq].ring.size()*sizeof(float));
+                results.push_back(std::move(step[seq]));
+            }
+        }
+        return results;
+    };
+    bool ok = true;
+    for (const bool sampled : {false, true}) {
+        const auto one = run(false, sampled);
+        const auto tp4 = run(true, sampled);
+        int differences = 0, changed_support = 0;
+        float max_q = 0.0f;
+        double max_ring = 0.0;
+        for (size_t i = 0; i < one.size(); ++i) {
+            differences += one[i].ids != tp4[i].ids;
+            if (one[i].q.size() != tp4[i].q.size()) {
+                throw std::runtime_error("Inkling DSpark proposal support sizes differ");
+            }
+            const size_t k = one[i].q.size()/depth;
+            for (int step = 0; k > 0 && step < depth; ++step) {
+                const auto * a = one[i].q.data() + step*k;
+                const auto * b = tp4[i].q.data() + step*k;
+                float dlogit = 0.0f;
+                int changed = 0;
+                for (size_t j = 0; j < k; ++j) {
+                    const auto * match = std::lower_bound(b, b + k, a[j].id,
+                            [](const auto & e, llama_token id) { return e.id < id; });
+                    if (match == b + k || match->id != a[j].id) {
+                        ++changed;
+                    } else {
+                        max_q = std::max(max_q, std::abs(a[j].p - match->p));
+                        dlogit = std::max(dlogit, std::abs(a[j].logit - match->logit));
+                    }
+                }
+                changed_support += changed;
+                if (changed) {
+                    fprintf(stderr, "Inkling DSpark round %zu slot %zu proposal %d: %d displaced candidates, max shared logit delta %g\n",
+                            i/n_seq, i%n_seq, step + 1, changed, dlogit);
+                }
+            }
+            max_ring = std::max(max_ring, nmse(one[i].ring, tp4[i].ring));
+            ok = ok && largest(one[i].ring) > 1e-6f;
+        }
+        fprintf(stderr, "Inkling DSpark TP4 %s: %d differing blocks, %d differing candidate IDs, max q delta %g, ring NMSE %g\n",
+                sampled ? "sampled" : "greedy", differences, changed_support, max_q, max_ring);
+        ok = ok && differences == 0 && changed_support == 0 && max_q <= 2e-5f && max_ring <= tolerance;
+    }
     return ok ? 0 : 1;
 }
 

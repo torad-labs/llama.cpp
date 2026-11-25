@@ -555,8 +555,8 @@ void mul_mat_q_tma_q3_K(const __grid_constant__ CUtensorMap map, const int4 * y,
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
 }
 
-// Persistent 2-slot alternating gate/up Q3_K + SITU kernel: overlaps every up TMA load with gate compute
-// and every next-tile gate TMA load with up compute + SITU writeback. Bit-identical to mul_mat_q_tma_q3_K + SITU.
+// Persistent 2-slot alternating gate/up Q3_K + SITU kernel: overlaps every up TMA load with SITU writeback + gate compute
+// and every next-tile gate TMA load with up compute. Bit-identical to mul_mat_q_tma_q3_K + SITU.
 static __global__ __launch_bounds__(MMQ_TMA_Q3K_NWARPS*WARP_SIZE, 1)
 void mul_mat_q_tma_q3_K_gate_up_situ(
         const __grid_constant__ CUtensorMap map, const int4 * y, float * dst,
@@ -566,7 +566,7 @@ void mul_mat_q_tma_q3_K_gate_up_situ(
         const mmq_tma_warm_args warm) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
     constexpr int NWARPS = MMQ_TMA_Q3K_NWARPS;
-    constexpr int REDUCE_FLOATS = (NWARPS - 1)*4*WARP_SIZE;
+    constexpr int REDUCE_FLOATS = NWARPS*4*WARP_SIZE;
 
     extern __shared__ __align__(128) char s_dyn[];
     char *     s_gate   = s_dyn;
@@ -612,9 +612,11 @@ void mul_mat_q_tma_q3_K_gate_up_situ(
         const int p0  = t_begin / n_row_tiles;
         const int rt0 = t_begin % n_row_tiles;
         const int e0  = pairs[p0*MMQ_FEW_PAIR_INTS];
-        mmq_tma_mbar_expect(&bar[0], MMQ_TMA_TILE_BYTES);
         const int chunk_g0 = (int) (int64_t(e0)*expert_chunks + int64_t(rt0)*MMQ_TMA_BOX);
+        mmq_tma_mbar_expect(&bar[0], MMQ_TMA_TILE_BYTES);
         mmq_tma_load(s_gate, &map, 0, chunk_g0, &bar[0], policy);
+        mmq_tma_mbar_expect(&bar[1], MMQ_TMA_TILE_BYTES);
+        mmq_tma_load(s_up, &map, 0, chunk_g0 + (int) half_chunks, &bar[1], policy);
     }
     __syncthreads();
 
@@ -627,14 +629,6 @@ void mul_mat_q_tma_q3_K_gate_up_situ(
         const int rt   = t % n_row_tiles;
         const int row0 = rt*MMQ_TMA_TILE_ROWS;
         const int * pair = pairs + p*MMQ_FEW_PAIR_INTS;
-
-        // Issue up(t) into s_up while computing gate(t) from s_gate.
-        if (tid == 0) {
-            const int e = pair[0];
-            mmq_tma_mbar_expect(&bar[1], MMQ_TMA_TILE_BYTES);
-            const int chunk_u = (int) (int64_t(e)*expert_chunks + half_chunks + int64_t(rt)*MMQ_TMA_BOX);
-            mmq_tma_load(s_up, &map, 0, chunk_u, &bar[1], policy);
-        }
 
         if (p != cached_p) {
             const int4 * y_pair = y + int64_t(p)*MMQ_TMA_UNITS*MMQ_FEW_Q8_1_INT4;
@@ -659,7 +653,7 @@ void mul_mat_q_tma_q3_K_gate_up_situ(
             };
             mmq_tma_vec_dot_q3_K(xg1, yf1, sum_g);
         }
-        // Release s_gate and ensure prior iter's warp-0 reduction finished reading buf_gate/buf_up.
+        // Release s_gate and ensure prior iter's reduction finished reading buf_gate/buf_up.
         __syncthreads();
 
         if (tid == 0 && t + 1 < t_end) {
@@ -688,35 +682,39 @@ void mul_mat_q_tma_q3_K_gate_up_situ(
             mmq_tma_vec_dot_q3_K(xu1, yf1, sum_u);
         }
 
-        if (warp > 0) {
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                buf_gate[((warp - 1)*4 + i)*WARP_SIZE + lane] = sum_g[i];
-                buf_up[((warp - 1)*4 + i)*WARP_SIZE + lane]   = sum_u[i];
-            }
+        for (int i = 0; i < 4; ++i) {
+            buf_gate[(warp*4 + i)*WARP_SIZE + lane] = sum_g[i];
+            buf_up[(warp*4 + i)*WARP_SIZE + lane]   = sum_u[i];
         }
-        // Release s_up for next iter's up(t+1) TMA and publish buf_gate/buf_up to warp 0.
+        // Release s_up for up(t+1) and publish buf_gate/buf_up.
         __syncthreads();
 
-        if (warp == 0) {
+        if (tid == 0 && t + 1 < t_end) {
+            const int pn  = (t + 1) / n_row_tiles;
+            const int rtn = (t + 1) % n_row_tiles;
+            const int en  = pairs[pn*MMQ_FEW_PAIR_INTS];
+            mmq_tma_mbar_expect(&bar[1], MMQ_TMA_TILE_BYTES);
+            const int chunk_un = (int) (int64_t(en)*expert_chunks + half_chunks + int64_t(rtn)*MMQ_TMA_BOX);
+            mmq_tma_load(s_up, &map, 0, chunk_un, &bar[1], policy);
+        }
+
+        // Warp l reduces element l over warps 0..NWARPS-1 in warp order, as mul_mat_q_tma_q3_K does.
+        if (warp < 4) {
+            const int l = warp;
+            float g = buf_gate[l*WARP_SIZE + lane];
+            float u = buf_up[l*WARP_SIZE + lane];
 #pragma unroll
-            for (int w = 0; w < NWARPS - 1; ++w) {
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    sum_g[i] += buf_gate[(w*4 + i)*WARP_SIZE + lane];
-                    sum_u[i] += buf_up[(w*4 + i)*WARP_SIZE + lane];
-                }
+            for (int w = 1; w < NWARPS; ++w) {
+                g += buf_gate[(w*4 + l)*WARP_SIZE + lane];
+                u += buf_up[(w*4 + l)*WARP_SIZE + lane];
             }
-            const int ncols = pair[1];
-#pragma unroll
-            for (int l = 0; l < 4; ++l) {
-                const int i = row0 + tile<16, 8, int>::get_i(l);
-                const int j = tile<16, 8, int>::get_j(l);
-                if (i < n_ff && j < ncols) {
-                    const int e = pair[2 + j];
-                    const float r = ggml_cuda_op_situ_single(sum_g[l], sum_u[l], beta, lb);
-                    dst[int64_t(e / ncols_dst)*stride_channel_dst + int64_t(e % ncols_dst)*stride_col_dst + i] = r;
-                }
+            const int i = row0 + tile<16, 8, int>::get_i(l);
+            const int j = tile<16, 8, int>::get_j(l);
+            if (i < n_ff && j < pair[1]) {
+                const int e = pair[2 + j];
+                dst[int64_t(e / ncols_dst)*stride_channel_dst + int64_t(e % ncols_dst)*stride_col_dst + i] =
+                    ggml_cuda_op_situ_single(g, u, beta, lb);
             }
         }
     }
@@ -894,11 +892,11 @@ void mul_mat_q_tma_q45_K(const __grid_constant__ CUtensorMap map, const int4 * y
 #endif
 }
 
-// Map global expert ids to [0, count) or -1.
+// Map global expert ids to [0, count) or -1: global expert first + expert_stride*l is local l.
 static __global__ void mmq_tma_local_ids_kernel(
         const int32_t * GGML_CUDA_RESTRICT global_ids, int32_t * GGML_CUDA_RESTRICT local_ids,
         const int n_entries, const int n_used, const int ids_stride,
-        const int32_t first, const int32_t count) {
+        const int32_t first, const int32_t count, const int32_t expert_stride) {
     ggml_cuda_pdl_sync();
     const int entry = (int) (blockIdx.x*blockDim.x + threadIdx.x);
     if (entry >= n_entries) {
@@ -906,8 +904,9 @@ static __global__ void mmq_tma_local_ids_kernel(
     }
     const int token = entry / n_used;
     const int slot  = entry % n_used;
-    const int32_t e = global_ids[token*ids_stride + slot];
-    local_ids[entry] = (e >= first && e < first + count) ? (e - first) : -1;
+    const int32_t d = global_ids[token*ids_stride + slot] - first;
+    const int32_t l = d / expert_stride;
+    local_ids[entry] = d >= 0 && l*expert_stride == d && l < count ? l : -1;
 }
 
 // Zero non-owned dst rows after inputs have been staged.
@@ -1009,6 +1008,15 @@ static void launch_mul_mat_q_tma_q45_K(
         ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, warm);
 }
 
+// CTAs an sm_120 SM holds by SMEM (100 KiB, 1 KiB reserved a CTA) for one unit a warp.
+template <ggml_type type, int NWARPS>
+static constexpr int mmq_tma_q45_occ() {
+    constexpr int row_bytes   = NWARPS*(type == GGML_TYPE_Q4_K ? MMQ_TMA_Q4K_UNIT_BYTES : MMQ_TMA_Q5K_UNIT_BYTES);
+    constexpr int tile_stride = (MMQ_TMA_TILE_ROWS*row_bytes + 127)/128*128;
+    constexpr int smem        = 2*tile_stride + 2*(int) sizeof(uint64_t) + 2*(NWARPS - 1)*4*WARP_SIZE*(int) sizeof(float);
+    return 100*1024/(smem + 1024);
+}
+
 template <ggml_type type>
 static void dispatch_mul_mat_q_tma_q45_K(
         const int device, const CUtensorMap & map, const int4 * y, float * dst,
@@ -1018,7 +1026,9 @@ static void dispatch_mul_mat_q_tma_q45_K(
         const mmq_tma_warm_args & warm, const bool ids_ready, cudaStream_t stream) {
     if (nunits == 9) {
         // 9 warps x 1 unit/warp: 0% warp imbalance, y cached in regs across row tiles of each pair.
-        launch_mul_mat_q_tma_q45_K<type, 9, 1, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
+        // Two Q4_K CTAs (2 x 49,680 B SMEM) fit one SM; one Q5_K CTA (58,896 B) does.
+        constexpr int occ = type == GGML_TYPE_Q4_K ? 2 : 1;
+        launch_mul_mat_q_tma_q45_K<type, 9, occ, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
             ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, warm, ids_ready, stream);
     } else if (nunits == 6) {
         launch_mul_mat_q_tma_q45_K<type, 6, 2, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
@@ -1026,6 +1036,14 @@ static void dispatch_mul_mat_q_tma_q45_K(
     } else if (nunits == 4) {
         launch_mul_mat_q_tma_q45_K<type, 4, 2, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
             ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, warm, ids_ready, stream);
+    } else if (nunits == 2) {
+        // K=512 bank: Q4_K 10,256 B a CTA (9 an SM), Q5_K 12,304 B (7).
+        launch_mul_mat_q_tma_q45_K<type, 2, mmq_tma_q45_occ<type, 2>(), true>(device, map, y, dst, nrows_x, expert_rows,
+            nunits, row_bytes, ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, warm, ids_ready, stream);
+    } else if (nunits == 1) {
+        // K=256 bank: Q4_K 4,624 B a CTA (18 an SM), Q5_K 5,648 B (15).
+        launch_mul_mat_q_tma_q45_K<type, 1, mmq_tma_q45_occ<type, 1>(), true>(device, map, y, dst, nrows_x, expert_rows,
+            nunits, row_bytes, ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, warm, ids_ready, stream);
     } else {
         GGML_ABORT("unexpected nunits %d for Q4_K/Q5_K TMA", nunits);
     }
@@ -1084,7 +1102,7 @@ static bool mmq_tma_q45_shape_ok(const ggml_tensor * w, int & nunits, int & row_
         return false;
     }
     const int u = (int) (w->ne[0] / QK_K);
-    if (u != 4 && u != 6 && u != 9) {
+    if (u != 1 && u != 2 && u != 4 && u != 6 && u != 9) {
         return false;
     }
     const int unit_bytes = w->type == GGML_TYPE_Q4_K ? MMQ_TMA_Q4K_UNIT_BYTES : MMQ_TMA_Q5K_UNIT_BYTES;
@@ -1195,8 +1213,9 @@ bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
                                     const ggml_tensor * ids, ggml_tensor * glu, int32_t first, int32_t count,
                                     float beta, float lb, const int32_t * precomputed_local_ids,
-                                    bool zero_non_owned) {
+                                    bool zero_non_owned, int32_t expert_stride) {
     static const bool enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
+    GGML_ASSERT(expert_stride >= 1);
     if (!enabled || !w || !x || !ids || !glu || w->type != GGML_TYPE_Q3_K) {
         return false;
     }
@@ -1227,7 +1246,7 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
     }
 
     constexpr size_t smem_bytes = (size_t) (2*MMQ_TMA_TILE_STRIDE) + 2*sizeof(uint64_t) +
-        (size_t) (2*(MMQ_TMA_Q3K_NWARPS - 1)*4*WARP_SIZE)*sizeof(float);
+        (size_t) (2*MMQ_TMA_Q3K_NWARPS*4*WARP_SIZE)*sizeof(float);
     static std::atomic<int> max_smem_gu[GGML_CUDA_MAX_DEVICES];
     mmq_tma_ensure_smem(ctx.device, mul_mat_q_tma_q3_K_gate_up_situ, max_smem_gu, smem_bytes);
 
@@ -1245,7 +1264,7 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
             dim3((unsigned) ((nentries + 255)/256), 1, 1), dim3(256, 1, 1), 0, stream);
         ggml_cuda_kernel_launch(mmq_tma_local_ids_kernel, lid_params,
             (const int32_t *) ids->data, local_ids_buf.get(),
-            (int) nentries, (int) n_expert_used, (int) ids_stride, first, count);
+            (int) nentries, (int) n_expert_used, (int) ids_stride, first, count, expert_stride);
         local_ids = local_ids_buf.get();
     }
 
@@ -1292,8 +1311,9 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
 bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
                                          const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor * dst,
                                          int32_t first, int32_t count,
-                                         const int32_t * precomputed_local_ids) {
+                                         const int32_t * precomputed_local_ids, int32_t expert_stride) {
     static const bool enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
+    GGML_ASSERT(expert_stride >= 1);
     if (!enabled || !w || !x || !ids || !weights || !dst) {
         return false;
     }
@@ -1343,7 +1363,7 @@ bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const 
             dim3((unsigned) ((nentries + 255)/256), 1, 1), dim3(256, 1, 1), 0, stream);
         ggml_cuda_kernel_launch(mmq_tma_local_ids_kernel, lid_params,
             (const int32_t *) ids->data, local_ids_buf.get(),
-            (int) nentries, (int) n_expert_used, (int) ids_stride, first, count);
+            (int) nentries, (int) n_expert_used, (int) ids_stride, first, count, expert_stride);
         local_ids = local_ids_buf.get();
     }
 
@@ -1401,16 +1421,16 @@ bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
                                     const ggml_tensor * ids, ggml_tensor * glu, int32_t first, int32_t count,
                                     float beta, float lb, const int32_t * precomputed_local_ids,
-                                    bool zero_non_owned) {
-    GGML_UNUSED_VARS(ctx, w, x, ids, glu, first, count, beta, lb, precomputed_local_ids, zero_non_owned);
+                                    bool zero_non_owned, int32_t expert_stride) {
+    GGML_UNUSED_VARS(ctx, w, x, ids, glu, first, count, beta, lb, precomputed_local_ids, zero_non_owned, expert_stride);
     return false;
 }
 
 bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
                                          const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor * dst,
                                          int32_t first, int32_t count,
-                                         const int32_t * precomputed_local_ids) {
-    GGML_UNUSED_VARS(ctx, w, x, ids, weights, dst, first, count, precomputed_local_ids);
+                                         const int32_t * precomputed_local_ids, int32_t expert_stride) {
+    GGML_UNUSED_VARS(ctx, w, x, ids, weights, dst, first, count, precomputed_local_ids, expert_stride);
     return false;
 }
 

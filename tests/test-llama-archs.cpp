@@ -7,6 +7,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-context.h"
 
 #include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
@@ -285,6 +286,23 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
         }
     }
 
+    if (ggml_is_quantized(tensor->type) && !ggml_quantize_requires_imatrix(tensor->type)) {
+        const int64_t width = tensor->ne[0];
+        const int64_t chunk = std::max<int64_t>(1, (1 << 20)/width);
+        const size_t row_bytes = ggml_row_size(tensor->type, width);
+        std::vector<float> src;
+        std::vector<uint8_t> dst;
+        for (int64_t r = 0; r < ggml_nrows(tensor); r += chunk) {
+            const int64_t rows = std::min(chunk, ggml_nrows(tensor) - r);
+            src.resize(rows*width);
+            dst.resize(rows*row_bytes);
+            const std::string name = std::string(tensor->name) + ":" + std::to_string(r);
+            fill(src, name.c_str(), params);
+            ggml_quantize_chunk(tensor->type, src.data(), dst.data(), 0, rows, width, nullptr);
+            ggml_backend_tensor_set(tensor, dst.data(), r*row_bytes, dst.size());
+        }
+        return;
+    }
     std::vector<float> tmp(ggml_nelements(tensor));
     fill(tmp, tensor->name, params);
 
@@ -296,11 +314,6 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
             tmp16[i] = ggml_fp32_to_fp16(tmp[i]);
         }
         ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
-    } else if (ggml_is_quantized(tensor->type) && !ggml_quantize_requires_imatrix(tensor->type)) {
-        // a fixture that declares a weight's type in its metadata (test_inkling_stack)
-        std::vector<uint8_t> q(ggml_nbytes(tensor));
-        ggml_quantize_chunk(tensor->type, tmp.data(), q.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
-        ggml_backend_tensor_set(tensor, q.data(), 0, q.size());
     } else {
         GGML_ABORT("fatal error");
     }
@@ -319,6 +332,8 @@ static void usage(char ** argv) {
     LOG("  --inkling-split <case>   Compare Inkling 2 under -sm tensor with one device: prefill, decode, chunks, seq-cp,\n");
     LOG("                           state, rollback, graph-churn or layer-inp\n");
     LOG("  --inkling-split-device <devs>  The ranks of that split, one per name (default: CUDA0,CUDA0)\n");
+    LOG("  --inkling-dspark <gguf>  Compare DSpark draft TP4 with one device using the Inkling fixture draft\n");
+    LOG("                           Use GGML_CUDA_AR_BF16_THRESHOLD=0 to compare without BF16 wire rounding\n");
     LOG("  --inkling-data <devs>    Compare Inkling 2 under -sm data (sequence-parallel rows) with one device, on <devs>\n");
     LOG("  --inkling-path <f>/<case>  Compare an optimized path of Inkling 2 with the path it replaced: rel, fuse, conv,\n");
     LOG("                           kv-q8_0, kv-q4_0 or kv-split, in prompt, decode, unified or streams\n");
@@ -328,6 +343,7 @@ static void usage(char ** argv) {
     LOG("  --inkling-stack <devs>   Compare Inkling 2's Q-input products as one launch with one launch each, on <devs> (two: -sm tensor)\n");
     LOG("  --inkling-delta-upload <devs>  Verify Inkling 2 delta uploads and batched small H2D inputs bit-for-bit on <devs>\n");
     LOG("  --inkling-delta-bench <devs>   Benchmark Inkling 2 delta uploads vs legacy full writes on <devs>\n");
+    LOG("  --time-inkling-alloc <dev> <repeats>   Time 48-layer graph allocation on four logical ranks\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -423,6 +439,94 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         throw std::runtime_error("failed to create llama context");
     }
     return std::make_pair(std::move(model), std::move(lctx));
+}
+
+static int time_inkling_alloc(ggml_backend_dev_t device, size_t seed, int repeats) {
+    constexpr int layers = 48;
+    constexpr int rows = 23;
+    auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true, false, layers);
+    kv_writer(LLM_ARCH_INKLING2, gguf.get()).add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+    const float stdev = arch_stdev(LLM_ARCH_INKLING2, seed, 0.01f);
+    auto model = get_model(gguf.get(), nullptr, seed, stdev, std::vector<ggml_backend_dev_t>(4, device), LLAMA_SPLIT_MODE_TENSOR);
+    auto params = llama_context_default_params();
+    params.n_ctx = 256*rows;
+    params.n_batch = 256;
+    params.n_ubatch = rows;
+    params.n_seq_max = rows;
+    params.n_threads = params.n_threads_batch = 3;
+    params.kv_unified = true;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+    GGML_ASSERT(ctx);
+
+    auto memory = ctx->get_memory()->init_full();
+    llama_batch_allocr batch(model->hparams.n_pos_per_embd(), model->n_seq_devices());
+    auto ubatch = batch.ubatch_reserve(1, rows);
+    for (int i = 0; i < rows; ++i) {
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i] = &ubatch.seq_id_unq[i];
+        ubatch.output[i] = true;
+    }
+    llama_adapter_cvec cvec;
+    llama_adapter_loras loras;
+    llm_graph_result result(32768);
+    llm_graph_params graph_params = {};
+    graph_params.model = model.get();
+    graph_params.cparams = ctx->get_cparams();
+    graph_params.ubatch = ubatch;
+    graph_params.gtype = LLM_GRAPH_TYPE_DEFAULT;
+    graph_params.sched = ctx->get_sched();
+    graph_params.backend_cpu = ggml_backend_sched_get_backend(graph_params.sched,
+            ggml_backend_sched_get_n_backends(graph_params.sched) - 1);
+    graph_params.cvec = &cvec;
+    graph_params.loras = &loras;
+    graph_params.mctx = memory.get();
+    graph_params.n_outputs = rows;
+    graph_params.res = &result;
+
+    ggml_backend_buffer_type_t bufts[] = {
+        ggml_backend_dev_buffer_type(model->devices.front().dev),
+        ggml_backend_cpu_buffer_type(),
+    };
+    ggml_gallocr_ptr alloc(ggml_gallocr_new_n(bufts, 2));
+
+    const auto build = [&]() {
+        result.reset();
+        auto * graph = model->build_graph(graph_params);
+        auto * last = ggml_new_tensor_1d(result.get_ctx(), GGML_TYPE_F32, 1);
+        ggml_build_forward_expand(graph, last);
+        GGML_ASSERT(graph->leafs[graph->n_leafs - 1] == last);
+        return graph;
+    };
+    auto * graph = build();
+    std::vector<int> nodes(graph->n_nodes, 0), leaves(graph->n_leafs, 0);
+    leaves.back() = 1;
+    GGML_ASSERT(ggml_gallocr_reserve_n(alloc.get(), graph, nodes.data(), leaves.data()));
+    printf("Inkling 2: %d layers, 4 logical ranks, %d rows, %d nodes, %d leaves\n",
+            layers, rows, graph->n_nodes, graph->n_leafs);
+
+    double needs = 0, reserve = 0, place = 0;
+    for (int i = 0; i < repeats; ++i) {
+        graph = build();
+        GGML_ASSERT((int) nodes.size() == graph->n_nodes && (int) leaves.size() == graph->n_leafs);
+        // Change only the last leaf's lifetime so alloc_graph checks the full plan but cannot place it.
+        ggml_set_input(graph->leafs[graph->n_leafs - 1]);
+        const auto start = ggml_time_us();
+        GGML_ASSERT(!ggml_gallocr_alloc_graph(alloc.get(), graph));
+        needs += ggml_time_us() - start;
+        graph->leafs[graph->n_leafs - 1]->flags &= ~GGML_TENSOR_FLAG_INPUT;
+
+        const auto reserve_start = ggml_time_us();
+        GGML_ASSERT(ggml_gallocr_reserve_n(alloc.get(), graph, nodes.data(), leaves.data()));
+        reserve += ggml_time_us() - reserve_start;
+        const auto place_start = ggml_time_us();
+        GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), graph));
+        place += ggml_time_us() - place_start;
+    }
+    const double scale = 1.0/(1000*repeats);
+    printf("Mean of %d (ms): needs_realloc %.3f, reserve %.3f, sum %.3f, alloc_graph %.3f\n",
+            repeats, needs*scale, reserve*scale, (needs + reserve)*scale, place*scale);
+    return 0;
 }
 
 static std::vector<float> get_logits(
@@ -4402,6 +4506,14 @@ int main(int argc, char ** argv) {
     common_init();
     llama_backend_init();
 
+    if (argc == 4 && strcmp(argv[1], "--time-inkling-alloc") == 0) {
+        ggml_backend_load_all();
+        const auto device = ggml_backend_dev_by_name(argv[2]);
+        const int repeats = atoi(argv[3]);
+        GGML_ASSERT(device && repeats > 0);
+        return time_inkling_alloc(device, 1234, repeats);
+    }
+
     std::random_device rd;
 
     std::string arch_filter;
@@ -4417,6 +4529,7 @@ int main(int argc, char ** argv) {
     std::string dp_device, prefill_device, shared_device;
     std::string tensor_device; // --glm-tensor-device CUDA0,CUDA1,CUDA0,CUDA1: one rank per name, repeats allowed
     std::string inkling_split, inkling_device; // --inkling-split <case> on --inkling-split-device's ranks, as above
+    std::string inkling_dspark; // --inkling-dspark <gguf>: draft fixture on --inkling-split-device
     std::string inkling_data; // --inkling-data <devs>: Inkling 2 under -sm data against one device
     std::string inkling_path, inkling_path_device; // --inkling-path <feature>/<case> on --inkling-path-device
     std::string inkling_window; // --inkling-window <device>
@@ -4460,6 +4573,11 @@ int main(int argc, char ** argv) {
             const bool device = strcmp(argv[i], "--inkling-split-device") == 0;
             if (i + 1 == argc) return 1;
             (device ? inkling_device : inkling_split) = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--inkling-dspark") == 0) {
+            if (i + 1 == argc) return 1;
+            inkling_dspark = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--inkling-data") == 0) {
@@ -4635,15 +4753,16 @@ int main(int argc, char ** argv) {
             }
             return test_inkling_data(seed, ranks);
         }
-        if (!inkling_split.empty()) {
+        if (!inkling_split.empty() || !inkling_dspark.empty()) {
             ggml_backend_load_all();
             std::vector<ggml_backend_dev_t> ranks;
-            for (const auto & name : string_split<std::string>(inkling_device.empty() ? "CUDA0,CUDA0" : inkling_device, ',')) {
+            const auto * defaults = inkling_dspark.empty() ? "CUDA0,CUDA0" : "CUDA0,CUDA1,CUDA2,CUDA3";
+            for (const auto & name : string_split<std::string>(inkling_device.empty() ? defaults : inkling_device, ',')) {
                 const auto device = ggml_backend_dev_by_name(name.c_str());
                 if (!device) throw std::runtime_error("Inkling split device is unavailable: " + name);
                 ranks.push_back(device);
             }
-            return test_inkling_split(inkling_split, seed, ranks);
+            return inkling_dspark.empty() ? test_inkling_split(inkling_split, seed, ranks) : test_inkling_dspark(inkling_dspark, seed, ranks);
         }
         if (!inkling_path.empty()) {
             ggml_backend_load_all();
@@ -4735,7 +4854,14 @@ int main(int argc, char ** argv) {
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
         }
-        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        const int status = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        if (status == 0 && arch == LLM_ARCH_INKLING2 && target_backend && strcmp(target_backend, "CUDA0") == 0) {
+            auto * dev = ggml_backend_dev_by_name(target_backend);
+            if (dev) {
+                return test_inkling_split("expert-banks", seed, {dev, dev, dev, dev});
+            }
+        }
+        return status;
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
