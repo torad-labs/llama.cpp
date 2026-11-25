@@ -14820,6 +14820,10 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     for (int64_t k : {128, 256, 512, 1536}) {
         cases.emplace_back(new test_mul_mat_group({512, 4096}, 69, k, GGML_TYPE_Q8_0));
     }
+    cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 69, 512, {1, 1}, {1, 1}));
+    cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1536, 69, 4096, {1, 1}, {1, 1}));
+    cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, 69, 512, 4096,
+        false, 1, 1, false, false, true, false, {1, 1}));
     for (int64_t n : {9, 23, 69}) {
         for (int64_t m : {24576, 49152, 98304}) {
             cases.emplace_back(new test_glm_q8_head(m, n));
@@ -16352,6 +16356,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling_f32(384, n, 4608));
     }
     test_cases.emplace_back(new test_inkling_f32(384, 23, 4096)); // K not a multiple of the 384 floats a round covers
+    for (int64_t n : {23, 69}) {
+        for (int64_t m : {16, 32}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, 4096, {1, 1}, {1, 1}));
+        }
+    }
     for (int64_t heads : {12, 48}) {
         for (int64_t tokens : {1, 8, 23}) {
             test_cases.emplace_back(new test_inkling_f32(1024, heads, 16, tokens));
@@ -17972,6 +17981,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_pad());
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {33, 17, 2, 1}, 4, 3, true)); // circular
+    // I32: the meta backend gathers an index tensor (the indexer's pool selection) with a pad
+    test_cases.emplace_back(new test_pad(GGML_TYPE_I32, {64, 23, 1, 1}, 0, 9, false));
+    test_cases.emplace_back(new test_pad(GGML_TYPE_I32, {33, 17, 2, 1}, 4, 3, true));
     test_cases.emplace_back(new test_pad_ext());
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {1024, 1, 1, 1}, 1, 0, false));
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {1024, 2, 1, 1}, 1, 0, false));

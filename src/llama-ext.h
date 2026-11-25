@@ -183,6 +183,7 @@ LLAMA_API bool    llama_set_nextn_source(struct llama_context * ctx_dft, struct 
 
 // Optional sequence-owned rows, separate from the two reusable batch halves. A retained binding stores short batches too.
 LLAMA_API bool    llama_nextn_keep_rows(struct llama_context * ctx_tgt, llama_seq_id seq, const int32_t * rows, int32_t n);
+LLAMA_API bool    llama_nextn_keep_rows_at(struct llama_context * ctx_tgt, llama_seq_id seq, const int32_t * rows, int32_t n, int32_t dst_offset);
 LLAMA_API int32_t llama_nextn_kept_row(const struct llama_context * ctx_tgt, llama_seq_id seq, int32_t row);
 LLAMA_API bool    llama_nextn_kept_get(struct llama_context * ctx_tgt, int32_t ref, float * dst);
 LLAMA_API bool    llama_nextn_kept_set(struct llama_context * ctx_tgt, int32_t ref, const float * src);

@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# the sibling modules import by bare name, so the test runs from the repo root as well as from here
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qualification import (BASELINE_COMMIT, device_cases, check_run_identity, check_quality, check_stop_at,
                            verify_files, validate_arch_table, validate_device_csv)
 
@@ -401,17 +403,16 @@ class ServingRecipeTest(unittest.TestCase):
     def test_four_card_tensor_recipe_shares_one_pool_on_the_four_bit_cache(self):
         args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "tensor-4"])
         argv, env = self.serve.make_plan(args)
-        expected = {"-sm": "tensor", "-ts": "1,1,1,1", "-np": "23", "-c": "524288", "-b": "2048", "-ub": "2048",
-                    "--prompt-step": "1024", "--prompt-chunk": "128",
+        expected = {"-sm": "tensor", "-ts": "1,1,1,1", "-np": "23", "-c": "3014656", "-b": "2048", "-ub": "2048",
+                    "--prompt-step": "1024", "--prompt-step-ms": "30", "--prompt-chunk": "128",
                     "--cache-type-k": "q4_0", "--cache-type-v": "q4_0", "-ctki": "q8_0",
+                    "--cache-ram": "262144",
                     "--spec-type": "draft-mtp", "--spec-draft-n-max": "2", "--spec-draft-mtp-adaptive": "0.18"}
         for flag, value in expected.items():
             self.assertEqual(argv[argv.index(flag) + 1], value)
         self.assertIn("--kv-unified", argv)
         for flag in ("--backend-sampling", "-fit", "-cts", "-ubd", "--spec-draft-model"):
             self.assertNotIn(flag, argv)
-        # the reductions on the copy engines through host memory in 8-bit blocks, graphs kept by shape, CUDA
-        # executables held between turns, saves and restores beside the steps, the coupled MTP draws
         self.assertEqual(env, {
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
             "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": "internal",
@@ -419,19 +420,25 @@ class ServingRecipeTest(unittest.TestCase):
             "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
             "GGML_CUDA_AR_LL_MAX_BYTES": "0", "GGML_CUDA_AR_P2P_MAX_BYTES": "0", "GGML_CUDA_AR_COPY_THRESHOLD": "1",
             "GGML_CUDA_AR_COPY_PEER": "0", "GGML_CUDA_AR_GATHER_OWNER_SLICES": "0", "GGML_CUDA_AR_WIRE_Q8": "1",
-            "LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": "128", "GGML_META_CAPTURE_GRAPHS": "132",
+            "GGML_CUDA_AR_COPY_ENGINE_CAPTURE": "1",
+            "LLAMA_GRAPH_ANY_SEQS": "1", "LLAMA_GRAPH_SLOTS": "32", "GGML_META_CAPTURE_GRAPHS": "38",
+            "LLAMA_GRAPH_PROMPT_KEPT": "1",
             "GGML_CUDA_GRAPH_NODES": "262144", "GGML_CUDA_GRAPH_IDLE_MS": "600000",
-            "LLAMA_SPEC_COUPLED": "1", "LLAMA_STATE_SAVE_ASYNC": "1", "LLAMA_STATE_RESTORE_ASYNC": "1",
+            "LLAMA_SPEC_COUPLED": "1", "LLAMA_KV_SEQ_CELLS": "262144", "LLAMA_KV_PAD_SHARED": "65536",
+            "LLAMA_STATE_SAVE_ASYNC": "1", "LLAMA_STATE_RESTORE_ASYNC": "1",
+            "LLAMA_SLOT_PREFIX_COPY": "1", "LLAMA_RS_STAGE_ROWS": "2",
+            "LLAMA_RS_FIXED_ROWS": "1", "GGML_CUDA_SSM_CONV_ROWS": "1",
+            "LLAMA_SAMPLE_THREADS": "23", "GGML_CUDA_F32_FEW": "1", "GGML_CUDA_GDN_STATE_PERSIST": "1",
             "LD_LIBRARY_PATH": str(self.serve.ROOT / "build/bin")})
-        # two cards serve the same settings; what differs is the devices in sight, the host-memory reduction route
-        # no pair has been read on, the kept graphs a session limit sizes, the session limit itself and the fuller
-        # cards' graph reserve
+        # tensor-2 keeps its compact defaults while tensor-4 turns on the four-card concurrency switches
         two = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))[1]
         self.assertEqual({key for key in set(env) | set(two) if env.get(key) != two.get(key)}, {
             "CUDA_VISIBLE_DEVICES", "GGML_CUDA_AR_LL_MAX_BYTES", "GGML_CUDA_AR_P2P_MAX_BYTES",
             "GGML_CUDA_AR_COPY_THRESHOLD", "GGML_CUDA_AR_COPY_PEER", "GGML_CUDA_AR_GATHER_OWNER_SLICES",
-            "LLAMA_GRAPH_SLOTS", "GGML_META_CAPTURE_GRAPHS", "LLAMA_GRAPH_DEVICE_RESERVE_MIB",
-            "LLAMA_KV_SEQ_CELLS"})
+            "GGML_CUDA_AR_COPY_ENGINE_CAPTURE", "GGML_META_CAPTURE_GRAPHS", "LLAMA_GRAPH_PROMPT_KEPT",
+            "LLAMA_GRAPH_DEVICE_RESERVE_MIB", "LLAMA_KV_SEQ_CELLS", "LLAMA_KV_PAD_SHARED",
+            "LLAMA_SLOT_PREFIX_COPY", "LLAMA_RS_STAGE_ROWS", "LLAMA_RS_FIXED_ROWS", "GGML_CUDA_SSM_CONV_ROWS",
+            "LLAMA_SAMPLE_THREADS", "GGML_CUDA_F32_FEW", "GGML_CUDA_GDN_STATE_PERSIST"})
         bf16 = self.serve.make_plan(self.serve.arguments(
             ["--model", "/models/target.gguf", "--profile", "tensor-4", "--reduction-wire", "bf16"]))[1]
         self.assertEqual(bf16, {key: value for key, value in env.items() if key != "GGML_CUDA_AR_WIRE_Q8"})
@@ -453,26 +460,78 @@ class ServingRecipeTest(unittest.TestCase):
             self.assertIn("--backend-sampling", argv)
         argv, _ = self.serve.make_plan(self.serve.arguments(base + ["--dflash", "/models/draft.gguf", "--dflash-depth", "7"]))
         for flag, value in {"--spec-type": "draft-dflash", "--spec-draft-model": "/models/draft.gguf",
-                            "--spec-draft-n-max": "7", "--spec-draft-device": "CUDA0", "--spec-draft-ngl": "99"}.items():
+                            "--spec-draft-n-max": "7", "--spec-draft-sampling": "probabilistic",
+                            "--spec-draft-device": "CUDA0", "--spec-draft-ngl": "99"}.items():
             self.assertEqual(argv[argv.index(flag) + 1], value)
         self.assertFalse(any(arg.startswith("--spec-draft-mtp") for arg in argv))
-        # a session's limit is the engine's own switch, set only when asked for
-        self.assertNotIn("LLAMA_KV_SEQ_CELLS", self.serve.make_plan(self.serve.arguments(base))[1])
+        argv_g, _ = self.serve.make_plan(self.serve.arguments(
+            base + ["--dflash", "/models/draft.gguf", "--dflash-depth", "7", "--dflash-sampling", "greedy"]))
+        self.assertEqual(argv_g[argv_g.index("--spec-draft-sampling") + 1], "greedy")
+        # two cards keep the engine's greedy draft unless asked
+        two_dflash = ["--model", "/models/target.gguf", "--dflash", "/models/draft.gguf", "--dflash-depth", "7"]
+        self.assertNotIn("--spec-draft-sampling", self.serve.make_plan(self.serve.arguments(two_dflash))[0])
+        argv_p = self.serve.make_plan(self.serve.arguments(two_dflash + ["--dflash-sampling", "probabilistic"]))[0]
+        self.assertEqual(argv_p[argv_p.index("--spec-draft-sampling") + 1], "probabilistic")
+        # explicit --context without --slot-context leaves sessions uncapped; default tensor-4 sets 262144
+        self.assertEqual(self.serve.make_plan(self.serve.arguments(base))[1]["LLAMA_KV_SEQ_CELLS"], "262144")
+        self.assertNotIn("LLAMA_KV_SEQ_CELLS", self.serve.make_plan(self.serve.arguments(base + ["--context", "524288"]))[1])
         argv, env = self.serve.make_plan(self.serve.arguments(base + ["--context", "3014656", "--slot-context", "262144"]))
         self.assertEqual(argv[argv.index("-c") + 1], "3014656")
         self.assertEqual(env["LLAMA_KV_SEQ_CELLS"], "262144")
-        # graphs sized for long sessions are kept 32 a context, not 128, unless a count is given; four captures beyond
-        self.assertEqual((env["LLAMA_GRAPH_SLOTS"], env["GGML_META_CAPTURE_GRAPHS"]), ("32", "36"))
+        # graphs sized for long sessions are kept 32 a context + 4 meta + 2 checkpoint rows = 38
+        self.assertEqual((env["LLAMA_GRAPH_SLOTS"], env["GGML_META_CAPTURE_GRAPHS"]), ("32", "38"))
         for options, kept in ((["--kept-graphs", "64"], "64"),
                               (["--context", "3014656", "--slot-context", "262144", "--kept-graphs", "128"], "128")):
             env = self.serve.make_plan(self.serve.arguments(base + options))[1]
-            self.assertEqual((env["LLAMA_GRAPH_SLOTS"], env["GGML_META_CAPTURE_GRAPHS"]), (kept, str(int(kept) + 4)))
+            self.assertEqual((env["LLAMA_GRAPH_SLOTS"], env["GGML_META_CAPTURE_GRAPHS"]), (kept, str(int(kept) + 6)))
+        # each tensor-4 default has its own switch, and the switch moves nothing else of the plan
+        argv0, env0 = self.serve.make_plan(self.serve.arguments(base))
+        step_ms = argv0.index("--prompt-step-ms")
+        for options, drop, change, argv_expected in (
+                (["--no-ar-copy-capture"], {"GGML_CUDA_AR_COPY_ENGINE_CAPTURE"}, {}, argv0),
+                (["--slot-context", "131072"], set(), {"LLAMA_KV_SEQ_CELLS": "131072"}, argv0),
+                (["--kept-graphs", "16"], set(), {"LLAMA_GRAPH_SLOTS": "16", "GGML_META_CAPTURE_GRAPHS": "22"}, argv0),
+                (["--session-step", "0"], {"LLAMA_KV_PAD_SHARED"}, {}, argv0),
+                (["--session-step", "131072"], set(), {"LLAMA_KV_PAD_SHARED": "131072"}, argv0),
+                (["--prompt-step-ms", "0"], set(), {}, argv0[:step_ms] + argv0[step_ms + 2:]),
+                (["--no-prompt-kept"], {"LLAMA_GRAPH_PROMPT_KEPT"}, {}, argv0),
+                (["--checkpoint-rows", "0"], set(), {"LLAMA_RS_STAGE_ROWS": "0", "GGML_META_CAPTURE_GRAPHS": "36"}, argv0),
+                (["--fixed-rows", "off"], {"LLAMA_RS_FIXED_ROWS", "GGML_CUDA_SSM_CONV_ROWS"}, {}, argv0),
+                (["--fixed-rows", "unfused"], {"GGML_CUDA_SSM_CONV_ROWS"}, {}, argv0),
+                (["--no-prefix-copy"], {"LLAMA_SLOT_PREFIX_COPY"}, {}, argv0),
+                (["--sample-threads", "0"], set(), {"LLAMA_SAMPLE_THREADS": "1"}, argv0),
+                (["--sample-threads", "8"], set(), {"LLAMA_SAMPLE_THREADS": "8"}, argv0),
+                (["--no-f32-few"], {"GGML_CUDA_F32_FEW"}, {}, argv0),
+                (["--no-gdn-state-persist"], {"GGML_CUDA_GDN_STATE_PERSIST"}, {}, argv0)):
+            with self.subTest(options=options):
+                argv, env = self.serve.make_plan(self.serve.arguments(base + options))
+                self.assertEqual(env, {**{k: v for k, v in env0.items() if k not in drop}, **change})
+                self.assertEqual(argv, argv_expected)
+        argv = self.serve.make_plan(self.serve.arguments(base + ["--cache-ram", "0"]))[0]
+        self.assertEqual(argv[argv.index("--cache-ram") + 1], "0")
+        self.assertEqual(self.serve.make_plan(self.serve.arguments(base + ["--slots", "80"]))[1]["LLAMA_SAMPLE_THREADS"], "64")
+        # tensor-2 keeps each of them off, and each opt-in turns on its own switch alone
+        two_argv, two_env = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"]))
+        for options, change in ((["--ar-copy-capture"], {"GGML_CUDA_AR_COPY_ENGINE_CAPTURE": "1"}),
+                                (["--prompt-kept"], {"LLAMA_GRAPH_PROMPT_KEPT": "1"}),
+                                (["--prefix-copy"], {"LLAMA_SLOT_PREFIX_COPY": "1"}),
+                                (["--f32-few"], {"GGML_CUDA_F32_FEW": "1"}),
+                                (["--gdn-state-persist"], {"GGML_CUDA_GDN_STATE_PERSIST": "1"}),
+                                (["--sample-threads", "12"], {"LLAMA_SAMPLE_THREADS": "12"}),
+                                (["--session-step", "65536"], {"LLAMA_KV_PAD_SHARED": "65536"}),
+                                (["--checkpoint-rows", "2"], {"LLAMA_RS_STAGE_ROWS": "2", "GGML_META_CAPTURE_GRAPHS": "38"})):
+            with self.subTest(profile="tensor-2", options=options):
+                argv, env = self.serve.make_plan(self.serve.arguments(["--model", "/models/target.gguf"] + options))
+                self.assertEqual((argv, env), (two_argv, {**two_env, **change}))
         for options in (base + ["--slots", "0"], base + ["--slots", "257"], base + ["--slots", "8", "--context", "7"],
                         base + ["--kept-graphs", "0"], base + ["--kept-graphs", "257"],
-                        base + ["--slot-context", "255"], base + ["--slot-context", "524288"],
+                        base + ["--slot-context", "255"], base + ["--slot-context", "3014656"],
                         base + ["--context", "294912", "--slot-context", "294912"],
                         ["--model", "/models/target.gguf", "--context", "400000", "--slot-context", "400000"],
                         base + ["--dflash", "/models/draft.gguf"], base + ["--dflash-depth", "7"],
+                        base + ["--dflash-sampling", "greedy"],
+                        base + ["--prefix-copy", "--no-prefix-copy"],
+                        base + ["--ar-copy-capture", "--no-ar-copy-capture"],
                         base + ["--mtp-adaptive", "1.5"]):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(options))
@@ -525,6 +584,11 @@ class ServingRecipeTest(unittest.TestCase):
         env = self.serve.make_plan(self.serve.arguments(
             ["--model", "/models/target.gguf", "--profile", "tensor-4", "--reduction-route", "engine"]))[1]
         self.assertFalse(route & set(env))
+        # copy-engine capture is a default of the host route only; the engine's routes take it when asked
+        self.assertNotIn("GGML_CUDA_AR_COPY_ENGINE_CAPTURE", env)
+        env = self.serve.make_plan(self.serve.arguments(
+            ["--model", "/models/target.gguf", "--profile", "tensor-4", "--reduction-route", "engine", "--ar-copy-capture"]))[1]
+        self.assertEqual(env["GGML_CUDA_AR_COPY_ENGINE_CAPTURE"], "1")
         # the cache the two cards served with before the four-card settings stays one flag away
         argv = self.serve.make_plan(self.serve.arguments(
             ["--model", "/models/target.gguf", "--latent-cache", "q8_0"]))[0]
@@ -533,7 +597,12 @@ class ServingRecipeTest(unittest.TestCase):
 
     def test_prompt_step_ms_is_an_opt_in_and_its_step_is_the_most_a_step_takes(self):
         base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
-        self.assertNotIn("--prompt-step-ms", self.serve.make_plan(self.serve.arguments(base))[0])
+        two = ["--model", "/models/target.gguf"]
+        # tensor-4 defaults to --prompt-step-ms 30 (0 disables); tensor-2 leaves it unset
+        self.assertNotIn("--prompt-step-ms", self.serve.make_plan(self.serve.arguments(two))[0])
+        self.assertEqual(self.serve.make_plan(self.serve.arguments(base))[0][
+            self.serve.make_plan(self.serve.arguments(base))[0].index("--prompt-step-ms") + 1], "30")
+        self.assertNotIn("--prompt-step-ms", self.serve.make_plan(self.serve.arguments(base + ["--prompt-step-ms", "0"]))[0])
         argv = self.serve.make_plan(self.serve.arguments(base + ["--prompt-step-ms", "40"]))[0]
         self.assertEqual((argv[argv.index("--prompt-step-ms") + 1], argv[argv.index("--prompt-step") + 1]), ("40", "1024"))
         # with shapes the step is one pass; the time takes the count there, so the step is not held to the pass
@@ -542,15 +611,15 @@ class ServingRecipeTest(unittest.TestCase):
         argv = self.serve.make_plan(self.serve.arguments(
             base + ["--prompt-shapes", "8", "--prompt-step-ms", "40", "--prompt-step", "512"]))[0]
         self.assertEqual(argv[argv.index("--prompt-step") + 1], "512")
-        for ms in ("0", "-5"):
-            with self.subTest(ms=ms), self.assertRaises(ValueError):
-                self.serve.make_plan(self.serve.arguments(base + ["--prompt-step-ms", ms]))
+        with self.assertRaises(ValueError):
+            self.serve.make_plan(self.serve.arguments(base + ["--prompt-step-ms", "-5"]))
 
     def test_prompt_shapes_session_step_and_low_depth_are_opt_ins(self):
         base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
         argv, env = self.serve.make_plan(self.serve.arguments(base))
-        for key in ("LLAMA_PROMPT_SHAPES", "LLAMA_PROMPT_SHAPE_SMALL", "LLAMA_PROMPT_SHAPE_ROWS", "LLAMA_KV_PAD_SHARED"):
+        for key in ("LLAMA_PROMPT_SHAPES", "LLAMA_PROMPT_SHAPE_SMALL", "LLAMA_PROMPT_SHAPE_ROWS"):
             self.assertNotIn(key, env)
+        self.assertEqual(env["LLAMA_KV_PAD_SHARED"], "65536")
         self.assertNotIn("--spec-draft-n-min", argv)
         self.assertEqual(argv[argv.index("--prompt-step") + 1], "1024")
         # 32 is the engine's switch as it was; a smaller count names the rows a short part keeps whole
@@ -587,10 +656,10 @@ class ServingRecipeTest(unittest.TestCase):
     def test_prompt_cache_size_checkpoint_count_and_prefix_copy_are_launcher_options(self):
         base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
         argv, env = self.serve.make_plan(self.serve.arguments(base))
-        self.assertEqual(argv[argv.index("--cache-ram") + 1], "32768")
+        self.assertEqual(argv[argv.index("--cache-ram") + 1], "262144")
         self.assertIn("--no-cache-idle-slots", argv)
         self.assertNotIn("--ctx-checkpoints", argv)
-        self.assertNotIn("LLAMA_SLOT_PREFIX_COPY", env)
+        self.assertEqual(env["LLAMA_SLOT_PREFIX_COPY"], "1")
         argv, env = self.serve.make_plan(self.serve.arguments(
             base + ["--cache-ram", "65536", "--ctx-checkpoints", "8", "--prefix-copy"]))
         self.assertEqual((argv[argv.index("--cache-ram") + 1], argv[argv.index("--ctx-checkpoints") + 1]), ("65536", "8"))
@@ -669,20 +738,27 @@ class ServingRecipeTest(unittest.TestCase):
         self.assertIn("GGML_TENSOR_N_STAGE_LEGACY", self.serve.removed_overrides({"GGML_TENSOR_N_STAGE_LEGACY": "1"}))
 
     def test_fixed_rows_is_an_opt_in_of_the_tensor_recipes(self):
-        for profile in ("tensor-2", "tensor-4"):
-            base = ["--model", "/models/target.gguf", "--profile", profile]
-            plain_argv, plain_env = self.serve.make_plan(self.serve.arguments(base))
-            # the engine's own switches, set only when asked for, and nothing else of the recipe moves with them
-            self.assertNotIn("LLAMA_RS_FIXED_ROWS", plain_env)
-            self.assertNotIn("GGML_CUDA_SSM_CONV_ROWS", plain_env)
-            # the rows come with the kernel that keeps their conv-state update one launch; "unfused" is the rows alone
-            rows, fused = {"LLAMA_RS_FIXED_ROWS": "1"}, {"GGML_CUDA_SSM_CONV_ROWS": "1"}
-            for options, switches in ((["--fixed-rows"], {**rows, **fused}), (["--fixed-rows", "fused"], {**rows, **fused}),
-                                      (["--fixed-rows", "unfused"], rows)):
-                with self.subTest(profile=profile, options=options):
-                    argv, env = self.serve.make_plan(self.serve.arguments(base + options))
-                    self.assertEqual(env, {**plain_env, **switches})
-                    self.assertEqual(argv, plain_argv)
+        # tensor-2 keeps fixed-rows opt-in; tensor-4 enables fused fixed-rows by default with --fixed-rows off
+        two_base = ["--model", "/models/target.gguf", "--profile", "tensor-2"]
+        plain_argv, plain_env = self.serve.make_plan(self.serve.arguments(two_base))
+        self.assertNotIn("LLAMA_RS_FIXED_ROWS", plain_env)
+        self.assertNotIn("GGML_CUDA_SSM_CONV_ROWS", plain_env)
+        rows, fused = {"LLAMA_RS_FIXED_ROWS": "1"}, {"GGML_CUDA_SSM_CONV_ROWS": "1"}
+        for options, switches in ((["--fixed-rows"], {**rows, **fused}), (["--fixed-rows", "fused"], {**rows, **fused}),
+                                  (["--fixed-rows", "unfused"], rows)):
+            with self.subTest(profile="tensor-2", options=options):
+                argv, env = self.serve.make_plan(self.serve.arguments(two_base + options))
+                self.assertEqual(env, {**plain_env, **switches})
+                self.assertEqual(argv, plain_argv)
+        four_base = ["--model", "/models/target.gguf", "--profile", "tensor-4"]
+        _, four_env = self.serve.make_plan(self.serve.arguments(four_base))
+        self.assertEqual((four_env["LLAMA_RS_FIXED_ROWS"], four_env["GGML_CUDA_SSM_CONV_ROWS"]), ("1", "1"))
+        _, four_unfused = self.serve.make_plan(self.serve.arguments(four_base + ["--fixed-rows", "unfused"]))
+        self.assertEqual(four_unfused["LLAMA_RS_FIXED_ROWS"], "1")
+        self.assertNotIn("GGML_CUDA_SSM_CONV_ROWS", four_unfused)
+        _, four_off = self.serve.make_plan(self.serve.arguments(four_base + ["--fixed-rows", "off"]))
+        self.assertNotIn("LLAMA_RS_FIXED_ROWS", four_off)
+        self.assertNotIn("GGML_CUDA_SSM_CONV_ROWS", four_off)
 
     def test_slot_defaults_and_bounds_follow_the_profile(self):
         for options, expected in ((["--profile", "tensor-4"], "23"), (["--profile", "tensor-2"], "12"),

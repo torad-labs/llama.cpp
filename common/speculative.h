@@ -196,6 +196,12 @@ void common_speculative_end(common_speculative * spec, llama_seq_id seq_id);
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// flush any deferred draft-context catch-up work after verification acceptance is known
+bool common_speculative_flush(common_speculative * spec);
+
+// true when the drafter already populated ctx_dft at pos0 during draft step 0 and wants it kept
+bool common_speculative_keep_draft_step0(const common_speculative * spec, llama_seq_id seq_id, llama_pos pos0);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

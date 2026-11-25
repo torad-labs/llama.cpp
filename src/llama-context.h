@@ -355,7 +355,7 @@ public:
 
     // the MTP store (llama-ext.h): this context is the target, head its MTP head
     bool    nextn_bind(llama_context & head, int32_t n_keep);
-    bool    nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int32_t n);
+    bool    nextn_keep_rows(llama_seq_id seq, const int32_t * rows, int32_t n, int32_t dst_offset = 0);
     int32_t nextn_kept_row(llama_seq_id seq, int32_t row) const;
     bool    nextn_kept_get(int32_t ref, float * dst);
     bool    nextn_kept_set(int32_t ref, const float * src);
