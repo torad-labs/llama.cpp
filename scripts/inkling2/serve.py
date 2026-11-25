@@ -100,10 +100,17 @@ def arguments(argv=None):
     parser.add_argument("--context", type=int, help="Tokens in the shared pool (default: the profile's)")
     parser.add_argument("--slot-context", type=int,
                         help=f"Maximum input plus generation per session (tensor-4: {CODING_SLOT_CONTEXT}, other profiles: {SLOT_CONTEXT})")
-    parser.add_argument("--kv-cache", choices=["f16", "q8_0", "q4_0"],
-                        help="KV cache type (default: the profile's; q4_0 serves only the dense-path decode today)")
+    parser.add_argument("--kv-cache", choices=["f16", "q8_0", "f8_e4m3", "q4_0"],
+                        help="Global-layer KV cache type (default: the profile's). q8_0 and f8_e4m3 are one byte a value and "
+                             "turn on the one-byte relative decode; q4_0 turns on the q4_0 relative decode")
     parser.add_argument("--swa-kv-cache", choices=["f16", "q8_0"],
                         help="Override K and V precision in sliding-window layers (default: follow --kv-cache)")
+    parser.add_argument("--kv-mixed", action=argparse.BooleanOptionalAction,
+                        help="Keep each session's newest --kv-mixed-hot global cells in an F16 ring beside the --kv-cache "
+                             "store, which then holds only the cold cells' precision (needs a q8_0, f8_e4m3 or q4_0 --kv-cache; default off)")
+    parser.add_argument("--kv-mixed-hot", type=int, metavar="CELLS",
+                        help="Newest positions a session keeps in F16 with --kv-mixed, 64..65536 (engine default: 1024, "
+                             "where the relative bias ends); the ring holds this times --slots rows a layer")
     parser.add_argument("--attn-mask-bits", action=argparse.BooleanOptionalAction, default=True,
                         help="Use a one-bit mask for supported flash attention paths (default: enabled)")
     parser.add_argument("--bucket-prefill-kv", action=argparse.BooleanOptionalAction,
@@ -214,7 +221,8 @@ def arguments(argv=None):
                           ("compact_greedy", False), ("kv_runs", False), ("packed_prefill", False),
                           ("f32_few", False), ("moe_fuse", False), ("mmq_tma", False),
                           ("l2_persist", False), ("l2_expert_warm", False),
-                          ("router_bake", False), ("moe_route_gate", False), ("ar_copy_capture", False)):
+                          ("router_bake", False), ("moe_route_gate", False),
+                          ("ar_copy_capture", False), ("kv_mixed", False)):
         if getattr(args, key) is None:
             setattr(args, key, profile.get(key, fallback))
     if args.prompt_shapes == 0:
@@ -278,6 +286,12 @@ def make_plan(args):
         raise ValueError("ctx-checkpoints must be nonnegative")
     if args.checkpoint_every is not None and args.checkpoint_every < 0:
         raise ValueError("checkpoint-every must be nonnegative")
+    if args.kv_mixed and kv not in ("q8_0", "f8_e4m3", "q4_0"):
+        raise ValueError(f"kv-mixed keeps cold cells in --kv-cache, which is {kv}: pick q8_0, f8_e4m3 or q4_0")
+    if args.kv_mixed_hot is not None and not args.kv_mixed:
+        raise ValueError("kv-mixed-hot requires --kv-mixed")
+    if args.kv_mixed_hot is not None and not 64 <= args.kv_mixed_hot <= 65536:
+        raise ValueError("kv-mixed-hot must be 64..65536")
     if args.text_only and args.mmproj:
         raise ValueError("text-only loads no projector, so it takes no --mmproj")
     if not args.host or any(char in args.host for char in "\n\r\0"):
@@ -393,8 +407,12 @@ def make_plan(args):
         env["LLAMA_DSPARK_TRIM_BLOCK"] = "1"
     elif not args.dspark_trim_block:
         env.pop("LLAMA_DSPARK_TRIM_BLOCK", None)
-    if kv == "q8_0" or swa_kv == "q8_0":
+    if kv in ("q8_0", "f8_e4m3") or swa_kv == "q8_0":
         env["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"] = "1"
+    if args.kv_mixed:
+        env["LLAMA_INKLING2_KV_MIXED"] = "1"
+        if args.kv_mixed_hot is not None:
+            env["LLAMA_INKLING2_KV_MIXED_HOT"] = str(args.kv_mixed_hot)
     if kv == "q4_0" or swa_kv == "q4_0":
         env["GGML_CUDA_FATTN_REL_DECODE_Q4"] = "1"
     if args.keep_graphs > 0:

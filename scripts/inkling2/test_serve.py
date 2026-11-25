@@ -257,6 +257,27 @@ class OptionTest(unittest.TestCase):
         self.assertEqual(plan("--kv-cache", "q8_0")[1]["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"], "1")
         self.assertEqual(plan("--kv-cache", "q4_0")[1]["GGML_CUDA_FATTN_REL_DECODE_Q4"], "1")
 
+    def test_one_byte_and_mixed_kv(self):
+        argv, env = plan("--kv-cache", "f8_e4m3", "--swa-kv-cache", "f16")
+        self.assertEqual(argv[argv.index("--cache-type-k") + 1], "f8_e4m3")
+        self.assertEqual(argv[argv.index("--cache-type-v") + 1], "f8_e4m3")
+        self.assertEqual(env["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"], "1")
+        self.assertNotIn("LLAMA_INKLING2_KV_MIXED", env)
+        self.assertNotIn("LLAMA_INKLING2_KV_MIXED", plan()[1])
+        self.assertNotIn("GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE", plan("--swa-kv-cache", "f16")[1])
+        for cold in ("q8_0", "f8_e4m3"):
+            env = plan("--kv-cache", cold, "--kv-mixed", "--swa-kv-cache", "f16")[1]
+            self.assertEqual(env["LLAMA_INKLING2_KV_MIXED"], "1")
+            self.assertEqual(env["GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE"], "1")
+            self.assertNotIn("LLAMA_INKLING2_KV_MIXED_HOT", env)
+        env = plan("--kv-cache", "q4_0", "--kv-mixed", "--kv-mixed-hot", "2048")[1]
+        self.assertEqual(env["LLAMA_INKLING2_KV_MIXED_HOT"], "2048")
+        self.assertEqual(env["GGML_CUDA_FATTN_REL_DECODE_Q4"], "1")
+        for bad in (["--kv-mixed"], ["--kv-cache", "f16", "--kv-mixed"], ["--kv-cache", "q8_0", "--kv-mixed-hot", "2048"],
+                    ["--kv-cache", "q8_0", "--kv-mixed", "--kv-mixed-hot", "32"]):
+            with self.assertRaises(ValueError):
+                plan(*bad)
+
     def test_expert_row_limit_only_overrides_sm120_kquants(self):
         for count in ("8", "23", "32"):
             env = plan("--expert-row-limit", count)[1]

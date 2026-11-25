@@ -447,6 +447,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             set_tests_properties(${inkling_kvmix_live_test} PROPERTIES ENVIRONMENT
                 "GGML_CUDA_FATTN_REL_DECODE_Q4=1;GGML_CUDA_FATTN_REL_PACKED_PREFILL=1;GGML_CUDA_FATTN_REL_RUNS_SHARED=1;GGML_CUDA_FATTN_REL_RUNS_GROUP=3")
         endforeach()
+        # the same on one-byte cold cells (q8_0, f8_e4m3) under the one-byte decode, as serve.py --kv-mixed launches them
+        foreach(inkling_kv q8_0 e4m3)
+            foreach(inkling_case prompt served drafted restore)
+                set(inkling_kvmix_live_test test-inkling-kvmix-live-${inkling_path_name}-${inkling_kv}-${inkling_case})
+                llama_test(test-llama-archs NAME ${inkling_kvmix_live_test}
+                    ARGS --inkling-path kv-mixed-${inkling_kv}/${inkling_case} --inkling-path-device ${inkling_path_device} -s 1234)
+                set_tests_properties(${inkling_kvmix_live_test} PROPERTIES ENVIRONMENT
+                    "GGML_CUDA_FATTN_REL_DECODE_ONE_BYTE=1;GGML_CUDA_FATTN_REL_PACKED_PREFILL=1;GGML_CUDA_FATTN_REL_RUNS_SHARED=1;GGML_CUDA_FATTN_REL_RUNS_GROUP=3")
+            endforeach()
+        endforeach()
         # the global layers' decode by the runs of cells each row reads against its mask (LLAMA_INKLING2_KV_RUNS), and on
         # a GPU with the shared runs read once for groups of 3 rows (GGML_CUDA_FATTN_REL_RUNS_SHARED)
         foreach(inkling_case runs served restore drafted)

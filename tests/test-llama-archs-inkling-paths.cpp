@@ -147,7 +147,8 @@ std::string kv_mixed_kind(const ggml_tensor * t) {
     return t->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_get_hot_kv(t) ? "hot F16 mixed KV" : "";
 }
 
-std::function<void(llama_context_params &, bool)> kv_mixed_on(const char * hot_cells, bool use_runs) {
+// cold global cells in `cold`, the newest hot_cells of each sequence in the F16 ring, against an F16 cache
+std::function<void(llama_context_params &, bool)> kv_mixed_on(const char * hot_cells, bool use_runs, ggml_type cold = GGML_TYPE_Q4_0) {
     return [=](llama_context_params & params, bool legacy) {
         params.attn_mask_bits = true;
         params.type_k_swa = params.type_v_swa = GGML_TYPE_F16;
@@ -161,7 +162,7 @@ std::function<void(llama_context_params &, bool)> kv_mixed_on(const char * hot_c
             unsetenv("LLAMA_INKLING2_KV_MIXED");
             unsetenv("LLAMA_INKLING2_KV_MIXED_HOT");
         } else {
-            params.type_k = params.type_v = GGML_TYPE_Q4_0;
+            params.type_k = params.type_v = cold;
             setenv("LLAMA_INKLING2_KV_MIXED", "1", 1);
             setenv("LLAMA_INKLING2_KV_MIXED_HOT", hot_cells, 1);
         }
@@ -328,6 +329,10 @@ const std::map<std::string, feature> & features() {
         {"ring", {nullptr, {"swa ring runs"}, swa_ring_kind, swa_ring_on, tolerance, 0.0, served_heads}},
         {"kv-mixed-near", {nullptr, {"hot F16 mixed KV"}, kv_mixed_kind, kv_mixed_on("2048", false), tolerance, tolerance}},
         {"kv-mixed", {nullptr, {"hot F16 mixed KV"}, kv_mixed_kind, kv_mixed_on("1024", true), q4_0_rounding, q4_0_on_host, served_heads}},
+        {"kv-mixed-q8_0", {nullptr, {"hot F16 mixed KV"}, kv_mixed_kind, kv_mixed_on("1024", true, GGML_TYPE_Q8_0), tolerance, tolerance,
+            served_heads}},
+        {"kv-mixed-e4m3", {nullptr, {"hot F16 mixed KV"}, kv_mixed_kind, kv_mixed_on("1024", true, GGML_TYPE_F8_E4M3), tolerance, tolerance,
+            served_heads}},
     };
     add_kvg(all);
     return all; }();
