@@ -253,9 +253,21 @@ std::map<std::string, case_def> cases(size_t seed, const std::vector<ggml_backen
             throw std::runtime_error("inkling2: the sequence's state was not restored");
         }
         read_state(ctx, 1, out);
+        std::vector<uint8_t> ref(llama_state_seq_get_size(ctx, 1)), async(ref.size());
+        if (llama_state_seq_get_data(ctx, ref.data(), ref.size(), 1) != ref.size()) {
+            throw std::runtime_error("inkling2: the restored sequence's state was not saved");
+        }
         decode_steps(ctx, b, n_prompt, 1, out);
         read_state(ctx, 0, out);
         read_state(ctx, 1, out);
+
+        if (llama_state_seq_set_data_async(ctx, seq.data(), seq.size(), 1, LLAMA_STATE_SEQ_FLAGS_NONE) != seq.size()) {
+            throw std::runtime_error("inkling2: async restore did not consume the sequence state");
+        }
+        llama_state_seq_async_wait(ctx, 1);
+        if (llama_state_seq_get_data(ctx, async.data(), async.size(), 1) != async.size() || ref != async) {
+            throw std::runtime_error("inkling2: async restore differs from sync restore");
+        }
     }};
     ret["rollback"] = {{64, 1, 8}, [=](llama_context * ctx, record & out) {
         decode_span(ctx, tokens(n_prompt, 0), 0, 0, out);

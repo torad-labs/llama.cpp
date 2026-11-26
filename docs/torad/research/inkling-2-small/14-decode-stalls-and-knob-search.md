@@ -91,7 +91,8 @@ The periodic owner layout in that kernel, measured earlier the same day, gave 42
 
 ## What the knobs are worth
 
-Trials on the build before the two fixes above, one trial each, 23 sessions:
+Trials on the build before the two fixes above, one trial each, 23 sessions.
+`GGML_TENSOR_N_SPLIT_ROWS` is historical: current builds batch whole split rows regardless of run length.
 
 | Setting | tokens/s |
 | --- | ---: |
