@@ -11753,8 +11753,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
 
 #ifdef USE_CUDA_GRAPH
-        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+            ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
             // CUPTI's update callbacks inspect the executable's original graph and nodes.
             // Keep that source alive until the executable has adopted the new capture.
             previous_graph = graph->graph;
@@ -11781,12 +11781,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         const cudaGraph_t instance_source = graph->instance_source;
         // An executable made for this capture just now, instantiated from it or recycled and updated to it
         // (ggml_cuda_graph_adopt), has nothing to be updated to: only one kept from an earlier capture has.
-        bool made_now = false;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             ggml_cuda_graph_instantiate(cuda_ctx, graph);
-            made_now = ggml_backend_cuda_context::cuda_graph_recycle();
-        }
-        if (cuda_graph_update_required && !made_now) { // Update graph executable
+        } else if (cuda_graph_update_required) {
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         if (cuda_graph_update_required) {
@@ -11825,7 +11822,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    const auto it = cuda_ctx->cuda_graphs.find(graph_key);
+    if (it == cuda_ctx->cuda_graphs.end()) {
+        return ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_VOLTA && ggml_cuda_graph{}.is_enabled();
+    }
+    ggml_cuda_graph * graph = it->second.get();
 
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
@@ -11865,9 +11866,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_ledger_eval ledger_eval(cuda_ctx->device, cuda_ctx->stream(), cuda_ctx->outer_capture, cgraph->n_nodes,
-            cuda_ctx->cuda_graphs.size());
+            cuda_ctx->cuda_graphs_held_now.graphs);
     const char * graph_reason = "disabled";
-    graph_key = ggml_cuda_graph_get_key(cgraph);
 
     if (cuda_ctx->outer_capture) {
         ledger_eval.kind = GGML_CUDA_LEDGER_OUTER;
@@ -11879,10 +11879,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     }
 
-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
-
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    graph_key = ggml_cuda_graph_get_key(cgraph);
+    if (ggml_cuda_graph_set_enabled(cuda_ctx, graph_key)) {
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         graph_reason = "incompatible";
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
@@ -11891,43 +11890,37 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
             graph_reason = properties_changed ? "properties_changed" : "warmup";
 
-            if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
-                    graph->warmup_complete = true;
-                    if (ggml_cuda_graph_debug_enabled()) {
-                        GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
-                    }
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = true;
-                }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+            if (properties_changed) {
+                // Recapture a warm executable once. Another change before a replay goes direct until stable.
+                use_cuda_graph = cuda_graph_update_required = graph->warmup_complete && graph->instance != nullptr;
+                graph->warmup_complete = false;
             } else {
-                // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    if (ggml_cuda_graph_debug_enabled()) {
-                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
-                    }
-                } else {
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instance == nullptr;
+                use_cuda_graph = true;
+                cuda_graph_update_required = graph->instance == nullptr;
+                if (!graph->warmup_complete && cuda_graph_update_required && ggml_cuda_graph_debug_enabled()) {
+                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                 }
+                graph->warmup_complete = true;
             }
-            // A capture is about to begin, for a new executable or for an update that makes one when it fails, on a
-            // device with no room for one (cuda_graph_has_room): the graph is evaluated directly this time and asked
-            // again at its next evaluation. An executable it still has is of the properties before and goes now, so
-            // nothing replays it meanwhile.
-            if (use_cuda_graph && cuda_graph_update_required && !cuda_ctx->cuda_graph_has_room()) {
-                if (graph->instance != nullptr) {
-                    CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
-                    graph->instance = nullptr;
-                    cuda_ctx->cuda_graph_account(graph);
-                }
+            // Even an update can need a new executable when the driver rejects it.
+            if (cuda_graph_update_required && !cuda_ctx->cuda_graph_has_room()) {
                 use_cuda_graph             = false;
                 cuda_graph_update_required = false;
                 graph_reason               = "no_memory";
+            }
+            if (!use_cuda_graph && graph->instance != nullptr) {
+                // The property snapshot already describes this call, not the old executable.
+                CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                graph->instance = nullptr;
+                cuda_ctx->cuda_graph_account(graph);
+                if (graph->instance_source != graph->graph) {
+                    CUDA_CHECK(cudaGraphDestroy(graph->instance_source));
+                }
+                CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                graph->instance_source = graph->graph = nullptr;
+                if (ggml_cuda_graph_debug_enabled()) {
+                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                }
             }
         }
     }
