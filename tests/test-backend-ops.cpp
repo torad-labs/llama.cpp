@@ -5858,6 +5858,8 @@ struct test_attn_prep_clip_fwht : public test_case {
         return 1e-6;
     }
 
+    bool run_whole_graph() override { return true; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nh*n, nt);
         ggml_set_name(x, "x");
@@ -5915,6 +5917,8 @@ struct test_attn_prep_kv_tail : public test_case {
         return 1e-6;
     }
 
+    bool run_whole_graph() override { return true; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int ch = nk*hd;
         ggml_tensor * past = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k - 1, ch, ns);
@@ -5931,7 +5935,8 @@ struct test_attn_prep_kv_tail : public test_case {
             ggml_set_name(d, "d");
         }
         ggml_tensor * conv = ggml_short_conv(ctx, x, w, d, 0.5f);
-        ggml_tensor * r2   = ggml_reshape_3d(ctx, conv, hd, nk, nt*ns);
+        // the two reshapes the model emits: convolve() returns [ch, t], the layer splits it into heads
+        ggml_tensor * r2   = ggml_reshape_3d(ctx, ggml_reshape_2d(ctx, conv, ch, nt*ns), hd, nk, nt*ns);
         ggml_tensor * nn   = rms ? ggml_rms_norm(ctx, r2, 1e-6f) : ggml_norm_clip(ctx, r2, nullptr, 1.5f, 1e-6f);
         ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, hd);
         ggml_set_name(rot, "rot");
@@ -6029,8 +6034,10 @@ struct test_attn_prep_state_store : public test_case {
         for (size_t i = 0; i < chg.size(); ++i) {
             v += std::to_string(chg[i]) + (i + 1 < chg.size() ? "," : "");
         }
-        return v + "]},ns=" + std::to_string(ns) + ",strided=" + (strided ? "1" : "0") + ",f16=" + (f16 ? "1" : "0");
+        return v + "],ns=" + std::to_string(ns) + ",strided=" + (strided ? "1" : "0") + ",f16=" + (f16 ? "1" : "0");
     }
+
+    bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         int sum_ch = 0;
