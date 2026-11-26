@@ -243,8 +243,9 @@ public:
     // the cells a graph attends: the cache's used cells padded to 256, or, for a step of at least 256 rows whose pooled
     // indexer scores, to n_pad_prefill (LLAMA_KV_PAD_PREFILL), so a prompt read in equal steps builds its graph once every
     // n_pad_prefill cells instead of every step; in a pool that sequences share, a scoring step of any length is padded
-    // to at least n_pad_shared and a dense one to a power of two. Shared scoring uses a separate cell capacity once
-    // the old span meets every row count's direct-index cutoff; ubatch supplies its tail bound. Without it, keep the old span.
+    // to at least n_pad_shared and a dense one to a power of two. Unified Inkling 2 and DSpark use geometric buckets instead.
+    // Shared scoring uses a separate cell capacity once the old span meets every row count's direct-index cutoff; ubatch supplies its tail bound.
+    // Without it, keep the old span.
     // n_pad_used and n_kv_pool receive the original padding and span used to size the indexer's pools
     uint32_t get_n_kv(const slot_info & sinfo, const llama_ubatch * ubatch = nullptr, uint32_t * n_pad_used = nullptr,
             uint32_t * n_kv_pool = nullptr) const;
@@ -457,7 +458,8 @@ private:
 
     // a pool that sequences share is padded to a power of two while it reads densely (get_n_kv); false for a pool of one
     // sequence or with LLAMA_KV_PAD_DENSE_LEGACY=1 when the cache is made
-    bool pad_dense_shared = false;
+    bool pad_dense_shared  = false;
+    bool pad_dense_inkling = false; // geometric buckets for unified Inkling 2 and DSpark caches
 
     // SWA
     const uint32_t n_swa = 0;

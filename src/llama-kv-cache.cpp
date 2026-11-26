@@ -145,14 +145,11 @@ llama_kv_cache::llama_kv_cache(
     // card the crossing step and the one after it took 76 ms more than a 31 ms step. Padded to 256 cells a sequence, the
     // pool crosses as often a step as one sequence does; the next power of two, which GGML_PAD and the pool padding
     // derived from it (llama_kpool_pool_pad) take. LLAMA_KV_PAD_SHARED_LEGACY=1: 256, whatever the pool holds
-    // Inkling 2 has no indexer, and a pool its sequences share shapes every decode graph the same way: its masks and
-    // positions are as long as the padded pool. 23 sessions crossed 256 cells every 11 steps, and each crossing ran a
-    // step's graphs uncaptured and captured them again (four RTX PRO 6000, -sm tensor, 16K-token sessions, Nov 19, 2026:
-    // 10 of 110 steps captured every graph again). It reads densely at every length, so it pads as a dense pool does.
-    // Its DSpark draft's pool too: 23 sessions crossed 256 cells every ~5 drafted rounds, each crossing a round that ran
-    // the draft's graphs uncaptured, one that captured them and one that destroyed them (four RTX PRO 6000, Nov 20, 2026)
-    if ((hparams.indexer_kpool > 0 || model.arch == LLM_ARCH_INKLING2 || llama_model_is_inkling_draft(model) ||
-            model.arch == LLM_ARCH_DFLASH) && n_stream < n_seq_max) {
+    if (unified && hparams.indexer_kpool == 0 && (model.arch == LLM_ARCH_INKLING2 || llama_model_is_inkling_draft(model))) {
+        const char * shared_legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
+        const char * dense_legacy  = getenv("LLAMA_KV_PAD_DENSE_LEGACY");
+        pad_dense_inkling = (!shared_legacy || atoi(shared_legacy) != 1) && (!dense_legacy || atoi(dense_legacy) != 1);
+    } else if ((hparams.indexer_kpool > 0 || model.arch == LLM_ARCH_DFLASH) && n_stream < n_seq_max) {
         const char * legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
 
         if (!legacy || atoi(legacy) != 1) {
@@ -1746,12 +1743,18 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
         result = padded(pad);
     }
 
-    if (model.arch == LLM_ARCH_INKLING2 && n_swa == 0 && n_stream == 1 && !v_trans && ubatch &&
+    if (pad_dense_inkling) {
+        // Keep 256-cell steps up to 4096 cells, then use eight steps per doubling to keep extra padding below 12.5%.
+        while (result > 16ull*pad) {
+            pad *= 2;
+        }
+        result = std::min<uint64_t>(get_size(), GGML_PAD(result, (uint64_t) pad));
+    } else if (model.arch == LLM_ARCH_INKLING2 && n_swa == 0 && n_stream == 1 && !v_trans && ubatch &&
             ubatch->n_tokens >= 256 && result >= 32768 &&
             !layers.empty() && layers[0].k && layers[0].v && type_k() == type_v() &&
             (type_k() == GGML_TYPE_F16 || type_k() == GGML_TYPE_Q8_0 || type_k() == GGML_TYPE_Q4_0 || type_k() == GGML_TYPE_F8_E4M3) &&
             ggml_env_switch("LLAMA_INKLING2_BUCKET_PREFILL_KV")) {
-        // Reuse the long reader's graph within a bucket. The mask still comes from actual cell membership.
+        // With geometric buckets off, the long prefill reader can still use fixed-width buckets.
         pad = (uint32_t) ggml_env_int("LLAMA_INKLING2_BUCKET_CELLS");
         result = padded(pad);
     }
