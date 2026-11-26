@@ -42,13 +42,7 @@ static bool llama_state_plan_split_rows(const llama_state_async::copy & c, std::
     return ggml_backend_meta_read_rows(c.tensor, c.offset, c.size,
             [](ggml_tensor * t, size_t start, size_t width, size_t rows, size_t pitch, size_t stride, size_t host, void * userdata) {
                 auto & plan = *static_cast<llama_state_copy_plan *>(userdata);
-                if (rows <= 8) {
-                    for (size_t row = 0; row < rows; ++row) {
-                        plan.out.push_back({t, plan.dst + host + row*stride, width, start + row*pitch});
-                    }
-                } else {
-                    plan.out.push_back({t, plan.dst + host, width, start, rows, pitch, stride});
-                }
+                plan.out.push_back({t, plan.dst + host, width, start, rows, pitch, stride});
             }, &plan);
 }
 
@@ -153,42 +147,115 @@ static void llama_state_read_batch(const llama_state_async::copy * copies, size_
     }
 }
 
-static void llama_state_write_batch(const llama_state_async::copy * copies, size_t count, std::vector<uint8_t> & scratch) {
-    if (count == 1) {
-        ggml_backend_tensor_set(copies->tensor, copies->ptr, copies->offset, copies->size);
-        return;
-    }
+template <bool write>
+static void llama_state_transfer_split(const std::vector<llama_state_async::copy> & copies, size_t limit, std::vector<uint8_t> & scratch) {
+    using copy = llama_state_async::copy;
     struct group {
-        ggml_backend_buffer_type_t type;
-        std::vector<ggml_tensor *> tensors;
-        std::vector<size_t> offsets, sizes, host_offsets;
-        std::vector<const uint8_t *> srcs;
-        size_t bytes = 0;
+        ggml_backend_buffer_t buffer;
+        std::vector<const copy *> copies;
     };
     std::vector<group> groups;
-    for (size_t i = 0; i < count; ++i) {
-        const auto & c = copies[i];
-        auto type = ggml_backend_buffer_get_type(c.tensor->view_src ? c.tensor->view_src->buffer : c.tensor->buffer);
-        auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.type == type; });
+    for (const auto & c : copies) {
+        auto buffer = c.tensor->view_src ? c.tensor->view_src->buffer : c.tensor->buffer;
+        auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.buffer == buffer; });
         if (it == groups.end()) {
-            groups.emplace_back();
+            groups.push_back({ buffer, {} });
             it = groups.end() - 1;
-            it->type = type;
         }
-        it->tensors.push_back(c.tensor);
-        it->offsets.push_back(c.offset);
-        it->sizes.push_back(c.size);
-        it->host_offsets.push_back(it->bytes);
-        it->srcs.push_back(c.ptr);
-        it->bytes += c.size;
+        it->copies.push_back(&c);
     }
-    for (const auto & g : groups) {
-        // One contiguous source per device lets its scatter use a single H2D. Rank slices are de-interleaved on the CPU.
-        scratch.resize(g.bytes);
-        for (size_t j = 0; j < g.sizes.size(); ++j) {
-            memcpy(scratch.data() + g.host_offsets[j], g.srcs[j], g.sizes[j]);
+
+    constexpr size_t max_ranges = 16*1024;
+    std::vector<ggml_tensor *> tensors;
+    std::vector<size_t> offsets, sizes, host_offsets;
+    struct piece {
+        uint8_t * host;
+        size_t start, width, rows, stride;
+    };
+    std::vector<piece> pieces;
+    size_t used = 0;
+    const auto flush = [&]() {
+        if (tensors.empty()) {
+            return;
         }
-        ggml_backend_tensor_set_n(g.tensors.data(), scratch.data(), g.offsets.data(), g.sizes.data(), g.host_offsets.data(), g.sizes.size());
+        if constexpr (write) {
+            ggml_backend_tensor_set_n(tensors.data(), scratch.data(), offsets.data(), sizes.data(), host_offsets.data(), tensors.size());
+        } else {
+            ggml_backend_tensor_get_n(tensors.data(), scratch.data(), offsets.data(), sizes.data(), host_offsets.data(), tensors.size());
+            for (const auto & p : pieces) {
+                for (size_t j = 0; j < p.rows; ++j) {
+                    memcpy(p.host + j*p.stride, scratch.data() + p.start + j*p.width, p.width);
+                }
+            }
+            pieces.clear();
+        }
+        tensors.clear();
+        offsets.clear();
+        sizes.clear();
+        host_offsets.clear();
+        used = 0;
+    };
+    for (const auto & g : groups) {
+        for (const copy * c : g.copies) {
+            if (c->size == 0) {
+                continue;
+            }
+            if (c->size > limit) {
+                flush();
+                for (size_t r = 0; r < c->rows; ++r) {
+                    const size_t pos = c->offset + r*c->tensor_stride;
+                    uint8_t * host = c->ptr + r*c->data_stride;
+                    // A strided copy still transfers whole rows when one exceeds the batch budget.
+                    const size_t step = c->rows > 1 ? c->size : limit;
+                    for (size_t done = 0; done < c->size; done += step) {
+                        const size_t n = std::min(step, c->size - done);
+                        if constexpr (write) {
+                            ggml_backend_tensor_set(c->tensor, host + done, pos + done, n);
+                        } else {
+                            ggml_backend_tensor_get(c->tensor, host + done, pos + done, n);
+                        }
+                    }
+                }
+                continue;
+            }
+            const bool contiguous = c->rows == 1 || c->tensor_stride == c->size;
+            const auto add = [&](size_t row, size_t n, size_t start) {
+                tensors.push_back(c->tensor);
+                offsets.push_back(c->offset + row*c->tensor_stride);
+                sizes.push_back(n*c->size);
+                host_offsets.push_back(start);
+            };
+            for (size_t r = 0; r < c->rows;) {
+                const size_t ranges = max_ranges - tensors.size();
+                const size_t n = ranges ? std::min({ c->rows - r, (limit - used)/c->size,
+                        contiguous ? c->rows - r : ranges }) : 0;
+                if (n == 0) {
+                    flush();
+                    continue;
+                }
+                if (scratch.size() < limit) {
+                    scratch.resize(limit);
+                }
+                uint8_t * host = c->ptr + r*c->data_stride;
+                if constexpr (write) {
+                    for (size_t j = 0; j < n; ++j) {
+                        memcpy(scratch.data() + used + j*c->size, host + j*c->data_stride, c->size);
+                    }
+                } else {
+                    pieces.push_back({ host, used, c->size, n, c->data_stride });
+                }
+                if (contiguous) {
+                    add(r, n, used);
+                } else {
+                    for (size_t j = 0; j < n; ++j) {
+                        add(r + j, 1, used + j*c->size);
+                    }
+                }
+                used += n*c->size;
+                r += n;
+            }
+        }
+        flush();
     }
 }
 
@@ -204,95 +271,61 @@ void llama_state_async::run() {
         jobs.pop_front();
         lock.unlock();
 
-        // copies that follow each other go as one batched call of up to `chunk` bytes, which a device makes as a few copies
-        // GGML_TENSOR_N_STAGE_LEGACY=1: one call a copy, as before
-        static const bool batched = !ggml_env_switch("GGML_TENSOR_N_STAGE_LEGACY");
-        std::vector<ggml_tensor *> tensors;
-        std::vector<size_t>        offsets;
-        std::vector<size_t>        sizes;
-        std::vector<size_t>        data_offsets;
-        for (size_t i = 0; i < cur.copies.size();) {
-            const auto & first = cur.copies[i];
-            if (first.rows > 1) {
-                // Pack strided rank slices through bounded scratch for contiguous H2D/D2H transfers.
-                const size_t limit = chunk ? std::min(chunk, llama_state_read_scratch_bytes) : llama_state_read_scratch_bytes;
-                const size_t step = std::max(size_t(1), limit / first.size);
-                for (size_t row = 0; row < first.rows; row += step) {
-                    const size_t n = std::min(step, first.rows - row);
-                    const size_t pos = first.offset + row*first.tensor_stride;
-                    uint8_t * host = first.ptr + row*first.data_stride;
-                    if (first.tensor_stride == first.size && first.data_stride != first.size && first.size <= limit) {
-                        scratch.resize(n*first.size);
-                        if (cur.to_device) {
-                            for (size_t j = 0; j < n; ++j) {
-                                memcpy(scratch.data() + j*first.size, host + j*first.data_stride, first.size);
-                            }
-                            ggml_backend_tensor_set(first.tensor, scratch.data(), pos, n*first.size);
-                        } else {
-                            ggml_backend_tensor_get(first.tensor, scratch.data(), pos, n*first.size);
-                            for (size_t j = 0; j < n; ++j) {
-                                memcpy(host + j*first.data_stride, scratch.data() + j*first.size, first.size);
-                            }
-                        }
-                    } else if (cur.to_device) {
-                        ggml_backend_tensor_set_2d(first.tensor, host, pos, first.size, n, first.tensor_stride, first.data_stride);
-                    } else {
-                        ggml_backend_tensor_get_2d(first.tensor, host, pos, first.size, n, first.tensor_stride, first.data_stride);
+        if (cur.packed_split) {
+            const size_t limit = chunk ? std::min(chunk, llama_state_read_scratch_bytes) : llama_state_read_scratch_bytes;
+            if (cur.to_device) {
+                llama_state_transfer_split<true>(cur.copies, limit, scratch);
+            } else {
+                llama_state_transfer_split<false>(cur.copies, limit, scratch);
+            }
+        } else {
+            // Batch consecutive copies up to the copy budget.
+            static const bool batched = !ggml_env_switch("GGML_TENSOR_N_STAGE_LEGACY");
+            std::vector<ggml_tensor *> tensors;
+            std::vector<size_t> offsets, sizes, data_offsets;
+            for (size_t i = 0; i < cur.copies.size();) {
+                size_t n_batch = 0;
+                size_t bytes = 0;
+                uint8_t * base = cur.copies[i].ptr;
+                while (batched && i + n_batch < cur.copies.size()) {
+                    const auto & c = cur.copies[i + n_batch];
+                    if (chunk > 0 && c.size > chunk - bytes) {
+                        break;
                     }
+                    base = std::min(base, c.ptr);
+                    bytes += c.size;
+                    n_batch++;
                 }
-                ++i;
-                continue;
-            }
-            size_t n_batch = 0;
-            size_t bytes   = 0;
-            uint8_t * base = cur.copies[i].ptr;
-            while (batched && i + n_batch < cur.copies.size()) {
-                const auto & c = cur.copies[i + n_batch];
-                if (c.rows > 1 || (chunk > 0 && bytes + c.size > chunk) || (cur.packed_split && bytes + c.size > llama_state_read_scratch_bytes)) {
-                    break;
+                if (n_batch > 1) {
+                    tensors.clear();
+                    offsets.clear();
+                    sizes.clear();
+                    data_offsets.clear();
+                    for (size_t j = i; j < i + n_batch; ++j) {
+                        const auto & c = cur.copies[j];
+                        tensors.push_back(c.tensor);
+                        offsets.push_back(c.offset);
+                        sizes.push_back(c.size);
+                        data_offsets.push_back(c.ptr - base);
+                    }
+                    if (cur.to_device) {
+                        ggml_backend_tensor_set_n(tensors.data(), base, offsets.data(), sizes.data(), data_offsets.data(), n_batch);
+                    } else {
+                        ggml_backend_tensor_get_n(tensors.data(), base, offsets.data(), sizes.data(), data_offsets.data(), n_batch);
+                    }
+                    i += n_batch;
+                    continue;
                 }
-                base   = std::min(base, c.ptr);
-                bytes += c.size;
-                n_batch++;
-            }
-            if (n_batch > 1 && cur.packed_split) {
-                if (cur.to_device) {
-                    llama_state_write_batch(cur.copies.data() + i, n_batch, scratch);
-                } else {
-                    llama_state_read_batch(cur.copies.data() + i, n_batch, scratch);
+                const auto & c = cur.copies[i++];
+                for (size_t done = 0; done < c.size;) {
+                    const size_t n = chunk > 0 ? std::min(chunk, c.size - done) : c.size - done;
+                    if (cur.to_device) {
+                        ggml_backend_tensor_set(c.tensor, c.ptr + done, c.offset + done, n);
+                    } else {
+                        ggml_backend_tensor_get(c.tensor, c.ptr + done, c.offset + done, n);
+                    }
+                    done += n;
                 }
-                i += n_batch;
-                continue;
-            }
-            if (n_batch > 1) {
-                tensors.clear();
-                offsets.clear();
-                sizes.clear();
-                data_offsets.clear();
-                for (size_t j = i; j < i + n_batch; ++j) {
-                    const auto & c = cur.copies[j];
-                    tensors.push_back(c.tensor);
-                    offsets.push_back(c.offset);
-                    sizes.push_back(c.size);
-                    data_offsets.push_back(c.ptr - base);
-                }
-                if (cur.to_device) {
-                    ggml_backend_tensor_set_n(tensors.data(), base, offsets.data(), sizes.data(), data_offsets.data(), n_batch);
-                } else {
-                    ggml_backend_tensor_get_n(tensors.data(), base, offsets.data(), sizes.data(), data_offsets.data(), n_batch);
-                }
-                i += n_batch;
-                continue;
-            }
-            const auto & c = cur.copies[i++];
-            for (size_t done = 0; done < c.size;) {
-                const size_t n = chunk > 0 ? std::min(chunk, c.size - done) : c.size - done;
-                if (cur.to_device) {
-                    ggml_backend_tensor_set(c.tensor, c.ptr + done, c.offset + done, n);
-                } else {
-                    ggml_backend_tensor_get(c.tensor, c.ptr + done, c.offset + done, n);
-                }
-                done += n;
             }
         }
 
