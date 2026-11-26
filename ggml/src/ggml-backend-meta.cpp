@@ -3371,152 +3371,176 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
     }
 }
 
-// A batch of ranges goes to each device buffer as batches of the ranges of its tensors, which the buffer batches its own way.
-// A run of a few rows of a tensor split inside its rows (ggml_backend_meta_read_rows) goes the same way: a device's pieces of the rows pass through a scratch where they are side by side, so it copies them as one.
-// Any other range that is no such list (ggml_backend_meta_tensor_ranges) is copied on its own, after the ranges before it.
-// GGML_TENSOR_N_SPLIT_ROWS: the longest run of split rows that goes in a batch (8); 0: none
-// GGML_TENSOR_N_STAGE_LEGACY=1: one copy per range, as before
+// Whole split rows are packed per child buffer before transfer. Other layouts keep the scalar path.
 template <bool write>
 static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std::conditional_t<write, const void *, void *> const * data,
         const size_t * offsets, const size_t * sizes, size_t n_tensors) {
     static const bool legacy = ggml_env_switch("GGML_TENSOR_N_STAGE_LEGACY");
-
-    // a part of the batch: its lists stay small enough to be walked in the cache, however many ranges the batch has
     constexpr size_t part_ranges = 16*1024;
     constexpr size_t part_bytes  = 4*1024*1024;
-    static const size_t part_rows = (size_t) ggml_env_int("GGML_TENSOR_N_SPLIT_ROWS"); // a longer run of split rows is one 2D copy per device
 
-    // a piece of a split row that was read into a scratch, and where it goes in the caller's memory
     struct piece {
-        const uint8_t * scratch;
-        uintptr_t       host;
-        size_t          size;
+        uintptr_t host;
+        size_t    start, width, rows, stride;
     };
-    // the ranges of one device buffer, in their order: two devices can have one buffer type, and then their ranges would alternate in one batch
     struct batch {
-        ggml_backend_buffer_t      buffer = nullptr;
+        ggml_backend_buffer_t      buffer;
         std::vector<ggml_tensor *> tensors;
         std::vector<size_t>        offsets;
         std::vector<size_t>        sizes;
         std::vector<uintptr_t>     host;
-        std::unique_ptr<uint8_t[]> scratch; // part_bytes, where this device's pieces of split rows are side by side
-        size_t                     used = 0;
+        std::unique_ptr<uint8_t[]> scratch;
         std::vector<piece>         pieces;
-    };
-    std::vector<batch> cur;
-    std::vector<size_t> data_offsets;
-    struct plan {
-        std::vector<batch> * out;
-        uintptr_t            host;
-        bool                 rows; // the range may go as pieces of split rows
-        // the batch of the device buffer a tensor is in
-        batch & of(ggml_tensor * tensor) {
-            const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-            size_t at = 0;
-            while (at < out->size() && (*out)[at].buffer != buffer) {
-                at++;
-            }
-            if (at == out->size()) {
-                out->emplace_back();
-                out->back().buffer = buffer;
-            }
-            return (*out)[at];
-        }
-    };
+        size_t                     bytes = 0;
+        size_t                     used = 0;
 
-    const auto flush = [&]() {
-        for (auto & b : cur) {
-            if (b.tensors.empty()) {
-                continue;
+        void add(ggml_tensor * tensor, size_t offset, size_t size, uintptr_t ptr) {
+            tensors.push_back(tensor);
+            offsets.push_back(offset);
+            sizes.push_back(size);
+            host.push_back(ptr);
+            bytes += size;
+        }
+
+        void flush(std::vector<size_t> & data_offsets) {
+            if (tensors.empty()) {
+                return;
             }
-            const uintptr_t base = *std::min_element(b.host.begin(), b.host.end());
-            data_offsets.resize(b.host.size());
-            for (size_t i = 0; i < b.host.size(); ++i) {
-                data_offsets[i] = b.host[i] - base;
+            const uintptr_t base = *std::min_element(host.begin(), host.end());
+            data_offsets.resize(host.size());
+            for (size_t i = 0; i < host.size(); ++i) {
+                data_offsets[i] = host[i] - base;
             }
             if constexpr (write) {
-                ggml_backend_tensor_set_n(b.tensors.data(), (const void *) base, b.offsets.data(), b.sizes.data(), data_offsets.data(), b.tensors.size());
+                if (used && !buffer->iface.set_tensor_n && buffer->iface.set_tensor_2d) {
+                    for (size_t i = 0; i < host.size(); ++i) {
+                        ggml_backend_tensor_set(tensors[i], (const void *) host[i], offsets[i], sizes[i]);
+                    }
+                } else {
+                    ggml_backend_tensor_set_n(tensors.data(), (const void *) base, offsets.data(), sizes.data(), data_offsets.data(), tensors.size());
+                }
             } else {
-                ggml_backend_tensor_get_n(b.tensors.data(), (void *) base, b.offsets.data(), b.sizes.data(), data_offsets.data(), b.tensors.size());
+                if (used && !buffer->iface.get_tensor_n && buffer->iface.get_tensor_2d) {
+                    for (size_t i = 0; i < host.size(); ++i) {
+                        ggml_backend_tensor_get(tensors[i], (void *) host[i], offsets[i], sizes[i]);
+                    }
+                } else {
+                    ggml_backend_tensor_get_n(tensors.data(), (void *) base, offsets.data(), sizes.data(), data_offsets.data(), tensors.size());
+                }
+                for (const auto & c : pieces) {
+                    for (size_t r = 0; r < c.rows; ++r) {
+                        memcpy((void *) (c.host + r*c.stride), scratch.get() + c.start + r*c.width, c.width);
+                    }
+                }
             }
-            for (const piece & c : b.pieces) {
-                memcpy((void *) c.host, c.scratch, c.size);
+            tensors.clear();
+            offsets.clear();
+            sizes.clear();
+            host.clear();
+            pieces.clear();
+            bytes = used = 0;
+        }
+    };
+    std::vector<batch> batches;
+    std::vector<size_t> data_offsets;
+    struct plan {
+        std::vector<batch> & batches;
+        std::vector<size_t> & data_offsets;
+        uintptr_t host;
+
+        batch & of(ggml_tensor * tensor) {
+            const auto buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+            for (auto & b : batches) {
+                if (b.buffer == buffer) {
+                    return b;
+                }
             }
-            b.tensors.clear();
-            b.offsets.clear();
-            b.sizes.clear();
-            b.host.clear();
-            b.pieces.clear();
-            b.used = 0;
+            batches.emplace_back();
+            batches.back().buffer = buffer;
+            return batches.back();
         }
     };
 
-    size_t n_part = 0;
-    size_t bytes  = 0;
+    const auto flush_all = [&]() {
+        for (auto & b : batches) {
+            b.flush(data_offsets);
+        }
+    };
     for (size_t i = 0; i < n_tensors; ++i) {
         if (sizes[i] == 0) {
             continue;
         }
-        if (n_part == part_ranges || (n_part > 0 && bytes + sizes[i] > part_bytes)) {
-            flush();
-            n_part = 0;
-            bytes  = 0;
-        }
-        plan p = { &cur, (uintptr_t) data[i], !legacy && sizes[i] <= part_bytes };
+        plan p = { batches, data_offsets, (uintptr_t) data[i] };
         if (!legacy && ggml_backend_meta_tensor_ranges(tensors[i], offsets[i], sizes[i], /*read =*/ !write,
                 [](ggml_tensor * tensor, size_t offset, size_t size, size_t data_offset, void * userdata) {
-                    auto * p = (plan *) userdata;
-                    batch & b = p->of(tensor);
-                    b.tensors.push_back(tensor);
-                    b.offsets.push_back(offset);
-                    b.sizes.push_back(size);
-                    b.host.push_back(p->host + data_offset);
+                    auto & p = *static_cast<plan *>(userdata);
+                    batch & b = p.of(tensor);
+                    if (b.used || b.tensors.size() == part_ranges || size > part_bytes - b.bytes) {
+                        b.flush(p.data_offsets);
+                    }
+                    b.add(tensor, offset, size, p.host + data_offset);
+                    if (size > part_bytes) {
+                        b.flush(p.data_offsets);
+                    }
                 }, &p)) {
-            n_part++;
-            bytes += sizes[i];
             continue;
         }
-        if (p.rows && ggml_backend_meta_read_rows(tensors[i], offsets[i], sizes[i],
+        if (!legacy && ggml_backend_meta_read_rows(tensors[i], offsets[i], sizes[i],
                 [](ggml_tensor * tensor, size_t offset, size_t width, size_t rows, size_t pitch, size_t stride, size_t host, void * userdata) {
-                    auto * p = (plan *) userdata;
-                    p->rows = p->rows && rows <= part_rows;
-                    if (!p->rows) {
+                    auto & p = *static_cast<plan *>(userdata);
+                    batch & b = p.of(tensor);
+                    const uintptr_t src = p.host + host;
+                    if (b.bytes != b.used || width > part_bytes) {
+                        b.flush(p.data_offsets);
+                    }
+                    if (width > part_bytes) {
+                        for (size_t r = 0; r < rows; ++r) {
+                            b.add(tensor, offset + r*pitch, width, src + r*stride);
+                            b.flush(p.data_offsets);
+                        }
                         return;
                     }
-                    batch & b = p->of(tensor);
                     if (!b.scratch) {
                         b.scratch.reset(new uint8_t[part_bytes]);
                     }
-                    GGML_ASSERT(b.used + rows*width <= part_bytes); // a part's ranges are no more bytes than that
-                    for (size_t r = 0; r < rows; ++r) {
-                        uint8_t * at = b.scratch.get() + b.used;
-                        const uintptr_t mem = p->host + host + r*stride;
-                        if constexpr (write) {
-                            memcpy(at, (const void *) mem, width);
-                        } else {
-                            b.pieces.push_back({ at, mem, width });
+                    for (size_t r = 0; r < rows;) {
+                        const size_t ranges = part_ranges - b.tensors.size();
+                        const size_t n = ranges ? std::min({ rows - r, (part_bytes - b.used)/width,
+                                pitch == width ? rows - r : ranges }) : 0;
+                        if (n == 0) {
+                            b.flush(p.data_offsets);
+                            continue;
                         }
-                        b.tensors.push_back(tensor);
-                        b.offsets.push_back(offset + r*pitch);
-                        b.sizes.push_back(width);
-                        b.host.push_back((uintptr_t) at);
-                        b.used += width;
+                        uint8_t * dst = b.scratch.get() + b.used;
+                        if constexpr (write) {
+                            for (size_t j = 0; j < n; ++j) {
+                                memcpy(dst + j*width, (const void *) (src + (r + j)*stride), width);
+                            }
+                        } else {
+                            b.pieces.push_back({ src + r*stride, b.used, width, n, stride });
+                        }
+
+                        if (pitch == width) {
+                            b.add(tensor, offset + r*pitch, n*width, (uintptr_t) dst);
+                        } else {
+                            for (size_t j = 0; j < n; ++j) {
+                                b.add(tensor, offset + (r + j)*pitch, width, (uintptr_t) (dst + j*width));
+                            }
+                        }
+                        b.used += n*width;
+                        r += n;
                     }
-                }, &p) && p.rows) {
-            n_part++;
-            bytes += sizes[i];
+                }, &p)) {
             continue;
         }
-        flush();
-        n_part = 0;
-        bytes  = 0;
+        flush_all();
         if constexpr (write) {
             ggml_backend_tensor_set(tensors[i], data[i], offsets[i], sizes[i]);
         } else {
             ggml_backend_tensor_get(tensors[i], data[i], offsets[i], sizes[i]);
         }
     }
-    flush();
+    flush_all();
 }
 
 static void ggml_backend_meta_buffer_set_tensor_n(ggml_backend_buffer_t buffer, ggml_tensor * const * tensors, const void * const * data,

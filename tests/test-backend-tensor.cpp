@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -509,6 +510,9 @@ struct mock_config {
     int  get_n_calls;
     int  cpy_n_calls;
     int  copy_calls; // every set and get a buffer is asked for: one range, the rows of a 2D copy, or a batch
+    int  set_2d_calls;
+    int  get_2d_calls;
+    std::unordered_map<ggml_backend_buffer_t, std::pair<int, int>> batches; // set_n, get_n
 };
 
 static mock_config g_mock = {};
@@ -522,6 +526,9 @@ static void mock_config_reset(bool set_n, bool get_n, bool cpy_n, bool cpy_n_res
     g_mock.get_n_calls = 0;
     g_mock.cpy_n_calls = 0;
     g_mock.copy_calls = 0;
+    g_mock.set_2d_calls = 0;
+    g_mock.get_2d_calls = 0;
+    g_mock.batches.clear();
 }
 
 static void mock_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -554,6 +561,7 @@ static void mock_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct gg
 
 static void mock_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
         size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    g_mock.set_2d_calls++;
     g_mock.copy_calls++;
     for (size_t i = 0; i < n_copies; i++) {
         memcpy((char *) tensor->data + offset + i*stride_tensor, (const char *) data + i*stride_data, size);
@@ -564,6 +572,7 @@ static void mock_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_
 
 static void mock_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size,
         size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    g_mock.get_2d_calls++;
     g_mock.copy_calls++;
     for (size_t i = 0; i < n_copies; i++) {
         memcpy((char *) data + i*stride_data, (const char *) tensor->data + offset + i*stride_tensor, size);
@@ -585,6 +594,7 @@ static void mock_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
 
 static void mock_buffer_set_tensor_n(ggml_backend_buffer_t buffer, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
     g_mock.set_n_calls++;
+    g_mock.batches[buffer].first++;
     g_mock.copy_calls++;
     for (size_t i = 0; i < n_tensors; i++) {
         memcpy((char *) tensors[i]->data + offsets[i], data[i], sizes[i]);
@@ -595,6 +605,7 @@ static void mock_buffer_set_tensor_n(ggml_backend_buffer_t buffer, struct ggml_t
 
 static void mock_buffer_get_tensor_n(ggml_backend_buffer_t buffer, const struct ggml_tensor * const * tensors, void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
     g_mock.get_n_calls++;
+    g_mock.batches[buffer].second++;
     g_mock.copy_calls++;
     for (size_t i = 0; i < n_tensors; i++) {
         memcpy(data[i], (const char *) tensors[i]->data + offsets[i], sizes[i]);
@@ -994,6 +1005,92 @@ static bool test_split_rows(ggml_backend_dev_t dev, bool count) {
     return true;
 }
 
+static bool test_long_split_rows() {
+    constexpr size_t part_bytes = 4*1024*1024;
+    constexpr size_t long_run = part_bytes/272 + 31;
+    ggml_backend_dev_t dev = mock_dev();
+    ggml_backend_dev_t devs[] = { dev, dev, dev, dev };
+    auto * meta = ggml_backend_meta_device(devs, 4, [](const ggml_tensor * t, void *) -> ggml_backend_meta_split_state {
+        if (strcmp(t->name, "segments") == 0) {
+            return { GGML_BACKEND_SPLIT_AXIS_0, { 64, 96, 128, 224, 192, 160, 128, 32 }, { 1, 1 }, 2 };
+        }
+        return { GGML_BACKEND_SPLIT_AXIS_0, { 256, 256, 256, 256 }, { 1 }, 1 };
+    }, nullptr);
+    ggml_context_ptr ctx(ggml_init({ 3*ggml_tensor_overhead(), nullptr, true }));
+    ggml_tensor * tensors[] = {
+        ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_0, 1024, long_run + 2600),
+        ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, 1024, 3500),
+        ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, 1024, 3500),
+    };
+    ggml_set_name(tensors[2], "segments");
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_dev_buffer_type(meta)));
+    GGML_ASSERT(buf);
+    ggml_backend_buffer_clear(buf.get(), 0);
+
+    std::vector<ggml_tensor *> ts;
+    std::vector<size_t> offsets, sizes, data_offsets;
+    size_t bytes = 0;
+    const auto add = [&](ggml_tensor * t, size_t start, size_t rows) {
+        ts.push_back(t);
+        offsets.push_back(start*t->nb[1]);
+        sizes.push_back(rows*t->nb[1]);
+        data_offsets.push_back(bytes);
+        bytes += sizes.back();
+    };
+    add(tensors[0], 2500, long_run);
+    for (auto * t : tensors) {
+        add(t, 2200, 1);
+        add(t, 9, 7);
+        add(t, 39, 8);
+        add(t, 91, 9);
+        add(t, 1900, 100);
+        add(t, 300, 1024);
+    }
+    // Add enough small runs to distinguish a per-rank budget from an aggregate budget.
+    for (size_t start = 1350; start + 9 < 1890; start += 10) {
+        for (auto * t : tensors) {
+            add(t, start, 9);
+        }
+    }
+    add(tensors[1], 2300, 1024);
+    add(tensors[2], 2300, 1024);
+
+    std::vector<uint8_t> src(bytes), out(bytes);
+    uint32_t state = 1234;
+    for (auto & byte : src) {
+        state = state*1664525u + 1013904223u;
+        byte = state >> 24;
+    }
+    mock_config_reset(true, true, false, true);
+    ggml_backend_tensor_set_n(ts.data(), src.data(), offsets.data(), sizes.data(), data_offsets.data(), ts.size());
+    ggml_backend_tensor_get_n(ts.data(), out.data(), offsets.data(), sizes.data(), data_offsets.data(), ts.size());
+
+    const size_t max_batches = (bytes/4 + part_bytes - 1)/part_bytes + 1;
+    bool ok = src == out && g_mock.set_2d_calls == 0 && g_mock.get_2d_calls == 0 && g_mock.batches.size() == 4 &&
+        g_mock.copy_calls == g_mock.set_n_calls + g_mock.get_n_calls;
+    printf("MOCK long split rows: %d set_2d, %d get_2d; set_n/get_n by rank (max %zu):",
+            g_mock.set_2d_calls, g_mock.get_2d_calls, max_batches);
+    for (const auto & entry : g_mock.batches) {
+        const auto & calls = entry.second;
+        printf(" %d/%d", calls.first, calls.second);
+        ok = ok && calls.first > 0 && calls.second > 0 && (size_t) calls.first <= max_batches && (size_t) calls.second <= max_batches;
+    }
+    printf("\n");
+
+    // Check writes against a scalar read, including cells outside the restore list.
+    for (auto * t : tensors) {
+        std::vector<uint8_t> ref(ggml_nbytes(t)), actual(ref.size());
+        for (size_t i = 0; i < ts.size(); ++i) {
+            if (ts[i] == t) {
+                memcpy(ref.data() + offsets[i], src.data() + data_offsets[i], sizes[i]);
+            }
+        }
+        ggml_backend_tensor_get(t, actual.data(), 0, actual.size());
+        ok = ok && ref == actual;
+    }
+    return ok;
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -1053,5 +1150,8 @@ int main() {
     const bool mock_rows_ok = test_split_rows(mock_dev(), true);
     printf("MOCK split rows %s\n", mock_rows_ok ? "PASSED" : "FAILED");
 
-    return n_ok == n_devs && meta_ok && rows_ok && mock_ok && mock_rows_ok ? 0 : 1;
+    const bool long_rows_ok = test_long_split_rows();
+    printf("MOCK long split rows %s\n", long_rows_ok ? "PASSED" : "FAILED");
+
+    return n_ok == n_devs && meta_ok && rows_ok && mock_ok && mock_rows_ok && long_rows_ok ? 0 : 1;
 }
