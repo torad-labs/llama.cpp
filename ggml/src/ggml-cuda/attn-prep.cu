@@ -190,13 +190,13 @@ static __global__ void attn_prep_rel_table_f32(const float * x, const float * sc
         if (r < rows) {
             const int token = r/ne1;
             const float * xr = x + r*nrel;
-            const float * sr = scale ? scale + (r - token*ne1)*nrel : nullptr;
+            const float * sr = scale + (r - token*ne1)*nrel;
             float sum = 0.0f;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int d = threadIdx.x + j*WARP_SIZE;
                 if (d < nrel) {
-                    v[j] = xr[d]*(sr ? sr[d] : 1.0f);
+                    v[j] = xr[d]*sr[d];
                     sum += v[j]*v[j];
                 }
             }
@@ -250,6 +250,69 @@ static __global__ void attn_prep_rel_table_f32(const float * x, const float * sc
     }
 }
 
+// One lane owns an extent column. Each warp writes a contiguous span for every staged row.
+template<int ROW_TILE, bool VEC4>
+static __global__ void attn_prep_rel_table_n16_f32(const float * x, const float * scale, const float * tau,
+        const int64_t st2, const float * bias, float * table, const int ne1,
+        const int rows, const int extent, const int extent_tile, const float threshold, const float eps) {
+    constexpr int NREL = 16;
+    constexpr int VEC = NREL/4;
+    __shared__ float4 srow[ROW_TILE][VEC];
+    ggml_cuda_pdl_sync();
+
+    const int tid = threadIdx.x;
+    const int r0 = blockIdx.y*ROW_TILE;
+    const int i = tid/VEC;
+    const int r = r0 + i;
+    if (i < ROW_TILE) {
+        const int j = tid % VEC;
+        float4 v = {};
+        int token = 0;
+        if (r < rows) {
+            token = r/ne1;
+            const float * xr = x + r*NREL + 4*j;
+            const float * sr = scale + (r - token*ne1)*NREL + 4*j;
+            v = make_float4(xr[0]*sr[0], xr[1]*sr[1], xr[2]*sr[2], xr[3]*sr[3]);
+        }
+        const float sum = attn_prep_row_sum<VEC>(((v.x*v.x + v.y*v.y) + v.z*v.z) + v.w*v.w);
+        const float factor = r < rows ?
+            attn_prep_factor(true, sum, NREL, threshold, eps)*(tau ? tau[token*st2] : 1.0f) : 0.0f;
+        srow[i][j] = make_float4(v.x*factor, v.y*factor, v.z*factor, v.w*factor);
+    }
+    __syncthreads();
+
+    const int64_t e = int64_t(blockIdx.x)*extent_tile + tid;
+    if (tid >= extent_tile || e >= extent) {
+        return;
+    }
+
+    const float * bcol = bias + e*NREL;
+    float4 b[VEC];
+#pragma unroll
+    for (int j = 0; j < VEC; ++j) {
+        if constexpr (VEC4) {
+            b[j] = reinterpret_cast<const float4 *>(bcol)[j];
+        } else {
+            b[j] = make_float4(bcol[4*j], bcol[4*j + 1], bcol[4*j + 2], bcol[4*j + 3]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < ROW_TILE; ++i) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            const float4 a = srow[i][j];
+            acc += a.x*b[j].x;
+            acc += a.y*b[j].y;
+            acc += a.z*b[j].z;
+            acc += a.w*b[j].w;
+        }
+        if (r0 + i < rows) {
+            table[int64_t(r0 + i)*extent + e] = acc;
+        }
+    }
+}
+
 bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
         const ggml_tensor * mul, ggml_tensor * table) {
     const ggml_tensor * a     = norm->src[0];
@@ -271,8 +334,8 @@ bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggm
             ggml_nelements(table) != bias->ne[1]*rows || table->ne[1] != a->ne[1]) {
         return false;
     }
-    if (scale && (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) ||
-            scale->ne[0] != a->ne[0] || scale->ne[1] != a->ne[1] || scale->ne[2] != 1 || scale->ne[3] != 1)) {
+    if (!scale || scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) ||
+            scale->ne[0] != a->ne[0] || scale->ne[1] != a->ne[1] || scale->ne[2] != 1 || scale->ne[3] != 1) {
         return false;
     }
 
@@ -294,6 +357,24 @@ bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggm
     }
 
     const bool vec4 = nrel % 4 == 0 && reinterpret_cast<uintptr_t>(bias->data) % alignof(float4) == 0;
+    if (nrel == 16 && ggml_cuda_info().devices[ctx.device].warp_size == WARP_SIZE) {
+        constexpr int ROW_TILE = 8;
+        const int row_tiles = (rows + ROW_TILE - 1)/ROW_TILE;
+        const int min_tiles = 2*ggml_cuda_info().devices[ctx.device].nsm;
+        int extent_tile = 128;
+        while (extent_tile > 4 && ((bias->ne[1] + extent_tile - 1)/extent_tile)*row_tiles < min_tiles) {
+            extent_tile /= 2;
+        }
+        const dim3 grid((bias->ne[1] + extent_tile - 1)/extent_tile, row_tiles);
+        const dim3 block(std::max(WARP_SIZE, extent_tile));
+        const ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
+        auto kernel = vec4 ? attn_prep_rel_table_n16_f32<ROW_TILE, true> : attn_prep_rel_table_n16_f32<ROW_TILE, false>;
+        ggml_cuda_kernel_launch(kernel, params, (const float *) a->data, (const float *) scale->data, tau_d, st2,
+            (const float *) bias->data, (float *) table->data, (int) a->ne[1], (int) rows, (int) bias->ne[1],
+            extent_tile, threshold, eps);
+        return true;
+    }
+
     const dim3 block(WARP_SIZE, 4);
     auto launch = [&](auto row_tile, auto dot_lanes, const int extent_tile) {
         constexpr int R = decltype(row_tile)::value;
@@ -302,7 +383,7 @@ bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggm
         const ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
         auto kernel = vec4 ? attn_prep_rel_table_f32<R, L, true> : attn_prep_rel_table_f32<R, L, false>;
         ggml_cuda_kernel_launch(kernel, params, (const float *) a->data,
-            scale ? (const float *) scale->data : nullptr, tau_d, st2, (const float *) bias->data,
+            (const float *) scale->data, tau_d, st2, (const float *) bias->data,
             (float *) table->data, (int) a->ne[1], (int) nrel, (int) rows, (int) bias->ne[1], extent_tile, threshold, eps);
     };
     // Use narrow extent tiles when row tiles alone cannot fill the GPU.
