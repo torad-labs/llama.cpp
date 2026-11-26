@@ -2150,10 +2150,22 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
-bool llm_graph_result::same_shape(const llama_ubatch & ubatch, uint32_t n_outputs) const {
+bool llm_graph_params::is_inkling_draft_feed() const {
+    // Only the simple split on a unified cache has no sequence layout in the feed's inputs.
+    return n_outputs == 0 && (ubatch.embd || ubatch.embd_row) && !ubatch.equal_seqs() &&
+        cparams.kv_unified && cparams.n_seq_devices == 1 && gtype != LLM_GRAPH_TYPE_ENCODER &&
+        model && llama_model_is_inkling_draft(*model);
+}
+
+bool llm_graph_result::same_shape(const llm_graph_params & other) const {
     const auto & built = params.ubatch;
-    return built.n_tokens == ubatch.n_tokens && built.n_seq_tokens == ubatch.n_seq_tokens && built.n_seqs == ubatch.n_seqs &&
-        built.n_seqs_unq == ubatch.n_seqs_unq && built.equal_seqs() == ubatch.equal_seqs() && params.n_outputs == n_outputs;
+    const auto & ubatch = other.ubatch;
+    if (built.n_tokens != ubatch.n_tokens || built.n_seq_tokens != ubatch.n_seq_tokens || built.n_seqs != ubatch.n_seqs ||
+            built.equal_seqs() != ubatch.equal_seqs() || params.n_outputs != other.n_outputs) {
+        return false;
+    }
+    const bool feed = other.is_inkling_draft_feed();
+    return feed == params.is_inkling_draft_feed() && (feed || built.n_seqs_unq == ubatch.n_seqs_unq);
 }
 
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
