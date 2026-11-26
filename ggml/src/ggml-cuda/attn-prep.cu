@@ -171,50 +171,145 @@ bool ggml_cuda_op_attn_prep_clip_fwht(ggml_backend_cuda_context & ctx, const ggm
     return true;
 }
 
-// D1: the relative-position rows' clip and their bias-table matmul in one launch. Each row of r, a head's n_rel
-// positions in one token, is scaled by its head's row of the clip scale, clipped to an L2 norm of at most threshold,
-// multiplied by its token's tau, then dotted with every column of the contiguous bias [n_rel, extent]:
-// table[e, h, t] = sum_d r[d] * bias[d, e].
+// D1: clip and scale each row in the block's tile, then reuse each bias load across those rows.
+template<int ROW_TILE, int DOT_LANES, bool VEC4>
 static __global__ void attn_prep_rel_table_f32(const float * x, const float * scale, const float * tau,
         const int64_t st2, const float * bias, float * table, const int ne1, const int nrel,
-        const int64_t rows, const int extent, const float threshold, const float eps) {
-    __shared__ float srow[4][128]; // one clipped row per warp; nrel is at most 128
+        const int rows, const int extent, const int extent_tile, const float threshold, const float eps) {
+    constexpr int WARPS = 4;
+    constexpr int DOT_GROUPS = WARPS*WARP_SIZE/DOT_LANES;
+    __shared__ __align__(16) float srow[ROW_TILE][128];
     ggml_cuda_pdl_sync();
 
-    const int64_t r = int64_t(blockIdx.x)*blockDim.y + threadIdx.y;
-    if (r >= rows) {
+    const int r0 = blockIdx.y*ROW_TILE;
+#pragma unroll
+    for (int i = threadIdx.y; i < ROW_TILE; i += WARPS) {
+        const int r = r0 + i;
+        float v[4] = {};
+        float factor = 0.0f;
+        if (r < rows) {
+            const int token = r/ne1;
+            const float * xr = x + r*nrel;
+            const float * sr = scale + (r - token*ne1)*nrel;
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int d = threadIdx.x + j*WARP_SIZE;
+                if (d < nrel) {
+                    v[j] = xr[d]*sr[d];
+                    sum += v[j]*v[j];
+                }
+            }
+            sum = attn_prep_row_sum<WARP_SIZE>(sum);
+            factor = attn_prep_factor(true, sum, nrel, threshold, eps)*(tau ? tau[token*st2] : 1.0f);
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            srow[i][threadIdx.x + j*WARP_SIZE] = v[j]*factor;
+        }
+    }
+    __syncthreads();
+
+    const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
+    const int lane = tid % DOT_LANES;
+    const int64_t e0 = int64_t(blockIdx.x)*extent_tile;
+    for (int off = tid/DOT_LANES; off < extent_tile; off += DOT_GROUPS) {
+        const int64_t e = e0 + off;
+        float acc[ROW_TILE] = {};
+        if (e < extent) {
+            const float * bcol = bias + e*nrel;
+            if constexpr (VEC4) {
+                for (int d4 = lane; d4 < nrel/4; d4 += DOT_LANES) {
+                    const float4 b = reinterpret_cast<const float4 *>(bcol)[d4];
+#pragma unroll
+                    for (int i = 0; i < ROW_TILE; ++i) {
+                        const float4 v = reinterpret_cast<const float4 *>(srow[i])[d4];
+                        acc[i] += v.x*b.x;
+                        acc[i] += v.y*b.y;
+                        acc[i] += v.z*b.z;
+                        acc[i] += v.w*b.w;
+                    }
+                }
+            } else {
+                for (int d = lane; d < nrel; d += DOT_LANES) {
+                    const float b = bcol[d];
+#pragma unroll
+                    for (int i = 0; i < ROW_TILE; ++i) {
+                        acc[i] += srow[i][d]*b;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < ROW_TILE; ++i) {
+            const float sum = attn_prep_row_sum<DOT_LANES>(acc[i]);
+            if (lane == 0 && e < extent && r0 + i < rows) {
+                table[int64_t(r0 + i)*extent + e] = sum;
+            }
+        }
+    }
+}
+
+// One lane owns an extent column. Each warp writes a contiguous span for every staged row.
+template<int ROW_TILE, bool VEC4>
+static __global__ void attn_prep_rel_table_n16_f32(const float * x, const float * scale, const float * tau,
+        const int64_t st2, const float * bias, float * table, const int ne1,
+        const int rows, const int extent, const int extent_tile, const float threshold, const float eps) {
+    constexpr int NREL = 16;
+    constexpr int VEC = NREL/4;
+    __shared__ float4 srow[ROW_TILE][VEC];
+    ggml_cuda_pdl_sync();
+
+    const int tid = threadIdx.x;
+    const int r0 = blockIdx.y*ROW_TILE;
+    const int i = tid/VEC;
+    const int r = r0 + i;
+    if (i < ROW_TILE) {
+        const int j = tid % VEC;
+        float4 v = {};
+        int token = 0;
+        if (r < rows) {
+            token = r/ne1;
+            const float * xr = x + r*NREL + 4*j;
+            const float * sr = scale + (r - token*ne1)*NREL + 4*j;
+            v = make_float4(xr[0]*sr[0], xr[1]*sr[1], xr[2]*sr[2], xr[3]*sr[3]);
+        }
+        const float sum = attn_prep_row_sum<VEC>(((v.x*v.x + v.y*v.y) + v.z*v.z) + v.w*v.w);
+        const float factor = r < rows ?
+            attn_prep_factor(true, sum, NREL, threshold, eps)*(tau ? tau[token*st2] : 1.0f) : 0.0f;
+        srow[i][j] = make_float4(v.x*factor, v.y*factor, v.z*factor, v.w*factor);
+    }
+    __syncthreads();
+
+    const int64_t e = int64_t(blockIdx.x)*extent_tile + tid;
+    if (tid >= extent_tile || e >= extent) {
         return;
     }
 
-    const float * xr = x + r*nrel; // a contiguous [nrel, ne1]
-    const float * sr = scale ? scale + (r % ne1)*nrel : nullptr;
-
-    float * sv = srow[threadIdx.y & 3]; // blockDim.y is 4: one shared row per warp
-    float sum = 0.0f;
-    for (int d = threadIdx.x; d < nrel; d += WARP_SIZE) {
-        const float v = xr[d]*(sr ? sr[d] : 1.0f);
-        sv[d] = v;
-        sum += v*v;
-    }
-    sum = attn_prep_row_sum<WARP_SIZE>(sum);
-
-    const float factor = attn_prep_factor(true, sum, nrel, threshold, eps)*(tau ? tau[(r/ne1)*st2] : 1.0f);
-    __syncwarp();
-    for (int d = threadIdx.x; d < nrel; d += WARP_SIZE) {
-        sv[d] *= factor;
-    }
-    __syncwarp();
-
-    // table[e, h, t] with this row's head and token: flat ((t*ne1 + h)*extent + e)
-    float * tr_out = table + ((r/ne1)*ne1 + (r % ne1))*extent;
-    for (int e = threadIdx.x; e < extent; e += WARP_SIZE) {
-        const float * bcol = bias + e*nrel;
-        float acc = 0.0f;
-#pragma unroll 4
-        for (int d = 0; d < nrel; ++d) {
-            acc += sv[d]*bcol[d];
+    const float * bcol = bias + e*NREL;
+    float4 b[VEC];
+#pragma unroll
+    for (int j = 0; j < VEC; ++j) {
+        if constexpr (VEC4) {
+            b[j] = reinterpret_cast<const float4 *>(bcol)[j];
+        } else {
+            b[j] = make_float4(bcol[4*j], bcol[4*j + 1], bcol[4*j + 2], bcol[4*j + 3]);
         }
-        tr_out[e] = acc;
+    }
+#pragma unroll
+    for (int i = 0; i < ROW_TILE; ++i) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            const float4 a = srow[i][j];
+            acc += a.x*b[j].x;
+            acc += a.y*b[j].y;
+            acc += a.z*b[j].z;
+            acc += a.w*b[j].w;
+        }
+        if (r0 + i < rows) {
+            table[int64_t(r0 + i)*extent + e] = acc;
+        }
     }
 }
 
@@ -239,8 +334,8 @@ bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggm
             ggml_nelements(table) != bias->ne[1]*rows || table->ne[1] != a->ne[1]) {
         return false;
     }
-    if (scale && (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) ||
-            scale->ne[0] != a->ne[0] || scale->ne[1] != a->ne[1] || scale->ne[2] != 1 || scale->ne[3] != 1)) {
+    if (!scale || scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) ||
+            scale->ne[0] != a->ne[0] || scale->ne[1] != a->ne[1] || scale->ne[2] != 1 || scale->ne[3] != 1) {
         return false;
     }
 
@@ -261,12 +356,44 @@ bool ggml_cuda_op_attn_prep_rel_table(ggml_backend_cuda_context & ctx, const ggm
         st2   = t->nb[2]/sizeof(float);
     }
 
+    const bool vec4 = nrel % 4 == 0 && reinterpret_cast<uintptr_t>(bias->data) % alignof(float4) == 0;
+    if (nrel == 16 && ggml_cuda_info().devices[ctx.device].warp_size == WARP_SIZE) {
+        constexpr int ROW_TILE = 8;
+        const int row_tiles = (rows + ROW_TILE - 1)/ROW_TILE;
+        const int min_tiles = 2*ggml_cuda_info().devices[ctx.device].nsm;
+        int extent_tile = 128;
+        while (extent_tile > 4 && ((bias->ne[1] + extent_tile - 1)/extent_tile)*row_tiles < min_tiles) {
+            extent_tile /= 2;
+        }
+        const dim3 grid((bias->ne[1] + extent_tile - 1)/extent_tile, row_tiles);
+        const dim3 block(std::max(WARP_SIZE, extent_tile));
+        const ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
+        auto kernel = vec4 ? attn_prep_rel_table_n16_f32<ROW_TILE, true> : attn_prep_rel_table_n16_f32<ROW_TILE, false>;
+        ggml_cuda_kernel_launch(kernel, params, (const float *) a->data, (const float *) scale->data, tau_d, st2,
+            (const float *) bias->data, (float *) table->data, (int) a->ne[1], (int) rows, (int) bias->ne[1],
+            extent_tile, threshold, eps);
+        return true;
+    }
+
     const dim3 block(WARP_SIZE, 4);
-    const dim3 grid((unsigned) ((rows + block.y - 1)/block.y));
-    const ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
-    ggml_cuda_kernel_launch(attn_prep_rel_table_f32, params, (const float *) a->data,
-        scale ? (const float *) scale->data : nullptr, tau_d, st2, (const float *) bias->data,
-        (float *) table->data, (int) a->ne[1], (int) nrel, rows, (int) bias->ne[1], threshold, eps);
+    auto launch = [&](auto row_tile, auto dot_lanes, const int extent_tile) {
+        constexpr int R = decltype(row_tile)::value;
+        constexpr int L = decltype(dot_lanes)::value;
+        const dim3 grid((bias->ne[1] + extent_tile - 1)/extent_tile, (rows + R - 1)/R);
+        const ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
+        auto kernel = vec4 ? attn_prep_rel_table_f32<R, L, true> : attn_prep_rel_table_f32<R, L, false>;
+        ggml_cuda_kernel_launch(kernel, params, (const float *) a->data,
+            (const float *) scale->data, tau_d, st2, (const float *) bias->data,
+            (float *) table->data, (int) a->ne[1], (int) nrel, (int) rows, (int) bias->ne[1], extent_tile, threshold, eps);
+    };
+    // Use narrow extent tiles when row tiles alone cannot fill the GPU.
+    if (rows <= 16) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 32>{}, 4);
+    } else if (rows <= 80) {
+        launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 8>{}, rows <= 56 ? 16 : 32);
+    } else {
+        launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 4>{}, 32);
+    }
     return true;
 }
 

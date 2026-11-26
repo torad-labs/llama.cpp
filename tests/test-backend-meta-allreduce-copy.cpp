@@ -839,6 +839,10 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
         backends.push_back(ggml_backend_dev_init(device, nullptr));
         GGML_ASSERT(backends.back());
     }
+    const bool ce_capture = ggml_env_switch("GGML_CUDA_AR_COPY_ENGINE_CAPTURE") &&
+                           !ggml_env_switch("GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY");
+    const bool live_only = ggml_env_switch("GGML_TEST_COLLECTIVE_LIVE");
+    const bool q8_wire = ggml_env_switch("GGML_CUDA_AR_WIRE_Q8");
     bool ok = true;
     {
         benchmark_launcher runner(backends, launch);
@@ -854,6 +858,13 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
             set_env("GGML_CUDA_AR_COPY_ONE_STREAM", "0");
             set_env("GGML_CUDA_AR_GATHER_OWNER_SLICES", strcmp(route, "owner-slice") == 0 || strcmp(route, "peer_chunked") == 0 ? "1" : "0");
             for (bool bf16 : {false, true}) {
+                const char * wire = !bf16 ? "F32" : copy && q8_wire ? "Q8" : "BF16";
+                const char * only_wire = getenv("GGML_TEST_COLLECTIVE_WIRE");
+                if (only_wire != nullptr && strcmp(wire, only_wire) != 0) { continue; }
+                const auto value = [q8 = strcmp(wire, "Q8") == 0](size_t rank, int iteration) {
+                    // A Q8 block of 127*k has scale k and reconstructs exactly.
+                    return float((q8 ? 127 : 1)*(rank + 1)*(iteration + 1));
+                };
                 set_env("GGML_CUDA_AR_BF16_THRESHOLD", bf16 ? "1" : "0");
                 void * comm = init(backends.data(), backends.size());
                 GGML_ASSERT(comm);
@@ -877,6 +888,7 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                         std::vector<ggml_context *> contexts;
                         std::vector<ggml_backend_buffer_t> buffers;
                         std::vector<ggml_cgraph *> graphs;
+                        std::vector<ggml_tensor *> inputs;
                         std::vector<ggml_tensor *> outputs;
                         for (size_t rank = 0; rank < devices.size(); ++rank) {
                             auto * ctx = ggml_init({(size_t(delay_steps) + 16)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
@@ -906,13 +918,14 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                             auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backends[rank]);
                             GGML_ASSERT(buffer);
                             buffers.push_back(buffer);
-                            std::vector<float> values(operation == 2 ? ggml_nelements(input) : ne, float(rank + 1));
+                            std::vector<float> values(operation == 2 ? ggml_nelements(input) : ne, value(rank, 0));
                             ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
                             if (delay) {
                                 values.assign(262144, 1.0f);
                                 ggml_backend_tensor_set(delay, values.data(), 0, ggml_nbytes(delay));
                             }
                             graphs.push_back(graph);
+                            inputs.push_back(input);
                             outputs.push_back(out);
                         }
                         const auto queue = [&] {
@@ -935,9 +948,17 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                         };
                         queue(); // allocate transport scratch outside capture
                         for (auto backend : backends) { ggml_backend_synchronize(backend); }
-                        const bool counter_run = operation == 2 && getenv("GGML_TEST_COUNTER_RUN") != nullptr;
-                        const bool captured = !counter_run &&
-                            (operation == 0 || (operation == 1 ? can_sum(comm, outputs.data()) : can_gather(comm, outputs.data())));
+                        const char * counters = getenv("GGML_TEST_COUNTER_RUN");
+                        const bool counter_gather = operation == 2 && counters != nullptr;
+                        const bool counter_run = counter_gather || (operation == 1 && counters != nullptr && strcmp(counters, "reduce") == 0);
+                        const bool capturable =
+                            operation == 0 || (operation == 1 ? can_sum(comm, outputs.data()) : can_gather(comm, outputs.data()));
+                        const bool captured = capturable && !counter_gather && !live_only;
+                        if (copy && operation == 1 && capturable != ce_capture) {
+                            fprintf(stderr, "FAIL: %s %s copy-engine capture requested=%d, capturable=%d\n",
+                                    route, wire, ce_capture, capturable);
+                            ok = false;
+                        }
                         std::vector<void *> execs;
                         if (captured) {
                             for (auto backend : backends) { begin(backend); }
@@ -948,8 +969,7 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                             if (captured) {
                                 runner.run(execs, count);
                             } else {
-                                // The copy-engine reduction waits across devices and cannot join a whole-evaluation
-                                // capture: a sample queues `count` evaluations, each a small kernel and its reduction.
+                                // A live sample queues count evaluations before synchronizing the ranks.
                                 for (int i = 0; i < count; ++i) { queue(); }
                                 for (auto backend : backends) { ggml_backend_synchronize(backend); }
                             }
@@ -978,18 +998,40 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                             }
                         }
                         std::vector<float> actual(ne);
-                        bool correct = true;
-                        for (size_t rank = 0; rank < devices.size(); ++rank) {
-                            ggml_backend_tensor_get(outputs[rank], actual.data(), 0, ggml_nbytes(outputs[rank]));
-                            for (int64_t i = 0; i < ne; ++i) {
-                                const int64_t row = i/4096;
-                                size_t owner = 0;
-                                while (owner + 1 < devices.size() && row >= int64_t(rows*(owner + 1))/int64_t(devices.size())) {
-                                    ++owner;
+                        const auto check_outputs = [&](int iteration) {
+                            float sum_expected = 0.0f;
+                            for (size_t rank = 0; rank < devices.size(); ++rank) { sum_expected += value(rank, iteration); }
+                            bool correct = true;
+                            for (size_t rank = 0; rank < devices.size(); ++rank) {
+                                ggml_backend_tensor_get(outputs[rank], actual.data(), 0, ggml_nbytes(outputs[rank]));
+                                for (int64_t i = 0; i < ne; ++i) {
+                                    const int64_t row = i/4096;
+                                    size_t owner = 0;
+                                    while (owner + 1 < devices.size() && row >= int64_t(rows*(owner + 1))/int64_t(devices.size())) {
+                                        ++owner;
+                                    }
+                                    const float expected = operation == 1 ? sum_expected :
+                                        operation == 2 ? value(owner, 0) : value(rank, 0);
+                                    correct = correct && actual[i] == expected;
                                 }
-                                const float expected = operation == 1 ? float(devices.size()*(devices.size()+1)/2) :
-                                    operation == 2 ? float(owner + 1) : float(rank + 1);
-                                correct = correct && actual[i] == expected;
+                            }
+                            return correct;
+                        };
+                        bool correct = check_outputs(0);
+                        if (copy && operation == 1 && !counter_run) {
+                            // A replay must see fresh shares, and the next live call must see the counters advanced by replay.
+                            for (int iteration = 1; iteration <= 4; ++iteration) {
+                                for (size_t rank = 0; rank < devices.size(); ++rank) {
+                                    std::fill(actual.begin(), actual.end(), value(rank, iteration));
+                                    ggml_backend_tensor_set(inputs[rank], actual.data(), 0, ggml_nbytes(inputs[rank]));
+                                }
+                                if (captured && iteration == 4) {
+                                    queue();
+                                    for (auto backend : backends) { ggml_backend_synchronize(backend); }
+                                } else {
+                                    run(1);
+                                }
+                                correct = check_outputs(iteration) && correct;
                             }
                         }
                         ok = ok && correct;
@@ -997,7 +1039,7 @@ static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices
                         std::sort(us.begin(), us.end());
                         printf("{\"ranks\":%zu,\"backend\":\"%s\",\"operation\":\"%s\",\"route_requested\":\"%s\",\"peer_enabled\":%s,\"wire\":\"%s\",\"elements\":%lld,\"owner_delay_steps\":%d,\"delay_elements\":262144,\"whole_eval_capture\":%s,\"iterations_per_sample\":%d,\"samples\":%d,\"wall_us_min\":%.3f,\"wall_us_p50\":%.3f,\"wall_us_p95\":%.3f,\"correct\":%s,\"sample_wall_us\":[",
                             devices.size(), getenv("GGML_CUDA_ALLREDUCE"), operation == 0 ? "reset_only" : operation == 1 ? "reduce" : "gather", route,
-                            peer_active ? "true" : "false", bf16 ? "BF16" : "F32", (long long) ne, delay_steps, captured ? "true" : "false", replays, samples,
+                            peer_active ? "true" : "false", wire, (long long) ne, delay_steps, captured ? "true" : "false", replays, samples,
                             us.front(), us[samples/2], us[samples*95/100], correct ? "true" : "false");
                         for (size_t i = 0; i < raw_us.size(); ++i) { printf("%s%.3f", i ? "," : "", raw_us[i]); }
                         printf("]}\n");

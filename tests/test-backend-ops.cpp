@@ -1451,6 +1451,9 @@ struct test_case {
         return 1e-4;
     }
 
+    // Nonzero selects a chunked absolute-error check for contiguous F32 outputs.
+    virtual double max_abs_err() { return 0.0; }
+
     virtual double max_err() {
         return max_nmse_err();
     }
@@ -1755,6 +1758,33 @@ struct test_case {
                     ud->ok = false;
                 }
                 return true; // a sentinel is compared byte for byte, not as values
+            }
+
+            if (const double limit = ud->tc->max_abs_err(); limit > 0.0) {
+                GGML_ASSERT(t1->type == GGML_TYPE_F32 && t2->type == GGML_TYPE_F32 &&
+                            ggml_is_contiguous(t1) && ggml_is_contiguous(t2) && ggml_are_same_shape(t1, t2));
+                const size_t nrows = ggml_nrows(t1);
+                const size_t width = t1->ne[0];
+                const size_t chunk = 32;
+                std::vector<float> a(std::min(chunk, nrows)*width);
+                std::vector<float> b(a.size());
+                double max_diff = 0.0;
+                for (size_t row = 0; row < nrows; row += chunk) {
+                    const size_t n = std::min(chunk, nrows - row)*width;
+                    ggml_backend_tensor_get(t1, a.data(), row*width*sizeof(float), n*sizeof(float));
+                    ggml_backend_tensor_get(t2, b.data(), row*width*sizeof(float), n*sizeof(float));
+                    for (size_t i = 0; i < n; ++i) {
+                        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                            printf("[%s] nonfinite output at index %zu ", ggml_op_desc(t1), row*width + i);
+                            ud->ok = false;
+                            return true;
+                        }
+                        max_diff = std::max(max_diff, std::abs(double(a[i]) - double(b[i])));
+                    }
+                }
+                printf("max_abs_diff=%.9g ", max_diff);
+                ud->ok &= max_diff <= limit;
+                return true;
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
@@ -5828,6 +5858,8 @@ struct test_attn_prep_clip_fwht : public test_case {
         return 1e-6;
     }
 
+    bool run_whole_graph() override { return true; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nh*n, nt);
         ggml_set_name(x, "x");
@@ -5885,6 +5917,8 @@ struct test_attn_prep_kv_tail : public test_case {
         return 1e-6;
     }
 
+    bool run_whole_graph() override { return true; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int ch = nk*hd;
         ggml_tensor * past = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k - 1, ch, ns);
@@ -5901,7 +5935,8 @@ struct test_attn_prep_kv_tail : public test_case {
             ggml_set_name(d, "d");
         }
         ggml_tensor * conv = ggml_short_conv(ctx, x, w, d, 0.5f);
-        ggml_tensor * r2   = ggml_reshape_3d(ctx, conv, hd, nk, nt*ns);
+        // the two reshapes the model emits: convolve() returns [ch, t], the layer splits it into heads
+        ggml_tensor * r2   = ggml_reshape_3d(ctx, ggml_reshape_2d(ctx, conv, ch, nt*ns), hd, nk, nt*ns);
         ggml_tensor * nn   = rms ? ggml_rms_norm(ctx, r2, 1e-6f) : ggml_norm_clip(ctx, r2, nullptr, 1.5f, 1e-6f);
         ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, hd);
         ggml_set_name(rot, "rot");
@@ -5923,46 +5958,60 @@ struct test_attn_prep_kv_tail : public test_case {
 
 // the relative-position tail: the rows' clip and their bias-table matmul
 struct test_attn_prep_rel_table : public test_case {
-    const int nrel;     // positions a head reads of its token's row
-    const int nh;       // heads
-    const int nt;       // tokens
+    const int nrel;
+    const int nh;
+    const int nt;
     const bool tau;
+    const int extent;
+    const bool scaled;
+    const bool misaligned;
 
-    test_attn_prep_rel_table(int nrel, int nh, int nt, bool tau) : nrel(nrel), nh(nh), nt(nt), tau(tau) {}
+    test_attn_prep_rel_table(int nrel, int nh, int nt, bool tau, int extent = 64, bool scaled = true, bool misaligned = false)
+        : nrel(nrel), nh(nh), nt(nt), tau(tau), extent(extent), scaled(scaled), misaligned(misaligned) {}
 
-        std::string op_desc(ggml_tensor * t) override {
+    std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "ATTN_PREP_REL_TABLE";
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(nrel, nh, nt, tau);
+        return VARS_TO_STR7(nrel, nh, nt, tau, extent, scaled, misaligned);
     }
 
-    double max_nmse_err() override {
-        return 1e-6;
-    }
+    double max_abs_err() override { return 1e-5; }
+    bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrel*nh, nt);
-        ggml_set_name(x, "x");
-        ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrel, nh);
-        ggml_set_name(scale, "scale");
-
-        ggml_tensor * cur = ggml_norm_clip(ctx, ggml_reshape_3d(ctx, x, nrel, nh, nt), scale, 1.5f, 1e-6f);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nrel, nh, nt);
+        ggml_tensor * scale = scaled ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrel, nh) : nullptr;
+        ggml_tensor * cur = ggml_norm_clip(ctx, x, scale, 1.5f, 1e-6f);
         if (tau) {
             ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, nt);
-            ggml_set_name(t, "tau");
             cur = ggml_mul(ctx, cur, t);
         }
-        ggml_tensor * bias  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrel, 64);
-        ggml_set_name(bias, "bias");
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrel, extent + misaligned);
+        if (misaligned) {
+            bias = ggml_view_2d(ctx, bias, nrel, extent, bias->nb[1], sizeof(float));
+        }
         return ggml_mul_mat(ctx, bias, cur);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t);
+        std::mt19937 gen(729);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const size_t nrows = ggml_nrows(t);
+            const size_t width = t->ne[0];
+            const size_t chunk = 32;
+            std::vector<float> values(std::min(chunk, nrows)*width);
+            for (size_t row = 0; row < nrows; row += chunk) {
+                const size_t n = std::min(chunk, nrows - row)*width;
+                std::generate_n(values.begin(), n, [&] { return dist(gen); });
+                ggml_backend_tensor_set(t, values.data(), row*width*sizeof(float), n*sizeof(float));
+            }
         }
     }
 };
@@ -5989,8 +6038,10 @@ struct test_attn_prep_state_store : public test_case {
         for (size_t i = 0; i < chg.size(); ++i) {
             v += std::to_string(chg[i]) + (i + 1 < chg.size() ? "," : "");
         }
-        return v + "]},ns=" + std::to_string(ns) + ",strided=" + (strided ? "1" : "0") + ",f16=" + (f16 ? "1" : "0");
+        return v + "],ns=" + std::to_string(ns) + ",strided=" + (strided ? "1" : "0") + ",f16=" + (f16 ? "1" : "0");
     }
+
+    bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         int sum_ch = 0;
@@ -16459,6 +16510,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_attn_prep_clip_fwht(16, 5, 6, false));
     test_cases.emplace_back(new test_attn_prep_rel_table(17, 12, 3, false));
     test_cases.emplace_back(new test_attn_prep_rel_table(17, 3, 8, true));
+    for (int nrel = 1; nrel <= 128; ++nrel) {
+        test_cases.emplace_back(new test_attn_prep_rel_table(nrel, 1, 5, nrel % 2 != 0, 67));
+    }
+    for (bool tau : {false, true}) {
+        for (bool scaled : {false, true}) {
+            test_cases.emplace_back(new test_attn_prep_rel_table(1, 1, 1, tau, 1, scaled));
+            test_cases.emplace_back(new test_attn_prep_rel_table(3, 1, 1, tau, 1025, scaled));
+            test_cases.emplace_back(new test_attn_prep_rel_table(127, 1, 277, tau, 1025, scaled));
+            test_cases.emplace_back(new test_attn_prep_rel_table(128, 1, 1, tau, 1025, scaled));
+            // Unscaled graphs use standalone matmul. A single head keeps that oracle in FP32.
+            test_cases.emplace_back(new test_attn_prep_rel_table(128, scaled ? 12 : 1, scaled ? 23 : 276, tau, 1024, scaled));
+            test_cases.emplace_back(new test_attn_prep_rel_table(128, scaled ? 16 : 1, scaled ? 128 : 2048, tau, 2048, scaled));
+        }
+    }
+
+    // Inkling 2 Small's width, including the extra extent column when sinks are not direct.
+    for (const auto & [nh, nt] : {std::pair<int, int>{1, 1}, {4, 1}, {23, 1}, {12, 23}, {1, 277}, {12, 92}, {12, 2048}}) {
+        for (int extent : {1024, 1025}) {
+            for (bool tau : {false, true}) {
+                test_cases.emplace_back(new test_attn_prep_rel_table(16, nh, nt, tau, extent));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_attn_prep_rel_table(16, 12, 23, true, 1025, true, true));
 
     for (int k = 3; k <= 4; ++k) {
         for (int dyn = 0; dyn < 2; ++dyn) {
@@ -19619,6 +19694,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int nt : {4, 23, 92, 2048}) {
+        test_cases.emplace_back(new test_attn_prep_rel_table(16, 12, nt, true, 1024));
+    }
+    test_cases.emplace_back(new test_attn_prep_rel_table(128, 12, 23, true, 1024));
+    test_cases.emplace_back(new test_attn_prep_rel_table(128, 16, 128, true, 1024));
     for (int n_tokens : {23, 2048}) {
         for (int n_src : {2, 5, 9}) {
             for (int n_query : {1, 3}) {
