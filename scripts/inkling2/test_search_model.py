@@ -10,7 +10,7 @@ from search_model import CRASH_PENALTY_TOKENS_PER_SECOND, Model, decode, encode
 ROUNDTRIP_SPACE = {
     "--draft-depth": ["1", "2", "3", "4"],
     "--draft": ["off", "on"],
-    "GGML_TENSOR_N_SPLIT_ROWS": ["0", "8", "64"],
+    "NON_UNIFORM": ["0", "8", "64"],
     "ONLY": ["one"],
 }
 
@@ -69,9 +69,9 @@ class Encoding(unittest.TestCase):
             self.assertEqual(decode(ROUNDTRIP_SPACE, point), settings)
 
     def test_ordinal_position_and_flag_ends(self):
-        lowest = {"--draft-depth": "1", "--draft": "off", "GGML_TENSOR_N_SPLIT_ROWS": "0", "ONLY": "one"}
-        highest = {"--draft-depth": "4", "--draft": "on", "GGML_TENSOR_N_SPLIT_ROWS": "64", "ONLY": "one"}
-        middle = {"--draft-depth": "3", "--draft": "on", "GGML_TENSOR_N_SPLIT_ROWS": "8", "ONLY": "one"}
+        lowest = {"--draft-depth": "1", "--draft": "off", "NON_UNIFORM": "0", "ONLY": "one"}
+        highest = {"--draft-depth": "4", "--draft": "on", "NON_UNIFORM": "64", "ONLY": "one"}
+        middle = {"--draft-depth": "3", "--draft": "on", "NON_UNIFORM": "8", "ONLY": "one"}
         self.assertEqual(encode(ROUNDTRIP_SPACE, lowest), [0.0, 0.0, 0.0, 0.0])
         self.assertEqual(encode(ROUNDTRIP_SPACE, highest), [1.0, 1.0, 1.0, 0.0])
         self.assertEqual(encode(ROUNDTRIP_SPACE, middle), [2 / 3, 1.0, 0.5, 0.0])

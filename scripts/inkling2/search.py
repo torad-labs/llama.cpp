@@ -59,7 +59,6 @@ SPACE = {
     "--sort-expert-rows": ["on", "off"],
     "--expert-row-limit": ["8", "16", "23", "32"],
     "--host-owner-rows": ["on", "off"],
-    "GGML_TENSOR_N_SPLIT_ROWS": ["0", "8", "64"],
 }
 SUBJECTS = ("merges overlapping time intervals", "parses an ISO 8601 duration", "finds the longest common prefix of a list",
             "rotates a square matrix in place", "counts the islands in a grid", "evaluates a postfix expression",

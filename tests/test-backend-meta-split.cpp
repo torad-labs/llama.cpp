@@ -11,6 +11,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 #include "test-backend-meta-split-inkling.h"
 
 #include <algorithm>
@@ -2054,6 +2055,115 @@ static bool test_candidates_all(ggml_backend_dev_t device) {
     return ok;
 }
 
+struct restore_list {
+    std::vector<ggml_tensor *> tensors;
+    std::vector<size_t> offsets, sizes, host_offsets;
+    size_t bytes = 0;
+
+    void add(ggml_tensor * t, size_t start, size_t rows) {
+        tensors.push_back(t);
+        offsets.push_back(start*t->nb[1]);
+        sizes.push_back(rows*t->nb[1]);
+        host_offsets.push_back(bytes);
+        bytes += sizes.back();
+    }
+
+    void set(const uint8_t * data) const {
+        ggml_backend_tensor_set_n(tensors.data(), data, offsets.data(), sizes.data(), host_offsets.data(), tensors.size());
+    }
+
+    void get(uint8_t * data) const {
+        ggml_backend_tensor_get_n(tensors.data(), data, offsets.data(), sizes.data(), host_offsets.data(), tensors.size());
+    }
+};
+
+static ggml_backend_buffer_type_t restore_buft(ggml_backend_dev_t dev) {
+    ggml_backend_dev_t devs[] = { dev, dev, dev, dev };
+    return ggml_backend_dev_buffer_type(ggml_backend_meta_device(devs, 4,
+        [](const ggml_tensor *, void *) -> ggml_backend_meta_split_state {
+            return { GGML_BACKEND_SPLIT_AXIS_0, { 256, 256, 256, 256 }, { 1 }, 1 };
+        }, nullptr));
+}
+
+static bool test_restore_runs(ggml_backend_dev_t dev) {
+    const ggml_type types[] = { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_F8_E4M3 };
+    ggml_context_ptr ctx(ggml_init({ 3*ggml_tensor_overhead(), nullptr, true }));
+    restore_list list;
+    for (auto type : types) {
+        auto * t = ggml_new_tensor_2d(ctx.get(), type, 1024, 1400);
+        list.add(t, 38, 100);
+        list.add(t, 320, 1024);
+        list.add(t, 3, 9);
+        list.add(t, 260, 23);
+    }
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), restore_buft(dev)));
+    GGML_ASSERT(buf);
+    ggml_backend_buffer_clear(buf.get(), 0);
+
+    std::vector<uint8_t> src(list.bytes), out(list.bytes);
+    std::mt19937 rng(1234);
+    for (auto & b : src) {
+        b = rng() >> 24;
+    }
+    list.set(src.data());
+    list.get(out.data());
+    bool ok = src == out;
+    for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+        std::vector<uint8_t> ref(ggml_nbytes(t)), actual(ref.size());
+        for (size_t i = 0; i < list.tensors.size(); ++i) {
+            if (list.tensors[i] == t) {
+                memcpy(ref.data() + list.offsets[i], src.data() + list.host_offsets[i], list.sizes[i]);
+            }
+        }
+        ggml_backend_tensor_get(t, actual.data(), 0, actual.size());
+        ok = ok && actual == ref;
+    }
+    printf("%s four-rank restore runs (F16/Q8_0/F8_E4M3): %s\n", ggml_backend_dev_name(dev), ok ? "OK" : "FAIL");
+    return ok;
+}
+
+static void bench_restore(ggml_backend_dev_t dev, bool loop, bool batch) {
+    constexpr size_t n_tensors = 80;
+    ggml_context_ptr ctx(ggml_init({ n_tensors*ggml_tensor_overhead(), nullptr, true }));
+    restore_list list;
+    for (size_t k = 0; k < n_tensors; ++k) {
+        auto * t = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_0, 1024, 1024);
+        size_t start = 1;
+        for (size_t rows : { 9, 37, 59, 82, 101, 117, 125, 132, 150, 180 }) {
+            list.add(t, start, rows);
+            start += rows + 2;
+        }
+    }
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), restore_buft(dev)));
+    GGML_ASSERT(buf);
+    std::vector<uint8_t> src(list.bytes, 0x51);
+    printf("%s x4 restore: %zu tensors, %zu runs, %zu bytes\n", ggml_backend_dev_name(dev), n_tensors, list.tensors.size(), list.bytes);
+
+    const auto run = [&](bool batched) {
+        std::array<int64_t, 5> times;
+        for (auto & us : times) {
+            const int64_t start = ggml_time_us();
+            if (batched) {
+                list.set(src.data());
+            } else {
+                for (size_t i = 0; i < list.tensors.size(); ++i) {
+                    ggml_backend_tensor_set(list.tensors[i], src.data() + list.host_offsets[i], list.offsets[i], list.sizes[i]);
+                }
+            }
+            us = ggml_time_us() - start;
+        }
+        std::sort(times.begin(), times.end());
+        printf("%s: %.3f ms median per restore (%.3f-%.3f ms, %zu restores)\n", batched ? "batch" : "loop",
+                times[times.size()/2]/1000.0, times.front()/1000.0, times.back()/1000.0, times.size());
+    };
+    if (loop) {
+        run(false);
+    }
+    if (batch) {
+        run(true);
+    }
+}
+
 int main(int argc, char ** argv) {
     // Isolate partition correctness from the optional BF16 collective round trip.
 #ifdef _WIN32
@@ -2101,7 +2211,7 @@ int main(int argc, char ** argv) {
     }
     if (argc > 1 && strcmp(argv[1], "--cpu") == 0) {
         gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        bool ok = true;
+        bool ok = test_restore_runs(gpu);
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) { ok = test_experts(gpu, type) && ok; }
         for (int variant = 0; variant < 12; ++variant) {
             ok = test_owned_ops(gpu, variant) && ok;
@@ -2123,6 +2233,19 @@ int main(int argc, char ** argv) {
         if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             gpu = ggml_backend_dev_get(i);
         }
+    }
+    if (argc > 1 && strcmp(argv[1], "--bench-restore") == 0) {
+        if (!gpu || strncmp(ggml_backend_dev_name(gpu), "CUDA", 4) != 0) {
+            return 77;
+        }
+        const bool loop = argc == 2 || (argc == 3 && strcmp(argv[2], "loop") == 0);
+        const bool batch = argc == 2 || (argc == 3 && strcmp(argv[2], "batch") == 0);
+        if (!loop && !batch) {
+            fprintf(stderr, "usage: %s --bench-restore [loop|batch]\n", argv[0]);
+            return 1;
+        }
+        bench_restore(gpu, loop, batch);
+        return 0;
     }
     if (gpu == nullptr) {
         printf("no GPU for the meta backend, skipped\n");
@@ -2283,6 +2406,7 @@ int main(int argc, char ** argv) {
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
 
+    ok = test_restore_runs(gpu) && ok;
     ok = test_rows(gpu, false) && ok;
     ok = test_rows(gpu, true) && ok;
     ok = test_sequence_axis(gpu) && ok;
