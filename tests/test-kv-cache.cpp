@@ -348,9 +348,7 @@ int main() {
         }
     }
 
-    // Inkling 2 sessions that share a pool each add a cell a step, and the padded length shapes every decode graph: it
-    // holds for a power of two while the pool is small and for 256 cells a session after. LLAMA_KV_PAD_SHARED_LEGACY=1: 256.
-    // The pool of its DSpark draft pads the same
+    // A shared target or draft pool uses fewer shapes than the old 8192-cell policy and keeps a shape during small drops.
     for (const bool draft : { false, true }) {
         std::unique_ptr<llama_model> model(llama_model_create(draft ? LLM_ARCH_DFLASH : LLM_ARCH_INKLING2, llama_model_default_params()));
         init_model(*model, 1);
@@ -380,7 +378,8 @@ int main() {
         slot.strm = {0};
         slot.idxs.resize(1);
         const char * legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
-        const bool narrow = legacy && atoi(legacy) == 1;
+        const char * dense_legacy = getenv("LLAMA_KV_PAD_DENSE_LEGACY");
+        const bool narrow = (legacy && atoi(legacy) == 1) || (dense_legacy && atoi(dense_legacy) == 1);
         uint32_t lengths = 0, last = 0;
         for (uint32_t step = 0; step < n_steps; ++step) {
             slot.idxs[0].clear();
@@ -391,14 +390,41 @@ int main() {
             kv.apply_ubatch(slot, ub);
             const uint32_t cells = (step + 1)*n_seq, n_kv = kv.get_n_kv(slot, &ub);
             GGML_ASSERT(n_kv >= cells && n_kv <= size && n_kv % 256 == 0);
-            // the empty cells the padding adds stay under 8,192, the next power of two over 256 a session
-            GGML_ASSERT(n_kv - cells < (narrow ? 256u : 8192u));
+            GGML_ASSERT(n_kv - cells < (narrow ? 256u : 16384u));
             lengths += n_kv != last;
             last = n_kv;
         }
         fprintf(stderr, "shared Inkling 2%s pool: %u padded lengths in %u steps of %u sessions\n", draft ? " draft" : "", lengths, n_steps, n_seq);
-        // 47,104 cells: 256 to 8,192 by powers of two, then every 8,192; or every 256
-        GGML_ASSERT(lengths == (narrow ? 184u : 11u));
+        // Through 47104 cells: nine shapes instead of eleven, or 184 with the legacy step.
+        GGML_ASSERT(lengths == (narrow ? 184u : 9u));
+
+        kv.clear(false);
+        const auto place = [&](llama_seq_id id, uint32_t cell) {
+            llama_pos p = 0;
+            llama_seq_id * ids = &id;
+            auto one = ub;
+            one.n_tokens = one.n_seqs = one.n_seqs_unq = 1;
+            one.pos = &p;
+            one.seq_id = &ids;
+            one.seq_id_unq = &id;
+            slot.idxs[0] = { cell };
+            kv.apply_ubatch(slot, one);
+        };
+
+        place(0, 31743);
+        GGML_ASSERT(kv.get_n_kv(slot) == (narrow ? 31744u : 32768u));
+        for (int i = 0; i < 3; ++i) {
+            place(1, 33023);
+            GGML_ASSERT(kv.get_n_kv(slot) == (narrow ? 33024u : 49152u));
+            GGML_ASSERT(kv.seq_rm(1, -1, -1));
+            // The old shared path crossed down to 32768 here and back up on each admission.
+            GGML_ASSERT(kv.get_n_kv(slot) == (narrow ? 31744u : 49152u));
+        }
+        GGML_ASSERT(kv.seq_rm(0, -1, -1));
+        place(0, 30719);
+        GGML_ASSERT(kv.get_n_kv(slot) == (narrow ? 30720u : 32768u));
+        kv.clear(false);
+        GGML_ASSERT(kv.get_n_kv(slot) == (narrow ? 256u : 512u));
     }
 
     llama_backend_free();

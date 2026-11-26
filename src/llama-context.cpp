@@ -2912,11 +2912,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ubatch.n_seq_tokens <= graph_slot_mtp_seq_tokens && ubatch.n_tokens <= graph_slot_max_rows;
     const bool prompt_shape = graph_prompt_shapes && ubatch.n_seqs == 1 && ubatch.n_tokens > graph_slot_max_tokens &&
         ubatch.n_tokens <= graph_prompt_shape_max && (ubatch.n_tokens & (ubatch.n_tokens - 1)) == 0;
+    // Keep draft feed and block graphs in the draft context's slots, even above graph_slot_max_tokens.
+    static const bool draft_slots_legacy = ggml_env_switch("LLAMA_DRAFT_GRAPH_SLOTS_LEGACY");
+    const bool draft_shape = model.arch == LLM_ARCH_DFLASH && !draft_slots_legacy;
+    const bool draft_feed_shape = draft_shape && gparams.is_chunked_inkling_draft_feed();
+
     // a shape the slots do not take otherwise, seen before (LLAMA_GRAPH_PROMPT_KEPT): the first sighting is recorded
     bool   prompt_kept = false;
     size_t prompt_seen = 0; // its place in graph_prompt_seen
     if (graph_prompt_kept && graph_shared && !graph_reuse_disable &&
-            ubatch.n_tokens > graph_slot_max_tokens && !mtp_shape && !prompt_shape) {
+            ubatch.n_tokens > graph_slot_max_tokens && !mtp_shape && !prompt_shape && !draft_feed_shape) {
         auto seen = std::find_if(graph_prompt_seen.begin(), graph_prompt_seen.end(), [&](const graph_prompt_seen_shape & s) {
             return s.rows == ubatch.n_tokens && s.seqs == ubatch.n_seqs && s.outputs == (uint32_t) gparams.n_outputs;
         });
@@ -2934,11 +2939,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
     }
-    // A DFlash/DSpark draft decodes two step shapes in turn, its feed (sessions x verified rows) and its block (sessions x
-    // block rows), both past graph_slot_max_tokens at 23 sessions: on the main scheduler, which holds one graph, each
-    // round built both again. Its graphs stay in the slots. LLAMA_DRAFT_GRAPH_SLOTS_LEGACY=1: the main scheduler
-    static const bool draft_slots_legacy = ggml_env_switch("LLAMA_DRAFT_GRAPH_SLOTS_LEGACY");
-    const bool draft_shape = model.arch == LLM_ARCH_DFLASH && !draft_slots_legacy;
     const bool use_slots = !graph_reuse_disable &&
         (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape || prompt_shape || prompt_kept || draft_shape) && sampling_can_retain();
 
@@ -2948,13 +2948,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     bool reuse   = false;
     bool refused = false;            // a kept graph of this shape turned it down
     size_t slot_refused = SIZE_MAX;  // the slot that holds it
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->same_shape(ubatch, gparams.n_outputs)) {
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->same_shape(gparams)) {
         reuse   = res->can_reuse(gparams);
         refused = !reuse;
     }
     for (size_t i = 0; !reuse && use_slots && i < graph_slots.size(); ++i) {
         auto & slot = graph_slots[i];
-        if (!slot.res->same_shape(ubatch, gparams.n_outputs)) {
+        if (!slot.res->same_shape(gparams)) {
             continue;
         }
         auto gparams_slot = graph_params(slot.res.get(), ubatch, mctx, gtype, slot.sched.get());
@@ -3737,10 +3737,41 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
+    const bool chunk_feed = llm_graph_params::is_chunked_inkling_draft_feed(
+            model, cparams, n_outputs_all, balloc->get_batch().embd || has_embd_row);
+    const auto init_batch = [&]() -> llama_memory_context_ptr {
+        if (!chunk_feed) {
+            return memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        }
+
+        // Like prompt shapes, use powers of two up to the prompt cap, but keep even the small tail shaped.
+        // This feed only writes K/V and nextn rows, so it can split across sequence boundaries in batch order.
+        auto * kv = static_cast<llama_kv_cache_iswa *>(memory.get());
+        balloc->split_reset();
+        std::vector<llama_ubatch> ubatches;
+        for (uint32_t rows = graph_prompt_shape_max; balloc->get_n_used() < n_tokens_all; ) {
+            const uint32_t limit = std::min(cparams.n_ubatch, n_tokens_all - balloc->get_n_used());
+            while (rows > limit) {
+                rows /= 2;
+            }
+            ubatches.push_back(balloc->split_simple(rows));
+        }
+
+        auto base = kv->get_base()->prepare(ubatches);
+        if (base.empty()) {
+            return std::make_unique<llama_kv_cache_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+        auto swa = kv->get_swa()->prepare(ubatches);
+        if (swa.empty()) {
+            return std::make_unique<llama_kv_cache_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+        return std::make_unique<llama_kv_cache_iswa_context>(kv, std::move(base), std::move(swa), std::move(ubatches));
+    };
+
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        mctx = init_batch();
         if (!mctx) {
             return -2;
         }

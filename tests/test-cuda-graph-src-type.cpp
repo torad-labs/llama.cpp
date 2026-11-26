@@ -199,16 +199,26 @@ static bool test_parameter_updates(ggml_backend_t backend, graph_log & log) {
     ggml_backend_tensor_set(x, input.data(), 0, n*sizeof(float));
     bool ok = true;
     bool armed = false;
-    for (int step = 0; step < 24; ++step) {
-        const float scale = float(int(rng()%33) - 16)/8.0f;
+    const graph_log before = log;
+    for (int step = 0; step < 28; ++step) {
+        // First replay between changes, then change on every call before settling again.
+        const bool churn = step >= 24;
+        const float scale = churn ? float(step) : float(int(rng()%33) - 16)/8.0f;
         memcpy(y->op_params, &scale, sizeof(scale));
-        for (int run = 0; run < 3; ++run) {
+        const int runs = churn && step < 27 ? 1 : 3;
+        for (int run = 0; run < runs; ++run) {
             compute(backend, graph, log, armed);
             ggml_backend_tensor_get(y, output.data(), 0, n*sizeof(float));
             for (size_t i = 0; i < n; ++i) {
                 ok &= output[i] == input[i]*scale;
             }
         }
+        if (step == 23 && log.captured > before.captured) {
+            ok &= log.captured == before.captured + 1 && log.stale == before.stale;
+        }
+    }
+    if (log.captured > before.captured) {
+        ok &= log.captured == before.captured + 2 && log.stale == before.stale + 1;
     }
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);

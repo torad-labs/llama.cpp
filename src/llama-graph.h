@@ -1002,6 +1002,10 @@ struct llm_graph_params {
     bool candidates_sample = false;
     const std::map<llama_seq_id, llm_cand_draw_entry> * cand_draw = nullptr;
 
+    static bool is_chunked_inkling_draft_feed(
+            const llama_model & model, const llama_cparams & cparams, uint32_t n_outputs, bool has_features);
+    bool is_chunked_inkling_draft_feed() const;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other, const char ** reason = nullptr) const {
@@ -1012,7 +1016,7 @@ struct llm_graph_params {
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
-            ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
+            (ubatch.n_seqs_unq == other.ubatch.n_seqs_unq || (is_chunked_inkling_draft_feed() && other.is_chunked_inkling_draft_feed())) &&
             ubatch.is_mixed()   == other.ubatch.is_mixed() &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
@@ -1166,7 +1170,7 @@ public:
 
     // the ubatch shape and output count this graph was built for: a kept graph of another shape cannot be reused, and
     // is not asked (can_reuse would turn it down at its first check)
-    bool same_shape(const llama_ubatch & ubatch, uint32_t n_outputs) const;
+    bool same_shape(const llm_graph_params & other) const;
 
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
