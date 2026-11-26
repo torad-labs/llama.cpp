@@ -2915,7 +2915,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // Keep draft feed and block graphs in the draft context's slots, even above graph_slot_max_tokens.
     static const bool draft_slots_legacy = ggml_env_switch("LLAMA_DRAFT_GRAPH_SLOTS_LEGACY");
     const bool draft_shape = model.arch == LLM_ARCH_DFLASH && !draft_slots_legacy;
-    const bool draft_feed_shape = draft_shape && gparams.is_inkling_draft_feed();
+    const bool draft_feed_shape = draft_shape && gparams.is_chunked_inkling_draft_feed();
 
     // a shape the slots do not take otherwise, seen before (LLAMA_GRAPH_PROMPT_KEPT): the first sighting is recorded
     bool   prompt_kept = false;
@@ -3737,10 +3737,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
-    const bool inkling_feed = n_outputs_all == 0 && (balloc->get_batch().embd || has_embd_row) &&
-        cparams.kv_unified && cparams.n_seq_devices == 1 && llama_model_is_inkling_draft(model);
+    const bool chunk_feed = llm_graph_params::is_chunked_inkling_draft_feed(
+            model, cparams, n_outputs_all, balloc->get_batch().embd || has_embd_row);
     const auto init_batch = [&]() -> llama_memory_context_ptr {
-        if (!inkling_feed) {
+        if (!chunk_feed) {
             return memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
         }
 
