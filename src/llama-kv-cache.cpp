@@ -1743,20 +1743,20 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
         result = padded(pad);
     }
 
-    if (pad_dense_inkling) {
+    if (model.arch == LLM_ARCH_INKLING2 && n_swa == 0 && n_stream == 1 && !v_trans && ubatch &&
+            ubatch->n_tokens >= 256 && result >= 32768 &&
+            !layers.empty() && layers[0].k && layers[0].v && type_k() == type_v() &&
+            (type_k() == GGML_TYPE_F16 || type_k() == GGML_TYPE_Q8_0 || type_k() == GGML_TYPE_Q4_0 || type_k() == GGML_TYPE_F8_E4M3) &&
+            ggml_env_switch("LLAMA_INKLING2_BUCKET_PREFILL_KV")) {
+        // An explicitly configured long prefill keeps its fixed bucket width.
+        pad = (uint32_t) ggml_env_int("LLAMA_INKLING2_BUCKET_CELLS");
+        result = padded(pad);
+    } else if (pad_dense_inkling) {
         // Keep 256-cell steps up to 4096 cells, then use eight steps per doubling to keep extra padding below 12.5%.
         while (result > 16ull*pad) {
             pad *= 2;
         }
         result = std::min<uint64_t>(get_size(), GGML_PAD(result, (uint64_t) pad));
-    } else if (model.arch == LLM_ARCH_INKLING2 && n_swa == 0 && n_stream == 1 && !v_trans && ubatch &&
-            ubatch->n_tokens >= 256 && result >= 32768 &&
-            !layers.empty() && layers[0].k && layers[0].v && type_k() == type_v() &&
-            (type_k() == GGML_TYPE_F16 || type_k() == GGML_TYPE_Q8_0 || type_k() == GGML_TYPE_Q4_0 || type_k() == GGML_TYPE_F8_E4M3) &&
-            ggml_env_switch("LLAMA_INKLING2_BUCKET_PREFILL_KV")) {
-        // With geometric buckets off, the long prefill reader can still use fixed-width buckets.
-        pad = (uint32_t) ggml_env_int("LLAMA_INKLING2_BUCKET_CELLS");
-        result = padded(pad);
     }
 
     if (n_pad_used) {
