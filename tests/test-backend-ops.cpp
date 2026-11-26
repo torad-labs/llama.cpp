@@ -5959,9 +5959,10 @@ struct test_attn_prep_rel_table : public test_case {
     const bool tau;
     const int extent;
     const bool scaled;
+    const bool misaligned;
 
-    test_attn_prep_rel_table(int nrel, int nh, int nt, bool tau, int extent = 64, bool scaled = true)
-        : nrel(nrel), nh(nh), nt(nt), tau(tau), extent(extent), scaled(scaled) {}
+    test_attn_prep_rel_table(int nrel, int nh, int nt, bool tau, int extent = 64, bool scaled = true, bool misaligned = false)
+        : nrel(nrel), nh(nh), nt(nt), tau(tau), extent(extent), scaled(scaled), misaligned(misaligned) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5969,7 +5970,7 @@ struct test_attn_prep_rel_table : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(nrel, nh, nt, tau, extent, scaled);
+        return VARS_TO_STR7(nrel, nh, nt, tau, extent, scaled, misaligned);
     }
 
     double max_abs_err() override { return 1e-5; }
@@ -5983,7 +5984,10 @@ struct test_attn_prep_rel_table : public test_case {
             ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, nt);
             cur = ggml_mul(ctx, cur, t);
         }
-        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrel, extent);
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrel, extent + misaligned);
+        if (misaligned) {
+            bias = ggml_view_2d(ctx, bias, nrel, extent, bias->nb[1], sizeof(float));
+        }
         return ggml_mul_mat(ctx, bias, cur);
     }
 
@@ -16514,6 +16518,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Inkling 2 Small's width, including the extra extent column when sinks are not direct.
+    for (const auto & [nh, nt] : {std::pair<int, int>{1, 1}, {4, 1}, {23, 1}, {12, 23}, {1, 277}, {12, 92}, {12, 2048}}) {
+        for (int extent : {1024, 1025}) {
+            for (bool tau : {false, true}) {
+                test_cases.emplace_back(new test_attn_prep_rel_table(16, nh, nt, tau, extent));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_attn_prep_rel_table(16, 12, 23, true, 1025, true, true));
+
     for (int k = 3; k <= 4; ++k) {
         for (int dyn = 0; dyn < 2; ++dyn) {
             for (int rms = 0; rms < 2; ++rms) {
@@ -19673,6 +19687,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int nt : {4, 23, 92, 2048}) {
+        test_cases.emplace_back(new test_attn_prep_rel_table(16, 12, nt, true, 1024));
+    }
     test_cases.emplace_back(new test_attn_prep_rel_table(128, 12, 23, true, 1024));
     test_cases.emplace_back(new test_attn_prep_rel_table(128, 16, 128, true, 1024));
     for (int n_tokens : {23, 2048}) {
