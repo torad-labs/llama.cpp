@@ -145,11 +145,7 @@ llama_kv_cache::llama_kv_cache(
     // card the crossing step and the one after it took 76 ms more than a 31 ms step. Padded to 256 cells a sequence, the
     // pool crosses as often a step as one sequence does; the next power of two, which GGML_PAD and the pool padding
     // derived from it (llama_kpool_pool_pad) take. LLAMA_KV_PAD_SHARED_LEGACY=1: 256, whatever the pool holds
-    if (unified && hparams.indexer_kpool == 0 && (model.arch == LLM_ARCH_INKLING2 || llama_model_is_inkling_draft(model))) {
-        const char * shared_legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
-        const char * dense_legacy  = getenv("LLAMA_KV_PAD_DENSE_LEGACY");
-        pad_dense_inkling = (!shared_legacy || atoi(shared_legacy) != 1) && (!dense_legacy || atoi(dense_legacy) != 1);
-    } else if ((hparams.indexer_kpool > 0 || model.arch == LLM_ARCH_DFLASH) && n_stream < n_seq_max) {
+    if ((hparams.indexer_kpool > 0 || model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_DFLASH) && n_stream < n_seq_max) {
         const char * legacy = getenv("LLAMA_KV_PAD_SHARED_LEGACY");
 
         if (!legacy || atoi(legacy) != 1) {
@@ -183,6 +179,8 @@ llama_kv_cache::llama_kv_cache(
         const char * legacy = getenv("LLAMA_KV_PAD_DENSE_LEGACY");
 
         pad_dense_shared = !legacy || atoi(legacy) != 1;
+        pad_dense_inkling = pad_dense_shared && hparams.indexer_kpool == 0 &&
+                (model.arch == LLM_ARCH_INKLING2 || llama_model_is_inkling_draft(model));
         if (!ggml_env_switch("LLAMA_KV_CELL_CAPACITY_LEGACY")) {
             n_pad_cells = std::max(n_pad_shared, 65536u);
         }
@@ -585,6 +583,7 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
 }
 
 void llama_kv_cache::clear(bool data) {
+    n_kv_bucket = 0;
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -1735,15 +1734,35 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
         result = padded(pad);
     }
 
-    // a shared pool that reads densely: the next power of two that holds its cells and still reads densely
-    if (!scores && pad_dense_shared) {
+    if (pad_dense_inkling && sinfo.n_stream() > 0) {
+        const uint32_t used = v_cells[sinfo.strm[0]].used_max_p1();
+        const uint32_t capacity = get_size();
+        const auto bucket = [&](uint64_t span) {
+            uint64_t step = 512;
+            while (step < span && step < n_pad_shared) {
+                step *= 2;
+            }
+            if (span > 4ull*n_pad_shared) {
+                step = 2ull*n_pad_shared;
+            }
+            return std::min<uint64_t>(capacity, std::max(step, GGML_PAD(span, step)));
+        };
+
+        // Grow at the bucket edge, but require a drop past the edge and the deadband before shrinking.
+        const uint32_t next = bucket(used);
+        if (next >= n_kv_bucket || bucket(uint64_t(used) + std::min(used/4, n_pad_shared/4)) < n_kv_bucket) {
+            n_kv_bucket = next;
+        }
+        result = n_kv_bucket;
+    } else if (!scores && pad_dense_shared) {
+        // The next power of two that holds the cells and still reads densely.
         while (pad < result && 2*pad <= n_pad_shared && padded(2*pad) <= n_dense) {
             pad *= 2;
         }
         result = padded(pad);
     }
 
-    if (model.arch == LLM_ARCH_INKLING2 && n_swa == 0 && n_stream == 1 && !v_trans && ubatch &&
+    if (!pad_dense_inkling && model.arch == LLM_ARCH_INKLING2 && n_swa == 0 && n_stream == 1 && !v_trans && ubatch &&
             ubatch->n_tokens >= 256 && result >= 32768 &&
             !layers.empty() && layers[0].k && layers[0].v && type_k() == type_v() &&
             (type_k() == GGML_TYPE_F16 || type_k() == GGML_TYPE_Q8_0 || type_k() == GGML_TYPE_Q4_0 || type_k() == GGML_TYPE_F8_E4M3) &&
@@ -1751,12 +1770,6 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
         // An explicitly configured long prefill keeps its fixed bucket width.
         pad = (uint32_t) ggml_env_int("LLAMA_INKLING2_BUCKET_CELLS");
         result = padded(pad);
-    } else if (pad_dense_inkling) {
-        // Keep 256-cell steps up to 4096 cells, then use eight steps per doubling to keep extra padding below 12.5%.
-        while (result > 16ull*pad) {
-            pad *= 2;
-        }
-        result = std::min<uint64_t>(get_size(), GGML_PAD(result, (uint64_t) pad));
     }
 
     if (n_pad_used) {
