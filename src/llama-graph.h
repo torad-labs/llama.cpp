@@ -1002,7 +1002,9 @@ struct llm_graph_params {
     bool candidates_sample = false;
     const std::map<llama_seq_id, llm_cand_draw_entry> * cand_draw = nullptr;
 
-    bool is_inkling_draft_feed() const;
+    static bool is_chunked_inkling_draft_feed(
+            const llama_model & model, const llama_cparams & cparams, uint32_t n_outputs, bool has_features);
+    bool is_chunked_inkling_draft_feed() const;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1014,7 +1016,7 @@ struct llm_graph_params {
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
-            (ubatch.n_seqs_unq == other.ubatch.n_seqs_unq || (is_inkling_draft_feed() && other.is_inkling_draft_feed())) &&
+            (ubatch.n_seqs_unq == other.ubatch.n_seqs_unq || (is_chunked_inkling_draft_feed() && other.is_chunked_inkling_draft_feed())) &&
             ubatch.is_mixed()   == other.ubatch.is_mixed() &&
             (
                 (!ubatch.token && !other.ubatch.token) ||

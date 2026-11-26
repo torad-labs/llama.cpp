@@ -2150,11 +2150,21 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
-bool llm_graph_params::is_inkling_draft_feed() const {
-    // Only the simple split on a unified cache has no sequence layout in the feed's inputs.
-    return n_outputs == 0 && (ubatch.embd || ubatch.embd_row) && !ubatch.equal_seqs() &&
-        cparams.kv_unified && cparams.n_seq_devices == 1 && gtype != LLM_GRAPH_TYPE_ENCODER &&
-        model && llama_model_is_inkling_draft(*model);
+bool llm_graph_params::is_chunked_inkling_draft_feed(
+        const llama_model & model, const llama_cparams & cparams, uint32_t n_outputs, bool has_features) {
+    if (n_outputs != 0 || !has_features || !cparams.kv_unified || cparams.n_seq_devices != 1 ||
+            !llama_model_is_inkling_draft(model)) {
+        return false;
+    }
+    static const bool legacy = ggml_env_switch("LLAMA_DSPARK_FEED_CHUNK_LEGACY");
+    return !legacy;
+}
+
+bool llm_graph_params::is_chunked_inkling_draft_feed() const {
+    // The feed does not attend: its KQ masks are sized by n_seqs_unq via get_n_kv_slices but never allocated.
+    // If the feed starts attending, put n_seqs_unq back in the reuse key.
+    return !ubatch.equal_seqs() && gtype != LLM_GRAPH_TYPE_ENCODER && model &&
+        is_chunked_inkling_draft_feed(*model, cparams, n_outputs, ubatch.embd || ubatch.embd_row);
 }
 
 bool llm_graph_result::same_shape(const llm_graph_params & other) const {
@@ -2164,8 +2174,8 @@ bool llm_graph_result::same_shape(const llm_graph_params & other) const {
             built.equal_seqs() != ubatch.equal_seqs() || params.n_outputs != other.n_outputs) {
         return false;
     }
-    const bool feed = other.is_inkling_draft_feed();
-    return feed == params.is_inkling_draft_feed() && (feed || built.n_seqs_unq == ubatch.n_seqs_unq);
+    const bool feed = other.is_chunked_inkling_draft_feed();
+    return feed == params.is_chunked_inkling_draft_feed() && (feed || built.n_seqs_unq == ubatch.n_seqs_unq);
 }
 
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
