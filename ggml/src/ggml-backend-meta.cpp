@@ -3371,6 +3371,9 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
     }
 }
 
+// Keep split scratch warm across saves and restores on the same thread, without storing buffer pointers.
+static thread_local std::unique_ptr<uint8_t[]> ggml_backend_meta_tensor_n_scratch[GGML_BACKEND_META_MAX_DEVICES];
+
 // Whole split rows are packed per child buffer before transfer. Other layouts keep the scalar path.
 template <bool write>
 static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std::conditional_t<write, const void *, void *> const * data,
@@ -3501,7 +3504,14 @@ static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std
                         return;
                     }
                     if (!b.scratch) {
-                        b.scratch.reset(new uint8_t[part_bytes]);
+                        const size_t slot = &b - p.batches.data();
+                        if (slot < GGML_BACKEND_META_MAX_DEVICES) {
+                            // Borrow the scratch so a nested copy cannot use the same storage.
+                            b.scratch = std::move(ggml_backend_meta_tensor_n_scratch[slot]);
+                        }
+                        if (!b.scratch) {
+                            b.scratch.reset(new uint8_t[part_bytes]);
+                        }
                     }
                     for (size_t r = 0; r < rows;) {
                         const size_t ranges = part_ranges - b.tensors.size();
@@ -3541,6 +3551,11 @@ static void ggml_backend_meta_buffer_tensor_n(ggml_tensor * const * tensors, std
         }
     }
     flush_all();
+    for (size_t i = 0; i < std::min<size_t>(batches.size(), GGML_BACKEND_META_MAX_DEVICES); ++i) {
+        if (batches[i].scratch) {
+            ggml_backend_meta_tensor_n_scratch[i] = std::move(batches[i].scratch);
+        }
+    }
 }
 
 static void ggml_backend_meta_buffer_set_tensor_n(ggml_backend_buffer_t buffer, ggml_tensor * const * tensors, const void * const * data,
