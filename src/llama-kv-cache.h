@@ -250,6 +250,9 @@ public:
     uint32_t get_n_kv(const slot_info & sinfo, const llama_ubatch * ubatch = nullptr, uint32_t * n_pad_used = nullptr,
             uint32_t * n_kv_pool = nullptr) const;
 
+    void keep_inkling_span() { keep_span = true; }
+    bool keeps_inkling_span() const { return pad_dense_inkling && keep_span; }
+
     // the widest padding used to size the indexer's pools
     uint32_t get_n_pad_max() const;
 
@@ -460,6 +463,7 @@ private:
     // sequence or with LLAMA_KV_PAD_DENSE_LEGACY=1 when the cache is made
     bool pad_dense_shared  = false;
     bool pad_dense_inkling = false;
+    bool keep_span = false;
     mutable uint32_t n_kv_bucket = 0; // last shared Inkling 2 or DSpark span
 
     // SWA

@@ -401,7 +401,9 @@ public:
         const auto & ub = params.ubatch;
         const auto * kv = cache[i];
         const bool decode_rows = params.cparams.rel_decode_rows;
-        if (!params.cparams.attn_mask_bits || !params.cparams.kv_unified || kv->is_full()) {
+        // A prompt tail may belong to a new or a long-lived sequence on each replay.
+        const bool kept_prompt = kv->get_kv()->keeps_inkling_span() && params.n_outputs < ub.n_tokens;
+        if (!params.cparams.attn_mask_bits || !params.cparams.kv_unified || kv->is_full() || kept_prompt) {
             return inkling2_decode_mask::dense;
         }
         const ggml_type kt = kv->type_k();

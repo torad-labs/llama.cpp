@@ -4210,6 +4210,25 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         throw std::runtime_error("an MTP attention window is not supported by this model's memory");
     }
 
+    if (cparams.kv_unified && cparams.flash_attn && cparams.attn_mask_bits && !ggml_env_switch("LLAMA_INKLING2_DSPARK_KV_LEGACY")) {
+        const auto * target = cparams.ctx_other ? llama_get_model(cparams.ctx_other) : this;
+        // Mini's cache keeps its existing buckets.
+        if (target->arch == LLM_ARCH_INKLING2 && target->hparams.n_expert != 128) {
+            llama_kv_cache_iswa * cache = nullptr;
+            if (arch == LLM_ARCH_INKLING2 && cparams.n_rs_seq > 0) {
+                if (auto * hybrid = dynamic_cast<llama_memory_hybrid_iswa *>(res)) {
+                    cache = hybrid->get_mem_attn();
+                }
+            } else if (llama_model_is_inkling_draft(*this)) {
+                cache = dynamic_cast<llama_kv_cache_iswa *>(res);
+            }
+            if (cache) {
+                cache->get_base()->keep_inkling_span();
+                cache->get_swa()->keep_inkling_span();
+            }
+        }
+    }
+
     return res;
 }
 

@@ -953,6 +953,11 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
 
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get());
+                hybrid && hybrid->get_mem_attn()->get_base()->keeps_inkling_span()) {
+            balloc->set_prompt_tail(cparams.n_rs_seq + 1);
+        }
+
         if (params.path_kv_mean_center != nullptr) {
             // collect every standard llama_kv_cache the memory module keeps for attention
             // layers. hybrid (recurrent + attention) models keep one for their attention
