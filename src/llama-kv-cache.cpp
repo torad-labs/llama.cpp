@@ -1738,12 +1738,14 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
         const uint32_t used = v_cells[sinfo.strm[0]].used_max_p1();
         const uint32_t capacity = get_size();
         if (keep_span) {
-            // Keep the read span through small growth and turnover. Grow only when it no longer fits.
-            uint64_t span = std::max<uint64_t>(65536, n_kv_bucket);
-            while (span < used) {
-                span *= 2;
+            // Hold the read span until it fills or the pool's high-water falls to a quarter.
+            if (used > n_kv_bucket || 4ull*used <= n_kv_bucket) {
+                uint64_t span = 512;
+                while (span < used) {
+                    span *= 2;
+                }
+                n_kv_bucket = std::min<uint64_t>(span, capacity);
             }
-            n_kv_bucket = std::min<uint64_t>(span, capacity);
         } else {
             const auto bucket = [&](uint64_t span) {
                 uint64_t step = 512;
