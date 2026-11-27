@@ -2468,6 +2468,16 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     for (size_t i = 0; i < n_backends; i++) {
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
     }
+    // Ranks on one GPU spin while they wait for each other's all-reduce packets.
+    // A side stream can delay graph replay until those ranks stop spinning, so do not use side streams for these ranks.
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    for (size_t i = 0; i < n_backends; i++) {
+        for (size_t j = 0; j < n_backends; j++) {
+            if (j != i && info.devices[ret->dev_ids[i]].physical_device == info.devices[ret->dev_ids[j]].physical_device) {
+                static_cast<ggml_backend_cuda_context *>(backends[i]->context)->card_shared = true;
+            }
+        }
+    }
 
     const char * env = ggml_env_str("GGML_CUDA_ALLREDUCE");
     if (!env) {
@@ -3962,7 +3972,8 @@ static ggml_cuda_l2_issue_plan ggml_cuda_l2_issue_plan_of(ggml_backend_cuda_cont
 
     ggml_cuda_l2_issue_plan plan;
     const ggml_cuda_device_info::cuda_device_info & dev = ggml_cuda_info().devices[ctx.device];
-    if (legacy || !GGML_CUDA_CC_IS_NVIDIA(dev.cc) || dev.cc < GGML_CUDA_CC_HOPPER || dev.dram_gbs <= 0.0 || dev.l2_bytes == 0) {
+    if (legacy || ctx.card_shared || !GGML_CUDA_CC_IS_NVIDIA(dev.cc) || dev.cc < GGML_CUDA_CC_HOPPER || dev.dram_gbs <= 0.0 ||
+            dev.l2_bytes == 0) {
         return plan;
     }
     // of the L2 outside the lines the recurrent states persist in (ggml_cuda_l2_persist_window)
@@ -4257,7 +4268,7 @@ struct ggml_cuda_l2_expert_warm_plan {
 static ggml_cuda_l2_expert_warm_plan ggml_cuda_l2_expert_warm_plan_of(
         ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
     ggml_cuda_l2_expert_warm_plan plan;
-    if (!ggml_env_switch("GGML_CUDA_L2_EXPERT_WARM")) {
+    if (!ggml_env_switch("GGML_CUDA_L2_EXPERT_WARM") || ctx.card_shared) {
         return plan;
     }
     const double dose_mib = ggml_env_float("GGML_CUDA_L2_EXPERT_WARM_MIB");

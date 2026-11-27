@@ -2794,6 +2794,7 @@ struct ggml_backend_cuda_context {
     cudaEvent_t l2_issue_join = nullptr;
     bool        l2_issue_open = false;   // an issuer was started and the stream has not waited for it
     bool        l2_issue_counter = false; // the open issuer forked through device arrival counters
+    bool        card_shared = false; // another rank of this backend's all-reduce runs on the same GPU (ggml_backend_cuda_comm_init)
     ggml_cuda_l2_issue_stop l2_issue_stop;
     ggml_cuda_arrival_counters arrival_counters;
     bool        l2_persisting = false;   // a launch was given a persisting L2 window (ggml_cuda_l2_persist_window)
