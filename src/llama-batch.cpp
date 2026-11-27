@@ -82,6 +82,16 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, uint32_t n_devic
     seq_idx.resize(LLAMA_MAX_SEQ, -1);
 }
 
+void llama_batch_allocr::set_prompt_tail(uint32_t n_rows) {
+    if (!getenv("LLAMA_PROMPT_SHAPE_SMALL")) {
+        uint32_t tail = 1;
+        while (tail < n_rows && tail < prompt_shape_small) {
+            tail *= 2;
+        }
+        prompt_shape_small = tail;
+    }
+}
+
 bool llama_batch_allocr::init(
         const llama_batch_ext & batch_inp,
         const llama_vocab & vocab,

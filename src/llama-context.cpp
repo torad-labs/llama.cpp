@@ -953,6 +953,35 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
 
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get());
+                hybrid && hybrid->get_mem_attn()->get_base()->keeps_inkling_span()) {
+            balloc->set_prompt_tail(cparams.n_rs_seq + 1);
+        }
+
+        if (graph_any_seqs && !ggml_env_switch("LLAMA_INKLING2_GRAPH_SLOTS_LEGACY")) {
+            if (model.arch == LLM_ARCH_INKLING2 && model.hparams.n_expert != 128 &&
+                    cparams.n_rs_seq > 0 && graph_prompt_shapes) {
+                const size_t verify = std::min(cparams.n_seq_max, cparams.n_ubatch / (cparams.n_rs_seq + 1));
+                const uint32_t tail = std::min(cparams.n_ubatch, balloc->get_prompt_tail());
+                size_t chunks = 0;
+                for (uint32_t rows = cparams.n_ubatch; rows > tail; rows /= 2) {
+                    ++chunks;
+                }
+                // Verify counts, one reply, prompt chunks, and tails with or without logits.
+                graph_slots_max = std::max(graph_slots_max, verify + 1 + chunks + 2*tail);
+            } else if (cparams.ctx_other && llama_model_is_inkling_draft(model)) {
+                const auto * target = llama_get_model(cparams.ctx_other);
+                if (target->arch == LLM_ARCH_INKLING2 && target->hparams.n_expert != 128) {
+                    size_t chunks = 0;
+                    for (uint32_t rows = cparams.n_ubatch; rows > 0; rows /= 2) {
+                        ++chunks;
+                    }
+                    // One block per active count, power-of-two feed chunks, and warmup.
+                    graph_slots_max = std::max(graph_slots_max, size_t(cparams.n_seq_max) + chunks + 1);
+                }
+            }
+        }
+
         if (params.path_kv_mean_center != nullptr) {
             // collect every standard llama_kv_cache the memory module keeps for attention
             // layers. hybrid (recurrent + attention) models keep one for their attention

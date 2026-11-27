@@ -205,6 +205,9 @@ public:
     uint32_t get_n_outputs() const;
     uint32_t get_n_used()    const;
 
+    void set_prompt_tail(uint32_t n_rows);
+    uint32_t get_prompt_tail() const { return prompt_shape_small; }
+
     // the array of output indices in the order they were encountered during the ubatch splitting
     std::vector<int32_t> & get_out_ids();
 

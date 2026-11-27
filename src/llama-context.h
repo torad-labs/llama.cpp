@@ -622,7 +622,7 @@ private:
     // 3, or LLAMA_GRAPH_SLOTS: with LLAMA_GRAPH_ANY_SEQS a graph serves every set of as many sequences, and a slot for
     // each count of sequences keeps every decode a reuse (the meta backend then needs GGML_META_CAPTURE_GRAPHS of
     // at least the slots and two more, to keep their captured evaluations)
-    const size_t graph_slots_max = (size_t) ggml_env_int("LLAMA_GRAPH_SLOTS");
+    size_t graph_slots_max = (size_t) ggml_env_int("LLAMA_GRAPH_SLOTS");
     // LLAMA_GRAPH_ANY_SEQS=1, read when the context is made (llm_graph_params::any_seqs)
     const bool graph_any_seqs = ggml_env_switch("LLAMA_GRAPH_ANY_SEQS");
     // the loop's active pass count (Inkling 2 loop), read when the context is made (llm_graph_params::loop_passes), and

@@ -669,6 +669,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    // An empty unified pool no longer needs the previous read span.
+    if (keep_span && v_cells[0].get_used() == 0) {
+        n_kv_bucket = 0;
+    }
+
     return true;
 }
 
@@ -1737,21 +1742,30 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
     if (pad_dense_inkling && sinfo.n_stream() > 0) {
         const uint32_t used = v_cells[sinfo.strm[0]].used_max_p1();
         const uint32_t capacity = get_size();
-        const auto bucket = [&](uint64_t span) {
-            uint64_t step = 512;
-            while (step < span && step < n_pad_shared) {
-                step *= 2;
+        if (keep_span) {
+            // Hold the read span through turnover; grow only when it no longer fits.
+            uint64_t span = std::max<uint64_t>(65536, n_kv_bucket);
+            while (span < used) {
+                span *= 2;
             }
-            if (span > 4ull*n_pad_shared) {
-                step = 2ull*n_pad_shared;
-            }
-            return std::min<uint64_t>(capacity, std::max(step, GGML_PAD(span, step)));
-        };
+            n_kv_bucket = std::min<uint64_t>(span, capacity);
+        } else {
+            const auto bucket = [&](uint64_t span) {
+                uint64_t step = 512;
+                while (step < span && step < n_pad_shared) {
+                    step *= 2;
+                }
+                if (span > 4ull*n_pad_shared) {
+                    step = 2ull*n_pad_shared;
+                }
+                return std::min<uint64_t>(capacity, std::max(step, GGML_PAD(span, step)));
+            };
 
-        // Grow at the bucket edge, but require a drop past the edge and the deadband before shrinking.
-        const uint32_t next = bucket(used);
-        if (next >= n_kv_bucket || bucket(uint64_t(used) + std::min(used/4, n_pad_shared/4)) < n_kv_bucket) {
-            n_kv_bucket = next;
+            // Grow at the bucket edge, but require a drop past the edge and the deadband before shrinking.
+            const uint32_t next = bucket(used);
+            if (next >= n_kv_bucket || bucket(uint64_t(used) + std::min(used/4, n_pad_shared/4)) < n_kv_bucket) {
+                n_kv_bucket = next;
+            }
         }
         result = n_kv_bucket;
     } else if (!scores && pad_dense_shared) {

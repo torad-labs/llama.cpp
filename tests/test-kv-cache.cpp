@@ -356,7 +356,7 @@ int main() {
             static_cast<llama_model_dflash &>(*model).dspark_markov_rank = 1;
             GGML_ASSERT(llama_model_is_inkling_draft(*model));
         }
-        const uint32_t n_seq = 23, size = 65536, n_steps = 2048;
+        const uint32_t n_seq = 23, size = 131072, n_steps = 2048;
         llama_kv_cache kv(*model, false, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, size, n_seq,
                 0, LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
         std::vector<llama_seq_id> seq(n_seq);
@@ -425,6 +425,30 @@ int main() {
         GGML_ASSERT(kv.get_n_kv(slot) == (narrow ? 30720u : 32768u));
         kv.clear(false);
         GGML_ASSERT(kv.get_n_kv(slot) == (narrow ? 256u : 512u));
+
+        if (!narrow) {
+            kv.keep_inkling_span();
+            place(0, 2047);
+            for (uint32_t cell : { 24575u, 24576u, 65535u }) {
+                place(1, cell);
+                GGML_ASSERT(kv.get_n_kv(slot) == 65536);
+                GGML_ASSERT(kv.seq_rm(1, -1, -1));
+            }
+
+            place(1, 65536);
+            GGML_ASSERT(kv.get_n_kv(slot) == size);
+            GGML_ASSERT(kv.seq_rm(1, -1, -1));
+            GGML_ASSERT(kv.get_n_kv(slot) == size);
+
+            GGML_ASSERT(kv.seq_rm(0, -1, -1));
+            place(0, 2047);
+            GGML_ASSERT(kv.get_n_kv(slot) == 65536);
+
+            place(1, 65536);
+            GGML_ASSERT(kv.get_n_kv(slot) == size);
+            kv.clear(false);
+            GGML_ASSERT(kv.get_n_kv(slot) == 65536);
+        }
     }
 
     llama_backend_free();
