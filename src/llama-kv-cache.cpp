@@ -669,6 +669,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    // An empty unified pool no longer needs the previous read span.
+    if (keep_span && v_cells[0].get_used() == 0) {
+        n_kv_bucket = 0;
+    }
+
     return true;
 }
 
@@ -1738,14 +1743,12 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, const llama_ubatch * 
         const uint32_t used = v_cells[sinfo.strm[0]].used_max_p1();
         const uint32_t capacity = get_size();
         if (keep_span) {
-            // Hold the read span until it fills or the pool's high-water falls to a quarter.
-            if (used > n_kv_bucket || 4ull*used <= n_kv_bucket) {
-                uint64_t span = 512;
-                while (span < used) {
-                    span *= 2;
-                }
-                n_kv_bucket = std::min<uint64_t>(span, capacity);
+            // Hold the read span through turnover; grow only when it no longer fits.
+            uint64_t span = std::max<uint64_t>(65536, n_kv_bucket);
+            while (span < used) {
+                span *= 2;
             }
+            n_kv_bucket = std::min<uint64_t>(span, capacity);
         } else {
             const auto bucket = [&](uint64_t span) {
                 uint64_t step = 512;

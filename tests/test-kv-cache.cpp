@@ -429,22 +429,25 @@ int main() {
         if (!narrow) {
             kv.keep_inkling_span();
             place(0, 2047);
-            GGML_ASSERT(kv.get_n_kv(slot) == 2048);
-            place(1, 16383);
-            GGML_ASSERT(kv.get_n_kv(slot) == 16384);
-            GGML_ASSERT(kv.seq_rm(1, -1, -1));
-            GGML_ASSERT(kv.get_n_kv(slot) == 2048);
+            for (uint32_t cell : { 24575u, 24576u, 65535u }) {
+                place(1, cell);
+                GGML_ASSERT(kv.get_n_kv(slot) == 65536);
+                GGML_ASSERT(kv.seq_rm(1, -1, -1));
+            }
 
             place(1, 65536);
             GGML_ASSERT(kv.get_n_kv(slot) == size);
             GGML_ASSERT(kv.seq_rm(1, -1, -1));
-            place(1, 32768);
             GGML_ASSERT(kv.get_n_kv(slot) == size);
-            GGML_ASSERT(kv.seq_rm(1, -1, -1));
-            place(1, 32767);
-            GGML_ASSERT(kv.get_n_kv(slot) == 32768);
-            GGML_ASSERT(kv.seq_rm(1, -1, -1));
-            GGML_ASSERT(kv.get_n_kv(slot) == 2048);
+
+            GGML_ASSERT(kv.seq_rm(0, -1, -1));
+            place(0, 2047);
+            GGML_ASSERT(kv.get_n_kv(slot) == 65536);
+
+            place(1, 65536);
+            GGML_ASSERT(kv.get_n_kv(slot) == size);
+            kv.clear(false);
+            GGML_ASSERT(kv.get_n_kv(slot) == 65536);
         }
     }
 
