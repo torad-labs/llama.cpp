@@ -2017,6 +2017,20 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // between configs; both unset means the route stays on the live path.
     p->ce_cap = !ggml_env_switch("GGML_CUDA_AR_COPY_ENGINE_CAPTURE_LEGACY") &&
                 ggml_env_switch("GGML_CUDA_AR_COPY_ENGINE_CAPTURE");
+    // Ranks on one GPU share its work queues: in captured steps one rank's publish can queue behind the other ranks'
+    // branches that wait on it, so these ranks keep their reductions on their compute streams.
+    bool shared_gpu = false;
+    for (size_t i = 0; i < n_devices; ++i) {
+        for (size_t j = i + 1; j < n_devices; ++j) {
+            shared_gpu = shared_gpu || ggml_cuda_info().devices[p->devices[i]].physical_device ==
+                                       ggml_cuda_info().devices[p->devices[j]].physical_device;
+        }
+    }
+    if (p->ce_cap && shared_gpu) {
+        GGML_LOG_INFO("%s: ranks share a GPU: copy-engine capture off, reductions stay off the copy engines\n", __func__);
+        p->ce_cap         = false;
+        p->copy_threshold = 0;
+    }
     if (p->ce_cap) {
         const size_t tok_bytes = GGML_CUDA_AR_CE_TOK_COUNT * GGML_CUDA_AR_CE_STRIDE * sizeof(uint32_t);
         if (p->ce_tokens.alloc(tok_bytes) != cudaSuccess) {

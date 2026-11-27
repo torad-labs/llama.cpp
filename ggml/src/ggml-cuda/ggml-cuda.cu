@@ -2389,11 +2389,41 @@ static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
     return false;
 }
 
+// Ranks on one GPU spin while they wait for each other's all-reduce packets.
+// A side stream can delay graph replay until those ranks stop spinning, so do not use side streams for these ranks.
+static void ggml_backend_cuda_comm_mark_shared(ggml_backend_cuda_comm_context * comm, int delta) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    for (size_t i = 0; i < comm->backends.size(); i++) {
+        for (size_t j = 0; j < comm->backends.size(); j++) {
+            if (j == i || info.devices[comm->dev_ids[i]].physical_device != info.devices[comm->dev_ids[j]].physical_device) {
+                continue;
+            }
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm->backends[i]->context);
+            const bool was_shared = ctx->card_shared > 0;
+            ctx->card_shared += delta;
+#ifdef USE_CUDA_GRAPH
+            if (was_shared != (ctx->card_shared > 0)) {
+                // graphs captured under the other policy keep its side streams
+                for (const auto & [key, graph] : ctx->cuda_graphs) {
+                    ctx->cuda_graph_forget(graph.get());
+                }
+                ctx->cuda_graphs.clear();
+            }
+#endif // USE_CUDA_GRAPH
+            break;
+        }
+    }
+}
+
 static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
     if (comm_ctx_v == nullptr) {
         return;
     }
-    delete static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->world_size == 0) {
+        ggml_backend_cuda_comm_mark_shared(comm_ctx, -1);
+    }
+    delete comm_ctx;
 }
 
 // ---------------------------------------------------------------------------
@@ -2457,7 +2487,9 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
 // platform default.
 static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
     for (size_t i = 0; i < n_backends; i++) {
-        if (!ggml_backend_is_cuda(backends[i])) {
+        // the GUID is shared with other builds of this source (HIP, MUSA), whose contexts differ
+        if (!ggml_backend_is_cuda(backends[i]) ||
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[i])) != ggml_backend_cuda_reg()) {
             return nullptr;
         }
     }
@@ -2468,16 +2500,7 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     for (size_t i = 0; i < n_backends; i++) {
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
     }
-    // Ranks on one GPU spin while they wait for each other's all-reduce packets.
-    // A side stream can delay graph replay until those ranks stop spinning, so do not use side streams for these ranks.
-    const ggml_cuda_device_info & info = ggml_cuda_info();
-    for (size_t i = 0; i < n_backends; i++) {
-        for (size_t j = 0; j < n_backends; j++) {
-            if (j != i && info.devices[ret->dev_ids[i]].physical_device == info.devices[ret->dev_ids[j]].physical_device) {
-                static_cast<ggml_backend_cuda_context *>(backends[i]->context)->card_shared = true;
-            }
-        }
-    }
+    ggml_backend_cuda_comm_mark_shared(ret, 1);
 
     const char * env = ggml_env_str("GGML_CUDA_ALLREDUCE");
     if (!env) {
