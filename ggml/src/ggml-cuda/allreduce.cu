@@ -1327,6 +1327,8 @@ struct ggml_cuda_ar_pipeline {
     // this pipeline was born with GGML_CUDA_AR_COPY_ENGINE_CAPTURE=1 and without the LEGACY revert: its
     // copy-engine route may capture whole, and its rendezvous tokens exist
     bool                      ce_cap                             = false;
+    // stream memory ops (cuStreamWaitValue32/WriteValue32/BatchMemOp) replace CE sync kernels when supported
+    bool                      ce_memop                           = false;
 
     // a captured call ran and no capture is open now: if meta refused the step,
     // its pooled events need fresh records before the live route syncs one
@@ -1471,12 +1473,79 @@ static void ggml_cuda_ar_wait_for_compute(
     CUDA_CHECK(cudaStreamWaitEvent(p->streams[rank], ev.app));
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12000
+#define GGML_CUDA_AR_HAS_STREAM_MEM_OPS 1
+#else
+#define GGML_CUDA_AR_HAS_STREAM_MEM_OPS 0
+#endif
+
 // The rendezvous counters at [row * GGML_CUDA_MAX_DEVICES + col] of each block
 static uint32_t * ggml_cuda_ar_ce_at(const ggml_cuda_ar_pipeline * p, size_t base, int row, int col) {
     return p->ce_tok + (base + (size_t) row * GGML_CUDA_MAX_DEVICES + col) * GGML_CUDA_AR_CE_STRIDE;
 }
 
+#if GGML_CUDA_AR_HAS_STREAM_MEM_OPS
+static void ggml_cuda_ar_ce_memop_wait_peers(
+        const ggml_cuda_ar_pipeline * p, size_t base, int fixed_idx, bool fixed_is_col, uint32_t value, cudaStream_t stream) {
+    CUstream s = reinterpret_cast<CUstream>(stream);
+    if (p->n_devices == 2) {
+        const int other = 1 - fixed_idx;
+        const int row = fixed_is_col ? other : fixed_idx;
+        const int col = fixed_is_col ? fixed_idx : other;
+        CU_CHECK(cuStreamWaitValue32(s, reinterpret_cast<CUdeviceptr>(ggml_cuda_ar_ce_at(p, base, row, col)),
+                                     value, CU_STREAM_WAIT_VALUE_EQ));
+        return;
+    }
+    CUstreamBatchMemOpParams ops[GGML_CUDA_MAX_DEVICES] = {};
+    unsigned int n_ops = 0;
+    for (int peer = 0; peer < p->n_devices; ++peer) {
+        if (peer == fixed_idx) { continue; }
+        const int row = fixed_is_col ? peer : fixed_idx;
+        const int col = fixed_is_col ? fixed_idx : peer;
+        ops[n_ops].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+        ops[n_ops].waitValue.address   = reinterpret_cast<CUdeviceptr>(ggml_cuda_ar_ce_at(p, base, row, col));
+        ops[n_ops].waitValue.value     = value;
+        ops[n_ops].waitValue.flags     = CU_STREAM_WAIT_VALUE_EQ;
+        ++n_ops;
+    }
+    CU_CHECK(cuStreamBatchMemOp(s, n_ops, ops, 0));
+}
+
+static void ggml_cuda_ar_ce_memop_write_peers(
+        const ggml_cuda_ar_pipeline * p, size_t base, int fixed_idx, bool fixed_is_col, uint32_t value, cudaStream_t stream) {
+    CUstream s = reinterpret_cast<CUstream>(stream);
+    if (p->n_devices == 2) {
+        const int other = 1 - fixed_idx;
+        const int row = fixed_is_col ? other : fixed_idx;
+        const int col = fixed_is_col ? fixed_idx : other;
+        CU_CHECK(cuStreamWriteValue32(s, reinterpret_cast<CUdeviceptr>(ggml_cuda_ar_ce_at(p, base, row, col)),
+                                      value, CU_STREAM_WRITE_VALUE_DEFAULT));
+        return;
+    }
+    CUstreamBatchMemOpParams ops[GGML_CUDA_MAX_DEVICES] = {};
+    unsigned int n_ops = 0;
+    for (int peer = 0; peer < p->n_devices; ++peer) {
+        if (peer == fixed_idx) { continue; }
+        const int row = fixed_is_col ? peer : fixed_idx;
+        const int col = fixed_is_col ? fixed_idx : peer;
+        ops[n_ops].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_32;
+        ops[n_ops].writeValue.address   = reinterpret_cast<CUdeviceptr>(ggml_cuda_ar_ce_at(p, base, row, col));
+        ops[n_ops].writeValue.value     = value;
+        ops[n_ops].writeValue.flags     = CU_STREAM_WRITE_VALUE_DEFAULT;
+        ++n_ops;
+    }
+    CU_CHECK(cuStreamBatchMemOp(s, n_ops, ops, 0));
+}
+#endif
+
 static void ggml_cuda_ar_ce_wait_send(const ggml_cuda_ar_pipeline * p, int rank, cudaStream_t stream) {
+#if GGML_CUDA_AR_HAS_STREAM_MEM_OPS
+    if (p->ce_memop) {
+        const size_t base = p->copy_peer ? GGML_CUDA_AR_CE_LAND : GGML_CUDA_AR_CE_READ;
+        ggml_cuda_ar_ce_memop_wait_peers(p, base, rank, /*fixed_is_col=*/true, 0u, stream);
+        return;
+    }
+#endif
     const size_t waited = p->copy_peer ? GGML_CUDA_AR_CE_DT_ADD : GGML_CUDA_AR_CE_READ;
     const uint32_t * against = ggml_cuda_ar_ce_at(p, p->copy_peer ? GGML_CUDA_AR_CE_DT_WROTE : GGML_CUDA_AR_CE_SENT, 0, rank);
     if (p->n_devices == 2) {
@@ -1485,6 +1554,89 @@ static void ggml_cuda_ar_ce_wait_send(const ggml_cuda_ar_pipeline * p, int rank,
         ggml_cuda_ar_ce_wait_peers<false><<<1, 32, 0, stream>>>(
             ggml_cuda_ar_ce_at(p, waited, 0, rank), against, rank, p->n_devices);
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_ar_ce_publish_send(const ggml_cuda_ar_pipeline * p, int rank, cudaStream_t stream) {
+#if GGML_CUDA_AR_HAS_STREAM_MEM_OPS
+    if (p->ce_memop) {
+        const size_t base = p->copy_peer ? GGML_CUDA_AR_CE_LAND : GGML_CUDA_AR_CE_READ;
+        ggml_cuda_ar_ce_memop_write_peers(p, base, rank, /*fixed_is_col=*/true, 1u, stream);
+        return;
+    }
+#endif
+    if (!p->copy_peer) {
+        ggml_cuda_ar_ce_bump<<<1, 32, 0, stream>>>(
+            ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_SENT, 0, rank));
+    } else {
+        ggml_cuda_ar_ce_publish_d2d<<<1, 32, 0, stream>>>(
+            ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_LAND, 0, 0),
+            ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_WROTE, 0, rank), rank, p->n_devices);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_ar_ce_wait_recv_peer(const ggml_cuda_ar_pipeline * p, int rank, int peer, cudaStream_t stream) {
+#if GGML_CUDA_AR_HAS_STREAM_MEM_OPS
+    if (p->ce_memop) {
+        CU_CHECK(cuStreamWaitValue32(
+            reinterpret_cast<CUstream>(stream),
+            reinterpret_cast<CUdeviceptr>(ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, rank, peer)),
+            1u, CU_STREAM_WAIT_VALUE_EQ));
+        return;
+    }
+#endif
+    ggml_cuda_ar_ce_wait_new<<<1, 32, 0, stream>>>(
+        (const volatile uint32_t *) ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_SENT, 0, peer),
+        (volatile uint32_t *) ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, rank, peer));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_ar_ce_wait_recv_all_d2d(const ggml_cuda_ar_pipeline * p, int rank, cudaStream_t stream) {
+#if GGML_CUDA_AR_HAS_STREAM_MEM_OPS
+    if (p->ce_memop) {
+        ggml_cuda_ar_ce_memop_wait_peers(p, GGML_CUDA_AR_CE_LAND, rank, /*fixed_is_col=*/false, 1u, stream);
+        return;
+    }
+#endif
+    if (p->n_devices == 2) {
+        ggml_cuda_ar_ce_wait_new<<<1, 32, 0, stream>>>(
+            ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_LAND, rank, 1 - rank),
+            ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_ADD, rank, 1 - rank));
+    } else {
+        ggml_cuda_ar_ce_wait_peers<true><<<1, 32, 0, stream>>>(
+            ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_LAND, rank, 0),
+            ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_ADD, rank, 0), rank, p->n_devices);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_ar_ce_release_recv_peer(const ggml_cuda_ar_pipeline * p, int rank, int peer, cudaStream_t stream) {
+#if GGML_CUDA_AR_HAS_STREAM_MEM_OPS
+    if (p->ce_memop) {
+        CU_CHECK(cuStreamWriteValue32(
+            reinterpret_cast<CUstream>(stream),
+            reinterpret_cast<CUdeviceptr>(ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, rank, peer)),
+            0u, CU_STREAM_WRITE_VALUE_DEFAULT));
+        return;
+    }
+#endif
+    ggml_cuda_ar_ce_bump<<<1, 32, 0, stream>>>(
+        ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, rank, peer));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_ar_ce_release_recv_all(const ggml_cuda_ar_pipeline * p, int rank, cudaStream_t stream) {
+#if GGML_CUDA_AR_HAS_STREAM_MEM_OPS
+    if (p->ce_memop) {
+        const size_t base = p->copy_peer ? GGML_CUDA_AR_CE_LAND : GGML_CUDA_AR_CE_READ;
+        ggml_cuda_ar_ce_memop_write_peers(p, base, rank, /*fixed_is_col=*/false, 0u, stream);
+        return;
+    }
+#endif
+    const size_t base = p->copy_peer ? GGML_CUDA_AR_CE_DT_ADD : GGML_CUDA_AR_CE_READ;
+    ggml_cuda_ar_ce_read_all<<<1, 32, 0, stream>>>(
+        ggml_cuda_ar_ce_at(p, base, 0, 0), rank, p->n_devices);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2052,6 +2204,27 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             }
             p->ce_wire[i].size = p->copy_bytes;
         }
+#if GGML_CUDA_AR_HAS_STREAM_MEM_OPS
+        if (!ggml_env_switch("GGML_CUDA_AR_CE_MEMOP_LEGACY")) {
+            bool memop_ok = true;
+            for (size_t i = 0; i < n_devices && memop_ok; ++i) {
+                ggml_cuda_set_device(p->devices[i]);
+                CUstream s = reinterpret_cast<CUstream>(p->streams[i]);
+                CUdeviceptr probe_addr = reinterpret_cast<CUdeviceptr>(p->ce_tok);
+                if (cuStreamWriteValue32(s, probe_addr, 0u, CU_STREAM_WRITE_VALUE_DEFAULT) != CUDA_SUCCESS ||
+                        cuStreamWaitValue32(s, probe_addr, 0u, CU_STREAM_WAIT_VALUE_EQ) != CUDA_SUCCESS ||
+                        cudaStreamSynchronize(p->streams[i]) != cudaSuccess) {
+                    memop_ok = false;
+                }
+            }
+            p->ce_memop = memop_ok;
+            if (memop_ok) {
+                GGML_LOG_INFO("%s: copy-engine capture rendezvous uses CUDA stream memory operations\n", __func__);
+            } else {
+                GGML_LOG_WARN("%s: stream memory operations unavailable on mapped rendezvous flags; using CE sync kernels\n", __func__);
+            }
+        }
+#endif
     }
 
     const size_t gather_bytes = GGML_CUDA_AR_POOL_SIZE * GGML_CUDA_AR_PEER_MAX_BYTES * (n_devices - 1);
@@ -2273,10 +2446,7 @@ static bool ggml_cuda_ar_allreduce_copy_peer(
         CUDA_CHECK(cudaMemcpyAsync(p->dev_tmp[peer].dev, src_buf[i], nbytes, cudaMemcpyDeviceToDevice, p->streams[i]));
         // publish before recording cpy[0] so compute joins after the counter update
         if (p->ce_tok) {
-            ggml_cuda_ar_ce_publish_d2d<<<1, 32, 0, p->streams[i]>>>(
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_LAND, 0, 0),
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_WROTE, 0, i), i, p->n_devices);
-            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_ar_ce_publish_send(p, i, p->streams[i]);
         }
         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].cpy[0], p->streams[i]));
     }
@@ -2294,9 +2464,7 @@ static bool ggml_cuda_ar_allreduce_copy_peer(
         ggml_cuda_ar_copy_add<T_src, T_dst>(p, i, slot, stream, src_buf[i], dst_buf[i], ne);
         // the captured route's rendezvous: this device's adds are done with what its peers wrote it
         if (p->ce_tok) {
-            ggml_cuda_ar_ce_read_all<<<1, 32, 0, stream>>>(
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_ADD, 0, 0), i, p->n_devices);
-            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_ar_ce_release_recv_all(p, i, stream);
         }
     }
     p->dev_tmp_kernel_done_valid = true;
@@ -2387,16 +2555,8 @@ static bool ggml_cuda_ar_allreduce_copy_n(
         }
         // publish before recording the final copy event so compute joins after the counter update
         if (p->ce_tok) {
-            if (!p->copy_peer) {
-                ggml_cuda_ar_ce_bump<<<1, 32, 0, p->streams[i]>>>(
-                    ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_SENT, 0, i));
-            } else {
-                ggml_cuda_ar_ce_publish_d2d<<<1, 32, 0, p->streams[i]>>>(
-                    ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_LAND, 0, 0),
-                    ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_WROTE, 0, i), i, p->n_devices);
-            }
+            ggml_cuda_ar_ce_publish_send(p, i, p->streams[i]);
             CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].cpy[chunks - 1], p->streams[i]));
-            CUDA_CHECK(cudaGetLastError());
         }
     }
     for (int i = 0; i < p->n_devices; ++i) {
@@ -2427,9 +2587,7 @@ static bool ggml_cuda_ar_allreduce_copy_n(
             }
             // update rendezvous counters before recording completion events so compute and later captures see them
             if (p->ce_tok) {
-                ggml_cuda_ar_ce_read_all<<<1, 32, 0, recv>>>(
-                    ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, 0, 0), i, p->n_devices);
-                CUDA_CHECK(cudaGetLastError());
+                ggml_cuda_ar_ce_release_recv_all(p, i, recv);
             }
             CUDA_CHECK(cudaEventRecord(p->host_large_read_done[i], recv));
             CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, recv));
@@ -2456,9 +2614,7 @@ static bool ggml_cuda_ar_allreduce_copy_n(
                 }
                 // update READ before recording recv_peer_done so compute joins after the counter bump
                 if (p->ce_tok) {
-                    ggml_cuda_ar_ce_bump<<<1, 32, 0, recv>>>(
-                        ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, i, peer));
-                    CUDA_CHECK(cudaGetLastError());
+                    ggml_cuda_ar_ce_release_recv_peer(p, i, peer, recv);
                 }
                 CUDA_CHECK(cudaEventRecord(p->recv_peer_done[i][index], recv));
                 CUDA_CHECK(cudaStreamWaitEvent(stream, p->recv_peer_done[i][index]));
@@ -2468,9 +2624,7 @@ static bool ggml_cuda_ar_allreduce_copy_n(
         ggml_cuda_ar_copy_add<T_src, T_dst, owned_rows>(p, i, slot, stream, src_buf[i], dst_buf[i], ne);
         // the captured route's rendezvous: this device's adds are done with what its peers wrote it
         if (p->ce_tok && p->copy_peer) {
-            ggml_cuda_ar_ce_read_all<<<1, 32, 0, stream>>>(
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_ADD, 0, 0), i, p->n_devices);
-            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_ar_ce_release_recv_all(p, i, stream);
         }
     }
     p->host_large_read_done_valid = !p->copy_peer && rank_order;
@@ -2545,10 +2699,8 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         }
         // publish SENT before recording the final copy event so compute joins after the counter bump
         if (p->ce_tok) {
-            ggml_cuda_ar_ce_bump<<<1, 32, 0, p->streams[i]>>>(
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_SENT, 0, i));
+            ggml_cuda_ar_ce_publish_send(p, i, p->streams[i]);
             CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].cpy[copy_chunks - 1], p->streams[i]));
-            CUDA_CHECK(cudaGetLastError());
         }
     }
 
@@ -2588,9 +2740,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
 
         // update READ before recording host_large_read_done so senders and later captures see it
         if (p->ce_tok) {
-            ggml_cuda_ar_ce_bump<<<1, 32, 0, recv>>>(
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, i, peer));
-            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_ar_ce_release_recv_peer(p, i, peer, recv);
         }
         CUDA_CHECK(cudaEventRecord(p->host_large_read_done[i], recv));
 
@@ -2716,17 +2866,9 @@ static bool ggml_cuda_ar_allreduce_copy_captured(
             }
         }
         // the publication the other cards probe for
-        if (!p->copy_peer) {
-            ggml_cuda_ar_ce_bump<<<1, 32, 0, send>>>(
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_SENT, 0, i));
-        } else {
-            ggml_cuda_ar_ce_publish_d2d<<<1, 32, 0, send>>>(
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_LAND, 0, 0),
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_WROTE, 0, i), i, p->n_devices);
-        }
+        ggml_cuda_ar_ce_publish_send(p, i, send);
         // join after the publish node so the send stream leaves no unjoined work at capture end
         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].cpy[chunks - 1], send));
-        CUDA_CHECK(cudaGetLastError());
     }
 
     // Stage 2: receives on the same streams in the same order as the live route,
@@ -2749,18 +2891,14 @@ static bool ggml_cuda_ar_allreduce_copy_captured(
                 if (session_call[i] > 0 && p->dev_tmp_kernel_done_valid) {
                     CUDA_CHECK(cudaStreamWaitEvent(recv, p->dev_tmp_kernel_done[i]));
                 }
-                ggml_cuda_ar_ce_wait_new<<<1, 32, 0, recv>>>(
-                    (const volatile uint32_t *) ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_SENT, 0, peer),
-                    (volatile uint32_t *) ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, i, peer));
-                CUDA_CHECK(cudaGetLastError());
+                ggml_cuda_ar_ce_wait_recv_peer(p, i, peer, recv);
                 for (size_t c = 0; c < chunks; ++c) {
                     const size_t offset = c*chunk_bytes;
                     const size_t bytes = std::min(chunk_bytes, nbytes - offset);
                     receive(i, peer, index, offset, bytes, recv);
                 }
                 // this share is fully in: the sender may overwrite its staging next round
-                ggml_cuda_ar_ce_bump<<<1, 32, 0, recv>>>(
-                    ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, i, peer));
+                ggml_cuda_ar_ce_release_recv_peer(p, i, peer, recv);
                 CUDA_CHECK(cudaEventRecord(p->recv_peer_done[i][index], recv));
                 CUDA_CHECK(cudaStreamWaitEvent(stream, p->recv_peer_done[i][index]));
             }
@@ -2776,10 +2914,7 @@ static bool ggml_cuda_ar_allreduce_copy_captured(
             for (int peer = 0; peer < p->n_devices; ++peer) {
                 if (peer == i) { continue; }
                 const int index = peer < i ? peer : peer - 1;
-                ggml_cuda_ar_ce_wait_new<<<1, 32, 0, recv>>>(
-                    (const volatile uint32_t *) ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_SENT, 0, peer),
-                    (volatile uint32_t *) ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, i, peer));
-                CUDA_CHECK(cudaGetLastError());
+                ggml_cuda_ar_ce_wait_recv_peer(p, i, peer, recv);
                 for (size_t c = 0; c < chunks; ++c) {
                     const size_t offset = c*chunk_bytes;
                     const size_t bytes = std::min(chunk_bytes, nbytes - offset);
@@ -2787,32 +2922,19 @@ static bool ggml_cuda_ar_allreduce_copy_captured(
                 }
             }
             // this device took every share in: its senders may overwrite their staging
-            ggml_cuda_ar_ce_read_all<<<1, 32, 0, recv>>>(
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_READ, 0, 0), i, p->n_devices);
-            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_ar_ce_release_recv_all(p, i, recv);
             CUDA_CHECK(cudaEventRecord(p->host_large_read_done[i], recv));
             CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, recv));
             CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[i][slot].h2d));
         } else {
             // card to card: wait for this device's own sends first so send always publishes before compute spins
             CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[i][slot].cpy[chunks - 1]));
-            if (p->n_devices == 2) {
-                ggml_cuda_ar_ce_wait_new<<<1, 32, 0, stream>>>(
-                    ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_LAND, i, 1 - i),
-                    ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_ADD, i, 1 - i));
-            } else {
-                ggml_cuda_ar_ce_wait_peers<true><<<1, 32, 0, stream>>>(
-                    ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_LAND, i, 0),
-                    ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_ADD, i, 0), i, p->n_devices);
-            }
-            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_ar_ce_wait_recv_all_d2d(p, i, stream);
         }
         ggml_cuda_ar_copy_add<T_src, T_dst, owned_rows>(p, i, slot, stream, src_buf[i], dst_buf[i], ne, /*signal_pace=*/false);
         if (p->copy_peer) {
             // my adds released the scratch my peers write me at: they may overwrite it next round
-            ggml_cuda_ar_ce_read_all<<<1, 32, 0, stream>>>(
-                ggml_cuda_ar_ce_at(p, GGML_CUDA_AR_CE_DT_ADD, 0, 0), i, p->n_devices);
-            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_ar_ce_release_recv_all(p, i, stream);
         }
     }
     p->dev_tmp_kernel_done_valid = true;
