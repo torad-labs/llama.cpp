@@ -36,11 +36,11 @@ TENSOR4_ENV = {**ENV, "LLAMA_KV_SEQ_CELLS": "294912", "LLAMA_SLOT_PREFIX_COPY": 
                "LLAMA_RS_STAGE_ROWS": "2", "LLAMA_CHECKPOINT_RAM_MIB": "16384"}
 
 
-def pinned(pack, kv, context, cache_ram="32768", projector=MMPROJ, swa_kv="q8_0"):
+def pinned(pack, kv, context, cache_ram="32768", projector=MMPROJ, swa_kv="q8_0", prompt_step="256"):
     argv = [SERVER, "-m", str(PACKS / (pack + ".gguf")), "--mmproj", projector,
             "-ngl", "99", "-sm", "tensor", "-ts", "1,1,1,1", "--jinja", "-fa", "on", "--poll", "0",
             "--cache-type-k", kv, "--cache-type-v", kv,
-            "-b", "2048", "-ub", "2048", "--prompt-step", "1024", "--prompt-chunk", "128", "--attn-mask-bits"]
+            "-b", "2048", "-ub", "2048", "--prompt-step", prompt_step, "--prompt-chunk", "128", "--attn-mask-bits"]
     if swa_kv:
         argv += ["--cache-type-k-swa", swa_kv, "--cache-type-v-swa", swa_kv]
     argv += ["--temp", "1.0", "--top-p", "1.0", "--top-k", "0", "--min-p", "0.0",
@@ -249,6 +249,16 @@ class OptionTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--prompt-step-ms") + 1], "40")
         self.assertEqual(argv[argv.index("--prompt-chunk") + 1], "128")
         self.assertNotIn("--prompt-step-ms", plan()[0])
+
+    def test_tensor_4_prompt_step_matches_the_prompt_shape(self):
+        # beside decode, prompt rows match the 256-row retained prompt shape; the command line still wins
+        argv, _ = plan()
+        self.assertEqual(argv[argv.index("--prompt-step") + 1], "256")
+        self.assertEqual(argv[argv.index("-b") + 1], "2048")
+        for step in ("1024", "0"):
+            with self.subTest(step=step):
+                argv, _ = plan("--prompt-step", step)
+                self.assertEqual(argv[argv.index("--prompt-step") + 1], step)
 
     def test_q3_pack_can_keep_sliding_kv_at_f16(self):
         argv, _ = plan("--kv-cache", "q8_0", "--swa-kv-cache", "f16")

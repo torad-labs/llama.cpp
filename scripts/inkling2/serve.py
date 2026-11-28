@@ -55,6 +55,10 @@ PROFILES = {
     "tensor-4": {"pack": f"{SOURCE}-Q3_K_M-imatrix.gguf", "mmproj": "mmproj-F16.gguf",
                  "context": 3014656, "slot_context": CODING_SLOT_CONTEXT, "kv": "f8_e4m3", "kv_mixed": True, "swa_kv": "q8_0",
                  "cache_ram": 262144, "keep_graphs": 32, "keep_prompt_graphs": True, "prompt_shapes": 32,
+                 # Prompt tokens beside decode match the 256-row retained prompt shape: in the v4 4-card run the
+                 # 1024-token mixed steps took 260 ms to 1.41 s and stalled every decoding stream
+                 # (reports/inkling2-4card-v4-combined-toks.md). A prompt read alone still fills -b 2048.
+                 "prompt_step": 256,
                  "checkpoint_every": 32768, "checkpoint_rows": 2, "checkpoint_ram": 16384,
                  "expert_row_limit": 23, "expert_layout": "rotated", "bucket_prefill_kv": True,
                  "stable_prefill": False, "sort_expert_rows": True,
@@ -209,8 +213,9 @@ def arguments(argv=None):
                           help=f"Allow KV copies for slot exchanges to {direction} in the background (default)")
         mode.add_argument(f"--{direction}-sync", dest=f"{direction}_async", action="store_false",
                           help=f"Wait for all slot-exchange copies on the server thread during {direction}")
-    parser.add_argument("--prompt-step", type=int, default=1024,
-                        help="Prompt tokens per step beside generation (default: 1024, GLM's first read; 0 removes the cap)")
+    parser.add_argument("--prompt-step", type=int,
+                        help="Prompt tokens per step beside generation (tensor-4: 256, otherwise 1024, GLM's first read; "
+                             "0 removes the cap)")
     parser.add_argument("--prompt-step-ms", type=int, metavar="MS",
                         help="The time a step's prompt tokens may take beside replies; the server sets their count from "
                              "its last steps, up to --prompt-step (opt-in: not read for Inkling)")
@@ -245,7 +250,7 @@ def arguments(argv=None):
                           ("f32_few", False), ("moe_fuse", False), ("mmq_tma", False),
                           ("l2_persist", False), ("l2_expert_warm", False),
                           ("router_bake", False), ("moe_route_gate", False),
-                          ("ar_copy_capture", False)):
+                          ("ar_copy_capture", False), ("prompt_step", 1024)):
         if getattr(args, key) is None:
             setattr(args, key, profile.get(key, fallback))
     args.kv_mixed_explicit = args.kv_mixed is not None
