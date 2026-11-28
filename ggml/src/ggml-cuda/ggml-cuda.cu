@@ -2399,7 +2399,9 @@ static void ggml_backend_cuda_comm_mark_shared(ggml_backend_cuda_comm_context * 
                 continue;
             }
             auto * ctx = static_cast<ggml_backend_cuda_context *>(comm->backends[i]->context);
+#ifdef USE_CUDA_GRAPH
             const bool was_shared = ctx->card_shared > 0;
+#endif // USE_CUDA_GRAPH
             ctx->card_shared += delta;
 #ifdef USE_CUDA_GRAPH
             if (was_shared != (ctx->card_shared > 0)) {
