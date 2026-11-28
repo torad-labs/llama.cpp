@@ -182,7 +182,7 @@ __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain
         }
 #pragma unroll
         for (int t = 0; t < rounds; ++t) {
-            const int row = row_base + warp + t*MOE_CHAIN_WARPS;
+            const int row = wide ? row_base + warp : warp + t*MOE_CHAIN_WARPS;
             if (row >= n_tokens) {
                 continue;
             }
@@ -199,7 +199,7 @@ __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain
 
 #pragma unroll
         for (int t = 0; t < rounds; ++t) {
-            const int row = row_base + warp + t*MOE_CHAIN_WARPS;
+            const int row = wide ? row_base + warp : warp + t*MOE_CHAIN_WARPS;
             if (row >= n_tokens) {
                 continue;
             }
