@@ -6,6 +6,12 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+int ggml_cuda_mmq_tma_max_tokens() {
+    static const bool enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
+    static const bool legacy  = ggml_env_switch("GGML_CUDA_MMQ_TMA_WIDE_LEGACY");
+    return enabled ? (legacy ? 32 : MMQ_TMA_MAX_TOKENS) : 0;
+}
+
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 #include <cuda.h>
@@ -36,7 +42,6 @@ static constexpr int MMQ_TMA_Q3K_NWARPS     = 9;  // 18 / 9 = 2 units per warp (
 static constexpr int MMQ_TMA_Q4K_UNIT_BYTES = 144;
 static constexpr int MMQ_TMA_Q5K_UNIT_BYTES = 176;
 static constexpr int MMQ_TMA_Q45_MAX_BOX_U64 = 256; // hardware TMA rank-2 inner box limit in UINT64 elements
-static constexpr int MMQ_TMA_MAX_TOKENS     = 32;
 
 static_assert(MMQ_TMA_CHUNK % 16 == 0, "a chunk starts on a TMA stride boundary");
 static_assert(MMQ_TMA_CHUNK/8 <= 256, "a TMA box is at most 256 8-byte elements wide");
@@ -1036,6 +1041,9 @@ static void dispatch_mul_mat_q_tma_q45_K(
     } else if (nunits == 4) {
         launch_mul_mat_q_tma_q45_K<type, 4, 2, true>(device, map, y, dst, nrows_x, expert_rows, nunits, row_bytes,
             ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, warm, ids_ready, stream);
+    } else if (nunits == 3) {
+        launch_mul_mat_q_tma_q45_K<type, 3, mmq_tma_q45_occ<type, 3>(), true>(device, map, y, dst, nrows_x, expert_rows,
+            nunits, row_bytes, ncols_dst, stride_col_dst, stride_channel_dst, pairs, npairs_ptr, npairs_max, warm, ids_ready, stream);
     } else if (nunits == 2) {
         // K=512 bank: Q4_K 10,256 B a CTA (9 an SM), Q5_K 12,304 B (7).
         launch_mul_mat_q_tma_q45_K<type, 2, mmq_tma_q45_occ<type, 2>(), true>(device, map, y, dst, nrows_x, expert_rows,
@@ -1094,7 +1102,7 @@ static bool mmq_tma_arch_ok(const int device) {
     return cc == GGML_CUDA_CC_BLACKWELL && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_BLACKWELL;
 }
 
-static bool mmq_tma_q45_shape_ok(const ggml_tensor * w, int & nunits, int & row_bytes) {
+static bool mmq_tma_q45_shape_ok(const ggml_tensor * w, int64_t n_tokens, int & nunits, int & row_bytes) {
     if (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K) {
         return false;
     }
@@ -1102,7 +1110,7 @@ static bool mmq_tma_q45_shape_ok(const ggml_tensor * w, int & nunits, int & row_
         return false;
     }
     const int u = (int) (w->ne[0] / QK_K);
-    if (u != 1 && u != 2 && u != 4 && u != 6 && u != 9) {
+    if (u != 1 && u != 2 && u != 4 && u != 6 && u != 9 && !(u == 3 && n_tokens > 32)) {
         return false;
     }
     const int unit_bytes = w->type == GGML_TYPE_Q4_K ? MMQ_TMA_Q4K_UNIT_BYTES : MMQ_TMA_Q5K_UNIT_BYTES;
@@ -1113,14 +1121,14 @@ static bool mmq_tma_q45_shape_ok(const ggml_tensor * w, int & nunits, int & row_
 
 bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                           const ggml_tensor * ids, ggml_tensor * dst, const bool ids_ready) {
-    static const bool enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
-    if (!enabled || src0 == nullptr || ids == nullptr) {
+    const int max_tokens = ggml_cuda_mmq_tma_max_tokens();
+    if (max_tokens == 0 || src0 == nullptr || ids == nullptr) {
         return false;
     }
     const bool is_q3k = src0->type == GGML_TYPE_Q3_K && src0->ne[0] == MMQ_TMA_UNITS*QK_K;
     int q45_nunits = 0;
     int q45_row_bytes = 0;
-    const bool is_q45 = !is_q3k && mmq_tma_q45_shape_ok(src0, q45_nunits, q45_row_bytes);
+    const bool is_q45 = !is_q3k && mmq_tma_q45_shape_ok(src0, ids->ne[1], q45_nunits, q45_row_bytes);
     if ((!is_q3k && !is_q45) || src0->ne[1] % MMQ_TMA_TILE_ROWS != 0 || src0->ne[2] < 2 || src0->ne[3] != 1) {
         return false;
     }
@@ -1138,7 +1146,7 @@ bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         return false;
     }
     if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1 ||
-            ids->ne[1] < 2 || ids->ne[1] > MMQ_TMA_MAX_TOKENS || src1->ne[2] != ids->ne[1] ||
+            ids->ne[1] < 2 || ids->ne[1] > max_tokens || src1->ne[2] != ids->ne[1] ||
             ids->ne[0] % src1->ne[1] != 0 ||
             dst->ne[1] != ids->ne[0] || dst->ne[2] != ids->ne[1] || dst->ne[3] != 1) {
         return false;
@@ -1214,9 +1222,9 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
                                     const ggml_tensor * ids, ggml_tensor * glu, int32_t first, int32_t count,
                                     float beta, float lb, const int32_t * precomputed_local_ids,
                                     bool zero_non_owned, int32_t expert_stride) {
-    static const bool enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
+    const int max_tokens = ggml_cuda_mmq_tma_max_tokens();
     GGML_ASSERT(expert_stride >= 1);
-    if (!enabled || !w || !x || !ids || !glu || w->type != GGML_TYPE_Q3_K) {
+    if (max_tokens == 0 || !w || !x || !ids || !glu || w->type != GGML_TYPE_Q3_K) {
         return false;
     }
     const int64_t n_ff = w->ne[1]/2;
@@ -1231,7 +1239,7 @@ bool ggml_cuda_mmq_tma_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_
     if (x->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(glu) ||
             (uintptr_t) x->data % 16 != 0 ||
             ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) ||
-            ids->ne[1] < 2 || ids->ne[1] > MMQ_TMA_MAX_TOKENS || x->ne[2] != ids->ne[1] ||
+            ids->ne[1] < 2 || ids->ne[1] > max_tokens || x->ne[2] != ids->ne[1] ||
             ids->ne[0] % x->ne[1] != 0 || glu->ne[0] != n_ff || glu->ne[1] != ids->ne[0] || glu->ne[2] != ids->ne[1]) {
         return false;
     }
@@ -1312,14 +1320,14 @@ bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const 
                                          const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor * dst,
                                          int32_t first, int32_t count,
                                          const int32_t * precomputed_local_ids, int32_t expert_stride) {
-    static const bool enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
+    const int max_tokens = ggml_cuda_mmq_tma_max_tokens();
     GGML_ASSERT(expert_stride >= 1);
-    if (!enabled || !w || !x || !ids || !weights || !dst) {
+    if (max_tokens == 0 || !w || !x || !ids || !weights || !dst) {
         return false;
     }
     int nunits = 0;
     int row_bytes = 0;
-    if (!mmq_tma_q45_shape_ok(w, nunits, row_bytes)) {
+    if (!mmq_tma_q45_shape_ok(w, ids->ne[1], nunits, row_bytes)) {
         return false;
     }
     if (w->ne[1] % MMQ_TMA_TILE_ROWS != 0 || w->ne[2] != count || w->ne[2] < 2 || w->ne[3] != 1) {
@@ -1332,7 +1340,7 @@ bool ggml_cuda_mmq_tma_down_weighted_sum(ggml_backend_cuda_context & ctx, const 
     if (x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(x) || !ggml_is_contiguous(dst) || (uintptr_t) x->data % 16 != 0 ||
             ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) ||
-            ids->ne[1] < 2 || ids->ne[1] > MMQ_TMA_MAX_TOKENS || x->ne[2] != ids->ne[1] ||
+            ids->ne[1] < 2 || ids->ne[1] > max_tokens || x->ne[2] != ids->ne[1] ||
             ids->ne[0] % x->ne[1] != 0 || weights->ne[0] != 1 || weights->nb[1] != sizeof(float) ||
             dst->ne[0] != w->ne[1] || dst->ne[1] != ids->ne[1] ||
             (dst->ne[0] & 3) != 0 || (uintptr_t) dst->data % 16 != 0) {
