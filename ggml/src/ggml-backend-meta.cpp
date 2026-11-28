@@ -4377,6 +4377,21 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
 }
 
+static void ggml_backend_meta_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    const auto split = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    if (split.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        for (size_t rank = 0; rank < ggml_backend_meta_n_backends(backend); ++rank) {
+            ggml_backend_tensor_set_2d_async(ggml_backend_meta_simple_backend(backend, rank),
+                    ggml_backend_meta_buffer_simple_tensor(tensor, rank), data, offset, size, n_copies, stride_tensor, stride_data);
+        }
+    } else {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_backend_meta_set_tensor_async(backend, tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size);
+        }
+    }
+}
+
 static void ggml_backend_meta_set_tensor_n_async(ggml_backend_t backend, struct ggml_tensor * const * tensors,
         const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -5486,7 +5501,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .free                    = */ ggml_backend_meta_free,
     /* .set_tensor_async        = */ ggml_backend_meta_set_tensor_async,
     /* .get_tensor_async        = */ ggml_backend_meta_get_tensor_async,
-    /* .set_tensor_2d_async     = */ nullptr,
+    /* .set_tensor_2d_async     = */ ggml_backend_meta_set_tensor_2d_async,
     /* .get_tensor_2d_async     = */ nullptr,
     /* .cpy_tensor_async        = */ ggml_backend_meta_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_meta_synchronize,
