@@ -157,25 +157,26 @@ const std::vector<llama_kv_run> * llama_kv_runs::get(const llama_kv_cells & cell
 void llama_kv_runs::write_active(const llama_kv_cells & cells, const llama_ubatch & ubatch, int32_t * data, int64_t n_entries,
         std::vector<int32_t> & active_counts) {
     const uint32_t n_rows = ubatch.n_tokens;
-    std::vector<const std::vector<llama_kv_run> *> lists(n_rows);
-    std::vector<uint32_t> seq_of(n_rows);
-    for (uint32_t r = 0; r < n_rows; ++r) {
-        const llama_seq_id seq = ubatch.seq_id[r][0];
-        lists[r] = get(cells, seq, uint32_t(n_entries - 2));
-        seq_of[r] = uint32_t(ubatch.seq_idx[seq]);
-        GGML_ASSERT(lists[r] && seq_of[r] < 32 && "the step was classed by llama_kv_cache::kv_runs_fit");
-    }
+    const std::vector<llama_kv_run> * lists[32] = {};
+    uint32_t first[32] = {};
 
     // Shared list: stride-1 runs held whole by at least two distinct sequences (skipped on SWA).
     using key = std::tuple<uint32_t, llama_pos, uint32_t>;
-    std::map<key, std::pair<uint32_t, uint32_t>> held; // sequences, rows
-    if (n_swa == 0) {
-        for (uint32_t r = 0; r < n_rows; ++r) {
-            for (const auto & b : *lists[r]) {
+    std::map<key, uint32_t> held;
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        const llama_seq_id seq = ubatch.seq_id[r][0];
+        const uint32_t idx = ubatch.seq_idx[seq];
+        GGML_ASSERT(idx < 32);
+        if (lists[idx]) {
+            continue;
+        }
+        lists[idx] = get(cells, seq, uint32_t(n_entries - 2));
+        GGML_ASSERT(lists[idx] && "the step was classed by llama_kv_cache::kv_runs_fit");
+        first[idx] = r;
+        if (n_swa == 0) {
+            for (const auto & b : *lists[idx]) {
                 if (b.stride == 1) {
-                    auto & h = held[{b.cell, b.pos, b.len}];
-                    h.first |= 1u << seq_of[r];
-                    h.second++;
+                    held[{b.cell, b.pos, b.len}] |= 1u << idx;
                 }
             }
         }
@@ -185,7 +186,7 @@ void llama_kv_runs::write_active(const llama_kv_cells & cells, const llama_ubatc
     int32_t n_list = 0, at_list = 0;
     for (auto it = held.begin(); it != held.end();) {
         const auto & [cell, pos, len] = it->first;
-        const uint32_t seq_mask = it->second.first;
+        const uint32_t seq_mask = it->second;
         const bool multi_seq = (seq_mask & (seq_mask - 1u)) != 0;
         if (!multi_seq || n_list == n_entries - 2) {
             it = held.erase(it);
@@ -195,7 +196,7 @@ void llama_kv_runs::write_active(const llama_kv_cells & cells, const llama_ubatc
         e[0] = int32_t(cell);
         e[1] = pos;
         e[2] = at_list;
-        e[3] = int32_t(it->second.first);
+        e[3] = int32_t(seq_mask);
         at_list += int32_t(len);
         n_list++;
         ++it;
@@ -214,9 +215,19 @@ void llama_kv_runs::write_active(const llama_kv_cells & cells, const llama_ubatc
     // each row: the runs of the shared list first, then the others, in cell order as the sequence holds them
     for (uint32_t r = 0; r < n_rows; ++r) {
         int32_t * row = data + 4*n_entries*r;
+        const uint32_t idx = ubatch.seq_idx[ubatch.seq_id[r][0]];
+        const uint32_t src = first[idx];
+        if (src != r) {
+            active_counts[r] = active_counts[src];
+            std::copy_n(data + 4*n_entries*src, 4*active_counts[r], row);
+            continue;
+        }
         int32_t n = 0, at = 0, n_shared = 0;
         for (const bool in_list : {true, false}) {
-            for (const auto & b : *lists[r]) {
+            if (in_list && held.empty()) {
+                continue;
+            }
+            for (const auto & b : *lists[idx]) {
                 if ((b.stride == 1 && held.count({b.cell, b.pos, b.len})) != in_list) {
                     continue;
                 }
@@ -233,7 +244,7 @@ void llama_kv_runs::write_active(const llama_kv_cells & cells, const llama_ubatc
         row[0] = n;
         row[1] = at;
         row[2] = n_shared;
-        row[3] = int32_t(seq_of[r]);
+        row[3] = int32_t(idx);
         int32_t * row_end = row + 4*(1 + n);
         row_end[0] = 0;
         row_end[1] = 0;

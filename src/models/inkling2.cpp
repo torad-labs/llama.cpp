@@ -891,22 +891,29 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         inputs[1] = build_norm(inputs[1], l.attn_k_inp_norm, nullptr, LLM_NORM_RMS, il);
         inputs[2] = build_norm(inputs[2], l.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
     }
-    // the products of the Q input, and K's where it reads the same input, next to each other in the graph: a backend can
-    // run them as one launch (the CUDA few-row MMQ group)
+    // Group adjacent K-quant products ({q, gate}, {k, v_raw}) before F32 {r, sinks} for CUDA few-row MMQ groups.
+    const bool proj_group_legacy = ggml_env_switch("LLAMA_INKLING2_PROJ_GROUP_LEGACY");
     auto * q     = build_lora_mm(l.wq, inputs[0]);
     auto * r     = build_lora_mm(l.attn_rel, inputs[0]);
     auto * sinks = build_lora_mm(l.attn_sink_proj, inputs[0]);
     auto * gate  = build_lora_mm(l.wqkv_gate, inputs[0]);
     auto * k     = build_lora_mm(l.wk, inputs[1]);
-    for (auto * t : {q, r, sinks, gate, k}) {
-        ggml_build_forward_expand(gf, t);
+    auto * v_raw = proj_group_legacy ? nullptr : build_lora_mm(l.wv, inputs[2]);
+    if (proj_group_legacy) {
+        for (auto * t : {q, r, sinks, gate, k}) {
+            ggml_build_forward_expand(gf, t);
+        }
+    } else {
+        for (auto * t : {q, gate, k, v_raw, r, sinks}) {
+            ggml_build_forward_expand(gf, t);
+        }
     }
     // the windows of the state's streams in the order of its channels: K, V, and the two hidden streams when they
     // share the row
     std::vector<ggml_tensor *> windows;
     auto & hwindows = hidden_apart ? hidden_windows : windows;
     k = convolve(k, l.attn_k_conv, swa ? nullptr : build_lora_mm(l.attn_k_conv_proj, inputs[1]), history, 0, windows, il);
-    auto * v = convolve(build_lora_mm(l.wv, inputs[2]), l.attn_v_conv,
+    auto * v = convolve(v_raw ? v_raw : build_lora_mm(l.wv, inputs[2]), l.attn_v_conv,
             swa ? nullptr : build_lora_mm(l.attn_v_conv_proj, inputs[2]), history, kv, windows, il);
     q = clip(ggml_reshape_3d(ctx0, q, hd, nh, n_tokens), l.attn_q_clip, hparams.f_qk_clip, il);
     k = clip(ggml_reshape_3d(ctx0, k, hd, nk, n_tokens), nullptr, hparams.f_qk_clip, il);

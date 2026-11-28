@@ -3267,7 +3267,18 @@ struct llama_kv_delta_buf {
         pending_data.clear();
         pending_offsets.clear();
         pending_sizes.clear();
+        record_upload();
+    }
 
+    void upload_rows(ggml_backend_t backend, ggml_tensor * dst, const void * src, size_t width, size_t rows, size_t stride) {
+        begin_upload(backend, rows * width);
+        auto & sl = slots[cur_slot];
+        std::memcpy(sl.stage_ptr, src, rows * width);
+        ggml_backend_tensor_set_2d_async(upload_backend, dst, sl.stage_ptr, 0, width, rows, stride, width);
+        record_upload();
+    }
+
+    void record_upload() {
         auto & sl = slots[cur_slot];
         if (sl.uploaded) {
             ggml_backend_event_record(sl.uploaded, upload_backend);
@@ -3303,6 +3314,7 @@ struct llama_kv_delta_state {
     };
     llama_kv_delta_buf    kq_mask;
     size_t                kq_mask_n_words = 0;
+    std::vector<size_t>   kq_mask_row_hi;
     std::vector<uint16_t> kq_mask_shadow;
     kq_row_state          kq_rows[LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS];
     std::vector<uint32_t> mask_dirty;
@@ -3627,7 +3639,13 @@ void llama_kv_cache::sync_resident_cell_pos(ggml_tensor * dst, ggml_backend_sche
 }
 
 ggml_tensor * llama_kv_cache::get_resident_kq_mask(int64_t n_kv, int64_t n_tokens) const {
-    if (n_tokens <= 0 || n_tokens > LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS || n_kv <= 0 || n_kv % 16 != 0) {
+    const bool wide = keeps_inkling_span() && get_size() >= 65536;
+    const int64_t max_rows = wide && n_kv >= 65536 ? 256 : LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS;
+    const int64_t max_words = (int64_t(get_size()) + 15) / 16;
+    // Fit one 256-row ubatch at the held span. Retain the host path for larger masks.
+    const int64_t capacity = std::max(max_words * LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS,
+            wide ? 65536 / 16 * int64_t(256) : 0);
+    if (n_tokens <= 0 || n_tokens > max_rows || n_kv <= 0 || n_kv % 16 != 0 || n_kv / 16 * n_tokens > capacity) {
         return nullptr;
     }
     ggml_backend_buffer_type_t buft = get_resident_buft();
@@ -3640,12 +3658,11 @@ ggml_tensor * llama_kv_cache::get_resident_kq_mask(int64_t n_kv, int64_t n_token
     auto & km = delta_state->kq_mask;
     if (!km.tensor) {
         const auto & cells = v_cells[0];
-        const int64_t max_words = (cells.size() + 15) / 16;
         km.ctx = ggml_init({ ggml_tensor_overhead(), nullptr, true });
         if (!km.ctx) {
             return nullptr;
         }
-        km.tensor = ggml_new_tensor_1d(km.ctx, GGML_TYPE_I16, max_words * LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS);
+        km.tensor = ggml_new_tensor_1d(km.ctx, GGML_TYPE_I16, capacity);
         ggml_set_name(km.tensor, "kv_resident_kq_mask");
         km.buffer = ggml_backend_alloc_ctx_tensors_from_buft(km.ctx, buft);
         if (!km.buffer) {
@@ -3672,7 +3689,7 @@ bool llama_kv_cache::is_resident_kq_mask(const ggml_tensor * dst) const {
 void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool block_uniform, ggml_backend_sched_t sched) const {
     GGML_ASSERT(delta_state && delta_state->kq_mask.tensor && dst->type == GGML_TYPE_I16 && dst->ne[3] == 1);
     const uint32_t n_tokens = ubatch->n_tokens;
-    GGML_ASSERT(n_tokens > 0 && n_tokens <= LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS);
+    GGML_ASSERT(n_tokens > 0 && ggml_nelements(dst) <= ggml_nelements(delta_state->kq_mask.tensor));
 
     delta_stats.kq_mask.calls++;
 
@@ -3699,7 +3716,7 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
 
     const bool standard_window = causal_attn && swa_type == LLAMA_SWA_TYPE_STANDARD &&
             n_swa > 0 && n_swa <= INT32_MAX && !block_uniform;
-    bool tip_decode = causal_attn && !hparams.use_alibi && !ubatch->is_pos_2d() && !block_uniform &&
+    bool tip_decode = n_tokens <= LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS && causal_attn && !hparams.use_alibi && !ubatch->is_pos_2d() && !block_uniform &&
             (swa_type == LLAMA_SWA_TYPE_NONE || standard_window);
     for (uint32_t i = 0; tip_decode && i < n_tokens; ++i) {
         if (ubatch->n_seq_id[i] != 1) {
@@ -3713,37 +3730,68 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
         }
     }
 
-    if (!tip_decode) {
-        // non-tip step (drafted or small prompt): build into host shadow and upload asynchronously
-        shadow.resize(n_words * LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS);
+    auto & row_hi = delta_state->kq_mask_row_hi;
+    if (delta_state->kq_mask_n_words != n_words) {
+        // A new stride can put an old row's words anywhere in the new row.
+        row_hi.clear();
         delta_state->kq_mask_n_words = n_words;
         for (auto & rs : delta_state->kq_rows) {
             rs.valid = false;
         }
+    }
+
+    if (row_hi.size() < n_tokens) {
+        row_hi.resize(n_tokens, n_words);
+    }
+    const size_t used_words = std::min(n_words, (size_t(cells.used_max_p1()) + 15) / 16);
+    if (!tip_decode) {
+        // The cache owns the buffer, not the graph allocator. Rewrite the old live prefix too, to clear removed cells.
+        const size_t prefix = std::max({size_t(1), used_words, *std::max_element(row_hi.begin(), row_hi.begin() + n_tokens)});
+        const size_t upload_words = backend && n_words >= 2048 && prefix <= n_words / 2 ? prefix : n_words;
+        for (auto & rs : delta_state->kq_rows) {
+            rs.valid = false;
+        }
+        if (shadow.size() < upload_words * n_tokens) {
+            shadow.resize(upload_words * n_tokens);
+        }
         ggml_tensor host_view = *dst;
         host_view.data        = shadow.data();
         host_view.view_src    = nullptr;
+        host_view.ne[0]       = upload_words;
+        host_view.nb[1]       = upload_words * sizeof(uint16_t);
+        host_view.nb[2]       = host_view.nb[1] * n_tokens;
+        host_view.nb[3]       = host_view.nb[2];
         static const bool scan_cells = ggml_env_switch("LLAMA_KQ_MASK_SCAN_LEGACY");
         static const bool seq_bits   = !ggml_env_switch("LLAMA_KQ_MASK_SEQ_BITS_LEGACY");
         llama_kv_cache_set_input_kq_mask(&host_view, ubatch, causal_attn, hparams, v_cells, seq_to_stream, n_swa, swa_type,
                 scan_cells, seq_bits, nullptr, block_uniform);
-        const size_t nbytes = n_tokens * n_words * sizeof(uint16_t);
-        delta_stats.kq_mask.full_uploads++;
-        delta_stats.kq_mask.spans++;
+
+        const size_t row_bytes = host_view.nb[1];
+        const size_t nbytes = n_tokens * row_bytes;
         delta_stats.kq_mask.bytes += nbytes;
-        if (backend) {
-            km.begin_upload(backend, nbytes);
-            km.upload_to(km.tensor, 0, shadow.data(), nbytes);
-            km.end_upload();
+        if (upload_words < n_words) {
+            delta_stats.kq_mask.delta_uploads++;
+            delta_stats.kq_mask.spans += n_tokens;
+            km.upload_rows(backend, km.tensor, shadow.data(), row_bytes, n_tokens, n_words * sizeof(uint16_t));
         } else {
-            ggml_backend_tensor_set(km.tensor, shadow.data(), 0, nbytes);
+            delta_stats.kq_mask.full_uploads++;
+            delta_stats.kq_mask.spans++;
+            if (backend) {
+                km.begin_upload(backend, nbytes);
+                km.upload_to(km.tensor, 0, shadow.data(), nbytes);
+                km.end_upload();
+            } else {
+                ggml_backend_tensor_set(km.tensor, shadow.data(), 0, nbytes);
+            }
         }
+        std::fill_n(row_hi.begin(), n_tokens, used_words);
         return;
     }
 
-    if (delta_state->kq_mask_n_words != n_words || !listed) {
+    if (shadow.size() < n_words * LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS) {
         shadow.resize(n_words * LLAMA_KV_RESIDENT_KQ_MASK_MAX_ROWS);
-        delta_state->kq_mask_n_words = n_words;
+    }
+    if (!listed) {
         for (auto & rs : delta_state->kq_rows) {
             rs.valid = false;
         }
@@ -3791,6 +3839,7 @@ void llama_kv_cache::sync_resident_kq_mask(ggml_tensor * dst, const llama_ubatch
         const llama_pos p_min  = standard_window ? std::max<int64_t>(0, int64_t(ubatch->pos[r]) + 1 - n_swa) : 0;
         uint16_t * row_ptr     = shadow.data() + r * n_words;
         auto & rs              = delta_state->kq_rows[r];
+        row_hi[r] = used_words;
 
         if (rs.valid && rs.tip && rs.seq == seq && rs.p_min <= p_min) {
             auto & dw = delta_state->dirty_words;
