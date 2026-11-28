@@ -19,6 +19,9 @@
 
 struct ggml_backend_cuda_context;
 
+constexpr int MMQ_TMA_MAX_TOKENS = 128;
+int ggml_cuda_mmq_tma_max_tokens();
+
 // GGML_CUDA_MMQ_TMA=1 opts in; the kernel declines outside Blackwell sm_120 and the few-row MMQ's own gate.
 bool ggml_cuda_mmq_tma_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                           const ggml_tensor * ids, ggml_tensor * dst, bool ids_ready = false);

@@ -17435,6 +17435,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, true,  2304, n, 4608));
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 384, 8, false, 4608, n, 2304));
     }
+    for (int64_t rows : {33, 128}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 32, 8, true, 256, rows, 4608));
+        for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 256, rows, 512));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, false, 256, 128, 512));
     // Inkling 2's full gate/up and down expert products at 23 rows.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 384, 8, true,  4608, 23, 4608));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 384, 8, false, 4608, 23, 2304));

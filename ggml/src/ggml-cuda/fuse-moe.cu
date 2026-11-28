@@ -1,4 +1,5 @@
 #include "fuse-moe.cuh"
+#include "mmq-tma-tiles.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -40,13 +41,17 @@ __device__ __forceinline__ int32_t moe_chain_local(int32_t expert, int32_t first
     return expert >= first && expert < first + count ? expert - first : -1;
 }
 
-template <int n_expert, int cpl, bool has_bias, bool tma_mode>
+template <int n_expert, int cpl, bool has_bias, bool tma_mode, bool wide = false>
 __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain(
         const float * cur, const float * expert_cur, const float * router, const float * bias, float * logits,
         int32_t * ids, float * weights, int32_t * routes, block_q8_1 * q8, unsigned int * flag,
         int32_t * local_ids_out, const int n_embd, const int n_tokens, const int n_used,
         const int ids_stride, const moe_chain_args args) {
+    static_assert(!wide || tma_mode);
     constexpr int ncol = 4*cpl;
+    constexpr int wide_routes = wide ? MMQ_TMA_MAX_TOKENS*8 : 1;
+    [[maybe_unused]] __shared__ int32_t wide_ids[wide_routes];
+    [[maybe_unused]] __shared__ float   wide_weights[wide_routes];
     __shared__ float                     partial[MOE_CHAIN_WARPS][MOE_CHAIN_ROWS][ncol];
     [[maybe_unused]] __shared__ uint32_t keys[tma_mode ? 1 : 256];
     __shared__ bool                      is_last;
@@ -91,10 +96,11 @@ __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain
     for (int r = 0; r < MOE_CHAIN_ROWS; ++r) {
         ar[r] = router + min(row0 + r, int64_t(n_expert - 1))*n_embd;
     }
+    const int col0 = wide ? blockIdx.y*ncol : 0;
     const float * xc[cpl];
 #pragma unroll
     for (int j = 0; j < cpl; ++j) {
-        xc[j] = cur + min(int64_t(cg*cpl + j), int64_t(n_tokens - 1))*n_embd;
+        xc[j] = cur + min(int64_t(col0 + cg*cpl + j), int64_t(n_tokens - 1))*n_embd;
     }
 
     float acc[MOE_CHAIN_ROWS][cpl] = {};
@@ -139,13 +145,13 @@ __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain
     for (int o = tid; o < MOE_CHAIN_ROWS*ncol; o += MOE_CHAIN_WARPS*WARP_SIZE) {
         const int r = o%MOE_CHAIN_ROWS;
         const int c = o/MOE_CHAIN_ROWS;
-        if (row0 + r < n_expert && c < n_tokens) {
+        if (row0 + r < n_expert && col0 + c < n_tokens) {
             float sum = 0.0f;
 #pragma unroll
             for (int w = 0; w < MOE_CHAIN_WARPS; ++w) {
                 sum += partial[w][r][c];
             }
-            logits[c*n_expert + row0 + r] = sum;
+            logits[(col0 + c)*n_expert + row0 + r] = sum;
         }
     }
 
@@ -153,7 +159,7 @@ __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain
     __syncthreads();
     __threadfence();
     if (tid == 0) {
-        is_last = atomicAdd(flag, 1u) == gridDim.x - 1;
+        is_last = atomicAdd(flag, 1u) == gridDim.x*(wide ? gridDim.y : 1) - 1;
     }
     __syncthreads();
     if (!is_last) {
@@ -161,153 +167,172 @@ __global__ __launch_bounds__(MOE_CHAIN_WARPS*WARP_SIZE, 1) void moe_router_chain
     }
 
     constexpr int ept    = (n_expert + WARP_SIZE - 1)/WARP_SIZE;
-    constexpr int rounds = (MOE_CHAIN_MAX_TOKENS + MOE_CHAIN_WARPS - 1)/MOE_CHAIN_WARPS;
+    constexpr int rounds = wide ? 1 : (MOE_CHAIN_MAX_TOKENS + MOE_CHAIN_WARPS - 1)/MOE_CHAIN_WARPS;
 
-    // ids and weights can alias the logits, so every row a warp selects reads all of its logits first
-    float wt[rounds][ept];
-    [[maybe_unused]] float sel[has_bias ? rounds : 1][has_bias ? ept : 1];
+    // IDs and weights can alias logits. The wide selector holds its results in shared memory until all logits are read.
+    for (int row_base = 0; row_base < (wide ? n_tokens : 1); row_base += MOE_CHAIN_WARPS) {
+        float wt[rounds][ept];
+        [[maybe_unused]] float sel[has_bias ? rounds : 1][has_bias ? ept : 1];
 #pragma unroll
-    for (int t = 0; t < rounds; ++t) {
+        for (int t = 0; t < rounds; ++t) {
 #pragma unroll
-        for (int i = 0; i < ept; ++i) {
-            wt[t][i] = -INFINITY;
-        }
-    }
-#pragma unroll
-    for (int t = 0; t < rounds; ++t) {
-        const int row = warp + t*MOE_CHAIN_WARPS;
-        if (row >= n_tokens) {
-            continue;
-        }
-        const float * lg = logits + (int64_t) row*n_expert;
-#pragma unroll
-        for (int i = 0; i < ept; ++i) {
-            const int expert = i*WARP_SIZE + lane;
-            wt[t][i] = n_expert % WARP_SIZE == 0 || expert < n_expert ? __ldcg(lg + expert) : -INFINITY;
-        }
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (int t = 0; t < rounds; ++t) {
-        const int row = warp + t*MOE_CHAIN_WARPS;
-        if (row >= n_tokens) {
-            continue;
-        }
-
-#pragma unroll
-        for (int i = 0; i < ept; ++i) {
-            const int expert = i*WARP_SIZE + lane;
-            if (n_expert % WARP_SIZE == 0 || expert < n_expert) {
-                wt[t][i] = 1.f/(1.f + expf(-wt[t][i]));
+            for (int i = 0; i < ept; ++i) {
+                wt[t][i] = -INFINITY;
             }
         }
-        // NaN logits select nothing under an iterative argmax, so they become -FLT_MAX
 #pragma unroll
-        for (int i = 0; i < ept; ++i) {
-            if (__isnanf(wt[t][i])) {
-                wt[t][i] = -FLT_MAX;
+        for (int t = 0; t < rounds; ++t) {
+            const int row = row_base + warp + t*MOE_CHAIN_WARPS;
+            if (row >= n_tokens) {
+                continue;
             }
-        }
-
-        if constexpr (has_bias) {
+            const float * lg = logits + (int64_t) row*n_expert;
 #pragma unroll
             for (int i = 0; i < ept; ++i) {
                 const int expert = i*WARP_SIZE + lane;
-                sel[t][i] = (n_expert % WARP_SIZE == 0 || expert < n_expert) ? wt[t][i] + bias[expert] : -INFINITY;
-                if (__isnanf(sel[t][i])) {
-                    sel[t][i] = -FLT_MAX;
-                }
+                wt[t][i] = n_expert % WARP_SIZE == 0 || expert < n_expert ? __ldcg(lg + expert) : -INFINITY;
             }
         }
-
-        float wt_sum = 0.f;
-
-        float output_weights[ept];
-#pragma unroll
-        for (int i = 0; i < ept; ++i) {
-            output_weights[i] = 0.f;
+        if constexpr (!wide) {
+            __syncthreads();
         }
 
-        for (int k = 0; k < n_used; ++k) {
-            float max_val    = wt[t][0];
-            int   max_expert = lane;
-            float max_val_s  = 0.0f;
+#pragma unroll
+        for (int t = 0; t < rounds; ++t) {
+            const int row = row_base + warp + t*MOE_CHAIN_WARPS;
+            if (row >= n_tokens) {
+                continue;
+            }
+
+#pragma unroll
+            for (int i = 0; i < ept; ++i) {
+                const int expert = i*WARP_SIZE + lane;
+                if (n_expert % WARP_SIZE == 0 || expert < n_expert) {
+                    wt[t][i] = 1.f/(1.f + expf(-wt[t][i]));
+                }
+            }
+            // NaN logits select nothing under an iterative argmax, so they become -FLT_MAX
+#pragma unroll
+            for (int i = 0; i < ept; ++i) {
+                if (__isnanf(wt[t][i])) {
+                    wt[t][i] = -FLT_MAX;
+                }
+            }
 
             if constexpr (has_bias) {
-                max_val_s = sel[t][0];
 #pragma unroll
-                for (int i = 1; i < ept; ++i) {
-                    const int expert = lane + i*WARP_SIZE;
-                    if ((n_expert % WARP_SIZE == 0 || expert < n_expert) && sel[t][i] > max_val_s) {
-                        max_val    = wt[t][i];
-                        max_val_s  = sel[t][i];
-                        max_expert = expert;
+                for (int i = 0; i < ept; ++i) {
+                    const int expert = i*WARP_SIZE + lane;
+                    sel[t][i] = (n_expert % WARP_SIZE == 0 || expert < n_expert) ? wt[t][i] + bias[expert] : -INFINITY;
+                    if (__isnanf(sel[t][i])) {
+                        sel[t][i] = -FLT_MAX;
                     }
                 }
+            }
+
+            float wt_sum = 0.f;
+
+            float output_weights[ept];
 #pragma unroll
-                for (int mask = WARP_SIZE/2; mask > 0; mask /= 2) {
-                    const float val    = ggml_cuda_shfl_xor(max_val, mask, WARP_SIZE);
-                    const float val_s  = ggml_cuda_shfl_xor(max_val_s, mask, WARP_SIZE);
-                    const int   expert = ggml_cuda_shfl_xor(max_expert, mask, WARP_SIZE);
-                    if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
-                        max_val    = val;
-                        max_val_s  = val_s;
-                        max_expert = expert;
+            for (int i = 0; i < ept; ++i) {
+                output_weights[i] = 0.f;
+            }
+
+            for (int k = 0; k < n_used; ++k) {
+                float max_val    = wt[t][0];
+                int   max_expert = lane;
+                float max_val_s  = 0.0f;
+
+                if constexpr (has_bias) {
+                    max_val_s = sel[t][0];
+#pragma unroll
+                    for (int i = 1; i < ept; ++i) {
+                        const int expert = lane + i*WARP_SIZE;
+                        if ((n_expert % WARP_SIZE == 0 || expert < n_expert) && sel[t][i] > max_val_s) {
+                            max_val    = wt[t][i];
+                            max_val_s  = sel[t][i];
+                            max_expert = expert;
+                        }
                     }
+#pragma unroll
+                    for (int mask = WARP_SIZE/2; mask > 0; mask /= 2) {
+                        const float val    = ggml_cuda_shfl_xor(max_val, mask, WARP_SIZE);
+                        const float val_s  = ggml_cuda_shfl_xor(max_val_s, mask, WARP_SIZE);
+                        const int   expert = ggml_cuda_shfl_xor(max_expert, mask, WARP_SIZE);
+                        if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
+                            max_val    = val;
+                            max_val_s  = val_s;
+                            max_expert = expert;
+                        }
+                    }
+                    if ((max_expert & (WARP_SIZE - 1)) == lane) {
+                        sel[t][max_expert/WARP_SIZE] = -INFINITY;
+                    }
+                } else {
+#pragma unroll
+                    for (int i = 1; i < ept; ++i) {
+                        const int expert = lane + i*WARP_SIZE;
+                        if ((n_expert % WARP_SIZE == 0 || expert < n_expert) && wt[t][i] > max_val) {
+                            max_val    = wt[t][i];
+                            max_expert = expert;
+                        }
+                    }
+#pragma unroll
+                    for (int mask = WARP_SIZE/2; mask > 0; mask /= 2) {
+                        const float val    = ggml_cuda_shfl_xor(max_val, mask, WARP_SIZE);
+                        const int   expert = ggml_cuda_shfl_xor(max_expert, mask, WARP_SIZE);
+                        if (val > max_val || (val == max_val && expert < max_expert)) {
+                            max_val    = val;
+                            max_expert = expert;
+                        }
+                    }
+                    if ((max_expert & (WARP_SIZE - 1)) == lane) {
+                        wt[t][max_expert/WARP_SIZE] = -INFINITY;
+                    }
+                }
+
+                if ((k & (WARP_SIZE - 1)) == lane) {
+                    output_weights[k/WARP_SIZE] = max_val;
                 }
                 if ((max_expert & (WARP_SIZE - 1)) == lane) {
-                    sel[t][max_expert/WARP_SIZE] = -INFINITY;
+                    if constexpr (wide) {
+                        wide_ids[row*n_used + k] = max_expert;
+                    } else {
+                        ids[row*ids_stride + k] = max_expert;
+                    }
+                    if (local_ids_out != nullptr) {
+                        local_ids_out[row*n_used + k] = moe_chain_local(max_expert, args.first, args.count);
+                    }
+                    wt_sum += max_val;
                 }
-            } else {
+            }
+
+            wt_sum              = warp_reduce_sum<WARP_SIZE>(wt_sum);
+            wt_sum              = args.norm_eps ? wt_sum + args.clamp_val : max(wt_sum, args.clamp_val);
+            const float inv_sum = 1.0f/wt_sum;
+
 #pragma unroll
-                for (int i = 1; i < ept; ++i) {
-                    const int expert = lane + i*WARP_SIZE;
-                    if ((n_expert % WARP_SIZE == 0 || expert < n_expert) && wt[t][i] > max_val) {
-                        max_val    = wt[t][i];
-                        max_expert = expert;
+            for (int i = 0; i < ept; ++i) {
+                output_weights[i] *= inv_sum;
+            }
+#pragma unroll
+            for (int i = 0; i < ept; ++i) {
+                const int idx = i*WARP_SIZE + lane;
+                if (idx < n_used) {
+                    if constexpr (wide) {
+                        wide_weights[row*n_used + idx] = output_weights[i]*args.scale_val;
+                    } else {
+                        weights[row*n_used + idx] = output_weights[i]*args.scale_val;
                     }
                 }
-#pragma unroll
-                for (int mask = WARP_SIZE/2; mask > 0; mask /= 2) {
-                    const float val    = ggml_cuda_shfl_xor(max_val, mask, WARP_SIZE);
-                    const int   expert = ggml_cuda_shfl_xor(max_expert, mask, WARP_SIZE);
-                    if (val > max_val || (val == max_val && expert < max_expert)) {
-                        max_val    = val;
-                        max_expert = expert;
-                    }
-                }
-                if ((max_expert & (WARP_SIZE - 1)) == lane) {
-                    wt[t][max_expert/WARP_SIZE] = -INFINITY;
-                }
-            }
-
-            if ((k & (WARP_SIZE - 1)) == lane) {
-                output_weights[k/WARP_SIZE] = max_val;
-            }
-            if ((max_expert & (WARP_SIZE - 1)) == lane) {
-                ids[row*ids_stride + k] = max_expert;
-                if (local_ids_out != nullptr) {
-                    local_ids_out[row*n_used + k] = moe_chain_local(max_expert, args.first, args.count);
-                }
-                wt_sum += max_val;
             }
         }
-
-        wt_sum              = warp_reduce_sum<WARP_SIZE>(wt_sum);
-        wt_sum              = args.norm_eps ? wt_sum + args.clamp_val : max(wt_sum, args.clamp_val);
-        const float inv_sum = 1.0f/wt_sum;
-
-#pragma unroll
-        for (int i = 0; i < ept; ++i) {
-            output_weights[i] *= inv_sum;
-        }
-#pragma unroll
-        for (int i = 0; i < ept; ++i) {
-            const int idx = i*WARP_SIZE + lane;
-            if (idx < n_used) {
-                weights[row*n_used + idx] = output_weights[i]*args.scale_val;
-            }
+    }
+    if constexpr (wide) {
+        __syncthreads();
+        for (int i = tid; i < n_tokens*n_used; i += blockDim.x) {
+            ids[(i/n_used)*ids_stride + i%n_used] = wide_ids[i];
+            weights[i] = wide_weights[i];
         }
     }
 
@@ -529,7 +554,9 @@ void ggml_cuda_op_moe_router_chain(ggml_backend_cuda_context & ctx, const ggml_t
     const int n_embd   = (int) router->ne[0];
     const int n_tokens = (int) ggml_nrows(cur);
     const int n_used   = (int) ids->ne[0];
-    GGML_ASSERT(n_tokens >= 1 && n_tokens <= MOE_CHAIN_MAX_TOKENS && n_used >= 1 && n_used <= 32 && n_tokens * n_used <= 256);
+    const bool wide = n_tokens > MOE_CHAIN_MAX_TOKENS;
+    GGML_ASSERT(n_tokens >= 1 && n_used >= 1 && n_used <= 32);
+    GGML_ASSERT(wide ? tma_mode && n_tokens <= MMQ_TMA_MAX_TOKENS && n_used <= 8 : n_tokens*n_used <= 256);
 
     const moe_chain_args args = { clamp_val, scale_val, norm_eps, first, count };
 
@@ -537,13 +564,13 @@ void ggml_cuda_op_moe_router_chain(ggml_backend_cuda_context & ctx, const ggml_t
     const int ids_stride = (int) (ids->nb[1]/ggml_type_size(ids->type));
     GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids_stride >= n_used);
 
-    const dim3 grid((n_expert + MOE_CHAIN_ROWS - 1)/MOE_CHAIN_ROWS, 1, 1);
+    const dim3 grid((n_expert + MOE_CHAIN_ROWS - 1)/MOE_CHAIN_ROWS, wide ? (n_tokens + 31)/32 : 1, 1);
     const dim3 block(MOE_CHAIN_WARPS*WARP_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params params(grid, block, 0, ctx.stream());
 
-    const auto launch_impl = [&](auto cpl_tag, auto bias_tag, auto tma_tag) {
+    const auto launch_impl = [&](auto cpl_tag, auto bias_tag, auto tma_tag, auto wide_tag) {
         ggml_cuda_kernel_launch(
-            moe_router_chain<n_expert, decltype(cpl_tag)::value, decltype(bias_tag)::value, decltype(tma_tag)::value>,
+            moe_router_chain<n_expert, decltype(cpl_tag)::value, decltype(bias_tag)::value, decltype(tma_tag)::value, decltype(wide_tag)::value>,
             params, (const float *) cur->data, (const float *) expert_cur->data, (const float *) router->data,
             decltype(bias_tag)::value ? (const float *) bias->data : (const float *) nullptr,
             (float *) logits->data, (int32_t *) ids->data, (float *) weights->data,
@@ -552,18 +579,27 @@ void ggml_cuda_op_moe_router_chain(ggml_backend_cuda_context & ctx, const ggml_t
     const auto launch_cpl = [&](auto cpl_tag) {
         if (bias != nullptr) {
             if (tma_mode) {
-                launch_impl(cpl_tag, std::true_type{}, std::true_type{});
+                launch_impl(cpl_tag, std::true_type{}, std::true_type{}, std::false_type{});
             } else {
-                launch_impl(cpl_tag, std::true_type{}, std::false_type{});
+                launch_impl(cpl_tag, std::true_type{}, std::false_type{}, std::false_type{});
             }
         } else {
             if (tma_mode) {
-                launch_impl(cpl_tag, std::false_type{}, std::true_type{});
+                launch_impl(cpl_tag, std::false_type{}, std::true_type{}, std::false_type{});
             } else {
-                launch_impl(cpl_tag, std::false_type{}, std::false_type{});
+                launch_impl(cpl_tag, std::false_type{}, std::false_type{}, std::false_type{});
             }
         }
     };
+
+    if (wide) {
+        if (bias != nullptr) {
+            launch_impl(std::integral_constant<int, 8>{}, std::true_type{}, std::true_type{}, std::true_type{});
+        } else {
+            launch_impl(std::integral_constant<int, 8>{}, std::false_type{}, std::true_type{}, std::true_type{});
+        }
+        return;
+    }
 
     switch (moe_chain_cpl(n_tokens)) {
         case 1: launch_cpl(std::integral_constant<int, 1>{}); break;

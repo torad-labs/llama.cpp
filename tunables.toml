@@ -369,6 +369,7 @@ param = [
   { name = "GGML_CUDA_MMQ_FEW_ID_QUANT_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda", output = "same", about = "quantize broadcast MUL_MAT_ID activations per expert slot instead of once per token in quantize_mmq_few_id_q8_1" },
   { name = "GGML_CUDA_MMQ_FIXUP_COMPACT_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_MMQ_MOE_TILES_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
+  { name = "GGML_CUDA_MMQ_TMA_WIDE_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda", output = "rounding", about = "limits Blackwell TMA MUL_MAT_ID and fused MoE to 32 tokens" },
   { name = "GGML_CUDA_MMQ_SHARED_Q8_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_MMVF_PAIR_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },
   { name = "GGML_CUDA_MMVF_TRIGGER_LEGACY", available = true, set = "env", type = "bool", default = false, kind = "legacy", scope = "shared", layer = "cuda" },

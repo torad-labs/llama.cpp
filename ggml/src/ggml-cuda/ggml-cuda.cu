@@ -5000,10 +5000,9 @@ static void ggml_cuda_mul_mat_id_partition(ggml_backend_cuda_context & ctx, cons
     const ggml_tensor * ids = mm->src[2];
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool vector_ok = ggml_is_quantized(src0->type) && mm->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc);
-    static const bool mmq_tma_enabled = ggml_env_switch("GGML_CUDA_MMQ_TMA");
-    const bool try_tma = !fusion && !paired && mmq_tma_enabled &&
+    const bool try_tma = !fusion && !paired &&
         (src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) &&
-        mm->ne[2] >= 2 && mm->ne[2] <= 32;
+        mm->ne[2] >= 2 && mm->ne[2] <= ggml_cuda_mmq_tma_max_tokens();
     const bool use_mmq_few = !fusion && !paired && !try_tma && ggml_cuda_should_use_mmq_few(src0, src1, ids, cc);
     const bool vector = !try_tma && !use_mmq_few && vector_ok;
     GGML_ASSERT(ggml_is_contiguous(dst) && ids->nb[0] == sizeof(int32_t));
@@ -8329,11 +8328,13 @@ static int ggml_cuda_try_share_mmq_q8(ggml_backend_cuda_context & ctx, ggml_cgra
 }
 
 // ===== C3: Inkling 2's routed-expert chain, one launch a piece (fuse-moe.cu; plan 17 section C, group 3) =====
-// Off by default behind GGML_CUDA_MOE_FUSE; the chain's buffers come from ggml_cuda_moe_fuse_plan. Each piece keeps the
-// launches it replaces bit for bit, so the switches only change the launch count.
+// GGML_CUDA_MOE_FUSE opts in. The vector path keeps the arithmetic of the launches it replaces.
 
-// The chain's scratch once an evaluation, from the graph's own tensors: the q8_1 copies of the expert input and of the
-// GLU output, the sorted routes and the arrival flag. One set serves every layer, which the graph runs in order.
+static bool ggml_cuda_moe_fuse_ff(int64_t n_ff, int64_t n_tokens) {
+    return n_ff == 2304 || (n_tokens > MMVQ_MMID_CEILING && (n_ff == 512 || n_ff == 768));
+}
+
+// One set of scratch serves all layers. Only the vector path needs q8_1 and sorted routes.
 static void ggml_cuda_moe_fuse_plan(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph,
         std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> & allocs) {
     static const bool enabled = ggml_env_switch("GGML_CUDA_MOE_FUSE");
@@ -8341,6 +8342,9 @@ static void ggml_cuda_moe_fuse_plan(ggml_backend_cuda_context & ctx, const ggml_
     if (!enabled) {
         return;
     }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int max_tokens = cc == GGML_CUDA_CC_BLACKWELL && ggml_cuda_highest_compiled_arch(cc) == cc ?
+        std::max(MMVQ_MMID_CEILING, ggml_cuda_mmq_tma_max_tokens()) : MMVQ_MMID_CEILING;
     const ggml_tensor * gate_up = nullptr;
     const ggml_tensor * glu     = nullptr;
     for (int i = 0; i + 3 < cgraph->n_nodes; ++i) {
@@ -8349,8 +8353,12 @@ static void ggml_cuda_moe_fuse_plan(ggml_backend_cuda_context & ctx, const ggml_
             continue;
         }
         const ggml_tensor * w = node->src[0];
-        if (w->ne[0] != 4608 || w->ne[1] != 4608 || (w->ne[2] != 96 && w->ne[2] != 384) ||
-                (w->type != GGML_TYPE_Q3_K && w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K) ||
+        const ggml_tensor * ids = node->src[2];
+        const int64_t rows = ids->ne[1];
+        if (w->ne[0] != 4608 || w->ne[1] % 2 || !ggml_cuda_moe_fuse_ff(w->ne[1]/2, rows) ||
+                (w->ne[2] != 96 && w->ne[2] != 384) ||
+                (rows > MMVQ_MMID_CEILING ? w->type != GGML_TYPE_Q3_K :
+                    (w->type != GGML_TYPE_Q3_K && w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K)) ||
                 node->src[1]->type != GGML_TYPE_F32 || node->src[2]->type != GGML_TYPE_I32) {
             continue;
         }
@@ -8372,27 +8380,29 @@ static void ggml_cuda_moe_fuse_plan(ggml_backend_cuda_context & ctx, const ggml_
     }
     const int64_t n_tokens = gate_up->src[2]->ne[1];
     const int64_t n_used   = gate_up->src[2]->ne[0];
-    if (n_tokens < 1 || n_tokens > 32 || n_used < 1 || n_used > 8) {
+    if (n_tokens < 1 || n_tokens > max_tokens || n_used < 1 || n_used > 8) {
         return;
     }
-    const int64_t q8_cur_bytes = n_tokens*GGML_PAD(gate_up->src[1]->ne[0], MATRIX_ROW_PADDING)*sizeof(block_q8_1)/QK8_1;
-    const int64_t q8_glu_bytes = n_used*n_tokens*GGML_PAD(glu->ne[0], MATRIX_ROW_PADDING)*sizeof(block_q8_1)/QK8_1;
-    auto q8_cur    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_cur_bytes);
-    auto q8_glu    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_glu_bytes);
-    auto routes    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), n_tokens*n_used*sizeof(int32_t));
+    if (n_tokens <= MMVQ_MMID_CEILING) {
+        const int64_t q8_cur_bytes = n_tokens*GGML_PAD(gate_up->src[1]->ne[0], MATRIX_ROW_PADDING)*sizeof(block_q8_1)/QK8_1;
+        const int64_t q8_glu_bytes = n_used*n_tokens*GGML_PAD(glu->ne[0], MATRIX_ROW_PADDING)*sizeof(block_q8_1)/QK8_1;
+        auto q8_cur = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_cur_bytes);
+        auto q8_glu = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_glu_bytes);
+        auto routes = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), n_tokens*n_used*sizeof(int32_t));
+        ctx.moe_fuse.q8_cur = q8_cur->get();
+        ctx.moe_fuse.q8_glu = (block_q8_1 *) q8_glu->get();
+        ctx.moe_fuse.routes = (int32_t *) routes->get();
+        allocs.push_back(std::move(q8_cur));
+        allocs.push_back(std::move(q8_glu));
+        allocs.push_back(std::move(routes));
+    }
     auto local_ids = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), n_tokens*n_used*sizeof(int32_t));
     auto flag      = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), sizeof(unsigned int));
-    ctx.moe_fuse.q8_cur    = q8_cur->get();
-    ctx.moe_fuse.q8_glu    = (block_q8_1 *) q8_glu->get();
-    ctx.moe_fuse.routes    = (int32_t *) routes->get();
     ctx.moe_fuse.local_ids = (int32_t *) local_ids->get();
     ctx.moe_fuse.flag      = (unsigned int *) flag->get();
     ctx.moe_fuse.n_tokens  = n_tokens;
     ctx.moe_fuse.n_used    = n_used;
     CUDA_CHECK(cudaMemsetAsync(ctx.moe_fuse.flag, 0, sizeof(unsigned int), ctx.stream()));
-    allocs.push_back(std::move(q8_cur));
-    allocs.push_back(std::move(q8_glu));
-    allocs.push_back(std::move(routes));
     allocs.push_back(std::move(local_ids));
     allocs.push_back(std::move(flag));
 }
@@ -8403,7 +8413,7 @@ static int ggml_cuda_try_moe_chain(ggml_backend_cuda_context & ctx, const ggml_c
     static const bool enabled = ggml_env_switch("GGML_CUDA_MOE_FUSE");
     static const bool legacy  = ggml_env_switch("GGML_CUDA_ROUTE_MATVEC_TOPK_LEGACY");
     ggml_cuda_moe_fuse_scratch & scratch = ctx.moe_fuse;
-    if (!enabled || legacy || scratch.q8_cur == nullptr) {
+    if (!enabled || legacy || scratch.flag == nullptr) {
         return 0;
     }
     // the router product it replaces must be f32_cols (f32-few.cu), whose summation order it keeps; with the switch off
@@ -8419,7 +8429,7 @@ static int ggml_cuda_try_moe_chain(ggml_backend_cuda_context & ctx, const ggml_c
     const ggml_tensor * router = node->src[0];
     const ggml_tensor * cur    = node->src[1];
     if (node->type != GGML_TYPE_F32 || router->type != GGML_TYPE_F32 || cur->type != GGML_TYPE_F32 ||
-            node->ne[0] != 384 || node->ne[1] < 1 || node->ne[1] > 32 || node->ne[2] != 1 || node->ne[3] != 1 ||
+            node->ne[0] != 384 || node->ne[1] < 1 || node->ne[2] != 1 || node->ne[3] != 1 ||
             router->ne[0] != 4608 || router->ne[1] != 384 || cur->ne[0] != 4608 ||
             ((uintptr_t) router->data & 15) != 0 || ((uintptr_t) cur->data & 15) != 0 ||
             cur->nb[0] != sizeof(float) || !ggml_is_contiguous(cur) || !ggml_is_contiguous(node) ||
@@ -8473,7 +8483,7 @@ static int ggml_cuda_try_moe_chain(ggml_backend_cuda_context & ctx, const ggml_c
     for (int j = start + group; j < std::min(start + group + 8, cgraph->n_nodes); ++j) {
         const ggml_tensor * t = cgraph->nodes[j];
         if (t->op == GGML_OP_MUL_MAT_ID && t->src[2] == ids && t->src[0] != nullptr && t->src[0]->ne[0] == 4608 &&
-                t->src[0]->ne[1] == 4608) {
+                t->src[0]->ne[1] % 2 == 0 && ggml_cuda_moe_fuse_ff(t->src[0]->ne[1]/2, scratch.n_tokens)) {
             mm = t;
             break;
         }
@@ -8509,14 +8519,17 @@ static int ggml_cuda_try_moe_chain(ggml_backend_cuda_context & ctx, const ggml_c
     const bool  norm_eps  = clamp->op == GGML_OP_SCALE;
     const float clamp_val = ggml_get_op_params_f32(clamp, norm_eps ? 1 : 0);
 
-    static const bool mmq_tma = ggml_env_switch("GGML_CUDA_MMQ_TMA");
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_tensor * mw = mm->src[0];
-    const bool tma_chain_ok = mmq_tma && cc == GGML_CUDA_CC_BLACKWELL &&
+    const bool tma_chain_ok = cc == GGML_CUDA_CC_BLACKWELL &&
         ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_BLACKWELL &&
         mw->type == GGML_TYPE_Q3_K && count >= 2 && mw->ne[3] == 1 &&
         ggml_is_contiguous(mw) && ((uintptr_t) mw->data % 16) == 0 &&
-        scratch.n_tokens >= 2 && scratch.n_tokens <= MMVQ_MMID_CEILING;
+        scratch.n_tokens >= 2 && scratch.n_tokens <= ggml_cuda_mmq_tma_max_tokens();
+    if (scratch.n_tokens > MMVQ_MMID_CEILING &&
+            (!tma_chain_ok || ggml_mul_mat_id_expert_stride(mm) != 1)) {
+        return 0;
+    }
     const bool skip_vec_prep = tma_chain_ok || scratch.n_tokens < 2;
 
     ggml_cuda_op_moe_router_chain(ctx, router, cur, expert_cur, bias, node, ids, weights,
@@ -8540,7 +8553,7 @@ static int ggml_cuda_try_moe_chain(ggml_backend_cuda_context & ctx, const ggml_c
 static int ggml_cuda_try_moe_gate_up_situ(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     static const bool enabled = ggml_env_switch("GGML_CUDA_MOE_FUSE");
     ggml_cuda_moe_fuse_scratch & scratch = ctx.moe_fuse;
-    if (!enabled || scratch.q8_cur == nullptr || scratch.q8_cur_src == nullptr) {
+    if (!enabled || scratch.q8_cur_src == nullptr) {
         return 0;
     }
     ggml_tensor * node = cgraph->nodes[i];
@@ -8562,7 +8575,8 @@ static int ggml_cuda_try_moe_gate_up_situ(ggml_backend_cuda_context & ctx, const
     const ggml_tensor * w   = node->src[0];
     const ggml_tensor * x   = node->src[1];
     const ggml_tensor * ids = node->src[2];
-    if (w->ne[0] != 4608 || w->ne[1] != 4608 || (w->ne[2] != 96 && w->ne[2] != 384) ||
+    if (w->ne[0] != 4608 || w->ne[1] % 2 || !ggml_cuda_moe_fuse_ff(w->ne[1]/2, ids->ne[1]) ||
+            (w->ne[2] != 96 && w->ne[2] != 384) ||
             (w->type != GGML_TYPE_Q3_K && w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K) ||
             x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ids->type != GGML_TYPE_I32 ||
             q8_cur_src != x->data || routes_ids != (const int32_t *) ids->data) {
@@ -8591,12 +8605,11 @@ static int ggml_cuda_try_moe_gate_up_situ(ggml_backend_cuda_context & ctx, const
     }
 
     // only where the launch it replaces is mul_mat_vec_q_moe itself (or Blackwell TMA when GGML_CUDA_MMQ_TMA=1)
-    static const bool mmq_tma = ggml_env_switch("GGML_CUDA_MMQ_TMA");
     const int64_t n_tokens = ids->ne[1];
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    const bool tma_ok = mmq_tma && cc == GGML_CUDA_CC_BLACKWELL && w->type == GGML_TYPE_Q3_K &&
-        n_tokens >= 2 && n_tokens <= MMVQ_MMID_CEILING;
-    const bool vector_ref = !tma_chain && n_tokens >= 2 &&
+    const bool tma_ok = cc == GGML_CUDA_CC_BLACKWELL && w->type == GGML_TYPE_Q3_K &&
+        n_tokens >= 2 && n_tokens <= ggml_cuda_mmq_tma_max_tokens();
+    const bool vector_ref = scratch.q8_cur != nullptr && !tma_chain && n_tokens >= 2 &&
         (ggml_get_op_params_i32(node, 2) > 0 ? n_tokens <= get_mmvq_mmid_max_batch(w->type, cc) :
          !ggml_cuda_should_use_mmq_few(w, x, ids, cc) && n_tokens <= MMVQ_MMID_CEILING &&
          n_tokens <= get_mmvq_mmid_max_batch(w->type, cc));
@@ -8619,10 +8632,11 @@ static int ggml_cuda_try_moe_gate_up_situ(ggml_backend_cuda_context & ctx, const
         next_mm != nullptr && next_mm->op == GGML_OP_MUL_MAT_ID &&
         next_mm->type == GGML_TYPE_F32 && ggml_is_contiguous(next_mm) &&
         next_mm->src[0] != nullptr && (next_mm->src[0]->type == GGML_TYPE_Q4_K || next_mm->src[0]->type == GGML_TYPE_Q5_K) &&
-        next_mm->src[0]->ne[0] == 2304 && next_mm->src[0]->ne[1] == 4608 &&
+        next_mm->src[0]->ne[0] == n_ff && next_mm->src[0]->ne[1] == 4608 &&
         next_mm->src[0]->ne[2] == count && next_mm->src[0]->ne[3] == 1 &&
         ggml_is_contiguous(next_mm->src[0]) && ((uintptr_t) next_mm->src[0]->data % 16) == 0 &&
-        next_mm->src[1] == glu && next_mm->src[2] == ids && next_first == first;
+        next_mm->src[1] == glu && next_mm->src[2] == ids && next_first == first &&
+        ggml_mul_mat_id_expert_stride(next_mm) == ggml_mul_mat_id_expert_stride(node);
 
     if (tma_ok && ggml_cuda_mmq_tma_gate_up_situ(ctx, w, x, ids, glu, first, count, beta, lb, pre_lids, !glu_sole_tma_down)) {
         scratch.q8_glu_src     = glu->data;
@@ -8655,7 +8669,7 @@ static int ggml_cuda_try_moe_gate_up_situ(ggml_backend_cuda_context & ctx, const
 static int ggml_cuda_try_moe_experts_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     static const bool enabled = ggml_env_switch("GGML_CUDA_MOE_FUSE");
     ggml_cuda_moe_fuse_scratch & scratch = ctx.moe_fuse;
-    if (!enabled || scratch.q8_glu == nullptr || scratch.q8_glu_src == nullptr) {
+    if (!enabled || scratch.q8_glu_src == nullptr) {
         return 0;
     }
     ggml_tensor * node = cgraph->nodes[i];
@@ -8674,7 +8688,8 @@ static int ggml_cuda_try_moe_experts_weighted_sum(ggml_backend_cuda_context & ct
     const ggml_tensor * w   = node->src[0];
     const ggml_tensor * x   = node->src[1];
     const ggml_tensor * ids = node->src[2];
-    if (w->ne[0] != 2304 || w->ne[1] != 4608 || (w->ne[2] != 96 && w->ne[2] != 384) ||
+    if (!ggml_cuda_moe_fuse_ff(w->ne[0], ids->ne[1]) || w->ne[1] != 4608 ||
+            (w->ne[2] != 96 && w->ne[2] != 384) ||
             (w->type != GGML_TYPE_Q3_K && w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K) ||
             x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ids->type != GGML_TYPE_I32 ||
             ids->nb[0] != sizeof(int32_t) || q8_glu_src != x->data ||
@@ -8698,12 +8713,11 @@ static int ggml_cuda_try_moe_experts_weighted_sum(ggml_backend_cuda_context & ct
     const int64_t n_tokens = ids->ne[1];
 
     // only where the launch it replaces is mul_mat_vec_q_moe itself (or Blackwell TMA when GGML_CUDA_MMQ_TMA=1)
-    static const bool mmq_tma = ggml_env_switch("GGML_CUDA_MMQ_TMA");
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    const bool tma_ok = mmq_tma && cc == GGML_CUDA_CC_BLACKWELL &&
+    const bool tma_ok = cc == GGML_CUDA_CC_BLACKWELL &&
         (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_K) &&
-        n_tokens >= 2 && n_tokens <= MMVQ_MMID_CEILING;
-    const bool vector_ref = n_tokens >= 2 &&
+        n_tokens >= 2 && n_tokens <= ggml_cuda_mmq_tma_max_tokens();
+    const bool vector_ref = scratch.q8_glu != nullptr && n_tokens >= 2 &&
         (ggml_get_op_params_i32(node, 2) > 0 ? n_tokens <= get_mmvq_mmid_max_batch(w->type, cc) :
          !ggml_cuda_should_use_mmq_few(w, x, ids, cc) && n_tokens <= MMVQ_MMID_CEILING &&
          n_tokens <= get_mmvq_mmid_max_batch(w->type, cc));
@@ -8747,10 +8761,11 @@ static int ggml_cuda_try_moe_experts_weighted_sum(ggml_backend_cuda_context & ct
 
     const int32_t first = ggml_get_op_params_i32(node, 2) > 0 ? ggml_get_op_params_i32(node, 1) : 0;
     const int32_t count = (int32_t) w->ne[2];
-    const int32_t * pre_lids = (down_local_ids == (const int32_t *) ids->data &&
+    const int32_t stride = ggml_mul_mat_id_expert_stride(node);
+    const int32_t * pre_lids = (down_local_ids == (const int32_t *) ids->data && stride == 1 &&
         first == scratch.local_ids_first && count == scratch.local_ids_count) ? scratch.local_ids : nullptr;
 
-    if (tma_ok && ggml_cuda_mmq_tma_down_weighted_sum(ctx, w, x, ids, wsum, out, first, count, pre_lids)) {
+    if (tma_ok && ggml_cuda_mmq_tma_down_weighted_sum(ctx, w, x, ids, wsum, out, first, count, pre_lids, stride)) {
         return j - 1 - i;
     }
     if (!vector_ref) {
