@@ -838,57 +838,79 @@ int test_inkling_window(size_t seed, ggml_backend_dev_t dev) {
     return ok ? 0 : 1;
 }
 
-// The products that read a layer's Q input (q, rel, sink and gate, and k on the sliding layers) as one launch of the CUDA
-// few-row MMQ group against one launch each (GGML_CUDA_MMQ_FEW_GROUP_LEGACY=1), on one device or under a tensor split
-// over several. The group takes K-quant weights whose rows hold 8 blocks of 256 or more at 3 to 24 rows, so the fixture
-// is widened to n_embd 2048 in heads of 128, the five weights are Q3_K and attn_v Q4_K as in the served pack, and the
-// rows come in ubatches of 23, the served decode's, and a last one of 5. The logits must be the same bit for bit.
+// The products that read a layer's Q input (q, gate, k, v, rel, sink) as CUDA few-row MMQ groups against
+// GGML_CUDA_MMQ_FEW_GROUP_LEGACY=1 and LLAMA_INKLING2_PROJ_GROUP_LEGACY=1, on one device or under a tensor split.
+// The group takes K-quant weights whose rows hold 8 blocks of 256 or more at 3 to 24 rows, so the fixture is widened
+// to n_embd 2048 in heads of 128, and the rows come in ubatches of 23 and a last one of 5. Logits must be bit-identical.
 int test_inkling_stack(size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
-    constexpr uint32_t n_embd = 2048, n_head = 16, n_head_kv = 8, head_dim = 128;
-    auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
-    kv_writer ms(LLM_ARCH_INKLING2, gguf.get());
-    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,        n_embd);
-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head);
-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv);
-    ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,    head_dim);
-    ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,  head_dim);
-    const uint32_t n_layer = gguf_get_val_u32(gguf.get(),
-            gguf_find_key(gguf.get(), llama_arch_kv_name(LLM_ARCH_INKLING2, LLM_KV_BLOCK_COUNT).c_str()));
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        for (const char * name : {"attn_q", "attn_k", "attn_rel", "attn_sink_proj", "attn_gate", "attn_v"}) {
-            ggml_tensor t;
-            memset(&t, 0, sizeof(t));
-            t.type = strcmp(name, "attn_v") == 0 ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K;
-            ggml_format_name(&t, "blk.%u.%s.weight", il, name);
-            gguf_add_tensor(gguf.get(), &t);
+    const auto check_pack = [&](const char * label, uint32_t n_embd, uint32_t n_head, uint32_t n_head_kv,
+            bool f32_rel_sinks, ggml_type v_type) -> bool {
+        constexpr uint32_t head_dim = 128;
+        auto gguf = get_gguf_ctx(LLM_ARCH_INKLING2, true);
+        kv_writer ms(LLM_ARCH_INKLING2, gguf.get());
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH,        n_embd);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv);
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,    head_dim);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,  head_dim);
+        const uint32_t n_layer = gguf_get_val_u32(gguf.get(),
+                gguf_find_key(gguf.get(), llama_arch_kv_name(LLM_ARCH_INKLING2, LLM_KV_BLOCK_COUNT).c_str()));
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            for (const char * name : {"attn_q", "attn_k", "attn_rel", "attn_sink_proj", "attn_gate", "attn_v"}) {
+                ggml_tensor t;
+                memset(&t, 0, sizeof(t));
+                if (strcmp(name, "attn_v") == 0) {
+                    t.type = v_type;
+                } else if (f32_rel_sinks && (strcmp(name, "attn_rel") == 0 || strcmp(name, "attn_sink_proj") == 0)) {
+                    t.type = GGML_TYPE_F32;
+                } else {
+                    t.type = GGML_TYPE_Q3_K;
+                }
+                ggml_format_name(&t, "blk.%u.%s.weight", il, name);
+                gguf_add_tensor(gguf.get(), &t);
+            }
         }
-    }
-    llama_model_ptr model = get_model(gguf.get(), nullptr, seed, 0.0f, devs,
-            devs.size() > 1 ? LLAMA_SPLIT_MODE_TENSOR : LLAMA_SPLIT_MODE_LAYER);
+        llama_model_ptr model = get_model(gguf.get(), nullptr, seed, 0.0f, devs,
+                devs.size() > 1 ? LLAMA_SPLIT_MODE_TENSOR : LLAMA_SPLIT_MODE_LAYER);
 
-    const auto run = [&](bool legacy, std::vector<float> & out) {
-        set_env("GGML_CUDA_MMQ_FEW_GROUP_LEGACY", legacy ? "1" : nullptr); // read at each evaluation
-        llama_context_params params = llama_context_default_params();
-        params.n_ctx = 256;
-        params.n_batch = 256;
-        params.n_ubatch = 23;
-        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        params.n_threads = params.n_threads_batch = 4;
-        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
-        if (!ctx) {
-            throw std::runtime_error("inkling2 stack: the context was not created");
-        }
-        decode(ctx.get(), span(get_tokens(97, 128, seed), 0, 0), out);
-        set_env("GGML_CUDA_MMQ_FEW_GROUP_LEGACY", nullptr);
+        const auto run = [&](bool group_legacy, bool proj_legacy, std::vector<float> & out) {
+            set_env("GGML_CUDA_MMQ_FEW_GROUP_LEGACY", group_legacy ? "1" : nullptr);
+            set_env("LLAMA_INKLING2_PROJ_GROUP_LEGACY", proj_legacy ? "1" : nullptr);
+            llama_context_params params = llama_context_default_params();
+            params.n_ctx = 256;
+            params.n_batch = 256;
+            params.n_ubatch = 23;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            params.n_threads = params.n_threads_batch = 4;
+            llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+            if (!ctx) {
+                throw std::runtime_error("inkling2 stack: the context was not created");
+            }
+            decode(ctx.get(), span(get_tokens(97, 128, seed), 0, 0), out);
+            set_env("GGML_CUDA_MMQ_FEW_GROUP_LEGACY", nullptr);
+            set_env("LLAMA_INKLING2_PROJ_GROUP_LEGACY", nullptr);
+        };
+        std::vector<float> expected, legacy_order, actual;
+        run(true,  false, expected);
+        run(false, true,  legacy_order);
+        run(false, false, actual);
+
+        const bool ok_group = !expected.empty() && expected.size() == actual.size() &&
+            memcmp(expected.data(), actual.data(), expected.size()*sizeof(float)) == 0;
+        const bool ok_order = !legacy_order.empty() && legacy_order.size() == actual.size() &&
+            memcmp(legacy_order.data(), actual.data(), legacy_order.size()*sizeof(float)) == 0;
+        const bool ok = ok_group && ok_order;
+        fprintf(stderr, "inkling2 stack [%s] on %zu device(s): %zu logits, group=%s order=%s bit for bit (NMSE %g / %g)\n",
+                label, devs.size(), expected.size(),
+                ok_group ? "same" : "diff", ok_order ? "same" : "diff",
+                expected.size() == actual.size() ? nmse(expected, actual) : INFINITY,
+                legacy_order.size() == actual.size() ? nmse(legacy_order, actual) : INFINITY);
+        return ok;
     };
-    std::vector<float> expected, actual;
-    run(true, expected);
-    run(false, actual);
 
-    const bool ok = !expected.empty() && expected.size() == actual.size() &&
-        memcmp(expected.data(), actual.data(), expected.size()*sizeof(float)) == 0;
-    fprintf(stderr, "inkling2 stack on %zu device(s): %zu logits, %s bit for bit (NMSE %g)\n", devs.size(), expected.size(),
-            ok ? "the same" : "not the same", expected.size() == actual.size() ? nmse(expected, actual) : INFINITY);
+    const bool ok = check_pack("q3k-all", 2048, 16, 8, false, GGML_TYPE_Q4_K) &&
+                    check_pack("f32-rel-sinks-q4v", 4608, 12, 2, true, GGML_TYPE_Q4_K) &&
+                    check_pack("f32-rel-sinks-q3v", 4608, 12, 2, true, GGML_TYPE_Q3_K);
     fprintf(stderr, "%s inkling2 stack\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
